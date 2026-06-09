@@ -1,10 +1,15 @@
+import bz2
 import contextlib
 import os
 import re
 import stat
 import tempfile
 import zipfile
-from typing import Any, ClassVar
+import zlib
+from collections.abc import Iterator
+from dataclasses import dataclass
+from itertools import pairwise
+from typing import Any, BinaryIO, ClassVar, cast
 
 from ..core_results import mark_operational_scan_error
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
@@ -36,6 +41,78 @@ CRITICAL_SYSTEM_PATHS = [
 ARCHIVE_MEMBER_COPY_CHUNK_BYTES = 64 * 1024
 ZIP_SECURITY_ONLY_MEMBER_ENTRIES_CONFIG_KEY = "_zip_security_only_member_entries"
 ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY = "_zip_content_only_member_entries"
+_ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
+_ZIP_EOCD_MIN_SIZE = 22
+_ZIP_MAX_COMMENT_SIZE = 0xFFFF
+_ZIP_MAX_EOCD_CANDIDATES = 16
+_ZIP_CENTRAL_DIRECTORY_SIGNATURE = b"PK\x01\x02"
+_ZIP_CENTRAL_DIRECTORY_HEADER_SIZE = 46
+_ZIP_MAX_CENTRAL_DIRECTORY_RECORD_SIZE = _ZIP_CENTRAL_DIRECTORY_HEADER_SIZE + (3 * 0xFFFF)
+_ZIP_LOCAL_FILE_HEADER_SIGNATURE = b"PK\x03\x04"
+_ZIP_LOCAL_FILE_HEADER_SIZE = 30
+_ZIP_DATA_DESCRIPTOR_SIGNATURE = b"PK\x07\x08"
+_ZIP_ARCHIVE_EXTRA_DATA_SIGNATURE = b"PK\x06\x08"
+_ZIP_MAX_ARCHIVE_EXTRA_DATA_RECORDS = 1024
+_ZIP_MAX_LOCAL_PREFIX_SCAN_SIZE = 64 * 1024 * 1024
+_ZIP_MAX_LOCAL_PAYLOAD_VALIDATION_SIZE = 64 * 1024 * 1024
+_ZIP_MAX_LOCAL_ENTRY_PADDING = 64 * 1024
+_ZIP_MAX_LOCAL_HEADER_CANDIDATES = 10000
+_ZIP64_EOCD_LOCATOR_SIGNATURE = b"PK\x06\x07"
+_ZIP64_EOCD_LOCATOR_SIZE = 20
+_ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
+_ZIP64_EOCD_MIN_SIZE = 56
+_ZIP64_SENTINEL_ENTRY_COUNT = 0xFFFF
+_ZIP64_SENTINEL_OFFSET = 0xFFFFFFFF
+
+
+@dataclass(frozen=True)
+class _ZipDirectoryMetadata:
+    entry_count: int
+    directory_start: int
+    directory_size: int
+    archive_prefix_size: int
+
+
+@dataclass(frozen=True)
+class _ZipCentralDirectoryEntry:
+    filename: bytes
+    flags: int
+    compression_method: int
+    crc32: int
+    compressed_size: int
+    uncompressed_size: int
+    relative_local_offset: int
+    uses_zip64_sizes: bool
+
+
+@dataclass(frozen=True)
+class _ZipLocalEntryLayout:
+    offset: int
+    end_candidates: frozenset[int]
+
+
+class _InvalidZipDirectory(ValueError):
+    def __init__(self, message: str, *, routing_evidence: bool = False):
+        super().__init__(message)
+        self.routing_evidence = routing_evidence
+
+
+class _ZipCentralDirectorySizeExceeded(_InvalidZipDirectory):
+    def __init__(self, directory_size: int, max_directory_size: int):
+        super().__init__(
+            f"ZIP central directory is too large ({directory_size} > {max_directory_size} bytes)",
+            routing_evidence=True,
+        )
+        self.directory_size = directory_size
+        self.max_directory_size = max_directory_size
+
+
+class ZipPreflightRejected(Exception):
+    """Raised when a same-handle ZIP preflight produces a terminal scan result."""
+
+    def __init__(self, result: ScanResult):
+        super().__init__("ZIP central-directory preflight rejected the archive")
+        self.result = result
 
 
 class ZipScanner(BaseScanner):
@@ -49,6 +126,8 @@ class ZipScanner(BaseScanner):
     MAX_SYMLINK_TARGET_BYTES: ClassVar[int] = 64 * 1024
     MAX_COMPRESSION_RATIO: ClassVar[int] = 100
     MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE: ClassVar[int] = 1024 * 1024
+    DEFAULT_MAX_ENTRIES: ClassVar[int] = 10000
+    DEFAULT_MAX_CENTRAL_DIRECTORY_SIZE: ClassVar[int] = 64 * 1024 * 1024
     DEFAULT_MAX_ENTRY_SIZE: ClassVar[int] = 10 * 1024 * 1024 * 1024
     DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE: ClassVar[int] = 10 * 1024 * 1024 * 1024
     UNLIMITED_ARCHIVE_SIZE: ClassVar[int] = 1024 * 1024 * 1024 * 1024
@@ -58,8 +137,9 @@ class ZipScanner(BaseScanner):
         self.max_depth = self.config.get("max_zip_depth", 5)  # Prevent zip bomb attacks
         self.max_entries = self.config.get(
             "max_zip_entries",
-            10000,
+            self.DEFAULT_MAX_ENTRIES,
         )  # Limit number of entries
+        self.max_central_directory_size = self.central_directory_size_limit(self.config)
         self.max_compression_ratio = self.MAX_COMPRESSION_RATIO
         self.min_compression_bomb_uncompressed_size = self._normalize_positive_int_config(
             self.config.get("zip_min_compression_bomb_uncompressed_size"),
@@ -93,6 +173,13 @@ class ZipScanner(BaseScanner):
     def _get_archive_depth(self) -> int:
         """Return the current shared archive depth from config."""
         return get_archive_depth(self.config)
+
+    @classmethod
+    def central_directory_size_limit(cls, config: dict[str, Any] | None = None) -> int:
+        """Return the byte cap applied before ``zipfile`` materializes directory metadata."""
+        raw_limit = (config or {}).get("max_zip_central_directory_size")
+        configured_limit = cls._normalize_positive_int_config(raw_limit, cls.DEFAULT_MAX_CENTRAL_DIRECTORY_SIZE)
+        return min(configured_limit, cls.DEFAULT_MAX_CENTRAL_DIRECTORY_SIZE)
 
     def _get_max_entry_size(self) -> int:
         """Return the configured per-entry extraction limit with a safe unlimited fallback."""
@@ -167,6 +254,1004 @@ class ZipScanner(BaseScanner):
     def _is_known_unreadable_archive_entry(self, info: zipfile.ZipInfo) -> bool:
         return info.header_offset in self.known_unreadable_archive_entry_offsets
 
+    @staticmethod
+    def _find_zip_eocd_indices(tail: bytes) -> tuple[int, ...]:
+        primary_index = tail.rfind(_ZIP_EOCD_SIGNATURE)
+        if primary_index < 0 or primary_index + _ZIP_EOCD_MIN_SIZE > len(tail):
+            return ()
+
+        earlier_indices: list[int] = []
+        primary_record_end = primary_index + _ZIP_EOCD_MIN_SIZE
+        primary_is_empty = not any(tail[primary_index + 8 : primary_index + 16])
+        search_start = 0
+        while True:
+            eocd_index = tail.find(_ZIP_EOCD_SIGNATURE, search_start, primary_index)
+            if eocd_index < 0 or eocd_index + _ZIP_EOCD_MIN_SIZE > len(tail):
+                return (primary_index, *reversed(earlier_indices))
+            comment_length = int.from_bytes(tail[eocd_index + 20 : eocd_index + 22], "little")
+            record_fields = tail[eocd_index + 8 : eocd_index + 20]
+            if eocd_index + _ZIP_EOCD_MIN_SIZE + comment_length >= primary_record_end or (
+                primary_is_empty and any(record_fields)
+            ):
+                earlier_indices.append(eocd_index)
+                if len(earlier_indices) + 1 >= _ZIP_MAX_EOCD_CANDIDATES:
+                    return (primary_index, *reversed(earlier_indices))
+            search_start = eocd_index + 1
+
+    @staticmethod
+    def _zip_directory_metadata(
+        *,
+        entry_count: int,
+        directory_size: int,
+        directory_offset: int,
+        directory_end: int,
+    ) -> _ZipDirectoryMetadata:
+        directory_start = directory_end - directory_size
+        if directory_start < 0 or directory_offset > directory_start:
+            raise _InvalidZipDirectory("ZIP central-directory offsets are inconsistent")
+        return _ZipDirectoryMetadata(
+            entry_count=entry_count,
+            directory_start=directory_start,
+            directory_size=directory_size,
+            archive_prefix_size=directory_start - directory_offset,
+        )
+
+    @classmethod
+    def _read_zip64_directory_metadata(
+        cls,
+        handle: BinaryIO,
+        *,
+        locator_offset: int,
+    ) -> _ZipDirectoryMetadata:
+        if locator_offset < 0:
+            raise _InvalidZipDirectory("ZIP64 locator is missing")
+
+        handle.seek(locator_offset)
+        locator = handle.read(_ZIP64_EOCD_LOCATOR_SIZE)
+        if len(locator) != _ZIP64_EOCD_LOCATOR_SIZE or not locator.startswith(_ZIP64_EOCD_LOCATOR_SIGNATURE):
+            raise _InvalidZipDirectory("ZIP64 locator is missing")
+        if int.from_bytes(locator[4:8], "little") != 0 or int.from_bytes(locator[16:20], "little") != 1:
+            raise _InvalidZipDirectory("multi-disk ZIP64 archives are unsupported")
+
+        relative_record_offset = int.from_bytes(locator[8:16], "little")
+        candidate_offsets = (relative_record_offset, locator_offset - _ZIP64_EOCD_MIN_SIZE)
+        record_offset: int | None = None
+        record = b""
+        for candidate_offset in candidate_offsets:
+            if candidate_offset < 0 or candidate_offset > locator_offset - _ZIP64_EOCD_MIN_SIZE:
+                continue
+            try:
+                handle.seek(candidate_offset)
+                candidate = handle.read(_ZIP64_EOCD_MIN_SIZE)
+            except (OSError, OverflowError, ValueError):
+                continue
+            if len(candidate) == _ZIP64_EOCD_MIN_SIZE and candidate.startswith(_ZIP64_EOCD_SIGNATURE):
+                record_offset = candidate_offset
+                record = candidate
+                break
+        if record_offset is None:
+            raise _InvalidZipDirectory("ZIP64 end-of-directory record is missing")
+
+        record_size = int.from_bytes(record[4:12], "little")
+        if record_size < _ZIP64_EOCD_MIN_SIZE - 12 or record_offset + 12 + record_size != locator_offset:
+            raise _InvalidZipDirectory("ZIP64 end-of-directory size is inconsistent")
+        if int.from_bytes(record[16:20], "little") != 0 or int.from_bytes(record[20:24], "little") != 0:
+            raise _InvalidZipDirectory("multi-disk ZIP64 archives are unsupported")
+
+        entries_on_disk = int.from_bytes(record[24:32], "little")
+        entry_count = int.from_bytes(record[32:40], "little")
+        directory_size = int.from_bytes(record[40:48], "little")
+        directory_offset = int.from_bytes(record[48:56], "little")
+        if entries_on_disk != entry_count or directory_offset + directory_size != relative_record_offset:
+            raise _InvalidZipDirectory("ZIP64 central-directory metadata is inconsistent", routing_evidence=True)
+        return cls._zip_directory_metadata(
+            entry_count=entry_count,
+            directory_size=directory_size,
+            directory_offset=directory_offset,
+            directory_end=record_offset,
+        )
+
+    @classmethod
+    def _read_zip_directory_metadata_at(
+        cls,
+        handle: BinaryIO,
+        *,
+        file_size: int,
+        tail_size: int,
+        tail: bytes,
+        eocd_index: int,
+    ) -> _ZipDirectoryMetadata:
+        eocd = tail[eocd_index : eocd_index + _ZIP_EOCD_MIN_SIZE]
+        disk_number = int.from_bytes(eocd[4:6], "little")
+        directory_disk = int.from_bytes(eocd[6:8], "little")
+        entries_on_disk = int.from_bytes(eocd[8:10], "little")
+        entry_count = int.from_bytes(eocd[10:12], "little")
+        eocd_offset = file_size - tail_size + eocd_index
+        directory_size = int.from_bytes(eocd[12:16], "little")
+        directory_offset = int.from_bytes(eocd[16:20], "little")
+        locator_offset = eocd_offset - _ZIP64_EOCD_LOCATOR_SIZE
+        if locator_offset >= 0:
+            handle.seek(locator_offset)
+            if handle.read(len(_ZIP64_EOCD_LOCATOR_SIGNATURE)) == _ZIP64_EOCD_LOCATOR_SIGNATURE:
+                return cls._read_zip64_directory_metadata(handle, locator_offset=locator_offset)
+        if (
+            entry_count == _ZIP64_SENTINEL_ENTRY_COUNT
+            or entries_on_disk == _ZIP64_SENTINEL_ENTRY_COUNT
+            or directory_size == _ZIP64_SENTINEL_OFFSET
+            or directory_offset == _ZIP64_SENTINEL_OFFSET
+        ):
+            return cls._read_zip64_directory_metadata(
+                handle,
+                locator_offset=eocd_offset - _ZIP64_EOCD_LOCATOR_SIZE,
+            )
+        if disk_number != 0 or directory_disk != 0:
+            raise _InvalidZipDirectory("multi-disk ZIP archives are unsupported")
+        if entries_on_disk != entry_count:
+            raise _InvalidZipDirectory("ZIP entry counts are inconsistent")
+        return cls._zip_directory_metadata(
+            entry_count=entry_count,
+            directory_size=directory_size,
+            directory_offset=directory_offset,
+            directory_end=eocd_offset,
+        )
+
+    @classmethod
+    def _read_zip_tail(cls, handle: BinaryIO) -> tuple[int, int, bytes, tuple[int, ...]] | None:
+        handle.seek(0, os.SEEK_END)
+        file_size = handle.tell()
+        if file_size < _ZIP_EOCD_MIN_SIZE:
+            return None
+        tail_size = min(file_size, _ZIP_EOCD_MIN_SIZE + _ZIP_MAX_COMMENT_SIZE)
+        handle.seek(file_size - tail_size)
+        tail = handle.read(tail_size)
+        return file_size, tail_size, tail, cls._find_zip_eocd_indices(tail)
+
+    @classmethod
+    def _has_zip_routing_evidence(cls, path: str) -> bool:
+        return os.path.splitext(path)[1].lower() in cls.supported_extensions
+
+    @classmethod
+    def _count_bounded_central_directory_entries(
+        cls,
+        handle: BinaryIO,
+        metadata: _ZipDirectoryMetadata,
+        max_entries: int,
+    ) -> tuple[int, bool]:
+        """Count fixed central-directory records, stopping once the configured cap is exceeded."""
+        consumed = 0
+        entry_count = 0
+        entries: list[_ZipCentralDirectoryEntry] = []
+        try:
+            handle.seek(metadata.directory_start)
+            while consumed < metadata.directory_size:
+                remaining = metadata.directory_size - consumed
+                if remaining < _ZIP_CENTRAL_DIRECTORY_HEADER_SIZE:
+                    raise _InvalidZipDirectory(
+                        "ZIP central directory is truncated",
+                        routing_evidence=entry_count > 0,
+                    )
+                header = handle.read(_ZIP_CENTRAL_DIRECTORY_HEADER_SIZE)
+                if len(header) != _ZIP_CENTRAL_DIRECTORY_HEADER_SIZE:
+                    raise _InvalidZipDirectory(
+                        "ZIP central directory is truncated",
+                        routing_evidence=entry_count > 0,
+                    )
+                if not header.startswith(_ZIP_CENTRAL_DIRECTORY_SIGNATURE):
+                    raise _InvalidZipDirectory("ZIP central-directory signature is invalid")
+
+                variable_size = (
+                    int.from_bytes(header[28:30], "little")
+                    + int.from_bytes(header[30:32], "little")
+                    + int.from_bytes(header[32:34], "little")
+                )
+                record_size = _ZIP_CENTRAL_DIRECTORY_HEADER_SIZE + variable_size
+                if record_size > remaining:
+                    raise _InvalidZipDirectory(
+                        "ZIP central-directory record exceeds its declared size",
+                        routing_evidence=True,
+                    )
+
+                entry_count += 1
+                if entry_count > max_entries:
+                    return entry_count, True
+                variable_data = handle.read(variable_size)
+                if len(variable_data) != variable_size:
+                    raise _InvalidZipDirectory(
+                        "ZIP central directory is truncated",
+                        routing_evidence=True,
+                    )
+                filename_size = int.from_bytes(header[28:30], "little")
+                extra_size = int.from_bytes(header[30:32], "little")
+                filename = variable_data[:filename_size]
+                extra = variable_data[filename_size : filename_size + extra_size]
+                entries.append(cls._central_directory_entry(header, filename, extra))
+                consumed += record_size
+        except OSError as exc:
+            raise _InvalidZipDirectory(f"ZIP central directory could not be read: {exc}") from exc
+
+        if entry_count != metadata.entry_count:
+            raise _InvalidZipDirectory(
+                f"ZIP entry count mismatch ({metadata.entry_count} declared, {entry_count} observed)",
+                routing_evidence=True,
+            )
+        cls._validate_declared_local_entry_layout(handle, metadata, entries)
+        return entry_count, False
+
+    @staticmethod
+    def _zip64_extra_field(extra: bytes) -> bytes | None:
+        field_offset = 0
+        while field_offset + 4 <= len(extra):
+            field_id = int.from_bytes(extra[field_offset : field_offset + 2], "little")
+            field_size = int.from_bytes(extra[field_offset + 2 : field_offset + 4], "little")
+            field_data = extra[field_offset + 4 : field_offset + 4 + field_size]
+            if len(field_data) != field_size:
+                return None
+            field_offset += 4 + field_size
+            if field_id == 0x0001:
+                return field_data
+        return None
+
+    @classmethod
+    def _central_directory_entry(
+        cls,
+        header: bytes,
+        filename: bytes,
+        extra: bytes,
+    ) -> _ZipCentralDirectoryEntry:
+        if not filename or b"\x00" in filename:
+            raise _InvalidZipDirectory("ZIP central-directory filename is invalid", routing_evidence=True)
+
+        raw_uncompressed_size = int.from_bytes(header[24:28], "little")
+        raw_compressed_size = int.from_bytes(header[20:24], "little")
+        raw_local_offset = int.from_bytes(header[42:46], "little")
+        raw_disk_start = int.from_bytes(header[34:36], "little")
+        requires_zip64 = (
+            raw_uncompressed_size == _ZIP64_SENTINEL_OFFSET
+            or raw_compressed_size == _ZIP64_SENTINEL_OFFSET
+            or raw_local_offset == _ZIP64_SENTINEL_OFFSET
+            or raw_disk_start == _ZIP64_SENTINEL_ENTRY_COUNT
+        )
+        zip64_data = cls._zip64_extra_field(extra) if requires_zip64 else b""
+        if zip64_data is None:
+            raise _InvalidZipDirectory("ZIP64 central-directory metadata is incomplete", routing_evidence=True)
+
+        value_offset = 0
+
+        def zip64_value(raw_value: int, sentinel: int, width: int) -> int:
+            nonlocal value_offset
+            if raw_value != sentinel:
+                return raw_value
+            if value_offset + width > len(zip64_data):
+                raise _InvalidZipDirectory("ZIP64 central-directory metadata is incomplete", routing_evidence=True)
+            value = int.from_bytes(zip64_data[value_offset : value_offset + width], "little")
+            value_offset += width
+            return value
+
+        uncompressed_size = zip64_value(raw_uncompressed_size, _ZIP64_SENTINEL_OFFSET, 8)
+        compressed_size = zip64_value(raw_compressed_size, _ZIP64_SENTINEL_OFFSET, 8)
+        relative_local_offset = zip64_value(raw_local_offset, _ZIP64_SENTINEL_OFFSET, 8)
+        disk_start = zip64_value(raw_disk_start, _ZIP64_SENTINEL_ENTRY_COUNT, 4)
+        if disk_start != 0:
+            raise _InvalidZipDirectory("multi-disk ZIP archives are unsupported", routing_evidence=True)
+
+        return _ZipCentralDirectoryEntry(
+            filename=filename,
+            flags=int.from_bytes(header[8:10], "little"),
+            compression_method=int.from_bytes(header[10:12], "little"),
+            crc32=int.from_bytes(header[16:20], "little"),
+            compressed_size=compressed_size,
+            uncompressed_size=uncompressed_size,
+            relative_local_offset=relative_local_offset,
+            uses_zip64_sizes=(
+                raw_uncompressed_size == _ZIP64_SENTINEL_OFFSET or raw_compressed_size == _ZIP64_SENTINEL_OFFSET
+            ),
+        )
+
+    @classmethod
+    def _local_sizes(cls, header: bytes, extra: bytes) -> tuple[int, int] | None:
+        raw_uncompressed_size = int.from_bytes(header[22:26], "little")
+        raw_compressed_size = int.from_bytes(header[18:22], "little")
+        if raw_uncompressed_size != _ZIP64_SENTINEL_OFFSET and raw_compressed_size != _ZIP64_SENTINEL_OFFSET:
+            return raw_compressed_size, raw_uncompressed_size
+        zip64_data = cls._zip64_extra_field(extra)
+        if zip64_data is None:
+            return None
+        value_offset = 0
+
+        def zip64_value(raw_value: int) -> int | None:
+            nonlocal value_offset
+            if raw_value != _ZIP64_SENTINEL_OFFSET:
+                return raw_value
+            if value_offset + 8 > len(zip64_data):
+                return None
+            value = int.from_bytes(zip64_data[value_offset : value_offset + 8], "little")
+            value_offset += 8
+            return value
+
+        uncompressed_size = zip64_value(raw_uncompressed_size)
+        compressed_size = zip64_value(raw_compressed_size)
+        if uncompressed_size is None or compressed_size is None:
+            return None
+        return compressed_size, uncompressed_size
+
+    @staticmethod
+    def _data_descriptor_end_candidates(
+        descriptor: bytes,
+        descriptor_offset: int,
+        entry: _ZipCentralDirectoryEntry,
+        *,
+        uses_zip64_sizes: bool,
+    ) -> frozenset[int]:
+        size_width = 8 if uses_zip64_sizes else 4
+        payload_size = 4 + (2 * size_width)
+        end_candidates: set[int] = set()
+        for signature_size in (0, len(_ZIP_DATA_DESCRIPTOR_SIGNATURE)):
+            if signature_size and not descriptor.startswith(_ZIP_DATA_DESCRIPTOR_SIGNATURE):
+                continue
+            end = signature_size + payload_size
+            if len(descriptor) < end:
+                continue
+            payload = descriptor[signature_size:end]
+            crc32 = int.from_bytes(payload[:4], "little")
+            compressed_size = int.from_bytes(payload[4 : 4 + size_width], "little")
+            uncompressed_size = int.from_bytes(payload[4 + size_width :], "little")
+            if (
+                crc32 == entry.crc32
+                and compressed_size == entry.compressed_size
+                and uncompressed_size == entry.uncompressed_size
+            ):
+                end_candidates.add(descriptor_offset + end)
+        return frozenset(end_candidates)
+
+    @classmethod
+    def _local_entry_layout(
+        cls,
+        handle: BinaryIO,
+        metadata: _ZipDirectoryMetadata,
+        entry: _ZipCentralDirectoryEntry,
+        local_header_offset: int,
+    ) -> _ZipLocalEntryLayout | None:
+        if local_header_offset < 0 or local_header_offset + _ZIP_LOCAL_FILE_HEADER_SIZE > metadata.directory_start:
+            return None
+        try:
+            handle.seek(local_header_offset)
+            header = handle.read(_ZIP_LOCAL_FILE_HEADER_SIZE)
+            if len(header) != _ZIP_LOCAL_FILE_HEADER_SIZE or not header.startswith(_ZIP_LOCAL_FILE_HEADER_SIGNATURE):
+                return None
+            filename_size = int.from_bytes(header[26:28], "little")
+            extra_size = int.from_bytes(header[28:30], "little")
+            variable_data = handle.read(filename_size + extra_size)
+            if len(variable_data) != filename_size + extra_size:
+                return None
+            filename = variable_data[:filename_size]
+            extra = variable_data[filename_size:]
+        except OSError as exc:
+            raise _InvalidZipDirectory(f"ZIP local header could not be read: {exc}") from exc
+
+        local_flags = int.from_bytes(header[6:8], "little")
+        if (
+            filename != entry.filename
+            or local_flags != entry.flags
+            or int.from_bytes(header[8:10], "little") != entry.compression_method
+        ):
+            return None
+
+        uses_data_descriptor = bool(local_flags & 0x0008)
+        local_crc32 = int.from_bytes(header[14:18], "little")
+        local_uses_zip64_sizes = (
+            int.from_bytes(header[18:22], "little") == _ZIP64_SENTINEL_OFFSET
+            or int.from_bytes(header[22:26], "little") == _ZIP64_SENTINEL_OFFSET
+        )
+        local_sizes = cls._local_sizes(header, extra)
+        if local_sizes is None:
+            return None
+        local_compressed_size, local_uncompressed_size = local_sizes
+        if uses_data_descriptor:
+            if local_crc32 not in {0, entry.crc32}:
+                return None
+            if local_compressed_size not in {0, entry.compressed_size}:
+                return None
+            if local_uncompressed_size not in {0, entry.uncompressed_size}:
+                return None
+        elif (
+            local_crc32 != entry.crc32
+            or local_compressed_size != entry.compressed_size
+            or local_uncompressed_size != entry.uncompressed_size
+        ):
+            return None
+
+        data_offset = local_header_offset + _ZIP_LOCAL_FILE_HEADER_SIZE + filename_size + extra_size
+        data_end = data_offset + entry.compressed_size
+        if data_end > metadata.directory_start:
+            return None
+        if not uses_data_descriptor:
+            return _ZipLocalEntryLayout(offset=local_header_offset, end_candidates=frozenset({data_end}))
+
+        uses_zip64_descriptor = entry.uses_zip64_sizes or local_uses_zip64_sizes
+        descriptor_size = 24 if uses_zip64_descriptor else 16
+        try:
+            handle.seek(data_end)
+            descriptor = handle.read(descriptor_size)
+        except OSError as exc:
+            raise _InvalidZipDirectory(f"ZIP data descriptor could not be read: {exc}") from exc
+        end_candidates = cls._data_descriptor_end_candidates(
+            descriptor,
+            data_end,
+            entry,
+            uses_zip64_sizes=uses_zip64_descriptor,
+        )
+        if not end_candidates:
+            return None
+        return _ZipLocalEntryLayout(offset=local_header_offset, end_candidates=end_candidates)
+
+    @classmethod
+    def _validate_declared_local_entry_layout(
+        cls,
+        handle: BinaryIO,
+        metadata: _ZipDirectoryMetadata,
+        entries: list[_ZipCentralDirectoryEntry],
+    ) -> None:
+        if not entries:
+            if cls._has_preceding_central_directory_entry(
+                handle, metadata
+            ) or cls._has_unreferenced_local_entry_ending_at(handle, metadata.directory_start):
+                raise _InvalidZipDirectory(
+                    "ZIP central directory omits a preceding record",
+                    routing_evidence=True,
+                )
+            return
+        layouts: list[_ZipLocalEntryLayout] = []
+        for entry in entries:
+            candidates = {
+                entry.relative_local_offset,
+                metadata.archive_prefix_size + entry.relative_local_offset,
+            }
+            matching_layouts = [
+                layout
+                for candidate in candidates
+                if (layout := cls._local_entry_layout(handle, metadata, entry, candidate)) is not None
+            ]
+            if len(matching_layouts) != 1:
+                raise _InvalidZipDirectory(
+                    "ZIP central directory does not uniquely identify its local entry",
+                    routing_evidence=True,
+                )
+            layouts.append(matching_layouts[0])
+
+        layouts.sort(key=lambda layout: layout.offset)
+        if cls._has_unreferenced_local_entry_ending_at(handle, layouts[0].offset):
+            raise _InvalidZipDirectory(
+                "ZIP central directory omits a preceding record",
+                routing_evidence=True,
+            )
+        for layout, next_layout in pairwise(layouts):
+            if next_layout.offset not in layout.end_candidates:
+                raise _InvalidZipDirectory(
+                    "ZIP central directory omits a preceding record",
+                    routing_evidence=True,
+                )
+        if metadata.directory_start not in layouts[-1].end_candidates and not any(
+            cls._archive_extra_data_records_cover(handle, end, metadata.directory_start)
+            for end in layouts[-1].end_candidates
+        ):
+            raise _InvalidZipDirectory("ZIP central directory omits a preceding record", routing_evidence=True)
+
+    @staticmethod
+    def _archive_extra_data_records_cover(handle: BinaryIO, start: int, end: int) -> bool:
+        if start >= end:
+            return False
+        offset = start
+        record_count = 0
+        try:
+            while offset < end:
+                record_count += 1
+                if record_count > _ZIP_MAX_ARCHIVE_EXTRA_DATA_RECORDS:
+                    raise _InvalidZipDirectory(
+                        "too many ZIP archive extra data records",
+                        routing_evidence=True,
+                    )
+                if end - offset < 8:
+                    return False
+                handle.seek(offset)
+                header = handle.read(8)
+                if len(header) != 8 or not header.startswith(_ZIP_ARCHIVE_EXTRA_DATA_SIGNATURE):
+                    return False
+                record_size = int.from_bytes(header[4:8], "little")
+                offset += 8 + record_size
+                if offset > end:
+                    return False
+        except OSError as exc:
+            raise _InvalidZipDirectory(f"ZIP archive extra data could not be read: {exc}") from exc
+        return offset == end
+
+    @classmethod
+    def _has_preceding_central_directory_entry(
+        cls,
+        handle: BinaryIO,
+        metadata: _ZipDirectoryMetadata,
+    ) -> bool:
+        window_size = min(metadata.directory_start, _ZIP_MAX_CENTRAL_DIRECTORY_RECORD_SIZE)
+        if window_size < _ZIP_CENTRAL_DIRECTORY_HEADER_SIZE:
+            return False
+        window_start = metadata.directory_start - window_size
+        try:
+            handle.seek(window_start)
+            prefix = handle.read(window_size)
+        except OSError as exc:
+            raise _InvalidZipDirectory(f"ZIP central-directory prefix could not be read: {exc}") from exc
+
+        candidate_index = prefix.find(_ZIP_CENTRAL_DIRECTORY_SIGNATURE)
+        while candidate_index >= 0:
+            header_end = candidate_index + _ZIP_CENTRAL_DIRECTORY_HEADER_SIZE
+            if header_end <= len(prefix):
+                header = prefix[candidate_index:header_end]
+                filename_size = int.from_bytes(header[28:30], "little")
+                extra_size = int.from_bytes(header[30:32], "little")
+                comment_size = int.from_bytes(header[32:34], "little")
+                record_end = header_end + filename_size + extra_size + comment_size
+                if record_end <= len(prefix):
+                    filename = prefix[header_end : header_end + filename_size]
+                    extra = prefix[header_end + filename_size : header_end + filename_size + extra_size]
+                    try:
+                        entry = cls._central_directory_entry(header, filename, extra)
+                    except _InvalidZipDirectory:
+                        pass
+                    else:
+                        for local_offset in {
+                            entry.relative_local_offset,
+                            metadata.archive_prefix_size + entry.relative_local_offset,
+                        }:
+                            if cls._local_entry_layout(handle, metadata, entry, local_offset) is not None:
+                                return True
+            candidate_index = prefix.find(_ZIP_CENTRAL_DIRECTORY_SIGNATURE, candidate_index + 1)
+        return False
+
+    @classmethod
+    def _has_unreferenced_local_entry_ending_at(cls, handle: BinaryIO, boundary: int) -> bool:
+        if boundary < _ZIP_LOCAL_FILE_HEADER_SIZE:
+            return False
+        if boundary > _ZIP_MAX_LOCAL_PREFIX_SCAN_SIZE:
+            raise _InvalidZipDirectory(
+                "ZIP local-entry prefix is too large to validate safely",
+                routing_evidence=True,
+            )
+
+        overlap = len(_ZIP_LOCAL_FILE_HEADER_SIGNATURE) - 1
+        search_offset = 0
+        trailing = b""
+        candidate_count = 0
+        while search_offset < boundary:
+            read_size = min(64 * 1024, boundary - search_offset)
+            try:
+                handle.seek(search_offset)
+                chunk = handle.read(read_size)
+            except OSError as exc:
+                raise _InvalidZipDirectory(f"ZIP local-entry prefix could not be read: {exc}") from exc
+            if not chunk:
+                break
+            search_data = trailing + chunk
+            data_offset = search_offset - len(trailing)
+            candidate_index = search_data.find(_ZIP_LOCAL_FILE_HEADER_SIGNATURE)
+            while candidate_index >= 0:
+                candidate_count += 1
+                if candidate_count > _ZIP_MAX_LOCAL_HEADER_CANDIDATES:
+                    raise _InvalidZipDirectory(
+                        "too many plausible ZIP local headers before the declared entries",
+                        routing_evidence=True,
+                    )
+                candidate_offset = data_offset + candidate_index
+                if cls._unreferenced_local_entry_ends_at(handle, candidate_offset, boundary):
+                    return True
+                candidate_index = search_data.find(_ZIP_LOCAL_FILE_HEADER_SIGNATURE, candidate_index + 1)
+            trailing = search_data[-overlap:]
+            search_offset += len(chunk)
+        return False
+
+    @staticmethod
+    def _local_entry_payload_matches_header(
+        handle: BinaryIO,
+        *,
+        data_offset: int,
+        compressed_size: int,
+        uncompressed_size: int,
+        compression_method: int,
+        expected_crc32: int,
+        flags: int,
+    ) -> bool:
+        """Validate a bounded local-entry payload when its central record is absent."""
+        if flags & 0x0001:
+            return True
+        if (
+            compressed_size > _ZIP_MAX_LOCAL_PAYLOAD_VALIDATION_SIZE
+            or uncompressed_size > _ZIP_MAX_LOCAL_PAYLOAD_VALIDATION_SIZE
+        ):
+            return True
+        if compression_method == zipfile.ZIP_LZMA:
+            # ZIP's LZMA wrapper cannot bound output per call. A structurally
+            # valid hidden entry must fail closed rather than risk decompression.
+            return True
+        if compression_method not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2}:
+            return True
+
+        try:
+            handle.seek(data_offset)
+            compressed_data = handle.read(compressed_size)
+        except OSError as exc:
+            raise _InvalidZipDirectory(f"ZIP local-entry data could not be read: {exc}") from exc
+        if len(compressed_data) != compressed_size:
+            return False
+
+        crc32 = 0
+        output_size = 0
+
+        def consume_output(output: bytes) -> bool:
+            nonlocal crc32, output_size
+            output_size += len(output)
+            if output_size > uncompressed_size:
+                return False
+            crc32 = zlib.crc32(output, crc32)
+            return True
+
+        if compression_method == zipfile.ZIP_STORED:
+            return compressed_size == uncompressed_size and consume_output(compressed_data) and crc32 == expected_crc32
+
+        if compression_method == zipfile.ZIP_DEFLATED:
+            decompressor: Any = zlib.decompressobj(-15)
+            pending = compressed_data
+            try:
+                while pending:
+                    output = decompressor.decompress(
+                        pending,
+                        min(64 * 1024, uncompressed_size - output_size + 1),
+                    )
+                    pending = decompressor.unconsumed_tail
+                    if not consume_output(output):
+                        return False
+                    if pending and not output:
+                        return False
+            except zlib.error:
+                return False
+            if not decompressor.eof or decompressor.unused_data:
+                return False
+        else:
+            decompressor = bz2.BZ2Decompressor()
+            pending = compressed_data
+            try:
+                while pending or not decompressor.needs_input:
+                    output = decompressor.decompress(
+                        pending,
+                        max_length=min(64 * 1024, uncompressed_size - output_size + 1),
+                    )
+                    pending = b""
+                    if not consume_output(output):
+                        return False
+                    if decompressor.eof:
+                        break
+                    if decompressor.needs_input and not pending:
+                        break
+            except (OSError, EOFError):
+                return False
+            if not decompressor.eof or decompressor.unused_data:
+                return False
+
+        return output_size == uncompressed_size and crc32 == expected_crc32
+
+    @classmethod
+    def _unreferenced_local_entry_ends_at(cls, handle: BinaryIO, offset: int, boundary: int) -> bool:
+        try:
+            handle.seek(offset)
+            header = handle.read(_ZIP_LOCAL_FILE_HEADER_SIZE)
+            if len(header) != _ZIP_LOCAL_FILE_HEADER_SIZE or not header.startswith(_ZIP_LOCAL_FILE_HEADER_SIGNATURE):
+                return False
+            version_needed = int.from_bytes(header[4:6], "little")
+            flags = int.from_bytes(header[6:8], "little")
+            filename_size = int.from_bytes(header[26:28], "little")
+            extra_size = int.from_bytes(header[28:30], "little")
+            if not (10 <= version_needed <= 100) or filename_size == 0:
+                return False
+            variable_data = handle.read(filename_size + extra_size)
+            if len(variable_data) != filename_size + extra_size:
+                return False
+            filename = variable_data[:filename_size]
+            if b"\x00" in filename:
+                return False
+            extra = variable_data[filename_size:]
+        except OSError as exc:
+            raise _InvalidZipDirectory(f"ZIP local-entry prefix could not be read: {exc}") from exc
+
+        data_offset = offset + _ZIP_LOCAL_FILE_HEADER_SIZE + filename_size + extra_size
+        local_sizes = cls._local_sizes(header, extra)
+        if local_sizes is None:
+            return False
+        compressed_size, uncompressed_size = local_sizes
+        if not flags & 0x0008:
+            entry_end = data_offset + compressed_size
+            if entry_end == boundary:
+                return True
+            if entry_end < boundary:
+                return cls._local_entry_payload_matches_header(
+                    handle,
+                    data_offset=data_offset,
+                    compressed_size=compressed_size,
+                    uncompressed_size=uncompressed_size,
+                    compression_method=int.from_bytes(header[8:10], "little"),
+                    expected_crc32=int.from_bytes(header[14:18], "little"),
+                    flags=flags,
+                )
+            return False
+
+        raw_compressed_size = int.from_bytes(header[18:22], "little")
+        raw_uncompressed_size = int.from_bytes(header[22:26], "little")
+        descriptor_window_start = max(
+            data_offset,
+            boundary - (_ZIP_MAX_LOCAL_ENTRY_PADDING + 24),
+        )
+        try:
+            handle.seek(descriptor_window_start)
+            descriptor_window = handle.read(boundary - descriptor_window_start)
+        except OSError as exc:
+            raise _InvalidZipDirectory(f"ZIP data descriptor could not be read: {exc}") from exc
+        for size_width in (4, 8):
+            for signature_size in (0, len(_ZIP_DATA_DESCRIPTOR_SIGNATURE)):
+                descriptor_size = signature_size + 4 + (2 * size_width)
+                for descriptor_end in range(boundary, descriptor_window_start + descriptor_size - 1, -1):
+                    descriptor_offset = descriptor_end - descriptor_size
+                    relative_offset = descriptor_offset - descriptor_window_start
+                    descriptor = descriptor_window[relative_offset : relative_offset + descriptor_size]
+                    if len(descriptor) != descriptor_size:
+                        continue
+                    if signature_size and not descriptor.startswith(_ZIP_DATA_DESCRIPTOR_SIGNATURE):
+                        continue
+                    payload = descriptor[signature_size:]
+                    descriptor_crc32 = int.from_bytes(payload[:4], "little")
+                    descriptor_compressed_size = int.from_bytes(payload[4 : 4 + size_width], "little")
+                    descriptor_uncompressed_size = int.from_bytes(payload[4 + size_width :], "little")
+                    if data_offset + descriptor_compressed_size != descriptor_offset:
+                        continue
+                    if raw_compressed_size not in {0, _ZIP64_SENTINEL_OFFSET, descriptor_compressed_size}:
+                        continue
+                    if raw_uncompressed_size not in {0, _ZIP64_SENTINEL_OFFSET, descriptor_uncompressed_size}:
+                        continue
+                    if compressed_size not in {0, descriptor_compressed_size}:
+                        continue
+                    if uncompressed_size not in {0, descriptor_uncompressed_size}:
+                        continue
+                    if cls._local_entry_payload_matches_header(
+                        handle,
+                        data_offset=data_offset,
+                        compressed_size=descriptor_compressed_size,
+                        uncompressed_size=descriptor_uncompressed_size,
+                        compression_method=int.from_bytes(header[8:10], "little"),
+                        expected_crc32=descriptor_crc32,
+                        flags=flags,
+                    ):
+                        return True
+        return False
+
+    @staticmethod
+    def _candidate_has_directory_signature(
+        handle: BinaryIO,
+        *,
+        file_size: int,
+        tail_size: int,
+        tail: bytes,
+        eocd_index: int,
+    ) -> bool:
+        directory_size = int.from_bytes(tail[eocd_index + 12 : eocd_index + 16], "little")
+        if directory_size in {0, _ZIP64_SENTINEL_OFFSET}:
+            return False
+        eocd_offset = file_size - tail_size + eocd_index
+        directory_start = eocd_offset - directory_size
+        if directory_start < 0:
+            return False
+        try:
+            handle.seek(directory_start)
+            return handle.read(len(_ZIP_CENTRAL_DIRECTORY_SIGNATURE)) == _ZIP_CENTRAL_DIRECTORY_SIGNATURE
+        except OSError:
+            return False
+
+    @classmethod
+    def _preflight_zip_directory(
+        cls,
+        handle: BinaryIO,
+        max_entries: int,
+        max_directory_size: int,
+    ) -> tuple[int, bool] | None:
+        tail_data = cls._read_zip_tail(handle)
+        if tail_data is None:
+            return None
+        file_size, tail_size, tail, eocd_indices = tail_data
+        if not eocd_indices:
+            return None
+        if len(eocd_indices) >= _ZIP_MAX_EOCD_CANDIDATES:
+            raise _InvalidZipDirectory(
+                "too many plausible ZIP end-of-directory records",
+                routing_evidence=True,
+            )
+
+        last_error: _InvalidZipDirectory | None = None
+        size_limit_error: _ZipCentralDirectorySizeExceeded | None = None
+        candidate_errors: list[tuple[int, bool]] = []
+        valid_preflight: tuple[int, bool] | None = None
+        valid_eocd_index: int | None = None
+        for eocd_index in eocd_indices:
+            try:
+                metadata = cls._read_zip_directory_metadata_at(
+                    handle,
+                    file_size=file_size,
+                    tail_size=tail_size,
+                    tail=tail,
+                    eocd_index=eocd_index,
+                )
+                if metadata.directory_size > max_directory_size:
+                    raise _ZipCentralDirectorySizeExceeded(metadata.directory_size, max_directory_size)
+                candidate_preflight = cls._count_bounded_central_directory_entries(handle, metadata, max_entries)
+            except _ZipCentralDirectorySizeExceeded as exc:
+                size_limit_error = exc
+                candidate_errors.append((eocd_index, True))
+                continue
+            except _InvalidZipDirectory as exc:
+                candidate_errors.append(
+                    (
+                        eocd_index,
+                        exc.routing_evidence
+                        or cls._candidate_has_directory_signature(
+                            handle,
+                            file_size=file_size,
+                            tail_size=tail_size,
+                            tail=tail,
+                            eocd_index=eocd_index,
+                        ),
+                    )
+                )
+                if last_error is None or (exc.routing_evidence and not last_error.routing_evidence):
+                    last_error = exc
+                continue
+            if valid_preflight is not None:
+                raise _InvalidZipDirectory(
+                    "multiple valid ZIP end-of-directory records are ambiguous",
+                    routing_evidence=True,
+                )
+            valid_preflight = candidate_preflight
+            valid_eocd_index = eocd_index
+        if valid_preflight is not None:
+            assert valid_eocd_index is not None
+            valid_comment_length = int.from_bytes(tail[valid_eocd_index + 20 : valid_eocd_index + 22], "little")
+            valid_record_end = valid_eocd_index + _ZIP_EOCD_MIN_SIZE + valid_comment_length
+            if any(
+                strong_evidence
+                and not (
+                    valid_eocd_index < error_index
+                    and error_index
+                    + _ZIP_EOCD_MIN_SIZE
+                    + int.from_bytes(tail[error_index + 20 : error_index + 22], "little")
+                    <= valid_record_end
+                )
+                for error_index, strong_evidence in candidate_errors
+            ):
+                raise _InvalidZipDirectory(
+                    "multiple plausible ZIP end-of-directory records are ambiguous",
+                    routing_evidence=True,
+                )
+            return valid_preflight
+        if size_limit_error is not None:
+            raise size_limit_error
+        if last_error is not None:
+            raise last_error
+        return None
+
+    @classmethod
+    def requires_preflight_result(cls, path: str, max_entries: int, max_directory_size: int | None = None) -> bool:
+        """Return whether ZIP routing must defer to this scanner before materializing entries."""
+        directory_size_limit = max_directory_size or cls.DEFAULT_MAX_CENTRAL_DIRECTORY_SIZE
+        try:
+            with open(path, "rb") as handle:
+                preflight = cls._preflight_zip_directory(handle, max_entries, directory_size_limit)
+        except _InvalidZipDirectory as exc:
+            if exc.routing_evidence:
+                return True
+            try:
+                return cls._has_zip_routing_evidence(path)
+            except OSError:
+                return False
+        except OSError:
+            return False
+        return preflight is not None and preflight[1]
+
+    def _add_entry_count_limit_check(
+        self,
+        result: ScanResult,
+        path: str,
+        entry_count: int,
+        *,
+        passed: bool,
+        source: str,
+    ) -> None:
+        details: dict[str, Any] = {
+            "entries": entry_count,
+            "max_entries": self.max_entries,
+            "entry_count_source": source,
+        }
+        if not passed:
+            details["analysis_incomplete"] = True
+            details["scan_outcome_reason"] = "zip_analysis_incomplete"
+
+        result.add_check(
+            name="Entry Count Limit Check",
+            passed=passed,
+            message=(
+                f"Entry count ({entry_count}) is within limits"
+                if passed
+                else f"ZIP file contains too many entries ({entry_count} > {self.max_entries})"
+            ),
+            severity=None if passed else IssueSeverity.WARNING,
+            rule_code=None if passed else "S410",
+            location=path,
+            details=details,
+        )
+
+    def _preflight_rejection_result(
+        self,
+        path: str,
+        *,
+        entry_count: int | None = None,
+        error: _InvalidZipDirectory | None = None,
+    ) -> ScanResult:
+        result = self._create_result()
+        with contextlib.suppress(OSError):
+            result.metadata["file_size"] = os.path.getsize(path)
+        if entry_count is not None:
+            result.metadata["zip_entry_count_preflight"] = entry_count
+            self._add_entry_count_limit_check(
+                result,
+                path,
+                entry_count,
+                passed=False,
+                source="central_directory_preflight",
+            )
+        elif isinstance(error, _ZipCentralDirectorySizeExceeded):
+            self._add_central_directory_size_limit_check(result, path, error)
+        else:
+            assert error is not None
+            result.add_check(
+                name="ZIP Central Directory Preflight",
+                passed=False,
+                message=f"ZIP central-directory validation failed: {error}",
+                severity=IssueSeverity.INFO,
+                rule_code="S902",
+                location=path,
+                details={
+                    "exception": str(error),
+                    "exception_type": type(error).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "zip_analysis_incomplete",
+                },
+            )
+        mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
+        result.finish(success=False)
+        return result
+
+    @staticmethod
+    def _add_central_directory_size_limit_check(
+        result: ScanResult,
+        path: str,
+        exc: _ZipCentralDirectorySizeExceeded,
+    ) -> None:
+        result.add_check(
+            name="Central Directory Size Limit Check",
+            passed=False,
+            message=str(exc),
+            severity=IssueSeverity.WARNING,
+            rule_code="S410",
+            location=path,
+            details={
+                "central_directory_size": exc.directory_size,
+                "max_central_directory_size": exc.max_directory_size,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "zip_analysis_incomplete",
+            },
+        )
+
     def _read_symlink_target(self, archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> str:
         """Read a symlink target with a hard cap to avoid materializing large archive members."""
         target_bytes = bytearray()
@@ -188,14 +1273,18 @@ class ZipScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        # Verify it's actually a zip file. Header-routed scans may reach this
-        # scanner even when the outer filename uses a misleading suffix.
         try:
-            with zipfile.ZipFile(path, "r") as _:
-                pass
-            return True
-        except zipfile.BadZipFile:
-            return False
+            with open(path, "rb") as handle:
+                preflight = cls._preflight_zip_directory(
+                    handle,
+                    cls.DEFAULT_MAX_ENTRIES,
+                    cls.DEFAULT_MAX_CENTRAL_DIRECTORY_SIZE,
+                )
+            return preflight is not None or cls._has_zip_routing_evidence(path)
+        except _InvalidZipDirectory as exc:
+            if exc.routing_evidence:
+                return True
+            return cls._has_zip_routing_evidence(path)
         except OSError:
             return os.path.splitext(path)[1].lower() in cls.supported_extensions
         except Exception:
@@ -263,7 +1352,7 @@ class ZipScanner(BaseScanner):
         result.metadata["file_size"] = os.path.getsize(path)
         return result
 
-    def scan_archive_members(self, path: str) -> ScanResult:
+    def scan_archive_members(self, path: str, archive: zipfile.ZipFile | None = None) -> ScanResult:
         """Recursively scan entries of an already validated ZIP container."""
         # Shared archive depth must survive scanner handoffs, while nested ZIP
         # recursion still needs its own counter for extensionless ZIP members
@@ -271,6 +1360,7 @@ class ZipScanner(BaseScanner):
         return self._scan_zip_file(
             path,
             depth=max(self._get_archive_depth(), self._get_zip_depth()),
+            archive=archive,
         )
 
     def _rewrite_nested_result_context(
@@ -423,7 +1513,12 @@ class ZipScanner(BaseScanner):
 
         return True, True
 
-    def _scan_zip_file(self, path: str, depth: int = 0) -> ScanResult:
+    def _scan_zip_file(
+        self,
+        path: str,
+        depth: int = 0,
+        archive: zipfile.ZipFile | None = None,
+    ) -> ScanResult:
         """Recursively scan a ZIP file and its contents"""
         result = ScanResult(scanner_name=self.name)
         contents: list[dict[str, Any]] = []
@@ -459,39 +1554,116 @@ class ZipScanner(BaseScanner):
                 details={"depth": depth, "max_depth": self.max_depth},
             )
 
-        with zipfile.ZipFile(path, "r") as z:
-            max_total_uncompressed_size = self._get_max_total_uncompressed_size()
-            entries = z.infolist()
-
-            # Check number of entries
-            entry_count = len(entries)
-            if entry_count > self.max_entries:
+        with contextlib.ExitStack() as archive_stack:
+            opened_archive_handle: BinaryIO
+            if archive is None:
+                opened_archive_handle = archive_stack.enter_context(open(path, "rb"))
+            else:
+                archive_fp = archive.fp
+                if archive_fp is None:
+                    raise zipfile.BadZipFile("ZIP archive is already closed")
+                opened_archive_handle = cast(BinaryIO, archive_fp)
+            try:
+                archive_file_size = os.fstat(opened_archive_handle.fileno()).st_size
+            except (AttributeError, OSError):
+                archive_file_size = os.path.getsize(path)
+            try:
+                preflight = self._preflight_zip_directory(
+                    opened_archive_handle,
+                    self.max_entries,
+                    self.max_central_directory_size,
+                )
+                if preflight is not None:
+                    preflight_entry_count, exceeds_limit = preflight
+                    result.metadata["zip_entry_count_preflight"] = preflight_entry_count
+                else:
+                    preflight_entry_count = None
+            except _ZipCentralDirectorySizeExceeded as exc:
+                self._add_central_directory_size_limit_check(result, path, exc)
+                mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
+                result.finish(success=False)
+                return result
+            except _InvalidZipDirectory as exc:
                 result.add_check(
-                    name="Entry Count Limit Check",
+                    name="ZIP Central Directory Preflight",
                     passed=False,
-                    message=f"ZIP file contains too many entries ({entry_count} > {self.max_entries})",
-                    severity=IssueSeverity.WARNING,
-                    rule_code="S410",  # Archive bomb
+                    message=f"ZIP central-directory validation failed: {exc}",
+                    severity=IssueSeverity.INFO,
+                    rule_code="S902",
                     location=path,
                     details={
-                        "entries": entry_count,
-                        "max_entries": self.max_entries,
+                        "exception": str(exc),
+                        "exception_type": type(exc).__name__,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "zip_analysis_incomplete",
                     },
                 )
                 mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
                 result.finish(success=False)
                 return result
-            else:
+
+            if preflight_entry_count is not None and exceeds_limit:
+                self._add_entry_count_limit_check(
+                    result,
+                    path,
+                    preflight_entry_count,
+                    passed=False,
+                    source="central_directory_preflight",
+                )
+                mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
+                result.finish(success=False)
+                return result
+
+            opened_archive_handle.seek(0)
+            z = (
+                archive
+                if archive is not None
+                else archive_stack.enter_context(zipfile.ZipFile(opened_archive_handle, "r"))
+            )
+            max_total_uncompressed_size = self._get_max_total_uncompressed_size()
+            entries = z.infolist()
+
+            # Check number of entries
+            entry_count = len(entries)
+            if preflight_entry_count is not None and entry_count != preflight_entry_count:
                 result.add_check(
-                    name="Entry Count Limit Check",
-                    passed=True,
-                    message=f"Entry count ({entry_count}) is within limits",
+                    name="ZIP Central Directory Preflight",
+                    passed=False,
+                    message=(
+                        "ZIP central directory changed between preflight and parsing "
+                        f"({preflight_entry_count} != {entry_count})"
+                    ),
+                    severity=IssueSeverity.INFO,
+                    rule_code="S902",
                     location=path,
                     details={
-                        "entries": entry_count,
-                        "max_entries": self.max_entries,
+                        "preflight_entries": preflight_entry_count,
+                        "parsed_entries": entry_count,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "zip_analysis_incomplete",
                     },
-                    rule_code=None,  # Passing check
+                )
+                mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
+                result.finish(success=False)
+                return result
+            if entry_count > self.max_entries:
+                self._add_entry_count_limit_check(
+                    result,
+                    path,
+                    entry_count,
+                    passed=False,
+                    source="post_open_fallback",
+                )
+                mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
+                result.finish(success=False)
+                return result
+            else:
+                self._add_entry_count_limit_check(
+                    result,
+                    path,
+                    entry_count,
+                    passed=True,
+                    source=("post_open_fallback" if preflight_entry_count is None else "central_directory_preflight"),
                 )
 
             temp_base = os.path.join(tempfile.gettempdir(), "extract")
@@ -766,7 +1938,7 @@ class ZipScanner(BaseScanner):
                     )
 
         result.metadata["contents"] = contents
-        result.metadata["file_size"] = os.path.getsize(path)
+        result.metadata["file_size"] = archive_file_size
         if not scan_complete:
             mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
         result.finish(success=scan_complete and not member_scan_incomplete(result) and not result.has_errors)
@@ -875,7 +2047,7 @@ class ZipScanner(BaseScanner):
         metadata = super().extract_metadata(file_path)
 
         try:
-            with zipfile.ZipFile(file_path, "r") as zip_file:
+            with open_preflighted_zip(file_path, self.config) as zip_file:
                 file_list = zip_file.namelist()
 
                 # Basic ZIP info
@@ -957,3 +2129,59 @@ class ZipScanner(BaseScanner):
             metadata["extraction_error"] = str(e)
 
         return metadata
+
+
+@contextlib.contextmanager
+def open_preflighted_zip_handle(
+    path: str | os.PathLike[str],
+    config: dict[str, Any] | None = None,
+    *,
+    require_zip: bool = True,
+) -> Iterator[BinaryIO]:
+    """Open once, preflight that descriptor, and yield it without a pathname race."""
+    scanner = ZipScanner(config=config)
+    path_text = os.fspath(path)
+    with open(path, "rb") as handle:
+        if not require_zip:
+            try:
+                leading_signature = handle.read(4)
+                if leading_signature not in {
+                    _ZIP_LOCAL_FILE_HEADER_SIGNATURE,
+                    _ZIP_EOCD_SIGNATURE,
+                    _ZIP64_EOCD_SIGNATURE,
+                }:
+                    handle.seek(0)
+                    yield handle
+                    return
+            except OSError:
+                handle.seek(0)
+                yield handle
+                return
+            handle.seek(0)
+        try:
+            preflight = scanner._preflight_zip_directory(
+                handle,
+                scanner.max_entries,
+                scanner.max_central_directory_size,
+            )
+        except _InvalidZipDirectory as exc:
+            raise ZipPreflightRejected(scanner._preflight_rejection_result(path_text, error=exc)) from exc
+        if preflight is None:
+            if require_zip:
+                raise zipfile.BadZipFile("File is not a valid ZIP archive")
+        else:
+            entry_count, exceeds_limit = preflight
+            if exceeds_limit:
+                raise ZipPreflightRejected(scanner._preflight_rejection_result(path_text, entry_count=entry_count))
+        handle.seek(0)
+        yield handle
+
+
+@contextlib.contextmanager
+def open_preflighted_zip(
+    path: str | os.PathLike[str],
+    config: dict[str, Any] | None = None,
+) -> Iterator[zipfile.ZipFile]:
+    """Construct ``ZipFile`` only after preflighting the same open descriptor."""
+    with open_preflighted_zip_handle(path, config) as handle, zipfile.ZipFile(handle, "r") as archive:
+        yield archive

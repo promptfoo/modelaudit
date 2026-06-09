@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import types
+import zipfile
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -23,6 +24,7 @@ from modelaudit.cli import (
     _create_path_progress_callback,
     _display_error,
     _display_path,
+    _local_path_will_be_scanned,
     _resolve_scan_runtime_config,
     _ScanPathState,
     _summarize_progress_tree,
@@ -35,6 +37,24 @@ from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.cli_output import parse_click_json_output
 from tests.helpers import create_mock_pytorch_zip
+
+
+def test_local_txt_zip_prefilter_uses_bounded_zip_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "many.txt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("one.txt", "one")
+        archive.writestr("two.txt", "two")
+
+    def fail_zipfile_open(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("CLI prefilter must not materialize ZIP entries")
+
+    monkeypatch.setattr("modelaudit.scanners.zip_scanner.zipfile.ZipFile", fail_zipfile_open)
+
+    assert _local_path_will_be_scanned(str(archive_path), skip_non_model_files=True) is True
+
 
 _HF_TEST_REVISION = "a" * 40
 

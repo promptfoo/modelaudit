@@ -2082,6 +2082,43 @@ class TestKerasZipScanner:
             check.name == "Keras ZIP Format Check" and check.status == CheckStatus.FAILED for check in result.checks
         )
 
+    def test_recursive_member_scan_reuses_preflighted_archive_after_path_replacement(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            file_name="same_descriptor.keras",
+        )
+        with zipfile.ZipFile(keras_path, "a") as archive:
+            archive.writestr("safe.txt", "safe")
+
+        replacement_path = tmp_path / "replacement.keras"
+        with zipfile.ZipFile(replacement_path, "w") as archive:
+            archive.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo replacement"\ntR.')
+
+        original_scan_archive_members = keras_zip_scanner_module.ZipScanner.scan_archive_members
+
+        def replace_then_scan(
+            scanner: keras_zip_scanner_module.ZipScanner,
+            path: str,
+            archive: zipfile.ZipFile | None = None,
+        ) -> ScanResult:
+            assert archive is not None
+            replacement_path.replace(path)
+            return original_scan_archive_members(scanner, path, archive=archive)
+
+        monkeypatch.setattr(keras_zip_scanner_module.ZipScanner, "scan_archive_members", replace_then_scan)
+
+        result = KerasZipScanner().scan(str(keras_path))
+
+        assert not any(issue.details.get("zip_entry") == "payload.pkl" for issue in result.issues)
+        assert any(entry.get("path", "").endswith(":safe.txt") for entry in result.metadata["contents"])
+        assert not any(entry.get("path", "").endswith(":payload.pkl") for entry in result.metadata["contents"])
+
     def test_read_failure_returns_inconclusive_exit2(
         self,
         tmp_path: Path,

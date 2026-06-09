@@ -36,6 +36,7 @@ from modelaudit.scanner_selection import (
     ScannerSelectionPolicy,
     add_scanner_selection_skip_check,
     allows_protobuf_model_candidate_analysis,
+    allows_zip_structure_analysis,
     make_scanner_selection_skip_result,
     normalize_scanner_selection_config,
     policy_from_config,
@@ -689,21 +690,28 @@ def _resolve_discovered_shard_path(shard_path: str, results: ModelAuditResultMod
         return None
 
 
-def _select_non_hdf5_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
+def _select_non_hdf5_preferred_scanner_id(
+    path: str,
+    header_format: str,
+    ext: str,
+    config: dict[str, Any] | None = None,
+) -> str | None:
     """Select the trusted route that owns content before an HDF5 user block."""
     if header_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT:
         return "zip"
 
     if header_format == "zip":
-        if is_torchserve_mar_archive(path):
+        if config is not None and not allows_zip_structure_analysis(policy_from_config(config)):
+            return "joblib" if ext == ".joblib" else "zip"
+        if is_torchserve_mar_archive(path, config):
             return "torchserve_mar"
-        if is_keras_zip_archive(path, allow_config_only=ext == ".keras"):
+        if is_keras_zip_archive(path, allow_config_only=ext == ".keras", config=config):
             return "keras_zip"
-        if is_pytorch_zip_archive(path):
+        if is_pytorch_zip_archive(path, config):
             return "pytorch_zip"
-        if is_executorch_archive(path):
+        if is_executorch_archive(path, config):
             return "executorch"
-        if is_skops_archive(path):
+        if is_skops_archive(path, config):
             return "skops"
         if ext == ".skops":
             return "skops"
@@ -723,9 +731,14 @@ def _select_non_hdf5_preferred_scanner_id(path: str, header_format: str, ext: st
     return _registry.get_scanner_id_for_header_format(header_format)
 
 
-def _select_hdf5_userblock_supplemental_scanner_id(path: str, header_format: str, ext: str) -> str | None:
+def _select_hdf5_userblock_supplemental_scanner_id(
+    path: str,
+    header_format: str,
+    ext: str,
+    config: dict[str, Any] | None = None,
+) -> str | None:
     """Preserve the non-HDF5 scanner that owns a user-block prefix or path."""
-    scanner_id = _select_non_hdf5_preferred_scanner_id(path, header_format, ext)
+    scanner_id = _select_non_hdf5_preferred_scanner_id(path, header_format, ext, config)
     if scanner_id is not None:
         return scanner_id
 
@@ -733,11 +746,16 @@ def _select_hdf5_userblock_supplemental_scanner_id(path: str, header_format: str
     return path_scanner_id if path_scanner_id != "keras_h5" else None
 
 
-def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
+def _select_preferred_scanner_id(
+    path: str,
+    header_format: str,
+    ext: str,
+    config: dict[str, Any] | None = None,
+) -> str | None:
     """Select a scanner by trusted file structure, not just suffix."""
     if find_hdf5_signature_offset(path) is not None:
         return "keras_h5"
-    return _select_non_hdf5_preferred_scanner_id(path, header_format, ext)
+    return _select_non_hdf5_preferred_scanner_id(path, header_format, ext, config)
 
 
 def _merge_supplemental_scanner_analysis(
@@ -821,8 +839,20 @@ def _preferred_scanner_can_handle(
         )
         return True
 
+    if header_format == "zip" and scanner_id in {
+        "executorch",
+        "keras_zip",
+        "pytorch_zip",
+        "skops",
+        "torchserve_mar",
+    }:
+        return True
+
     if scanner_class.can_handle(path):
         return True
+
+    if scanner_id == "zip":
+        return False
 
     if os.path.exists(path) and _is_direct_header_route(scanner_id, header_format):
         logger.debug(
@@ -2921,6 +2951,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     config = normalize_scanner_selection_config(config)
     scanner_selection = policy_from_config(config)
     validate_scan_config(config)
+    from modelaudit.scanners.zip_scanner import ZipPreflightRejected, ZipScanner
 
     allowed_shard_paths = _allowed_shard_paths_from_config(config)
     allowed_shard_targets = _validated_shard_targets_from_config(config)
@@ -3039,6 +3070,18 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         sr.finish(success=False)
         return sr
 
+    try:
+        max_zip_entries = int(config.get("max_zip_entries", ZipScanner.DEFAULT_MAX_ENTRIES))
+    except (TypeError, ValueError):
+        max_zip_entries = ZipScanner.DEFAULT_MAX_ENTRIES
+    max_zip_directory_size = ZipScanner.central_directory_size_limit(config)
+    if allows_zip_structure_analysis(scanner_selection) and ZipScanner.requires_preflight_result(
+        path,
+        max_zip_entries,
+        max_zip_directory_size,
+    ):
+        return ZipScanner(config=config).scan(path)
+
     logger.debug(f"Processing: {path}")
 
     format_probe_error: OSError | None = None
@@ -3057,8 +3100,21 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         format_probe_error = e
     ext_format = detect_format_from_extension(path)
     ext = os.path.splitext(path)[1].lower()
+    pytorch_binary_supplemental_scanner_id = (
+        detect_pytorch_binary_supplemental_format(path) if ext == ".bin" and header_format == "pytorch_binary" else None
+    )
+    if (
+        format_probe_error is None
+        and header_format in {"unknown", "pytorch_binary"}
+        and pytorch_binary_supplemental_scanner_id is None
+        and scanner_selection.allows("zip")
+        and ZipScanner.can_handle(path)
+    ):
+        header_format = "zip"
     if format_probe_error is not None:
         magic_format = "unknown"
+    elif header_format == "zip":
+        magic_format = "zip"
     elif header_format in {"mxnet", MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT}:
         magic_format = header_format
     else:
@@ -3230,17 +3286,19 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     # Prefer scanners based on trusted structure rather than the filename alone.
     preferred_scanner: type[BaseScanner] | None = None
-    scanner_id = (
-        "keras_h5" if hdf5_signature_offset is not None else _select_preferred_scanner_id(path, header_format, ext)
-    )
-    hdf5_userblock_supplemental_scanner_id = (
-        _select_hdf5_userblock_supplemental_scanner_id(path, magic_format, ext)
-        if scanner_id == "keras_h5" and hdf5_signature_offset not in (None, 0)
-        else None
-    )
-    pytorch_binary_supplemental_scanner_id = (
-        detect_pytorch_binary_supplemental_format(path) if ext == ".bin" and header_format == "pytorch_binary" else None
-    )
+    try:
+        scanner_id = (
+            "keras_h5"
+            if hdf5_signature_offset is not None
+            else _select_preferred_scanner_id(path, header_format, ext, config)
+        )
+        hdf5_userblock_supplemental_scanner_id = (
+            _select_hdf5_userblock_supplemental_scanner_id(path, magic_format, ext, config)
+            if scanner_id == "keras_h5" and hdf5_signature_offset not in (None, 0)
+            else None
+        )
+    except ZipPreflightRejected as exc:
+        return exc.result
     skipped_preferred_scanner_id: str | None = None
     unavailable_preferred_scanner_id: str | None = None
     trusted_flax_overlap_scanner_id: str | None = None
@@ -3434,6 +3492,20 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     result = make_scanner_selection_skip_result(path, candidate_scanner_id, scanner_selection)
                     if result.bytes_scanned == 0 and file_size > 0:
                         result.bytes_scanned = file_size
+                    userblock_zip_allowed = hdf5_signature_offset not in (None, 0) and (
+                        scanner_selection.allows("zip")
+                        or scanner_selection.allows(hdf5_userblock_supplemental_scanner_id)
+                    )
+                    if userblock_zip_allowed:
+                        assert hdf5_signature_offset is not None
+                        result.scanner_name = "zip"
+                        merge_hdf5_userblock_zip_findings(
+                            path,
+                            result,
+                            config,
+                            hdf5_signature_offset,
+                            context="HDF5 user-block ZIP",
+                        )
                     return result
 
             if unavailable_preferred_scanner_id is not None:

@@ -10,6 +10,7 @@ from typing import Any, ClassVar
 
 from ..scanner_results import mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
+from .zip_scanner import ZipPreflightRejected
 
 _ANALYSIS_INCONCLUSIVE_REASON = "weight_distribution_analysis_incomplete"
 _FINAL_LAYER_NAME_PATTERNS = ("fc", "classifier", "head", "output", "final", "dense")
@@ -283,6 +284,8 @@ class WeightDistributionScanner(BaseScanner):
                 result.finish(success=False)
                 return result
 
+        except ZipPreflightRejected as exc:
+            return exc.result
         except Exception as e:
             self._mark_analysis_incomplete(
                 result,
@@ -503,59 +506,67 @@ class WeightDistributionScanner(BaseScanner):
         max_tensor_bytes = self._max_tensor_bytes()
 
         try:
-            if zipfile.is_zipfile(path):
-                with zipfile.ZipFile(path, "r") as archive:
-                    selected = self._select_pytorch_data_pickle(archive)
-                    if selected is None:
-                        return not self.extraction_incomplete
-                    root, data_pkl_info = selected
-                    prefix_parts = root.split("/") if root else []
-                    selected_members = [data_pkl_info]
-                    selected_names = {data_pkl_info.filename}
-                    for member_info in archive.infolist():
-                        parts = member_info.filename.strip("/").split("/")
-                        is_storage = (
-                            len(parts) == len(prefix_parts) + 2
-                            and parts[: len(prefix_parts)] == prefix_parts
-                            and parts[-2] == "data"
-                            and parts[-1].isdigit()
-                        )
-                        if member_info.is_dir() or not is_storage:
-                            continue
-                        if member_info.filename in selected_names:
+            from .zip_scanner import open_preflighted_zip_handle
+
+            with open_preflighted_zip_handle(path, self.config, require_zip=False) as archive_handle:
+                has_zip_signature = archive_handle.read(4).startswith(b"PK")
+                archive_handle.seek(0)
+                if has_zip_signature:
+                    with zipfile.ZipFile(archive_handle) as archive:
+                        selected = self._select_pytorch_data_pickle(archive)
+                        if selected is None:
+                            return not self.extraction_incomplete
+                        root, data_pkl_info = selected
+                        prefix_parts = root.split("/") if root else []
+                        selected_members = [data_pkl_info]
+                        selected_names = {data_pkl_info.filename}
+                        for member_info in archive.infolist():
+                            parts = member_info.filename.strip("/").split("/")
+                            is_storage = (
+                                len(parts) == len(prefix_parts) + 2
+                                and parts[: len(prefix_parts)] == prefix_parts
+                                and parts[-2] == "data"
+                                and parts[-1].isdigit()
+                            )
+                            if member_info.is_dir() or not is_storage:
+                                continue
+                            if member_info.filename in selected_names:
+                                self._record_extraction_incomplete(
+                                    "pytorch_archive_member_ambiguous",
+                                    failed_tensors=[member_info.filename],
+                                )
+                                return False
+                            selected_names.add(member_info.filename)
+                            selected_members.append(member_info)
+                            if max_tensor_bytes is not None and member_info.file_size > max_tensor_bytes:
+                                self._record_oversized_tensor(
+                                    "pytorch_tensor_storage_size_limit",
+                                    member_info.filename,
+                                    tensor_nbytes=member_info.file_size,
+                                )
+                                return False
+
+                        load_bytes = sum(member.file_size for member in selected_members)
+
+                        if max_total_bytes is not None and load_bytes > max_total_bytes:
                             self._record_extraction_incomplete(
-                                "pytorch_archive_member_ambiguous",
-                                failed_tensors=[member_info.filename],
-                            )
-                            return False
-                        selected_names.add(member_info.filename)
-                        selected_members.append(member_info)
-                        if max_tensor_bytes is not None and member_info.file_size > max_tensor_bytes:
-                            self._record_oversized_tensor(
-                                "pytorch_tensor_storage_size_limit",
-                                member_info.filename,
-                                tensor_nbytes=member_info.file_size,
+                                "pytorch_load_size_limit",
+                                failed_tensors=[path],
+                                oversized_tensors=1,
+                                tensor_nbytes=load_bytes,
+                                max_total_tensor_bytes=max_total_bytes,
                             )
                             return False
 
-                    load_bytes = sum(member.file_size for member in selected_members)
+                        data = self._read_zip_member_bounded(archive, data_pkl_info)
+                        if data is None or not self._pickle_object_budget_allows(data, data_pkl_info.filename):
+                            return False
+                    return True
 
-                    if max_total_bytes is not None and load_bytes > max_total_bytes:
-                        self._record_extraction_incomplete(
-                            "pytorch_load_size_limit",
-                            failed_tensors=[path],
-                            oversized_tensors=1,
-                            tensor_nbytes=load_bytes,
-                            max_total_tensor_bytes=max_total_bytes,
-                        )
-                        return False
-
-                    data = self._read_zip_member_bounded(archive, data_pkl_info)
-                    if data is None or not self._pickle_object_budget_allows(data, data_pkl_info.filename):
-                        return False
-                return True
-            else:
-                load_bytes = os.path.getsize(path)
+                try:
+                    load_bytes = os.fstat(archive_handle.fileno()).st_size
+                except (AttributeError, OSError):
+                    load_bytes = os.path.getsize(path)
         except (OSError, zipfile.BadZipFile):
             return True
 
@@ -914,7 +925,10 @@ class WeightDistributionScanner(BaseScanner):
                 return {}
 
             # Load model with map_location to CPU to avoid GPU requirements
-            model_data = torch.load(path, **load_kwargs)
+            from .zip_scanner import open_preflighted_zip_handle
+
+            with open_preflighted_zip_handle(path, self.config, require_zip=False) as model_handle:
+                model_data = torch.load(model_handle, **load_kwargs)
 
             # Handle different PyTorch save formats
             if isinstance(model_data, dict):
@@ -958,11 +972,15 @@ class WeightDistributionScanner(BaseScanner):
                         if array is not None:
                             weights_info[key_text] = array
 
+        except ZipPreflightRejected:
+            raise
         except Exception as e:
             logger.debug(f"Failed to extract weights from {path}: {e}")
             safe_fallback_processed = False
             try:
-                with zipfile.ZipFile(path, "r") as z:
+                from .zip_scanner import open_preflighted_zip
+
+                with open_preflighted_zip(path, self.config) as z:
                     selected = self._select_pytorch_data_pickle(z)
                     if selected is not None:
                         import io
@@ -1113,6 +1131,8 @@ class WeightDistributionScanner(BaseScanner):
                                 safe_fallback_processed = True
                     elif self.extraction_incomplete:
                         safe_fallback_processed = True
+            except ZipPreflightRejected:
+                raise
             except Exception as e2:  # pragma: no cover - defensive
                 logger.debug(f"Failed to extract weights from {path}: {e2}")
 

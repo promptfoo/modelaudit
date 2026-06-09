@@ -16,6 +16,7 @@ from ..helpers.cache_decorator import (
     add_optional_dependency_availability_to_version_context,
     should_bypass_cache_for_safetensors_header_limit,
     should_bypass_cache_for_unavailable_hdf5_analysis,
+    should_bypass_cache_for_zip_entry_preflight,
 )
 
 # Lazy import to avoid circular dependency
@@ -252,6 +253,9 @@ def scan_large_file(
 
     # If caching is disabled, proceed with direct scan
     if not cache_enabled:
+        return _scan_large_file_internal(file_path, scanner, progress_callback, timeout)
+    if should_bypass_cache_for_zip_entry_preflight(file_path, config):
+        logger.debug(f"Bypassing large-file cache for bounded ZIP entry preflight: {file_path}")
         return _scan_large_file_internal(file_path, scanner, progress_callback, timeout)
     if should_bypass_cache_for_unavailable_hdf5_analysis(file_path):
         logger.debug(f"Bypassing large-file cache because HDF5 analysis is unavailable: {file_path}")

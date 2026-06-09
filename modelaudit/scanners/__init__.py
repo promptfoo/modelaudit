@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from ..scanner_registry_metadata import get_scanner_registry_metadata
-from ..scanner_selection import ScannerSelectionPolicy, policy_from_config
+from ..scanner_selection import ScannerSelectionPolicy, allows_zip_structure_analysis, policy_from_config
 from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
@@ -395,7 +395,9 @@ class ScannerRegistry:
             and (scanner_selection is None or scanner_selection.allows(header_scanner_id))
         ):
             scanner_class = self._load_scanner(header_scanner_id)
-            if scanner_class and (scanner_class.can_handle(path) or os.path.exists(path)):
+            if scanner_class and (
+                scanner_class.can_handle(path) or (header_scanner_id != "zip" and os.path.exists(path))
+            ):
                 return scanner_class
 
         # Manifest-like config files sometimes intentionally use generic or
@@ -570,6 +572,20 @@ def __getattr__(name: str) -> Any:
 def get_scanner_for_file(path: str, config: dict[str, Any] | None = None) -> BaseScanner | None:
     """Get an instantiated scanner for a given file path"""
     scanner_selection = policy_from_config(config)
+    from .zip_scanner import ZipScanner
+
+    raw_config = config or {}
+    try:
+        max_entries = int(raw_config.get("max_zip_entries", ZipScanner.DEFAULT_MAX_ENTRIES))
+    except (TypeError, ValueError):
+        max_entries = ZipScanner.DEFAULT_MAX_ENTRIES
+    max_directory_size = ZipScanner.central_directory_size_limit(raw_config)
+    if allows_zip_structure_analysis(scanner_selection) and ZipScanner.requires_preflight_result(
+        path,
+        max_entries,
+        max_directory_size,
+    ):
+        return ZipScanner(config=config)
     scanner_class = _registry.get_scanner_for_path(
         path,
         scanner_selection=scanner_selection if scanner_selection.active else None,

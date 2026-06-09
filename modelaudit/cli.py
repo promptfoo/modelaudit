@@ -1621,6 +1621,10 @@ def _local_path_will_be_scanned(path: str, *, skip_non_model_files: bool) -> boo
         return True
 
     from modelaudit.scanners import SCANNER_REGISTRY
+    from modelaudit.scanners.zip_scanner import ZipScanner
+
+    if ZipScanner.can_handle(path):
+        return True
 
     return any(scanner_class().can_handle(path) for scanner_class in SCANNER_REGISTRY)
 

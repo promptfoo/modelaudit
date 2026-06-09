@@ -330,8 +330,10 @@ class TorchServeMarScanner(BaseScanner):
             details={"depth": current_depth, "max_depth": self.max_depth},
         )
 
+        from .zip_scanner import ZipPreflightRejected, open_preflighted_zip
+
         try:
-            with zipfile.ZipFile(path, "r") as archive:
+            with open_preflighted_zip(path, self.config) as archive:
                 member_infos = archive.infolist()
                 member_set = self._member_name_set(archive)
 
@@ -344,6 +346,8 @@ class TorchServeMarScanner(BaseScanner):
                     result=result,
                     current_depth=current_depth,
                 )
+        except ZipPreflightRejected as exc:
+            return exc.result
         except zipfile.BadZipFile:
             result.add_check(
                 name="TorchServe MAR Archive Validation",

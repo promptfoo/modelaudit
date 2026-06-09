@@ -12,6 +12,7 @@ import pytest
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
+from modelaudit.scanners import zip_scanner as zip_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.skops_scanner import SkopsScanner
 
@@ -1118,7 +1119,13 @@ class TestSkopsScannerEdgeCases:
         with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("schema.json", '{"version": "1.0"}')
 
-        def fail_member_scan(_self: SkopsScanner, _path: str, _result: ScanResult) -> None:
+        def fail_member_scan(
+            _self: SkopsScanner,
+            _path: str,
+            _result: ScanResult,
+            archive: zipfile.ZipFile | None = None,
+        ) -> None:
+            del archive
             raise RuntimeError("unexpected nested scan failure")
 
         monkeypatch.setattr(SkopsScanner, "_scan_archive_members", fail_member_scan)
@@ -1138,6 +1145,40 @@ class TestSkopsScannerEdgeCases:
             assert stats["total_entries"] == 0
         finally:
             reset_cache_manager()
+
+    def test_recursive_member_scan_reuses_preflighted_archive_after_path_replacement(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        skops_path = tmp_path / "same_descriptor.skops"
+        with zipfile.ZipFile(skops_path, "w") as archive:
+            archive.writestr("schema.json", '{"version": "1.0"}')
+            archive.writestr("safe.txt", "safe")
+
+        replacement_path = tmp_path / "replacement.skops"
+        with zipfile.ZipFile(replacement_path, "w") as archive:
+            archive.writestr("schema.json", '{"version": "1.0"}')
+            archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo replacement"\ntR.')
+
+        original_scan_archive_members = zip_scanner_module.ZipScanner.scan_archive_members
+
+        def replace_then_scan(
+            scanner: zip_scanner_module.ZipScanner,
+            path: str,
+            archive: zipfile.ZipFile | None = None,
+        ) -> ScanResult:
+            assert archive is not None
+            replacement_path.replace(path)
+            return original_scan_archive_members(scanner, path, archive=archive)
+
+        monkeypatch.setattr(zip_scanner_module.ZipScanner, "scan_archive_members", replace_then_scan)
+
+        result = SkopsScanner().scan(str(skops_path))
+
+        assert not any(issue.details.get("zip_entry") == "payload.pkl" for issue in result.issues)
+        assert any(entry.get("path", "").endswith(":safe.txt") for entry in result.metadata["contents"])
+        assert not any(entry.get("path", "").endswith(":payload.pkl") for entry in result.metadata["contents"])
 
     def test_oversized_numpy_payload_core_exits_zero_and_still_caches(self, tmp_path: Path) -> None:
         """Oversized numeric arrays should not become Skops CVE false positives in aggregate scans."""

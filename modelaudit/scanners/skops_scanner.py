@@ -474,7 +474,12 @@ class SkopsScanner(BaseScanner):
                 ),
             )
 
-    def _scan_archive_members(self, path: str, result: ScanResult) -> None:
+    def _scan_archive_members(
+        self,
+        path: str,
+        result: ScanResult,
+        archive: zipfile.ZipFile | None = None,
+    ) -> None:
         """Recursively scan embedded archive members through the generic ZIP pipeline."""
         if self.config.get(SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY):
             return
@@ -499,7 +504,7 @@ class SkopsScanner(BaseScanner):
             else []
         )
         zip_scanner = ZipScanner(config=nested_config)
-        result.merge(zip_scanner.scan_archive_members(path))
+        result.merge(zip_scanner.scan_archive_members(path, archive=archive))
         for reason in preserved_reasons:
             mark_archive_scan_incomplete(result, reason)
 
@@ -517,6 +522,8 @@ class SkopsScanner(BaseScanner):
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
+
+        from .zip_scanner import ZipPreflightRejected, open_preflighted_zip
 
         try:
             self.current_file_path = path
@@ -537,7 +544,7 @@ class SkopsScanner(BaseScanner):
                 return result
 
             # Open as ZIP archive
-            with zipfile.ZipFile(path, "r") as zip_file:
+            with open_preflighted_zip(path, self.config) as zip_file:
                 # Get file list
                 file_list = zip_file.namelist()
 
@@ -602,13 +609,15 @@ class SkopsScanner(BaseScanner):
                 self._check_unsafe_joblib_fallback(zip_file, result, path)
 
                 # Recursively scan embedded members with the broader scanner suite.
-                self._scan_archive_members(path, result)
+                self._scan_archive_members(path, result, archive=zip_file)
 
                 # Add file integrity check
                 self.add_file_integrity_check(path, result)
 
                 result.bytes_scanned += file_size
 
+        except ZipPreflightRejected as exc:
+            return exc.result
         except zipfile.BadZipFile:
             result.add_check(
                 name="Skops File Format Check",

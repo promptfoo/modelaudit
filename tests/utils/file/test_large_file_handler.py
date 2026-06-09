@@ -5,9 +5,10 @@ from __future__ import annotations
 import os
 import struct
 import sys
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -19,6 +20,7 @@ from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 from modelaudit.scanners.safetensors_scanner import MAX_HEADER_BYTES, SafeTensorsScanner
 from modelaudit.utils.file import handlers as advanced_handlers
 from modelaudit.utils.file import large_file_handler
+from modelaudit.utils.helpers.cache_decorator import should_bypass_cache_for_zip_entry_preflight
 from modelaudit.utils.helpers.secure_hasher import SecureFileHasher
 
 
@@ -195,6 +197,62 @@ def test_disabled_large_handler_cache_skips_hdf5_probe(
     result = scan_func(str(payload), scanner)
 
     assert result.success is True
+
+
+@pytest.mark.parametrize(
+    ("scan_func", "handler_module", "internal_name"),
+    [
+        (large_file_handler.scan_large_file, large_file_handler, "_scan_large_file_internal"),
+        (advanced_handlers.scan_advanced_large_file, advanced_handlers, "_scan_advanced_large_file_internal"),
+    ],
+)
+def test_large_handler_cache_bypasses_zip_entry_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scan_func: Callable[..., ScanResult],
+    handler_module: Any,
+    internal_name: str,
+) -> None:
+    payload = tmp_path / "over-entry.zip"
+    payload.write_bytes(b"bounded preflight fixture")
+    scanner = DummyNonChunkScanner()
+    scanner.config = {"cache_enabled": True, "cache_dir": str(tmp_path / "cache")}  # type: ignore[attr-defined]
+    internal_calls = 0
+    original_internal = getattr(handler_module, internal_name)
+
+    def record_internal(*args: Any, **kwargs: Any) -> ScanResult:
+        nonlocal internal_calls
+        internal_calls += 1
+        return cast(ScanResult, original_internal(*args, **kwargs))
+
+    monkeypatch.setattr(handler_module, "should_bypass_cache_for_zip_entry_preflight", lambda _path, _config: True)
+    monkeypatch.setattr(handler_module, internal_name, record_internal)
+
+    reset_cache_manager()
+    try:
+        result = scan_func(str(payload), scanner)
+
+        assert result.success is True
+        assert internal_calls == 1
+        assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_zip_entry_preflight_cache_bypass_honors_scanner_selection(tmp_path: Path) -> None:
+    payload = tmp_path / "selected-scanner.zip"
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("one.txt", "one")
+        archive.writestr("two.txt", "two")
+
+    assert not should_bypass_cache_for_zip_entry_preflight(
+        str(payload),
+        {"scanners": ["pickle"], "max_zip_entries": 1},
+    )
+    assert should_bypass_cache_for_zip_entry_preflight(
+        str(payload),
+        {"scanners": ["keras_zip"], "max_zip_entries": 1},
+    )
 
 
 def test_large_handler_missing_h5py_does_not_return_stale_clean_cache(

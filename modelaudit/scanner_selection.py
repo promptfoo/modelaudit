@@ -25,7 +25,16 @@ _GENERIC_CONTAINER_SCANNER_IDS = frozenset({"compressed", "rar", "sevenzip", "ta
 _PROTOBUF_MODEL_CANDIDATE_SCANNER_ID = "protobuf_model_candidate"
 _PROTOBUF_MODEL_CANDIDATE_ANALYZER_IDS = frozenset({"onnx", "coreml"})
 _ZIP_STRUCTURE_ROUTED_SCANNER_IDS = frozenset(
-    {"executorch", "keras_zip", "pytorch_zip", "skops", "torchserve_mar", "zip"}
+    {
+        "executorch",
+        "keras_zip",
+        "numpy",
+        "pytorch_zip",
+        "skops",
+        "torchserve_mar",
+        "weight_distribution",
+        "zip",
+    }
 )
 
 
@@ -180,6 +189,11 @@ def allows_protobuf_model_candidate_analysis(policy: ScannerSelectionPolicy) -> 
     return policy.allows(_PROTOBUF_MODEL_CANDIDATE_SCANNER_ID) or any(
         policy.allows(scanner_id) for scanner_id in _PROTOBUF_MODEL_CANDIDATE_ANALYZER_IDS
     )
+
+
+def allows_zip_structure_analysis(policy: ScannerSelectionPolicy) -> bool:
+    """Return whether any selected scanner relies on ZIP container structure."""
+    return any(policy.allows(scanner_id) for scanner_id in _ZIP_STRUCTURE_ROUTED_SCANNER_IDS)
 
 
 def allows_protobuf_model_candidate_analyzer(policy: ScannerSelectionPolicy, scanner_id: str) -> bool:

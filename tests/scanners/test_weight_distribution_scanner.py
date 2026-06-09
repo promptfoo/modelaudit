@@ -1018,6 +1018,23 @@ def test_pytorch_zip_alias_expansion_is_rejected_before_numpy(
     assert scanner.extraction_incomplete_reasons == ["pytorch_tensor_materialization_failed"]
 
 
+def test_pytorch_load_budget_ignores_incidental_eocd_in_legacy_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "legacy.pt"
+    path.write_bytes(b"legacy tensor payload" + b"PK\x05\x06" + (b"\x00" * 18))
+
+    def fail_zipfile_open(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("legacy non-ZIP files must not enter ZIP parsing")
+
+    monkeypatch.setattr(zipfile, "ZipFile", fail_zipfile_open)
+    scanner = WeightDistributionScanner()
+
+    assert scanner._pytorch_load_within_budget(str(path)) is True
+    assert scanner.extraction_incomplete is False
+
+
 def test_pytorch_zip_small_shared_sequence_is_not_treated_as_cycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
