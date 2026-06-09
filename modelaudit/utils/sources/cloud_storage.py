@@ -12,7 +12,7 @@ import zipfile
 from collections.abc import Callable, Collection, Coroutine, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 from urllib.parse import unquote, unquote_plus, urlparse, urlsplit, urlunsplit
 
@@ -117,6 +117,21 @@ _TFLITE_MAGIC_BYTES = b"TFL3"
 _MSGPACK_CONTAINER_MARKERS = frozenset((*range(0x80, 0x90), 0xDE, 0xDF))
 _MAX_CLOUD_METADATA_ERROR_SAMPLES = 3
 _MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS = 512
+_CLOUD_PROBE_SUFFIX_RE = re.compile(r"\.[0-9A-Za-z][0-9A-Za-z_-]{0,31}\Z")
+_CLOUD_LOCAL_PATH_ESCAPE_CHARS = frozenset('<>:"/\\|?*%#')
+_WINDOWS_RESERVED_LOCAL_PATH_NAMES = frozenset(
+    {"con", "conin$", "conout$", "prn", "aux", "nul"}
+    | {f"com{index}" for index in range(1, 10)}
+    | {f"lpt{index}" for index in range(1, 10)}
+    | {f"com{index}" for index in ("\u00b9", "\u00b2", "\u00b3")}
+    | {f"lpt{index}" for index in ("\u00b9", "\u00b2", "\u00b3")}
+)
+_CLOUD_LOCAL_IDENTITY_HASH_CHARS = 16
+_CLOUD_LOCAL_COMPONENT_MAX_BYTES = 240
+_CLOUD_LOCAL_GENERATED_IDENTITY_RE = re.compile(
+    rf"~[0-9a-f]{{{_CLOUD_LOCAL_IDENTITY_HASH_CHARS}}}(?:\.[0-9A-Za-z][0-9A-Za-z_-]{{0,31}})?\Z",
+    re.IGNORECASE,
+)
 _AWS_REGION_HOST_PART = r"[a-z][a-z0-9]*(?:-[a-z0-9]+)+-\d"
 _AWS_S3_DNS_SUFFIX = (
     r"(?:amazonaws\.com(?:\.cn)?|amazonaws\.eu|c2s\.ic\.gov|sc2s\.sgov\.gov|cloud\.adc-e\.uk|csp\.hci\.ic\.gov)"
@@ -541,6 +556,167 @@ def _cloud_url_basename(url: str) -> str:
     except Exception:
         path = url
     return Path(path).name
+
+
+def _cloud_probe_basename(url: str) -> str:
+    """Return a credential-free, cross-platform filename for content routing."""
+    try:
+        parts = urlsplit(url)
+        basename = parts.path.rsplit("/", 1)[-1]
+        if parts.scheme.casefold() in {"s3", "gs", "gcs", "r2"}:
+            basename = url.rstrip("/").rsplit("/", 1)[-1]
+        suffix = PurePosixPath(basename).suffix
+    except Exception:
+        suffix = ""
+    if not _CLOUD_PROBE_SUFFIX_RE.fullmatch(suffix):
+        suffix = ""
+    return f"cloud-object{suffix}"
+
+
+def _encode_cloud_local_character(character: str) -> str:
+    """Return a reversible ASCII encoding for one local-path character."""
+    return "".join(f"%{byte:02X}" for byte in character.encode("utf-8", errors="surrogatepass"))
+
+
+def _truncate_cloud_local_component(text: str, max_bytes: int) -> str:
+    """Truncate a path component without splitting a UTF-8 code point."""
+    if len(text.encode("utf-8", errors="surrogatepass")) <= max_bytes:
+        return text
+    parts: list[str] = []
+    used_bytes = 0
+    for character in text:
+        character_size = len(character.encode("utf-8", errors="surrogatepass"))
+        if used_bytes + character_size > max_bytes:
+            break
+        parts.append(character)
+        used_bytes += character_size
+    return "".join(parts)
+
+
+def _cloud_local_component_identity(component: str) -> str:
+    """Return the bounded identity used for collision-resistant local paths."""
+    return hashlib.sha256(component.encode("utf-8", errors="surrogatepass")).hexdigest()[
+        :_CLOUD_LOCAL_IDENTITY_HASH_CHARS
+    ]
+
+
+def _cloud_local_reserved_stem(component: str) -> str:
+    """Return the Windows device-name stem after filesystem normalization."""
+    return component.split(".", 1)[0].rstrip(" .").casefold()
+
+
+def _cloud_local_component_is_literal_safe(component: str) -> bool:
+    """Return whether a component can be preserved literally on Windows."""
+    if not component or component != component.rstrip(" ."):
+        return False
+    if any(
+        character in _CLOUD_LOCAL_PATH_ESCAPE_CHARS or ord(character) < 0x20 or 0xD800 <= ord(character) <= 0xDFFF
+        for character in component
+    ):
+        return False
+    return (
+        _cloud_local_reserved_stem(component) not in _WINDOWS_RESERVED_LOCAL_PATH_NAMES
+        and len(component.encode("utf-8", errors="surrogatepass")) <= _CLOUD_LOCAL_COMPONENT_MAX_BYTES
+    )
+
+
+def _cloud_local_path_component(component: str) -> str:
+    """Map one cloud key component to a collision-resistant Windows-safe name."""
+    if not component:
+        return f"~{_cloud_local_component_identity(component)}"
+
+    trailing_start = len(component.rstrip(" ."))
+    encoded_parts: list[str] = []
+    changed = False
+    for index, character in enumerate(component):
+        if (
+            character in _CLOUD_LOCAL_PATH_ESCAPE_CHARS
+            or ord(character) < 0x20
+            or 0xD800 <= ord(character) <= 0xDFFF
+            or index >= trailing_start
+        ):
+            encoded_parts.append(_encode_cloud_local_character(character))
+            changed = True
+        else:
+            encoded_parts.append(character)
+
+    encoded = "".join(encoded_parts)
+    reserved_stem = _cloud_local_reserved_stem(component)
+    if reserved_stem in _WINDOWS_RESERVED_LOCAL_PATH_NAMES:
+        encoded = f"{_encode_cloud_local_character(component[0])}{encoded[1:]}"
+        changed = True
+
+    encoded_size = len(encoded.encode("utf-8", errors="surrogatepass"))
+    needs_case_identity = not component.isascii() or component != component.casefold()
+    uses_generated_identity = _CLOUD_LOCAL_GENERATED_IDENTITY_RE.search(component) is not None
+    if (
+        not changed
+        and not needs_case_identity
+        and not uses_generated_identity
+        and encoded_size <= _CLOUD_LOCAL_COMPONENT_MAX_BYTES
+    ):
+        return component
+
+    # The digest keeps transformed and case-only variants distinct on case-insensitive filesystems.
+    identity = _cloud_local_component_identity(component)
+    suffix = Path(encoded).suffix
+    if not _CLOUD_PROBE_SUFFIX_RE.fullmatch(suffix):
+        suffix = ""
+    stem = encoded[: -len(suffix)] if suffix else encoded
+    identity_suffix = f"~{identity}{suffix}"
+    stem_budget = _CLOUD_LOCAL_COMPONENT_MAX_BYTES - len(identity_suffix.encode("ascii"))
+    bounded_stem = _truncate_cloud_local_component(stem, stem_budget)
+    return f"{bounded_stem}{identity_suffix}"
+
+
+def _cloud_local_leaf_components(component: str) -> tuple[str, ...]:
+    """Preserve scanner-significant basenames while isolating case collisions."""
+    transformed = _cloud_local_path_component(component)
+    if transformed == component or not _cloud_local_component_is_literal_safe(component):
+        return (transformed,)
+    return (f"~{_cloud_local_component_identity(component)}", component)
+
+
+def _cloud_local_directory_component(component: str) -> str:
+    """Map a cloud key directory without colliding with a leaf object."""
+    transformed = _cloud_local_path_component(component)
+    identity_suffix = f"~{_cloud_local_component_identity(component)}"
+    stem_budget = _CLOUD_LOCAL_COMPONENT_MAX_BYTES - len(identity_suffix)
+    return f"{_truncate_cloud_local_component(transformed, stem_budget)}{identity_suffix}"
+
+
+def _cloud_object_relative_path(base_url: str, file_url: str) -> str:
+    """Return a listed object's path relative to the requested cloud target."""
+    normalized_base = _cloud_url_without_query(base_url)
+    normalized_file_url = _cloud_url_without_query(file_url)
+
+    if normalized_file_url.startswith(f"{normalized_base}/"):
+        relative_path = normalized_file_url[len(normalized_base) + 1 :]
+    elif normalized_file_url == normalized_base:
+        relative_path = _cloud_url_basename(file_url)
+    else:
+        file_parts = urlsplit(normalized_file_url)
+        if file_parts.scheme or file_parts.netloc:
+            raise ValueError(f"Cloud object path is outside requested target: {redact_url_for_display(file_url)}")
+        # Provider-relative listing variants should already be normalized; keep a bounded fallback.
+        relative_path = _cloud_url_basename(file_url)
+
+    if not relative_path:
+        raise ValueError(f"Invalid cloud object path: {file_url}")
+    return relative_path
+
+
+def _cloud_object_prefix_conflicts(base_url: str, file_urls: Collection[str]) -> frozenset[str]:
+    """Return object keys that are also directory prefixes of selected objects."""
+    relative_paths = {_cloud_object_relative_path(base_url, file_url) for file_url in file_urls}
+    conflicts: set[str] = set()
+    for relative_path in relative_paths:
+        components = relative_path.split("/")
+        for component_count in range(1, len(components)):
+            prefix = "/".join(components[:component_count])
+            if prefix in relative_paths:
+                conflicts.add(prefix)
+    return frozenset(conflicts)
 
 
 def _remove_path(path: Path) -> None:
@@ -1715,7 +1891,7 @@ def _detect_cloud_shared_skip_filter_route(
         tail_offset = size - tail_size
         tail = _read_cloud_content_range(fs, file_url, tail_offset, tail_size, sniff_budget)
 
-    basename = _cloud_url_basename(file_url) or "cloud-object"
+    basename = _cloud_probe_basename(file_url)
     with tempfile.TemporaryDirectory(prefix="modelaudit_cloud_probe_") as temp_dir:
         probe_path = Path(temp_dir) / Path(basename).name
         with probe_path.open("wb") as handle:
@@ -2045,25 +2221,31 @@ def _filter_scannable_cloud_files(
     return list(scannable_by_path.values())
 
 
-def _build_safe_local_path(base_url: str, file_url: str, download_path: Path) -> Path:
-    """Build a local path for a cloud object and reject traversal attempts."""
-    normalized_base = _cloud_url_without_query(base_url)
-    normalized_file_url = _cloud_url_without_query(file_url)
+def _build_safe_local_path(
+    base_url: str,
+    file_url: str,
+    download_path: Path,
+    *,
+    object_prefix_conflicts: Collection[str] = (),
+) -> Path:
+    """Build a collision-resistant local path for a cloud object."""
+    relative_path = _cloud_object_relative_path(base_url, file_url)
 
-    if normalized_file_url.startswith(f"{normalized_base}/"):
-        relative_path = normalized_file_url[len(normalized_base) + 1 :]
-    elif normalized_file_url == normalized_base:
-        relative_path = _cloud_url_basename(file_url)
-    else:
-        # Fallback to basename for unexpected path shapes.
-        relative_path = _cloud_url_basename(file_url)
-
-    if not relative_path:
-        raise ValueError(f"Invalid cloud object path: {file_url}")
-
-    resolved_path, is_safe = _resolve_cloud_path(relative_path, download_path)
+    remote_components = relative_path.split("/")
+    local_components: list[str] = []
+    remote_prefix_components: list[str] = []
+    for component in remote_components[:-1]:
+        remote_prefix_components.append(component)
+        remote_prefix = "/".join(remote_prefix_components)
+        if remote_prefix in object_prefix_conflicts:
+            local_components.append(_cloud_local_directory_component(component))
+        else:
+            local_components.append(_cloud_local_path_component(component))
+    local_components.extend(_cloud_local_leaf_components(remote_components[-1]))
+    local_relative_path = "/".join(local_components)
+    resolved_path, is_safe = _resolve_cloud_path(local_relative_path, download_path)
     if not is_safe:
-        raise ValueError(f"Path traversal attempt detected in cloud object path: {file_url}")
+        raise ValueError(f"Encoded cloud object path escaped download directory: {file_url}")
 
     local_path = Path(resolved_path)
     if not _is_within_directory(download_path, local_path):
@@ -2397,10 +2579,13 @@ def download_from_cloud(
 
         # Download based on type
         if metadata["type"] == "directory":
+            assert files is not None
+            object_prefix_conflicts = _cloud_object_prefix_conflicts(
+                fs_url,
+                [str(file_info["path"]) for file_info in files],
+            )
             if cache:
                 _clear_directory_contents(download_path)
-
-            assert files is not None
 
             # Download files
             download_budget = _CloudDownloadBudget(max_size) if max_size else None
@@ -2408,7 +2593,12 @@ def download_from_cloud(
                 download_budget.consume(acquired_probe_bytes)
             for file_info in files:
                 file_url = file_info["path"]
-                local_path = _build_safe_local_path(fs_url, file_url, download_path)
+                local_path = _build_safe_local_path(
+                    fs_url,
+                    file_url,
+                    download_path,
+                    object_prefix_conflicts=object_prefix_conflicts,
+                )
                 local_path.parent.mkdir(parents=True, exist_ok=True)
 
                 if show_progress:
@@ -2426,8 +2616,10 @@ def download_from_cloud(
                 download_file()
         else:
             # Single file download
-            file_name = _cloud_url_basename(url)
-            local_file = download_path / file_name
+            remote_file_name = _cloud_url_basename(fs_url)
+            local_file = download_path.joinpath(*_cloud_local_leaf_components(remote_file_name))
+            file_name = local_file.name
+            local_file.parent.mkdir(parents=True, exist_ok=True)
             download_budget = _CloudDownloadBudget(max_size) if max_size else None
             if cache:
                 _remove_path(local_file)
@@ -2563,6 +2755,11 @@ def download_from_cloud_streaming(
             acquired_bytes=acquired_probe_bytes,
         )
 
+    object_prefix_conflicts = _cloud_object_prefix_conflicts(
+        fs_url,
+        [str(file_info["path"]) for file_info in files],
+    )
+
     # Create temp directory for downloads
     temp_dir = Path(tempfile.mkdtemp(prefix="modelaudit_stream_"))
 
@@ -2578,7 +2775,12 @@ def download_from_cloud_streaming(
             is_last = i == total_files - 1
 
             # Build a safe local path relative to the requested cloud base path.
-            local_path = _build_safe_local_path(fs_url, file_url, temp_dir)
+            local_path = _build_safe_local_path(
+                fs_url,
+                file_url,
+                temp_dir,
+                object_prefix_conflicts=object_prefix_conflicts,
+            )
             local_path.parent.mkdir(parents=True, exist_ok=True)
 
             if show_progress:
