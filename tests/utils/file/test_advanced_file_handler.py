@@ -19,6 +19,7 @@ from modelaudit.utils.file.handlers import (
     ParallelShardHandler,
     ShardedModelDetector,
     ValidatedShardTargets,
+    _build_advanced_shard_family_cache_fingerprint,
     scan_advanced_large_file,
     should_use_advanced_handler,
 )
@@ -1388,6 +1389,129 @@ class TestAdvancedFileHandler:
 
         assert restricted.bytes_scanned == shard_one.stat().st_size
         assert expanded.bytes_scanned == shard_one.stat().st_size + shard_two.stat().st_size
+
+    def test_cached_advanced_scan_keys_direct_shard_family_content(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Direct representative-shard cache entries must track sibling shard bytes."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        shard_one.write_bytes(b"one")
+        shard_two.write_bytes(b"two")
+        cache_dir = tmp_path / "cache"
+        scanned_payloads: list[bytes] = []
+
+        class RecordingShardScanner:
+            name = "recording_shard_scanner"
+
+            def __init__(self, config: dict[str, Any] | None = None) -> None:
+                self.config = config or {}
+
+            def scan(self, shard_path: str) -> ScanResult:
+                scanned_payloads.append(Path(shard_path).read_bytes())
+                result = ScanResult(scanner_name=self.name)
+                result.bytes_scanned = Path(shard_path).stat().st_size
+                result.finish(success=True)
+                return result
+
+        def stable_detect_shards(
+            cls: type[ShardedModelDetector],
+            file_path: str,
+            *,
+            allowed_paths: list[str] | None = None,
+            allowed_targets: ValidatedShardTargets | None = None,
+        ) -> dict[str, Any]:
+            del cls, file_path, allowed_paths, allowed_targets
+            return {
+                "pattern": r"checkpoint_(\d+)\.pt",
+                "current_file": str(shard_one),
+                "shards": [str(shard_one), str(shard_two)],
+                "total_shards": 2,
+                "total_size": shard_one.stat().st_size + shard_two.stat().st_size,
+            }
+
+        monkeypatch.setattr(ShardedModelDetector, "detect_shards", classmethod(stable_detect_shards))
+        scanner = RecordingShardScanner({"cache_enabled": True, "cache_dir": str(cache_dir)})
+
+        reset_cache_manager()
+        try:
+            first = scan_advanced_large_file(str(shard_one), scanner)
+            cached = scan_advanced_large_file(str(shard_one), scanner)
+            shard_two.write_bytes(b"bad")
+            second = scan_advanced_large_file(str(shard_one), scanner)
+        finally:
+            reset_cache_manager()
+
+        assert first.success is True
+        assert cached.success is True
+        assert second.success is True
+        assert scanned_payloads == [b"one", b"two", b"one", b"bad"]
+
+    def test_sampled_shard_family_fingerprint_is_not_cacheable(self, tmp_path: Path) -> None:
+        """Sampled sibling shard hashes are not strong enough for reusable direct-scan cache identity."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        shard_one.write_bytes(b"one")
+        shard_two.write_bytes(b"two")
+
+        class SampledShardHasher:
+            def hash_file(self, path: str) -> str:
+                return "fingerprint:sampled" if Path(path) == shard_two else "secure:full"
+
+        fingerprint, cacheable = _build_advanced_shard_family_cache_fingerprint(
+            {
+                "pattern": r"checkpoint_(\d+)\.pt",
+                "shards": [str(shard_one), str(shard_two)],
+                "total_shards": 2,
+                "total_size": shard_one.stat().st_size + shard_two.stat().st_size,
+            },
+            SampledShardHasher(),
+        )
+
+        assert fingerprint is None
+        assert cacheable is False
+
+    @pytest.mark.parametrize(
+        "shards",
+        [[], ["valid", 7], ["valid", ""]],
+    )
+    def test_incomplete_shard_family_fingerprint_is_not_cacheable(
+        self,
+        tmp_path: Path,
+        shards: list[object],
+    ) -> None:
+        """Malformed membership must not produce a cache key for only part of a family."""
+        shard = tmp_path / "valid"
+        shard.write_bytes(b"content")
+        resolved_shards = [str(shard) if value == "valid" else value for value in shards]
+
+        fingerprint, cacheable = _build_advanced_shard_family_cache_fingerprint(
+            {"pattern": r"checkpoint_(\d+)\.pt", "shards": resolved_shards},
+            object(),
+        )
+
+        assert fingerprint is None
+        assert cacheable is False
+
+    def test_non_secure_shard_family_hash_is_not_cacheable(self, tmp_path: Path) -> None:
+        """Only full cryptographic hashes can bind reusable shard-family entries."""
+        shard = tmp_path / "checkpoint_1.pt"
+        shard.write_bytes(b"content")
+
+        class UnexpectedShardHasher:
+            def hash_file(self, path: str) -> object:
+                assert Path(path) == shard
+                return None
+
+        fingerprint, cacheable = _build_advanced_shard_family_cache_fingerprint(
+            {"pattern": r"checkpoint_(\d+)\.pt", "shards": [str(shard)]},
+            UnexpectedShardHasher(),
+        )
+
+        assert fingerprint is None
+        assert cacheable is False
 
     def test_sharded_scan_bypasses_cache_without_reliable_sibling_identity(
         self,

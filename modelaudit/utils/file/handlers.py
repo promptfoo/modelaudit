@@ -70,6 +70,48 @@ def _is_resolved_path_within_directory(base_dir: Path, resolved_target: str) -> 
     return target_path.is_relative_to(base_path)
 
 
+def _build_advanced_shard_family_cache_fingerprint(
+    shard_info: dict[str, Any] | None,
+    hasher: Any,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Return a content-bound shard-family fingerprint, or mark cache unsafe."""
+    if not shard_info:
+        return None, False
+
+    raw_shards = shard_info.get("shards")
+    if (
+        not isinstance(raw_shards, list)
+        or not raw_shards
+        or any(type(shard_path) is not str or not shard_path for shard_path in raw_shards)
+    ):
+        return None, False
+
+    members: list[dict[str, str]] = []
+    resolved_members: set[str] = set()
+    for shard_path in sorted(raw_shards):
+        try:
+            resolved_path = str(Path(shard_path).resolve(strict=True))
+            content_hash = hasher.hash_file(resolved_path)
+        except Exception:
+            return None, False
+        normalized_resolved_path = os.path.normcase(os.path.normpath(resolved_path))
+        if normalized_resolved_path in resolved_members:
+            return None, False
+        resolved_members.add(normalized_resolved_path)
+        if type(content_hash) is not str or not content_hash.startswith("secure:"):
+            return None, False
+        members.append({"path": resolved_path, "content_hash": content_hash})
+
+    return (
+        {
+            "pattern": shard_info.get("pattern"),
+            "expected_total_shards": shard_info.get("expected_total_shards"),
+            "members": members,
+        },
+        True,
+    )
+
+
 def _mark_inconclusive_scan_outcome(result: "ScanResult", reason: str) -> None:
     """Mark a scan result as incomplete while preserving existing reasons."""
     from ...scanner_results import INCONCLUSIVE_SCAN_OUTCOME
@@ -1507,6 +1549,22 @@ def scan_advanced_large_file(
             # A representative file key alone cannot describe sibling shard
             # membership, target identity, or incomplete-family state.
             version_config["advanced_shard_family"] = shard_info
+            shard_family_fingerprint, shard_family_cacheable = _build_advanced_shard_family_cache_fingerprint(
+                shard_info,
+                cache_manager.cache.hasher if cache_manager.cache is not None else None,
+            )
+            if not shard_family_cacheable:
+                logger.debug("Bypassing advanced-file cache for uncacheable shard family identity: %s", file_path)
+                return _scan_advanced_large_file_internal(
+                    file_path,
+                    scanner,
+                    progress_callback,
+                    timeout,
+                    allowed_shard_paths=allowed_shard_paths,
+                    allowed_shard_targets=allowed_shard_targets,
+                )
+            if shard_family_fingerprint is not None:
+                version_config["advanced_shard_family_cache_fingerprint"] = shard_family_fingerprint
         if allowed_shard_paths is not None:
             # The allowlist changes shard expansion, so direct advanced scans need distinct cache keys.
             version_config["advanced_allowed_shard_paths"] = sorted(
