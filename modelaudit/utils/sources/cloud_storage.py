@@ -1384,6 +1384,19 @@ class _CloudContentSniffBudget:
         self._complete_prefixes: set[str] = set()
         self.incomplete_stream_reads = 0
 
+    def _read_bounded(self, remote_file: Any, max_bytes: int) -> bytes:
+        """Charge each transferred chunk before a later transport read can fail."""
+        payload = bytearray()
+        while len(payload) < max_bytes:
+            chunk = remote_file.read(max_bytes - len(payload))
+            if not isinstance(chunk, bytes):
+                raise TypeError("cloud filesystem returned non-bytes content")
+            if not chunk:
+                break
+            payload.extend(chunk)
+            self.remaining_bytes -= len(chunk)
+        return bytes(payload)
+
     def read_prefix(self, fs: Any, file_url: str, max_bytes: int) -> bytes:
         """Return a cached prefix, extending it without rereading transferred bytes."""
         prefix = self._prefixes.get(file_url, b"")
@@ -1397,9 +1410,8 @@ class _CloudContentSniffBudget:
         with fs.open(file_url, "rb") as remote_file:
             if prefix:
                 remote_file.seek(len(prefix))
-            chunk = _read_bounded_cloud_content(remote_file, read_size)
+            chunk = self._read_bounded(remote_file, read_size)
 
-        self.remaining_bytes -= len(chunk)
         prefix += chunk
         self._prefixes[file_url] = prefix
         if len(chunk) < read_size:
@@ -1420,9 +1432,8 @@ class _CloudContentSniffBudget:
 
         with fs.open(file_url, "rb") as remote_file:
             remote_file.seek(range_offset)
-            chunk = _read_bounded_cloud_content(remote_file, read_size)
+            chunk = self._read_bounded(remote_file, read_size)
 
-        self.remaining_bytes -= len(chunk)
         return cached + chunk
 
     def read_stream(self, remote_file: Any, requested_bytes: int | None = -1) -> bytes:
@@ -1888,12 +1899,21 @@ def _detect_cloud_content_route_format(
             and proven_size - len(cached_prefix) <= sniff_budget.remaining_bytes
         ):
             try:
-                complete_probe = _read_cloud_content_prefix(fs, file_url, proven_size, sniff_budget)
-            except ValueError:
-                if detected_format != "pickle":
-                    raise
-            else:
-                if len(complete_probe) == proven_size:
+                reported_size = _parse_size_value(file_info.get("size"))
+            except (TypeError, ValueError):
+                reported_size = None
+            size_proof_is_contradicted = reported_size is not None and reported_size > proven_size
+            if not size_proof_is_contradicted:
+                remaining_probe_bytes = proven_size - len(cached_prefix)
+                complete_probe_limit = proven_size + int(remaining_probe_bytes < sniff_budget.remaining_bytes)
+                try:
+                    complete_probe = _read_cloud_content_prefix(fs, file_url, complete_probe_limit, sniff_budget)
+                except ValueError:
+                    if detected_format != "pickle":
+                        raise
+                else:
+                    if len(complete_probe) != proven_size:
+                        return detected_format
                     prefix = complete_probe
                     size = proven_size
                     size_is_known = True

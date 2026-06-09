@@ -30,6 +30,7 @@ from modelaudit.utils.sources.cloud_storage import (
     _CLOUD_CONTENT_SNIFF_BYTES,
     GCSCache,
     _build_safe_local_path,
+    _CloudContentSniffBudget,
     _filter_scannable_cloud_files,
     _run_coroutine_sync,
     analyze_cloud_target,
@@ -88,6 +89,31 @@ class _NoTailSeekCountingBytesIO(_CountingBytesIO):
         return super().seek(offset, whence)
 
 
+class _UnderreportedEndCountingBytesIO(_CountingBytesIO):
+    def __init__(self, payload: bytes, byte_counter: list[int], reported_size: int):
+        super().__init__(payload, byte_counter)
+        self._reported_size = reported_size
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        if whence == os.SEEK_END:
+            return super().seek(self._reported_size + offset, os.SEEK_SET)
+        return super().seek(offset, whence)
+
+
+class _PartialReadThenErrorCountingBytesIO(_CountingBytesIO):
+    def __init__(self, payload: bytes, byte_counter: list[int], partial_bytes: int):
+        super().__init__(payload, byte_counter)
+        self._partial_bytes = partial_bytes
+        self._returned_partial = False
+
+    def read(self, size: int | None = -1) -> bytes:
+        if self._returned_partial:
+            raise OSError("connection reset after partial read")
+        self._returned_partial = True
+        requested_size = self._partial_bytes if size is None or size < 0 else min(size, self._partial_bytes)
+        return super().read(requested_size)
+
+
 def make_tar_payload() -> bytes:
     payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
     output = io.BytesIO()
@@ -116,6 +142,16 @@ def make_incomplete_pickle_probe_payload(*, malicious: bool) -> bytes:
     operand = b"a" * _CLOUD_CONTENT_SNIFF_BYTES
     prefix = b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94" if malicious else b"\x88\x89"
     return prefix + b"\x8d" + struct.pack("<Q", len(operand)) + operand + (b"0." if malicious else b".")
+
+
+def make_delayed_pickle_security_payload() -> bytes:
+    operand = b"a" * _CLOUD_CONTENT_SNIFF_BYTES
+    return (
+        b"\x88\x89\x8d"
+        + struct.pack("<Q", len(operand))
+        + operand
+        + b"0\x8c\x02os\x94\x8c\x06system\x94\x93\x94\x8c\x02id\x94\x85\x94R\x94."
+    )
 
 
 def make_coreml_payload(tmp_path: Path) -> bytes:
@@ -1490,6 +1526,85 @@ def test_filter_scannable_cloud_files_routes_large_protocolless_pickle_at_exact_
         {**files[0], "content_detected_format": "pickle"}
     ]
     assert transferred == [len(payload)]
+
+
+def test_filter_scannable_cloud_files_rejects_underreported_end_for_delayed_pickle_payload() -> None:
+    url = "s3://bucket/models/evil.payload"
+    payload = make_delayed_pickle_security_payload()
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _UnderreportedEndCountingBytesIO(
+        payload,
+        transferred,
+        _CLOUD_CONTENT_SNIFF_BYTES,
+    )
+    files = [{"path": url, "name": "evil.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=_CLOUD_CONTENT_SNIFF_BYTES) == [
+        {**files[0], "content_detected_format": PICKLE_ROUTING_INCONCLUSIVE_FORMAT}
+    ]
+
+    assert transferred == [_CLOUD_CONTENT_SNIFF_BYTES]
+
+
+def test_filter_scannable_cloud_files_probes_past_underreported_end_with_stale_metadata() -> None:
+    url = "s3://bucket/models/evil.payload"
+    payload = make_delayed_pickle_security_payload()
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _UnderreportedEndCountingBytesIO(
+        payload,
+        transferred,
+        _CLOUD_CONTENT_SNIFF_BYTES,
+    )
+    files = [{"path": url, "name": "evil.payload", "size": 1, "human_size": "1 B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=_CLOUD_CONTENT_SNIFF_BYTES + 1) == [
+        {**files[0], "content_detected_format": PICKLE_ROUTING_INCONCLUSIVE_FORMAT}
+    ]
+
+    assert transferred == [_CLOUD_CONTENT_SNIFF_BYTES + 1]
+
+
+def test_filter_scannable_cloud_files_routes_delayed_pickle_security_signal() -> None:
+    url = "s3://bucket/models/evil.payload"
+    payload = make_delayed_pickle_security_payload()
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
+    files = [{"path": url, "name": "evil.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=len(payload)) == [
+        {**files[0], "content_detected_format": "pickle"}
+    ]
+
+    assert transferred == [len(payload)]
+
+
+def test_filter_scannable_cloud_files_charges_partial_prefix_extension_before_failure() -> None:
+    url = "s3://bucket/models/evil.payload"
+    payload = make_incomplete_pickle_probe_payload(malicious=True)
+    transferred = [0]
+    open_count = [0]
+    partial_bytes = 10
+    fs = make_fs_mock()
+
+    def open_side_effect(_path: str, _mode: str = "rb") -> _CountingBytesIO:
+        open_count[0] += 1
+        if open_count[0] == 3:
+            return _PartialReadThenErrorCountingBytesIO(payload, transferred, partial_bytes)
+        return _CountingBytesIO(payload, transferred)
+
+    fs.open.side_effect = open_side_effect
+    files = [{"path": url, "name": "evil.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+    sniff_budget = _CloudContentSniffBudget(len(payload))
+
+    assert _filter_scannable_cloud_files(files, fs=fs, sniff_budget=sniff_budget) == [
+        {**files[0], "content_detected_format": "pickle"}
+    ]
+    assert open_count == [3]
+    assert transferred == [_CLOUD_CONTENT_SNIFF_BYTES + partial_bytes]
+    assert sniff_budget.remaining_bytes == len(payload) - transferred[0]
 
 
 def test_filter_scannable_cloud_files_preserves_prefix_only_pickle_route_without_tail_seek() -> None:
