@@ -117,6 +117,11 @@ _TFLITE_MAGIC_BYTES = b"TFL3"
 _MSGPACK_CONTAINER_MARKERS = frozenset((*range(0x80, 0x90), 0xDE, 0xDF))
 _MAX_CLOUD_METADATA_ERROR_SAMPLES = 3
 _MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS = 512
+_CLOUD_LOCAL_PATH_ESCAPE_CHARS = frozenset('<>:"/\\|?*%#')
+_WINDOWS_RESERVED_LOCAL_PATH_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"} | {f"com{index}" for index in range(1, 10)} | {f"lpt{index}" for index in range(1, 10)}
+)
+_CLOUD_LOCAL_IDENTITY_HASH_CHARS = 16
 _AWS_REGION_HOST_PART = r"[a-z][a-z0-9]*(?:-[a-z0-9]+)+-\d"
 _AWS_S3_DNS_SUFFIX = (
     r"(?:amazonaws\.com(?:\.cn)?|amazonaws\.eu|c2s\.ic\.gov|sc2s\.sgov\.gov|cloud\.adc-e\.uk|csp\.hci\.ic\.gov)"
@@ -541,6 +546,44 @@ def _cloud_url_basename(url: str) -> str:
     except Exception:
         path = url
     return Path(path).name
+
+
+def _encode_cloud_local_character(character: str) -> str:
+    """Return a reversible ASCII encoding for one local-path character."""
+    return "".join(f"%{byte:02X}" for byte in character.encode("utf-8", errors="surrogatepass"))
+
+
+def _cloud_local_path_component(component: str) -> str:
+    """Map one cloud key component to a collision-resistant Windows-safe name."""
+    if not component:
+        return component
+
+    trailing_start = len(component.rstrip(" ."))
+    encoded_parts: list[str] = []
+    changed = False
+    for index, character in enumerate(component):
+        if character in _CLOUD_LOCAL_PATH_ESCAPE_CHARS or ord(character) < 0x20 or index >= trailing_start:
+            encoded_parts.append(_encode_cloud_local_character(character))
+            changed = True
+        else:
+            encoded_parts.append(character)
+
+    encoded = "".join(encoded_parts)
+    reserved_stem = component.rstrip(" .").split(".", 1)[0].casefold()
+    if reserved_stem in _WINDOWS_RESERVED_LOCAL_PATH_NAMES:
+        encoded = f"{_encode_cloud_local_character(component[0])}{encoded[1:]}"
+        changed = True
+
+    if not changed:
+        return component
+
+    # The digest keeps transformed case variants distinct on case-insensitive filesystems.
+    identity = hashlib.sha256(component.encode("utf-8", errors="surrogatepass")).hexdigest()
+    identity = identity[:_CLOUD_LOCAL_IDENTITY_HASH_CHARS]
+    suffix = Path(encoded).suffix
+    if suffix and "%" not in suffix and len(suffix) <= 32:
+        return f"{encoded[: -len(suffix)]}~{identity}{suffix}"
+    return f"{encoded}~{identity}"
 
 
 def _remove_path(path: Path) -> None:
@@ -2021,9 +2064,14 @@ def _build_safe_local_path(base_url: str, file_url: str, download_path: Path) ->
     if not relative_path:
         raise ValueError(f"Invalid cloud object path: {file_url}")
 
-    resolved_path, is_safe = _resolve_cloud_path(relative_path, download_path)
+    _, is_safe = _resolve_cloud_path(relative_path, download_path)
     if not is_safe:
         raise ValueError(f"Path traversal attempt detected in cloud object path: {file_url}")
+
+    local_relative_path = "/".join(_cloud_local_path_component(component) for component in relative_path.split("/"))
+    resolved_path, is_safe = _resolve_cloud_path(local_relative_path, download_path)
+    if not is_safe:
+        raise ValueError(f"Encoded cloud object path escaped download directory: {file_url}")
 
     local_path = Path(resolved_path)
     if not _is_within_directory(download_path, local_path):
@@ -2386,7 +2434,7 @@ def download_from_cloud(
                 download_file()
         else:
             # Single file download
-            file_name = _cloud_url_basename(url)
+            file_name = _cloud_local_path_component(_cloud_url_basename(fs_url))
             local_file = download_path / file_name
             download_budget = _CloudDownloadBudget(max_size) if max_size else None
             if cache:

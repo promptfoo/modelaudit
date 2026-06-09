@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import logging
+import ntpath
 import os
 import stat
 import struct
@@ -2327,7 +2328,37 @@ def test_download_from_cloud_preserves_native_query_text_in_local_path(
     result = download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
 
     assert isinstance(result, Path)
-    assert result.name == "model?variant.bin"
+    assert result.name.startswith("model%3Fvariant~")
+    assert result.suffix == ".bin"
+    assert not any(character in result.name for character in '<>:"/\\|?*')
+    fs.get.assert_called_once_with(url, str(result))
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("modelaudit.utils.sources.cloud_storage.check_disk_space")
+@patch("fsspec.filesystem")
+def test_download_from_cloud_omits_https_credentials_from_local_path(
+    mock_fs: MagicMock, mock_disk_space: MagicMock, mock_analyze: AsyncMock, tmp_path: Path
+) -> None:
+    url = "https://bucket.s3.amazonaws.com/model.bin?X-Amz-Signature=secret#access_token=fragment-secret"
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": 1024}
+    fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
+    mock_fs.return_value = fs
+    mock_analyze.return_value = {
+        "type": "file",
+        "size": 1024,
+        "name": "model.bin",
+        "human_size": "1.0 KB",
+        "estimated_time": "1 second",
+    }
+    mock_disk_space.return_value = (True, "")
+
+    result = download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
+
+    assert result == tmp_path / "model.bin"
+    assert "secret" not in str(result)
+    assert "access_token" not in str(result)
     fs.get.assert_called_once_with(url, str(result))
 
 
@@ -2352,9 +2383,15 @@ def test_build_safe_local_path_preserves_literal_object_delimiters(tmp_path: Pat
     question_path = _build_safe_local_path(base_url, f"{base_url}/model?one.pkl", tmp_path)
     fragment_path = _build_safe_local_path(base_url, f"{base_url}/model#two.pkl", tmp_path)
 
-    assert question_path == tmp_path / "model?one.pkl"
-    assert fragment_path == tmp_path / "model#two.pkl"
+    assert question_path.parent == tmp_path
+    assert fragment_path.parent == tmp_path
+    assert question_path.name.startswith("model%3Fone~")
+    assert fragment_path.name.startswith("model%23two~")
+    assert question_path.suffix == ".pkl"
+    assert fragment_path.suffix == ".pkl"
     assert question_path != fragment_path
+    assert not any(character in question_path.name for character in '<>:"/\\|?*')
+    assert not any(character in fragment_path.name for character in '<>:"/\\|?*')
 
 
 def test_build_safe_local_path_preserves_sensitive_looking_native_key_text(tmp_path: Path) -> None:
@@ -2362,9 +2399,46 @@ def test_build_safe_local_path_preserves_sensitive_looking_native_key_text(tmp_p
     first = _build_safe_local_path(base_url, f"{base_url}/model.pkl?X-Amz-Signature=one", tmp_path)
     second = _build_safe_local_path(base_url, f"{base_url}/model.pkl?X-Amz-Signature=two", tmp_path)
 
-    assert first == tmp_path / "model.pkl?X-Amz-Signature=one"
-    assert second == tmp_path / "model.pkl?X-Amz-Signature=two"
+    assert first.name.startswith("model.pkl%3FX-Amz-Signature=one~")
+    assert second.name.startswith("model.pkl%3FX-Amz-Signature=two~")
     assert first != second
+
+
+def test_build_safe_local_path_distinguishes_literal_and_encoded_native_key_text(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+
+    literal = _build_safe_local_path(base_url, f"{base_url}/model?variant.pkl", tmp_path)
+    encoded = _build_safe_local_path(base_url, f"{base_url}/model%3Fvariant.pkl", tmp_path)
+
+    assert "%3F" in literal.name
+    assert "%253F" in encoded.name
+    assert literal != encoded
+
+
+def test_build_safe_local_path_distinguishes_native_keys_on_case_insensitive_filesystems(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+
+    lower = _build_safe_local_path(base_url, f"{base_url}/model?variant.pkl", tmp_path)
+    upper = _build_safe_local_path(base_url, f"{base_url}/model?Variant.pkl", tmp_path)
+
+    assert ntpath.normcase(lower.name) != ntpath.normcase(upper.name)
+
+
+def test_build_safe_local_path_preserves_windows_safe_name(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+
+    assert _build_safe_local_path(base_url, f"{base_url}/model.pkl", tmp_path) == tmp_path / "model.pkl"
+
+
+def test_build_safe_local_path_encodes_windows_reserved_name(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+
+    local_path = _build_safe_local_path(base_url, f"{base_url}/CON.pkl", tmp_path)
+
+    assert local_path.parent == tmp_path
+    assert local_path.name.startswith("%43ON~")
+    assert local_path.suffix == ".pkl"
+    assert local_path.stem.casefold() != "con"
 
 
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
