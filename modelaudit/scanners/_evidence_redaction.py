@@ -1225,6 +1225,8 @@ def _parameterized_authorization_value_end(
             if stop_at_newline:
                 return index
         elif char == ";":
+            if SHELL_OPERATOR_COMMAND_RE.match(text, index) is not None:
+                return index
             parameter_start = max(start, text.rfind(",", start, index) + 1)
             parameter = text[parameter_start:index].strip()
             signed_headers_continue = (
