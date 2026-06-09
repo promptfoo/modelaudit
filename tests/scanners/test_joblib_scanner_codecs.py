@@ -13,7 +13,6 @@ from pathlib import Path
 
 import pytest
 
-import modelaudit.scanners.joblib_scanner as joblib_scanner
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
@@ -24,6 +23,7 @@ from modelaudit.scanners.joblib_scanner import (
     _JoblibPickleObject,
     _SafeJoblibUnpickler,
     _validated_numpy_dtype,
+    np,
 )
 
 
@@ -202,7 +202,7 @@ def test_protocol2_datetime_dtype_metadata_is_bounded_and_safe() -> None:
 
 
 def test_dtype_validation_bounds_shared_memo_graph(monkeypatch: pytest.MonkeyPatch) -> None:
-    real_dtype = joblib_scanner.np.dtype
+    real_dtype = np.dtype
     calls = 0
 
     def bounded_dtype(spec: str) -> object:
@@ -212,7 +212,7 @@ def test_dtype_validation_bounds_shared_memo_graph(monkeypatch: pytest.MonkeyPat
             raise AssertionError("dtype validation exceeded its unique-node budget")
         return real_dtype(spec)
 
-    monkeypatch.setattr(joblib_scanner.np, "dtype", bounded_dtype)
+    monkeypatch.setattr(np, "dtype", bounded_dtype)
 
     _validated_numpy_dtype(_shared_structured_dtype_graph())
 
@@ -220,7 +220,7 @@ def test_dtype_validation_bounds_shared_memo_graph(monkeypatch: pytest.MonkeyPat
 
 
 def test_safe_parser_bounds_control_opcode_materialization(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(joblib_scanner, "_MAX_JOBLIB_CONTROL_OPCODES", 16)
+    monkeypatch.setattr("modelaudit.scanners.joblib_scanner._MAX_JOBLIB_CONTROL_OPCODES", 16)
     parser = _SafeJoblibUnpickler(io.BytesIO(b"\x80\x02](" + (b"N" * 32) + b"e."))
 
     with pytest.raises(pickle.UnpicklingError, match="control stream is too complex"):
@@ -383,7 +383,7 @@ def test_scan_preserves_unvalidated_codec_when_python_object_ids_collide(
     assert len(parser.codec_encode_reduction_ids) == 2
     assert len(parser.dtype_validation_context.validated_codec_encode_reduction_ids) == 1
 
-    monkeypatch.setattr(joblib_scanner, "id", lambda _value: 7, raising=False)
+    monkeypatch.setattr("modelaudit.scanners.joblib_scanner.id", lambda _value: 7, raising=False)
 
     result = _scan_payload(
         tmp_path,
@@ -411,7 +411,7 @@ def test_scan_revalidates_dtype_when_python_object_ids_collide(
         + _joblib_numpy_raw_segment(second_prefix_length, nested_pickle)
         + b"e."
     )
-    monkeypatch.setattr(joblib_scanner, "id", lambda _value: 7, raising=False)
+    monkeypatch.setattr("modelaudit.scanners.joblib_scanner.id", lambda _value: 7, raising=False)
 
     result = _scan_payload(tmp_path, payload, "dtype_identity_collision.joblib")
 
