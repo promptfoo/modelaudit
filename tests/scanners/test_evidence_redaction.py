@@ -1640,6 +1640,189 @@ def test_redacts_secret_bearing_structured_keys() -> None:
     )
 
 
+def test_preserves_values_when_redacted_mapping_keys_collide() -> None:
+    """Redaction must not silently overwrite distinct mapping entries."""
+    secret = "sk-proj-REDACTEDKEYCOLLISION1234567890"
+
+    redacted_value = redact_evidence_value(
+        {
+            f"node_{secret}": "secret-derived-key",
+            f"node_{REDACTED_EVIDENCE_VALUE}": "literal-redacted-key",
+            1: "first-non-string-key",
+            2: "second-non-string-key",
+        },
+        max_string_chars=500,
+    )
+
+    assert redacted_value == {
+        f"node_{REDACTED_EVIDENCE_VALUE}": "secret-derived-key",
+        f"node_{REDACTED_EVIDENCE_VALUE}[2]": "literal-redacted-key",
+        "<int-key>": "first-non-string-key",
+        "<int-key>[2]": "second-non-string-key",
+    }
+    assert secret not in json.dumps(redacted_value)
+
+
+def test_redacted_mapping_key_collision_allocation_is_linear() -> None:
+    """Collision allocation should not repeatedly scan prior suffixes."""
+
+    class CountingKeys(set[str]):
+        contains_calls = 0
+
+        def __contains__(self, key: object) -> bool:
+            self.contains_calls += 1
+            return super().__contains__(key)
+
+    existing_keys = CountingKeys()
+    next_occurrences: dict[str, int] = {}
+    key_count = 4_000
+
+    for _ in range(key_count):
+        redacted_key = evidence_redaction._unique_redacted_mapping_key(
+            existing_keys,
+            REDACTED_EVIDENCE_VALUE,
+            next_occurrences,
+        )
+        existing_keys.add(redacted_key)
+
+    assert len(existing_keys) == key_count
+    assert existing_keys.contains_calls < key_count * 3
+
+
+def test_case_variant_name_keys_cannot_bypass_value_redaction() -> None:
+    """Every name/key alias must contribute to name-value sensitivity."""
+    secret = "context-only-sensitive-value"
+
+    redacted_value = redact_evidence_value(
+        {
+            "name": "API_KEY",
+            "Name": "public_label",
+            "value": secret,
+        }
+    )
+
+    assert redacted_value["value"] == REDACTED_EVIDENCE_VALUE
+    assert secret not in json.dumps(redacted_value)
+
+
+@pytest.mark.parametrize(
+    "alias",
+    ["\uff2e\uff41\uff4d\uff45", "na\u200bme", "\uff2b\uff45\uff59", "ke\u200by"],
+)
+def test_unicode_name_key_aliases_cannot_bypass_value_redaction(alias: str) -> None:
+    secret = "unicode-context-only-sensitive-value"
+
+    redacted_value = redact_evidence_value({alias: "API_KEY", "value": secret})
+
+    assert redacted_value["value"] == REDACTED_EVIDENCE_VALUE
+    assert secret not in json.dumps(redacted_value)
+
+
+def test_unicode_sensitive_label_cannot_bypass_contextual_value_redaction() -> None:
+    secret = "unicode-sensitive-label-value"
+
+    redacted_value = redact_evidence_value(
+        {
+            "name": "\uff21\uff30\uff29\uff3f\uff2b\uff25\uff39",
+            "\uff56\uff41\uff4c\uff55\uff45": secret,
+        }
+    )
+
+    assert REDACTED_EVIDENCE_VALUE in redacted_value.values()
+    assert secret not in json.dumps(redacted_value)
+
+
+@pytest.mark.parametrize("key", ["auth", "basic_auth", "cookie", "session_id", "authentication"])
+def test_redacts_opaque_structured_credential_container_values(key: str) -> None:
+    secret = "opaque-structured-credential-value"
+
+    redacted_value = redact_evidence_value({key: secret})
+
+    assert redacted_value[key] == REDACTED_EVIDENCE_VALUE
+    assert secret not in json.dumps(redacted_value)
+
+
+@pytest.mark.parametrize(
+    "label",
+    [b"API_KEY", bytearray(b"session_id"), b"api_\xffkey", bytearray(b"tok\xffen")],
+)
+def test_bytes_sensitive_labels_cannot_bypass_contextual_value_redaction(
+    label: bytes | bytearray,
+) -> None:
+    secret = "bytes-context-only-sensitive-value"
+
+    redacted_mapping = redact_evidence_value({"name": label, "value": secret})
+    redacted_pair = redact_evidence_value([label, secret])
+
+    assert redacted_mapping["value"] == REDACTED_EVIDENCE_VALUE
+    assert redacted_pair[1] == REDACTED_EVIDENCE_VALUE
+    assert secret not in json.dumps([redacted_mapping, redacted_pair])
+
+
+@pytest.mark.parametrize("key", [b"api_key", b"api_\xffkey", b"session_id"])
+def test_bytes_sensitive_mapping_keys_cannot_bypass_value_redaction(key: bytes) -> None:
+    secret = "bytes-key-sensitive-value"
+
+    redacted_value = redact_evidence_value({key: secret})
+
+    assert list(redacted_value.values()) == [REDACTED_EVIDENCE_VALUE]
+    assert secret not in json.dumps(redacted_value)
+
+
+def test_bytes_contextual_keys_cannot_bypass_value_redaction() -> None:
+    secret = "bytes-contextual-key-sensitive-value"
+
+    redacted_value = redact_evidence_value({b"name": b"API_KEY", b"values": [secret]})
+
+    assert REDACTED_EVIDENCE_VALUE in redacted_value.values()
+    assert secret not in json.dumps(redacted_value)
+
+
+def test_long_opaque_bytes_labels_fail_closed() -> None:
+    secret = "long-bytes-context-sensitive-value"
+    opaque_label = b"\xff" * (evidence_redaction.MAX_SENSITIVE_EVIDENCE_KEY_CHARS + 1)
+
+    redacted_mapping = redact_evidence_value({"name": opaque_label, "value": secret})
+    redacted_key = redact_evidence_value({opaque_label: secret})
+
+    assert redacted_mapping["value"] == REDACTED_EVIDENCE_VALUE
+    assert list(redacted_key.values()) == [REDACTED_EVIDENCE_VALUE]
+    assert secret not in json.dumps([redacted_mapping, redacted_key])
+
+
+def test_preserves_benign_bytes_contextual_labels() -> None:
+    value = "public-model-label"
+
+    redacted_mapping = redact_evidence_value({"name": b"display_name", "value": value})
+    redacted_pair = redact_evidence_value((bytearray(b"display_name"), value))
+
+    assert redacted_mapping["value"] == value
+    assert redacted_pair[1] == value
+
+
+def test_sensitive_label_redacts_plural_contextual_values() -> None:
+    secret = "plural-context-only-sensitive-value"
+
+    redacted_value = redact_evidence_value(
+        {
+            "name": "API_KEY",
+            "values": [secret],
+        }
+    )
+
+    assert redacted_value["values"] == REDACTED_EVIDENCE_VALUE
+    assert secret not in json.dumps(redacted_value)
+
+
+def test_unicode_sensitive_mapping_key_cannot_bypass_value_redaction() -> None:
+    secret = "unicode-sensitive-key-value"
+
+    redacted_value = redact_evidence_value({"\uff21\uff30\uff29\uff3f\uff2b\uff25\uff39": secret})
+
+    assert list(redacted_value.values()) == [REDACTED_EVIDENCE_VALUE]
+    assert secret not in json.dumps(redacted_value)
+
+
 def test_redacts_camel_case_structured_credential_keys() -> None:
     """SDK-style camelCase credential keys should redact values by key context."""
     aws_secret = "AWS_SECRET_ACCESS_KEY_VALUE"

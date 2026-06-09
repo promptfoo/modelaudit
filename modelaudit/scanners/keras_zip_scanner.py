@@ -10,7 +10,7 @@ from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from modelaudit.detectors.network_comm import redact_url_for_finding
 from modelaudit.detectors.suspicious_symbols import (
@@ -38,13 +38,18 @@ from ..utils.file.hdf5 import (
     is_hdf5_signature_probe_complete,
 )
 from ._archive_config import get_archive_depth
-from ._evidence_redaction import redact_evidence_string, redact_evidence_value
+from ._evidence_redaction import (
+    redact_evidence_mapping_key,
+    redact_evidence_string,
+    redact_evidence_value,
+    redact_untrusted_error_message,
+)
 from .archive_dispatch import (
     KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY,
     SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY,
 )
 from .archive_member_security import is_executable_archive_member_name
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, Issue, IssueSeverity, ScanResult
 from .keras_utils import (
     check_custom_loss_config,
     check_custom_metric_config,
@@ -408,6 +413,7 @@ class KerasZipScanner(BaseScanner):
     MAX_HDF5_EXTERNAL_REFERENCE_REPORTS: ClassVar[int] = 20
     MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS: ClassVar[int] = 20
     MAX_HDF5_REFERENCE_TEXT_CHARS: ClassVar[int] = 4096
+    MAX_ARCHIVE_MEMBER_TEXT_CHARS: ClassVar[int] = 4096
     MAX_NESTED_LAYER_DEPTH: ClassVar[int] = 64
     MAX_NESTED_LAYER_ITEMS: ClassVar[int] = 1_000
     MAX_CONFIG_TRAVERSAL_DEPTH: ClassVar[int] = 256
@@ -516,7 +522,41 @@ class KerasZipScanner(BaseScanner):
         self._nested_layer_items_scanned = 0
         self._content_route_embedded_weights = False
         self._checked_config_module_references: set[tuple[int, str, str]] = set()
+        self._current_keras_version: str | None = None
         self._torchmodule_version_status: bool | None = None
+
+    @classmethod
+    def _redact_archive_member_name(cls, member_name: str) -> str:
+        """Return bounded, redacted archive-member evidence for serialized findings."""
+        return redact_evidence_string(member_name, max_chars=cls.MAX_ARCHIVE_MEMBER_TEXT_CHARS)
+
+    @classmethod
+    def _redact_recursive_archive_scan_result(cls, nested_result: ScanResult) -> None:
+        """Redact model-controlled ZIP member evidence before merging generic archive findings."""
+        findings: list[Check | Issue] = [*nested_result.checks, *nested_result.issues]
+        for finding in findings:
+            finding.message = redact_evidence_string(
+                finding.message,
+                max_chars=cls.MAX_ARCHIVE_MEMBER_TEXT_CHARS,
+            )
+            if finding.location is not None:
+                finding.location = redact_evidence_string(
+                    finding.location,
+                    max_chars=cls.MAX_ARCHIVE_MEMBER_TEXT_CHARS,
+                )
+            finding.details = cast(
+                dict[str, Any],
+                redact_evidence_value(
+                    finding.details,
+                    max_string_chars=cls.MAX_ARCHIVE_MEMBER_TEXT_CHARS,
+                ),
+            )
+
+        if "contents" in nested_result.metadata:
+            nested_result.metadata["contents"] = redact_evidence_value(
+                nested_result.metadata["contents"],
+                max_string_chars=cls.MAX_ARCHIVE_MEMBER_TEXT_CHARS,
+            )
 
     @staticmethod
     def _is_allowlisted_keras_module(module_value: Any) -> bool:
@@ -739,6 +779,7 @@ class KerasZipScanner(BaseScanner):
         )
         if has_embedded_weights_limit:
             self._suppress_expected_embedded_weights_limit_noise(nested_result)
+        self._redact_recursive_archive_scan_result(nested_result)
         preserved_metadata = dict(result.metadata)
         nested_contents = nested_result.metadata.get("contents")
         result.merge(nested_result)
@@ -763,6 +804,7 @@ class KerasZipScanner(BaseScanner):
         self._nested_layer_items_scanned = 0
         self._content_route_embedded_weights = False
         self._checked_config_module_references.clear()
+        self._current_keras_version = None
         self._torchmodule_version_status = None
 
         # Check if path is valid
@@ -798,7 +840,7 @@ class KerasZipScanner(BaseScanner):
                         message="No config.json found in Keras ZIP file",
                         severity=IssueSeverity.INFO,
                         location=path,
-                        details={"files": zf.namelist()},
+                        details={"files": [self._redact_archive_member_name(name) for name in zf.namelist()]},
                     )
                     self._load_keras_metadata(zf, result)
                     self._check_archive_security_members(zf, path, result)
@@ -817,6 +859,11 @@ class KerasZipScanner(BaseScanner):
                     raw_config_text = config_data.decode("utf-8", errors="ignore")
                     model_config = json.loads(config_data)
                 except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+                    redacted_error = (
+                        str(e)
+                        if type(e) is ValueError and str(e) == "ZIP member exceeds bounded read size"
+                        else redact_untrusted_error_message(e)
+                    )
                     self._mark_inconclusive_scan_result(result, "keras_zip_config_parse_failed")
                     # Fall back to a structure-aware raw scan only when the archive
                     # config is malformed and cannot be parsed as JSON.
@@ -825,11 +872,11 @@ class KerasZipScanner(BaseScanner):
                     result.add_check(
                         name="Config JSON Parsing",
                         passed=False,
-                        message=f"Failed to parse config.json: {e}",
+                        message=f"Failed to parse config.json: {redacted_error}",
                         severity=IssueSeverity.INFO,
-                        location=f"{path}/{config_info.filename}",
+                        location=f"{path}/{self._redact_archive_member_name(config_info.filename)}",
                         details={
-                            "error": str(e),
+                            "error": redacted_error,
                             "max_config_bytes": _KERAS_CONFIG_MAX_BYTES,
                         },
                     )
@@ -854,7 +901,7 @@ class KerasZipScanner(BaseScanner):
                         passed=False,
                         message=f"Invalid config.json type: expected dict, got {type(model_config).__name__}",
                         severity=IssueSeverity.INFO,
-                        location=f"{path}/{config_info.filename}",
+                        location=f"{path}/{self._redact_archive_member_name(config_info.filename)}",
                         details={"actual_type": type(model_config).__name__, "expected_type": "dict"},
                     )
                     self._check_archive_security_members(zf, path, result)
@@ -870,30 +917,38 @@ class KerasZipScanner(BaseScanner):
                 self._merge_recursive_archive_scan(path, result)
 
         except _AmbiguousKerasArchiveMemberError as e:
+            redacted_member_name = self._redact_archive_member_name(e.member_name)
+            redacted_candidate_filenames = [
+                self._redact_archive_member_name(filename) for filename in e.candidate_filenames
+            ]
             result.add_check(
                 name="Keras ZIP Member Path Validation",
                 passed=False,
-                message=str(e),
+                message=(
+                    f"Ambiguous Keras ZIP member '{redacted_member_name}' matches multiple archive entries: "
+                    f"{', '.join(redacted_candidate_filenames)}"
+                ),
                 severity=IssueSeverity.CRITICAL,
                 location=path,
                 details={
-                    "member_name": e.member_name,
-                    "candidate_filenames": e.candidate_filenames,
+                    "member_name": redacted_member_name,
+                    "candidate_filenames": redacted_candidate_filenames,
                 },
             )
             self._merge_recursive_archive_scan(path, result)
             result.finish(success=False)
             return result
         except OSError as e:
+            redacted_error = redact_untrusted_error_message(e)
             self._mark_inconclusive_scan_result(result, "keras_zip_read_failed")
             result.add_check(
                 name="Keras ZIP File Read",
                 passed=False,
-                message=f"Unable to read Keras ZIP content: {e!s}",
+                message=f"Unable to read Keras ZIP content: {redacted_error}",
                 severity=IssueSeverity.INFO,
                 location=path,
                 details={
-                    "exception": str(e),
+                    "exception": redacted_error,
                     "exception_type": type(e).__name__,
                     "analysis_incomplete": True,
                     "scan_outcome_reason": "keras_zip_read_failed",
@@ -903,15 +958,16 @@ class KerasZipScanner(BaseScanner):
             self._finish_scan_result(result)
             return result
         except Exception as e:
+            redacted_error = redact_untrusted_error_message(e)
             self._mark_inconclusive_scan_result(result, "keras_zip_scan_failed")
             result.add_check(
                 name="Keras ZIP File Scan",
                 passed=False,
-                message=f"Error scanning Keras ZIP file: {e!s}",
+                message=f"Error scanning Keras ZIP file: {redacted_error}",
                 severity=IssueSeverity.INFO,
                 location=path,
                 details={
-                    "exception": str(e),
+                    "exception": redacted_error,
                     "exception_type": type(e).__name__,
                     "analysis_incomplete": True,
                     "scan_outcome_reason": "keras_zip_scan_failed",
@@ -946,6 +1002,7 @@ class KerasZipScanner(BaseScanner):
         keras_version = metadata.get("keras_version")
         if isinstance(keras_version, str) and keras_version.strip():
             raw_keras_version = keras_version.strip()
+            self._current_keras_version = raw_keras_version
             # Classify before evidence truncation can alter a valid long local-version label.
             self._torchmodule_version_status = self._is_vulnerable_keras_3_11_x(raw_keras_version)
             result.metadata["keras_version"] = redact_evidence_string(raw_keras_version)
@@ -961,22 +1018,24 @@ class KerasZipScanner(BaseScanner):
         for filename in archive.namelist():
             normalized_name = filename.lower()
             if normalized_name.endswith((".py", ".pyc", ".pyo")):
+                redacted_filename = self._redact_archive_member_name(filename)
                 result.add_check(
                     name="Python File Detection",
                     passed=False,
-                    message=f"Python file found in Keras ZIP: {filename}",
+                    message=f"Python file found in Keras ZIP: {redacted_filename}",
                     severity=IssueSeverity.WARNING,
-                    location=f"{archive_path}/{filename}",
-                    details={"filename": filename},
+                    location=f"{archive_path}/{redacted_filename}",
+                    details={"filename": redacted_filename},
                 )
             elif is_executable_archive_member_name(normalized_name):
+                redacted_filename = self._redact_archive_member_name(filename)
                 result.add_check(
                     name="Executable File Detection",
                     passed=False,
-                    message=f"Executable file found in Keras ZIP: {filename}",
+                    message=f"Executable file found in Keras ZIP: {redacted_filename}",
                     severity=IssueSeverity.CRITICAL,
-                    location=f"{archive_path}/{filename}",
-                    details={"filename": filename},
+                    location=f"{archive_path}/{redacted_filename}",
+                    details={"filename": redacted_filename},
                 )
 
     @staticmethod
@@ -1503,11 +1562,26 @@ class KerasZipScanner(BaseScanner):
 
         # Check model class name
         model_class = model_config.get("class_name", "")
-        redacted_model_class = redact_evidence_string(str(model_class))
+        model_class_is_string = isinstance(model_class, str)
+        redacted_model_class = (
+            redact_evidence_string(model_class) if model_class_is_string else f"<invalid:{type(model_class).__name__}>"
+        )
         result.metadata["model_class"] = redacted_model_class
 
         # Check for subclassed models (custom class names)
-        check_subclassed_model(model_class, result, self.current_file_path)
+        if model_class_is_string:
+            check_subclassed_model(model_class, result, self.current_file_path)
+        else:
+            self._mark_inconclusive_scan_result(result, "keras_zip_model_class_invalid_type")
+            result.add_check(
+                name="Model Class Type Validation",
+                passed=False,
+                message=f"Invalid model class type: expected str, got {type(model_class).__name__}",
+                rule_code="S902",
+                severity=IssueSeverity.WARNING,
+                location=f"{self.current_file_path}/config.json",
+                details={"actual_type": type(model_class).__name__, "expected_type": "str"},
+            )
 
         # Root configs can themselves be serialized callables rather than model containers.
         self._check_layer_module_references(
@@ -1519,7 +1593,7 @@ class KerasZipScanner(BaseScanner):
         )
 
         # Check for suspicious model types (Lambda, etc.)
-        if model_class in self.suspicious_layer_types:
+        if model_class_is_string and model_class in self.suspicious_layer_types:
             result.add_check(
                 name="Model Type Security Check",
                 passed=False,
@@ -1584,6 +1658,8 @@ class KerasZipScanner(BaseScanner):
 
         # Count of each layer type
         layer_counts: dict[str, int] = {}
+        layer_count_display_keys: dict[str, str] = {}
+        layer_count_next_occurrences: dict[str, int] = {}
 
         # Check each layer
         for i, layer in enumerate(layers):
@@ -1622,11 +1698,18 @@ class KerasZipScanner(BaseScanner):
                 )
 
             # Update layer count
-            layer_count_key = (
-                redact_evidence_string(layer_class)
-                if isinstance(layer_class, str)
-                else f"<invalid:{type(layer_class).__name__}>"
+            layer_count_identity = (
+                f"str:{layer_class}" if isinstance(layer_class, str) else f"invalid:{type(layer_class).__name__}"
             )
+            layer_count_key = layer_count_display_keys.get(layer_count_identity)
+            if layer_count_key is None:
+                display_key = layer_class if isinstance(layer_class, str) else f"<invalid:{type(layer_class).__name__}>"
+                layer_count_key = redact_evidence_mapping_key(
+                    display_key,
+                    layer_counts,
+                    next_occurrences=layer_count_next_occurrences,
+                )
+                layer_count_display_keys[layer_count_identity] = layer_count_key
             layer_counts[layer_count_key] = layer_counts.get(layer_count_key, 0) + 1
 
             # CVE-2025-49655: TorchModuleWrapper uses torch.load(weights_only=False)
@@ -1644,8 +1727,11 @@ class KerasZipScanner(BaseScanner):
             if is_lambda_layer:
                 self._check_lambda_layer(layer, result, layer_name)
                 keras_version = result.metadata.get("keras_version")
+                classification_keras_version = self._current_keras_version
                 cve_2024_3660_status = (
-                    self._is_vulnerable_to_cve_2024_3660(keras_version) if isinstance(keras_version, str) else None
+                    self._is_vulnerable_to_cve_2024_3660(classification_keras_version)
+                    if isinstance(classification_keras_version, str)
+                    else None
                 )
                 if cve_2024_3660_status is True:
                     # CVE-2024-3660: Lambda layers enable arbitrary code injection
@@ -1729,14 +1815,15 @@ class KerasZipScanner(BaseScanner):
                     },
                 )
             elif layer_class in self.suspicious_layer_types:
+                redacted_layer_class = redact_evidence_string(layer_class)
                 result.add_check(
                     name="Suspicious Layer Type Detection",
                     passed=False,
-                    message=f"Suspicious layer type found: {layer_class}",
+                    message=f"Suspicious layer type found: {redacted_layer_class}",
                     severity=IssueSeverity.WARNING,
                     location=f"{self.current_file_path} (layer: {redacted_layer_name})",
                     details={
-                        "layer_class": layer_class,
+                        "layer_class": redacted_layer_class,
                         "layer_name": redacted_layer_name,
                         "description": self.suspicious_layer_types[layer_class],
                     },
@@ -1796,7 +1883,13 @@ class KerasZipScanner(BaseScanner):
                         details={"actual_type": type(nested_config).__name__, "expected_type": "dict"},
                     )
 
-            self._scan_wrapped_layer_config(layer_class, layer_config, result, layer_name, nested_layer_depth)
+            self._scan_wrapped_layer_config(
+                layer_class,
+                layer_config,
+                result,
+                redacted_layer_name,
+                nested_layer_depth,
+            )
 
         # Add layer counts to metadata
         result.metadata["layer_counts"] = layer_counts
@@ -2543,7 +2636,7 @@ class KerasZipScanner(BaseScanner):
                 location=f"{self.current_file_path}/config.json",
                 details={
                     "cve_id": "CVE-2025-8747",
-                    "context": context,
+                    "context": redact_evidence_string(context),
                     "cvss": 8.8,
                     "cwe": "CWE-502",
                     "description": (
@@ -2620,7 +2713,7 @@ class KerasZipScanner(BaseScanner):
                 location=f"{self.current_file_path}/config.json",
                 details={
                     "cve_id": "CVE-2025-12060",
-                    "context": context,
+                    "context": redact_evidence_string(context),
                     "urls": [_redact_url_for_display(origin)],
                     "cvss": 8.8,
                     "cwe": "CWE-22",
@@ -2985,6 +3078,7 @@ class KerasZipScanner(BaseScanner):
             return
 
         keras_version = result.metadata.get("keras_version")
+        classification_keras_version = self._current_keras_version
         redacted_vocabulary = (
             redact_url_for_finding(vocabulary)
             if _URL_SCHEME_PATTERN.match(vocabulary.strip())
@@ -3006,7 +3100,9 @@ class KerasZipScanner(BaseScanner):
             "affected_versions": "Keras < 3.12.0",
         }
         vulnerability_status = (
-            self._is_vulnerable_to_cve_2025_12058(keras_version) if isinstance(keras_version, str) else None
+            self._is_vulnerable_to_cve_2025_12058(classification_keras_version)
+            if isinstance(classification_keras_version, str)
+            else None
         )
 
         if vulnerability_status is True:
@@ -3078,6 +3174,7 @@ class KerasZipScanner(BaseScanner):
 
         if weights_info.file_size > self.max_embedded_weights_bytes:
             weights_entry = weights_info.filename
+            display_weights_entry = self._redact_archive_member_name(weights_entry)
             self._mark_inconclusive_scan_result(result, "keras_zip_embedded_weights_too_large")
             result.add_check(
                 name="Embedded Weights Size Limit",
@@ -3087,9 +3184,9 @@ class KerasZipScanner(BaseScanner):
                     f"exceeds the configured size limit ({weights_info.file_size} > {self.max_embedded_weights_bytes})"
                 ),
                 severity=IssueSeverity.INFO,
-                location=f"{self.current_file_path}:{weights_entry}",
+                location=f"{self.current_file_path}:{display_weights_entry}",
                 details={
-                    "entry": weights_entry,
+                    "entry": display_weights_entry,
                     "uncompressed_size": weights_info.file_size,
                     "compressed_size": weights_info.compress_size,
                     "max_embedded_weights_bytes": self.max_embedded_weights_bytes,
@@ -3110,6 +3207,7 @@ class KerasZipScanner(BaseScanner):
                 return
 
             weights_entry = weights_info.filename
+            display_weights_entry = self._redact_archive_member_name(weights_entry)
             reason = "keras_zip_embedded_weights_h5py_unavailable"
             result.metadata["embedded_weights_hdf5_signature_offset"] = hdf5_signature_offset
             self._mark_inconclusive_scan_result(result, reason)
@@ -3128,9 +3226,9 @@ class KerasZipScanner(BaseScanner):
                     "analysis. Install with 'pip install modelaudit[h5]'."
                 ),
                 severity=IssueSeverity.INFO,
-                location=f"{self.current_file_path}:{weights_entry}",
+                location=f"{self.current_file_path}:{display_weights_entry}",
                 details={
-                    "entry": weights_entry,
+                    "entry": display_weights_entry,
                     "required_package": "h5py",
                     "hdf5_signature_offset": hdf5_signature_offset,
                     "analysis_incomplete": True,
@@ -3168,15 +3266,16 @@ class KerasZipScanner(BaseScanner):
                 )
         except _EmbeddedWeightsLimitExceeded as exc:
             weights_entry = weights_info.filename
+            display_weights_entry = self._redact_archive_member_name(weights_entry)
             self._mark_inconclusive_scan_result(result, "keras_zip_embedded_weights_too_large")
             result.add_check(
                 name="Embedded Weights Size Limit",
                 passed=False,
                 message=str(exc),
                 severity=IssueSeverity.INFO,
-                location=f"{self.current_file_path}:{weights_entry}",
+                location=f"{self.current_file_path}:{display_weights_entry}",
                 details={
-                    "entry": weights_entry,
+                    "entry": display_weights_entry,
                     "extracted_bytes": exc.extracted_bytes,
                     "uncompressed_size": weights_info.file_size,
                     "compressed_size": weights_info.compress_size,
@@ -3202,7 +3301,7 @@ class KerasZipScanner(BaseScanner):
                 passed=False,
                 message="Embedded Keras HDF5 external-reference analysis reached a configured safety limit",
                 severity=IssueSeverity.INFO,
-                location=f"{self.current_file_path}:{weights_info.filename}",
+                location=f"{self.current_file_path}:{self._redact_archive_member_name(weights_info.filename)}",
                 details={
                     "analysis_incomplete": True,
                     "scan_outcome_reason": reason,
@@ -3215,7 +3314,8 @@ class KerasZipScanner(BaseScanner):
             return
 
         keras_version = result.metadata.get("keras_version")
-        location = f"{self.current_file_path}:{weights_info.filename}"
+        classification_keras_version = self._current_keras_version
+        location = f"{self.current_file_path}:{self._redact_archive_member_name(weights_info.filename)}"
         details = {
             "cve_id": "CVE-2026-1669",
             "cvss": 8.1,
@@ -3245,7 +3345,9 @@ class KerasZipScanner(BaseScanner):
             )
 
         cve_2026_1669_status = (
-            self._is_vulnerable_to_cve_2026_1669(keras_version) if isinstance(keras_version, str) else None
+            self._is_vulnerable_to_cve_2026_1669(classification_keras_version)
+            if isinstance(classification_keras_version, str)
+            else None
         )
         if cve_2026_1669_status is True:
             details["keras_version"] = keras_version
@@ -3318,6 +3420,7 @@ class KerasZipScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         weights_entry = weights_info.filename
+        display_weights_entry = self._redact_archive_member_name(weights_entry)
         reason = "keras_zip_embedded_weights_hdf5_signature_probe_incomplete"
         self._mark_inconclusive_scan_result(result, reason)
         result.add_check(
@@ -3329,9 +3432,9 @@ class KerasZipScanner(BaseScanner):
                 "Install with 'pip install modelaudit[h5]'."
             ),
             severity=IssueSeverity.INFO,
-            location=f"{self.current_file_path}:{weights_entry}",
+            location=f"{self.current_file_path}:{display_weights_entry}",
             details={
-                "entry": weights_entry,
+                "entry": display_weights_entry,
                 "required_package": "h5py",
                 "file_size": weights_info.file_size,
                 "hdf5_signature_probe_max_bytes": HDF5_SIGNATURE_SCAN_MAX_BYTES,
@@ -3355,6 +3458,7 @@ class KerasZipScanner(BaseScanner):
             return
 
         weights_entry = weights_info.filename
+        display_weights_entry = self._redact_archive_member_name(weights_entry)
         from .pickle_scanner import PickleScanner
         from .picklescan_adapter import apply_pickle_member_context
 
@@ -3396,11 +3500,11 @@ class KerasZipScanner(BaseScanner):
                         prefix_result,
                         temp_path,
                         self.current_file_path,
-                        weights_entry,
+                        display_weights_entry,
                     )
                     self._annotate_embedded_weights_security_prefix_result(
                         prefix_result,
-                        weights_entry=weights_entry,
+                        weights_entry=display_weights_entry,
                         hdf5_signature_offset=hdf5_signature_offset,
                     )
                     result.merge(prefix_result)
@@ -3415,7 +3519,9 @@ class KerasZipScanner(BaseScanner):
                 if temp_path is not None:
                     Path(temp_path).unlink(missing_ok=True)
 
-            pickle_source = f"{self.current_file_path}:{weights_entry}:embedded-weights-prefix-{segment_index}.pkl"
+            pickle_source = (
+                f"{self.current_file_path}:{display_weights_entry}:embedded-weights-prefix-{segment_index}.pkl"
+            )
             pickle_result = PickleScanner(config=self.config).scan_stream(
                 io.BytesIO(prefix),
                 len(prefix),
@@ -3425,11 +3531,11 @@ class KerasZipScanner(BaseScanner):
                 apply_pickle_member_context(
                     pickle_result,
                     archive_path=self.current_file_path,
-                    member_name=weights_entry,
+                    member_name=display_weights_entry,
                 )
                 self._annotate_embedded_weights_security_prefix_result(
                     pickle_result,
-                    weights_entry=weights_entry,
+                    weights_entry=display_weights_entry,
                     hdf5_signature_offset=hdf5_signature_offset,
                 )
                 result.merge(pickle_result)
@@ -3468,11 +3574,11 @@ class KerasZipScanner(BaseScanner):
                 full_result,
                 temp_path,
                 self.current_file_path,
-                weights_info.filename,
+                self._redact_archive_member_name(weights_info.filename),
             )
             self._annotate_embedded_weights_security_prefix_result(
                 full_result,
-                weights_entry=weights_info.filename,
+                weights_entry=self._redact_archive_member_name(weights_info.filename),
                 hdf5_signature_offset=hdf5_signature_offset,
             )
             result.merge(full_result)
@@ -3488,15 +3594,19 @@ class KerasZipScanner(BaseScanner):
         weights_entry: str,
         hdf5_signature_offset: int | None,
     ) -> None:
+        display_weights_entry = redact_evidence_string(
+            weights_entry,
+            max_chars=KerasZipScanner.MAX_ARCHIVE_MEMBER_TEXT_CHARS,
+        )
         for check in prefix_result.checks:
-            check.details.setdefault("zip_entry", weights_entry)
+            check.details.setdefault("zip_entry", display_weights_entry)
             check.details["embedded_weights_hdf5_userblock"] = True
             if hdf5_signature_offset is None:
                 check.details["hdf5_signature_probe_max_bytes"] = HDF5_SIGNATURE_SCAN_MAX_BYTES
             else:
                 check.details["hdf5_signature_offset"] = hdf5_signature_offset
         for issue in prefix_result.issues:
-            issue.details.setdefault("zip_entry", weights_entry)
+            issue.details.setdefault("zip_entry", display_weights_entry)
             issue.details["embedded_weights_hdf5_userblock"] = True
             if hdf5_signature_offset is None:
                 issue.details["hdf5_signature_probe_max_bytes"] = HDF5_SIGNATURE_SCAN_MAX_BYTES

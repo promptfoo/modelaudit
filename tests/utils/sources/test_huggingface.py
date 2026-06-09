@@ -693,6 +693,15 @@ class TestModelDownload:
                 "safetensors",
             ),
             (pickle.dumps({"weights": [1, 2, 3]}, protocol=0), "pickle"),
+            (
+                (b"\x8c\x01x0" * 8) + b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94\x8c\x02id\x94\x85\x94R\x94.",
+                "pickle",
+            ),
+            (
+                (b"\x8c\x01x0" * ((8 * 1024) // 4))
+                + b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94\x8c\x02id\x94\x85\x94R\x94.",
+                "pickle",
+            ),
             (_make_tar_payload(), "tar"),
             (b"\x0a\x07version\x0a\x03uidCompositeFunction", "cntk"),
             (
@@ -724,6 +733,8 @@ class TestModelDownload:
         ids=[
             "safetensors",
             "protocol0-pickle",
+            "delayed-protocolless-binary-pickle",
+            "protocolless-binary-pickle-beyond-probe-budget",
             "tar",
             "cntk",
             "lightgbm",
@@ -3165,6 +3176,10 @@ class TestHuggingFaceFileURLs:
                 ("gpt2", "main", "config.json"),
             ),
             (
+                f"https://huggingface.co/{'a' * 47}/{'b' * 48}/resolve/main/model.bin",
+                (f"{'a' * 47}/{'b' * 48}", "main", "model.bin"),
+            ),
+            (
                 "https://huggingface.co/bert-base/uncased/resolve/main/pytorch_model.bin",
                 ("bert-base/uncased", "main", "pytorch_model.bin"),
             ),
@@ -3249,6 +3264,77 @@ class TestHuggingFaceFileURLs:
 
         assert is_huggingface_file_url(url) is False
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "ftp://huggingface.co/test/model/resolve/main/model.bin",
+            "//huggingface.co/test/model/resolve/main/model.bin",
+            "https://huggingface.co:invalid/test/model/resolve/main/model.bin",
+            "https://huggingface.co:444/test/model/resolve/main/model.bin",
+            f"https://huggingface.co/{'a' * 48}/{'b' * 48}/resolve/main/model.bin",
+            "https://huggingface.co/test%FF/model/resolve/main/model.bin",
+            "https://huggingface.co/test/model/resolve/rev%FF/model.bin",
+            "https://huggingface.co/test/model/resolve/main/model%FF.bin",
+            "https://huggingface.co/test/model/resolve/main/model%00.bin",
+        ],
+    )
+    def test_parse_file_url_rejects_ambiguous_or_sdk_invalid_components(self, url: str) -> None:
+        """Validation should reject lossy decoding and repo IDs the SDK cannot accept."""
+        with pytest.raises(ValueError):
+            parse_huggingface_file_url(url)
+
+        assert is_huggingface_file_url(url) is False
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "..%20",
+            "C%3A",
+            "CON",
+            "CONIN%24",
+            "conout%24.log",
+            "nul.txt",
+            "model.bin.",
+            "model.bin%20",
+            "model.bin%3Astream",
+            "model%3F.bin",
+        ],
+    )
+    def test_parse_file_url_rejects_windows_unsafe_filename_components(
+        self,
+        filename: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Windows device, drive, alias, and alternate-stream names must fail closed."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface_paths._IS_WINDOWS", True)
+        url = f"https://huggingface.co/test/model/resolve/main/{filename}"
+
+        with pytest.raises(ValueError, match="on Windows"):
+            parse_huggingface_file_url(url)
+
+        assert is_huggingface_file_url(url) is False
+
+    def test_parse_file_url_preserves_posix_colon_filename(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Windows-only path restrictions should not reject a valid POSIX filename."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface_paths._IS_WINDOWS", False)
+
+        assert parse_huggingface_file_url("https://huggingface.co/test/model/resolve/main/model.bin%3Astream") == (
+            "test/model",
+            "main",
+            "model.bin:stream",
+        )
+
+    def test_parse_file_url_accepts_default_https_port(self) -> None:
+        """An explicit default transport port should preserve the same repository locator."""
+        assert parse_huggingface_file_url("https://huggingface.co:443/test/model/resolve/main/model.bin") == (
+            "test/model",
+            "main",
+            "model.bin",
+        )
+
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_rejects_unsafe_direct_url_before_sdk_download(
         self,
@@ -3257,6 +3343,25 @@ class TestHuggingFaceFileURLs:
         """Unsafe decoded filename components should fail before the SDK download path."""
         with pytest.raises(ValueError, match="Invalid HuggingFace filename path component"):
             download_file_from_hf("https://huggingface.co/test/model/resolve/main/%2e%2e%2Fsecrets.bin")
+
+        mock_hf_hub_download.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            f"https://huggingface.co/{'a' * 48}/{'b' * 48}/resolve/main/model.bin",
+            "https://huggingface.co/test/model/resolve/main/model%FF.bin",
+        ],
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_file_rejects_sdk_invalid_direct_url_before_download(
+        self,
+        mock_hf_hub_download: MagicMock,
+        url: str,
+    ) -> None:
+        """Repository and encoding validation must complete before the SDK call."""
+        with pytest.raises(ValueError):
+            download_file_from_hf(url)
 
         mock_hf_hub_download.assert_not_called()
 

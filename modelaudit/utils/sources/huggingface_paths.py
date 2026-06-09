@@ -1,6 +1,7 @@
 """HuggingFace URL and local-cache provenance parsing helpers."""
 
 import json
+import os
 import re
 from pathlib import Path
 from urllib.parse import unquote, urlparse, urlunparse
@@ -20,6 +21,29 @@ _SENSITIVE_URL_QUERY_PARAM_PATTERN = re.compile(
 )
 _URL_USERINFO_PATTERN = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
 _HF_REPO_COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+_HF_REPO_ID_MAX_LENGTH = 96
+_IS_WINDOWS = os.name == "nt"
+_WINDOWS_RESERVED_FILE_STEMS = {
+    "AUX",
+    "CON",
+    "CONIN$",
+    "CONOUT$",
+    "NUL",
+    "PRN",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+
+
+def _decode_huggingface_url_component(raw_component: str, field_name: str) -> str:
+    """Decode one URL component without silently replacing malformed UTF-8."""
+    try:
+        decoded = unquote(raw_component, errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"Invalid HuggingFace {field_name} encoding") from exc
+    if any(ord(character) < 32 or ord(character) == 127 for character in decoded):
+        raise ValueError(f"Invalid HuggingFace {field_name} control character")
+    return decoded
 
 
 def _validate_huggingface_repo_component(component: str, field_name: str) -> str:
@@ -41,19 +65,27 @@ def _validate_huggingface_repo_component(component: str, field_name: str) -> str
 
 
 def _decode_huggingface_repo_component(raw_component: str, field_name: str) -> str:
-    decoded = unquote(raw_component)
+    decoded = _decode_huggingface_url_component(raw_component, field_name)
     return _validate_huggingface_repo_component(decoded, field_name)
 
 
 def _decode_huggingface_file_path_component(raw_component: str, field_name: str) -> str:
-    decoded = unquote(raw_component)
+    decoded = _decode_huggingface_url_component(raw_component, field_name)
     if not decoded or decoded in {".", ".."} or "/" in decoded or "\\" in decoded:
         raise ValueError(f"Invalid HuggingFace {field_name} path component: {decoded!r}")
+    if _IS_WINDOWS:
+        reserved_stem = decoded.split(".", 1)[0].rstrip(" .").upper()
+        if (
+            decoded[-1] in {" ", "."}
+            or any(character in '<>:"|?*' for character in decoded)
+            or reserved_stem in _WINDOWS_RESERVED_FILE_STEMS
+        ):
+            raise ValueError(f"Invalid HuggingFace {field_name} path component on Windows: {decoded!r}")
     return decoded
 
 
 def _decode_huggingface_revision(raw_component: str) -> str:
-    decoded = unquote(raw_component)
+    decoded = _decode_huggingface_url_component(raw_component, "revision")
     revision_parts = decoded.split("/")
     if "\\" in decoded or any(not part or part in {".", ".."} for part in revision_parts):
         raise ValueError(f"Invalid HuggingFace revision path component: {decoded!r}")
@@ -130,8 +162,15 @@ def is_huggingface_file_url(url: str) -> bool:
 def parse_huggingface_file_url(url: str) -> tuple[str, str, str]:
     """Parse a HuggingFace file URL to extract repo_id, branch, and filename."""
     parsed = urlparse(url)
-    if parsed.hostname not in ["huggingface.co", "hf.co"]:
+    if parsed.scheme not in {"http", "https"} or parsed.hostname not in ["huggingface.co", "hf.co"]:
         raise ValueError(f"Not a HuggingFace URL: {redact_huggingface_url_for_display(url)}")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"Invalid HuggingFace URL authority: {redact_huggingface_url_for_display(url)}") from exc
+    expected_port = 443 if parsed.scheme == "https" else 80
+    if port is not None and port != expected_port:
+        raise ValueError(f"Invalid HuggingFace URL authority: {redact_huggingface_url_for_display(url)}")
 
     raw_path = parsed.path[1:] if parsed.path.startswith("/") else parsed.path
     if not raw_path or raw_path.startswith("/") or raw_path.endswith("/") or "//" in raw_path:
@@ -151,6 +190,8 @@ def parse_huggingface_file_url(url: str) -> tuple[str, str, str]:
         repo_id = f"{namespace}/{repo_name}"
     else:
         repo_id = _decode_huggingface_repo_component(path_parts[0], "repository")
+    if len(repo_id) > _HF_REPO_ID_MAX_LENGTH:
+        raise ValueError(f"Invalid HuggingFace repository ID length: {len(repo_id)}")
 
     branch = _decode_huggingface_revision(path_parts[resolve_index + 1])
     filename = "/".join(

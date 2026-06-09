@@ -19,9 +19,14 @@ from modelaudit.scanner_selection import (
     selected_scanner_extensions,
     selected_scanner_filenames,
 )
-from modelaudit.utils.file.detection import _XML_MODEL_SIGNATURE_READ_BYTES, JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES
+from modelaudit.utils.file.detection import (
+    _XML_MODEL_SIGNATURE_READ_BYTES,
+    JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES,
+    PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+)
 from modelaudit.utils.helpers.retry import RetryError
 from modelaudit.utils.sources.cloud_storage import (
+    _CLOUD_CONTENT_SNIFF_BYTES,
     GCSCache,
     _build_safe_local_path,
     _filter_scannable_cloud_files,
@@ -826,6 +831,12 @@ def test_filter_scannable_files_handles_signed_cloud_urls() -> None:
     ("filename", "payload", "expected_format"),
     [
         pytest.param("evil.payload", b'cos\nsystem\n(S"echo pwned"\ntR.', "pickle", id="protocol0-pickle"),
+        pytest.param(
+            "delayed.payload",
+            (b"\x8c\x01x0" * 8) + b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94\x8c\x02id\x94\x85\x94R\x94.",
+            "pickle",
+            id="delayed-protocolless-binary-pickle",
+        ),
         pytest.param("archive.payload", make_tar_payload(), "tar", id="tar"),
         pytest.param(
             "model.payload",
@@ -884,6 +895,31 @@ def test_filter_scannable_cloud_files_includes_content_routed_objects(
     files = [{"path": url, "name": filename, "size": len(payload), "human_size": f"{len(payload)} B"}]
 
     assert _filter_scannable_cloud_files(files, fs=fs) == [{**files[0], "content_detected_format": expected_format}]
+
+
+def test_filter_scannable_cloud_files_preserves_inconclusive_protocolless_pickle_prefix() -> None:
+    url = "s3://bucket/models/delayed.payload"
+    payload = (
+        b"\x8c\x01x0" * (_CLOUD_CONTENT_SNIFF_BYTES // 4)
+    ) + b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94\x8c\x02id\x94\x85\x94R\x94."
+    fs = make_fs_mock()
+    configure_remote_open_payloads(fs, {url: payload})
+    files = [{"path": url, "name": "delayed.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+    scanner_policy = resolve_scanner_selection_policy(scanners=["pickle"])
+
+    actual = _filter_scannable_cloud_files(
+        files,
+        fs=fs,
+        scannable_extensions=selected_scanner_extensions(scanner_policy, conservative=True),
+        scanner_selection=scanner_policy.to_config(),
+    )
+
+    assert actual == [
+        {
+            **files[0],
+            "content_detected_format": PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+        }
+    ]
 
 
 @pytest.mark.parametrize(
