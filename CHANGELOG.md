@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- preserve scanner read caps when core max_file_size is unlimited
 - route security-relevant protocol-less binary pickle streams through pickle analysis even when file suffixes are misleading
 - redact proxy and camel-case authorization evidence with scheme-bearing values without hiding benign counters
 - bound Keras ZIP config traversal for CVE detectors and fail closed when config.json coverage budgets are exhausted

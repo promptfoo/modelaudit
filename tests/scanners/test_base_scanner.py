@@ -415,11 +415,27 @@ def test_base_scanner_explicit_zero_read_limit_keeps_opt_out(tmp_path: Path) -> 
     assert result is None
 
 
-def test_base_scanner_inherits_core_max_file_size_unlimited() -> None:
-    """Core-level unlimited max_file_size should keep scanner read caps unlimited."""
+def test_base_scanner_core_max_file_size_unlimited_keeps_default_read_cap() -> None:
+    """Core-level unlimited max_file_size should not disable scanner read caps."""
     scanner = TinyReadLimitScanner(config={"max_file_size": 0})
 
-    assert scanner.max_file_read_size == 0
+    assert scanner.max_file_read_size == TinyReadLimitScanner.default_max_file_read_size
+
+
+def test_base_scanner_core_max_file_size_unlimited_still_fails_closed(tmp_path: Path) -> None:
+    """Default read caps should still apply when the core file-size limit is unlimited."""
+    scanner = TinyReadLimitScanner(config={"max_file_size": 0})
+    file_path = tmp_path / "large.test"
+    file_path.write_bytes(b"this is too long")
+
+    result = scanner._check_size_limit(str(file_path))
+
+    assert isinstance(result, ScanResult)
+    checks = {check.name: check for check in result.checks}
+    assert checks["File Size Limit"].status == CheckStatus.FAILED
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "max_file_read_size_exceeded" in result.metadata["scan_outcome_reasons"]
 
 
 def test_base_scanner_explicit_read_limit_overrides_core_file_size() -> None:
