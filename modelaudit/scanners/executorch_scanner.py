@@ -34,6 +34,10 @@ _ZIP_CENTRAL_DIRECTORY_SIGNATURE: Final[bytes] = b"PK\x01\x02"
 _ZIP_CENTRAL_DIRECTORY_HEADER_SIZE: Final[int] = 46
 _ZIP_CENTRAL_DIRECTORY_DIGITAL_SIGNATURE: Final[bytes] = b"PK\x05\x05"
 _ZIP_CENTRAL_DIRECTORY_DIGITAL_SIGNATURE_HEADER_SIZE: Final[int] = 6
+_ZIP_PREAMBLE_SCAN_CHUNK_SIZE: Final[int] = 64 * 1024
+_ZIP_MAX_PREAMBLE_EOCD_CANDIDATES: Final[int] = 64
+_ZIP_SNAPSHOT_MEMORY_LIMIT: Final[int] = 8 * 1024 * 1024
+_ZIP_SNAPSHOT_CHUNK_SIZE: Final[int] = 1024 * 1024
 PYTORCH_BINARY_PRIMARY_SCANNED_CONFIG_KEY = "_pytorch_binary_primary_scanned"
 
 
@@ -55,6 +59,7 @@ class ExecuTorchScanner(BaseScanner):
     ZIP_AGGREGATE_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "executorch_zip_total_uncompressed_size_limit"
     ZIP_PICKLE_MEMBER_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "executorch_zip_pickle_member_size_limit"
     ZIP_COMPRESSION_RATIO_INCONCLUSIVE_REASON: ClassVar[str] = "executorch_zip_compression_ratio_limit"
+    ZIP_PICKLE_MEMBER_READ_INCONCLUSIVE_REASON: ClassVar[str] = "executorch_zip_pickle_member_read_failed"
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
@@ -166,6 +171,7 @@ class ExecuTorchScanner(BaseScanner):
         directory_start: int,
         directory_size: int,
         entry_limit: int,
+        local_header_offsets: list[int] | None = None,
     ) -> tuple[int, bool]:
         """Count bounded central-directory records without constructing ZipInfo objects."""
         if directory_start < 0 or directory_size < 0:
@@ -202,6 +208,8 @@ class ExecuTorchScanner(BaseScanner):
             filename_length = int.from_bytes(header[28:30], "little")
             extra_length = int.from_bytes(header[30:32], "little")
             comment_length = int.from_bytes(header[32:34], "little")
+            if local_header_offsets is not None:
+                local_header_offsets.append(int.from_bytes(header[42:46], "little"))
             record_size = _ZIP_CENTRAL_DIRECTORY_HEADER_SIZE + filename_length + extra_length + comment_length
             if record_size > remaining:
                 return entry_count, False
@@ -213,6 +221,152 @@ class ExecuTorchScanner(BaseScanner):
             remaining -= record_size
 
         return entry_count, True
+
+    @classmethod
+    def _has_prior_valid_zip_in_preamble(
+        cls,
+        handle: BinaryIO,
+        *,
+        preamble_end: int,
+        entry_limit: int,
+        central_directory_size_limit: int,
+    ) -> bool:
+        """Detect a complete ZIP hidden before the selected archive's first member."""
+        if preamble_end < _ZIP_EOCD_MIN_SIZE:
+            return False
+
+        overlap = b""
+        position = 0
+        last_candidate_offset = -1
+        candidate_count = 0
+        while position < preamble_end:
+            handle.seek(position)
+            chunk = handle.read(min(_ZIP_PREAMBLE_SCAN_CHUNK_SIZE, preamble_end - position))
+            if not chunk:
+                break
+            window = overlap + chunk
+            window_start = position - len(overlap)
+            search_start = 0
+            while True:
+                candidate_index = window.find(_ZIP_EOCD_SIGNATURE, search_start)
+                if candidate_index < 0:
+                    break
+                search_start = candidate_index + 1
+                candidate_offset = window_start + candidate_index
+                if candidate_offset <= last_candidate_offset:
+                    continue
+                last_candidate_offset = candidate_offset
+                candidate_count += 1
+                if candidate_count > _ZIP_MAX_PREAMBLE_EOCD_CANDIDATES:
+                    return True
+
+                handle.seek(candidate_offset)
+                eocd = handle.read(_ZIP_EOCD_MIN_SIZE)
+                if len(eocd) != _ZIP_EOCD_MIN_SIZE:
+                    continue
+                comment_length = int.from_bytes(eocd[20:22], "little")
+                if candidate_offset + _ZIP_EOCD_MIN_SIZE + comment_length > preamble_end:
+                    continue
+
+                entry_count = int.from_bytes(eocd[10:12], "little")
+                directory_size = int.from_bytes(eocd[12:16], "little")
+                if cls._has_valid_prior_zip64_directory(
+                    handle,
+                    eocd_offset=candidate_offset,
+                    entry_limit=entry_limit,
+                    central_directory_size_limit=central_directory_size_limit,
+                ):
+                    return True
+                if entry_count == _ZIP64_SENTINEL_ENTRY_COUNT:
+                    continue
+                if directory_size == 0:
+                    continue
+
+                directory_start = candidate_offset - directory_size
+                if directory_start < 0:
+                    continue
+                if directory_size > central_directory_size_limit:
+                    handle.seek(directory_start)
+                    if handle.read(4) == _ZIP_CENTRAL_DIRECTORY_SIGNATURE:
+                        return True
+                    continue
+                parsed_count, parsed_completely = cls._count_central_directory_entries(
+                    handle,
+                    directory_start=directory_start,
+                    directory_size=directory_size,
+                    entry_limit=entry_limit,
+                )
+                if parsed_count > entry_limit or (parsed_completely and parsed_count > 0):
+                    return True
+
+            overlap = window[-(_ZIP_EOCD_MIN_SIZE - 1) :]
+            position += len(chunk)
+        return False
+
+    @classmethod
+    def _has_valid_prior_zip64_directory(
+        cls,
+        handle: BinaryIO,
+        *,
+        eocd_offset: int,
+        entry_limit: int,
+        central_directory_size_limit: int,
+    ) -> bool:
+        locator_offset = eocd_offset - _ZIP64_EOCD_LOCATOR_SIZE
+        if locator_offset < 0:
+            return False
+        handle.seek(locator_offset)
+        locator = handle.read(_ZIP64_EOCD_LOCATOR_SIZE)
+        if len(locator) != _ZIP64_EOCD_LOCATOR_SIZE or not locator.startswith(_ZIP64_EOCD_LOCATOR_SIGNATURE):
+            return False
+        if int.from_bytes(locator[4:8], "little") != 0 or int.from_bytes(locator[16:20], "little") != 1:
+            return False
+
+        stored_record_offset = int.from_bytes(locator[8:16], "little")
+        search_start = max(0, locator_offset - _ZIP_PREAMBLE_SCAN_CHUNK_SIZE)
+        handle.seek(search_start)
+        record_window = handle.read(locator_offset - search_start)
+        candidate_offsets = [stored_record_offset]
+        search_index = 0
+        while True:
+            record_index = record_window.find(_ZIP64_EOCD_SIGNATURE, search_index)
+            if record_index < 0:
+                break
+            candidate_offsets.append(search_start + record_index)
+            search_index = record_index + 1
+
+        for record_offset in dict.fromkeys(candidate_offsets):
+            if record_offset < 0 or record_offset >= locator_offset:
+                continue
+            handle.seek(record_offset)
+            record = handle.read(_ZIP64_EOCD_MIN_SIZE)
+            if len(record) != _ZIP64_EOCD_MIN_SIZE or not record.startswith(_ZIP64_EOCD_SIGNATURE):
+                continue
+            record_size = int.from_bytes(record[4:12], "little")
+            if record_size < _ZIP64_EOCD_MIN_SIZE - 12 or record_offset + 12 + record_size != locator_offset:
+                continue
+            if int.from_bytes(record[16:20], "little") != 0 or int.from_bytes(record[20:24], "little") != 0:
+                continue
+            directory_size = int.from_bytes(record[40:48], "little")
+            if directory_size == 0:
+                continue
+            directory_start = record_offset - directory_size
+            if directory_start < 0:
+                continue
+            if directory_size > central_directory_size_limit:
+                handle.seek(directory_start)
+                if handle.read(4) == _ZIP_CENTRAL_DIRECTORY_SIGNATURE:
+                    return True
+                continue
+            parsed_count, parsed_completely = cls._count_central_directory_entries(
+                handle,
+                directory_start=directory_start,
+                directory_size=directory_size,
+                entry_limit=entry_limit,
+            )
+            if parsed_count > entry_limit or (parsed_completely and parsed_count > 0):
+                return True
+        return False
 
     @classmethod
     def _has_prior_valid_eocd_overlay(
@@ -289,6 +443,7 @@ class ExecuTorchScanner(BaseScanner):
 
         entry_count = int.from_bytes(tail[eocd_index + 10 : eocd_index + 12], "little")
         central_directory_size = int.from_bytes(tail[eocd_index + 12 : eocd_index + 16], "little")
+        central_directory_offset = int.from_bytes(tail[eocd_index + 16 : eocd_index + 20], "little")
         tail_start = file_size - tail_size
         if eocd_ambiguous or cls._has_prior_valid_eocd_overlay(
             handle,
@@ -330,18 +485,37 @@ class ExecuTorchScanner(BaseScanner):
 
                 entry_count = int.from_bytes(zip64_eocd[32:40], "little")
                 central_directory_size = int.from_bytes(zip64_eocd[40:48], "little")
+                central_directory_offset = int.from_bytes(zip64_eocd[48:56], "little")
 
         if entry_count == _ZIP64_SENTINEL_ENTRY_COUNT and not zip64_locator_found:
             return entry_count, central_directory_size, False
         if entry_count > entry_limit or central_directory_size > central_directory_size_limit:
             return entry_count, central_directory_size, True
 
+        central_directory_start = central_directory_end - central_directory_size
+        if central_directory_start < 0 or central_directory_offset > central_directory_start:
+            return entry_count, central_directory_size, False
+
+        local_header_offsets: list[int] = []
         parsed_entry_count, parsed_completely = cls._count_central_directory_entries(
             handle,
-            directory_start=central_directory_end - central_directory_size,
+            directory_start=central_directory_start,
             directory_size=central_directory_size,
             entry_limit=entry_limit,
+            local_header_offsets=local_header_offsets,
         )
+        archive_prefix_size = central_directory_start - central_directory_offset
+        finite_local_offsets = [offset for offset in local_header_offsets if offset != 0xFFFFFFFF]
+        preamble_end = archive_prefix_size + min(finite_local_offsets, default=0)
+        if preamble_end < 0 or preamble_end > central_directory_start:
+            return max(entry_count, parsed_entry_count), central_directory_size, False
+        if cls._has_prior_valid_zip_in_preamble(
+            handle,
+            preamble_end=preamble_end,
+            entry_limit=entry_limit,
+            central_directory_size_limit=central_directory_size_limit,
+        ):
+            return max(entry_count, parsed_entry_count), central_directory_size, False
         return (
             max(entry_count, parsed_entry_count),
             central_directory_size,
@@ -367,6 +541,124 @@ class ExecuTorchScanner(BaseScanner):
         )
         result.finish(success=False)
         return result
+
+    def _check_opened_file_size_limit(
+        self,
+        result: ScanResult,
+        path: str,
+        archive_handle: BinaryIO,
+    ) -> tuple[os.stat_result, ScanResult | None]:
+        """Revalidate the archive size on the descriptor used for parsing."""
+        opened_stat = os.fstat(archive_handle.fileno())
+        opened_file_size = opened_stat.st_size
+        result.checks = [check for check in result.checks if check.name != "File Size Limit"]
+        result.metadata["file_size"] = opened_file_size
+
+        if self.max_file_read_size > 0 and opened_file_size > self.max_file_read_size:
+            mark_inconclusive_scan_result(result, "max_file_read_size_exceeded")
+            result.add_check(
+                name="File Size Limit",
+                passed=False,
+                message=f"File too large: {opened_file_size} bytes (max: {self.max_file_read_size})",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "file_size": opened_file_size,
+                    "max_file_read_size": self.max_file_read_size,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "max_file_read_size_exceeded",
+                },
+            )
+            result.finish(success=False)
+            return opened_stat, result
+
+        if self.max_file_read_size > 0:
+            result.add_check(
+                name="File Size Limit",
+                passed=True,
+                message="File size within limit",
+                location=path,
+                details={
+                    "file_size": opened_file_size,
+                    "max_file_read_size": self.max_file_read_size,
+                },
+            )
+        return opened_stat, None
+
+    @staticmethod
+    def _stable_stat_identity(stat_result: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            stat_result.st_ctime_ns,
+        )
+
+    @classmethod
+    def _snapshot_archive(
+        cls,
+        source_handle: BinaryIO,
+        opened_stat: os.stat_result,
+    ) -> BinaryIO:
+        """Copy one stable archive view before parsing attacker-controlled metadata."""
+        snapshot = cast(
+            BinaryIO,
+            tempfile.SpooledTemporaryFile(max_size=_ZIP_SNAPSHOT_MEMORY_LIMIT, mode="w+b"),  # noqa: SIM115
+        )
+        try:
+            source_handle.seek(0)
+            remaining = opened_stat.st_size
+            while remaining > 0:
+                chunk = source_handle.read(min(_ZIP_SNAPSHOT_CHUNK_SIZE, remaining))
+                if not chunk:
+                    raise OSError("ExecuTorch archive changed while creating a private snapshot")
+                snapshot.write(chunk)
+                remaining -= len(chunk)
+            if source_handle.read(1):
+                raise OSError("ExecuTorch archive grew while creating a private snapshot")
+            final_stat = os.fstat(source_handle.fileno())
+            if cls._stable_stat_identity(final_stat) != cls._stable_stat_identity(opened_stat):
+                raise OSError("ExecuTorch archive changed while creating a private snapshot")
+            snapshot.seek(0)
+            return snapshot
+        except Exception:
+            snapshot.close()
+            raise
+
+    @classmethod
+    def _source_changed_after_snapshot(
+        cls,
+        source_handle: BinaryIO,
+        opened_stat: os.stat_result,
+        path: str,
+    ) -> bool:
+        try:
+            descriptor_stat = os.fstat(source_handle.fileno())
+            path_stat = os.stat(path)
+        except OSError:
+            return True
+        expected = cls._stable_stat_identity(opened_stat)
+        return (
+            cls._stable_stat_identity(descriptor_stat) != expected or cls._stable_stat_identity(path_stat) != expected
+        )
+
+    @staticmethod
+    def _add_source_changed_failure(result: ScanResult, path: str) -> None:
+        reason = "executorch_file_changed_during_scan"
+        mark_inconclusive_scan_result(result, reason)
+        result.add_check(
+            name="ExecuTorch File Stability",
+            passed=False,
+            message="ExecuTorch archive changed while it was being scanned; refusing a stale success result",
+            severity=IssueSeverity.WARNING,
+            location=path,
+            details={
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+            rule_code="S902",
+        )
 
     @classmethod
     def _add_zip_budget_failure(
@@ -655,7 +947,7 @@ class ExecuTorchScanner(BaseScanner):
                 message=(
                     f"ExecuTorch ZIP total uncompressed size exceeds limit "
                     f"({safe_uncompressed_size} > {self.max_total_uncompressed_size} bytes); "
-                    "limiting pickle member content scans to the configured budget"
+                    "continuing only bounded pickle member scans"
                 ),
                 details={
                     "archive_uncompressed_size": safe_uncompressed_size,
@@ -687,20 +979,20 @@ class ExecuTorchScanner(BaseScanner):
         result: ScanResult,
         pickle_entries: list[zipfile.ZipInfo],
     ) -> tuple[list[zipfile.ZipInfo], bool]:
-        bytes_selected = 0
-        scannable_entries: list[zipfile.ZipInfo] = []
-        skipped_entries: list[zipfile.ZipInfo] = []
+        """Keep pickle scanning bounded while preserving earlier detections."""
+        selected_entries: list[zipfile.ZipInfo] = []
+        skipped_entry_count = 0
+        selected_uncompressed_size = 0
         for entry in pickle_entries:
-            if bytes_selected + entry.file_size > self.max_total_uncompressed_size:
-                skipped_entries.append(entry)
+            if entry.file_size > self.max_total_uncompressed_size - selected_uncompressed_size:
+                skipped_entry_count += 1
                 continue
-            scannable_entries.append(entry)
-            bytes_selected += entry.file_size
+            selected_entries.append(entry)
+            selected_uncompressed_size += entry.file_size
 
-        result.metadata["executorch_zip_pickle_scan_uncompressed_size"] = bytes_selected
-        if skipped_entries:
-            result.metadata["executorch_zip_skipped_pickle_files"] = [entry.filename for entry in skipped_entries[:20]]
-        return scannable_entries, bool(skipped_entries)
+        result.metadata["executorch_zip_pickle_scan_uncompressed_size"] = selected_uncompressed_size
+        result.metadata["executorch_zip_pickle_aggregate_skipped_count"] = skipped_entry_count
+        return selected_entries, skipped_entry_count > 0
 
     @staticmethod
     def _add_python_entry_checks(result: ScanResult, path: str, safe_entries: list[zipfile.ZipInfo]) -> None:
@@ -817,10 +1109,20 @@ class ExecuTorchScanner(BaseScanner):
             result.finish(success=False)
             return result
 
+        source_handle: BinaryIO | None = None
         archive_handle: BinaryIO | None = None
+        opened_stat: os.stat_result | None = None
         try:
-            # Kept open across preflight and ZipFile to prevent path-reopen races.
-            archive_handle = Path(path).open("rb")  # noqa: SIM115
+            source_handle = Path(path).open("rb")  # noqa: SIM115
+            opened_stat, opened_size_result = self._check_opened_file_size_limit(
+                result,
+                path,
+                source_handle,
+            )
+            if opened_size_result:
+                return opened_size_result
+            file_size = opened_stat.st_size
+            archive_handle = self._snapshot_archive(source_handle, opened_stat)
             preflight_result = self._check_zip_entry_count_preflight(result, path, archive_handle, file_size)
             if preflight_result:
                 return preflight_result
@@ -862,22 +1164,22 @@ class ExecuTorchScanner(BaseScanner):
                 pickle_entries = [entry for entry in safe_entries if entry.filename.casefold().endswith(".pkl")]
                 pickle_files = [entry.filename for entry in pickle_entries]
                 result.metadata["pickle_files"] = pickle_files
-                pickle_entries, member_coverage_incomplete = self._check_pickle_member_budgets(
+                pickle_entries, member_budget_incomplete = self._check_pickle_member_budgets(
                     result,
                     path,
                     pickle_entries,
                 )
-                pickle_entries, aggregate_pickle_coverage_incomplete = self._limit_pickle_entries_to_aggregate_budget(
-                    result, pickle_entries
+                pickle_entries, aggregate_pickle_budget_incomplete = self._limit_pickle_entries_to_aggregate_budget(
+                    result,
+                    pickle_entries,
                 )
                 pickle_coverage_incomplete = (
-                    aggregate_coverage_incomplete or member_coverage_incomplete or aggregate_pickle_coverage_incomplete
+                    aggregate_coverage_incomplete or member_budget_incomplete or aggregate_pickle_budget_incomplete
                 )
                 bytes_scanned = 0
 
                 for member_info in pickle_entries:
                     name = member_info.filename
-                    bytes_scanned += member_info.file_size
                     if self.pickle_scanner is None:
                         add_scanner_selection_skip_check(
                             result,
@@ -888,16 +1190,41 @@ class ExecuTorchScanner(BaseScanner):
                         )
                         continue
 
-                    with z.open(member_info, "r") as file_like:
-                        sub_result = self.pickle_scanner.scan_stream(
-                            cast(BinaryIO, file_like),
-                            member_info.file_size,
-                            source=f"{path}:{name}",
+                    try:
+                        with z.open(member_info, "r") as file_like:
+                            sub_result = self.pickle_scanner.scan_stream(
+                                cast(BinaryIO, file_like),
+                                member_info.file_size,
+                                source=f"{path}:{name}",
+                            )
+                    except Exception as exc:
+                        display_name = name[:256]
+                        self._add_zip_budget_failure(
+                            result,
+                            path,
+                            check_name="ExecuTorch ZIP Pickle Member Read",
+                            message=(
+                                f"Unable to scan ExecuTorch pickle member {display_name}; "
+                                "continuing with remaining members"
+                            ),
+                            details={
+                                "member": display_name,
+                                "exception": str(exc)[:512],
+                                "exception_type": type(exc).__name__,
+                            },
+                            reason=self.ZIP_PICKLE_MEMBER_READ_INCONCLUSIVE_REASON,
+                            rule_code="S902",
                         )
+                        pickle_coverage_incomplete = True
+                        continue
+                    bytes_scanned += member_info.file_size
                     apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
                     result.merge(sub_result)
 
                 result.bytes_scanned = bytes_scanned
+            if self._source_changed_after_snapshot(source_handle, opened_stat, path):
+                self._add_source_changed_failure(result, path)
+                pickle_coverage_incomplete = True
         except zipfile.BadZipFile:
             result.add_check(
                 name="ZIP File Format Validation",
@@ -930,6 +1257,8 @@ class ExecuTorchScanner(BaseScanner):
         finally:
             if archive_handle is not None:
                 archive_handle.close()
+            if source_handle is not None:
+                source_handle.close()
 
         if valid_binary_program or not header.startswith(b"PK"):
             self._merge_raw_binary_analysis(path, result, file_size)

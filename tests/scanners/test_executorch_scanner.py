@@ -11,7 +11,13 @@ from modelaudit import core
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.scanners.archive_dispatch import scan_nested_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.executorch_scanner import ExecuTorchScanner
+from modelaudit.scanners.executorch_scanner import (
+    _ZIP64_EOCD_LOCATOR_SIGNATURE,
+    _ZIP_EOCD_MIN_SIZE,
+    _ZIP_EOCD_SIGNATURE,
+    _ZIP_MAX_COMMENT_SIZE,
+    ExecuTorchScanner,
+)
 from modelaudit.scanners.pytorch_binary_scanner import PyTorchBinaryScanner
 from modelaudit.utils.file.detection import detect_file_format
 
@@ -85,6 +91,28 @@ def _corrupt_zip_member_crc(zip_path: Path, member_index: int) -> None:
         filename_len, extra_len, comment_len = struct.unpack_from("<HHH", archive_bytes, cursor + 28)
         if local_header_offset == member_info.header_offset:
             struct.pack_into("<I", archive_bytes, cursor + 16, corrupt_crc)
+            zip_path.write_bytes(archive_bytes)
+            return
+        cursor += 46 + filename_len + extra_len + comment_len
+
+    raise AssertionError(f"Unable to locate central directory entry at offset {member_info.header_offset}")
+
+
+def _patch_zip_member_compression_method(zip_path: Path, member_index: int, method: int) -> None:
+    """Patch one ZIP member to use an unsupported compression method."""
+    with zipfile.ZipFile(zip_path, "r") as zip_file:
+        member_info = zip_file.infolist()[member_index]
+        central_directory_offset = zip_file.start_dir
+
+    archive_bytes = bytearray(zip_path.read_bytes())
+    struct.pack_into("<H", archive_bytes, member_info.header_offset + 8, method)
+
+    cursor = central_directory_offset
+    while cursor < len(archive_bytes) and archive_bytes[cursor : cursor + 4] == b"PK\x01\x02":
+        local_header_offset = struct.unpack_from("<I", archive_bytes, cursor + 42)[0]
+        filename_len, extra_len, comment_len = struct.unpack_from("<HHH", archive_bytes, cursor + 28)
+        if local_header_offset == member_info.header_offset:
+            struct.pack_into("<H", archive_bytes, cursor + 10, method)
             zip_path.write_bytes(archive_bytes)
             return
         cursor += 46 + filename_len + extra_len + comment_len
@@ -807,6 +835,122 @@ def test_executorch_zip_entry_preflight_rejects_trailing_eocd_overlay(
     assert "executorch_zip_central_directory_invalid" in result.metadata["scan_outcome_reasons"]
 
 
+def test_executorch_zip_entry_preflight_rejects_prior_archive_outside_eocd_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "hidden-prior-archive.ptl"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("hidden.pkl", _pickle_payload_with_eval("print('evil')"))
+    model_path.write_bytes(
+        b"X"
+        + model_path.read_bytes()
+        + (b"A" * (_ZIP_MAX_COMMENT_SIZE + _ZIP_EOCD_MIN_SIZE + 1))
+        + _ZIP_EOCD_SIGNATURE
+        + (b"\x00" * 18)
+    )
+    with zipfile.ZipFile(model_path, "r") as zipf:
+        assert zipf.namelist() == []
+
+    def reject_zipfile_open(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("hidden prior archive should fail before ZipFile opens")
+
+    monkeypatch.setattr(zipfile, "ZipFile", reject_zipfile_open)
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "executorch_zip_central_directory_invalid" in result.metadata["scan_outcome_reasons"]
+
+
+def test_executorch_zip_entry_preflight_rejects_prior_archive_with_forged_zero_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "hidden-prior-zero-count.ptl"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("hidden.pkl", _pickle_payload_with_eval("print('evil')"))
+    _patch_zip_eocd_metadata(model_path, entry_count=0)
+    prior_archive = bytearray(model_path.read_bytes())
+    prior_eocd = prior_archive.rfind(_ZIP_EOCD_SIGNATURE)
+    assert prior_eocd >= 0
+    struct.pack_into("<HH", prior_archive, prior_eocd + 4, 1, 2)
+    model_path.write_bytes(
+        prior_archive + (b"A" * (_ZIP_MAX_COMMENT_SIZE + _ZIP_EOCD_MIN_SIZE + 1)) + _ZIP_EOCD_SIGNATURE + (b"\x00" * 18)
+    )
+    with zipfile.ZipFile(model_path, "r") as zipf:
+        assert zipf.namelist() == []
+
+    def reject_zipfile_open(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("forged prior count should fail before ZipFile opens")
+
+    monkeypatch.setattr(zipfile, "ZipFile", reject_zipfile_open)
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert "executorch_zip_central_directory_invalid" in result.metadata["scan_outcome_reasons"]
+
+
+def test_executorch_zip_entry_preflight_rejects_prior_zip64_archive_with_legacy_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "hidden-prior-zip64.ptl"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("hidden.pkl", _pickle_payload_with_eval("print('evil')"))
+    _insert_zip64_directory_metadata(model_path, entry_count=2, legacy_entry_count=2)
+    prior_archive = bytearray(model_path.read_bytes())
+    zip64_eocd = prior_archive.find(b"PK\x06\x06")
+    assert zip64_eocd >= 0
+    struct.pack_into("<QQ", prior_archive, zip64_eocd + 24, 0, 0)
+    model_path.write_bytes(
+        b"X"
+        + prior_archive
+        + (b"A" * (_ZIP_MAX_COMMENT_SIZE + _ZIP_EOCD_MIN_SIZE + 1))
+        + _ZIP_EOCD_SIGNATURE
+        + (b"\x00" * 18)
+    )
+    with zipfile.ZipFile(model_path, "r") as zipf:
+        assert zipf.namelist() == []
+
+    def reject_zipfile_open(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("hidden prior ZIP64 archive should fail before ZipFile opens")
+
+    monkeypatch.setattr(zipfile, "ZipFile", reject_zipfile_open)
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert "executorch_zip_central_directory_invalid" in result.metadata["scan_outcome_reasons"]
+
+
+def test_executorch_zip_entry_preflight_allows_preamble_eocd_near_match(tmp_path: Path) -> None:
+    model_path = create_executorch_archive(tmp_path)
+    near_match = b"launcher" + _ZIP_EOCD_SIGNATURE + (b"\x00" * 18) + b"payload"
+    model_path.write_bytes(near_match + model_path.read_bytes())
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert "executorch_zip_central_directory_invalid" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_executorch_zip_entry_preflight_allows_preamble_zip64_locator_near_match(tmp_path: Path) -> None:
+    model_path = create_executorch_archive(tmp_path)
+    near_match = b"launcher" + _ZIP64_EOCD_LOCATOR_SIGNATURE + (b"\x00" * 16) + _ZIP_EOCD_SIGNATURE + (b"\x00" * 18)
+    model_path.write_bytes(near_match + model_path.read_bytes())
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert "executorch_zip_central_directory_invalid" not in result.metadata.get("scan_outcome_reasons", [])
+
+
 def test_executorch_zip_entry_preflight_ignores_unstructured_member_eocd_near_match(tmp_path: Path) -> None:
     model_path = tmp_path / "member-eocd-near-match.ptl"
     eocd_near_match = struct.pack(
@@ -989,36 +1133,77 @@ def test_executorch_zip_entry_limit_fails_after_open_when_preflight_unavailable(
     )
 
 
-def test_executorch_zip_aggregate_limit_fails_before_member_content_scan(
+def test_executorch_zip_rechecks_size_from_opened_descriptor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    model_path = tmp_path / "split-size-bomb.ptl"
-    with zipfile.ZipFile(model_path, "w") as zipf:
+    model_path = tmp_path / "swapped-large.ptl"
+    with zipfile.ZipFile(model_path, "w", compression=zipfile.ZIP_STORED) as zipf:
         zipf.writestr("version", "1")
-        zipf.writestr("bytecode.pkl", _pickle_payload_with_eval("print('evil')"))
-        zipf.writestr("weights.bin", b"A" * 32)
+        zipf.writestr("weights.bin", b"A" * 4096)
 
-    scanner = ExecuTorchScanner(config={"max_executorch_zip_total_uncompressed_size": 16})
-    assert scanner.pickle_scanner is not None
+    opened_size = model_path.stat().st_size
+    scanner = ExecuTorchScanner(config={"max_file_read_size": opened_size - 1})
+    monkeypatch.setattr(scanner, "get_file_size", lambda _path: 1)
 
-    def reject_pickle_scan(*_args: Any, **_kwargs: Any) -> Any:
-        raise AssertionError("aggregate-size preflight should stop before scanning pickle members")
+    def reject_zipfile_open(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("descriptor size limit must fail before ZipFile opens")
 
-    monkeypatch.setattr(scanner.pickle_scanner, "scan_stream", reject_pickle_scan)
+    monkeypatch.setattr(zipfile, "ZipFile", reject_zipfile_open)
 
     result = scanner.scan(str(model_path))
 
     assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "executorch_zip_total_uncompressed_size_limit" in result.metadata["scan_outcome_reasons"]
-    assert result.metadata["executorch_zip_uncompressed_size"] > 16
+    assert result.metadata["file_size"] == opened_size
+    assert "max_file_read_size_exceeded" in result.metadata["scan_outcome_reasons"]
     assert any(
-        check.name == "ExecuTorch ZIP Aggregate Size Limit"
+        check.name == "File Size Limit"
         and check.status == CheckStatus.FAILED
-        and check.rule_code == "S410"
-        and check.details["archive_uncompressed_size"] > 16
-        and check.details["max_total_uncompressed_size"] == 16
+        and check.details["file_size"] == opened_size
+        and check.details["max_file_read_size"] == opened_size - 1
+        for check in result.checks
+    )
+
+
+def test_executorch_zip_private_snapshot_rejects_in_place_source_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "mutable-source.ptl"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("benign.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+    original_size = model_path.stat().st_size
+
+    replacement_path = tmp_path / "replacement.ptl"
+    with zipfile.ZipFile(replacement_path, "w", compression=zipfile.ZIP_STORED) as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("malicious.pkl", _pickle_payload_with_eval("print('evil')"))
+        zipf.writestr("weights.bin", b"A" * 4096)
+    replacement = replacement_path.read_bytes()
+
+    scanner = ExecuTorchScanner(config={"max_file_read_size": original_size})
+    original_preflight = scanner._check_zip_entry_count_preflight
+
+    def mutate_after_preflight(
+        result: ScanResult,
+        path: str,
+        archive_handle: BinaryIO,
+        file_size: int,
+    ) -> ScanResult | None:
+        preflight_result = original_preflight(result, path, archive_handle, file_size)
+        model_path.write_bytes(replacement)
+        return preflight_result
+
+    monkeypatch.setattr(scanner, "_check_zip_entry_count_preflight", mutate_after_preflight)
+
+    result = scanner.scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["file_size"] == original_size
+    assert "executorch_file_changed_during_scan" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "ExecuTorch File Stability" and check.status == CheckStatus.FAILED and check.rule_code == "S902"
         for check in result.checks
     )
 
@@ -1028,7 +1213,7 @@ def test_executorch_zip_aggregate_limit_preserves_scannable_member_detection(
     tmp_path: Path,
     malicious_first: bool,
 ) -> None:
-    model_path = tmp_path / "mixed-aggregate.ptl"
+    model_path = tmp_path / "split-size-bomb.ptl"
     malicious_payload = _pickle_payload_with_eval("print('evil')")
     benign_payload = pickle.dumps({"weights": b"A" * 4096})
     members = [
@@ -1037,8 +1222,7 @@ def test_executorch_zip_aggregate_limit_preserves_scannable_member_detection(
     ]
     if not malicious_first:
         members.reverse()
-
-    with zipfile.ZipFile(model_path, "w", compression=zipfile.ZIP_STORED) as zipf:
+    with zipfile.ZipFile(model_path, "w") as zipf:
         zipf.writestr("version", "1")
         for name, payload in members:
             zipf.writestr(name, payload)
@@ -1050,16 +1234,29 @@ def test_executorch_zip_aggregate_limit_preserves_scannable_member_detection(
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "executorch_zip_total_uncompressed_size_limit" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["executorch_zip_uncompressed_size"] > len(malicious_payload)
+    assert result.metadata["executorch_zip_pickle_scan_uncompressed_size"] == len(malicious_payload)
+    assert result.metadata["executorch_zip_pickle_aggregate_skipped_count"] == 1
     assert result.bytes_scanned == len(malicious_payload)
-    assert result.metadata["executorch_zip_skipped_pickle_files"] == ["benign.pkl"]
     assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
+    assert any(
+        check.name == "ExecuTorch ZIP Aggregate Size Limit"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S410"
+        and check.details["archive_uncompressed_size"] > len(malicious_payload)
+        and check.details["max_total_uncompressed_size"] == len(malicious_payload)
+        for check in result.checks
+    )
 
 
 def test_executorch_zip_aggregate_limit_allows_benign_near_match(tmp_path: Path) -> None:
     model_path = tmp_path / "aggregate-near-match.ptl"
+    first_payload = pickle.dumps({"weights": [1, 2, 3]})
+    second_payload = pickle.dumps({"weights": [4, 5, 6]})
     with zipfile.ZipFile(model_path, "w") as zipf:
         zipf.writestr("version", "1")
-        zipf.writestr("bytecode.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("first.pkl", first_payload)
+        zipf.writestr("second.pkl", second_payload)
         zipf.writestr("weights.bin", b"A" * 8)
 
     with zipfile.ZipFile(model_path, "r") as zipf:
@@ -1071,7 +1268,8 @@ def test_executorch_zip_aggregate_limit_allows_benign_near_match(tmp_path: Path)
 
     assert result.success is True
     assert result.metadata["executorch_zip_uncompressed_size"] == aggregate_limit
-    assert result.bytes_scanned > 0
+    assert result.bytes_scanned == len(first_payload) + len(second_payload)
+    assert result.metadata["executorch_zip_pickle_aggregate_skipped_count"] == 0
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(
         check.name == "ExecuTorch ZIP Aggregate Size Limit"
@@ -1230,8 +1428,8 @@ def test_executorch_zip_pickle_member_size_preserves_safe_member_detection(tmp_p
     oversized_payload = pickle.dumps({"weights": b"A" * 4096})
     with zipfile.ZipFile(model_path, "w", compression=zipfile.ZIP_STORED) as zipf:
         zipf.writestr("version", "1")
-        zipf.writestr("malicious.pkl", malicious_payload)
         zipf.writestr("oversized.pkl", oversized_payload)
+        zipf.writestr("malicious.pkl", malicious_payload)
 
     scanner = ExecuTorchScanner()
     assert scanner.pickle_scanner is not None
@@ -1424,6 +1622,26 @@ def test_executorch_unreadable_duplicate_pickle_is_inconclusive_and_scans_later_
 
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
+
+
+def test_executorch_unsupported_pickle_compression_is_inconclusive_and_scans_later_member(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "unsupported-compression.ptl"
+    malicious_payload = _pickle_payload_with_eval("print('evil')")
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("unreadable.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("malicious.pkl", malicious_payload)
+    _patch_zip_member_compression_method(model_path, 1, 99)
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "executorch_zip_pickle_member_read_failed" in result.metadata["scan_outcome_reasons"]
+    assert result.bytes_scanned == len(malicious_payload)
     assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
 
 

@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fsspec.implementations.memory import MemoryFileSystem
 
 from modelaudit.scanner_selection import (
     resolve_scanner_selection_policy,
@@ -35,6 +36,7 @@ from modelaudit.utils.sources.cloud_storage import (
     download_from_cloud,
     download_from_cloud_streaming,
     filter_scannable_files,
+    get_cloud_filesystem_config,
     get_cloud_object_size,
     get_fs_protocol,
     is_cleartext_cloud_url,
@@ -161,10 +163,26 @@ class TestCloudURLDetection:
             "s3://bucket/key",
             "gs://my-bucket/model.pt",
             "r2://data/model.bin",
+            "R2://data/model.bin",
             "https://bucket.s3.amazonaws.com/file",
+            "https://bucket.s3.us-west-2.amazonaws.com/file",
+            "https://s3.us-west-2.amazonaws.com/bucket/file",
+            "https://bucket.s3.cn-north-1.amazonaws.com.cn/file",
+            "https://s3.us-iso-east-1.c2s.ic.gov/bucket/file",
+            "https://bucket.s3.eusc-de-east-1.amazonaws.eu/file",
+            "https://bucket.s3-fips.us-east-1.amazonaws.com/file",
+            "https://s3-fips.us-east-1.amazonaws.com/bucket/file",
+            "https://bucket.s3-accelerate.amazonaws.com/file",
+            "https://bucket.s3-accelerate.dualstack.amazonaws.com/file",
             "HTTPS://BUCKET.S3.AMAZONAWS.COM/file",
             "https://storage.googleapis.com/bucket/file",
+            "https://storage.cloud.google.com/bucket/file",
+            "https://bucket.storage.googleapis.com/file",
             "https://account.r2.cloudflarestorage.com/bucket/file",
+            "https://bucket.account.r2.cloudflarestorage.com/file",
+            "https://bucket.s3.amazonaws.com/",
+            "https://bucket.storage.googleapis.com/",
+            "https://bucket.account.r2.cloudflarestorage.com/",
         ]
         for url in valid:
             assert is_cloud_url(url), f"Failed to detect {url}"
@@ -173,6 +191,15 @@ class TestCloudURLDetection:
         invalid = [
             "https://huggingface.co/model",
             "ftp://example.com/file",
+            "https://bucket.s3.us-west-2.amazonaws.com.evil.test/file",
+            "https://bucket.s3-fips.us-east-1.amazonaws.com.evil.test/file",
+            "https://bucket.s3-accelerate.amazonaws.com.evil.test/file",
+            "https://storage.googleapis.com.evil.test/bucket/file",
+            "https://bucket.storage.googleapis.com.evil.test/file",
+            "https://account.r2.cloudflarestorage.com.evil.test/bucket/file",
+            "https://s3.amazonaws.com/",
+            "https://storage.googleapis.com/",
+            "https://account.r2.cloudflarestorage.com/",
             "",  # empty
         ]
         for url in invalid:
@@ -182,12 +209,236 @@ class TestCloudURLDetection:
         ("url", "expected_protocol"),
         [
             ("HTTPS://BUCKET.S3.AMAZONAWS.COM/model.pkl", "s3"),
+            ("HTTPS://BUCKET.S3.US-WEST-2.AMAZONAWS.COM/model.pkl", "s3"),
+            ("HTTPS://S3.US-WEST-2.AMAZONAWS.COM/bucket/model.pkl", "s3"),
             ("HTTPS://STORAGE.GOOGLEAPIS.COM/bucket/model.pkl", "gcs"),
+            ("HTTPS://STORAGE.CLOUD.GOOGLE.COM/bucket/model.pkl", "gcs"),
+            ("HTTPS://BUCKET.STORAGE.GOOGLEAPIS.COM/model.pkl", "gcs"),
             ("HTTPS://ACCOUNT.R2.CLOUDFLARESTORAGE.COM/bucket/model.pkl", "s3"),
+            ("R2://ACCOUNT/bucket/model.pkl", "s3"),
+            ("https://s3.us-iso-east-1.c2s.ic.gov/bucket/model.pkl", "s3"),
+            ("https://bucket.s3.eusc-de-east-1.amazonaws.eu/model.pkl", "s3"),
         ],
     )
     def test_resolves_mixed_case_https_provider_hosts(self, url: str, expected_protocol: str) -> None:
         assert get_fs_protocol(url) == expected_protocol
+
+    @pytest.mark.parametrize(
+        ("url", "expected_protocol", "expected_path", "expected_args"),
+        [
+            (
+                "https://bucket.s3.us-west-2.amazonaws.com/models/model.pkl",
+                "s3",
+                "s3://bucket/models/model.pkl",
+                {"client_kwargs": {"endpoint_url": "https://s3.us-west-2.amazonaws.com"}},
+            ),
+            (
+                "https://s3.us-west-2.amazonaws.com/bucket/models/model.pkl",
+                "s3",
+                "s3://bucket/models/model.pkl",
+                {"client_kwargs": {"endpoint_url": "https://s3.us-west-2.amazonaws.com"}},
+            ),
+            (
+                "https://s3-fips.us-east-1.amazonaws.com/bucket/models/model.pkl",
+                "s3",
+                "s3://bucket/models/model.pkl",
+                {"client_kwargs": {"endpoint_url": "https://s3-fips.us-east-1.amazonaws.com"}},
+            ),
+            (
+                "https://bucket.s3-accelerate.amazonaws.com/models/model.pkl",
+                "s3",
+                "s3://bucket/models/model.pkl",
+                {
+                    "client_kwargs": {"endpoint_url": "https://s3-accelerate.amazonaws.com"},
+                    "config_kwargs": {"s3": {"addressing_style": "virtual"}},
+                },
+            ),
+            (
+                "https://bucket.s3.dualstack.us-west-2.amazonaws.com/models/model.pkl",
+                "s3",
+                "s3://bucket/models/model.pkl",
+                {"client_kwargs": {"endpoint_url": "https://s3.dualstack.us-west-2.amazonaws.com"}},
+            ),
+            (
+                "https://bucket.s3.us-iso-east-1.c2s.ic.gov/models/model.pkl",
+                "s3",
+                "s3://bucket/models/model.pkl",
+                {"client_kwargs": {"endpoint_url": "https://s3.us-iso-east-1.c2s.ic.gov"}},
+            ),
+            (
+                "https://s3.eusc-de-east-1.amazonaws.eu/bucket/models/model.pkl",
+                "s3",
+                "s3://bucket/models/model.pkl",
+                {"client_kwargs": {"endpoint_url": "https://s3.eusc-de-east-1.amazonaws.eu"}},
+            ),
+            (
+                "https://team.s3.archive.s3.us-west-2.amazonaws.com/models/model.pkl",
+                "s3",
+                "s3://team.s3.archive/models/model.pkl",
+                {"client_kwargs": {"endpoint_url": "https://s3.us-west-2.amazonaws.com"}},
+            ),
+            (
+                "https://team.s3.archive.s3-fips.us-gov-west-1.amazonaws.com/models/model.pkl",
+                "s3",
+                "s3://team.s3.archive/models/model.pkl",
+                {"client_kwargs": {"endpoint_url": "https://s3-fips.us-gov-west-1.amazonaws.com"}},
+            ),
+            (
+                "https://team.s3.archive.s3-accelerate.amazonaws.com/models/model.pkl",
+                "s3",
+                "s3://team.s3.archive/models/model.pkl",
+                {
+                    "client_kwargs": {"endpoint_url": "https://s3-accelerate.amazonaws.com"},
+                    "config_kwargs": {"s3": {"addressing_style": "virtual"}},
+                },
+            ),
+            (
+                "https://bucket.storage.googleapis.com/models/model.pkl",
+                "gcs",
+                "gcs://bucket/models/model.pkl",
+                {"token": "anon"},
+            ),
+            (
+                "https://storage.cloud.google.com/bucket/models/model.pkl",
+                "gcs",
+                "gcs://bucket/models/model.pkl",
+                {"token": "anon"},
+            ),
+            (
+                "https://account.r2.cloudflarestorage.com/bucket/models/model.pkl",
+                "s3",
+                "s3://bucket/models/model.pkl",
+                {"client_kwargs": {"endpoint_url": "https://account.r2.cloudflarestorage.com"}},
+            ),
+            (
+                "https://bucket.account.r2.cloudflarestorage.com/models/model.pkl",
+                "s3",
+                "s3://bucket/models/model.pkl",
+                {"client_kwargs": {"endpoint_url": "https://account.r2.cloudflarestorage.com"}},
+            ),
+            ("R2://bucket/models/model.pkl", "s3", "s3://bucket/models/model.pkl", {}),
+            ("S3://bucket/models/model.pkl", "s3", "s3://bucket/models/model.pkl", {}),
+            ("GS://bucket/models/model.pkl", "gcs", "gcs://bucket/models/model.pkl", {"token": "anon"}),
+            (
+                "https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=secret",
+                "https",
+                "https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=secret",
+                {},
+            ),
+        ],
+    )
+    def test_normalizes_provider_urls_for_fsspec(
+        self,
+        url: str,
+        expected_protocol: str,
+        expected_path: str,
+        expected_args: dict[str, object],
+    ) -> None:
+        assert get_cloud_filesystem_config(url) == (expected_protocol, expected_path, expected_args)
+
+    @pytest.mark.parametrize(
+        ("url", "expected_path"),
+        [
+            (
+                "https://bucket.s3.amazonaws.com/models/my%20model.pkl",
+                "s3://bucket/models/my model.pkl",
+            ),
+            (
+                "https://storage.googleapis.com/bucket/models%2Fmy%2520model%25.pkl",
+                "gcs://bucket/models/my%20model%.pkl",
+            ),
+        ],
+    )
+    def test_decodes_provider_object_paths_exactly_once(self, url: str, expected_path: str) -> None:
+        protocol, path, _ = get_cloud_filesystem_config(url)
+
+        assert protocol in {"s3", "gcs"}
+        assert path == expected_path
+
+    @pytest.mark.parametrize(
+        ("url", "expected_path"),
+        [
+            ("https://bucket.s3.amazonaws.com//model.pkl", "s3://bucket//model.pkl"),
+            ("https://bucket.s3.amazonaws.com/%2Fmodel.pkl", "s3://bucket//model.pkl"),
+            ("https://bucket.storage.googleapis.com//model.pkl", "gcs://bucket//model.pkl"),
+            ("https://bucket.account.r2.cloudflarestorage.com/%2Fmodel.pkl", "s3://bucket//model.pkl"),
+        ],
+    )
+    def test_preserves_leading_slash_in_provider_object_keys(self, url: str, expected_path: str) -> None:
+        _protocol, path, _args = get_cloud_filesystem_config(url)
+
+        assert path == expected_path
+
+    @pytest.mark.parametrize(
+        ("url", "expected_protocol", "expected_path", "expected_args"),
+        [
+            (
+                "https://bucket.s3.us-west-2.amazonaws.com/models/model.pkl",
+                "s3",
+                "s3://bucket/models/model.pkl",
+                {"client_kwargs": {"endpoint_url": "https://s3.us-west-2.amazonaws.com"}},
+            ),
+            (
+                "https://account.r2.cloudflarestorage.com/bucket/model.pkl",
+                "s3",
+                "s3://bucket/model.pkl",
+                {"client_kwargs": {"endpoint_url": "https://account.r2.cloudflarestorage.com"}},
+            ),
+        ],
+    )
+    @patch("fsspec.filesystem")
+    def test_analyze_cloud_target_uses_normalized_fsspec_path(
+        self,
+        mock_filesystem: MagicMock,
+        url: str,
+        expected_protocol: str,
+        expected_path: str,
+        expected_args: dict[str, object],
+    ) -> None:
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 4}
+        mock_filesystem.return_value = fs
+
+        result = asyncio.run(analyze_cloud_target(url))
+
+        assert result["type"] == "file"
+        mock_filesystem.assert_called_once_with(expected_protocol, **expected_args)
+        fs.info.assert_called_once_with(expected_path)
+
+    @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+    @patch("fsspec.filesystem")
+    def test_download_from_https_provider_uses_normalized_fsspec_path(
+        self,
+        mock_filesystem: MagicMock,
+        mock_analyze: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        url = "https://bucket.s3.us-west-2.amazonaws.com/models/model.pkl"
+        fs_path = "s3://bucket/models/model.pkl"
+        fs = make_fs_mock()
+        fs.info.return_value = {"type": "file", "size": 4}
+        configure_remote_open_payloads(fs, {fs_path: b"data"})
+        mock_filesystem.return_value = fs
+        mock_analyze.return_value = {
+            "type": "file",
+            "size": 4,
+            "name": "model.pkl",
+            "human_size": "4 B",
+            "estimated_time": "instant",
+        }
+
+        result = download_from_cloud(
+            url,
+            cache_dir=tmp_path,
+            max_size=4,
+            use_cache=False,
+            show_progress=False,
+        )
+
+        assert isinstance(result, Path)
+        assert result.read_bytes() == b"data"
+        fs.info.assert_called_once_with(fs_path)
+        fs.open.assert_called_once_with(fs_path, "rb")
 
 
 @pytest.mark.parametrize(
@@ -246,6 +497,21 @@ def test_cleartext_cloud_provider_detection_rejects_hostname_near_matches(url: s
 def test_routes_secure_cloud_provider_urls_with_ports(url: str, expected_protocol: str) -> None:
     assert is_cloud_url(url)
     assert get_fs_protocol(url) == expected_protocol
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://bucket.s3.amazonaws.com:444/model.bin",
+        "https://user@bucket.s3.amazonaws.com/model.bin",
+        "https://storage.googleapis.com:not-a-port/bucket/model.bin",
+        "https://account.r2.cloudflarestorage.com:8443/bucket/model.bin",
+    ],
+)
+def test_rejects_ambiguous_secure_cloud_authorities(url: str) -> None:
+    assert not is_cloud_url(url)
+    with pytest.raises(ValueError, match="Unsupported cloud storage URL"):
+        get_fs_protocol(url)
 
 
 @pytest.mark.parametrize(
@@ -667,6 +933,43 @@ def test_analyze_cloud_target_directory_success(mock_fs: MagicMock) -> None:
     fs.glob.assert_called_once_with("s3://bucket/path/**")
 
 
+@pytest.mark.parametrize(
+    ("listed_path", "expected_path", "expected_name"),
+    [
+        ("bucket/path/nested/model.bin", "s3://bucket/path/nested/model.bin", "model.bin"),
+        ("path/nested/model.bin", "s3://bucket/path/nested/model.bin", "model.bin"),
+        ("nested/model.bin", "s3://bucket/path/nested/model.bin", "model.bin"),
+        ("model.bin", "s3://bucket/path/model.bin", "model.bin"),
+        ("model:version.bin", "s3://bucket/path/model:version.bin", "model:version.bin"),
+    ],
+)
+@patch("fsspec.filesystem")
+def test_analyze_cloud_target_normalizes_provider_listing_paths(
+    mock_fs: MagicMock,
+    listed_path: str,
+    expected_path: str,
+    expected_name: str,
+) -> None:
+    url = "s3://bucket/path/"
+    fs = make_fs_mock()
+
+    def info_side_effect(path: str) -> dict[str, object]:
+        if path == url:
+            return {"type": "directory"}
+        if path == expected_path:
+            return {"type": "file", "size": 4}
+        raise FileNotFoundError(path)
+
+    fs.info.side_effect = info_side_effect
+    fs.glob.return_value = [listed_path]
+    mock_fs.return_value = fs
+
+    result = asyncio.run(analyze_cloud_target(url))
+
+    assert result["type"] == "directory"
+    assert result["files"] == [{"path": expected_path, "name": expected_name, "size": 4, "human_size": "4.0 B"}]
+
+
 @patch("fsspec.filesystem")
 def test_analyze_cloud_target_directory_ignores_explicit_directory_metadata(
     mock_fs: MagicMock,
@@ -822,7 +1125,13 @@ def test_analyze_cloud_target_bounds_partial_metadata_error_details(
 
 
 def test_filter_scannable_files_handles_signed_cloud_urls() -> None:
-    files = [{"path": "s3://bucket/model.pkl?X-Amz-Signature=secret"}]
+    files = [{"path": "https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=secret"}]
+
+    assert filter_scannable_files(files) == files
+
+
+def test_filter_scannable_files_handles_native_query_text_before_extension() -> None:
+    files = [{"path": "s3://bucket/model?variant.pkl"}]
 
     assert filter_scannable_files(files) == files
 
@@ -1691,6 +2000,69 @@ def test_download_from_cloud(mock_fs: MagicMock, tmp_path: Path) -> None:
 
 
 @patch("fsspec.filesystem")
+def test_download_from_cloud_uses_normalized_https_object_path(mock_fs: MagicMock, tmp_path: Path) -> None:
+    metadata_fs = make_fs_mock()
+    metadata_fs.info.return_value = {"type": "file", "size": 4}
+    download_fs = make_fs_mock()
+    download_fs.info.return_value = {"type": "file", "size": 4}
+    download_fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
+    mock_fs.side_effect = [metadata_fs, download_fs]
+
+    result = download_from_cloud(
+        "https://bucket.s3.us-west-2.amazonaws.com/models/model.pkl",
+        cache_dir=tmp_path,
+        use_cache=False,
+        show_progress=False,
+    )
+
+    assert result == tmp_path / "model.pkl"
+    metadata_fs.info.assert_called_once_with("s3://bucket/models/model.pkl")
+    download_fs.get.assert_called_once_with("s3://bucket/models/model.pkl", str(result))
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+def test_download_from_cloud_preserves_normalized_directory_hierarchy(
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+) -> None:
+    base_url = "https://s3.us-west-2.amazonaws.com/bucket/models"
+    canonical_base = "s3://bucket/models"
+    model_url = "s3://bucket/models/nested/model.pkl"
+    fs = make_fs_mock()
+
+    def info_side_effect(path: str) -> dict[str, object]:
+        if path == canonical_base:
+            return {"type": "directory", "size": 0}
+        return {"type": "file", "size": 4}
+
+    fs.info.side_effect = info_side_effect
+    fs.walk.return_value = [(canonical_base, [], [model_url])]
+    fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
+    mock_fs_class.return_value = fs
+    mock_analyze.return_value = {
+        "type": "directory",
+        "file_count": 1,
+        "total_size": 4,
+        "human_size": "4 B",
+        "estimated_time": "instant",
+        "files": [{"path": model_url, "name": "model.pkl", "size": 4, "human_size": "4 B"}],
+    }
+
+    result = download_from_cloud(
+        base_url,
+        cache_dir=tmp_path,
+        use_cache=False,
+        selective=False,
+        show_progress=False,
+    )
+
+    assert result == tmp_path
+    fs.get.assert_called_once_with(model_url, str(tmp_path / "nested" / "model.pkl"))
+
+
+@patch("fsspec.filesystem")
 def test_download_from_cloud_reuses_cache_with_matching_etag(mock_fs: MagicMock, tmp_path: Path) -> None:
     url = "s3://bucket/model.pt"
 
@@ -1935,10 +2307,10 @@ def test_download_from_cloud_replaces_symlinked_directory_cache_without_touching
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
 @patch("modelaudit.utils.sources.cloud_storage.check_disk_space")
 @patch("fsspec.filesystem")
-def test_download_from_cloud_strips_query_params_from_local_path(
+def test_download_from_cloud_preserves_native_query_text_in_local_path(
     mock_fs: MagicMock, mock_disk_space: MagicMock, mock_analyze: AsyncMock, tmp_path: Path
 ) -> None:
-    url = "s3://bucket/model.bin?X-Amz-Signature=secret"
+    url = "s3://bucket/model?variant.bin"
     fs = make_fs_mock()
     fs.info.return_value = {"type": "file", "size": 1024}
     fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
@@ -1946,7 +2318,7 @@ def test_download_from_cloud_strips_query_params_from_local_path(
     mock_analyze.return_value = {
         "type": "file",
         "size": 1024,
-        "name": "model.bin",
+        "name": "model?variant.bin",
         "human_size": "1.0 KB",
         "estimated_time": "1 second",
     }
@@ -1955,18 +2327,15 @@ def test_download_from_cloud_strips_query_params_from_local_path(
     result = download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
 
     assert isinstance(result, Path)
-    assert result.name == "model.bin"
-    assert "X-Amz-Signature" not in str(result)
-    assert "secret" not in str(result)
-    assert "X-Amz-Signature" not in fs.get.call_args.args[1]
-    assert "secret" not in fs.get.call_args.args[1]
+    assert result.name == "model?variant.bin"
+    fs.get.assert_called_once_with(url, str(result))
 
 
 def test_build_safe_local_path_preserves_signed_directory_relative_paths(tmp_path: Path) -> None:
     """Signed directory URLs should keep object-relative paths without query secrets."""
-    base_url = "s3://bucket/models?X-Amz-Signature=base-secret"
-    first = "s3://bucket/models/a/model.pkl?X-Amz-Signature=first-secret"
-    second = "s3://bucket/models/b/model.pkl?X-Amz-Signature=second-secret"
+    base_url = "https://bucket.s3.amazonaws.com/models?X-Amz-Signature=base-secret"
+    first = "https://bucket.s3.amazonaws.com/models/a/model.pkl?X-Amz-Signature=first-secret"
+    second = "https://bucket.s3.amazonaws.com/models/b/model.pkl?X-Amz-Signature=second-secret"
 
     first_path = _build_safe_local_path(base_url, first, tmp_path)
     second_path = _build_safe_local_path(base_url, second, tmp_path)
@@ -1975,6 +2344,27 @@ def test_build_safe_local_path_preserves_signed_directory_relative_paths(tmp_pat
     assert second_path == tmp_path / "b" / "model.pkl"
     assert "X-Amz-Signature" not in str(first_path)
     assert "X-Amz-Signature" not in str(second_path)
+
+
+def test_build_safe_local_path_preserves_literal_object_delimiters(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+
+    question_path = _build_safe_local_path(base_url, f"{base_url}/model?one.pkl", tmp_path)
+    fragment_path = _build_safe_local_path(base_url, f"{base_url}/model#two.pkl", tmp_path)
+
+    assert question_path == tmp_path / "model?one.pkl"
+    assert fragment_path == tmp_path / "model#two.pkl"
+    assert question_path != fragment_path
+
+
+def test_build_safe_local_path_preserves_sensitive_looking_native_key_text(tmp_path: Path) -> None:
+    base_url = "s3://bucket/models"
+    first = _build_safe_local_path(base_url, f"{base_url}/model.pkl?X-Amz-Signature=one", tmp_path)
+    second = _build_safe_local_path(base_url, f"{base_url}/model.pkl?X-Amz-Signature=two", tmp_path)
+
+    assert first == tmp_path / "model.pkl?X-Amz-Signature=one"
+    assert second == tmp_path / "model.pkl?X-Amz-Signature=two"
+    assert first != second
 
 
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
@@ -2100,9 +2490,16 @@ async def test_download_from_cloud_async_context(tmp_path: Path) -> None:
 
 
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
 @patch("modelaudit.utils.file.streaming.get_streaming_preview")
-def test_download_from_cloud_streaming_returns_stream_url(mock_preview, mock_analyze, tmp_path):
+def test_download_from_cloud_streaming_returns_stream_url(
+    mock_preview: MagicMock,
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+) -> None:
     url = "s3://bucket/model.pt"
+    mock_fs_class.return_value = make_fs_mock()
     mock_preview.return_value = None
     mock_analyze.return_value = {
         "type": "file",
@@ -2115,6 +2512,79 @@ def test_download_from_cloud_streaming_returns_stream_url(mock_preview, mock_ana
     result = download_from_cloud(url, cache_dir=tmp_path, use_cache=False, stream_analyze=True)
 
     assert result == f"stream://{url}"
+    mock_preview.assert_called_once_with(url, max_bytes=1024)
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+@patch("modelaudit.utils.file.streaming.get_streaming_preview")
+def test_download_from_cloud_stream_analyze_avoids_duplicate_capped_preview(
+    mock_preview: MagicMock,
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+) -> None:
+    url = "s3://bucket/model.pt"
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": 4}
+    mock_fs_class.return_value = fs
+    mock_preview.return_value = None
+    mock_analyze.return_value = {
+        "type": "file",
+        "size": 4,
+        "name": "model.pt",
+        "human_size": "4 B",
+        "estimated_time": "instant",
+    }
+
+    result = download_from_cloud(
+        url,
+        cache_dir=tmp_path,
+        max_size=4,
+        use_cache=False,
+        stream_analyze=True,
+    )
+
+    assert result == f"stream://{url}"
+    fs.info.assert_called_once_with(url)
+    mock_preview.assert_not_called()
+    fs.get.assert_not_called()
+    fs.open.assert_not_called()
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+@patch("modelaudit.utils.file.streaming.get_streaming_preview")
+def test_download_from_cloud_stream_analyze_rejects_late_size_before_preview(
+    mock_preview: MagicMock,
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+) -> None:
+    url = "s3://bucket/model.pt"
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": 8}
+    mock_fs_class.return_value = fs
+    mock_analyze.return_value = {
+        "type": "file",
+        "size": 4,
+        "name": "model.pt",
+        "human_size": "4 B",
+        "estimated_time": "instant",
+    }
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        download_from_cloud(
+            url,
+            cache_dir=tmp_path,
+            max_size=4,
+            use_cache=False,
+            stream_analyze=True,
+        )
+
+    mock_preview.assert_not_called()
+    fs.get.assert_not_called()
+    fs.open.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2202,6 +2672,13 @@ class TestCloudObjectSize:
         size = get_cloud_object_size(fs, "s3://bucket/file.bin")
         assert size == 1024 * 1024
 
+    def test_get_cloud_object_size_joins_real_fsspec_walk_basenames(self) -> None:
+        fs = MemoryFileSystem()
+        fs.makedirs("/bucket/dir", exist_ok=True)
+        fs.pipe_file("/bucket/dir/model.bin", b"data")
+
+        assert get_cloud_object_size(fs, "/bucket/dir", strict=True) == 4
+
     def test_get_cloud_object_size_directory(self) -> None:
         """Test getting total size of a directory."""
         fs = MagicMock()
@@ -2248,6 +2725,226 @@ class TestCloudObjectSize:
         assert size == 3072
         fs.walk.assert_called_once_with("s3://bucket/dir/")
         fs.ls.assert_not_called()
+
+    def test_get_cloud_object_size_strict_rejects_walk_metadata_failure(self) -> None:
+        """Strict directory sizing should not drop objects whose metadata lookup fails."""
+        fs = MagicMock()
+        url = "s3://bucket/dir/"
+        visible = "s3://bucket/dir/model.bin"
+        hidden = "s3://bucket/dir/evil.pkl?X-Amz-Signature=secret"
+
+        def info_side_effect(path: str) -> dict[str, object]:
+            if path == url:
+                return {"type": "directory", "size": 0}
+            if path == visible:
+                return {"type": "file", "size": 1024}
+            if path == hidden:
+                raise PermissionError(f"metadata denied for {hidden}")
+            raise FileNotFoundError(path)
+
+        fs.info.side_effect = info_side_effect
+        fs.walk.return_value = [(url, [], [visible, hidden])]
+
+        with pytest.raises(ValueError) as excinfo:
+            get_cloud_object_size(fs, url, strict=True)
+
+        error = str(excinfo.value)
+        assert "metadata lookup failed" in error
+        assert "evil.pkl" in error
+        assert "X-Amz-Signature" not in error
+        assert "secret" not in error
+        fs.ls.assert_not_called()
+
+    def test_get_cloud_object_size_non_strict_keeps_partial_walk_legacy_behavior(self) -> None:
+        """Uncapped callers may still use the best-effort size estimate."""
+        fs = MagicMock()
+        url = "s3://bucket/dir/"
+        visible = "s3://bucket/dir/model.bin"
+        hidden = "s3://bucket/dir/hidden.bin"
+
+        def info_side_effect(path: str) -> dict[str, object]:
+            if path == url:
+                return {"type": "directory", "size": 0}
+            if path == visible:
+                return {"type": "file", "size": 1024}
+            if path == hidden:
+                raise PermissionError("metadata denied")
+            raise FileNotFoundError(path)
+
+        fs.info.side_effect = info_side_effect
+        fs.walk.return_value = [(url, [], [visible, hidden])]
+
+        size = get_cloud_object_size(fs, url)
+
+        assert size == 1024
+
+    def test_get_cloud_object_size_strict_accepts_zero_byte_walk_objects(self) -> None:
+        """A measured zero-byte object is distinct from missing size metadata."""
+        fs = MagicMock()
+        url = "s3://bucket/dir/"
+        empty_file = "s3://bucket/dir/empty.pkl"
+        fs.info.side_effect = lambda path: (
+            {"type": "directory", "size": 0} if path == url else {"type": "file", "size": 0}
+        )
+        fs.walk.return_value = [(url, [], [empty_file])]
+
+        assert get_cloud_object_size(fs, url, strict=True) == 0
+        fs.ls.assert_not_called()
+
+    def test_get_cloud_object_size_strict_accepts_zero_byte_ls_objects(self) -> None:
+        """The recursive listing fallback must also preserve valid zero-byte totals."""
+        fs = MagicMock()
+        url = "s3://bucket/dir/"
+        fs.info.return_value = {"type": "directory", "size": 0}
+        fs.walk.side_effect = NotImplementedError("walk unavailable")
+        fs.ls.return_value = [{"name": f"{url}empty.pkl", "type": "file", "size": 0}]
+
+        assert get_cloud_object_size(fs, url, strict=True) == 0
+
+    def test_get_cloud_object_size_strict_accepts_empty_directory(self) -> None:
+        """A successful empty traversal has a known size of zero bytes."""
+        fs = MagicMock()
+        url = "s3://bucket/empty/"
+        fs.info.return_value = {"type": "directory", "size": 0}
+        fs.walk.return_value = [(url, [], [])]
+
+        assert get_cloud_object_size(fs, url, strict=True) == 0
+        fs.ls.assert_not_called()
+
+    def test_get_cloud_object_size_strict_rejects_partial_recursive_listing(self) -> None:
+        """Strict sizing must not accept a partial total after a nested listing fails."""
+        fs = MagicMock()
+        url = "s3://bucket/dir/"
+        nested = f"{url}nested/"
+        fs.info.return_value = {"type": "directory", "size": 0}
+        fs.walk.side_effect = NotImplementedError("walk unavailable")
+
+        def ls_side_effect(path: str, detail: bool) -> list[dict[str, object]]:
+            assert detail is True
+            if path == url:
+                return [
+                    {"name": f"{url}visible.bin", "type": "file", "size": 1024},
+                    {"name": nested, "type": "directory"},
+                ]
+            raise PermissionError("nested listing denied")
+
+        fs.ls.side_effect = ls_side_effect
+
+        with pytest.raises(ValueError, match="recursive listing failed"):
+            get_cloud_object_size(fs, url, strict=True)
+
+    def test_get_cloud_object_size_strict_rejects_non_mapping_listing_entry(self) -> None:
+        fs = MagicMock()
+        url = "s3://bucket/dir/"
+        fs.info.return_value = {"type": "directory", "size": 0}
+        fs.walk.side_effect = NotImplementedError("walk unavailable")
+        fs.ls.return_value = [f"{url}hidden.pkl"]
+
+        with pytest.raises(ValueError, match="invalid detailed listing entry"):
+            get_cloud_object_size(fs, url, strict=True)
+
+    def test_get_cloud_object_size_non_strict_retains_partial_recursive_listing(self) -> None:
+        """Best-effort callers may retain a partial total when recursive listing fails."""
+        fs = MagicMock()
+        url = "s3://bucket/dir/"
+        nested = f"{url}nested/"
+        fs.info.return_value = {"type": "directory", "size": 0}
+        fs.walk.side_effect = NotImplementedError("walk unavailable")
+        fs.ls.side_effect = [
+            [
+                {"name": f"{url}visible.bin", "type": "file", "size": 1024},
+                {"name": nested, "type": "directory"},
+            ],
+            PermissionError("nested listing denied"),
+        ]
+
+        assert get_cloud_object_size(fs, url) == 1024
+
+    def test_get_cloud_object_size_strict_rejects_cyclic_recursive_listing(self) -> None:
+        fs = MagicMock()
+        url = "s3://bucket/dir/"
+        fs.info.return_value = {"type": "directory", "size": 0}
+        fs.walk.side_effect = NotImplementedError("walk unavailable")
+        fs.ls.return_value = [{"name": url, "type": "directory"}]
+
+        with pytest.raises(ValueError, match="duplicate or cyclic directory listing"):
+            get_cloud_object_size(fs, url, strict=True)
+
+    def test_get_cloud_object_size_strict_rejects_inconsistent_duplicate_size(self) -> None:
+        fs = MagicMock()
+        url = "s3://bucket/dir/"
+        file_url = f"{url}model.bin"
+        fs.info.return_value = {"type": "directory", "size": 0}
+        fs.walk.side_effect = NotImplementedError("walk unavailable")
+        fs.ls.return_value = [
+            {"name": file_url, "type": "file", "size": 4},
+            {"name": file_url, "type": "file", "size": 8},
+        ]
+
+        with pytest.raises(ValueError, match="inconsistent size metadata"):
+            get_cloud_object_size(fs, url, strict=True)
+
+    def test_get_cloud_object_size_deduplicates_consistent_listing_entries(self) -> None:
+        fs = MagicMock()
+        url = "s3://bucket/dir/"
+        file_url = f"{url}model.bin"
+        fs.info.return_value = {"type": "directory", "size": 0}
+        fs.walk.side_effect = NotImplementedError("walk unavailable")
+        fs.ls.return_value = [
+            {"name": file_url, "type": "file", "size": 4},
+            {"name": file_url, "type": "file", "size": 4},
+        ]
+
+        assert get_cloud_object_size(fs, url, strict=True) == 4
+
+    def test_get_cloud_object_size_strict_bounds_provider_diagnostics(self) -> None:
+        """Provider-controlled paths and errors must not create unbounded diagnostics."""
+        fs = MagicMock()
+        url = "s3://bucket/dir/"
+        remote_path = f"s3://bucket/dir/{'x' * 2000}.pkl?token=secret"
+
+        def info_side_effect(path: str) -> dict[str, object]:
+            if path == url:
+                return {"type": "directory", "size": 0}
+            raise PermissionError("denied " + ("y" * 2000))
+
+        fs.info.side_effect = info_side_effect
+        fs.walk.return_value = [(url, [], [remote_path])]
+
+        with pytest.raises(ValueError) as excinfo:
+            get_cloud_object_size(fs, url, strict=True)
+
+        error = str(excinfo.value)
+        assert len(error) < 1200
+        assert "secret" not in error
+
+    def test_get_cloud_object_size_strict_bounds_top_level_provider_diagnostics(self) -> None:
+        """Top-level info failures must not retain unbounded provider text."""
+        fs = MagicMock()
+        url = "s3://bucket/dir/?token=secret"
+        fs.info.side_effect = PermissionError("info denied " + ("i" * 2000) + " token=secret")
+
+        with pytest.raises(ValueError) as excinfo:
+            get_cloud_object_size(fs, url, strict=True)
+
+        error = str(excinfo.value)
+        assert len(error) < 1200
+        assert "secret" not in error
+
+    def test_get_cloud_object_size_strict_bounds_walk_and_listing_diagnostics(self) -> None:
+        """Combined traversal failures must remain bounded and redact URL secrets."""
+        fs = MagicMock()
+        url = "s3://bucket/dir/?token=secret"
+        fs.info.return_value = {"type": "directory"}
+        fs.walk.side_effect = PermissionError("walk denied " + ("w" * 2000) + " token=secret")
+        fs.ls.side_effect = PermissionError("listing denied " + ("l" * 2000) + " token=secret")
+
+        with pytest.raises(ValueError) as excinfo:
+            get_cloud_object_size(fs, url, strict=True)
+
+        error = str(excinfo.value)
+        assert len(error) < 1200
+        assert "secret" not in error
 
     def test_get_cloud_object_size_error(self) -> None:
         """Test size retrieval returns None on error."""

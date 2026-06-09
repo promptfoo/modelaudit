@@ -1417,7 +1417,7 @@ class TestModelDownload:
             "test/model",
         )
 
-    @patch("modelaudit.utils.sources.huggingface.time.monotonic", side_effect=[100.0, 100.0, 102.0])
+    @patch("modelaudit.utils.sources.huggingface.time.monotonic", return_value=100.0)
     @patch("requests.get")
     def test_huggingface_prefix_rechecks_deadline_between_chunks(
         self,
@@ -1427,7 +1427,13 @@ class TestModelDownload:
         """A slow streaming response must not run past the acquisition deadline."""
         response = MagicMock()
         response.__enter__.return_value = response
-        response.iter_content.return_value = iter([b"first", b"second"])
+
+        def iter_content(*_args: object, **_kwargs: object) -> Iterator[bytes]:
+            yield b"first"
+            _mock_monotonic.return_value = 102.0
+            yield b"second"
+
+        response.iter_content.side_effect = iter_content
         mock_requests_get.return_value = response
         budget = _HuggingFaceProbeBudget(remaining_bytes=1024, deadline=101.0)
 
@@ -2091,7 +2097,7 @@ class TestModelDownloadStreaming:
         assert all(call.kwargs["revision"] == _HF_TEST_REVISION for call in mock_hf_hub_download.call_args_list)
         assert all(f"/resolve/{_HF_TEST_REVISION}/" in call.args[0] for call in mock_requests_get.call_args_list)
 
-    @patch("modelaudit.utils.sources.huggingface.time.monotonic", side_effect=[100.0, 100.0, 102.0])
+    @patch("modelaudit.utils.sources.huggingface.time.monotonic", return_value=100.0)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",

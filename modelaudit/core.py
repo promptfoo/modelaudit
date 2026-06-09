@@ -1554,7 +1554,14 @@ def scan_model_directory_or_file(
 
             scanner = get_scanner_for_file(stream_source_path(stream_url), config=config)
             if scanner:
-                scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
+                if max_file_size > 0:
+                    scan_result, analysis_complete = stream_analyze_file(
+                        stream_url,
+                        scanner,
+                        max_bytes=max_file_size,
+                    )
+                else:
+                    scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:
                     _redact_stream_scan_result_for_reporting(scan_result, stream_url, report_url)
                     if not analysis_complete:
