@@ -6,6 +6,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from itertools import chain
 from types import ModuleType
 from typing import Any, Final
 from urllib.parse import urlparse, urlsplit, urlunsplit
@@ -1046,7 +1047,7 @@ class ManifestScanner(BaseScanner):
                 allow_plain_field_scalar=mode == _JINJA_COLLECTION_MODE_CONTAINER,
             )
         ]
-        expanded_container_ids: set[tuple[str, int]] = set()
+        expanded_container_depths: dict[tuple[str, bool, int], int] = {}
 
         while stack:
             self._check_timeout()
@@ -1058,6 +1059,18 @@ class ManifestScanner(BaseScanner):
                 if collection.items_visited > max_items:
                     self._mark_jinja_collection_budget_exceeded(collection, "items", frame.path)
                     break
+
+                if isinstance(frame.value, (dict, list)):
+                    container_key = (
+                        frame.mode,
+                        "chat_template" in frame.path.lower(),
+                        id(frame.value),
+                    )
+                    expanded_depth = expanded_container_depths.get(container_key)
+                    if expanded_depth is not None and expanded_depth <= frame.depth:
+                        stack.pop()
+                        continue
+
                 if frame.depth > max_depth:
                     self._mark_jinja_collection_budget_exceeded(collection, "depth", frame.path)
                     stack.pop()
@@ -1075,20 +1088,27 @@ class ManifestScanner(BaseScanner):
                     continue
 
                 if isinstance(frame.value, dict):
-                    container_key = (frame.mode, id(frame.value))
-                    if container_key in expanded_container_ids:
-                        stack.pop()
-                        continue
-                    expanded_container_ids.add(container_key)
-                    frame.iterator = iter(frame.value.items())
+                    expanded_container_depths[(frame.mode, "chat_template" in frame.path.lower(), id(frame.value))] = (
+                        frame.depth
+                    )
+                    if frame.mode == _JINJA_COLLECTION_MODE_FIELDS:
+                        priority_items = (
+                            (field_name, frame.value[field_name])
+                            for field_name in sorted(JINJA_TEMPLATE_FIELD_NAMES)
+                            if field_name in frame.value
+                        )
+                        remaining_items = (
+                            (key, item) for key, item in frame.value.items() if key not in JINJA_TEMPLATE_FIELD_NAMES
+                        )
+                        frame.iterator = chain(priority_items, remaining_items)
+                    else:
+                        frame.iterator = iter(frame.value.items())
                     continue
 
                 if isinstance(frame.value, list):
-                    container_key = (frame.mode, id(frame.value))
-                    if container_key in expanded_container_ids:
-                        stack.pop()
-                        continue
-                    expanded_container_ids.add(container_key)
+                    expanded_container_depths[(frame.mode, "chat_template" in frame.path.lower(), id(frame.value))] = (
+                        frame.depth
+                    )
                     frame.iterator = enumerate(frame.value)
                     continue
 
@@ -1128,7 +1148,7 @@ class ManifestScanner(BaseScanner):
     def _get_positive_int_config(self, key: str, default: int) -> int:
         try:
             value = int(self.config.get(key, default))
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             return default
         return value if value > 0 else default
 
@@ -1138,6 +1158,8 @@ class ManifestScanner(BaseScanner):
         limit_type: str,
         path: str,
     ) -> None:
+        if collection.budget_exceeded and limit_type != "items":
+            return
         collection.budget_exceeded = True
         collection.limit_type = limit_type
         collection.path = path

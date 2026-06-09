@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- bound manifest embedded-Jinja template collection so deeply nested configs fail closed without hiding recovered template findings
+- bound manifest embedded-Jinja template collection while preserving findings across deep branches, cycles, and shared YAML aliases
 - restrict manual Docker publishes to validated immutable version tags and their matching Git release refs before registry login or push
 - harden cloud acquisition size caps, HTTPS/R2 auto-default routing, and directory metadata failures
 - detect operator attrgetter, itemgetter, and methodcaller archive-member Python paths to command execution while preserving benign accessor names
