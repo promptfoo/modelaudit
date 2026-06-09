@@ -3053,7 +3053,10 @@ def test_scan_huggingface_metadata_preflight_verbose_log_is_sanitized(
         patch("shutil.rmtree"),
         caplog.at_level(logging.DEBUG, logger="modelaudit"),
     ):
-        result = CliRunner().invoke(cli, ["scan", "--verbose", "--no-cache", url])
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--verbose", "--no-cache", "--format", "text", url],
+        )
 
     assert result.exit_code == 0, result.output
     assert "https://huggingface.co/org/model" in caplog.text
