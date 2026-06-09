@@ -5422,6 +5422,36 @@ def test_scan_mlflow_uri_budget_refusal_is_not_recorded_as_completed(
 
 @patch("modelaudit.cli.record_download_completed")
 @patch("modelaudit.integrations.mlflow.scan_mlflow_model")
+def test_scan_mlflow_uri_trust_refusal_is_not_recorded_as_completed(
+    mock_scan_mlflow: MagicMock,
+    mock_record_download_completed: MagicMock,
+) -> None:
+    """MLflow artifact trust refusals should not emit successful-download telemetry."""
+    mock_scan_mlflow.return_value = create_mock_scan_result(
+        bytes_scanned=0,
+        issues=[
+            {
+                "message": "MLflow artifact repository is not in the configured allowlist",
+                "severity": "info",
+                "type": "mlflow_artifact_trust",
+            }
+        ],
+        files_scanned=0,
+        has_errors=True,
+        success=False,
+        scanners=["mlflow"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--format", "text", "models:/TestModel/1"])
+
+    assert result.exit_code == 2
+    assert "Download refused by MLflow artifact trust policy" in result.output
+    mock_record_download_completed.assert_not_called()
+
+
+@patch("modelaudit.cli.record_download_completed")
+@patch("modelaudit.integrations.mlflow.scan_mlflow_model")
 def test_scan_mlflow_uri_path_refusal_is_not_recorded_as_completed(
     mock_scan_mlflow: MagicMock,
     mock_record_download_completed: MagicMock,

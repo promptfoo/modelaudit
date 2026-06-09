@@ -3176,7 +3176,7 @@ def _resolve_scan_source_for_path(
                     issue_type
                     for issue in results.issues
                     if isinstance((issue_type := getattr(issue, "type", None)), str)
-                    and issue_type.startswith("mlflow_download_")
+                    and (issue_type.startswith("mlflow_download_") or issue_type == "mlflow_artifact_trust")
                 ),
                 None,
             )
@@ -3187,7 +3187,11 @@ def _resolve_scan_source_for_path(
                     refusal_reason = (
                         "configured size budget"
                         if download_refusal_type == "mlflow_download_budget"
-                        else "MLflow staging safety checks"
+                        else (
+                            "MLflow artifact trust policy"
+                            if download_refusal_type == "mlflow_artifact_trust"
+                            else "MLflow staging safety checks"
+                        )
                     )
                     click.echo(f"Download refused by {refusal_reason}")
             else:
