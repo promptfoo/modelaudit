@@ -197,6 +197,34 @@ PARAMETERIZED_AUTHORIZATION_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(?P<prefix>\b(?:proxy(?:[-_ ]?)?)?authorization\s*[:=]\s*)"
     r"(?:Digest|AWS4-HMAC-SHA256)\b"
 )
+PARAMETERIZED_AUTHORIZATION_CONTINUATION_RE: Final[re.Pattern[str]] = re.compile(
+    r"[ \t]*(?P<comma>,[ \t]*)?(?P<parameter>[!#$%&'*+.^_`|~A-Za-z0-9-]+)[ \t]*="
+)
+PARAMETERIZED_AUTHORIZATION_PARAMETER_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?P<parameter>[!#$%&'*+.^_`|~A-Za-z0-9-]+)[ \t]*="
+)
+PARAMETERIZED_AUTHORIZATION_PARAMETERS: Final[frozenset[str]] = frozenset(
+    {
+        "algorithm",
+        "charset",
+        "cnonce",
+        "credential",
+        "domain",
+        "nc",
+        "nonce",
+        "opaque",
+        "qop",
+        "realm",
+        "response",
+        "signature",
+        "signedheaders",
+        "stale",
+        "uri",
+        "userhash",
+        "username",
+        "username*",
+    }
+)
 AUTH_SCHEME_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\b(?:bearer|basic|token)\s+)[A-Za-z0-9._~+/=-]{8,}")
 STRING_LITERAL_PREFIX_PATTERN: Final[str] = r"(?P<string_prefix>[rRuUbBfF]{0,3})?"
 QUOTED_VALUE_PATTERN: Final[str] = (
@@ -1189,17 +1217,112 @@ def _redact_sensitive_auth_scheme_assignment(match: re.Match[str]) -> str:
     return f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}"
 
 
+def _parameterized_authorization_continuation_end(
+    text: str,
+    newline_index: int,
+    continuation_index: int,
+    *,
+    require_indent: bool,
+) -> int | None:
+    if require_indent and (continuation_index >= len(text) or text[continuation_index] not in " \t"):
+        return None
+    match = PARAMETERIZED_AUTHORIZATION_CONTINUATION_RE.match(text, continuation_index)
+    if match is None:
+        return None
+
+    previous_index = newline_index - 1
+    while previous_index >= 0 and text[previous_index] in " \t":
+        previous_index -= 1
+    clearly_continued = bool(
+        match.group("comma")
+        or (previous_index >= 0 and text[previous_index] == ",")
+        or match.group("parameter").casefold() in PARAMETERIZED_AUTHORIZATION_PARAMETERS
+    )
+    if not clearly_continued:
+        return None
+
+    line_end = len(text)
+    for newline in ("\r", "\n"):
+        candidate = text.find(newline, match.end())
+        if candidate >= 0:
+            line_end = min(line_end, candidate)
+
+    parameter_match = match
+    parameter_boundary: int | None = None
+    while True:
+        value_start = parameter_match.end()
+        while value_start < line_end and text[value_start] in " \t":
+            value_start += 1
+        if value_start >= line_end:
+            return line_end
+
+        quoted_value = text[value_start] in "\"'"
+        if quoted_value:
+            quote = text[value_start]
+            escaped = False
+            value_end = value_start + 1
+            while value_end < line_end:
+                char = text[value_end]
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    value_end += 1
+                    break
+                value_end += 1
+            else:
+                return line_end
+        else:
+            value_end = value_start
+            while value_end < line_end and text[value_end] not in " \t,":
+                value_end += 1
+            value = text[value_start:value_end]
+            if (
+                not value
+                or any(character in "()[]{}$" for character in value)
+                or re.match(r"(?i)(?:await|lambda|yield)\b", value) is not None
+            ):
+                return parameter_boundary
+
+        trailing_index = value_end
+        while trailing_index < line_end and text[trailing_index] in " \t":
+            trailing_index += 1
+        if trailing_index >= line_end:
+            return line_end
+        if text[trailing_index] != ",":
+            if not quoted_value and text[trailing_index] == "(":
+                return parameter_boundary
+            return value_end
+
+        parameter_boundary = trailing_index
+        next_parameter = trailing_index + 1
+        while next_parameter < line_end and text[next_parameter] in " \t":
+            next_parameter += 1
+        next_parameter_match = PARAMETERIZED_AUTHORIZATION_PARAMETER_RE.match(text, next_parameter)
+        if next_parameter_match is None:
+            return parameter_boundary
+        parameter_match = next_parameter_match
+
+
 def _parameterized_authorization_value_end(
     text: str,
     start: int,
     *,
     fstring: bool = False,
     stop_at_newline: bool = True,
+    require_continuation_indent: bool = True,
 ) -> int:
     quote: str | None = None
     escaped = False
     index = start
+    continuation_limit: int | None = None
     while index < len(text):
+        if continuation_limit is not None and index >= continuation_limit:
+            if text[index] in "\r\n":
+                continuation_limit = None
+            else:
+                return index
         char = text[index]
         if quote is not None:
             if escaped:
@@ -1213,17 +1336,35 @@ def _parameterized_authorization_value_end(
 
         if char in ("'", '"'):
             quote = char
-        elif fstring and char == "{" and (index + 1 >= len(text) or text[index + 1] != "{"):
-            expression_end = _find_balanced_container_end(text, index)
-            if expression_end is None:
-                return index
-            index = expression_end
-            continue
+        elif fstring and char in "{}":
+            if index + 1 < len(text) and text[index + 1] == char:
+                index += 2
+                continue
+            if char == "{":
+                expression_end = _find_balanced_container_end(text, index)
+                if expression_end is None:
+                    return index
+                index = expression_end
+                continue
+            return index
         elif char in "&|}]":
             return index
         elif char in "\r\n":
             if stop_at_newline:
-                return index
+                continuation_index = index + 1
+                if char == "\r" and continuation_index < len(text) and text[continuation_index] == "\n":
+                    continuation_index += 1
+                continuation_end = _parameterized_authorization_continuation_end(
+                    text,
+                    index,
+                    continuation_index,
+                    require_indent=require_continuation_indent,
+                )
+                if continuation_end is None:
+                    return index
+                continuation_limit = continuation_end
+                index = continuation_index
+                continue
         elif char == ";":
             if SHELL_OPERATOR_COMMAND_RE.match(text, index) is not None:
                 return index
@@ -1245,6 +1386,7 @@ def _redact_parameterized_authorization_values(
     fstring: bool = False,
     prefix_re: re.Pattern[str] = PARAMETERIZED_AUTHORIZATION_PREFIX_RE,
     stop_at_newline: bool = True,
+    require_continuation_indent: bool = True,
 ) -> str:
     redacted_chunks: list[str] = []
     last_index = 0
@@ -1255,6 +1397,7 @@ def _redact_parameterized_authorization_values(
             match.end(),
             fstring=fstring,
             stop_at_newline=stop_at_newline,
+            require_continuation_indent=require_continuation_indent,
         )
         trailing_start = value_end
         while trailing_start > match.end() and text[trailing_start - 1] in " \t":
@@ -1273,12 +1416,77 @@ def _redact_parameterized_authorization_values(
 def _redact_authorization_literal(literal: str | bytes) -> str | bytes:
     if isinstance(literal, bytes):
         decoded = literal.decode("latin-1")
-        redacted = _redact_parameterized_authorization_values(decoded, stop_at_newline=False)
+        redacted = _redact_parameterized_authorization_values(decoded, require_continuation_indent=False)
+        redacted = _redact_parameterized_authorization_values(
+            redacted,
+            prefix_re=SENSITIVE_PARAMETERIZED_AUTH_SCHEME_PREFIX_RE,
+            require_continuation_indent=False,
+        )
         redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
         return redacted.encode("latin-1")
 
-    redacted = _redact_parameterized_authorization_values(literal, stop_at_newline=False)
+    redacted = _redact_parameterized_authorization_values(literal, require_continuation_indent=False)
+    redacted = _redact_parameterized_authorization_values(
+        redacted,
+        prefix_re=SENSITIVE_PARAMETERIZED_AUTH_SCHEME_PREFIX_RE,
+        require_continuation_indent=False,
+    )
     return AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
+
+
+def _append_concatenated_fstring_authorization_replacements(
+    text: str,
+    offsets: list[int],
+    tokens: list[tokenize.TokenInfo],
+    node: ast.BinOp,
+    replacements: list[tuple[int, int, str]],
+) -> bool:
+    prefix = ""
+    leaves = _string_expression_leaves(node)
+    for index, leaf in enumerate(leaves):
+        if isinstance(leaf, ast.Constant) and isinstance(leaf.value, str):
+            prefix += leaf.value
+            continue
+        if not isinstance(leaf, ast.JoinedStr):
+            return False
+        if not any(isinstance(value, ast.FormattedValue) for value in leaf.values):
+            static_value = _static_string_literal_value(leaf)
+            if not isinstance(static_value, str):
+                return False
+            prefix += static_value
+            continue
+
+        source = ast.get_source_segment(text, leaf)
+        if source is None:
+            return False
+        string_match = PYTHON_STRING_QUOTE_RE.match(source)
+        if string_match is None or "f" not in string_match.group("prefix").lower():
+            return False
+        quote = string_match.group("quote")
+        if not source.endswith(quote):
+            return False
+        body = source[string_match.end() : -len(quote)]
+        candidate = f"{prefix}{body}"
+        redacted = _redact_parameterized_authorization_values(
+            candidate,
+            fstring=True,
+            require_continuation_indent=False,
+        )
+        redacted = _redact_parameterized_authorization_values(
+            redacted,
+            fstring=True,
+            prefix_re=SENSITIVE_PARAMETERIZED_AUTH_SCHEME_PREFIX_RE,
+            require_continuation_indent=False,
+        )
+        if redacted == candidate:
+            return False
+
+        for prior_leaf in leaves[:index]:
+            _append_static_string_token_replacements(text, offsets, tokens, prior_leaf, replacements, "")
+        redacted_source = f"{source[: string_match.end()]}{redacted}{quote}"
+        _append_ast_node_replacement(text, offsets, leaf, replacements, redacted_source)
+        return True
+    return False
 
 
 def _redact_authorization_in_python_strings(text: str) -> str:
@@ -1289,8 +1497,26 @@ def _redact_authorization_in_python_strings(text: str) -> str:
     except (MemoryError, RecursionError, SyntaxError, ValueError):
         return text
 
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except (IndentationError, UnicodeError, tokenize.TokenError):
+        tokens = []
+
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
     for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            parent = parents.get(node)
+            if isinstance(parent, ast.BinOp) and _authorization_string_expression_value(parent) is not None:
+                continue
+            if _append_concatenated_fstring_authorization_replacements(text, offsets, tokens, node, replacements):
+                continue
+            literal = _static_string_literal_value(node)
+            if literal is None:
+                continue
+            redacted = _redact_authorization_literal(literal)
+            if redacted != literal:
+                _append_static_string_token_replacements(text, offsets, tokens, node, replacements, redacted)
+            continue
         if isinstance(node, ast.JoinedStr):
             if isinstance(parents.get(node), (ast.FormattedValue, ast.JoinedStr)):
                 continue
@@ -1304,20 +1530,47 @@ def _redact_authorization_in_python_strings(text: str) -> str:
             if not source.endswith(quote):
                 continue
             body = source[string_match.end() : -len(quote)]
-            redacted_body = _redact_parameterized_authorization_values(body, fstring=True, stop_at_newline=False)
+            redacted_body = _redact_parameterized_authorization_values(
+                body,
+                fstring=True,
+                require_continuation_indent=False,
+            )
+            redacted_body = _redact_parameterized_authorization_values(
+                redacted_body,
+                fstring=True,
+                prefix_re=SENSITIVE_PARAMETERIZED_AUTH_SCHEME_PREFIX_RE,
+                require_continuation_indent=False,
+            )
             if redacted_body != body:
                 redacted_source = f"{source[: string_match.end()]}{redacted_body}{quote}"
                 _append_ast_node_replacement(text, offsets, node, replacements, redacted_source)
             continue
         if not isinstance(node, ast.Constant) or not isinstance(node.value, (str, bytes)):
             continue
-        if isinstance(parents.get(node), ast.JoinedStr):
+        parent = parents.get(node)
+        if isinstance(parent, ast.JoinedStr) or (
+            isinstance(parent, ast.BinOp) and _authorization_string_expression_value(parent) is not None
+        ):
             continue
         literal = node.value
         redacted = _redact_authorization_literal(literal)
         if redacted == literal:
             continue
-        _append_ast_node_replacement(text, offsets, node, replacements, repr(redacted))
+        _append_static_string_token_replacements(text, offsets, tokens, node, replacements, redacted)
+
+    for token in tokens:
+        if token.type != tokenize.COMMENT:
+            continue
+        redacted = _redact_authorization_literal(token.string)
+        if redacted == token.string:
+            continue
+        replacements.append(
+            (
+                _position_offset(offsets, token.start, len(text)),
+                _position_offset(offsets, token.end, len(text)),
+                str(redacted),
+            )
+        )
 
     for start, end, replacement in sorted(replacements, reverse=True):
         text = f"{text[:start]}{replacement}{text[end:]}"
@@ -2051,6 +2304,33 @@ def _static_string_literal_value(expression: ast.expr, depth: int = 0) -> str | 
     return None
 
 
+def _authorization_string_expression_value(expression: ast.expr, depth: int = 0) -> str | bytes | None:
+    if depth >= 64:
+        return None
+    static_value = _static_string_literal_value(expression, depth)
+    if static_value is not None:
+        return static_value
+    if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Add):
+        left = _authorization_string_expression_value(expression.left, depth + 1)
+        right = _authorization_string_expression_value(expression.right, depth + 1)
+        if isinstance(left, str) and isinstance(right, str):
+            return left + right
+        if isinstance(left, bytes) and isinstance(right, bytes):
+            return left + right
+        return None
+    if isinstance(expression, ast.JoinedStr):
+        parts: list[str] = []
+        for value in expression.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            elif isinstance(value, ast.FormattedValue):
+                parts.append("{dynamic}")
+            else:
+                return None
+        return "".join(parts)
+    return None
+
+
 def _static_text_literal_value(expression: ast.expr) -> str | None:
     value = _static_string_literal_value(expression)
     if isinstance(value, bytes):
@@ -2161,6 +2441,71 @@ def _append_ast_node_replacement(
             replacement,
         )
     )
+
+
+def _append_static_string_token_replacements(
+    text: str,
+    offsets: list[int],
+    tokens: list[tokenize.TokenInfo],
+    node: ast.AST,
+    replacements: list[tuple[int, int, str]],
+    redacted: str | bytes,
+) -> None:
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        leaves = _string_expression_leaves(node)
+        empty_literal = b"" if isinstance(redacted, bytes) else ""
+        for index, leaf in enumerate(leaves):
+            replacement_value = redacted if index == 0 else empty_literal
+            if isinstance(leaf, ast.JoinedStr):
+                _append_ast_node_replacement(text, offsets, leaf, replacements, repr(replacement_value))
+            else:
+                _append_static_string_token_replacements(
+                    text,
+                    offsets,
+                    tokens,
+                    leaf,
+                    replacements,
+                    replacement_value,
+                )
+        return
+
+    lineno = getattr(node, "lineno", None)
+    col_offset = getattr(node, "col_offset", None)
+    end_lineno = getattr(node, "end_lineno", None)
+    end_col_offset = getattr(node, "end_col_offset", None)
+    if lineno is None or col_offset is None or end_lineno is None or end_col_offset is None:
+        return
+
+    node_start = _ast_position_offset(text, offsets, lineno, col_offset)
+    node_end = _ast_position_offset(text, offsets, end_lineno, end_col_offset)
+    string_tokens = [
+        token
+        for token in tokens
+        if token.type == tokenize.STRING
+        and _position_offset(offsets, token.start, len(text)) >= node_start
+        and _position_offset(offsets, token.end, len(text)) <= node_end
+    ]
+    if not string_tokens:
+        _append_ast_node_replacement(text, offsets, node, replacements, repr(redacted))
+        return
+
+    empty_literal = "b''" if isinstance(redacted, bytes) else "''"
+    for index, token in enumerate(string_tokens):
+        replacements.append(
+            (
+                _position_offset(offsets, token.start, len(text)),
+                _position_offset(offsets, token.end, len(text)),
+                repr(redacted) if index == 0 else empty_literal,
+            )
+        )
+
+
+def _string_expression_leaves(expression: ast.expr) -> list[ast.expr]:
+    if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Add):
+        return [*_string_expression_leaves(expression.left), *_string_expression_leaves(expression.right)]
+    if isinstance(expression, (ast.Constant, ast.JoinedStr)):
+        return [expression]
+    return []
 
 
 def _append_ast_literal_replacements(
@@ -3279,6 +3624,8 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0, decode_percent: b
     dedented = textwrap.dedent(text) if python_evidence else text
     python_indent = _common_dedent_prefix(text, dedented) if python_evidence else ""
     redacted = dedented
+    if parseable_python_evidence:
+        redacted = _redact_authorization_in_python_strings(redacted)
     if r_evidence:
         redacted = _redact_r_raw_assignments(redacted)
         redacted = _redact_leftward_assignment_expressions(redacted)
@@ -3343,9 +3690,7 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0, decode_percent: b
     redacted = UNTERMINATED_SUBSCRIPTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_unterminated_quoted_assignment, redacted)
     redacted = UNTERMINATED_QUOTED_AUTHORIZATION_ASSIGNMENT_RE.sub(redact_unterminated_assignment, redacted)
     redacted = UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(redact_unterminated_assignment, redacted)
-    if parseable_python_evidence:
-        redacted = _redact_authorization_in_python_strings(redacted)
-    else:
+    if not parseable_python_evidence:
         redacted = _redact_parameterized_authorization_values(redacted)
         redacted = _redact_parameterized_authorization_values(
             redacted,

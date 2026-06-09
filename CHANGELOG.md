@@ -9,11 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- restrict manual Docker publishes to validated immutable version tags and their matching Git release refs before registry login or push
 - harden cloud acquisition size caps, HTTPS/R2 auto-default routing, and directory metadata failures
 - detect operator attrgetter, itemgetter, and methodcaller archive-member Python paths to command execution while preserving benign accessor names
 - redact Keras and TensorFlow scanner detail fields that echo model-controlled configs, code indicators, archive members, and external references.
 - route security-relevant protocol-less binary pickle streams through pickle analysis even when file suffixes are misleading
-- redact proxy and camel-case authorization evidence with scheme-bearing values without hiding benign counters
+- redact folded, placeholder-adjacent, proxy, and camel-case authorization evidence with scheme-bearing values without hiding benign counters
 - bound Keras ZIP config traversal for CVE detectors and fail closed when config.json coverage budgets are exhausted
 - redact MLflow registry, source, telemetry, and client exception credentials before logging, printing, or analytics export
 - bound 7z member-name collection before archive entry-limit failures
@@ -25,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fail closed on JFrog folder downloads whose selected artifacts use unsafe, colliding, or overlapping local paths
 - detect dangerous textual byte keys in Flax MessagePack checkpoints
 - bound Joblib decompression output to the configured scanner read budget
+- bound ExecuTorch ZIP metadata and member scans while preserving eligible pickle detections across archive limits and mutations
 - close JIT replay alias, probe-budget, and compound-clause context gaps without suppressing dangerous browser or native-library calls
 - scan raw payload indicators inside signature-valid ExecuTorch binaries and launcher-prefixed archives before reporting them clean
 - detect Keras get_file tar extraction from effective call arguments without relying on URL suffixes
@@ -35,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve registrable network domains and redact delimiter-split credentials in bounded finding evidence
 - preserve executable text-sidecar network findings for f-string calls, standard command wrappers, port-qualified Docker registries, and bounded xargs downloads while keeping prose references informational.
 - stabilize cache identity capture for compressed wrapper scans on Darwin `/private` path aliases and during unrelated temporary-file churn.
+- bound per-tensor and cumulative weight-distribution extraction before materializing PyTorch, HDF5, TensorFlow, and ONNX payloads
 
 ## [0.2.47](https://github.com/promptfoo/modelaudit/compare/v0.2.46...v0.2.47) (2026-06-05)
 
