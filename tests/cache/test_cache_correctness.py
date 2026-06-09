@@ -118,6 +118,18 @@ def _identity_kwargs(cache: ScanResultsCache, file_path: str) -> dict[str, Any]:
     }
 
 
+def test_cache_config_hash_preserves_128_bits(tmp_path: Path) -> None:
+    """Attacker-influenced scan context must not collapse to a short cache identity."""
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    version_context = {"advanced_shard_family": {"members": ["secure:member-digest"]}}
+    serialized_context = json.dumps(version_context, sort_keys=True)
+
+    config_hash = cache._get_config_hash(version_context)
+
+    assert config_hash == hashlib.blake2b(serialized_context.encode(), digest_size=16).hexdigest()
+    assert len(config_hash) == 32
+
+
 def test_capture_file_identity_uses_target_filesystem_probe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
