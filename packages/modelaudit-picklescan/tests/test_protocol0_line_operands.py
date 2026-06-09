@@ -207,6 +207,38 @@ def test_scan_bytes_detects_lenient_base64_pickle_after_long_protocol0_scalar(
     assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
 
 
+def test_scan_bytes_detects_sparse_lenient_base64_pickle_after_long_protocol0_scalar() -> None:
+    nested_payload = _long_scalar_before_reduce_protocol0_pickle(b"V")
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+    separated = ("!" * 4000).join(encoded)
+
+    report = scan_bytes(
+        pickle.dumps(separated, protocol=4),
+        source="sparse-lenient-base64-long-scalar-before-reduce.pkl",
+    )
+
+    assert len(separated) > 1024 * 1024
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
+
+
+def test_scan_bytes_ignores_sparse_unterminated_protocol0_base64_scalar() -> None:
+    encoded = base64.b64encode(b"V" + (b"A" * 257)).decode("ascii")
+    separated = ("!" * 4000).join(encoded)
+
+    report = scan_bytes(
+        pickle.dumps(separated, protocol=4),
+        source="sparse-unterminated-protocol0-base64-scalar.pkl",
+    )
+
+    assert len(separated) > 1024 * 1024
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert not any(notice.code == "nested_probe_limit_exceeded" for notice in report.notices)
+
+
 def test_scan_bytes_ignores_large_unterminated_protocol0_base64_scalar() -> None:
     encoded_scalar = base64.b64encode(b"V" + (b"A" * 257)).decode("ascii")
     encoded = encoded_scalar + ("!" * ((1024 * 1024) + 512))

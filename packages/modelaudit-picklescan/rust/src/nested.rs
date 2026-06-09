@@ -839,12 +839,20 @@ fn embedded_long_protocol0_base64_probe_windows(
     value: &str,
     max_window_chars: usize,
 ) -> EncodedNestedProbeWindows {
-    let max_input_bytes = MAX_ENCODED_LITERAL_MID_SCAN_BYTES
-        .saturating_add(max_window_chars.max(LONG_PROTOCOL0_SCALAR_PROBE_CHARS))
+    let tail_compact_chars = max_window_chars
+        .max(LONG_PROTOCOL0_SCALAR_PROBE_CHARS)
         .saturating_add(ENCODED_LITERAL_PROBE_CHARS);
-    let mut compact = String::with_capacity(value.len().min(max_input_bytes));
-    let mut raw_positions = Vec::with_capacity(value.len().min(max_input_bytes));
-    for (raw_index, byte) in value.bytes().take(max_input_bytes).enumerate() {
+    let max_compact_chars = MAX_ENCODED_LITERAL_MID_SCAN_BYTES.saturating_add(tail_compact_chars);
+    let mut compact = String::with_capacity(value.len().min(max_compact_chars));
+    let mut raw_positions = Vec::with_capacity(value.len().min(max_compact_chars));
+    let mut compact_chars_at_mid_scan = None;
+    for (raw_index, byte) in value.bytes().enumerate() {
+        if raw_index >= MAX_ENCODED_LITERAL_MID_SCAN_BYTES {
+            let compact_chars_at_mid_scan = *compact_chars_at_mid_scan.get_or_insert(compact.len());
+            if compact.len().saturating_sub(compact_chars_at_mid_scan) >= tail_compact_chars {
+                break;
+            }
+        }
         if base64_value(byte).is_some() {
             compact.push(char::from(byte));
             raw_positions.push(raw_index);
@@ -1032,8 +1040,10 @@ fn encoded_probe_prefix_consumes_literal(
     max_encoded_chars: usize,
     max_window_chars: usize,
 ) -> bool {
+    let prefix_may_be_long_protocol0_scalar = encoded_base64_first_byte_unbounded(value.as_bytes())
+        .is_some_and(|byte| matches!(byte, b'I' | b'S' | b'V'));
     encoded_prefix_consumes_literal(value, prefix_has_base64_pickle, prefix_has_hex_pickle)
-        || (prefix_has_base64_pickle
+        || ((prefix_has_base64_pickle || prefix_may_be_long_protocol0_scalar)
             && lenient_base64_decodes_to_single_pickle(value, max_encoded_chars, max_window_chars))
 }
 
