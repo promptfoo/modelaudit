@@ -122,6 +122,20 @@ class PatternMemoryMappedScanner:
 _SHARD_SCAN_CONTEXT: ContextVar[str] = ContextVar("_SHARD_SCAN_CONTEXT", default="missing")
 
 
+def _validated_target(path: Path) -> dict[str, int | str]:
+    """Return the target identity fields used by grouped shard scans."""
+    resolved_path = path.resolve(strict=True)
+    path_stat = os.stat(resolved_path, follow_symlinks=False)
+    return {
+        "resolved_path": str(resolved_path),
+        "device": path_stat.st_dev,
+        "inode": path_stat.st_ino,
+        "size": path_stat.st_size,
+        "mtime_ns": path_stat.st_mtime_ns,
+        "ctime_ns": path_stat.st_ctime_ns,
+    }
+
+
 class ContextRecordingShardScanner:
     """Scanner that records worker context for propagation tests."""
 
@@ -239,6 +253,74 @@ class TestShardedModelDetector:
         assert shard_info is not None
         assert shard_info["shards"] == [str(shard_one)]
         assert shard_info["total_shards"] == 1
+
+    def test_detect_shards_includes_validated_cross_directory_peers(self, tmp_path: Path) -> None:
+        """Validated peers selected in separate directories should form one complete family."""
+        shards: list[Path] = []
+        for shard_index in range(1, 4):
+            shard_dir = tmp_path / f"part-{shard_index}"
+            shard_dir.mkdir()
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00003.safetensors"
+            shard_path.write_bytes(f"shard-{shard_index}".encode())
+            shards.append(shard_path)
+        near_match = shards[1].parent / "model-00002-of-00003.safetensors.bak"
+        near_match.write_bytes(b"not-a-shard")
+        allowed_targets = {str(shard): _validated_target(shard) for shard in shards}
+
+        shard_info = ShardedModelDetector.detect_shards(
+            str(shards[0]),
+            allowed_targets=allowed_targets,
+        )
+        result = AdvancedFileHandler(
+            str(shards[0]),
+            CompletingShardScanner(),
+            allowed_shard_paths=[str(shard.resolve()) for shard in shards],
+            allowed_shard_targets=allowed_targets,
+        ).scan()
+
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(shard) for shard in shards]
+        assert shard_info["total_shards"] == 3
+        assert "missing_shard_count" not in shard_info
+        assert result.success is True
+        assert result.bytes_scanned == sum(shard.stat().st_size for shard in shards)
+
+    def test_detect_shards_rejects_changed_cross_directory_peer(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """A cross-directory peer cannot retarget after its identity is validated."""
+        first_dir = tmp_path / "first"
+        second_dir = tmp_path / "second"
+        targets_dir = tmp_path / "targets"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        targets_dir.mkdir()
+        shard_one = first_dir / "model-00001-of-00002.safetensors"
+        shard_two = second_dir / "model-00002-of-00002.safetensors"
+        original_target = targets_dir / "original"
+        replacement_target = targets_dir / "replacement"
+        shard_one.write_bytes(b"one")
+        original_target.write_bytes(b"two")
+        replacement_target.write_bytes(b"replacement")
+        shard_two.symlink_to(original_target)
+        allowed_targets = {
+            str(shard_one): _validated_target(shard_one),
+            str(shard_two): _validated_target(shard_two),
+        }
+        shard_two.unlink()
+        shard_two.symlink_to(replacement_target)
+
+        shard_info = ShardedModelDetector.detect_shards(
+            str(shard_one),
+            allowed_targets=allowed_targets,
+        )
+
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(shard_one)]
+        assert shard_info["missing_shard_count"] == 1
+        assert shard_info["unvalidated_shards"] == [str(shard_two)]
 
     def test_detect_shards_rejects_direct_sibling_symlink_outside_scan_directory(
         self,
@@ -616,9 +698,10 @@ class TestShardedModelDetector:
             def scan(self, shard_path: str) -> ScanResult:
                 path = Path(shard_path)
                 result = ScanResult(scanner_name=self.name)
-                if path == original_target:
-                    path.unlink()
-                    path.symlink_to(replacement_target)
+                if path.name == original_target.name:
+                    preserved_target = tmp_path / "preserved-malicious.pt"
+                    original_target.rename(preserved_target)
+                    replacement_target.rename(original_target)
                     result.add_check(
                         name="Clean Replacement Accepted",
                         passed=True,
@@ -631,7 +714,8 @@ class TestShardedModelDetector:
 
         result = AdvancedFileHandler(str(shard_one), SwappingScanner()).scan()
 
-        assert b"safe" in scanned_payloads
+        assert b"malicious" in scanned_payloads
+        assert b"safe" not in scanned_payloads
         assert result.success is False
         assert "shard_scan_error" in result.metadata["scan_outcome_reasons"]
         assert any(check.name == "Shard Scan" and check.status == CheckStatus.FAILED for check in result.checks)
@@ -658,7 +742,7 @@ class TestShardedModelDetector:
             def scan(self, shard_path: str) -> ScanResult:
                 path = Path(shard_path)
                 result = ScanResult(scanner_name=self.name)
-                if path == malicious_target:
+                if path.name == malicious_target.name:
                     result.add_check(
                         name="Malicious Shard Payload",
                         passed=False,
@@ -666,8 +750,9 @@ class TestShardedModelDetector:
                         severity=IssueSeverity.CRITICAL,
                         location=str(path),
                     )
-                    path.unlink()
-                    path.symlink_to(replacement_target)
+                    preserved_target = tmp_path / "preserved-malicious.pt"
+                    malicious_target.rename(preserved_target)
+                    replacement_target.rename(malicious_target)
                 result.finish(success=not result.has_errors)
                 return result
 
@@ -679,6 +764,90 @@ class TestShardedModelDetector:
             check.name == "Malicious Shard Payload" and check.status == CheckStatus.FAILED for check in result.checks
         )
         assert any(issue.message == "Malicious shard payload detected" for issue in result.issues)
+
+    def test_shard_target_aba_during_scan_cannot_hide_malicious_content(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Restoring a validated pathname cannot redirect the descriptor-bound shard scan."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        malicious_target = tmp_path / "malicious.pt"
+        benign_target = tmp_path / "benign.pt"
+        preserved_target = tmp_path / "preserved.pt"
+        shard_one.write_bytes(b"first")
+        malicious_target.write_bytes(b"malicious")
+        benign_target.write_bytes(b"benign")
+        shard_two.symlink_to(malicious_target)
+        scanned_payloads: list[bytes] = []
+
+        class AbaSwappingScanner:
+            name = "aba_swapping_scanner"
+
+            def scan(self, shard_path: str) -> ScanResult:
+                path = Path(shard_path)
+                result = ScanResult(scanner_name=self.name)
+                if path.name == malicious_target.name:
+                    malicious_target.rename(preserved_target)
+                    benign_target.rename(malicious_target)
+                    try:
+                        payload = path.read_bytes()
+                    finally:
+                        malicious_target.rename(benign_target)
+                        preserved_target.rename(malicious_target)
+                    scanned_payloads.append(payload)
+                    result.add_check(
+                        name="Malicious Shard Payload",
+                        passed=payload != b"malicious",
+                        message="Malicious shard payload detected",
+                        severity=IssueSeverity.CRITICAL,
+                        location=str(path),
+                    )
+                else:
+                    scanned_payloads.append(path.read_bytes())
+                result.finish(success=not result.has_errors)
+                return result
+
+        result = AdvancedFileHandler(str(shard_one), AbaSwappingScanner()).scan()
+
+        assert b"malicious" in scanned_payloads
+        assert b"benign" not in scanned_payloads
+        assert result.success is False
+        assert any(check.name == "Malicious Shard Payload" for check in result.checks)
+
+    @pytest.mark.skipif(os.name == "nt", reason="Windows uses open-handle hard-link pinning")
+    def test_shard_pin_unavailable_fails_explicitly(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A platform without descriptor paths must fail before scanning a mutable pathname."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        shard_one.write_bytes(b"first")
+        shard_two.write_bytes(b"second")
+        scanned_paths: list[str] = []
+
+        class RecordingScanner(CompletingShardScanner):
+            def scan(self, shard_path: str) -> ScanResult:
+                scanned_paths.append(shard_path)
+                return super().scan(shard_path)
+
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers._descriptor_path_for_open_file",
+            lambda _file_fd: None,
+        )
+
+        result = AdvancedFileHandler(str(shard_one), RecordingScanner()).scan()
+
+        assert scanned_paths == []
+        assert result.success is False
+        assert "shard_pin_unavailable" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Shard Scan Pinning" and check.details["scan_outcome_reason"] == "shard_pin_unavailable"
+            for check in result.checks
+        )
 
     def test_shard_added_during_scan_marks_family_inconclusive(self, tmp_path: Path) -> None:
         """A shard created after detection cannot remain outside the completed scan set."""
@@ -694,7 +863,7 @@ class TestShardedModelDetector:
 
             def scan(self, shard_path: str) -> ScanResult:
                 scanned_names.append(Path(shard_path).name)
-                if Path(shard_path) == shard_one:
+                if Path(shard_path).name == shard_one.name:
                     added_shard.write_bytes(b"malicious-unscanned")
                 result = ScanResult(scanner_name=self.name)
                 result.finish(success=True)
@@ -1850,8 +2019,9 @@ class TestAdvancedFileHandler:
 
         assert first.success is True
         assert second.success is True
-        assert scanned_paths.count(str(shard_one)) == 2
-        assert scanned_paths.count(str(shard_two)) == 2
+        scanned_names = [Path(path).name for path in scanned_paths]
+        assert scanned_names.count(shard_one.name) == 2
+        assert scanned_names.count(shard_two.name) == 2
         assert cache_entries == 0
 
     def test_sharded_scan_bypasses_cache_without_reliable_sibling_identity(
@@ -1909,8 +2079,9 @@ class TestAdvancedFileHandler:
         assert first.success is True
         assert second.success is False
         assert any(check.name == "Malicious Shard Payload" for check in second.checks)
-        assert scanned_paths.count(str(shard_one)) == 2
-        assert scanned_paths.count(str(shard_two)) == 2
+        scanned_names = [Path(path).name for path in scanned_paths]
+        assert scanned_names.count(shard_one.name) == 2
+        assert scanned_names.count(shard_two.name) == 2
         assert cache_entries == 0
 
     def test_cached_sharded_scan_revalidates_retargeted_sibling(
@@ -1963,7 +2134,7 @@ class TestAdvancedFileHandler:
 
         assert first.success is True
         assert cached.success is True
-        assert str(inside_target) in first_scan_paths
+        assert inside_target.name in {Path(path).name for path in first_scan_paths}
         assert cached_scan_paths == first_scan_paths
         assert second.success is False
         assert "out_of_scope_model_shards" in second.metadata["scan_outcome_reasons"]
