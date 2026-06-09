@@ -1051,15 +1051,16 @@ def get_cve_2025_12060_explanation(issue_type: str) -> str:
     """Get explanation for CVE-2025-12060: Keras get_file archive extraction traversal.
 
     CVE-2025-12060 (CVSS 8.8 HIGH): A crafted .keras archive can configure
-    keras.utils.get_file(extract=True) with a remote tar archive. During model
-    loading, affected Keras versions may extract traversal or symlink entries
-    outside the intended cache directory. Fixed in Keras 3.12.0.
+    keras.utils.get_file with truthy untar or extract arguments that enable tar
+    extraction. During model loading, affected Keras versions may extract traversal
+    or symlink entries outside the intended cache directory. Fixed in Keras 3.12.0.
     """
     explanations = {
         "get_file_extract_tar": (
             "CVE-2025-12060: The config.json references keras.utils.get_file with "
-            "extract=True and a remote tar-like archive URL. In affected Keras versions, "
-            "loading the model may download and extract attacker-controlled archive entries "
+            "a truthy untar argument, or a truthy extract argument with a tar-capable archive format. "
+            "In affected Keras versions, loading the model may download and extract attacker-controlled "
+            "archive entries "
             "that traverse outside the intended destination. Upgrade to Keras >= 3.12.0 "
             "and reject untrusted models that fetch and extract remote archives."
         ),
@@ -1068,8 +1069,8 @@ def get_cve_2025_12060_explanation(issue_type: str) -> str:
     return _get_explanation_with_default(
         explanations,
         issue_type,
-        "CVE-2025-12060: keras.utils.get_file(extract=True) can extract remote tar archives "
-        "with traversal entries. Upgrade to Keras >= 3.12.0.",
+        "CVE-2025-12060: Truthy keras.utils.get_file untar or extract arguments can enable "
+        "remote tar extraction with traversal entries. Upgrade to Keras >= 3.12.0.",
     )
 
 
