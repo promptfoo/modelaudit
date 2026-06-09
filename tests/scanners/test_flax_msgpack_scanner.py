@@ -736,6 +736,44 @@ def test_flax_msgpack_streaming_decode_does_not_call_unpackb(
     assert result.metadata.get("top_level_type") == "dict"
 
 
+def test_flax_msgpack_pure_python_unpacker_preserves_malicious_scalar_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback = pytest.importorskip("msgpack.fallback")
+    monkeypatch.setattr(msgpack, "Unpacker", fallback.Unpacker)
+    path = tmp_path / "pure_python_malicious.msgpack"
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["top_level_type"] == "dict"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == "Suspicious object attribute detected: __reduce__"
+        and issue.location == "root/__reduce__"
+        for issue in result.issues
+    )
+    assert not any("Failed to parse msgpack data" in issue.message for issue in result.issues)
+
+
+def test_flax_msgpack_pure_python_unpacker_preserves_benign_scalar_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback = pytest.importorskip("msgpack.fallback")
+    monkeypatch.setattr(msgpack, "Unpacker", fallback.Unpacker)
+    path = tmp_path / "pure_python_benign.msgpack"
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, "metadata": "safe"})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is True
+    assert result.metadata["top_level_type"] == "dict"
+    assert not result.issues
+
+
 def test_flax_msgpack_event_walker_scans_nested_and_trailing_content(tmp_path: Path) -> None:
     """Nested and trailing content should be inspected one scalar at a time."""
     path = tmp_path / "event_walk.msgpack"

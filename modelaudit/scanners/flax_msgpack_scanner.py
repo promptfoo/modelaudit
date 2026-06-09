@@ -8,7 +8,7 @@ import re
 from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Any, BinaryIO, ClassVar
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils.file.detection import has_inconclusive_renamed_flax_msgpack_routing, is_flax_msgpack_checkpoint_file
@@ -30,6 +30,7 @@ _EVIDENCE_REDACTION_INPUT_CHARS = 4096
 _MIN_SHORT_BINARY_TEXT_PERCENT = 85
 _MAX_STREAM_TENSOR_SAMPLES = 64
 _MAX_STREAM_SEQUENCE_EVIDENCE = 64
+_STREAM_MARKER_CHUNK_BYTES = 64 * 1024
 _STREAM_TEXT_CHUNK_BYTES = 64 * 1024
 _STREAM_TEXT_OVERLAP_CHARS = 4096
 _UNBOUNDED_GETATTR_PATTERN = r"getattr\s*\(\s*.*\s*,\s*['\"]__.*__['\"]"
@@ -60,6 +61,27 @@ class _StreamTraversalState:
     node_budget_reported: bool = False
     decode_limit_reported: bool = False
     recursion_limit_reported: bool = False
+
+
+@dataclass
+class _StreamMarkerReader:
+    source: BinaryIO
+    chunk_start: int = -1
+    chunk: bytes = b""
+
+    def peek(self, offset: int) -> int | None:
+        chunk_offset = offset - self.chunk_start
+        if 0 <= chunk_offset < len(self.chunk):
+            return self.chunk[chunk_offset]
+
+        source_offset = self.source.tell()
+        try:
+            self.source.seek(offset)
+            self.chunk_start = offset
+            self.chunk = self.source.read(_STREAM_MARKER_CHUNK_BYTES)
+        finally:
+            self.source.seek(source_offset)
+        return self.chunk[0] if self.chunk else None
 
 
 @dataclass
@@ -2160,6 +2182,7 @@ class FlaxMsgpackScanner(BaseScanner):
     def _read_stream_value(
         self,
         unpacker: Any,
+        marker_reader: _StreamMarkerReader,
         result: ScanResult,
         summary: _FlaxStreamSummary,
         state: _StreamTraversalState,
@@ -2215,11 +2238,9 @@ class FlaxMsgpackScanner(BaseScanner):
             unpacker.skip()
             return _StreamValue("skipped")
 
-        try:
+        marker = marker_reader.peek(unpacker.tell())
+        if marker is not None and (0x80 <= marker <= 0x8F or marker in {0xDE, 0xDF}):
             map_length = unpacker.read_map_header()
-        except ValueError:
-            pass
-        else:
             if top_level:
                 summary.top_level_key_count = map_length
             direct_string_keys: set[str] = set()
@@ -2267,6 +2288,7 @@ class FlaxMsgpackScanner(BaseScanner):
             for index in range(visible_items):
                 key_value = self._read_stream_value(
                     unpacker,
+                    marker_reader,
                     result,
                     summary,
                     state,
@@ -2294,6 +2316,7 @@ class FlaxMsgpackScanner(BaseScanner):
 
                 value = self._read_stream_value(
                     unpacker,
+                    marker_reader,
                     result,
                     summary,
                     state,
@@ -2323,11 +2346,8 @@ class FlaxMsgpackScanner(BaseScanner):
                 self._check_jax_array_metadata({"__jax_array__": True}, location, result)
             return _StreamValue("dict", direct_string_keys=direct_string_keys)
 
-        try:
+        if marker is not None and (0x90 <= marker <= 0x9F or marker in {0xDC, 0xDD}):
             array_length = unpacker.read_array_header()
-        except ValueError:
-            pass
-        else:
             visible_items = min(array_length, self.max_items_per_container)
             if array_length > self.max_items_per_container:
                 summary.analysis_complete = False
@@ -2341,6 +2361,7 @@ class FlaxMsgpackScanner(BaseScanner):
             for index in range(visible_items):
                 value = self._read_stream_value(
                     unpacker,
+                    marker_reader,
                     result,
                     summary,
                     state,
@@ -2425,6 +2446,7 @@ class FlaxMsgpackScanner(BaseScanner):
         try:
             with open(path, "rb") as source:
                 stream_size = os.fstat(source.fileno()).st_size
+                marker_reader = _StreamMarkerReader(source)
                 unpacker = msgpack.Unpacker(
                     source,
                     read_size=self._msgpack_stream_read_size(),
@@ -2458,6 +2480,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     try:
                         value = self._read_stream_value(
                             unpacker,
+                            marker_reader,
                             result,
                             summary,
                             state,
