@@ -25,7 +25,7 @@ from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.scanners import keras_h5_scanner as keras_h5_scanner_module
 from modelaudit.scanners import keras_utils as keras_utils_module
 from modelaudit.scanners import keras_zip_scanner as keras_zip_scanner_module
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.keras_zip_scanner import KerasZipScanner, _has_get_file_reference
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.utils.file import detection as file_detection
@@ -83,6 +83,17 @@ def _assert_inconclusive_keras_zip_scan(model_path: Path, reason: str, expected_
     assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     assert reason in metadata.get("scan_outcome_reasons")
     assert determine_exit_code(audit_result) == 2
+
+
+def _assert_no_stale_inconclusive_metadata(result: ScanResult) -> None:
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("analysis_incomplete") is not True
+    assert not result.metadata.get("scan_outcome_reasons")
+    for issue in result.issues:
+        if issue.details.get("cve_id") == "CVE-2025-12058":
+            assert issue.details.get("analysis_incomplete") is not True
+            assert "scan_outcome_reason" not in issue.details
 
 
 def _assert_inconclusive_keras_zip_scan_not_cached(model_path: Path, reason: str, cache_dir: Path) -> None:
@@ -3668,12 +3679,12 @@ __import__('pickle').loads(data)
         "keras_version",
         ["3.12.0", "3.12.0+local", "3.12.0.post1.dev0", "3.12.1.dev0"],
     )
-    def test_stringlookup_external_vocabulary_path_is_inconclusive_on_fixed_keras(
+    def test_stringlookup_external_vocabulary_path_flags_untrusted_fixed_keras_metadata(
         self,
         tmp_path: Path,
         keras_version: str,
     ) -> None:
-        """Fixed-version archive metadata is inconclusive and must fail closed operationally."""
+        """Fixed-version archive metadata must not suppress runtime StringLookup risk."""
         scanner = KerasZipScanner()
         external_vocab_path = tmp_path / "vocab.txt"
         external_vocab_path.write_text("token\n", encoding="utf-8")
@@ -3692,29 +3703,23 @@ __import__('pickle').loads(data)
 
         model_path = create_configured_keras_zip(tmp_path, config, keras_version=keras_version)
         result = scanner.scan(str(model_path))
-        reason = keras_zip_scanner_module._KERAS_STRINGLOOKUP_EXTERNAL_VOCABULARY_INCONCLUSIVE_REASON
 
         cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-12058"]
         assert len(cve_checks) == 1
-        assert cve_checks[0].name == "StringLookup External Vocabulary Metadata Check"
+        assert cve_checks[0].name == "StringLookup External Vocabulary Risk (Untrusted Version Metadata)"
         assert cve_checks[0].status == CheckStatus.FAILED
-        assert cve_checks[0].severity == IssueSeverity.INFO
-        assert cve_checks[0].details["analysis_incomplete"] is True
-        assert cve_checks[0].details["scan_outcome_reason"] == reason
-        assert "metadata-only assessment is inconclusive" in cve_checks[0].message
-        assert result.success is False
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert reason in result.metadata["scan_outcome_reasons"]
-        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+        assert cve_checks[0].severity == IssueSeverity.WARNING
+        assert cve_checks[0].details["metadata_only_assessment"] is True
+        assert cve_checks[0].details["parse_status"] == "untrusted_artifact_version"
+        assert cve_checks[0].details["version_source"] == "keras_archive_metadata"
+        assert "artifact-controlled version metadata cannot prove the loader runtime is fixed" in cve_checks[0].message
+        assert result.has_warnings is True
+        _assert_no_stale_inconclusive_metadata(result)
+        assert any(issue.details.get("cve_id") == "CVE-2025-12058" for issue in result.issues)
 
         audit_result = scan_model_directory_or_file(str(model_path))
-        metadata = audit_result.file_metadata[str(model_path)]
-        assert determine_exit_code(audit_result) == 2
-        assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-        assert reason in metadata.get("scan_outcome_reasons")
-        assert not any(
-            issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in audit_result.issues
-        )
+        assert determine_exit_code(audit_result) == 1
+        assert any(issue.details.get("cve_id") == "CVE-2025-12058" for issue in audit_result.issues)
 
     def test_stringlookup_external_vocabulary_path_unknown_version_is_warning_exit1(self, tmp_path: Path) -> None:
         """Missing Keras version context should remain a warning-level security decision."""
@@ -3746,7 +3751,7 @@ __import__('pickle').loads(data)
         assert risk_checks[0].status == CheckStatus.FAILED
         assert risk_checks[0].severity == IssueSeverity.WARNING
         assert result.has_warnings is True
-        assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        _assert_no_stale_inconclusive_metadata(result)
 
         audit_result = scan_model_directory_or_file(str(model_path))
         assert determine_exit_code(audit_result) == 1
@@ -3829,7 +3834,7 @@ __import__('pickle').loads(data)
         assert risk_checks[0].severity == IssueSeverity.WARNING
         assert risk_checks[0].details["keras_version"] == "3.12.0rc1junk"
         assert "non-canonical" in risk_checks[0].message
-        assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        _assert_no_stale_inconclusive_metadata(result)
 
         audit_result = scan_model_directory_or_file(str(model_path))
         assert determine_exit_code(audit_result) == 1
