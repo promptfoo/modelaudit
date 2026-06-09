@@ -197,6 +197,9 @@ PARAMETERIZED_AUTHORIZATION_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)(?P<prefix>\b(?:proxy(?:[-_ ]?)?)?authorization\s*[:=]\s*)"
     r"(?:Digest|AWS4-HMAC-SHA256)\b"
 )
+PARAMETERIZED_AUTHORIZATION_CONTINUATION_RE: Final[re.Pattern[str]] = re.compile(
+    r",?[ \t]*[A-Za-z][A-Za-z0-9_-]*[ \t]*="
+)
 AUTH_SCHEME_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\b(?:bearer|basic|token)\s+)[A-Za-z0-9._~+/=-]{8,}")
 STRING_LITERAL_PREFIX_PATTERN: Final[str] = r"(?P<string_prefix>[rRuUbBfF]{0,3})?"
 QUOTED_VALUE_PATTERN: Final[str] = (
@@ -1189,6 +1192,30 @@ def _redact_sensitive_auth_scheme_assignment(match: re.Match[str]) -> str:
     return f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}"
 
 
+def _is_parameterized_authorization_continuation(
+    text: str,
+    *,
+    value_start: int,
+    newline_index: int,
+    continuation_index: int,
+) -> bool:
+    if continuation_index >= len(text) or text[continuation_index] not in " \t":
+        return False
+
+    content_start = continuation_index
+    while content_start < len(text) and text[content_start] in " \t":
+        content_start += 1
+
+    previous_index = newline_index - 1
+    while previous_index >= value_start and text[previous_index] in " \t":
+        previous_index -= 1
+    line_starts_with_comma = content_start < len(text) and text[content_start] == ","
+    if (previous_index < value_start or text[previous_index] != ",") and not line_starts_with_comma:
+        return False
+
+    return PARAMETERIZED_AUTHORIZATION_CONTINUATION_RE.match(text, content_start) is not None
+
+
 def _parameterized_authorization_value_end(
     text: str,
     start: int,
@@ -1226,7 +1253,12 @@ def _parameterized_authorization_value_end(
                 continuation_index = index + 1
                 if char == "\r" and continuation_index < len(text) and text[continuation_index] == "\n":
                     continuation_index += 1
-                if continuation_index >= len(text) or text[continuation_index] not in " \t":
+                if not _is_parameterized_authorization_continuation(
+                    text,
+                    value_start=start,
+                    newline_index=index,
+                    continuation_index=continuation_index,
+                ):
                     return index
                 index = continuation_index
                 continue
