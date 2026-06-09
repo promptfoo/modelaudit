@@ -9,12 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- keep high-confidence command/network correlation findings from being downgraded by Hugging Face whitelists
+- keep same-fragment command/network correlations and relayed fail-closed findings active across Hugging Face whitelists
+- validate Joblib NumPy wrapper state and scan resumed pickle opcodes around raw array payloads without flagging inert array bytes.
+- bound CatBoost command-evidence redaction work and cover distant, shell-concatenated, wrapped, and netrc curl credentials
+- use credential-free, cross-platform cloud routing filenames without changing native object-key suffix semantics
+- encode native cloud object keys into collision-resistant, prefix-safe Windows paths and reject out-of-target listings
+- fail closed on unsafe cloud object paths, parent-directory swaps, and download destination aliases
+- discover extensionless pickle payloads inside ExecuTorch ZIP archives with bounded structural probing, including repeated protocol-0 comment-token evasions
+- report TAR external link escapes with the dedicated symlink rule code, resolve link targets from their correct archive bases, and avoid retaining passing checks for benign link floods
+- bind direct sharded-model cache entries to sibling shard and selected model configuration content fingerprints, and strengthen cache configuration hashes
+- fail closed on PMML XML parsing when defusedxml is unavailable instead of using the stdlib parser
+- reject ambiguous, lossy, SDK-invalid, or traversal-bearing Hugging Face direct file URLs, redact rejected URL secrets, and preserve platform-valid filenames
+- scan safe OCI layer links with model-looking member names instead of treating link metadata as complete coverage
+- preserve scanner read caps when core max_file_size is unlimited
+- reject untrusted JFrog redirect hostnames unless explicitly allowed, block non-public IP targets, suppress ambient netrc credentials, and isolate redirect authentication and cookies
+- restrict manual Docker publishes to validated immutable version tags and their matching Git release refs before registry login or push
 - harden cloud acquisition size caps, HTTPS/R2 auto-default routing, and directory metadata failures
 - detect operator attrgetter, itemgetter, and methodcaller archive-member Python paths to command execution while preserving benign accessor names
 - redact Keras and TensorFlow scanner detail fields that echo model-controlled configs, code indicators, archive members, and external references.
 - route security-relevant protocol-less binary pickle streams through pickle analysis even when file suffixes are misleading
-- redact proxy and camel-case authorization evidence with scheme-bearing values without hiding benign counters
+- avoid routing complete benign cloud objects as protocol-less pickle prefixes when they exactly consume the content-sniff budget
+- redact folded, placeholder-adjacent, proxy, and camel-case authorization evidence with scheme-bearing values without hiding benign counters
 - bound Keras ZIP config traversal for CVE detectors and fail closed when config.json coverage budgets are exhausted
 - redact MLflow registry, source, telemetry, and client exception credentials before logging, printing, or analytics export
 - bound 7z member-name collection before archive entry-limit failures
@@ -26,8 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fail closed on JFrog folder downloads whose selected artifacts use unsafe, colliding, or overlapping local paths
 - detect dangerous textual byte keys in Flax MessagePack checkpoints
 - bound Joblib decompression output to the configured scanner read budget
+- reconcile validated streamed shard families across staging directories and add an explicit opt-in for local cross-directory shards
+- stream Flax MessagePack containers with bounded traversal, object, and metadata-key handling instead of a whole-file size cutoff
 - bound ExecuTorch ZIP metadata and member scans while preserving eligible pickle detections across archive limits and mutations
 - close JIT replay alias, probe-budget, and compound-clause context gaps without suppressing dangerous browser or native-library calls
+- reject MLflow downloads that replace or escape private staging, hide behind directory links, expose special files, or retain external hardlinks, and report safety refusals without success telemetry
 - scan raw payload indicators inside signature-valid ExecuTorch binaries and launcher-prefixed archives before reporting them clean
 - detect Keras get_file tar extraction from effective call arguments without relying on URL suffixes
 - reject cleartext HTTP cloud storage and PyTorch Hub model sources
@@ -36,7 +54,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fail closed when capped DVC pointer outputs are not otherwise covered, change during verification, exceed bounded tail verification, or exhaust shared scan budgets
 - preserve registrable network domains and redact delimiter-split credentials in bounded finding evidence
 - preserve executable text-sidecar network findings for f-string calls, standard command wrappers, port-qualified Docker registries, and bounded xargs downloads while keeping prose references informational.
+- require explicit public progress hook egress hosts and reject internal webhook and SMTP destinations before sending scan details.
 - stabilize cache identity capture for compressed wrapper scans on Darwin `/private` path aliases and during unrelated temporary-file churn.
+- detect interpolated Hydra helper configs, legacy Hydra global-state aliases, and unsafe local or remote NeMo model-loader paths.
+- bound per-tensor and cumulative weight-distribution extraction before materializing PyTorch, HDF5, TensorFlow, and ONNX payloads
+- keep bounded ExecuTorch ZIP snapshots seekable on Python 3.10 so benign and malicious pickle members remain analyzable
 
 ## [0.2.47](https://github.com/promptfoo/modelaudit/compare/v0.2.46...v0.2.47) (2026-06-05)
 

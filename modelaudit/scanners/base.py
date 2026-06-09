@@ -111,6 +111,7 @@ _WHITELIST_DOWNGRADE_EXEMPT_CHECK_NAMES: Final[frozenset[str]] = frozenset(
         "RKNN Command and Network Indicator Correlation",
     }
 )
+_WHITELIST_DOWNGRADE_EXEMPT_CORRELATION_DETAIL = "same_fragment_correlation"
 # Word-boundary matching prevents incidental substrings (e.g. "executable" inside
 # "ExecuTorch", "rce" inside "force") from suppressing whitelist downgrades.
 _WHITELIST_DOWNGRADE_EXEMPT_KEYWORD_PATTERN: Final[re.Pattern[str]] = re.compile(
@@ -212,8 +213,6 @@ class BaseScanner(ABC):
             value = self.config["max_file_size"]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 return self.default_max_file_read_size
-            if value == 0:
-                return 0
 
         return self.default_max_file_read_size
 
@@ -264,7 +263,10 @@ class BaseScanner(ABC):
         if details.get("cve_id") or details.get("cve"):
             return True
 
-        if check_name in _WHITELIST_DOWNGRADE_EXEMPT_CHECK_NAMES:
+        if (
+            check_name in _WHITELIST_DOWNGRADE_EXEMPT_CHECK_NAMES
+            and details.get(_WHITELIST_DOWNGRADE_EXEMPT_CORRELATION_DETAIL) is True
+        ):
             return True
 
         if rule_code and (rule_code.startswith("S2") or rule_code in _WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES):
@@ -347,9 +349,16 @@ class BaseScanner(ABC):
         """
         original_severity = severity
         details = dict(details or {})
-        details.pop("whitelist_downgrade", None)
-        details.pop("whitelist_downgrade_restored", None)
-        details.pop("original_severity", None)
+        if severity in (IssueSeverity.INFO, IssueSeverity.DEBUG):
+            return severity, details
+
+        has_whitelist_metadata = (
+            details.get("whitelist_downgrade") is True or details.get("whitelist_downgrade_restored") is True
+        )
+        if has_whitelist_metadata:
+            details.pop("whitelist_downgrade", None)
+            details.pop("whitelist_downgrade_restored", None)
+            details.pop("original_severity", None)
         if self._should_apply_whitelist(
             severity,
             details=details,

@@ -415,11 +415,27 @@ def test_base_scanner_explicit_zero_read_limit_keeps_opt_out(tmp_path: Path) -> 
     assert result is None
 
 
-def test_base_scanner_inherits_core_max_file_size_unlimited() -> None:
-    """Core-level unlimited max_file_size should keep scanner read caps unlimited."""
+def test_base_scanner_core_max_file_size_unlimited_keeps_default_read_cap() -> None:
+    """Core-level unlimited max_file_size should not disable scanner read caps."""
     scanner = TinyReadLimitScanner(config={"max_file_size": 0})
 
-    assert scanner.max_file_read_size == 0
+    assert scanner.max_file_read_size == TinyReadLimitScanner.default_max_file_read_size
+
+
+def test_base_scanner_core_max_file_size_unlimited_still_fails_closed(tmp_path: Path) -> None:
+    """Default read caps should still apply when the core file-size limit is unlimited."""
+    scanner = TinyReadLimitScanner(config={"max_file_size": 0})
+    file_path = tmp_path / "large.test"
+    file_path.write_bytes(b"this is too long")
+
+    result = scanner._check_size_limit(str(file_path))
+
+    assert isinstance(result, ScanResult)
+    checks = {check.name: check for check in result.checks}
+    assert checks["File Size Limit"].status == CheckStatus.FAILED
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "max_file_read_size_exceeded" in result.metadata["scan_outcome_reasons"]
 
 
 def test_base_scanner_explicit_read_limit_overrides_core_file_size() -> None:
@@ -547,6 +563,7 @@ def test_whitelist_does_not_downgrade_critical_command_network_correlation(check
         passed=False,
         message="Correlated command and process/network indicators detected",
         severity=IssueSeverity.CRITICAL,
+        details={"same_fragment_correlation": True},
     )
 
     assert len(result.issues) == 1
@@ -555,6 +572,40 @@ def test_whitelist_does_not_downgrade_critical_command_network_correlation(check
     assert len(result.checks) == 1
     assert result.checks[0].severity == IssueSeverity.CRITICAL
     assert result.checks[0].details.get("whitelist_downgrade") is None
+
+
+@pytest.mark.parametrize(
+    "check_name",
+    [
+        "Command/Network Correlation Check",
+        "RKNN Command and Network Indicator Correlation",
+    ],
+)
+def test_whitelist_downgrades_unconfirmed_command_network_correlation(check_name: str) -> None:
+    """Display names alone must not turn unrelated model text into an active finding."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name=check_name,
+        passed=False,
+        message="Command and network indicators occur in unrelated model text",
+        severity=IssueSeverity.CRITICAL,
+        details={"same_fragment_correlation": False},
+    )
+
+    assert result.issues[0].severity == IssueSeverity.INFO
+    assert result.issues[0].details.get("whitelist_downgrade") is True
+    assert result.checks[0].severity == IssueSeverity.INFO
 
 
 def test_whitelist_still_downgrades_rknn_command_only_near_match() -> None:
@@ -640,7 +691,7 @@ def test_whitelist_annotations_do_not_leak_through_reused_details() -> None:
         passed=False,
         message="Correlated command and process/network indicators detected",
         severity=IssueSeverity.CRITICAL,
-        details=shared_details,
+        details=shared_details | {"same_fragment_correlation": True},
     )
 
     assert shared_details == {"source": "shared detector evidence"}
@@ -651,6 +702,51 @@ def test_whitelist_annotations_do_not_leak_through_reused_details() -> None:
     assert result.issues[1].severity == IssueSeverity.CRITICAL
     assert result.checks[1].severity == IssueSeverity.CRITICAL
     assert result.issues[1].details.get("whitelist_downgrade_restored") is None
+
+
+def test_relayed_whitelist_downgrade_can_be_restored_by_parent_metadata() -> None:
+    """Composition must retain the provenance needed for fail-closed restoration."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    child = scanner._create_result()
+    child.add_check(
+        name="Policy Finding",
+        passed=False,
+        message="Policy-grade anomaly detected",
+        severity=IssueSeverity.CRITICAL,
+    )
+    assert child.issues[0].severity == IssueSeverity.INFO
+
+    parent = scanner._create_result()
+    child_issue = child.issues[0]
+    parent.add_check(
+        name=child_issue.type or "Relayed Security Finding",
+        passed=False,
+        message=child_issue.message,
+        severity=child_issue.severity,
+        location=child_issue.location,
+        details=child_issue.details,
+        why=child_issue.why,
+    )
+
+    assert parent.issues[0].details.get("whitelist_downgrade") is True
+    assert parent.issues[0].details.get("original_severity") == "CRITICAL"
+
+    parent.metadata["analysis_incomplete"] = True
+    parent.finish(success=False)
+
+    assert parent.checks[0].severity == IssueSeverity.CRITICAL
+    assert parent.issues[0].severity == IssueSeverity.CRITICAL
+    assert parent.issues[0].details.get("whitelist_downgrade_restored") is True
 
 
 def test_whitelist_no_downgrade_info():
@@ -1493,12 +1589,26 @@ def test_whitelist_apply_downgrade_helper_keeps_exempt_critical_none_details() -
 
     new_severity, new_details = scanner._apply_whitelist_downgrade(
         IssueSeverity.CRITICAL,
-        None,
+        {"same_fragment_correlation": True},
         check_name="Command/Network Correlation Check",
     )
 
     assert new_severity == IssueSeverity.CRITICAL
-    assert new_details == {}
+    assert new_details == {"same_fragment_correlation": True}
+
+
+def test_whitelist_helper_preserves_detector_original_severity_evidence() -> None:
+    """Generic detector evidence must not be treated as internal whitelist state."""
+    scanner = MockScanner()
+    original_details = {"original_severity": "upstream-high", "source": "nested scanner"}
+
+    new_severity, new_details = scanner._apply_whitelist_downgrade(
+        IssueSeverity.WARNING,
+        original_details,
+    )
+
+    assert new_severity == IssueSeverity.WARNING
+    assert new_details == original_details
 
 
 def test_whitelist_apply_downgrade_helper_existing_details():
