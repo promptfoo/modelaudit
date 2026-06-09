@@ -96,6 +96,7 @@ def pytest_runtest_setup(item):
             "test_pickle_scanner.py",
             "test_pickle_binunicode8_setitem.py",
             "test_picklescan_adapter.py",
+            "test_nested_budget_limits.py",
             "test_basic.py",  # ScanResult private-metadata merge regressions
             "test_joblib_scanner.py",
             "test_scanner_registry.py",  # Scanner registry routing and metadata tests
@@ -107,6 +108,7 @@ def pytest_runtest_setup(item):
             "test_core.py",
             "test_cli.py",
             "test_sarif_formatter.py",  # SARIF output and credential-redaction regressions
+            "test_sarif_redaction.py",  # SARIF exported source credential-redaction regressions
             "test_directory_file_filtering.py",  # Directory prefilter regression tests
             "test_dependency_lock.py",  # Security-sensitive uv.lock dependency guardrails
             "test_bug1_confidence_exploit.py",  # Security bug test
@@ -217,16 +219,19 @@ def pytest_runtest_setup(item):
             "test_dill_joblib_enhanced.py",  # Dill/joblib pickle routing regression tests
             "test_pickle_context_filtering.py",  # Pickle context filtering regression tests
             "test_xdist_status.py",  # xdist worker progress reporting tests
+            "test_hooks_egress.py",  # progress hook egress allowlist regressions
             "test_release_workflow.py",  # release workflow regression tests
             "test_docker_workflow.py",  # Docker workflow regression tests
             "test_perf_workflow.py",  # Performance benchmark workflow regression tests
             "test_sbom_symlink_containment.py",  # SBOM symlink containment regression tests
+            "test_sbom_url_fixes.py",  # SBOM URL handling and credential-redaction regressions
         ]
         allowed_test_nodeids = [
             "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_vulnerable_pytorch_prereleases",
             "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_allows_torch_load_for_stable_patched_pytorch",
             "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_unknown_pytorch_version",
             "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_unknown_patched_version_suffixes",
+            "tests/test_security_enhancements.py::TestNumPyScannerSecurity::test_negative_dimension_rejection",
         ]
 
         # Check if this is an allowed test file
@@ -628,6 +633,8 @@ def mock_cli_scan_command():
         mock_model.files_scanned = mock_result_dict["files_scanned"]
         mock_model.bytes_scanned = mock_result_dict["bytes_scanned"]
         mock_model.has_errors = mock_result_dict["has_errors"]
+        mock_model.assets = mock_result_dict["assets"]
+        mock_model.file_metadata = mock_result_dict["file_metadata"]
 
         mock_scan.return_value = mock_model
         yield mock_scan

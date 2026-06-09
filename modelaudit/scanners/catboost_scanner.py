@@ -674,16 +674,24 @@ class CatBoostScanner(BaseScanner):
         script_matches: list[dict[str, str]] = []
         encoded_matches: list[dict[str, str]] = []
 
-        for fragment in fragments:
+        for fragment_index, fragment in enumerate(fragments):
             text = fragment["text"]
             lowered = text.lower().strip()
+            fragment_id = str(fragment_index)
 
             if lowered in _BENIGN_METADATA_KEYS:
                 continue
 
             for pattern, reason in _COMMAND_PATTERNS:
                 if pattern.search(text):
-                    command_matches.append({"text": text, "section": fragment["section"], "pattern": reason})
+                    command_matches.append(
+                        {
+                            "text": text,
+                            "section": fragment["section"],
+                            "pattern": reason,
+                            "fragment_id": fragment_id,
+                        },
+                    )
                     break
 
             if _PROCESS_CONTEXT_PATTERN.search(text):
@@ -692,6 +700,7 @@ class CatBoostScanner(BaseScanner):
                         "text": text,
                         "section": fragment["section"],
                         "pattern": "shell/process context",
+                        "fragment_id": fragment_id,
                     },
                 )
 
@@ -703,7 +712,12 @@ class CatBoostScanner(BaseScanner):
 
                 if any(keyword in lowered_url for keyword in _SUSPICIOUS_NETWORK_KEYWORDS):
                     network_matches.append(
-                        {"text": url, "section": fragment["section"], "pattern": "suspicious network URL"},
+                        {
+                            "text": url,
+                            "section": fragment["section"],
+                            "pattern": "suspicious network URL",
+                            "fragment_id": fragment_id,
+                        },
                     )
 
             for ip_pattern in (_IPV4_PATTERN, _IPV6_PATTERN):
@@ -719,7 +733,14 @@ class CatBoostScanner(BaseScanner):
                         or ip_obj.is_unspecified
                     ):
                         continue
-                    network_matches.append({"text": candidate, "section": fragment["section"], "pattern": "public IP"})
+                    network_matches.append(
+                        {
+                            "text": candidate,
+                            "section": fragment["section"],
+                            "pattern": "public IP",
+                            "fragment_id": fragment_id,
+                        },
+                    )
 
             for pattern, reason in _SCRIPT_PATTERNS:
                 if pattern.search(text):
@@ -847,6 +868,8 @@ class CatBoostScanner(BaseScanner):
 
         if command_matches and (process_context_matches or network_matches):
             context_matches = process_context_matches + network_matches
+            command_fragment_ids = {match["fragment_id"] for match in command_matches}
+            context_fragment_ids = {match["fragment_id"] for match in context_matches}
             result.add_check(
                 name="Command/Network Correlation Check",
                 passed=False,
@@ -858,6 +881,7 @@ class CatBoostScanner(BaseScanner):
                     "context_examples": self._summarize_matches(context_matches),
                     "command_match_count": len(command_matches),
                     "context_match_count": len(context_matches),
+                    "same_fragment_correlation": bool(command_fragment_ids & context_fragment_ids),
                 },
                 why="Correlated command primitives plus process/network context strongly indicate exploit intent.",
             )

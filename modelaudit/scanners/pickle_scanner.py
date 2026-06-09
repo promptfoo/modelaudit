@@ -328,6 +328,14 @@ _CVE_RAW_SCAN_SEEDS: tuple[bytes, ...] = (
     b"unpickl",
     b"untyped_storage",
 )
+_CVE_2026_24747_SYSTEM_RAW_SEEDS: tuple[bytes, ...] = (
+    b"os.system",
+    b"posix.system",
+    b"nt.system",
+    b"cos\nsystem\n",
+    b"cposix\nsystem\n",
+    b"cnt\nsystem\n",
+)
 _COPYREG_EXTENSION_OPCODES = (b"\x82", b"\x83", b"\x84")
 
 
@@ -498,7 +506,11 @@ def _has_parsed_pickle_opcode_prefix(data: bytes) -> bool:
     return True
 
 
-def _pickle_cve_streams(data: bytes) -> tuple[tuple[_PickleCveStream, ...], bool]:
+def _pickle_cve_streams(
+    data: bytes,
+    *,
+    first_stream_extent: int | None = None,
+) -> tuple[tuple[_PickleCveStream, ...], bool]:
     streams: list[_PickleCveStream] = []
     offset = 0
     while offset < len(data):
@@ -507,12 +519,14 @@ def _pickle_cve_streams(data: bytes) -> tuple[tuple[_PickleCveStream, ...], bool
         if offset >= len(data):
             break
 
-        extent = _complete_pickle_stream_extent(data, offset)
         if len(streams) >= _MAX_CVE_PICKLE_STREAMS:
             remainder = data[offset:]
-            return tuple(streams), (
-                extent is not None or _looks_like_pickle(remainder) or _has_parsed_pickle_opcode_prefix(remainder)
-            )
+            return tuple(streams), _looks_like_pickle(remainder) or _has_parsed_pickle_opcode_prefix(remainder)
+        extent = (
+            first_stream_extent
+            if offset == 0 and isinstance(first_stream_extent, int) and 0 < first_stream_extent <= len(data)
+            else _complete_pickle_stream_extent(data, offset)
+        )
         if extent is None:
             if not _looks_like_pickle(data[offset:]) and not _has_parsed_pickle_opcode_prefix(data[offset:]):
                 break
@@ -2400,7 +2414,13 @@ class PickleScanner(BaseScanner):
         present_bytes: frozenset[int] | None = None,
     ) -> None:
         """Add CVE attribution checks from a bounded raw pickle scan window."""
-        streams, stream_limit_exceeded = _pickle_cve_streams(data)
+        first_pickle_end_pos = result.metadata.get("first_pickle_end_pos")
+        first_stream_extent = (
+            first_pickle_end_pos
+            if isinstance(first_pickle_end_pos, int) and 0 < first_pickle_end_pos <= len(data)
+            else None
+        )
+        streams, stream_limit_exceeded = _pickle_cve_streams(data, first_stream_extent=first_stream_extent)
         result.metadata["pickle_cve_streams_analyzed"] = len(streams)
         if stream_limit_exceeded:
             reason = "pickle_cve_stream_limit_exceeded"
@@ -2429,35 +2449,65 @@ class PickleScanner(BaseScanner):
             reference.get("import_reference") in {"os.system", "posix.system", "nt.system"}
             for reference in import_references
         )
+        has_rebuild_tensor_global = _result_has_rebuild_tensor_global(result)
         lower = data.lower() if lower_data is None else lower_data
         if present_bytes is None:
             present_bytes = frozenset(lower)
         has_raw_cve_seed = _contains_any_seed_lowered(lower, _CVE_RAW_SCAN_SEEDS, present_bytes)
-        # Encoded STACK_GLOBAL operands are not contiguous raw-text seeds. Use
-        # a cheap candidate gate before running the Python stack model twice.
         has_raw_setitem_opcode = ord("s") in present_bytes or ord("u") in present_bytes
+        has_setitem_candidate = has_setitem_opcode or has_raw_setitem_opcode
+        has_rebuild_tensor_candidate = has_rebuild_tensor_global or b"_rebuild_tensor" in lower
+        has_system_candidate = has_dangerous_system_global or any(
+            seed in lower for seed in _CVE_2026_24747_SYSTEM_RAW_SEEDS
+        )
+        has_stack_global_candidate = opcode_counts.get("STACK_GLOBAL", 0) > 0 or b"\x93" in data
+        if has_stack_global_candidate and b"system" in lower:
+            has_system_candidate = has_system_candidate or b"os" in lower or b"posix" in lower or b"nt" in lower
+        has_escaped_string_operand = b"S'\\" in data or b'S"\\' in data or b"V\\" in data
+        if has_stack_global_candidate and has_escaped_string_operand:
+            has_system_candidate = True
+            has_rebuild_tensor_candidate = True
+        should_analyze_setitems = has_setitem_candidate and (has_rebuild_tensor_candidate or has_system_candidate)
         if (
             not has_raw_cve_seed
             and not (has_setitem_opcode and has_dangerous_system_global)
-            and not has_raw_setitem_opcode
+            and not should_analyze_setitems
         ):
             result.metadata["pickle_cve_raw_detector_skipped"] = True
             return
 
-        stream_setitem_analyses = [
-            (
-                _analyze_pickle_setitem_entries(
-                    stream.payload,
-                    global_needles=("_rebuild_tensor",),
-                    literal_needles=("_rebuild_tensor",),
-                ),
-                _analyze_pickle_setitem_entries(
-                    stream.payload,
-                    global_needles=("os.system", "posix.system", "nt.system"),
-                ),
+        no_setitem_abuse = _PickleSetitemAnalysis(
+            saw_setitem=False,
+            confirmed_dangerous_target=False,
+            suspicious_entry_on_unknown_target=False,
+            parse_incomplete=False,
+        )
+        stream_setitem_analyses: list[tuple[_PickleSetitemAnalysis, _PickleSetitemAnalysis]] = []
+        for stream in streams:
+            if not should_analyze_setitems:
+                stream_setitem_analyses.append((no_setitem_abuse, no_setitem_abuse))
+                continue
+            candidate_analysis = _analyze_pickle_setitem_entries(
+                stream.payload,
+                global_needles=("_rebuild_tensor", "os.system", "posix.system", "nt.system"),
+                literal_needles=("_rebuild_tensor",),
             )
-            for stream in streams
-        ]
+            if not candidate_analysis.has_abuse:
+                stream_setitem_analyses.append((candidate_analysis, candidate_analysis))
+                continue
+            stream_setitem_analyses.append(
+                (
+                    _analyze_pickle_setitem_entries(
+                        stream.payload,
+                        global_needles=("_rebuild_tensor",),
+                        literal_needles=("_rebuild_tensor",),
+                    ),
+                    _analyze_pickle_setitem_entries(
+                        stream.payload,
+                        global_needles=("os.system", "posix.system", "nt.system"),
+                    ),
+                )
+            )
         has_stream_setitem_evidence = any(
             rebuild_analysis.has_abuse or dangerous_system_analysis.has_abuse
             for rebuild_analysis, dangerous_system_analysis in stream_setitem_analyses
@@ -2493,14 +2543,17 @@ class PickleScanner(BaseScanner):
         attribution_context: dict[tuple[str, str], tuple[int, int, bool]] = {}
         dangerous_system_context: tuple[int, int, bool] | None = None
         for stream_index, (stream, setitem_analyses) in enumerate(zip(streams, stream_setitem_analyses, strict=True)):
-            try:
-                stream_attributions = analyze_cve_patterns(
-                    stream.payload.decode("utf-8", errors="ignore"),
-                    stream.payload,
-                )
-            except Exception as error:
-                logger.warning("Error checking pickle stream CVE patterns: %s", error)
-                stream_attributions = []
+            if len(streams) == 1 and stream.offset == 0 and stream.payload == data:
+                stream_attributions = attributions
+            else:
+                try:
+                    stream_attributions = analyze_cve_patterns(
+                        stream.payload.decode("utf-8", errors="ignore"),
+                        stream.payload,
+                    )
+                except Exception as error:
+                    logger.warning("Error checking pickle stream CVE patterns: %s", error)
+                    stream_attributions = []
             for attribution in stream_attributions:
                 if attribution.cve_id != "CVE-2026-24747" or any(
                     "setitem" in pattern.lower() for pattern in attribution.patterns_matched

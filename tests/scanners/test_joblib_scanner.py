@@ -29,6 +29,26 @@ def test_joblib_scanner_basic(tmp_path: Path) -> None:
     assert result.bytes_scanned > 0
 
 
+def test_joblib_metadata_extraction_ignores_deserialization_opt_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.joblib"
+    joblib.dump({"a": np.arange(5)}, path, compress=3)
+
+    def fail_load(_path: str) -> object:
+        raise AssertionError("joblib.load must not run during metadata extraction")
+
+    monkeypatch.setattr(joblib, "load", fail_load)
+
+    metadata = JoblibScanner({"allow_metadata_deserialization": True}).extract_metadata(str(path))
+
+    assert metadata["deserialization_skipped"] is True
+    assert metadata["allow_metadata_deserialization_ignored"] is True
+    assert "Unsafe in-process joblib deserialization is disabled" in metadata["reason"]
+    assert "object_type" not in metadata
+
+
 def test_joblib_default_decompressed_cap_tracks_file_read_budget() -> None:
     scanner = JoblibScanner()
 
