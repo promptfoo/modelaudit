@@ -208,11 +208,53 @@ def test_redacts_proxy_and_camel_case_auth_scheme_assignments() -> None:
     assert "eval('1')" in redacted
 
 
+def test_redacts_punctuated_auth_scheme_credentials() -> None:
+    """Valid punctuation in an unquoted scheme credential must not escape redaction."""
+    text = (
+        "apiKey = ApiKey COLON:SECRET123456; "
+        "customToken = Custom BANG!SECRET123456; "
+        "authToken = Bearer PERCENT%SECRET123456; eval('1')"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "COLON:SECRET123456" not in redacted
+    assert "BANG!SECRET123456" not in redacted
+    assert "PERCENT%SECRET123456" not in redacted
+    assert f"apiKey = {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert f"customToken = {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert f"authToken = {REDACTED_EVIDENCE_VALUE}" in redacted
+    assert "eval('1')" in redacted
+
+
+def test_redacts_parameterized_authorization_headers() -> None:
+    """Digest and SigV4 header parameters must be treated as one credential value."""
+    text = (
+        "Authorization: AWS4-HMAC-SHA256 "
+        "Credential=AKIAIOSFODNN7EXAMPLE/20260609/us-east-1/s3/aws4_request, "
+        "SignedHeaders=host;x-amz-date, Signature=SIGV4SECRET123456; "
+        'Proxy-Authorization: Digest username="user", response="DIGESTSECRET123456"; '
+        "eval('1')"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "AKIAIOSFODNN7EXAMPLE" not in redacted
+    assert "SIGV4SECRET123456" not in redacted
+    assert "DIGESTSECRET123456" not in redacted
+    assert f"Authorization: {REDACTED_EVIDENCE_VALUE};" in redacted
+    assert f"Proxy-Authorization: {REDACTED_EVIDENCE_VALUE};" in redacted
+    assert "eval('1')" in redacted
+
+
 def test_preserves_camel_case_credential_control_near_matches() -> None:
     """Credential-looking counters and controls should not be treated as secrets."""
     text = (
-        "xApiKeyCount = 2; apiKeyTimeout = 30; clientSecretStatus = 'present'; "
-        "sessionTokenEnabled = True; proxyAuthorizationEnabled = True; tokenizer = 'visible'; eval('1')"
+        "xApiKeyCount = 2; xApiKeyCounter = 3; xApiKeyCount2 = 4; apiKeyTimeout = 30; "
+        "myApiKeyTimeoutMs = 60; clientSecretStatus = 'present'; sessionTokenEnabled = True; "
+        "sessionTokenEnabledFlag = False; proxyAuthorizationEnabled = True; "
+        "ModelAccessTokenEndpoint = https://evil.example/token; "
+        "RequestSignatureAlgorithm = https://evil.example/payload.sh; tokenizer = 'visible'; eval('1')"
     )
 
     assert redact_evidence_string(text, max_chars=None) == text

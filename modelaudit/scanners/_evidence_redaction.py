@@ -117,12 +117,12 @@ SEPARATED_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
     r"(?:[_.-][a-z0-9]+)*"
 )
 CAMEL_CASE_SENSITIVE_ASSIGNMENT_KEY: Final[str] = (
-    r"(?:[A-Za-z][A-Za-z0-9]*)?"
+    r"(?:(?:[a-z][A-Za-z0-9]*)|(?:[A-Z]{2,}[A-Za-z0-9]*)|[A-Z])?"
     r"(?:AccessKey|accessKey|AccessToken|accessToken|APIKey|ApiKey|apiKey|AuthToken|authToken|"
     r"ClientSecret|clientSecret|Credential|Password|Passwd|PrivateKey|privateKey|Pwd|"
     r"RefreshToken|refreshToken|GoogleAccessId|googleAccessId|SAS|Secret|SecretKey|secretKey|"
     r"Signature|Sig|Token)"
-    r"(?!(?:Cache|Count|Enabled|Status|Timeout)\b)(?:[A-Z][A-Za-z0-9]*)?"
+    r"(?!(?:Algorithm|Cache|Count|Counter|Enabled|Endpoint|Status|Timeout))(?:[A-Z][A-Za-z0-9]*)?"
 )
 AUTHORIZATION_ALIAS_ASSIGNMENT_KEY: Final[str] = r"[a-z0-9_.-]*authorization(?:s|[_.-]?(?:headers?|values?))?"
 AUTHORIZATION_ALIAS_R_QUOTED_IDENTIFIER_KEY: Final[str] = (
@@ -193,6 +193,10 @@ AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r")"
     r"(?:[A-Za-z][A-Za-z0-9._-]*\s+)?[^\s\"';&|,}\]]+"
 )
+PARAMETERIZED_AUTHORIZATION_VALUE_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?P<prefix>\b(?:proxy(?:[-_ ]?)?)?authorization\s*[:=]\s*)"
+    r"(?:Digest|AWS4-HMAC-SHA256)\b[^\r\n;|}\]]*"
+)
 AUTH_SCHEME_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"(?i)(\b(?:bearer|basic|token)\s+)[A-Za-z0-9._~+/=-]{8,}")
 STRING_LITERAL_PREFIX_PATTERN: Final[str] = r"(?P<string_prefix>[rRuUbBfF]{0,3})?"
 QUOTED_VALUE_PATTERN: Final[str] = (
@@ -216,7 +220,7 @@ SENSITIVE_AUTH_SCHEME_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*{SCALAR_ASSIGNMENT_OPERATOR_PATTERN}\s*"
     rf"{VALUE_OPENERS_PATTERN})"
     r"(?:ApiKey|Bearer|Basic|Custom|Digest|Negotiate|NTLM|OAuth|Token|AWS4-HMAC-SHA256)"
-    r"[ \t]+[A-Za-z0-9._~+/_-]{8,}={0,2}"
+    rf"[ \t]+{UNQUOTED_VALUE_PATTERN}"
 )
 SENSITIVE_COMPOUND_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)"
@@ -3199,6 +3203,7 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0, decode_percent: b
     redacted = UNTERMINATED_QUOTED_AUTHORIZATION_ASSIGNMENT_RE.sub(redact_unterminated_assignment, redacted)
     redacted = UNTERMINATED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(redact_unterminated_assignment, redacted)
     if not parseable_python_evidence:
+        redacted = PARAMETERIZED_AUTHORIZATION_VALUE_RE.sub(_redact_sensitive_auth_scheme_assignment, redacted)
         redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = AUTH_SCHEME_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = SENSITIVE_FLAG_VALUE_RE.sub(_redact_sensitive_flag_value, redacted)
