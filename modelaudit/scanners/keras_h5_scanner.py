@@ -7,7 +7,6 @@ import os
 import re
 from collections.abc import Callable
 from contextlib import suppress
-from pathlib import Path
 from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import (
@@ -601,15 +600,12 @@ class KerasH5Scanner(BaseScanner):
             return self._JSON_ATTRIBUTE_PARSE_FAILED
 
     @classmethod
-    def _has_weights_like_hdf5_layout(cls, h5_file: Any, path: str) -> bool:
+    def _has_weights_like_hdf5_layout(cls, h5_file: Any, _path: str) -> bool:
         """Return True for HDF5 layouts that resemble Keras weights-only files."""
-        if any(str(key).lower() in cls._KERAS_WEIGHT_ROOT_GROUPS for key in h5_file):
-            return True
-
         if cls._has_legacy_weights_layout(h5_file):
             return True
 
-        return Path(path).name.lower().endswith(".weights.h5") and cls._has_keras3_weights_layout(h5_file)
+        return cls._has_keras3_weights_layout(h5_file)
 
     @classmethod
     def _has_legacy_weights_layout(cls, h5_file: Any) -> bool:
@@ -636,9 +632,6 @@ class KerasH5Scanner(BaseScanner):
     @classmethod
     def _has_keras3_weights_layout(cls, h5_file: Any) -> bool:
         """Detect Keras 3 H5IOStore weights-only layouts without generic HDF5 overreach."""
-        if cls._has_group_or_external_link(h5_file, "vars"):
-            return True
-
         layers_link = h5_file.get("layers", getlink=True)
         if isinstance(layers_link, h5py.ExternalLink):
             return True
@@ -664,6 +657,123 @@ class KerasH5Scanner(BaseScanner):
                 return True
 
         return False
+
+    @classmethod
+    def _hdf5_weight_scan_roots(cls, h5_file: Any) -> tuple[list[str], bool]:
+        """Return loader-consumed HDF5 roots without following external links."""
+        roots: list[str] = []
+        root_set: set[str] = set()
+        roots_truncated = False
+        inspected_name_count = 0
+
+        def consume_name_budget() -> bool:
+            nonlocal inspected_name_count, roots_truncated
+            if inspected_name_count >= cls._MAX_HDF5_LINK_VISITS:
+                roots_truncated = True
+                return False
+            inspected_name_count += 1
+            return True
+
+        def add_root(path: str) -> bool:
+            nonlocal roots_truncated
+            if path in root_set:
+                return True
+            if len(roots) >= cls._MAX_HDF5_LINK_VISITS:
+                roots_truncated = True
+                return False
+            roots.append(path)
+            root_set.add(path)
+            return True
+
+        def add_weight_names(group: Any, prefix: str) -> bool:
+            for weight_name in cls._decode_hdf5_names(group.attrs.get("weight_names")):
+                if not consume_name_budget():
+                    return False
+                lookup_name = weight_name or "."
+                if group.get(lookup_name, getlink=True) is None:
+                    continue
+                if weight_name.startswith("/"):
+                    weight_path = weight_name.lstrip("/")
+                else:
+                    weight_path = f"{prefix}/{weight_name}" if prefix else weight_name
+                if not add_root(weight_path):
+                    return False
+            return True
+
+        def add_legacy_group_roots(group: Any, prefix: str) -> None:
+            nonlocal roots_truncated
+            if not add_weight_names(group, prefix):
+                return
+            for layer_name in cls._decode_hdf5_names(group.attrs.get("layer_names")):
+                if not consume_name_budget():
+                    return
+                layer_link = group.get(layer_name, getlink=True)
+                if layer_link is None:
+                    continue
+                layer_path = f"{prefix}/{layer_name}" if prefix else layer_name
+                if isinstance(layer_link, h5py.ExternalLink):
+                    if not add_root(layer_path):
+                        return
+                    continue
+                if not isinstance(layer_link, h5py.HardLink):
+                    continue
+                layer_group = group.get(layer_name, getlink=False)
+                if isinstance(layer_group, h5py.Group) and not add_weight_names(layer_group, layer_path):
+                    return
+
+        if "model_config" in h5_file.attrs:
+            for root_name in cls._KERAS_WEIGHT_ROOT_GROUPS:
+                root_link = h5_file.get(root_name, getlink=True)
+                if isinstance(root_link, h5py.ExternalLink):
+                    if not add_root(root_name):
+                        break
+                    continue
+                if not isinstance(root_link, h5py.HardLink):
+                    continue
+                root_group = h5_file.get(root_name, getlink=False)
+                if isinstance(root_group, h5py.Group):
+                    add_legacy_group_roots(root_group, root_name)
+                if roots_truncated:
+                    break
+            return roots, roots_truncated
+
+        layer_names = cls._decode_hdf5_names(h5_file.attrs.get("layer_names"))
+        if layer_names:
+            add_legacy_group_roots(h5_file, "")
+            return roots, roots_truncated
+
+        layers_link = h5_file.get("layers", getlink=True)
+        if isinstance(layers_link, h5py.ExternalLink):
+            add_root("layers")
+            return roots, roots_truncated
+        if not isinstance(layers_link, h5py.HardLink):
+            return roots, False
+
+        layers = h5_file.get("layers", getlink=False)
+        if not isinstance(layers, h5py.Group):
+            return roots, False
+
+        for layer_name in layers:
+            if not consume_name_budget():
+                break
+            layer_path = f"layers/{layer_name}"
+            layer_link = layers.get(layer_name, getlink=True)
+            if isinstance(layer_link, h5py.ExternalLink):
+                if not add_root(layer_path):
+                    break
+                continue
+            if not isinstance(layer_link, h5py.HardLink):
+                continue
+
+            layer = layers.get(layer_name, getlink=False)
+            if (
+                isinstance(layer, h5py.Group)
+                and layer.get("vars", getlink=True) is not None
+                and not add_root(f"{layer_path}/vars")
+            ):
+                break
+
+        return roots, roots_truncated
 
     @staticmethod
     def _has_group_or_external_link(group: Any, name: str) -> bool:
@@ -703,6 +813,7 @@ class KerasH5Scanner(BaseScanner):
         findings: list[dict[str, Any]] = []
         external_reference_count = 0
         external_storage_segments_truncated = False
+        weight_roots, weight_roots_truncated = self._hdf5_weight_scan_roots(h5_file)
 
         def visit(name: str, link: Any) -> None:
             nonlocal external_reference_count, external_storage_segments_truncated
@@ -724,35 +835,81 @@ class KerasH5Scanner(BaseScanner):
 
             obj = h5_file.get(name, getlink=False)
             if isinstance(obj, h5py.Dataset):
-                external_storage = obj.external
-                if external_storage:
+                storage_properties = obj.id.get_create_plist()
+                external_storage_segment_count = storage_properties.get_external_count()
+                if external_storage_segment_count > 0:
                     external_reference_count += 1
                     if len(findings) >= self._MAX_HDF5_EXTERNAL_REFERENCE_REPORTS:
                         return
                     segments = [
-                        {"filename": filename, "offset": int(offset), "size": int(size)}
-                        for filename, offset, size in external_storage[
-                            : self._MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS
-                        ]
+                        {"filename": os.fsdecode(filename), "offset": int(offset), "size": int(size)}
+                        for filename, offset, size in (
+                            storage_properties.get_external(index)
+                            for index in range(
+                                min(
+                                    external_storage_segment_count,
+                                    self._MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS,
+                                )
+                            )
+                        )
                     ]
                     finding: dict[str, Any] = {
                         "kind": "external_storage",
                         "hdf5_path": f"/{name}".replace("//", "/"),
                         "segments": segments,
                     }
-                    if len(external_storage) > len(segments):
+                    if external_storage_segment_count > len(segments):
                         external_storage_segments_truncated = True
-                        finding["segment_count"] = len(external_storage)
+                        finding["segment_count"] = external_storage_segment_count
                         finding["segments_truncated"] = True
                     findings.append(finding)
 
-        visited_link_count, link_visits_truncated = self._visit_hdf5_links(
-            h5_file,
-            visit,
-            max_links=self._MAX_HDF5_LINK_VISITS,
-        )
+        visited_link_count = 0
+        link_visits_truncated = False
+        for root_path in weight_roots:
+            root_link = h5_file.get(root_path, getlink=True)
+            if root_link is None:
+                continue
+            if isinstance(root_link, h5py.ExternalLink):
+                visited_link_count += 1
+                visit(root_path, root_link)
+                continue
+            if not isinstance(root_link, h5py.HardLink):
+                continue
+
+            root_obj = h5_file.get(root_path, getlink=False)
+            if isinstance(root_obj, h5py.Dataset):
+                visited_link_count += 1
+                visit(root_path, root_link)
+                continue
+            if not isinstance(root_obj, h5py.Group):
+                continue
+
+            remaining_link_visits = max(self._MAX_HDF5_LINK_VISITS - visited_link_count, 0)
+            if remaining_link_visits == 0:
+                link_visits_truncated = True
+                break
+
+            def visit_root(name: str, link: Any, *, prefix: str = root_path) -> None:
+                visit(f"{prefix}/{name}", link)
+
+            root_visited, root_truncated = self._visit_hdf5_links(
+                root_obj,
+                visit_root,
+                max_links=remaining_link_visits,
+            )
+            visited_link_count += root_visited
+            if root_truncated:
+                link_visits_truncated = True
+                break
+
         external_references_truncated = external_reference_count > len(findings)
-        if link_visits_truncated or external_references_truncated or external_storage_segments_truncated:
+        if (
+            weight_roots_truncated
+            or link_visits_truncated
+            or external_references_truncated
+            or external_storage_segments_truncated
+        ):
             reason = "keras_h5_external_reference_analysis_limit_exceeded"
             self._mark_inconclusive_scan_result(result, reason)
             result.add_check(
@@ -766,6 +923,7 @@ class KerasH5Scanner(BaseScanner):
                     "scan_outcome_reason": reason,
                     "visited_link_count": visited_link_count,
                     "max_link_visits": self._MAX_HDF5_LINK_VISITS,
+                    "weight_roots_truncated": weight_roots_truncated,
                     "link_visits_truncated": link_visits_truncated,
                     "external_reference_count": external_reference_count,
                     "reported_external_reference_count": len(findings),
@@ -1382,10 +1540,7 @@ class KerasH5Scanner(BaseScanner):
         is_dangerous = (
             self._is_dangerous_exact_module_reference(source, module_value, object_class)
             or bool(symbol_tokens & self._ALWAYS_DANGEROUS_LAMBDA_FUNCTION_NAMES)
-            or (
-                top_module in _DANGEROUS_CONFIG_MODULE_ROOTS
-                and (object_class == "function" or bool(symbol_tokens & self._DANGEROUS_LAMBDA_FUNCTION_NAMES))
-            )
+            or top_module in _DANGEROUS_CONFIG_MODULE_ROOTS
         )
         is_outside_allowlist = top_module not in _SAFE_KERAS_MODULE_ROOTS
         is_untrusted_callable = is_callable_reference and not self._is_allowlisted_config_callable(
@@ -1409,8 +1564,8 @@ class KerasH5Scanner(BaseScanner):
                     "key": key,
                     "module": redacted_module_value,
                     "cve_id": "CVE-2025-1550",
-                    "cvss": 9.8,
-                    "cwe": "CWE-502",
+                    "cvss": 7.3,
+                    "cwe": "CWE-94",
                     "description": (
                         "Arbitrary dangerous module references in Keras H5 metadata can bypass safe_mode "
                         "and execute attacker-controlled code during model loading."
@@ -1435,8 +1590,8 @@ class KerasH5Scanner(BaseScanner):
                     "key": key,
                     "module": redacted_module_value,
                     "cve_id": "CVE-2025-1550",
-                    "cvss": 9.8,
-                    "cwe": "CWE-502",
+                    "cvss": 7.3,
+                    "cwe": "CWE-94",
                     "description": (
                         "Non-allowlisted callable module references may indicate safe_mode bypass "
                         "paths in untrusted Keras H5 metadata."
@@ -1650,7 +1805,7 @@ class KerasH5Scanner(BaseScanner):
         callback_details = {"layer_class": "Lambda", "callback_field": callback_field}
         encoded_function_handled = False
         function_requires_review = False
-        nested_callable_reference: tuple[Any, Any] | None = None
+        nested_callable_references: list[tuple[Any, Any]] = []
         if isinstance(function_str, dict):
             encoded_function_handled = check_lambda_dict_function(
                 function_str,
@@ -1658,8 +1813,8 @@ class KerasH5Scanner(BaseScanner):
                 self.current_file_path,
                 callback_layer_name,
             )
-            nested_callable_reference = self._lambda_callable_dict_reference(function_str)
-            if not encoded_function_handled and nested_callable_reference is None:
+            nested_callable_references = self._lambda_callable_dict_references(function_str)
+            if not encoded_function_handled and not nested_callable_references:
                 function_requires_review = True
                 result.add_check(
                     name="Lambda Layer Code Analysis",
@@ -1782,8 +1937,7 @@ class KerasH5Scanner(BaseScanner):
         module_references: list[tuple[Any, Any, str]] = []
         if module_name is not None or reference_function_name is not None:
             module_references.append((module_name, reference_function_name, "layer_config"))
-        if nested_callable_reference is not None:
-            module_references.append((*nested_callable_reference, "function_dict"))
+        module_references.extend((*reference, "function_dict") for reference in nested_callable_references)
 
         allowlisted_references: list[tuple[str, str, str]] = []
         reference_requires_review = encoded_function_handled or function_requires_review
@@ -1893,15 +2047,21 @@ class KerasH5Scanner(BaseScanner):
         return layer_class == "Lambda" or layer_class in KerasH5Scanner._TRUSTED_LAMBDA_LAYER_CLASSES
 
     @staticmethod
-    def _lambda_callable_dict_reference(function_dict: dict[str, Any]) -> tuple[Any, Any] | None:
-        """Extract a module/function pair from a serialized callable dictionary."""
-        for function_key in ("function_name", "function", "registered_name"):
-            if function_key in function_dict:
-                return function_dict.get("module"), function_dict.get(function_key)
-        function_config = function_dict.get("config")
-        if "module" in function_dict and isinstance(function_config, str):
-            return function_dict.get("module"), function_config
-        return None
+    def _lambda_callable_dict_references(function_dict: dict[str, Any]) -> list[tuple[Any, Any]]:
+        """Extract every module/function pair that may drive callable lookup."""
+        if "module" not in function_dict:
+            return []
+
+        module_value = function_dict.get("module")
+        references: list[tuple[Any, Any]] = []
+        for function_key in ("function_name", "function", "config", "registered_name"):
+            if function_key not in function_dict:
+                continue
+            function_value = function_dict.get(function_key)
+            if any(type(existing) is type(function_value) and existing == function_value for _, existing in references):
+                continue
+            references.append((module_value, function_value))
+        return references
 
     @staticmethod
     def _is_vulnerable_to_cve_2024_3660(version: str) -> bool | None:
@@ -2302,7 +2462,7 @@ class KerasH5Scanner(BaseScanner):
                                 return
                             obj = weights_group.get(name, getlink=False)
                             if isinstance(obj, h5py.Dataset):
-                                if obj.external:
+                                if obj.id.get_create_plist().get_external_count() > 0:
                                     skipped_external_weight_entries = True
                                     return
                                 param_count = obj.size

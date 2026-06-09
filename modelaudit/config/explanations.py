@@ -1076,7 +1076,7 @@ def get_cve_2025_12060_explanation(issue_type: str) -> str:
 def get_cve_2025_1550_explanation(issue_type: str) -> str:
     """Get explanation for CVE-2025-1550: Keras safe_mode bypass via module references.
 
-    CVE-2025-1550 (CVSS 9.8 CRITICAL): Keras Model.load_model allows arbitrary code execution
+    CVE-2025-1550 (CVSS 7.3 HIGH): Keras Model.load_model allows arbitrary code execution
     even with safe_mode=True by specifying arbitrary Python modules/functions in serialized model
     configuration. Fixed in Keras 3.9.0.
     """

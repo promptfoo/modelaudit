@@ -1,8 +1,8 @@
 """Scanner for detecting anomalous weight distributions in model files."""
 
 import inspect
+import numbers
 import os
-import re
 import zipfile
 from contextlib import suppress
 from typing import Any, ClassVar
@@ -11,14 +11,13 @@ from ..scanner_results import mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
 _ANALYSIS_INCONCLUSIVE_REASON = "weight_distribution_analysis_incomplete"
-_PATCHED_TORCH_WEIGHTS_ONLY_VERSION = (2, 6, 0)
-_TORCH_RELEASE_VERSION_PATTERN = re.compile(r"^\s*(\d+)\.(\d+)\.(\d+)([A-Za-z0-9.+_-]*)\s*$")
-_TORCH_PRERELEASE_MARKER_PATTERN = re.compile(r"(?i)^(?:a|b|c|rc|alpha|beta|pre|preview|dev)")
-_TORCH_LOCAL_SUFFIX = r"\+[a-z0-9]+(?:[._-][a-z0-9]+)*"
-_TORCH_POSTRELEASE_SUFFIX = r"(?:(?:[._-]?(?:post|rev|r)(?:[._-]?\d+)?)|-\d+)"
-_TORCH_STABLE_SUFFIX_PATTERN = re.compile(
-    rf"(?i)^(?:{_TORCH_LOCAL_SUFFIX}|{_TORCH_POSTRELEASE_SUFFIX}(?:{_TORCH_LOCAL_SUFFIX})?)$"
-)
+_MAX_RESTRICTED_PICKLE_BYTES = 10 * 1024 * 1024
+_MAX_RESTRICTED_PICKLE_NODES = 1_000_000
+_MAX_RESTRICTED_PICKLE_OPCODES = 500_000
+_MAX_RESTRICTED_PICKLE_MEMO_ENTRIES = 100_000
+_PICKLE_OPCODE_BUDGET_BYTES = 128
+_MAX_NUMERIC_SCALAR_BYTES = 16
+_MIN_NUMPY_ARRAY_BUDGET_BYTES = 256
 
 
 class WeightDistributionScanner(BaseScanner):
@@ -54,7 +53,7 @@ class WeightDistributionScanner(BaseScanner):
         # Use max_array_size for in-memory array size limits (default 100MB)
         self.max_array_size = self.config.get("max_array_size", 100 * 1024 * 1024)
         # Direct torch.load on untrusted files can trigger pickle RCE. Keep opt-in.
-        self.enable_unsafe_torch_load = self.config.get("enable_unsafe_torch_load", False)
+        self.enable_unsafe_torch_load = self.config.get("enable_unsafe_torch_load") is True
         # Flag set when weight extraction would be unsafe
         self.extraction_unsafe = False
         self.extraction_unsafe_reason: str | None = None
@@ -163,6 +162,11 @@ class WeightDistributionScanner(BaseScanner):
                     return result
 
             if not weights_info:
+                if self.extraction_unsafe:
+                    self._record_extraction_incomplete(
+                        "unsafe_pytorch_weight_extraction",
+                        unsafe_reason=self.extraction_unsafe_reason,
+                    )
                 if self.extraction_incomplete:
                     self._mark_analysis_incomplete(
                         result,
@@ -237,22 +241,6 @@ class WeightDistributionScanner(BaseScanner):
         result.finish(success=True)
         return result
 
-    @staticmethod
-    def _torch_weights_only_is_patched_version(version: object) -> bool:
-        version_text = str(version).strip()
-        match = _TORCH_RELEASE_VERSION_PATTERN.match(version_text)
-        if not match:
-            return False
-
-        release = tuple(int(part) for part in match.groups()[:3])
-        suffix = match.group(4)
-        normalized_suffix = suffix.lstrip("._-")
-        if _TORCH_PRERELEASE_MARKER_PATTERN.match(normalized_suffix):
-            return False
-        if suffix and _TORCH_STABLE_SUFFIX_PATTERN.fullmatch(suffix) is None:
-            return False
-        return release >= _PATCHED_TORCH_WEIGHTS_ONLY_VERSION
-
     def _record_extraction_incomplete(self, reason: str, **details: Any) -> None:
         """Record incomplete tensor extraction while preserving already-read tensors."""
         self.extraction_incomplete = True
@@ -299,6 +287,92 @@ class WeightDistributionScanner(BaseScanner):
             },
         )
 
+    def _restricted_pickle_array_limit(self) -> int:
+        """Return a hard-bounded array budget for the primitive pickle fallback."""
+        try:
+            configured_limit = int(self.max_array_size)
+        except (TypeError, ValueError):
+            configured_limit = 0
+        if configured_limit <= 0:
+            return 100 * 1024 * 1024
+        return min(configured_limit, 100 * 1024 * 1024)
+
+    def _new_primitive_array_budget(self) -> dict[str, int]:
+        byte_limit = self._restricted_pickle_array_limit()
+        max_numeric_items = byte_limit // _MAX_NUMERIC_SCALAR_BYTES
+        return {
+            "remaining_bytes": byte_limit,
+            "remaining_nodes": min(_MAX_RESTRICTED_PICKLE_NODES, max(1, max_numeric_items * 2 + 1)),
+        }
+
+    def _restricted_pickle_opcode_limit(self) -> int:
+        return min(
+            _MAX_RESTRICTED_PICKLE_OPCODES,
+            max(256, self._restricted_pickle_array_limit() // _PICKLE_OPCODE_BUDGET_BYTES),
+        )
+
+    def _bounded_primitive_array(self, value: Any, np: Any, budget: dict[str, int]) -> Any | None:
+        """Materialize a primitive numeric array only after bounded graph traversal."""
+        active_container_ids: set[int] = set()
+        stack: list[tuple[Any, bool]] = [(value, False)]
+        numeric_items = 0
+        metadata_items = 0
+
+        while stack:
+            node, leaving = stack.pop()
+            if leaving:
+                active_container_ids.remove(id(node))
+                continue
+
+            budget["remaining_nodes"] -= 1
+            if budget["remaining_nodes"] < 0:
+                raise ValueError("Primitive tensor structure exceeds aggregate node limit")
+
+            if isinstance(node, (list, tuple)):
+                node_id = id(node)
+                if node_id in active_container_ids:
+                    raise ValueError("Primitive tensor structure contains a cycle")
+                active_container_ids.add(node_id)
+                stack.append((node, True))
+                stack.extend((item, False) for item in reversed(node))
+                continue
+
+            if isinstance(node, bool):
+                metadata_items += 1
+                continue
+            if isinstance(node, numbers.Number):
+                numeric_items += 1
+                continue
+            if isinstance(node, (str, bytes)) or node is None:
+                metadata_items += 1
+                continue
+            raise ValueError(f"Primitive tensor contains unsupported value type: {type(node).__name__}")
+
+        if numeric_items and metadata_items:
+            raise ValueError("Primitive tensor mixes numeric values with non-numeric metadata")
+        if metadata_items or numeric_items == 0:
+            return None
+
+        required_bytes = max(
+            numeric_items * _MAX_NUMERIC_SCALAR_BYTES,
+            _MIN_NUMPY_ARRAY_BUDGET_BYTES,
+        )
+        if required_bytes > budget["remaining_bytes"]:
+            raise ValueError(
+                "Primitive tensor materialization exceeds aggregate byte limit "
+                f"({required_bytes} > {budget['remaining_bytes']})"
+            )
+        budget["remaining_bytes"] -= required_bytes
+
+        array = np.array(value)
+        if not np.issubdtype(array.dtype, np.number):
+            raise ValueError(f"Primitive tensor has non-numeric dtype: {array.dtype}")
+        if array.nbytes > required_bytes:
+            raise ValueError(
+                f"Primitive tensor materialization exceeded reserved bytes ({array.nbytes} > {required_bytes})"
+            )
+        return array
+
     def _extract_pytorch_weights(self, path: str) -> dict[str, Any]:
         """Extract weights from PyTorch model files"""
         try:
@@ -314,10 +388,18 @@ class WeightDistributionScanner(BaseScanner):
         weights_info: dict[str, Any] = {}
 
         try:
-            # SECURITY: avoid unsafe torch.load on untrusted files unless explicitly allowed.
-            # Use weights_only=True on patched versions, and block unsafe fallbacks by default.
+            if not self.enable_unsafe_torch_load:
+                self.extraction_unsafe = True
+                self.extraction_unsafe_reason = (
+                    "Blocked torch.load on untrusted model input. weights_only=True narrows the "
+                    "deserialization attack surface but is not a trust boundary. Set "
+                    "enable_unsafe_torch_load=true to opt in."
+                )
+                raise RuntimeError(self.extraction_unsafe_reason)
+
+            # The explicit unsafe opt-in permits torch.load; retain weights_only when available
+            # as defense in depth.
             load_kwargs: dict[str, Any] = {"map_location": torch.device("cpu")}
-            torch_version = getattr(torch, "__version__", "unknown")
             supports_weights_only = False
             try:
                 load_sig = inspect.signature(torch.load)
@@ -327,23 +409,6 @@ class WeightDistributionScanner(BaseScanner):
 
             if supports_weights_only:
                 load_kwargs["weights_only"] = True
-                is_patched_version = self._torch_weights_only_is_patched_version(torch_version)
-
-                if not is_patched_version and not self.enable_unsafe_torch_load:
-                    self.extraction_unsafe = True
-                    self.extraction_unsafe_reason = (
-                        "Blocked torch.load: weights_only=True is only treated as safe on stable "
-                        "PyTorch 2.6.0 or newer. Prerelease, dev, and unknown versions may still "
-                        "be vulnerable to RCE. Set enable_unsafe_torch_load=true to override."
-                    )
-                    raise RuntimeError(self.extraction_unsafe_reason)
-            elif not self.enable_unsafe_torch_load:
-                self.extraction_unsafe = True
-                self.extraction_unsafe_reason = (
-                    "Blocked torch.load: this PyTorch version does not support weights_only=True. "
-                    "Set enable_unsafe_torch_load=true to override."
-                )
-                raise RuntimeError(self.extraction_unsafe_reason)
 
             # Load model with map_location to CPU to avoid GPU requirements
             model_data = torch.load(path, **load_kwargs)
@@ -385,18 +450,50 @@ class WeightDistributionScanner(BaseScanner):
         except Exception as e:
             logger.debug(f"Failed to extract weights from {path}: {e}")
             # Try loading as a zip file (newer PyTorch format)
+            safe_fallback_processed = False
             try:
                 with zipfile.ZipFile(path, "r") as z:
-                    data_pkl_path = next(
-                        (n for n in z.namelist() if n.endswith("/data.pkl") or n == "data.pkl"),
-                        None,
-                    )
-                    if data_pkl_path:
+                    data_pkl_infos = [
+                        info
+                        for info in z.infolist()
+                        if info.filename.endswith("/data.pkl") or info.filename == "data.pkl"
+                    ]
+                    if len(data_pkl_infos) > 1:
+                        self._record_extraction_incomplete(
+                            "pytorch_pickle_member_ambiguous",
+                            pickle_member_count=len(data_pkl_infos),
+                            pickle_members=[info.filename for info in data_pkl_infos],
+                        )
+                        safe_fallback_processed = True
+                    elif data_pkl_infos:
                         import io
                         import pickle
                         import pickletools
 
-                        data = z.read(data_pkl_path)
+                        pickle_info = data_pkl_infos[0]
+                        data_pkl_path = pickle_info.filename
+                        pickle_limit = min(self._restricted_pickle_array_limit(), _MAX_RESTRICTED_PICKLE_BYTES)
+                        if pickle_info.file_size > pickle_limit:
+                            self._record_extraction_incomplete(
+                                "pytorch_pickle_read_limit_exceeded",
+                                pickle_member=data_pkl_path,
+                                pickle_size=pickle_info.file_size,
+                                pickle_read_limit=pickle_limit,
+                            )
+                            safe_fallback_processed = True
+                            data = b""
+                        else:
+                            with z.open(pickle_info, "r") as pickle_file:
+                                data = pickle_file.read(pickle_limit + 1)
+                            if len(data) > pickle_limit:
+                                self._record_extraction_incomplete(
+                                    "pytorch_pickle_read_limit_exceeded",
+                                    pickle_member=data_pkl_path,
+                                    pickle_size=len(data),
+                                    pickle_read_limit=pickle_limit,
+                                )
+                                safe_fallback_processed = True
+                                data = b""
 
                         # Look for disallowed opcodes that could trigger code execution
                         disallowed = {
@@ -410,51 +507,122 @@ class WeightDistributionScanner(BaseScanner):
                             "NEWOBJ_EX",
                         }
                         unsafe = False
-                        for opcode, _arg, _pos in pickletools.genops(data):
-                            if opcode.name in disallowed:
-                                unsafe = True
-                                break
-
-                        if unsafe:
-                            self.extraction_unsafe = True
-                            if self.extraction_unsafe_reason is None:
-                                self.extraction_unsafe_reason = (
-                                    "Unsafe to extract weights from data.pkl in PyTorch archive"
-                                )
-                        else:
+                        if data:
                             try:
-
-                                class RestrictedUnpickler(pickle.Unpickler):
-                                    def find_class(self, module: str, name: str) -> Any:
-                                        raise pickle.UnpicklingError("global lookup not allowed")
-
-                                obj = RestrictedUnpickler(io.BytesIO(data)).load()
-                                if isinstance(obj, dict):
-                                    for key, value in obj.items():
-                                        array = np.array(value)
-                                        if len(array.shape) >= 2 and (
-                                            "weight" in key.lower() or "kernel" in key.lower()
-                                        ):
-                                            weights_info[key] = array
-                                else:
-                                    self.extraction_unsafe = True
-                                    if self.extraction_unsafe_reason is None:
-                                        self.extraction_unsafe_reason = (
-                                            "Restricted unpickler could not parse PyTorch archive safely"
+                                pickle_opcode_limit = self._restricted_pickle_opcode_limit()
+                                pickle_opcode_count = 0
+                                pickle_graph_over_budget = False
+                                pickle_memo_entries = 0
+                                pickle_memo_limit = min(
+                                    _MAX_RESTRICTED_PICKLE_MEMO_ENTRIES,
+                                    pickle_opcode_limit,
+                                )
+                                for pickle_opcode_count, (opcode, _arg, _pos) in enumerate(
+                                    pickletools.genops(data), start=1
+                                ):
+                                    if pickle_opcode_count > pickle_opcode_limit:
+                                        self._record_extraction_incomplete(
+                                            "pytorch_pickle_graph_budget_exceeded",
+                                            pickle_opcode_count=pickle_opcode_count,
+                                            pickle_opcode_limit=pickle_opcode_limit,
                                         )
+                                        safe_fallback_processed = True
+                                        pickle_graph_over_budget = True
+                                        break
+                                    if opcode.name in {"PUT", "BINPUT", "LONG_BINPUT"}:
+                                        if (
+                                            not isinstance(_arg, int)
+                                            or _arg < 0
+                                            or _arg > pickle_memo_entries
+                                            or _arg >= pickle_memo_limit
+                                        ):
+                                            self._record_extraction_incomplete(
+                                                "pytorch_pickle_graph_budget_exceeded",
+                                                pickle_memo_index=_arg,
+                                                pickle_memo_entries=pickle_memo_entries,
+                                                pickle_memo_limit=pickle_memo_limit,
+                                                pickle_memo_opcode=opcode.name,
+                                            )
+                                            safe_fallback_processed = True
+                                            pickle_graph_over_budget = True
+                                            break
+                                        if _arg == pickle_memo_entries:
+                                            pickle_memo_entries += 1
+                                    elif opcode.name == "MEMOIZE":
+                                        if pickle_memo_entries >= pickle_memo_limit:
+                                            self._record_extraction_incomplete(
+                                                "pytorch_pickle_graph_budget_exceeded",
+                                                pickle_memo_entries=pickle_memo_entries,
+                                                pickle_memo_limit=pickle_memo_limit,
+                                                pickle_memo_opcode=opcode.name,
+                                            )
+                                            safe_fallback_processed = True
+                                            pickle_graph_over_budget = True
+                                            break
+                                        pickle_memo_entries += 1
+                                    if opcode.name in disallowed:
+                                        unsafe = True
+                                        break
+
+                                if pickle_graph_over_budget:
+                                    pass
+                                elif unsafe:
+                                    self.extraction_unsafe = True
+                                    self.extraction_unsafe_reason = (
+                                        "Unsafe to extract weights from data.pkl in PyTorch archive"
+                                    )
+                                else:
+
+                                    class RestrictedUnpickler(pickle.Unpickler):
+                                        def find_class(self, module: str, name: str) -> Any:
+                                            raise pickle.UnpicklingError("global lookup not allowed")
+
+                                    obj = RestrictedUnpickler(io.BytesIO(data)).load()
+                                    if isinstance(obj, dict):
+                                        primitive_budget = self._new_primitive_array_budget()
+                                        for key, value in obj.items():
+                                            if not isinstance(key, str) or not (
+                                                "weight" in key.lower() or "kernel" in key.lower()
+                                            ):
+                                                continue
+                                            try:
+                                                array = self._bounded_primitive_array(value, np, primitive_budget)
+                                            except Exception as array_error:
+                                                self._record_extraction_incomplete(
+                                                    "pytorch_tensor_materialization_failed",
+                                                    failed_tensors=[key],
+                                                    tensor_read_failures=1,
+                                                    exception_type=type(array_error).__name__,
+                                                )
+                                                continue
+                                            if array is None:
+                                                continue
+                                            if len(array.shape) >= 2:
+                                                weights_info[key] = array
+                                        safe_fallback_processed = True
+                                    else:
+                                        self._record_extraction_incomplete(
+                                            "pytorch_pickle_unsupported_root",
+                                            pickle_root_type=type(obj).__name__,
+                                        )
+                                        safe_fallback_processed = True
                             except Exception as e2:  # pragma: no cover - defensive
                                 logger.debug(
                                     f"Failed restricted unpickle for {path}: {e2}",
                                 )
-                                self.extraction_unsafe = True
-                                if self.extraction_unsafe_reason is None:
-                                    self.extraction_unsafe_reason = (
-                                        "Restricted unpickler failed while extracting PyTorch archive"
-                                    )
+                                self._record_extraction_incomplete(
+                                    "pytorch_pickle_parse_failed",
+                                    exception_type=type(e2).__name__,
+                                )
+                                safe_fallback_processed = True
             except Exception as e2:  # pragma: no cover - defensive
                 logger.debug(f"Failed to extract weights from {path}: {e2}")
 
-        if weights_info:
+            if safe_fallback_processed:
+                self.extraction_unsafe = False
+                self.extraction_unsafe_reason = None
+
+        if weights_info and not self.extraction_incomplete:
             self.extraction_unsafe = False
             self.extraction_unsafe_reason = None
 
