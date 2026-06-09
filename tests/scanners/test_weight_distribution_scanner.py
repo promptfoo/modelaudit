@@ -17,6 +17,7 @@ from modelaudit.rules import Severity
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
 from modelaudit.utils.tensorflow_compat import DataType, tensor_proto_to_ndarray
+from tests.helpers import create_mock_pytorch_zip
 
 
 def _make_mock_tensor_proto(
@@ -128,6 +129,44 @@ def test_extract_tensorflow_weights_skips_invalid_oversized_const(tmp_path: Path
     assert weights["dense/kernel"].tolist() == [[1.0, 1.0], [1.0, 1.0]]
 
 
+def test_extract_tensorflow_weights_rejects_string_const(tmp_path: Path) -> None:
+    import importlib
+
+    import modelaudit.protos
+
+    assert modelaudit.protos._check_vendored_protos()
+
+    attr_value_pb2 = importlib.import_module("tensorflow.core.framework.attr_value_pb2")
+    graph_pb2 = importlib.import_module("tensorflow.core.framework.graph_pb2")
+    node_def_pb2 = importlib.import_module("tensorflow.core.framework.node_def_pb2")
+    tensor_pb2 = importlib.import_module("tensorflow.core.framework.tensor_pb2")
+    types_pb2 = importlib.import_module("tensorflow.core.framework.types_pb2")
+
+    tensor = tensor_pb2.TensorProto(dtype=types_pb2.DT_STRING)
+    for size in (2, 2):
+        tensor.tensor_shape.dim.add(size=size)
+    tensor.string_val.extend([b"x" * 1024] * 4)
+    node = node_def_pb2.NodeDef(name="dense/kernel", op="Const")
+    node.attr["value"].CopyFrom(attr_value_pb2.AttrValue(tensor=tensor))
+
+    graph = graph_pb2.GraphDef()
+    graph.node.append(node)
+    model_path = tmp_path / "string-model.pb"
+    model_path.write_bytes(graph.SerializeToString())
+
+    scanner = WeightDistributionScanner(
+        {
+            "enable_unsafe_torch_load": True,
+            "max_array_size": 64,
+            "max_weight_distribution_total_bytes": 64,
+        }
+    )
+    weights = scanner._extract_tensorflow_weights(str(model_path))
+
+    assert weights == {}
+    assert scanner.extraction_incomplete_reasons == ["tensorflow_const_tensor_dtype_unsupported"]
+
+
 # Skip tests if required libraries are not available
 def has_numpy():
     try:
@@ -185,6 +224,24 @@ def _has_h5py_cached():
 @lru_cache(maxsize=1)
 def _has_tensorflow_cached():
     return has_tensorflow()
+
+
+def _install_fake_torch(
+    monkeypatch: pytest.MonkeyPatch,
+    load: Any,
+    *,
+    version: str = "2.12.0",
+) -> None:
+    fake_torch: Any = types.ModuleType("torch")
+    fake_torch.__version__ = version
+
+    class FakeTensor:  # pragma: no cover - simple test double
+        pass
+
+    fake_torch.Tensor = FakeTensor
+    fake_torch.device = lambda value: value
+    fake_torch.load = load
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
 
 
 @pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
@@ -367,8 +424,893 @@ def test_partial_hdf5_weight_extraction_preserves_analyzed_findings(tmp_path: Pa
     assert any(check.name == "Weight Distribution Anomaly Detection" for check in result.checks)
     analysis_check = next(check for check in result.checks if check.name == "Weight Distribution Analysis")
     assert analysis_check.details["analysis_incomplete"] is True
-    assert analysis_check.details["tensor_read_failures"] == 1
+    assert analysis_check.details["external_reference_tensors"] == 1
     assert analysis_check.details["failed_tensors"] == ["model_weights/z_dense/weight_external:0"]
+
+
+@pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
+def test_hdf5_oversized_weight_dataset_skips_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import h5py
+    import numpy as np
+
+    path = tmp_path / "oversized_weights.h5"
+    with h5py.File(path, "w") as hdf5_file:
+        hdf5_file.create_dataset("model_weights/dense/kernel:0", shape=(16, 16), dtype=np.float32)
+
+    original_array = np.array
+
+    def fail_if_oversized_dataset_is_materialized(obj: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(obj, h5py.Dataset) and obj.name.endswith("model_weights/dense/kernel:0"):
+            raise AssertionError("oversized HDF5 weight dataset should not be materialized")
+        return original_array(obj, *args, **kwargs)
+
+    monkeypatch.setattr(np, "array", fail_if_oversized_dataset_is_materialized)
+
+    result = WeightDistributionScanner({"max_array_size": 1}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    analysis_check = next(check for check in result.checks if check.name == "Weight Distribution Analysis")
+    assert "keras_tensor_size_limit" in analysis_check.details["extraction_incomplete_reasons"]
+    assert analysis_check.details["failed_tensors"] == ["model_weights/dense/kernel:0"]
+
+
+@pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
+def test_hdf5_external_weight_link_skips_without_following_target(tmp_path: Path) -> None:
+    import h5py
+
+    path = tmp_path / "external_link_weights.h5"
+    target_path = tmp_path / "missing_external_weights.h5"
+    with h5py.File(path, "w") as hdf5_file:
+        hdf5_file["model_weights/dense/kernel:0"] = h5py.ExternalLink(str(target_path), "/kernel")
+
+    result = WeightDistributionScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    analysis_check = next(check for check in result.checks if check.name == "Weight Distribution Analysis")
+    assert "keras_hdf5_external_link_skipped" in analysis_check.details["extraction_incomplete_reasons"]
+    assert analysis_check.details["external_reference_tensors"] == 1
+    assert analysis_check.details["failed_tensors"] == ["model_weights/dense/kernel:0"]
+
+
+@pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
+def test_hdf5_unrelated_external_link_does_not_make_weight_analysis_incomplete(tmp_path: Path) -> None:
+    import h5py
+    import numpy as np
+
+    path = tmp_path / "external_metadata_link.h5"
+    with h5py.File(path, "w") as hdf5_file:
+        hdf5_file.create_dataset("model_weights/dense/kernel:0", data=np.ones((2, 2), dtype=np.float32))
+        metadata = hdf5_file.create_group("metadata")
+        metadata["asset"] = h5py.ExternalLink("missing-assets.h5", "/asset")
+
+    scanner = WeightDistributionScanner()
+    weights = scanner._extract_keras_weights(str(path))
+
+    assert list(weights) == ["model_weights/dense/kernel:0"]
+    assert scanner.extraction_incomplete is False
+
+
+@pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
+def test_hdf5_internal_soft_link_is_resolved(tmp_path: Path) -> None:
+    import h5py
+    import numpy as np
+
+    path = tmp_path / "soft_link_weights.h5"
+    with h5py.File(path, "w") as hdf5_file:
+        hdf5_file.create_dataset("storage/dense_values", data=np.ones((2, 2), dtype=np.float32))
+        hdf5_file["model_weights/dense/kernel:0"] = h5py.SoftLink("/storage/dense_values")
+
+    scanner = WeightDistributionScanner()
+    weights = scanner._extract_keras_weights(str(path))
+
+    assert list(weights) == ["model_weights/dense/kernel:0"]
+    assert scanner.extraction_incomplete is False
+
+
+@pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
+def test_hdf5_group_soft_link_preserves_weight_alias_path(tmp_path: Path) -> None:
+    import h5py
+    import numpy as np
+
+    path = tmp_path / "group_soft_link_weights.h5"
+    with h5py.File(path, "w") as hdf5_file:
+        hdf5_file.create_dataset("z_storage/dense_values", data=np.ones((2, 2), dtype=np.float32))
+        hdf5_file["a_model_weights"] = h5py.SoftLink("/z_storage")
+
+    scanner = WeightDistributionScanner()
+    weights = scanner._extract_keras_weights(str(path))
+
+    assert list(weights) == ["a_model_weights/dense_values"]
+    assert scanner.extraction_incomplete is False
+
+
+@pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
+def test_hdf5_hard_link_aliases_materialize_dataset_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import h5py
+    import numpy as np
+
+    path = tmp_path / "hard_link_weights.h5"
+    with h5py.File(path, "w") as hdf5_file:
+        dataset = hdf5_file.create_dataset("weights/original_weight", data=np.ones((2, 2), dtype=np.float32))
+        hdf5_file["weights/alias_a_weight"] = dataset
+        hdf5_file["weights/alias_b_weight"] = dataset
+
+    materialized_datasets = 0
+    original_array = np.array
+
+    def count_dataset_materializations(obj: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal materialized_datasets
+        if isinstance(obj, h5py.Dataset):
+            materialized_datasets += 1
+        return original_array(obj, *args, **kwargs)
+
+    monkeypatch.setattr(np, "array", count_dataset_materializations)
+
+    scanner = WeightDistributionScanner()
+    weights = scanner._extract_keras_weights(str(path))
+
+    assert len(weights) == 1
+    assert materialized_datasets == 1
+    assert scanner.retained_tensor_bytes == 16
+
+
+@pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
+def test_hdf5_cumulative_tensor_budget_stops_before_second_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import h5py
+    import numpy as np
+
+    path = tmp_path / "cumulative_weights.h5"
+    with h5py.File(path, "w") as hdf5_file:
+        hdf5_file.create_dataset("weights/a_weight", data=np.ones((2, 2), dtype=np.float32))
+        hdf5_file.create_dataset("weights/b_weight", data=np.ones((2, 2), dtype=np.float32))
+
+    materialized_names: list[str] = []
+    original_array = np.array
+
+    def track_dataset_materialization(obj: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(obj, h5py.Dataset):
+            materialized_names.append(obj.name)
+        return original_array(obj, *args, **kwargs)
+
+    monkeypatch.setattr(np, "array", track_dataset_materialization)
+
+    scanner = WeightDistributionScanner({"max_array_size": 32, "max_weight_distribution_total_bytes": 20})
+    weights = scanner._extract_keras_weights(str(path))
+
+    assert list(weights) == ["weights/a_weight"]
+    assert materialized_names == ["/weights/a_weight"]
+    assert scanner.extraction_incomplete is True
+    assert scanner.extraction_incomplete_reasons == ["keras_tensor_size_limit_total"]
+    assert scanner.extraction_incomplete_details["max_total_tensor_bytes"] == 20
+
+
+@pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
+def test_hdf5_external_group_link_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
+    import h5py
+
+    path = tmp_path / "external_group.h5"
+    with h5py.File(path, "w") as hdf5_file:
+        hdf5_file["layers"] = h5py.ExternalLink("missing.h5", "/model_weights")
+
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        for _ in range(2):
+            result = core.scan_model_directory_or_file(
+                str(path),
+                scanners=["weight_distribution"],
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            assert result.success is False
+            assert core.determine_exit_code(result) == 2
+            assert result.file_metadata[str(path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_pytorch_primary_load_is_blocked_by_archive_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_torch: Any = types.ModuleType("torch")
+    fake_torch.__version__ = "2.6.0"
+
+    class FakeTensor:
+        pass
+
+    fake_torch.Tensor = FakeTensor
+    fake_torch.device = lambda value: value
+    load_called = False
+
+    def fake_load(
+        _path: str,
+        *,
+        map_location: object,
+        weights_only: bool = False,
+    ) -> dict[str, object]:
+        del map_location, weights_only
+        nonlocal load_called
+        load_called = True
+        return {}
+
+    fake_torch.load = fake_load
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    path = tmp_path / "large.pt"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("data.pkl", pickle.dumps({}))
+        archive.writestr("data/0", b"x" * 64)
+
+    scanner = WeightDistributionScanner(
+        {
+            "enable_unsafe_torch_load": True,
+            "max_array_size": 1024,
+            "max_weight_distribution_total_bytes": 32,
+        }
+    )
+    weights = scanner._extract_pytorch_weights(str(path))
+
+    assert weights == {}
+    assert load_called is False
+    assert scanner.extraction_incomplete_reasons == ["pytorch_load_size_limit"]
+
+
+def test_pytorch_primary_storage_is_checked_before_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_torch: Any = types.ModuleType("torch")
+    fake_torch.__version__ = "2.6.0"
+
+    class FakeTensor:
+        pass
+
+    fake_torch.Tensor = FakeTensor
+    fake_torch.device = lambda value: value
+
+    def fail_load(
+        _path: str,
+        *,
+        map_location: object,
+        weights_only: bool = False,
+    ) -> object:
+        del map_location, weights_only
+        raise AssertionError("oversized storage should be rejected before torch.load")
+
+    fake_torch.load = fail_load
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    path = tmp_path / "oversized-storage.pt"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({}))
+        archive.writestr("archive/data/0", b"x" * 64)
+
+    scanner = WeightDistributionScanner(
+        {
+            "enable_unsafe_torch_load": True,
+            "max_array_size": 8,
+            "max_weight_distribution_total_bytes": 128,
+        }
+    )
+    weights = scanner._extract_pytorch_weights(str(path))
+
+    assert weights == {}
+    assert scanner.extraction_incomplete_reasons == ["pytorch_tensor_storage_size_limit"]
+
+
+def test_pytorch_load_budget_ignores_unrelated_archive_members(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_torch: Any = types.ModuleType("torch")
+    fake_torch.__version__ = "2.6.0"
+
+    class FakeTensor:
+        pass
+
+    fake_torch.Tensor = FakeTensor
+    fake_torch.device = lambda value: value
+    load_called = False
+
+    def fake_load(
+        _path: str,
+        *,
+        map_location: object,
+        weights_only: bool = False,
+    ) -> dict[str, object]:
+        del map_location, weights_only
+        nonlocal load_called
+        load_called = True
+        return {}
+
+    fake_torch.load = fake_load
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    path = tmp_path / "metadata-heavy.pt"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({}))
+        archive.writestr("archive/data/0", b"x" * 26)
+        archive.writestr("archive/metadata.json", b"x" * 1024)
+
+    scanner = WeightDistributionScanner(
+        {
+            "enable_unsafe_torch_load": True,
+            "max_array_size": 64,
+            "max_weight_distribution_total_bytes": 64,
+        }
+    )
+    weights = scanner._extract_pytorch_weights(str(path))
+
+    assert weights == {}
+    assert load_called is True
+    assert scanner.extraction_incomplete is False
+
+
+def test_pytorch_pickle_object_budget_blocks_compact_container_amplification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_torch: Any = types.ModuleType("torch")
+    fake_torch.__version__ = "2.6.0"
+
+    class FakeTensor:
+        pass
+
+    fake_torch.Tensor = FakeTensor
+    fake_torch.device = lambda value: value
+
+    def fail_load(
+        _path: str,
+        *,
+        map_location: object,
+        weights_only: bool = False,
+    ) -> object:
+        del map_location, weights_only
+        raise AssertionError("object-heavy pickle should be rejected before torch.load")
+
+    fake_torch.load = fail_load
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    path = tmp_path / "object-heavy.pt"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps([[] for _ in range(2000)], protocol=4))
+
+    scanner = WeightDistributionScanner({"max_array_size": 8192, "max_weight_distribution_total_bytes": 8192})
+    weights = scanner._extract_pytorch_weights(str(path))
+
+    assert weights == {}
+    assert scanner.extraction_incomplete_reasons == ["pytorch_pickle_object_budget"]
+
+
+def test_pytorch_blocked_load_fallback_honors_remaining_metadata_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_torch: Any = types.ModuleType("torch")
+    fake_torch.__version__ = "2.5.1"
+
+    class FakeTensor:
+        pass
+
+    fake_torch.Tensor = FakeTensor
+    fake_torch.device = lambda value: value
+
+    def fake_load(
+        _path: str,
+        *,
+        map_location: object,
+        weights_only: bool = False,
+    ) -> dict[str, object]:
+        del map_location, weights_only
+        raise AssertionError("unsafe torch.load must remain blocked")
+
+    fake_torch.load = fake_load
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    path = tmp_path / "unsafe-version.pt"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("data.pkl", pickle.dumps({"layer.weight": [[1.0, 2.0], [3.0, 4.0]]}))
+
+    original_open = zipfile.ZipFile.open
+
+    def fail_if_data_pkl_is_opened(
+        archive: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        mode: str = "r",
+        pwd: bytes | None = None,
+        *,
+        force_zip64: bool = False,
+    ) -> Any:
+        member_name = name.filename if isinstance(name, zipfile.ZipInfo) else name
+        if member_name == "data.pkl":
+            raise AssertionError("over-budget data.pkl should not be opened")
+        return original_open(archive, name, mode=mode, pwd=pwd, force_zip64=force_zip64)
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", fail_if_data_pkl_is_opened)
+
+    scanner = WeightDistributionScanner({"max_array_size": 1024, "max_weight_distribution_total_bytes": 32})
+    weights = scanner._extract_pytorch_weights(str(path))
+
+    assert weights == {}
+    assert scanner.extraction_unsafe is False
+    assert scanner.extraction_incomplete_reasons == ["pytorch_zip_data_pkl_size_limit"]
+    assert scanner.extraction_incomplete_details["max_pickle_metadata_bytes"] == 32
+
+
+def test_pytorch_primary_tensor_size_is_checked_before_numpy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_torch: Any = types.ModuleType("torch")
+    fake_torch.__version__ = "2.6.0"
+
+    class FakeTensor:
+        shape = (2, 2)
+
+        @staticmethod
+        def numel() -> int:
+            return 4
+
+        @staticmethod
+        def element_size() -> int:
+            return 4
+
+        @staticmethod
+        def detach() -> object:
+            raise AssertionError("oversized tensor should not be converted")
+
+    fake_torch.Tensor = FakeTensor
+    fake_torch.device = lambda value: value
+
+    def fake_load(
+        _path: str,
+        *,
+        map_location: object,
+        weights_only: bool = False,
+    ) -> dict[str, object]:
+        del map_location, weights_only
+        return {"layer.weight": FakeTensor()}
+
+    fake_torch.load = fake_load
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    path = tmp_path / "tensor.pt"
+    path.write_bytes(b"x")
+    scanner = WeightDistributionScanner(
+        {
+            "enable_unsafe_torch_load": True,
+            "max_array_size": 8,
+            "max_weight_distribution_total_bytes": 1024,
+        }
+    )
+    weights = scanner._extract_pytorch_weights(str(path))
+
+    assert weights == {}
+    assert scanner.extraction_incomplete_reasons == ["pytorch_tensor_size_limit"]
+    assert scanner.extraction_incomplete_details["tensor_nbytes"] == 16
+
+
+def test_pytorch_unsupported_tensor_does_not_hide_valid_weights(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    fake_torch: Any = types.ModuleType("torch")
+    fake_torch.__version__ = "2.6.0"
+
+    class FakeTensor:
+        shape = (2, 2)
+
+        def __init__(self, *, supported: bool) -> None:
+            self.supported = supported
+
+        @staticmethod
+        def numel() -> int:
+            return 4
+
+        @staticmethod
+        def element_size() -> int:
+            return 4
+
+        def detach(self) -> "FakeTensor":
+            return self
+
+        def cpu(self) -> "FakeTensor":
+            return self
+
+        def numpy(self) -> Any:
+            if not self.supported:
+                raise TypeError("unsupported tensor layout")
+            return np.ones((2, 2), dtype=np.float32)
+
+    fake_torch.Tensor = FakeTensor
+    fake_torch.device = lambda value: value
+
+    def fake_load(
+        _path: str,
+        *,
+        map_location: object,
+        weights_only: bool = False,
+    ) -> dict[str, object]:
+        del map_location, weights_only
+        return {
+            "dense.weight": FakeTensor(supported=True),
+            "sparse.weight": FakeTensor(supported=False),
+        }
+
+    fake_torch.load = fake_load
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    path = tmp_path / "mixed.pt"
+    path.write_bytes(b"x")
+    scanner = WeightDistributionScanner({"enable_unsafe_torch_load": True})
+    weights = scanner._extract_pytorch_weights(str(path))
+
+    assert list(weights) == ["dense.weight"]
+    assert scanner.extraction_incomplete is True
+    assert scanner.extraction_incomplete_reasons == ["pytorch_tensor_read_failed"]
+    assert scanner.extraction_incomplete_details["failed_tensors"] == ["sparse.weight"]
+
+
+def test_pytorch_zip_alias_expansion_is_rejected_before_numpy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    fake_torch: Any = types.ModuleType("torch")
+    fake_torch.__version__ = "2.6.0"
+
+    class FakeTensor:
+        pass
+
+    fake_torch.Tensor = FakeTensor
+    fake_torch.device = lambda value: value
+
+    def fail_load(
+        _path: str,
+        *,
+        map_location: object,
+        weights_only: bool = False,
+    ) -> object:
+        del map_location, weights_only
+        raise RuntimeError("force restricted fallback")
+
+    fake_torch.load = fail_load
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    row = [1.0] * 100
+    payload = {"layer.weight": [row] * 100}
+    path = tmp_path / "aliased.pt"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("data.pkl", pickle.dumps(payload, protocol=4))
+
+    array_called = False
+    original_array = np.array
+
+    def track_array(value: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal array_called
+        array_called = True
+        return original_array(value, *args, **kwargs)
+
+    monkeypatch.setattr(np, "array", track_array)
+
+    scanner = WeightDistributionScanner({"max_array_size": 4096, "max_weight_distribution_total_bytes": 8192})
+    weights = scanner._extract_pytorch_weights(str(path))
+
+    assert weights == {}
+    assert array_called is False
+    assert scanner.extraction_incomplete_reasons == ["pytorch_tensor_materialization_failed"]
+
+
+def test_pytorch_zip_small_shared_sequence_is_not_treated_as_cycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_torch: Any = types.ModuleType("torch")
+    fake_torch.__version__ = "2.6.0"
+
+    class FakeTensor:
+        pass
+
+    fake_torch.Tensor = FakeTensor
+    fake_torch.device = lambda value: value
+
+    def fail_load(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("force restricted fallback")
+
+    fake_torch.load = fail_load
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    row = [1.0, 2.0]
+    path = tmp_path / "small-alias.pt"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("data.pkl", pickle.dumps({"layer.weight": [row, row]}, protocol=4))
+
+    scanner = WeightDistributionScanner({"max_array_size": 1024, "max_weight_distribution_total_bytes": 1024})
+    weights = scanner._extract_pytorch_weights(str(path))
+
+    assert list(weights) == ["layer.weight"]
+    assert weights["layer.weight"].shape == (2, 2)
+    assert scanner.extraction_incomplete is False
+
+
+def test_pytorch_zip_discarded_vector_does_not_consume_retained_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_torch: Any = types.ModuleType("torch")
+    fake_torch.__version__ = "2.6.0"
+
+    class FakeTensor:
+        pass
+
+    fake_torch.Tensor = FakeTensor
+    fake_torch.device = lambda value: value
+
+    def fail_load(
+        _path: str,
+        *,
+        map_location: object,
+        weights_only: bool = False,
+    ) -> object:
+        del map_location, weights_only
+        raise RuntimeError("force restricted fallback")
+
+    fake_torch.load = fail_load
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    payload = {
+        "weight_names": [1] * 100,
+        "layer.weight": [[1] * 10 for _ in range(10)],
+    }
+    path = tmp_path / "vector_metadata.pt"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("data.pkl", pickle.dumps(payload, protocol=4))
+
+    scanner = WeightDistributionScanner({"max_array_size": 1000, "max_weight_distribution_total_bytes": 1000})
+    weights = scanner._extract_pytorch_weights(str(path))
+
+    assert list(weights) == ["layer.weight"]
+    assert scanner.retained_tensor_bytes == 800
+    assert scanner.extraction_incomplete is False
+
+
+def test_pytorch_zip_ignores_large_non_weight_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_torch: Any = types.ModuleType("torch")
+    fake_torch.__version__ = "2.6.0"
+
+    class FakeTensor:
+        pass
+
+    fake_torch.Tensor = FakeTensor
+    fake_torch.device = lambda value: value
+
+    def fail_load(
+        _path: str,
+        *,
+        map_location: object,
+        weights_only: bool = False,
+    ) -> object:
+        del map_location, weights_only
+        raise RuntimeError("force restricted fallback")
+
+    fake_torch.load = fail_load
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    row = [1.0] * 100
+    payload = {
+        "metadata": [row] * 100,
+        "layer.weight": [[1.0, 2.0], [3.0, 4.0]],
+    }
+    path = tmp_path / "metadata.pt"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("data.pkl", pickle.dumps(payload, protocol=4))
+
+    scanner = WeightDistributionScanner({"max_array_size": 4096, "max_weight_distribution_total_bytes": 8192})
+    weights = scanner._extract_pytorch_weights(str(path))
+
+    assert list(weights) == ["layer.weight"]
+    assert weights["layer.weight"].shape == (2, 2)
+    assert scanner.extraction_incomplete is False
+
+
+def test_tensorflow_unknown_dtype_is_skipped_before_load_variable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved_model_dir = tmp_path / "saved_model"
+    variables_dir = saved_model_dir / "variables"
+    variables_dir.mkdir(parents=True)
+    (variables_dir / "variables.index").write_bytes(b"checkpoint index")
+
+    class FakeCheckpointReader:
+        @staticmethod
+        def get_variable_to_dtype_map() -> dict[str, object]:
+            return {"dense/kernel": object}
+
+    class FakeTrain:
+        @staticmethod
+        def load_checkpoint(_prefix: str) -> FakeCheckpointReader:
+            return FakeCheckpointReader()
+
+        @staticmethod
+        def list_variables(_prefix: str) -> list[tuple[str, list[int]]]:
+            return [("dense/kernel", [2, 2])]
+
+        @staticmethod
+        def load_variable(_prefix: str, _name: str) -> object:
+            raise AssertionError("unknown dtype variable should not be loaded")
+
+    fake_tensorflow: Any = types.ModuleType("tensorflow")
+    fake_tensorflow.train = FakeTrain
+    monkeypatch.setitem(sys.modules, "tensorflow", fake_tensorflow)
+
+    scanner = WeightDistributionScanner()
+    weights = scanner._extract_tensorflow_weights(str(saved_model_dir))
+
+    assert weights == {}
+    assert scanner.extraction_incomplete_reasons == ["tensorflow_checkpoint_tensor_size_limit"]
+
+
+def test_fixed_width_custom_numeric_dtype_remains_bounded() -> None:
+    import numpy as np
+
+    scanner = WeightDistributionScanner()
+
+    assert scanner._tensorflow_dtype_itemsize(np.dtype("V2")) == 2
+    assert scanner._tensorflow_checkpoint_variable_nbytes([2, 2], np.dtype("V2")) == 8
+
+
+def test_onnx_external_and_unknown_initializers_fail_closed_before_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    initializers = [
+        types.SimpleNamespace(
+            name="external_weight",
+            dims=[2, 2],
+            data_type=1,
+            data_location=1,
+            external_data=[object()],
+        ),
+        types.SimpleNamespace(
+            name="unknown_weight",
+            dims=[2, 2],
+            data_type=999,
+            data_location=0,
+            external_data=[],
+        ),
+        types.SimpleNamespace(
+            name="valid_weight",
+            dims=[2, 2],
+            data_type=1,
+            data_location=0,
+            external_data=[],
+        ),
+        types.SimpleNamespace(
+            name="custom_numeric_weight",
+            dims=[2, 2],
+            data_type=16,
+            data_location=0,
+            external_data=[],
+        ),
+    ]
+    materialized: list[str] = []
+
+    def tensor_dtype_to_np_dtype(data_type: int) -> Any:
+        dtypes = {1: np.dtype("float32"), 16: np.dtype("V2")}
+        return dtypes[data_type]
+
+    def to_array(initializer: Any) -> Any:
+        materialized.append(initializer.name)
+        return np.ones((2, 2), dtype=np.float32)
+
+    fake_onnx: Any = types.ModuleType("onnx")
+    fake_onnx.TensorProto = types.SimpleNamespace(EXTERNAL=1)
+    fake_onnx.helper = types.SimpleNamespace(tensor_dtype_to_np_dtype=tensor_dtype_to_np_dtype)
+    fake_onnx.mapping = types.SimpleNamespace(TENSOR_TYPE_TO_NP_TYPE={1: np.dtype("float32"), 16: np.dtype("V2")})
+    fake_onnx.numpy_helper = types.SimpleNamespace(to_array=to_array)
+    fake_onnx.load = lambda _path, load_external_data: types.SimpleNamespace(
+        graph=types.SimpleNamespace(initializer=initializers)
+    )
+    monkeypatch.setitem(sys.modules, "onnx", fake_onnx)
+
+    path = tmp_path / "model.onnx"
+    path.write_bytes(b"x")
+    scanner = WeightDistributionScanner()
+    weights = scanner._extract_onnx_weights(str(path))
+
+    assert list(weights) == ["valid_weight", "custom_numeric_weight"]
+    assert materialized == ["valid_weight", "custom_numeric_weight"]
+    assert scanner.extraction_incomplete_reasons == [
+        "onnx_external_initializer_skipped",
+        "onnx_initializer_size_limit",
+    ]
+
+
+def test_onnx_inline_storage_is_bounded_before_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    initializers = [
+        types.SimpleNamespace(
+            name="oversized_weight",
+            dims=[2, 2],
+            data_type=1,
+            data_location=0,
+            external_data=[],
+            raw_data=b"x" * 128,
+        ),
+        types.SimpleNamespace(
+            name="packed_weight",
+            dims=[2, 2],
+            data_type=21,
+            data_location=0,
+            external_data=[],
+            raw_data=b"x" * 40,
+        ),
+    ]
+
+    def fail_to_array(_initializer: Any) -> Any:
+        raise AssertionError("oversized inline storage should be rejected before to_array")
+
+    fake_onnx: Any = types.ModuleType("onnx")
+    fake_onnx.TensorProto = types.SimpleNamespace(EXTERNAL=1, UINT4=21)
+    fake_onnx.helper = types.SimpleNamespace(
+        tensor_dtype_to_np_dtype=lambda data_type: np.dtype("float32") if data_type == 1 else np.dtype("uint8")
+    )
+    fake_onnx.mapping = types.SimpleNamespace(TENSOR_TYPE_TO_NP_TYPE={})
+    fake_onnx.numpy_helper = types.SimpleNamespace(to_array=fail_to_array)
+    fake_onnx.load = lambda _path, load_external_data: types.SimpleNamespace(
+        graph=types.SimpleNamespace(initializer=initializers)
+    )
+    monkeypatch.setitem(sys.modules, "onnx", fake_onnx)
+
+    path = tmp_path / "inline-storage.onnx"
+    path.write_bytes(b"x")
+    scanner = WeightDistributionScanner({"max_array_size": 64})
+    weights = scanner._extract_onnx_weights(str(path))
+
+    assert weights == {}
+    assert scanner.extraction_incomplete_reasons == ["onnx_initializer_storage_size_limit"]
+    assert scanner.extraction_incomplete_details["failed_tensors"] == [
+        "oversized_weight",
+        "packed_weight",
+    ]
+
+
+def test_repeated_oversized_tensors_do_not_multiply_configured_limit() -> None:
+    scanner = WeightDistributionScanner({"max_array_size": 10})
+
+    scanner._record_oversized_tensor("tensor_size_limit", "first", tensor_nbytes=11)
+    scanner._record_oversized_tensor("tensor_size_limit", "second", tensor_nbytes=12)
+
+    assert scanner.extraction_incomplete_details["oversized_tensors"] == 2
+    assert scanner.extraction_incomplete_details["max_array_size"] == 10
+    assert scanner.extraction_incomplete_details["tensor_nbytes"] == [11, 12]
 
 
 @pytest.mark.skipif(not HAS_NUMPY, reason="numpy not available")
@@ -408,6 +1350,38 @@ class TestWeightDistributionScanner:
         assert scanner.cosine_similarity_threshold == 0.8
         assert scanner.weight_magnitude_threshold == 2.0
         assert scanner.max_array_size == 50 * 1024 * 1024
+
+    def test_numeric_byte_limit_config_is_coerced(self) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner(
+            {
+                "max_array_size": 1.5,
+                "max_weight_distribution_total_bytes": np.int64(32),
+            }
+        )
+
+        assert scanner._max_tensor_bytes() == 1
+        assert scanner._max_total_tensor_bytes() == 32
+
+    @pytest.mark.parametrize("invalid_limit", [True, False, "unbounded", -1, float("inf"), float("nan")])
+    def test_invalid_tensor_byte_limit_uses_secure_default(self, invalid_limit: Any) -> None:
+        scanner = WeightDistributionScanner({"max_array_size": invalid_limit})
+
+        assert scanner._max_tensor_bytes() == 100 * 1024 * 1024
+        assert scanner._max_total_tensor_bytes() == 512 * 1024 * 1024
+
+    def test_zero_tensor_byte_limit_remains_explicitly_unlimited(self) -> None:
+        scanner = WeightDistributionScanner({"max_array_size": 0})
+
+        assert scanner._max_tensor_bytes() is None
+        assert scanner._max_total_tensor_bytes() is None
+
+        bounded_total_scanner = WeightDistributionScanner(
+            {"max_array_size": 0, "max_weight_distribution_total_bytes": 64}
+        )
+        assert bounded_total_scanner._max_tensor_bytes() is None
+        assert bounded_total_scanner._max_total_tensor_bytes() == 64
 
     def test_can_handle(self):
         """Test file type detection"""
@@ -528,14 +1502,14 @@ class TestWeightDistributionScanner:
         assert 3 in extreme_anomaly["details"]["affected_neurons"]
 
     @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
-    def test_pytorch_model_scan(self):
+    def test_pytorch_model_scan(self, tmp_path: Path) -> None:
         """Test scanning a PyTorch model with anomalous weights"""
         if not has_torch():
             pytest.skip("PyTorch not installed")
 
         import torch
 
-        scanner = WeightDistributionScanner()
+        scanner = WeightDistributionScanner({"enable_unsafe_torch_load": True})
 
         # Create a simple model with anomalous weights
         class SimpleModel(torch.nn.Module):
@@ -551,29 +1525,23 @@ class TestWeightDistributionScanner:
 
         model = SimpleModel()
 
-        # Save model
-        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
-            torch.save(model.state_dict(), f.name)
-            temp_path = f.name
+        model_path = tmp_path / "model.pt"
+        torch.save(model.state_dict(), model_path)
 
-        try:
-            result = scanner.scan(temp_path)
-            assert result.success
+        result = scanner.scan(str(model_path))
+        assert result.success
 
-            # If no issues found, it might be because the scanner couldn't extract weights
-            # This test is more about integration than specific anomaly detection
-            # So we'll make it more lenient
-            if len(result.issues) == 0:
-                # Check if any layers were analyzed
-                assert result.metadata.get("layers_analyzed", 0) >= 0
-            else:
-                # Check that anomaly was detected - could be either type
-                has_magnitude = any("abnormal weight magnitudes" in issue.message for issue in result.issues)
-                has_extreme = any("extremely large weight values" in issue.message for issue in result.issues)
-                assert has_magnitude or has_extreme
-
-        finally:
-            os.unlink(temp_path)
+        # If no issues found, it might be because the scanner couldn't extract weights
+        # This test is more about integration than specific anomaly detection
+        # So we'll make it more lenient
+        if len(result.issues) == 0:
+            # Check if any layers were analyzed
+            assert result.metadata.get("layers_analyzed", 0) >= 0
+        else:
+            # Check that anomaly was detected - could be either type
+            has_magnitude = any("abnormal weight magnitudes" in issue.message for issue in result.issues)
+            has_extreme = any("extremely large weight values" in issue.message for issue in result.issues)
+            assert has_magnitude or has_extreme
 
     @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
     def test_keras_model_scan(self):
@@ -652,27 +1620,81 @@ class TestWeightDistributionScanner:
         finally:
             os.unlink(temp_path)
 
-    @pytest.mark.skipif(not has_torch(), reason="PyTorch not installed")
-    def test_pytorch_zip_data_pkl_safe_extraction(self, monkeypatch, tmp_path):
+    def test_pytorch_zip_data_pkl_safe_extraction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
         """Ensure safe pickle in PyTorch ZIP can be parsed without code execution"""
+        load_called = False
         data = {"layer.weight": [[1.0, 2.0], [3.0, 4.0]]}
         data_bytes = pickle.dumps(data, protocol=4)
         zip_path = tmp_path / "model.pt"
         with zipfile.ZipFile(zip_path, "w") as z:
             z.writestr("data.pkl", data_bytes)
 
-        def fail_load(*_args, **_kwargs):
-            raise RuntimeError("fail")
+        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
+            nonlocal load_called
+            load_called = True
+            return {}
 
-        # Mock torch.load directly since torch is now a lazy import
-        import torch
-
-        monkeypatch.setattr(torch, "load", fail_load)
+        _install_fake_torch(monkeypatch, fake_load)
         scanner = WeightDistributionScanner()
         weights = scanner._extract_pytorch_weights(str(zip_path))
         assert not scanner.extraction_unsafe
+        assert not scanner.extraction_incomplete
+        assert load_called is False
         assert "layer.weight" in weights
         assert weights["layer.weight"].shape == (2, 2)
+
+    def test_pytorch_zip_data_pkl_size_limit_skips_before_opening_member(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        fake_torch: Any = types.ModuleType("torch")
+        fake_torch.__version__ = "2.6.0"
+
+        class FakeTensor:  # pragma: no cover - simple test double
+            pass
+
+        fake_torch.Tensor = FakeTensor
+        fake_torch.device = lambda value: value
+
+        def fail_load(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("force zip fallback")
+
+        fake_torch.load = fail_load
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+        zip_path = tmp_path / "model.pt"
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr("data.pkl", pickle.dumps({"layer.weight": [[1.0, 2.0], [3.0, 4.0]]}))
+
+        original_open = zipfile.ZipFile.open
+
+        def fail_if_data_pkl_is_opened(
+            archive: zipfile.ZipFile,
+            name: str | zipfile.ZipInfo,
+            mode: str = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> Any:
+            member_name = name.filename if isinstance(name, zipfile.ZipInfo) else name
+            if member_name == "data.pkl":
+                raise AssertionError("oversized data.pkl should not be opened")
+            return original_open(archive, name, mode=mode, pwd=pwd, force_zip64=force_zip64)
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", fail_if_data_pkl_is_opened)
+
+        scanner = WeightDistributionScanner({"max_array_size": 1})
+        weights = scanner._extract_pytorch_weights(str(zip_path))
+
+        assert weights == {}
+        assert scanner.extraction_incomplete is True
+        assert scanner.extraction_incomplete_reasons == ["pytorch_zip_data_pkl_size_limit"]
+        assert scanner.extraction_incomplete_details["failed_tensors"] == ["data.pkl"]
 
     @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
     def test_pytorch_zip_data_pkl_unsafe_extraction(self, monkeypatch, tmp_path):
@@ -698,225 +1720,105 @@ class TestWeightDistributionScanner:
         assert weights == {}
         assert scanner.extraction_unsafe
 
-    def test_blocks_unsafe_torch_load_by_default(self, monkeypatch, tmp_path):
-        """_extract_pytorch_weights should not call torch.load in unsafe mode by default."""
-
-        load_called = False
-
-        fake_torch: Any = types.ModuleType("torch")
-        fake_torch.__version__ = "2.5.1"
-
-        class FakeTensor:  # pragma: no cover - simple test double
-            pass
-
-        fake_torch.Tensor = FakeTensor
-        fake_torch.device = lambda value: value
-
-        def fake_load(*_args, **_kwargs):
-            nonlocal load_called
-            load_called = True
-            return {}
-
-        fake_torch.load = fake_load
-        monkeypatch.setitem(sys.modules, "torch", fake_torch)
-
-        model_path = tmp_path / "blocked.pt"
-        model_path.write_bytes(b"not-a-valid-pytorch-model")
-
-        scanner = WeightDistributionScanner()
-        weights = scanner._extract_pytorch_weights(str(model_path))
-
-        assert weights == {}
-        assert scanner.extraction_unsafe
-        assert scanner.extraction_unsafe_reason is not None
-        assert "Blocked torch.load" in scanner.extraction_unsafe_reason
-        assert load_called is False
-
-    def test_blocks_torch_load_for_vulnerable_pytorch_prereleases(
+    def test_tensorflow_checkpoint_size_limit_skips_before_load_variable(
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        """Prerelease PyTorch versions must fail closed before torch.load."""
-        for torch_version in [
-            "2.6.0rc1",
-            "2.6.0-rc1",
-            "2.6.0_rc1",
-            "2.6.0a0",
-            "2.6.0pre",
-            "2.6.0.dev20250101",
-            "2.10.0a0",
-        ]:
-            load_called = False
+        import numpy as np
 
-            fake_torch: Any = types.ModuleType("torch")
-            fake_torch.__version__ = torch_version
+        saved_model_dir = tmp_path / "saved_model"
+        variables_dir = saved_model_dir / "variables"
+        variables_dir.mkdir(parents=True)
+        (variables_dir / "variables.index").write_bytes(b"checkpoint index")
 
-            class FakeTensor:  # pragma: no cover - simple test double
-                pass
+        loaded_variables: list[str] = []
 
-            fake_torch.Tensor = FakeTensor
-            fake_torch.device = lambda value: value
+        class FakeCheckpointReader:
+            def get_variable_to_dtype_map(self) -> dict[str, object]:
+                return {
+                    "dense/kernel": np.dtype("float32"),
+                    "small/kernel": np.dtype("float32"),
+                }
 
-            def fake_load(_path: str, *, map_location: object, weights_only: bool) -> dict[str, object]:
-                nonlocal load_called
-                load_called = True
-                return {}
+        class FakeTrain:
+            @staticmethod
+            def load_checkpoint(_prefix: str) -> FakeCheckpointReader:
+                return FakeCheckpointReader()
 
-            fake_torch.load = fake_load
-            monkeypatch.setitem(sys.modules, "torch", fake_torch)
+            @staticmethod
+            def list_variables(_prefix: str) -> list[tuple[str, list[int]]]:
+                return [
+                    ("dense/kernel", [1024, 1024]),
+                    ("small/kernel", [2, 2]),
+                ]
 
-            model_path = tmp_path / f"blocked-{torch_version}.pt"
-            model_path.write_bytes(b"not-a-valid-pytorch-model")
+            @staticmethod
+            def load_variable(_prefix: str, name: str) -> object:
+                if name == "dense/kernel":
+                    raise AssertionError("oversized checkpoint variable should not be loaded")
+                loaded_variables.append(name)
+                return np.ones((2, 2), dtype=np.float32)
 
-            scanner = WeightDistributionScanner()
-            weights = scanner._extract_pytorch_weights(str(model_path))
+        fake_tensorflow: Any = types.ModuleType("tensorflow")
+        fake_tensorflow.train = FakeTrain
+        monkeypatch.setitem(sys.modules, "tensorflow", fake_tensorflow)
 
-            assert weights == {}
-            assert scanner.extraction_unsafe
-            assert scanner.extraction_unsafe_reason is not None
-            assert "stable PyTorch 2.6.0 or newer" in scanner.extraction_unsafe_reason
-            assert load_called is False
+        scanner = WeightDistributionScanner({"max_array_size": 128})
+        weights = scanner._extract_tensorflow_weights(str(saved_model_dir))
 
-    @pytest.mark.parametrize(
-        "torch_version",
-        [
-            "2.6.0",
-            "2.6.0+cpu",
-            "2.6.0.post1",
-            "2.6.0.post",
-            "2.6.0.post1+cpu",
-            "2.6.0_post1",
-            "2.6.0post2",
-            "2.6.0.post-3",
-            "2.6.0rev4",
-            "2.6.0-r5",
-            "2.6.0-6",
-            "2.6.0_rev7+cpu",
-            "2.6.0+cu124.gitabcdef",
-            "2.6.1",
-        ],
-    )
-    def test_allows_torch_load_for_stable_patched_pytorch(
+        assert loaded_variables == ["small/kernel"]
+        assert list(weights) == ["small/kernel"]
+        assert scanner.extraction_incomplete is True
+        assert "tensorflow_checkpoint_tensor_size_limit" in scanner.extraction_incomplete_reasons
+        assert scanner.extraction_incomplete_details["failed_tensors"] == ["dense/kernel"]
+
+    def test_tensorflow_checkpoint_skips_rank_one_weight_before_budgeting(
         self,
-        monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
-        torch_version: str,
-    ) -> None:
-        load_call: dict[str, object] = {}
-
-        fake_torch: Any = types.ModuleType("torch")
-        fake_torch.__version__ = torch_version
-
-        class FakeTensor:  # pragma: no cover - simple test double
-            pass
-
-        fake_torch.Tensor = FakeTensor
-        fake_torch.device = lambda value: value
-
-        def fake_load(_path: str, *, map_location: object, weights_only: bool) -> dict[str, object]:
-            load_call["map_location"] = map_location
-            load_call["weights_only"] = weights_only
-            return {}
-
-        fake_torch.load = fake_load
-        monkeypatch.setitem(sys.modules, "torch", fake_torch)
-
-        model_path = tmp_path / f"stable-{torch_version}.pt"
-        model_path.write_bytes(b"not-a-valid-pytorch-model")
-
-        scanner = WeightDistributionScanner()
-        weights = scanner._extract_pytorch_weights(str(model_path))
-
-        assert weights == {}
-        assert scanner.extraction_unsafe is False
-        assert load_call == {"map_location": "cpu", "weights_only": True}
-
-    def test_blocks_torch_load_for_unknown_pytorch_version(
-        self,
         monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
     ) -> None:
-        load_called = False
+        import numpy as np
 
-        fake_torch: Any = types.ModuleType("torch")
-        fake_torch.__version__ = "unknown"
+        saved_model_dir = tmp_path / "saved_model"
+        variables_dir = saved_model_dir / "variables"
+        variables_dir.mkdir(parents=True)
+        (variables_dir / "variables.index").write_bytes(b"checkpoint index")
 
-        class FakeTensor:  # pragma: no cover - simple test double
-            pass
+        loaded_variables: list[str] = []
 
-        fake_torch.Tensor = FakeTensor
-        fake_torch.device = lambda value: value
+        class FakeCheckpointReader:
+            @staticmethod
+            def get_variable_to_dtype_map() -> dict[str, object]:
+                return {
+                    "class_weight": np.dtype("float32"),
+                    "dense/kernel": np.dtype("float32"),
+                }
 
-        def fake_load(_path: str, *, map_location: object, weights_only: bool) -> dict[str, object]:
-            nonlocal load_called
-            load_called = True
-            return {}
+        class FakeTrain:
+            @staticmethod
+            def load_checkpoint(_prefix: str) -> FakeCheckpointReader:
+                return FakeCheckpointReader()
 
-        fake_torch.load = fake_load
-        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+            @staticmethod
+            def list_variables(_prefix: str) -> list[tuple[str, list[int]]]:
+                return [("class_weight", [1024]), ("dense/kernel", [2, 2])]
 
-        model_path = tmp_path / "unknown.pt"
-        model_path.write_bytes(b"not-a-valid-pytorch-model")
+            @staticmethod
+            def load_variable(_prefix: str, name: str) -> object:
+                loaded_variables.append(name)
+                return np.ones((2, 2), dtype=np.float32)
 
-        scanner = WeightDistributionScanner()
-        weights = scanner._extract_pytorch_weights(str(model_path))
+        fake_tensorflow: Any = types.ModuleType("tensorflow")
+        fake_tensorflow.train = FakeTrain
+        monkeypatch.setitem(sys.modules, "tensorflow", fake_tensorflow)
 
-        assert weights == {}
-        assert scanner.extraction_unsafe
-        assert load_called is False
+        scanner = WeightDistributionScanner({"max_array_size": 128})
+        weights = scanner._extract_tensorflow_weights(str(saved_model_dir))
 
-    @pytest.mark.parametrize(
-        "torch_version",
-        [
-            "2.6",
-            "3",
-            "2.6.0-custom",
-            "2.6.0-unknown",
-            "2.6.0+",
-            "2.6.0+cpu+extra",
-            "2.6.0.post1.dev0",
-            "2.6.0postevil",
-            "2.6.0revx",
-            "2.6.0-",
-            "2.6.0+cpu dev",
-            "2.10.0-custom",
-        ],
-    )
-    def test_blocks_torch_load_for_unknown_patched_version_suffixes(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        torch_version: str,
-    ) -> None:
-        load_called = False
-
-        fake_torch: Any = types.ModuleType("torch")
-        fake_torch.__version__ = torch_version
-
-        class FakeTensor:  # pragma: no cover - simple test double
-            pass
-
-        fake_torch.Tensor = FakeTensor
-        fake_torch.device = lambda value: value
-
-        def fake_load(_path: str, *, map_location: object, weights_only: bool) -> dict[str, object]:
-            nonlocal load_called
-            load_called = True
-            return {}
-
-        fake_torch.load = fake_load
-        monkeypatch.setitem(sys.modules, "torch", fake_torch)
-
-        model_path = tmp_path / f"{torch_version}.pt"
-        model_path.write_bytes(b"not-a-valid-pytorch-model")
-
-        scanner = WeightDistributionScanner()
-        weights = scanner._extract_pytorch_weights(str(model_path))
-
-        assert weights == {}
-        assert scanner.extraction_unsafe
-        assert load_called is False
+        assert loaded_variables == ["dense/kernel"]
+        assert list(weights) == ["dense/kernel"]
+        assert scanner.extraction_incomplete is False
 
     def test_multiple_anomalies(self):
         """Test detection of multiple types of anomalies in one layer"""
@@ -1155,3 +2057,529 @@ class TestWeightDistributionScanner:
                 # Should only flag the 1 extremely suspicious neuron
                 assert anomaly["details"]["total_outliers"] <= 1
                 assert 0 in anomaly["details"]["outlier_neurons"]
+
+    def test_pytorch_zip_multiple_pickle_members_are_inconclusive(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise AssertionError("torch.load must remain blocked")
+
+        _install_fake_torch(monkeypatch, fake_load)
+        payload = pickle.dumps({"layer.weight": [[1.0, 2.0], [3.0, 4.0]]}, protocol=4)
+
+        distinct_path = tmp_path / "distinct-data-members.pt"
+        with zipfile.ZipFile(distinct_path, "w") as archive:
+            archive.writestr("decoy/data.pkl", payload)
+            archive.writestr("actual/data.pkl", payload)
+
+        duplicate_path = tmp_path / "duplicate-data-members.pt"
+        with pytest.warns(UserWarning, match="Duplicate name"), zipfile.ZipFile(duplicate_path, "w") as archive:
+            archive.writestr("data.pkl", payload)
+            archive.writestr("data.pkl", payload)
+
+        for model_path, expected_members in [
+            (distinct_path, ["decoy/data.pkl", "actual/data.pkl"]),
+            (duplicate_path, ["data.pkl", "data.pkl"]),
+        ]:
+            scanner = WeightDistributionScanner()
+            weights = scanner._extract_pytorch_weights(str(model_path))
+
+            assert weights == {}
+            assert scanner.extraction_unsafe is False
+            assert scanner.extraction_incomplete_reasons == ["pytorch_pickle_member_ambiguous"]
+            assert scanner.extraction_incomplete_details == {
+                "pickle_member_count": 2,
+                "pickle_members": expected_members,
+            }
+
+    def test_pytorch_zip_marked_root_beats_decoy_pickle(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise AssertionError("torch.load must remain blocked")
+
+        _install_fake_torch(monkeypatch, fake_load)
+        model_path = tmp_path / "marked-root.pt"
+        with zipfile.ZipFile(model_path, "w") as archive:
+            archive.writestr("decoy/data.pkl", pickle.dumps({"decoy.weight": [[9.0, 9.0], [9.0, 9.0]]}))
+            archive.writestr("model/data.pkl", pickle.dumps({"layer.weight": [[1.0, 2.0], [3.0, 4.0]]}))
+            archive.writestr("model/version", "3")
+
+        scanner = WeightDistributionScanner()
+        weights = scanner._extract_pytorch_weights(str(model_path))
+
+        assert list(weights) == ["layer.weight"]
+        assert weights["layer.weight"].tolist() == [[1.0, 2.0], [3.0, 4.0]]
+        assert scanner.extraction_unsafe is False
+        assert scanner.extraction_incomplete is False
+
+    def test_pytorch_zip_multiple_credible_roots_fail_closed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise AssertionError("torch.load must remain blocked")
+
+        _install_fake_torch(monkeypatch, fake_load)
+        model_path = tmp_path / "multiple-credible-roots.pt"
+        with zipfile.ZipFile(model_path, "w") as archive:
+            archive.writestr("data.pkl", pickle.dumps({"decoy.weight": [[0.0, 0.0], [0.0, 0.0]]}))
+            archive.writestr("version", "3")
+            archive.writestr("model/data.pkl", pickle.dumps({"actual.weight": [[1.0, 2.0], [3.0, 4.0]]}))
+            archive.writestr("model/byteorder", "little")
+
+        scanner = WeightDistributionScanner()
+        result = scanner.scan(str(model_path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        analysis_check = next(check for check in result.checks if check.name == "Weight Distribution Analysis")
+        assert analysis_check.details["extraction_incomplete_reasons"] == ["pytorch_pickle_member_ambiguous"]
+        assert analysis_check.details["pickle_member_count"] == 2
+        assert analysis_check.details["pickle_members"] == ["data.pkl", "model/data.pkl"]
+
+    def test_pytorch_zip_primitive_array_expansion_is_bounded_before_materialization(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        import numpy as np
+
+        shared_row = [1.0] * 8
+        data = {"layer.weight": [shared_row] * 200}
+        assert len(pickle.dumps(data, protocol=4)) < 1024
+        zip_path = create_mock_pytorch_zip(tmp_path / "expanded.pt", data=data)
+        array_called = False
+
+        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise AssertionError("torch.load must remain blocked")
+
+        original_array = np.array
+
+        def track_array(value: Any) -> Any:
+            nonlocal array_called
+            array_called = True
+            return original_array(value)
+
+        _install_fake_torch(monkeypatch, fake_load)
+        monkeypatch.setattr(np, "array", track_array)
+        scanner = WeightDistributionScanner({"max_array_size": 1024})
+        weights = scanner._extract_pytorch_weights(str(zip_path))
+
+        assert weights == {}
+        assert scanner.extraction_unsafe is False
+        assert scanner.extraction_incomplete is True
+        assert scanner.extraction_incomplete_reasons == ["pytorch_tensor_materialization_failed"]
+        assert scanner.extraction_incomplete_details["failed_tensors"] == ["layer.weight"]
+        assert array_called is False
+
+    def test_pytorch_zip_primitive_array_budget_is_shared_across_aliased_keys(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        import numpy as np
+
+        shared_value = [[float(column) for column in range(8)] for _row in range(4)]
+        data = {f"layer{index}.weight": shared_value for index in range(20)}
+        assert len(pickle.dumps(data, protocol=4)) < 1024
+        zip_path = create_mock_pytorch_zip(tmp_path / "aliased.pt", data=data)
+        array_calls = 0
+
+        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise AssertionError("torch.load must remain blocked")
+
+        original_array = np.array
+
+        def track_array(value: Any) -> Any:
+            nonlocal array_calls
+            array_calls += 1
+            return original_array(value)
+
+        _install_fake_torch(monkeypatch, fake_load)
+        monkeypatch.setattr(np, "array", track_array)
+        scanner = WeightDistributionScanner({"max_array_size": 1024})
+        weights = scanner._extract_pytorch_weights(str(zip_path))
+
+        assert array_calls <= 2
+        assert sum(array.nbytes for array in weights.values()) <= 1024
+        assert scanner.extraction_unsafe is False
+        assert list(weights) == ["layer0.weight"]
+        assert scanner.extraction_incomplete is False
+
+    def test_pytorch_zip_nonnumeric_weight_metadata_is_ignored(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        data = {
+            "layer.weight": [[1.0, 2.0], [3.0, 4.0]],
+            "weight_names": ["layer.weight"],
+            "kernel_metadata": [[b"dense", None]],
+            "weight_metadata": True,
+            "kernel_flags": [True, False],
+            "weight_mask": [[True, False]],
+        }
+        model_path = create_mock_pytorch_zip(tmp_path / "metadata.pt", data=data)
+
+        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise AssertionError("torch.load must remain blocked")
+
+        _install_fake_torch(monkeypatch, fake_load)
+        scanner = WeightDistributionScanner()
+        weights = scanner._extract_pytorch_weights(str(model_path))
+
+        assert list(weights) == ["layer.weight"]
+        assert scanner.extraction_unsafe is False
+        assert scanner.extraction_incomplete is False
+
+        result = WeightDistributionScanner().scan(str(model_path))
+        assert result.success is True
+        assert result.metadata["layers_analyzed"] == 1
+        assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+
+    def test_pytorch_zip_graph_budget_is_checked_before_unpickling(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        payload = b"\x80\x04" + (b"(1" * 1024) + b"}."
+        assert len(payload) < 16384
+        zip_path = tmp_path / "over-budget-graph.pt"
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr("data.pkl", payload)
+
+        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise AssertionError("torch.load must remain blocked")
+
+        class FailIfInstantiatedUnpickler:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                raise AssertionError("over-budget pickle must not be unpickled")
+
+        _install_fake_torch(monkeypatch, fake_load)
+        monkeypatch.setattr(pickle, "Unpickler", FailIfInstantiatedUnpickler)
+        scanner = WeightDistributionScanner({"max_array_size": 16384})
+        weights = scanner._extract_pytorch_weights(str(zip_path))
+
+        assert weights == {}
+        assert scanner.extraction_unsafe is False
+        assert scanner.extraction_incomplete_reasons == ["pytorch_pickle_graph_budget_exceeded"]
+        assert scanner.extraction_incomplete_details["pickle_opcode_limit"] == 2048
+        assert scanner.extraction_incomplete_details["pickle_opcode_count"] == 2049
+
+    def test_pytorch_zip_sparse_memo_index_is_inconclusive_and_not_cached(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        sparse_index = 5_000_000
+        payload = b"\x80\x04}r" + sparse_index.to_bytes(4, "little") + b"."
+        model_path = create_mock_pytorch_zip(tmp_path / "sparse-memo.pt", with_pickle=False)
+        with zipfile.ZipFile(model_path, "a") as archive:
+            archive.writestr("data.pkl", payload)
+
+        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise AssertionError("torch.load must remain blocked")
+
+        class FailIfInstantiatedUnpickler:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                raise AssertionError("sparse memo pickle must not be unpickled")
+
+        _install_fake_torch(monkeypatch, fake_load)
+        monkeypatch.setattr(pickle, "Unpickler", FailIfInstantiatedUnpickler)
+        direct = WeightDistributionScanner().scan(str(model_path))
+
+        assert direct.success is False
+        assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        analysis_check = next(check for check in direct.checks if check.name == "Weight Distribution Analysis")
+        assert analysis_check.details["extraction_incomplete_reasons"] == ["pytorch_pickle_graph_budget_exceeded"]
+        assert analysis_check.details["pickle_memo_index"] == sparse_index
+        assert analysis_check.details["pickle_memo_entries"] == 0
+        assert analysis_check.details["pickle_memo_opcode"] == "LONG_BINPUT"
+
+        cache_dir = tmp_path / "sparse-memo-cache"
+        reset_cache_manager()
+        try:
+            first = core.scan_model_directory_or_file(
+                str(model_path),
+                scanners=["weight_distribution"],
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            second = core.scan_model_directory_or_file(
+                str(model_path),
+                scanners=["weight_distribution"],
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            for aggregate in (first, second):
+                assert aggregate.success is False
+                assert core.determine_exit_code(aggregate) == 2
+                assert aggregate.file_metadata[str(model_path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_pytorch_zip_pickle_read_is_bounded_before_open(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        zip_path = tmp_path / "oversized-data.pt"
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr("data.pkl", b"x" * 1025)
+
+        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise AssertionError("torch.load must remain blocked")
+
+        original_open = zipfile.ZipFile.open
+
+        def fail_data_member_open(
+            archive: zipfile.ZipFile,
+            name: str | zipfile.ZipInfo,
+            mode: Any = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> Any:
+            member_name = name.filename if isinstance(name, zipfile.ZipInfo) else name
+            if member_name == "data.pkl":
+                raise AssertionError("oversized data.pkl must not be opened")
+            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
+
+        _install_fake_torch(monkeypatch, fake_load)
+        monkeypatch.setattr(zipfile.ZipFile, "open", fail_data_member_open)
+        scanner = WeightDistributionScanner({"max_array_size": 1024})
+        weights = scanner._extract_pytorch_weights(str(zip_path))
+
+        assert weights == {}
+        assert scanner.extraction_unsafe is False
+        assert scanner.extraction_incomplete_reasons == ["pytorch_zip_data_pkl_size_limit"]
+        assert scanner.extraction_incomplete_details == {
+            "failed_tensors": ["data.pkl"],
+            "oversized_tensors": 1,
+            "tensor_nbytes": 1025,
+            "max_array_size": 1024,
+            "max_pickle_metadata_bytes": 1024,
+        }
+
+    def test_partial_pytorch_zip_fallback_is_inconclusive_and_not_cached(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        data = {
+            "good.weight": [[1.0, 2.0], [3.0, 4.0]],
+            "bad.weight": [[1.0, 2.0], [3.0]],
+        }
+        model_path = create_mock_pytorch_zip(tmp_path / "partial.pt", data=data)
+
+        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise AssertionError("torch.load must remain blocked")
+
+        _install_fake_torch(monkeypatch, fake_load)
+        direct = WeightDistributionScanner().scan(str(model_path))
+
+        assert direct.success is False
+        assert direct.metadata["layers_analyzed"] == 1
+        assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        analysis_check = next(check for check in direct.checks if check.name == "Weight Distribution Analysis")
+        assert analysis_check.details["extraction_incomplete_reasons"] == ["pytorch_tensor_materialization_failed"]
+        assert analysis_check.details["failed_tensors"] == ["bad.weight"]
+        assert analysis_check.details["tensor_read_failures"] == 1
+
+        cache_dir = tmp_path / "partial-cache"
+        reset_cache_manager()
+        try:
+            first = core.scan_model_directory_or_file(
+                str(model_path),
+                scanners=["weight_distribution"],
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            second = core.scan_model_directory_or_file(
+                str(model_path),
+                scanners=["weight_distribution"],
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            for aggregate in (first, second):
+                assert aggregate.success is False
+                assert core.determine_exit_code(aggregate) == 2
+                assert aggregate.file_metadata[str(model_path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize(
+        "torch_version",
+        ["2.9.9", "2.10.0", "2.12.0", "2.10.0+dev", "unknown"],
+    )
+    def test_blocks_torch_load_without_explicit_opt_in(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        torch_version: str,
+    ) -> None:
+        load_called = False
+
+        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
+            nonlocal load_called
+            load_called = True
+            return {}
+
+        _install_fake_torch(monkeypatch, fake_load, version=torch_version)
+        model_path = tmp_path / "blocked.pt"
+        model_path.write_bytes(b"not-a-valid-pytorch-model")
+
+        scanner = WeightDistributionScanner()
+        weights = scanner._extract_pytorch_weights(str(model_path))
+
+        assert weights == {}
+        assert scanner.extraction_unsafe
+        assert scanner.extraction_unsafe_reason is not None
+        assert "Blocked torch.load" in scanner.extraction_unsafe_reason
+        assert "not a trust boundary" in scanner.extraction_unsafe_reason
+        assert load_called is False
+
+    @pytest.mark.parametrize("unsafe_value", [1, "true", "false", {"enabled": True}])
+    def test_torch_load_opt_in_requires_literal_true(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        unsafe_value: Any,
+    ) -> None:
+        load_called = False
+
+        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
+            nonlocal load_called
+            load_called = True
+            return {}
+
+        _install_fake_torch(monkeypatch, fake_load)
+        model_path = tmp_path / "strict-opt-in.pt"
+        model_path.write_bytes(b"not-a-valid-pytorch-model")
+
+        scanner = WeightDistributionScanner({"enable_unsafe_torch_load": unsafe_value})
+        weights = scanner._extract_pytorch_weights(str(model_path))
+
+        assert weights == {}
+        assert scanner.extraction_unsafe
+        assert load_called is False
+
+    def test_explicit_torch_load_opt_in_retains_weights_only(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        load_call: dict[str, object] = {}
+
+        def fake_load(_path: str, *, map_location: object, weights_only: bool) -> dict[str, object]:
+            load_call["map_location"] = map_location
+            load_call["weights_only"] = weights_only
+            return {}
+
+        _install_fake_torch(monkeypatch, fake_load)
+        model_path = tmp_path / "opted-in.pt"
+        model_path.write_bytes(b"not-a-valid-pytorch-model")
+
+        scanner = WeightDistributionScanner({"enable_unsafe_torch_load": True})
+        weights = scanner._extract_pytorch_weights(str(model_path))
+
+        assert weights == {}
+        assert scanner.extraction_unsafe is False
+        assert load_call == {"map_location": "cpu", "weights_only": True}
+
+    def test_explicit_torch_load_opt_in_supports_legacy_signatures(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        load_call: dict[str, object] = {}
+
+        def fake_load(_path: str, *, map_location: object) -> dict[str, object]:
+            load_call["map_location"] = map_location
+            return {}
+
+        _install_fake_torch(monkeypatch, fake_load, version="2.5.1")
+        model_path = tmp_path / "legacy-opted-in.pt"
+        model_path.write_bytes(b"not-a-valid-pytorch-model")
+
+        scanner = WeightDistributionScanner({"enable_unsafe_torch_load": True})
+        weights = scanner._extract_pytorch_weights(str(model_path))
+
+        assert weights == {}
+        assert scanner.extraction_unsafe is False
+        assert load_call == {"map_location": "cpu"}
+
+    def test_blocked_torch_load_is_inconclusive_and_not_cached(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        load_called = False
+
+        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
+            nonlocal load_called
+            load_called = True
+            return {}
+
+        _install_fake_torch(monkeypatch, fake_load)
+        model_path = create_mock_pytorch_zip(tmp_path / "blocked.pt", with_pickle=False)
+
+        direct = WeightDistributionScanner().scan(str(model_path))
+
+        assert direct.success is False
+        assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert direct.metadata["scan_outcome_reasons"] == ["weight_distribution_analysis_incomplete"]
+        analysis_check = next(check for check in direct.checks if check.name == "Weight Distribution Analysis")
+        assert analysis_check.severity == IssueSeverity.INFO
+        assert analysis_check.rule_code is None
+        assert analysis_check.details["extraction_incomplete_reasons"] == ["unsafe_pytorch_weight_extraction"]
+        assert "not a trust boundary" in analysis_check.details["unsafe_reason"]
+        assert not any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in direct.checks)
+        assert load_called is False
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            first = core.scan_model_directory_or_file(
+                str(model_path),
+                scanners=["weight_distribution"],
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            second = core.scan_model_directory_or_file(
+                str(model_path),
+                scanners=["weight_distribution"],
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            for aggregate in (first, second):
+                metadata = aggregate.file_metadata[str(model_path)]
+                assert aggregate.success is False
+                assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+                assert metadata["scan_outcome_reasons"] == ["weight_distribution_analysis_incomplete"]
+                assert core.determine_exit_code(aggregate) == 2
+                assert not any(
+                    issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues
+                )
+                assert all(issue.rule_code != "S801" for issue in aggregate.issues)
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+            assert load_called is False
+        finally:
+            reset_cache_manager()

@@ -573,15 +573,48 @@ def test_scan_bytes_ignores_wrapped_version_dunder_metadata() -> None:
     assert report.findings == ()
 
 
-def test_scan_bytes_detects_protocol0_encoded_nested_pickle_mid_literal() -> None:
+@pytest.mark.parametrize(
+    ("encoding", "rule_code"),
+    [("base64", "S601"), ("hex", "S602")],
+)
+def test_scan_bytes_detects_delimited_protocol0_encoded_nested_pickle_mid_literal(
+    encoding: str,
+    rule_code: str,
+) -> None:
     nested = b"cos\nsystem\n)R."
-    encoded = "prefix-" + base64.b64encode(nested).decode("ascii")
+    encoded = base64.b64encode(nested).decode("ascii") if encoding == "base64" else nested.hex()
+    value = f"prefix-{encoded}-suffix"
 
-    report = scan_bytes(pickle.dumps({"outer": encoded}, protocol=4), source="protocol0-nested-b64.pkl")
+    report = scan_bytes(
+        pickle.dumps({"outer": value}, protocol=4),
+        source=f"delimited-protocol0-nested-{encoding}.pkl",
+    )
 
+    assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(finding.rule_code == "S601" for finding in report.findings)
+    assert any(finding.rule_code == rule_code for finding in report.findings)
     assert any(finding.details.get("import_reference") in SYSTEM_GLOBALS for finding in report.findings)
+
+
+@pytest.mark.parametrize(
+    "encoding",
+    ["base64", "hex"],
+)
+def test_scan_bytes_ignores_corrupted_delimited_encoded_nested_pickle_near_match(
+    encoding: str,
+) -> None:
+    corrupted = _corrupt_first_byte(b"cos\nsystem\n)R.")
+    encoded = base64.b64encode(corrupted).decode("ascii") if encoding == "base64" else corrupted.hex()
+    value = f"prefix-{encoded}-suffix"
+
+    report = scan_bytes(
+        pickle.dumps({"outer": value}, protocol=4),
+        source=f"corrupted-delimited-protocol0-nested-{encoding}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
 
 
 @pytest.mark.parametrize("protocol", [2, 3, 4, 5])
@@ -970,7 +1003,7 @@ def test_scan_bytes_scans_legacy_string_opcodes_for_raw_nested_payloads(payload:
 
 RAW_NESTED_UNICODE_LITERAL = b"AAAAAAcos\nsystem\n)R.BBBB"
 RAW_NESTED_PICKLE_SIZE = len(b"cos\nsystem\n)R.")
-UNICODE_SCALAR_NEAR_MATCH = "AAAAAAco\u2603\nsafe\n)X.BBBB".encode("utf-8")
+UNICODE_SCALAR_NEAR_MATCH = "AAAAAAco\u2603\nsafe\n)X.BBBB".encode()
 BINARY_STACK_GLOBAL_NESTED_PICKLE = b"\x80\x04\x8c\x02os\x94\x8c\x06system\x94\x93)R."
 
 
@@ -1065,7 +1098,7 @@ def test_scan_bytes_fails_closed_for_under_limit_malformed_unicode_raw_nested_pa
 
 def test_scan_bytes_scans_ascii_raw_nested_payloads_in_mixed_unicode_literals() -> None:
     report = scan_bytes(
-        b"\x80\x02" + _binunicode("prefix\u2603cos\nsystem\n)R.".encode("utf-8")) + b".",
+        b"\x80\x02" + _binunicode("prefix\u2603cos\nsystem\n)R.".encode()) + b".",
         source="mixed-unicode-raw-nested.pkl",
     )
 
@@ -1870,6 +1903,105 @@ def test_scan_file_marks_oversized_pytorch_zip_member_inconclusive(
     assert report.verdict == SafetyVerdict.UNKNOWN
     assert report.findings == ()
     assert any(notice.code == "pytorch_zip_member_size_limit" for notice in report.notices)
+
+
+def test_scan_file_marks_pytorch_zip_pickle_member_budget_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(package_api, "_MAX_PYTORCH_ZIP_PICKLE_MEMBERS", 2)
+    archive_path = tmp_path / "member-budget.pt"
+    safe_payload = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+    malicious_payload = pickle.dumps(MaliciousPayload(), protocol=4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", safe_payload)
+        archive.writestr("archive/near-limit.pkl", safe_payload)
+        archive.writestr("archive/skipped-malicious.pkl", malicious_payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert not report.is_clean
+    assert report.coverage.raw_scan_complete is False
+    assert report.coverage.opcode_scan_complete is False
+    assert report.metadata["analysis_incomplete"] is True
+    assert list(report.metadata["pickle_files"]) == [
+        "archive/data.pkl",
+        "archive/near-limit.pkl",
+        "archive/skipped-malicious.pkl",
+    ]
+    assert len(report.metadata["member_reports"]) == 2
+    budget_notices = [notice for notice in report.notices if notice.code == "pytorch_zip_pickle_member_budget"]
+    assert len(budget_notices) == 1
+    assert budget_notices[0].details["analysis_incomplete"] is True
+    assert budget_notices[0].details["pickle_member_count"] == 3
+    assert budget_notices[0].details["scanned_pickle_member_count"] == 2
+    assert budget_notices[0].details["skipped_pickle_member_count"] == 1
+    assert budget_notices[0].details["max_pickle_members"] == 2
+    assert list(budget_notices[0].details["skipped_pickle_members"]) == ["archive/skipped-malicious.pkl"]
+
+
+def test_scan_file_marks_pytorch_zip_pickle_member_total_bytes_budget_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "member-byte-budget.pt"
+    safe_payload = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+    malicious_payload = pickle.dumps(MaliciousPayload(), protocol=4)
+    monkeypatch.setattr(package_api, "_MAX_PYTORCH_ZIP_PICKLE_MEMBERS", 10)
+    monkeypatch.setattr(package_api, "_MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES", len(safe_payload) * 2)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", safe_payload)
+        archive.writestr("archive/near-limit.pkl", safe_payload)
+        archive.writestr("archive/skipped-malicious.pkl", malicious_payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert report.metadata["analysis_incomplete"] is True
+    assert len(report.metadata["member_reports"]) == 2
+    budget_notices = [notice for notice in report.notices if notice.code == "pytorch_zip_pickle_member_budget"]
+    assert len(budget_notices) == 1
+    assert budget_notices[0].details["pickle_member_count"] == 3
+    assert budget_notices[0].details["scanned_pickle_member_count"] == 2
+    assert budget_notices[0].details["max_pickle_members"] == 10
+    assert budget_notices[0].details["total_pickle_member_bytes"] == len(safe_payload) * 2 + len(malicious_payload)
+    assert budget_notices[0].details["scanned_pickle_member_bytes"] == len(safe_payload) * 2
+    assert budget_notices[0].details["max_total_pickle_member_bytes"] == len(safe_payload) * 2
+    assert list(budget_notices[0].details["skipped_pickle_members"]) == ["archive/skipped-malicious.pkl"]
+
+
+def test_scan_file_scans_pytorch_zip_pickle_member_budget_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "member-budget-boundary.pt"
+    safe_payload = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+    monkeypatch.setattr(package_api, "_MAX_PYTORCH_ZIP_PICKLE_MEMBERS", 2)
+    monkeypatch.setattr(package_api, "_MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES", len(safe_payload) * 2)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", safe_payload)
+        archive.writestr("archive/near-limit.pkl", safe_payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.is_clean
+    assert "analysis_incomplete" not in report.metadata
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/near-limit.pkl"]
+    assert len(report.metadata["member_reports"]) == 2
+    assert all(notice.code != "pytorch_zip_pickle_member_budget" for notice in report.notices)
 
 
 def test_scan_file_enforces_pytorch_zip_entry_cap_before_opening_archive(
@@ -6917,6 +7049,51 @@ def test_with_call_graph_findings_keeps_import_warning_when_metadata_truncated(
     assert updated.findings == (finding,)
 
 
+def test_with_call_graph_findings_keeps_import_warning_when_invocation_classification_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_classification_error(_callable_invocations: object) -> frozenset[int]:
+        raise RuntimeError("invocation classification failed")
+
+    monkeypatch.setattr(package_api, "_invoked_global_positions", raise_classification_error)
+    monkeypatch.setattr(
+        package_api,
+        "_proven_inert_initialization_modules",
+        lambda _report: frozenset({"decimal"}),
+    )
+    finding = Finding(
+        message="custom global may have been invoked",
+        severity=Severity.WARNING,
+        location="classification-error.pkl",
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+        details={
+            "module": "decimal",
+            "name": "Decimal",
+            "import_reference": "decimal.Decimal",
+            "position": 0,
+        },
+    )
+    report = PickleReport(
+        source="classification-error.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(finding,),
+        metadata={"callable_invocations": ()},
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.SUSPICIOUS
+    assert updated.findings == (finding,)
+    assert any(
+        error.exception_type == "RuntimeError"
+        and error.details["analysis"] == "python_import_invocation_classification"
+        and error.details["analysis_incomplete"] is True
+        for error in updated.errors
+    )
+
+
 def test_safe_import_suppression_does_not_cross_invocation_positions() -> None:
     reference = ("_xxsubinterpreters", "create")
     finding = Finding(
@@ -7816,20 +7993,24 @@ def test_scan_bytes_still_checks_bounded_encoded_nested_windows_for_truncated_li
 
 
 @pytest.mark.parametrize(
-    ("literal", "encoding", "rule_code"),
+    ("literal", "encoding", "rule_code", "embedded"),
     [
-        (base64.b64encode(pickle.dumps({"inner": "data"}, protocol=4)).decode("ascii"), "base64", "S601"),
-        (binascii.hexlify(pickle.dumps({"inner": "data"}, protocol=4)).decode("ascii"), "hex", "S602"),
+        (base64.b64encode(pickle.dumps({"inner": "data"}, protocol=4)).decode("ascii"), "base64", "S601", False),
+        (base64.b64encode(pickle.dumps({"inner": "data"}, protocol=4)).decode("ascii"), "base64", "S601", True),
+        (binascii.hexlify(pickle.dumps({"inner": "data"}, protocol=4)).decode("ascii"), "hex", "S602", False),
+        (binascii.hexlify(pickle.dumps({"inner": "data"}, protocol=4)).decode("ascii"), "hex", "S602", True),
     ],
 )
 def test_scan_bytes_fails_closed_for_encoded_nested_payload_over_byte_limit(
     literal: str,
     encoding: str,
     rule_code: str,
+    embedded: bool,
 ) -> None:
+    value = f"prefix-{literal}-suffix" if embedded else literal
     report = scan_bytes(
-        pickle.dumps({"outer": literal}, protocol=4),
-        source=f"oversized-{encoding}-nested.pkl",
+        pickle.dumps({"outer": value}, protocol=4),
+        source=f"oversized-{encoding}-nested-embedded-{embedded}.pkl",
         options=ScanOptions(max_nested_pickle_bytes=4),
     )
 

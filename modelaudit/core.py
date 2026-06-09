@@ -74,6 +74,7 @@ from modelaudit.utils.file.detection import (
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
     ONNX_ROUTING_INCONCLUSIVE_FORMAT,
+    PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
     PROTOBUF_MODEL_CANDIDATE_FORMAT,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
@@ -266,6 +267,7 @@ _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON = "protobuf_model_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
+_PICKLE_ROUTING_INCOMPLETE_REASON = "pickle_routing_incomplete"
 _DVC_SCAN_BUDGET_EXHAUSTED_REASON = "dvc_scan_budget_exhausted"
 _DVC_DIRECTORY_WALK_FAILED_REASON = "dvc_directory_walk_failed"
 _DVC_DIRECTORY_SYMLINK_UNSCANNED_REASON = "dvc_directory_symlink_unscanned"
@@ -784,10 +786,15 @@ def _merge_pytorch_binary_supplemental_analysis(
     supplemental_scanner_id: str | None,
 ) -> None:
     """Merge strict format-specific findings without dropping raw `.bin` checks."""
+    supplemental_config = dict(config)
+    if supplemental_scanner_id == "executorch":
+        from .scanners.executorch_scanner import PYTORCH_BINARY_PRIMARY_SCANNED_CONFIG_KEY
+
+        supplemental_config[PYTORCH_BINARY_PRIMARY_SCANNED_CONFIG_KEY] = True
     _merge_supplemental_scanner_analysis(
         path,
         result,
-        config,
+        supplemental_config,
         scanner_selection,
         supplemental_scanner_id,
         context="supplemental .bin content analysis",
@@ -1106,6 +1113,23 @@ def _make_incomplete_onnx_routing_result(path: str) -> ScanResult:
     )
     _mark_inconclusive_scan_outcome(result, _ONNX_ROUTING_INCOMPLETE_REASON)
     _mark_operational_scan_error(result, _ONNX_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_pickle_routing_result(path: str) -> ScanResult:
+    """Fail closed when bounded protocol-less Pickle routing cannot decide."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="Pickle Routing",
+        passed=False,
+        message="Pickle routing was inconclusive because the bounded structural probe reached its limit",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": PICKLE_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _PICKLE_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _PICKLE_ROUTING_INCOMPLETE_REASON)
     result.finish(success=False)
     return result
 
@@ -1530,7 +1554,14 @@ def scan_model_directory_or_file(
 
             scanner = get_scanner_for_file(stream_source_path(stream_url), config=config)
             if scanner:
-                scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
+                if max_file_size > 0:
+                    scan_result, analysis_complete = stream_analyze_file(
+                        stream_url,
+                        scanner,
+                        max_bytes=max_file_size,
+                    )
+                else:
+                    scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:
                     _redact_stream_scan_result_for_reporting(scan_result, stream_url, report_url)
                     if not analysis_complete:
@@ -3140,6 +3171,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
+    if header_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT or magic_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT:
+        sr = _make_incomplete_pickle_routing_result(path)
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
     if (
         header_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
         or magic_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
@@ -3424,6 +3460,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 sr = _make_incomplete_xgboost_ubjson_routing_result(path)
             elif magic_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_onnx_routing_result(path)
+            elif magic_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_pickle_routing_result(path)
             elif magic_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_tensorflow_protobuf_routing_result(path)
             elif magic_format == "unknown":
