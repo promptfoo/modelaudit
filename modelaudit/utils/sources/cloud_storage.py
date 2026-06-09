@@ -54,7 +54,7 @@ _URL_TOKEN_RE = re.compile(
     re.IGNORECASE,
 )
 _ESCAPED_URL_DELIMITER_RE = re.compile(
-    r"\\(?P<delimiter>/|u002f|u003f|u003d|u0026|u0023|x2f|x3f|x3d|x26|x23)",
+    r"\\(?P<delimiter>/|u002f|u003f|u003d|u0026|u0023|u003b|x2f|x3f|x3d|x26|x23|x3b)",
     re.IGNORECASE,
 )
 _PERCENT_ENCODED_URL_DELIMITER_RE = re.compile(
@@ -292,11 +292,13 @@ def normalize_escaped_url_delimiters_for_display(value: str) -> str:
         "u003d": "=",
         "u0026": "&",
         "u0023": "#",
+        "u003b": ";",
         "x2f": "/",
         "x3f": "?",
         "x3d": "=",
         "x26": "&",
         "x23": "#",
+        "x3b": ";",
     }
     normalized = _ESCAPED_URL_DELIMITER_RE.sub(
         lambda match: replacements[match.group("delimiter").lower()],

@@ -104,12 +104,15 @@ def test_noncanonical_source_credentials_are_redacted(raw_path: str, safe_path: 
         (r"\\host\share\password=unc-secret\model.pkl", "<source redacted>", "unc-secret"),
         ("file:///tmp/model.pkl%3Ftoken%3Dfile-secret", "file:///tmp/model.pkl", "file-secret"),
         ("file:///tmp/model.pkl%253Ftoken%253Ddouble-secret", "file:///tmp/model.pkl", "double-secret"),
+        ("file://api-key%40host/tmp/model.pkl", "file://host/tmp/model.pkl", "api-key"),
         (
             "api-key@bucket.example/model.pkl?token=query-secret",
             "bucket.example/model.pkl",
             "api-key",
         ),
         ("https:/single-key@bucket.example/model.pkl", "https://bucket.example/model.pkl", "single-key"),
+        ("model.pkl;OPAQUE-SECRET", "model.pkl", "OPAQUE-SECRET"),
+        (r"bucket/model.pkl\u003btoken\u003descaped-secret", "bucket/model.pkl", "escaped-secret"),
     ],
 )
 def test_edge_credentials_are_redacted_across_export_sinks(
@@ -252,6 +255,25 @@ def test_nonexistent_windows_and_unc_credential_suffixes_are_redacted(local_path
     ],
 )
 def test_encoded_file_names_and_email_near_matches_are_preserved(source: str) -> None:
+    assert redact_source_identifier(source) == source
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "file://host/tmp/model.pkl",
+        "model.pkl;version=v1",
+        "bucket/model.pkl;version=v1",
+    ],
+)
+def test_authority_and_semicolon_near_matches_are_preserved(source: str) -> None:
+    assert redact_source_identifier(source) == source
+    assert redact_source_text(f"source {source}") == f"source {source}"
+
+
+def test_percent_encoded_at_in_file_path_is_not_treated_as_authority() -> None:
+    source = "file:///tmp/api-key%40host/model.pkl"
+
     assert redact_source_identifier(source) == source
 
 
@@ -413,6 +435,9 @@ def test_existing_local_credential_shaped_filename_is_preserved(tmp_path: Path) 
     [
         ("model.pkl?OPAQUE-SECRET", "model.pkl"),
         ("model.pkl%3FOPAQUE-SECRET", "model.pkl"),
+        ("model.pkl;OPAQUE-SECRET", "model.pkl"),
+        ("bucket/model.pkl;OPAQUE-SECRET", "bucket/model.pkl"),
+        (r"bucket/model.pkl\u003btoken\u003descaped-secret", "bucket/model.pkl"),
         ("source //bucket.example/model.pkl?OPAQUE-SECRET", "source //bucket.example/model.pkl"),
         ("model.pkl?version=1", "model.pkl?version=1"),
         ("model.pkl%3Fversion%3D1", "model.pkl%3Fversion%3D1"),

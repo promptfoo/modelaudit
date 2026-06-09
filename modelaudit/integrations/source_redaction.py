@@ -8,6 +8,9 @@ from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 from pydantic import AnyUrl, BaseModel
 
 from modelaudit.utils.sources.cloud_storage import (
+    _normalize_percent_encoded_url_authority_for_display as _normalize_percent_encoded_url_authority_for_display,
+)
+from modelaudit.utils.sources.cloud_storage import (
     _normalize_percent_encoded_url_delimiters_for_display as _normalize_percent_encoded_url_delimiters_for_display,
 )
 from modelaudit.utils.sources.cloud_storage import is_sensitive_credential_key, is_stream_url
@@ -143,7 +146,8 @@ def redact_source_identifier(source: str) -> str:
         safe_stream_url = _redact_stream_url_for_display(normalized_source[9:])
         return f"stream://{_redact_url_identifier(safe_stream_url)}"
     if _URL_LIKE_PREFIX_RE.match(normalized_source):
-        parts = urlsplit(normalized_source)
+        authority_normalized_source = _normalize_percent_encoded_url_authority_for_display(normalized_source)
+        parts = urlsplit(authority_normalized_source)
         if parts.scheme.casefold() == "file" and not parts.username and not parts.password:
             comparison_source = _normalize_percent_encoded_url_delimiters_for_display(normalized_source)
             comparison_parts = urlsplit(comparison_source)
@@ -175,7 +179,7 @@ def redact_source_identifier(source: str) -> str:
         suffix = comparison_source[suffix_index + 1 :]
         if _contains_sensitive_assignment(suffix):
             return prefix or "<source redacted>"
-        if comparison_source[suffix_index] in "?#" and _contains_opaque_suffix_part(suffix):
+        if _contains_opaque_suffix_part(suffix):
             return prefix or "<source redacted>"
     path_prefix = re.split(r"[?#;&]", comparison_source, maxsplit=1)[0]
     if _has_sensitive_path_assignment(path_prefix):

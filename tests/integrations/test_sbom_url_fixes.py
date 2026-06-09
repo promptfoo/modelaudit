@@ -154,6 +154,7 @@ class TestSBOMURLFixes:
                 "file:///tmp/model.pkl",
                 "double-secret",
             ),
+            ("file://api-key%40host/tmp/model.pkl", "file://host/tmp/model.pkl", "api-key"),
             (
                 "api-key@bucket.example/model.pkl?token=query-secret",
                 "bucket.example/model.pkl",
@@ -163,6 +164,12 @@ class TestSBOMURLFixes:
                 "https:/single-key@bucket.example/model.pkl",
                 "https://bucket.example/model.pkl",
                 "single-key",
+            ),
+            ("model.pkl;OPAQUE-SECRET", "model.pkl", "OPAQUE-SECRET"),
+            (
+                r"bucket/model.pkl\u003btoken\u003descaped-secret",
+                "bucket/model.pkl",
+                "escaped-secret",
             ),
         ],
     )
