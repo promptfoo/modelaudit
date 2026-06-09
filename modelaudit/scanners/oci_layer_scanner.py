@@ -65,8 +65,12 @@ class _TarStreamMetrics:
     _sparse_extension_pending: bool = False
     _sparse_payload_bytes: int = 0
     _payload_is_within_entry_limit: bool = False
+    _pax_payload: bytearray = field(default_factory=bytearray)
+    _pax_payload_bytes_remaining: int = 0
+    _pax_payload_type: bytes | None = None
     _ended: bool = False
     _invalid: bool = False
+    pax_size_override_seen: bool = False
 
     _HIDDEN_TYPES: ClassVar[frozenset[bytes]] = frozenset(
         {
@@ -77,10 +81,73 @@ class _TarStreamMetrics:
             tarfile.SOLARIS_XHDTYPE,
         }
     )
+    _PAX_SIZE_FIELDS: ClassVar[frozenset[bytes]] = frozenset({b"size", b"GNU.sparse.size", b"GNU.sparse.realsize"})
+
+    @staticmethod
+    def _pax_payload_has_size_override(payload: bytes) -> bool | None:
+        offset = 0
+        size_override_seen = False
+        while offset < len(payload):
+            if payload[offset] == 0:
+                return size_override_seen
+            separator = payload.find(b" ", offset)
+            if separator <= offset:
+                return None
+            length_bytes = payload[offset:separator]
+            if not length_bytes.isdigit() or len(length_bytes) > 20:
+                return None
+            try:
+                record_size = int(length_bytes)
+            except ValueError:
+                return None
+            record_end = offset + record_size
+            if record_end > len(payload) or record_size <= separator - offset + 2:
+                return None
+            record = payload[separator + 1 : record_end]
+            if not record.endswith(b"\n"):
+                return None
+            field = record[:-1]
+            equals = field.find(b"=")
+            if equals <= 0:
+                return None
+            if field[:equals] in _TarStreamMetrics._PAX_SIZE_FIELDS:
+                size_override_seen = True
+            offset = record_end
+        return size_override_seen
+
+    def _finish_pax_payload(self) -> None:
+        if self._pax_payload_type is None:
+            return
+        size_override = self._pax_payload_has_size_override(bytes(self._pax_payload))
+        if size_override is None:
+            self._invalid = True
+        elif size_override:
+            self.pax_size_override_seen = True
+        self._pax_payload.clear()
+        self._pax_payload_bytes_remaining = 0
+        self._pax_payload_type = None
+
+    @property
+    def is_complete(self) -> bool:
+        """Return whether the bounded parser reached a consistent TAR terminator."""
+        return (
+            self._ended
+            and not self._invalid
+            and not self._header
+            and self._payload_bytes_remaining == 0
+            and not self._sparse_extension_pending
+            and self._pax_payload_type is None
+        )
 
     def feed(self, data: bytes) -> None:
         offset = 0
-        while offset < len(data) and not self._ended and not self._invalid:
+        while (
+            offset < len(data)
+            and not self._ended
+            and not self._invalid
+            and not self.metadata_limit_exceeded
+            and not self.pax_size_override_seen
+        ):
             if self._sparse_extension_pending:
                 needed = tarfile.BLOCKSIZE - len(self._header)
                 consumed = min(needed, len(data) - offset)
@@ -105,14 +172,20 @@ class _TarStreamMetrics:
 
             if self._payload_bytes_remaining:
                 consumed = min(self._payload_bytes_remaining, len(data) - offset)
+                if self._pax_payload_bytes_remaining:
+                    pax_consumed = min(consumed, self._pax_payload_bytes_remaining)
+                    self._pax_payload.extend(data[offset : offset + pax_consumed])
+                    self._pax_payload_bytes_remaining -= pax_consumed
                 self._payload_bytes_remaining -= consumed
                 offset += consumed
-                if self._payload_bytes_remaining == 0 and self._payload_is_visible:
-                    self.visible_entries_completed += 1
-                    if self._payload_is_within_entry_limit:
-                        self.visible_entries_within_limit += 1
-                    self._payload_is_visible = False
-                    self._payload_is_within_entry_limit = False
+                if self._payload_bytes_remaining == 0:
+                    self._finish_pax_payload()
+                    if self._payload_is_visible:
+                        self.visible_entries_completed += 1
+                        if self._payload_is_within_entry_limit:
+                            self.visible_entries_within_limit += 1
+                        self._payload_is_visible = False
+                        self._payload_is_within_entry_limit = False
                 continue
 
             needed = tarfile.BLOCKSIZE - len(self._header)
@@ -136,18 +209,29 @@ class _TarStreamMetrics:
 
             self.raw_entries += 1
             is_hidden = info.type in self._HIDDEN_TYPES
+            payload_size = max(0, info.size)
+            padded_payload_size = ((payload_size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
             if is_hidden:
                 self.hidden_entries += 1
-                self.metadata_bytes += max(0, info.size)
+                self.metadata_bytes += padded_payload_size
                 if self.metadata_bytes > self.max_metadata_bytes:
                     self.metadata_limit_exceeded = True
 
-            payload_size = max(0, info.size)
+            if (
+                info.type in {tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE}
+                and not self.metadata_limit_exceeded
+                and payload_size <= self.max_metadata_bytes
+            ):
+                self._pax_payload_type = info.type
+                self._pax_payload_bytes_remaining = padded_payload_size
+                self._pax_payload.clear()
+            else:
+                self._pax_payload_type = None
+                self._pax_payload_bytes_remaining = 0
+                self._pax_payload.clear()
             self._payload_is_visible = not is_hidden
             self._payload_is_within_entry_limit = self.raw_entries <= self.max_entries
-            self._payload_bytes_remaining = (
-                (payload_size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE
-            ) * tarfile.BLOCKSIZE
+            self._payload_bytes_remaining = padded_payload_size
             sparse_structs: Any = getattr(info, "_sparse_structs", ())
             if (
                 info.type == tarfile.GNUTYPE_SPARSE
@@ -158,12 +242,14 @@ class _TarStreamMetrics:
                 self._sparse_extension_pending = True
                 self._sparse_payload_bytes = self._payload_bytes_remaining
                 self._payload_bytes_remaining = 0
-            if self._payload_bytes_remaining == 0 and self._payload_is_visible:
-                self.visible_entries_completed += 1
-                if self._payload_is_within_entry_limit:
-                    self.visible_entries_within_limit += 1
-                self._payload_is_visible = False
-                self._payload_is_within_entry_limit = False
+            if self._payload_bytes_remaining == 0:
+                self._finish_pax_payload()
+                if self._payload_is_visible:
+                    self.visible_entries_completed += 1
+                    if self._payload_is_within_entry_limit:
+                        self.visible_entries_within_limit += 1
+                    self._payload_is_visible = False
+                    self._payload_is_within_entry_limit = False
 
 
 @dataclass
@@ -225,6 +311,7 @@ class OciLayerScanner(BaseScanner):
     _DEFAULT_MAX_LAYER_FILE_SIZE: ClassVar[int] = 10 * 1024 * 1024 * 1024
     _DEFAULT_MAX_LAYER_ENTRIES: ClassVar[int] = 10000
     _DEFAULT_MAX_DECOMPRESSED_BYTES: ClassVar[int] = 512 * 1024 * 1024
+    _DEFAULT_MAX_EXTRACTED_BYTES: ClassVar[int] = 512 * 1024 * 1024
     _DEFAULT_MAX_DECOMPRESSION_RATIO: ClassVar[float] = 250.0
     _REMOTE_LAYER_REF_SCHEMES: ClassVar[frozenset[str]] = frozenset({"http", "https", "s3", "gs", "oci"})
     _PARENT_IDENTITY_METADATA_KEYS: ClassVar[frozenset[str]] = frozenset({"file_size", "file_hashes"})
@@ -268,10 +355,36 @@ class OciLayerScanner(BaseScanner):
             self.config.get("compressed_max_decompressed_bytes"),
             self._DEFAULT_MAX_DECOMPRESSED_BYTES,
         )
+        self.max_layer_extracted_bytes = self._resolve_max_layer_extracted_bytes()
+        self.max_total_extracted_bytes = self._resolve_max_total_extracted_bytes()
         self.max_decompression_ratio = self._normalize_positive_float_config(
             self.config.get("compressed_max_decompression_ratio"),
             self._DEFAULT_MAX_DECOMPRESSION_RATIO,
         )
+
+    def _resolve_max_layer_extracted_bytes(self) -> int:
+        """Return the aggregate copied-member budget for one OCI layer."""
+        positive_limits: list[int] = []
+        configured_limit = self.config.get("max_oci_layer_extracted_bytes")
+        if configured_limit is not None:
+            if configured_limit != 0:
+                positive_limits.append(
+                    self._normalize_positive_int_config(
+                        configured_limit,
+                        self._DEFAULT_MAX_EXTRACTED_BYTES,
+                    )
+                )
+        else:
+            positive_limits.append(self._DEFAULT_MAX_EXTRACTED_BYTES)
+
+        return min(positive_limits) if positive_limits else 0
+
+    def _resolve_max_total_extracted_bytes(self) -> int:
+        """Return the copied-member budget shared by every layer in one manifest."""
+        configured_limit = self.config.get("max_total_size")
+        if configured_limit in (None, 0):
+            return 0
+        return self._normalize_positive_int_config(configured_limit, self._DEFAULT_MAX_EXTRACTED_BYTES)
 
     @staticmethod
     def _normalize_positive_float_config(value: Any, default: float) -> float:
@@ -297,6 +410,58 @@ class OciLayerScanner(BaseScanner):
         self._mark_incomplete_coverage(result, reason)
         result.add_check(
             name="Layer Decompression Budget Check",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=f"{manifest_path}:{layer_ref}",
+            details={
+                "layer": layer_ref,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+                **details,
+            },
+            rule_code="S902",
+        )
+
+    def _add_layer_extraction_budget_check(
+        self,
+        result: ScanResult,
+        *,
+        manifest_path: str,
+        layer_ref: str,
+        reason: str,
+        message: str,
+        details: dict[str, Any],
+    ) -> None:
+        self._mark_incomplete_coverage(result, reason)
+        result.add_check(
+            name="Layer Extraction Budget Check",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=f"{manifest_path}:{layer_ref}",
+            details={
+                "layer": layer_ref,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+                **details,
+            },
+            rule_code="S902",
+        )
+
+    def _add_layer_tar_structure_check(
+        self,
+        result: ScanResult,
+        *,
+        manifest_path: str,
+        layer_ref: str,
+        reason: str,
+        message: str,
+        details: dict[str, Any],
+    ) -> None:
+        self._mark_incomplete_coverage(result, reason)
+        result.add_check(
+            name="Layer TAR Structure Check",
             passed=False,
             message=message,
             severity=IssueSeverity.INFO,
@@ -903,6 +1068,8 @@ class OciLayerScanner(BaseScanner):
 
         manifest_dir = os.path.dirname(path)
         scan_complete = True
+        total_extracted_member_bytes = 0
+        total_extraction_budget_exhausted = False
 
         for layer_ref in layer_paths:
             normalized_layer_ref = self._normalize_layer_ref(layer_ref)
@@ -1012,6 +1179,26 @@ class OciLayerScanner(BaseScanner):
                     raise tarfile.ReadError(f"gzip preflight failed: {gzip_metrics.failure.replace('_', ' ')}")
 
                 tar_metrics = gzip_metrics.tar
+                preflight_member_limit: int | None = None
+                if tar_metrics is not None and tar_metrics.pax_size_override_seen:
+                    scan_complete = False
+                    self._add_layer_tar_structure_check(
+                        result,
+                        manifest_path=path,
+                        layer_ref=layer_ref,
+                        reason="oci_layer_tar_size_override_unsupported",
+                        message=(
+                            f"Layer {normalized_layer_ref} uses a PAX size override that cannot be "
+                            "reconciled safely with bounded TAR preflight"
+                        ),
+                        details={
+                            "raw_entries": tar_metrics.raw_entries,
+                            "hidden_entries": tar_metrics.hidden_entries,
+                        },
+                    )
+                    preflight_member_limit = tar_metrics.visible_entries_completed
+                    if preflight_member_limit == 0:
+                        continue
                 if tar_metrics is not None and tar_metrics.metadata_limit_exceeded:
                     scan_complete = False
                     self._add_layer_budget_check(
@@ -1030,10 +1217,15 @@ class OciLayerScanner(BaseScanner):
                             "hidden_entries": tar_metrics.hidden_entries,
                         },
                     )
-                    continue
+                    metadata_member_limit = tar_metrics.visible_entries_completed
+                    if metadata_member_limit == 0:
+                        continue
+                    if preflight_member_limit is None:
+                        preflight_member_limit = metadata_member_limit
+                    else:
+                        preflight_member_limit = min(preflight_member_limit, metadata_member_limit)
 
                 compressed_budget_size = gzip_metrics.compressed_size or layer_size
-                preflight_member_limit: int | None = None
                 if gzip_metrics.size_exceeded:
                     scan_complete = False
                     self._add_layer_budget_check(
@@ -1078,16 +1270,45 @@ class OciLayerScanner(BaseScanner):
                     if preflight_member_limit == 0:
                         continue
 
-                hidden_entries_exceeded_limit = (
+                if (
                     tar_metrics is not None
-                    and tar_metrics.hidden_entries > 0
-                    and tar_metrics.raw_entries > self.max_layer_entries
+                    and not gzip_metrics.size_exceeded
+                    and not gzip_metrics.ratio_exceeded
+                    and not tar_metrics.pax_size_override_seen
+                    and not tar_metrics.metadata_limit_exceeded
+                    and not tar_metrics.is_complete
+                ):
+                    scan_complete = False
+                    self._add_layer_tar_structure_check(
+                        result,
+                        manifest_path=path,
+                        layer_ref=layer_ref,
+                        reason="oci_layer_tar_structure_incomplete",
+                        message=(
+                            f"Layer {normalized_layer_ref} bounded TAR preflight ended with "
+                            "incomplete or inconsistent structure"
+                        ),
+                        details={
+                            "raw_entries": tar_metrics.raw_entries,
+                            "hidden_entries": tar_metrics.hidden_entries,
+                        },
+                    )
+                    structure_member_limit = tar_metrics.visible_entries_completed
+                    if structure_member_limit == 0:
+                        continue
+                    if preflight_member_limit is None:
+                        preflight_member_limit = structure_member_limit
+                    else:
+                        preflight_member_limit = min(preflight_member_limit, structure_member_limit)
+
+                raw_entries_exceeded_limit = (
+                    tar_metrics is not None and tar_metrics.raw_entries > self.max_layer_entries
                 )
                 hidden_entry_hard_limit = max(self.max_layer_entries, self._MIN_MAX_HIDDEN_TAR_ENTRIES)
                 hidden_entry_hard_limit_exceeded = (
                     tar_metrics is not None and tar_metrics.hidden_entries > hidden_entry_hard_limit
                 )
-                if hidden_entries_exceeded_limit or hidden_entry_hard_limit_exceeded:
+                if raw_entries_exceeded_limit or hidden_entry_hard_limit_exceeded:
                     assert tar_metrics is not None
                     scan_complete = False
                     self._add_layer_budget_check(
@@ -1096,7 +1317,7 @@ class OciLayerScanner(BaseScanner):
                         layer_ref=layer_ref,
                         reason="oci_layer_entry_count_exceeded",
                         message=(
-                            f"Layer {normalized_layer_ref} contains too many raw TAR entries "
+                            f"Layer {normalized_layer_ref} contains too many entries/raw TAR entries "
                             f"({tar_metrics.raw_entries} > {self.max_layer_entries})"
                         ),
                         details={
@@ -1107,15 +1328,16 @@ class OciLayerScanner(BaseScanner):
                     )
                     if hidden_entry_hard_limit_exceeded:
                         continue
-                    hidden_entry_member_limit = tar_metrics.visible_entries_within_limit
-                    if hidden_entry_member_limit == 0:
+                    entry_member_limit = tar_metrics.visible_entries_within_limit
+                    if entry_member_limit == 0:
                         continue
                     if preflight_member_limit is None:
-                        preflight_member_limit = hidden_entry_member_limit
+                        preflight_member_limit = entry_member_limit
                     else:
-                        preflight_member_limit = min(preflight_member_limit, hidden_entry_member_limit)
+                        preflight_member_limit = min(preflight_member_limit, entry_member_limit)
 
                 layer_entry_count = 0
+                extracted_member_bytes = 0
                 metadata_state = _LayerMetadataState()
                 with tarfile.open(layer_path, "r:gz") as tar:
                     while preflight_member_limit is None or layer_entry_count < preflight_member_limit:
@@ -1175,6 +1397,58 @@ class OciLayerScanner(BaseScanner):
                             )
                             continue
 
+                        member_size = max(0, member.size)
+                        projected_extracted_bytes = extracted_member_bytes + member_size
+                        if (
+                            self.max_layer_extracted_bytes > 0
+                            and projected_extracted_bytes > self.max_layer_extracted_bytes
+                        ):
+                            scan_complete = False
+                            self._add_layer_extraction_budget_check(
+                                result,
+                                manifest_path=path,
+                                layer_ref=layer_ref,
+                                reason="oci_layer_extracted_size_exceeded",
+                                message=(
+                                    f"Layer {self._normalize_layer_ref(layer_ref)} extracted member bytes exceed "
+                                    f"limit ({projected_extracted_bytes} > {self.max_layer_extracted_bytes})"
+                                ),
+                                details={
+                                    "member": name,
+                                    "member_size": member_size,
+                                    "extracted_bytes": projected_extracted_bytes,
+                                    "previous_extracted_bytes": extracted_member_bytes,
+                                    "max_extracted_bytes": self.max_layer_extracted_bytes,
+                                },
+                            )
+                            break
+
+                        projected_total_extracted_bytes = total_extracted_member_bytes + member_size
+                        if (
+                            self.max_total_extracted_bytes > 0
+                            and projected_total_extracted_bytes > self.max_total_extracted_bytes
+                        ):
+                            scan_complete = False
+                            total_extraction_budget_exhausted = True
+                            self._add_layer_extraction_budget_check(
+                                result,
+                                manifest_path=path,
+                                layer_ref=layer_ref,
+                                reason="oci_total_extracted_size_exceeded",
+                                message=(
+                                    "OCI manifest extracted member bytes exceed total limit "
+                                    f"({projected_total_extracted_bytes} > {self.max_total_extracted_bytes})"
+                                ),
+                                details={
+                                    "member": name,
+                                    "member_size": member_size,
+                                    "total_extracted_bytes": projected_total_extracted_bytes,
+                                    "previous_total_extracted_bytes": total_extracted_member_bytes,
+                                    "max_total_extracted_bytes": self.max_total_extracted_bytes,
+                                },
+                            )
+                            break
+
                         fileobj = tar.extractfile(member)
                         if fileobj is None:
                             scan_complete = False
@@ -1208,6 +1482,8 @@ class OciLayerScanner(BaseScanner):
                                 if header_prefix:
                                     tmp.write(header_prefix)
                                 shutil.copyfileobj(fileobj, tmp)
+                            extracted_member_bytes = projected_extracted_bytes
+                            total_extracted_member_bytes = projected_total_extracted_bytes
 
                             from .. import core
 
@@ -1273,6 +1549,8 @@ class OciLayerScanner(BaseScanner):
                     },
                     rule_code="S902",
                 )
+            if total_extraction_budget_exhausted:
+                break
 
         result.finish(success=scan_complete and not result.has_errors)
         return result
