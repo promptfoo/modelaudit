@@ -7,6 +7,7 @@ import pytest
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
+from modelaudit.scanners import pmml_scanner as pmml_scanner_module
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pmml_scanner import PmmlScanner
 
@@ -82,6 +83,106 @@ def test_pmml_scanner_xxe(tmp_path: Path) -> None:
     assert result.success is False
     assert any("doctype" in m or "entity" in m for m in messages)
     assert any(i.severity == IssueSeverity.CRITICAL for i in result.issues)
+
+
+def test_pmml_scanner_missing_defusedxml_fails_closed_without_unsafe_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header/>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "model.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    monkeypatch.setattr(pmml_scanner_module, "HAS_DEFUSEDXML", False)
+    monkeypatch.setattr(pmml_scanner_module, "DefusedET", None)
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == [PmmlScanner.XML_PARSER_UNAVAILABLE_INCOMPLETE_REASON]
+    parser_checks = [check for check in result.checks if check.name == "XML Parser Security Check"]
+    assert len(parser_checks) == 1
+    assert parser_checks[0].severity == IssueSeverity.INFO
+    assert parser_checks[0].details["scan_outcome_reason"] == PmmlScanner.XML_PARSER_UNAVAILABLE_INCOMPLETE_REASON
+    assert "pmml_version" not in result.metadata
+
+    _assert_inconclusive_aggregate_not_cached(
+        path,
+        PmmlScanner.XML_PARSER_UNAVAILABLE_INCOMPLETE_REASON,
+        tmp_path / "cache",
+    )
+
+
+def test_pmml_cache_invalidates_when_safe_parser_becomes_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "model.pmml"
+    path.write_text(
+        "<?xml version='1.0'?><PMML version='4.4'><Header/></PMML>",
+        encoding="utf-8",
+    )
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert determine_exit_code(first) == 0
+
+        monkeypatch.setattr(pmml_scanner_module, "HAS_DEFUSEDXML", False)
+        monkeypatch.setattr(pmml_scanner_module, "DefusedET", None)
+
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        metadata = second.file_metadata[str(path)]
+        assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert metadata["scan_outcome_reasons"] == [PmmlScanner.XML_PARSER_UNAVAILABLE_INCOMPLETE_REASON]
+        assert determine_exit_code(second) == 2
+    finally:
+        reset_cache_manager()
+
+
+def test_pmml_scanner_missing_defusedxml_preserves_xxe_preparse_detection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    xxe_target = tmp_path / "xxe-target"
+    pmml = f"""<?xml version='1.0'?>
+<!DOCTYPE pmml [ <!ENTITY xxe SYSTEM '{xxe_target.as_uri()}'> ]>
+<PMML version='4.4'>
+  <Header>
+    <Extension>&xxe;</Extension>
+  </Header>
+</PMML>"""
+    path = tmp_path / "evil.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    monkeypatch.setattr(pmml_scanner_module, "HAS_DEFUSEDXML", False)
+    monkeypatch.setattr(pmml_scanner_module, "DefusedET", None)
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert PmmlScanner.XML_PARSER_UNAVAILABLE_INCOMPLETE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(issue.severity == IssueSeverity.CRITICAL and "DOCTYPE" in issue.message for issue in result.issues)
+
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+    assert determine_exit_code(aggregate) == 1
 
 
 def test_pmml_scanner_suspicious_extension_content(tmp_path: Path) -> None:
