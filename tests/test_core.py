@@ -1302,7 +1302,13 @@ def test_scan_file_passes_shard_allowlist_to_advanced_handler(
         def __init__(self, config: dict[str, Any] | None = None) -> None:
             self.config = config or {}
 
-    def fake_select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
+    def fake_select_preferred_scanner_id(
+        path: str,
+        header_format: str,
+        ext: str,
+        config: dict[str, Any] | None = None,
+    ) -> str | None:
+        del config
         assert path == str(shard)
         assert isinstance(header_format, str)
         assert ext == ".safetensors"
@@ -1761,7 +1767,13 @@ def test_scan_file_passes_shard_allowlist_to_preferred_advanced_handler(
         def can_handle(path: str) -> bool:
             return path == str(shard)
 
-    def fake_select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
+    def fake_select_preferred_scanner_id(
+        path: str,
+        header_format: str,
+        ext: str,
+        config: dict[str, Any] | None = None,
+    ) -> str | None:
+        del config
         assert path == str(shard)
         assert isinstance(header_format, str)
         assert ext == ".safetensors"
@@ -2040,6 +2052,406 @@ def test_scan_file_detects_malicious_zip_with_misleading_extension(tmp_path: Pat
 
     assert result.scanner_name == "zip"
     _assert_system_pickle_detected(result, "payload.pkl")
+
+
+def test_scan_file_rejects_over_entry_zip_before_routing_opens_zipfile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "over_entry.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("one.txt", "one")
+        archive.writestr("two.txt", "two")
+
+    def fail_zipfile_open(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("routing and preflight must reject before ZipFile construction")
+
+    monkeypatch.setattr("modelaudit.scanners.zip_scanner.zipfile.ZipFile", fail_zipfile_open)
+
+    result = scan_file(str(archive_path), config={"max_zip_entries": 1})
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert any(
+        check.name == "Entry Count Limit Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry_count_source"] == "central_directory_preflight"
+        for check in result.checks
+    )
+
+
+def test_scan_file_selected_keras_still_enforces_zip_entry_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "over-entry.keras"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("config.json", "{}")
+        archive.writestr("metadata.json", "{}")
+
+    def fail_zipfile_open(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("selected ZIP-backed scanners must not bypass the container cap")
+
+    monkeypatch.setattr("modelaudit.scanners.zip_scanner.zipfile.ZipFile", fail_zipfile_open)
+
+    result = scan_file(
+        str(archive_path),
+        config={"scanners": ["keras_zip"], "max_zip_entries": 1, "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert any(check.name == "Entry Count Limit Check" for check in result.checks)
+
+
+def test_scan_file_selected_keras_rechecks_replaced_archive_on_open_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "replaced.keras"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("config.json", "{}")
+
+    replacement_path = tmp_path / "replacement.keras"
+    with zipfile.ZipFile(replacement_path, "w") as archive:
+        archive.writestr("config.json", "{}")
+        archive.writestr("metadata.json", "{}")
+
+    from modelaudit.scanners.zip_scanner import ZipScanner
+
+    original_requires_preflight_result = ZipScanner.requires_preflight_result
+    replacement_installed = False
+
+    def replace_after_initial_preflight(
+        path: str,
+        max_entries: int,
+        max_directory_size: int | None = None,
+    ) -> bool:
+        nonlocal replacement_installed
+        result = original_requires_preflight_result(path, max_entries, max_directory_size)
+        if not replacement_installed:
+            os.replace(replacement_path, archive_path)
+            replacement_installed = True
+        return result
+
+    def fail_zipfile_open(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("the over-limit replacement must be rejected before ZipFile construction")
+
+    monkeypatch.setattr(ZipScanner, "requires_preflight_result", replace_after_initial_preflight)
+    monkeypatch.setattr("modelaudit.scanners.zip_scanner.zipfile.ZipFile", fail_zipfile_open)
+
+    result = scan_file(
+        str(archive_path),
+        config={"scanners": ["keras_zip"], "max_zip_entries": 1, "cache_enabled": False},
+    )
+
+    assert replacement_installed is True
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert any(
+        check.name == "Entry Count Limit Check" and check.status == CheckStatus.FAILED and check.details["entries"] == 2
+        for check in result.checks
+    )
+
+
+def test_scan_file_selected_weight_distribution_enforces_zip_entry_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "over-entry.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", b"data")
+        archive.writestr("archive/version", b"1")
+
+    def fail_weight_scan(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("ZIP entry preflight must reject before weight extraction")
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.weight_distribution_scanner.WeightDistributionScanner.scan",
+        fail_weight_scan,
+    )
+
+    result = scan_file(
+        str(archive_path),
+        config={"scanners": ["weight_distribution"], "max_zip_entries": 1, "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert any(
+        check.name == "Entry Count Limit Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry_count_source"] == "central_directory_preflight"
+        for check in result.checks
+    )
+
+
+def test_scan_file_selected_weight_distribution_routes_within_entry_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "within-entry-limit.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", b"data")
+
+    def fake_weight_scan(_self: Any, path: str) -> ScanResult:
+        assert path == str(archive_path)
+        result = ScanResult(scanner_name="weight_distribution")
+        result.finish(success=True)
+        return result
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.weight_distribution_scanner.WeightDistributionScanner.scan",
+        fake_weight_scan,
+    )
+
+    result = scan_file(
+        str(archive_path),
+        config={"scanners": ["weight_distribution"], "max_zip_entries": 1, "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "weight_distribution"
+    assert result.success is True
+    assert not any(check.name == "Entry Count Limit Check" for check in result.checks)
+
+
+def test_scan_file_selected_numpy_enforces_npz_entry_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "over-entry.npz"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("one.npy", b"first")
+        archive.writestr("two.npy", b"second")
+
+    def fail_zipfile_open(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("NPZ entry preflight must reject before ZipFile construction")
+
+    def fail_numpy_scan(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("NPZ entry preflight must reject before NumPy loading")
+
+    monkeypatch.setattr("modelaudit.scanners.zip_scanner.zipfile.ZipFile", fail_zipfile_open)
+    monkeypatch.setattr("modelaudit.scanners.numpy_scanner.NumPyScanner.scan", fail_numpy_scan)
+
+    result = scan_file(
+        str(archive_path),
+        config={"scanners": ["numpy"], "max_zip_entries": 1, "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert any(
+        check.name == "Entry Count Limit Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry_count_source"] == "central_directory_preflight"
+        for check in result.checks
+    )
+
+
+def test_scan_file_selected_numpy_preserves_within_limit_npz_selection(tmp_path: Path) -> None:
+    archive_path = tmp_path / "within-entry-limit.npz"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("weights.npy", b"safe")
+
+    result = scan_file(
+        str(archive_path),
+        config={"scanners": ["numpy"], "max_zip_entries": 1, "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "scanner_selection"
+    assert result.success is True
+    assert result.metadata["skipped_scanner_id"] == "zip"
+    assert not any(check.name == "Entry Count Limit Check" for check in result.checks)
+
+
+def test_scan_file_selected_numpy_honors_selection_before_plain_zip_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "not-numpy.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("one.txt", "one")
+        archive.writestr("two.txt", "two")
+
+    def fail_zip_preflight(*_args: Any, **_kwargs: Any) -> bool:
+        raise AssertionError("unselected plain ZIP routes must not be preflighted")
+
+    monkeypatch.setattr("modelaudit.scanners.zip_scanner.ZipScanner.requires_preflight_result", fail_zip_preflight)
+
+    result = scan_file(
+        str(archive_path),
+        config={"scanners": ["numpy"], "max_zip_entries": 1, "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "scanner_selection"
+    assert result.success is True
+    assert result.metadata["skipped_scanner_id"] == "zip"
+    assert not any(check.name == "Entry Count Limit Check" for check in result.checks)
+
+
+def test_scan_file_hf_bookkeeping_skip_precedes_zip_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    metadata_path = hf_home / "download" / "model.metadata"
+    metadata_path.parent.mkdir(parents=True)
+    metadata_path.write_text("{}")
+
+    def fail_zip_preflight(*_args: Any, **_kwargs: Any) -> bool:
+        raise AssertionError("Hugging Face bookkeeping must be skipped before ZIP preflight")
+
+    monkeypatch.setattr("modelaudit.scanners.zip_scanner.ZipScanner.requires_preflight_result", fail_zip_preflight)
+
+    result = scan_file(str(metadata_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "skipped"
+    assert result.success is True
+    assert any(check.name == "HuggingFace Cache File Skip" for check in result.checks)
+
+
+def test_scan_file_size_limit_precedes_zip_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "oversized.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("safe.txt", "safe")
+
+    def fail_zip_preflight(*_args: Any, **_kwargs: Any) -> bool:
+        raise AssertionError("file-size rejection must precede ZIP preflight")
+
+    monkeypatch.setattr("modelaudit.scanners.zip_scanner.ZipScanner.requires_preflight_result", fail_zip_preflight)
+
+    result = scan_file(
+        str(archive_path),
+        config={"max_file_size": 1, "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "size_check"
+    assert result.success is False
+    assert any(check.name == "File Size Limit Check" and check.status == CheckStatus.FAILED for check in result.checks)
+
+
+def test_scan_file_selected_pickle_honors_selection_before_zip_preflight(tmp_path: Path) -> None:
+    archive_path = tmp_path / "selected-pickle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("one.txt", "one")
+        archive.writestr("two.txt", "two")
+
+    result = scan_file(
+        str(archive_path),
+        config={"scanners": ["pickle"], "max_zip_entries": 1, "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "scanner_selection"
+    assert not any(check.name == "Entry Count Limit Check" for check in result.checks)
+    assert any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "zip"
+        for check in result.checks
+    )
+
+
+def test_scan_file_excluded_zip_honors_selection_before_zip_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "excluded.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("one.txt", "one")
+        archive.writestr("two.txt", "two")
+
+    def fail_zip_preflight(*_args: Any, **_kwargs: Any) -> bool:
+        raise AssertionError("explicitly excluded ZIP routes must not be preflighted")
+
+    monkeypatch.setattr("modelaudit.scanners.zip_scanner.ZipScanner.requires_preflight_result", fail_zip_preflight)
+
+    result = scan_file(
+        str(archive_path),
+        config={"exclude_scanners": ["zip"], "max_zip_entries": 1, "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "scanner_selection"
+    assert not any(check.name == "Entry Count Limit Check" for check in result.checks)
+    assert any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "zip"
+        for check in result.checks
+    )
+
+
+def test_scan_file_long_prefix_ambiguous_zip_fails_closed(tmp_path: Path) -> None:
+    archive_path = tmp_path / "ambiguous-sfx.bin"
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w") as archive:
+        archive.writestr("payload.pkl", _build_malicious_pickle())
+    real_archive = bytearray(archive_bytes.getvalue())
+    real_eocd_index = real_archive.rfind(b"PK\x05\x06")
+    assert real_eocd_index >= 0
+    fake_empty_eocd = b"PK\x05\x06" + (b"\x00" * 18)
+    real_archive[real_eocd_index + 20 : real_eocd_index + 22] = len(fake_empty_eocd).to_bytes(2, "little")
+    archive_path.write_bytes((b"A" * (1024 * 1024 + 1)) + real_archive + fake_empty_eocd)
+
+    result = scan_file(str(archive_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert any(check.name == "ZIP Central Directory Preflight" for check in result.checks)
+
+
+def test_scan_file_routes_prefixed_zip_with_trailing_bytes_and_misleading_extension(tmp_path: Path) -> None:
+    archive_path = tmp_path / "payload.bin"
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w") as archive:
+        archive.writestr("payload.pkl", _build_malicious_pickle())
+    archive_path.write_bytes(b"SFX-STUB" + archive_bytes.getvalue() + b"TRAILING-JUNK")
+
+    result = scan_file(str(archive_path))
+
+    assert result.scanner_name == "zip"
+    _assert_system_pickle_detected(result, "payload.pkl")
+
+
+def test_scan_file_does_not_route_bogus_terminal_eocd_as_zip(tmp_path: Path) -> None:
+    path = tmp_path / "not-a-zip.bin"
+    fake_directory = b"not a central directory".ljust(46, b"x")
+    fake_eocd = struct.pack(
+        "<4s4H2LH",
+        b"PK\x05\x06",
+        0,
+        0,
+        1,
+        1,
+        len(fake_directory),
+        0,
+        0,
+    )
+    path.write_bytes(fake_directory + fake_eocd)
+
+    result = scan_file(str(path))
+
+    assert result.scanner_name != "zip"
+
+
+def test_scan_file_malformed_zip64_locator_offset_fails_closed_without_raising(tmp_path: Path) -> None:
+    path = tmp_path / "malformed-zip64.zip"
+    locator = bytearray(20)
+    locator[0:4] = b"PK\x06\x07"
+    locator[8:16] = ((1 << 64) - 1).to_bytes(8, "little")
+    locator[16:20] = (1).to_bytes(4, "little")
+    eocd = bytearray(22)
+    eocd[0:4] = b"PK\x05\x06"
+    eocd[8:10] = (0xFFFF).to_bytes(2, "little")
+    eocd[10:12] = (0xFFFF).to_bytes(2, "little")
+    eocd[12:16] = (0xFFFFFFFF).to_bytes(4, "little")
+    eocd[16:20] = (0xFFFFFFFF).to_bytes(4, "little")
+    path.write_bytes(b"PK\x03\x04" + (b"\x00" * 60) + locator + eocd)
+
+    result = scan_file(str(path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert any(check.name == "ZIP Central Directory Preflight" for check in result.checks)
 
 
 def test_scan_file_routes_protocolless_binary_pickle_with_misleading_extension(tmp_path: Path) -> None:
@@ -6139,6 +6551,36 @@ def test_scan_file_merges_executorch_archive_analysis_for_signature_valid_bin(tm
     assert result.scanner_name == "pytorch_binary"
     assert result.metadata["supplemental_scanners"] == ["executorch"]
     assert any(issue.rule_code == "S104" and "evil.py" in (issue.location or "") for issue in result.issues)
+
+
+def test_scan_file_preflights_over_entry_executorch_archive_before_specialized_routing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "program.bin"
+    model_path.write_bytes(b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x04\x00\x00\x00")
+    with zipfile.ZipFile(model_path, "a") as archive:
+        archive.writestr("one.py", "print('one')")
+        archive.writestr("two.py", "print('two')")
+
+    def fail_zipfile_open(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("entry-count preflight must reject before specialized routing opens the ZIP")
+
+    monkeypatch.setattr("modelaudit.scanners.zip_scanner.zipfile.ZipFile", fail_zipfile_open)
+
+    result = scan_file(
+        str(model_path),
+        config={"cache_scan_results": False, "max_zip_entries": 1},
+    )
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert any(
+        check.name == "Entry Count Limit Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry_count_source"] == "central_directory_preflight"
+        for check in result.checks
+    )
 
 
 def test_preferred_scanner_does_not_route_generic_zip_bin_to_pickle(tmp_path: Path) -> None:

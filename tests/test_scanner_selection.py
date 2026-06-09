@@ -17,6 +17,7 @@ from modelaudit.cli import cli
 from modelaudit.core import scan_file, scan_model_directory_or_file
 from modelaudit.scanner_registry_metadata import get_scanner_registry_metadata
 from modelaudit.scanner_selection import (
+    allows_zip_structure_analysis,
     collect_suppressed_preferred_scanners,
     normalize_scanner_selection_config,
     policy_from_config,
@@ -108,6 +109,12 @@ def test_selection_policy_uses_allowlist_minus_exclusions() -> None:
     assert policy.enabled_scanner_ids == frozenset({"pickle"})
     assert policy.allows("pickle")
     assert not policy.allows("zip")
+
+
+def test_zip_structure_analysis_honors_explicit_zip_exclusion() -> None:
+    policy = resolve_scanner_selection_policy(exclude_scanners=["zip"])
+
+    assert allows_zip_structure_analysis(policy, "archive.zip") is False
 
 
 def test_normalize_scanner_selection_config_reuses_normalized_payload(

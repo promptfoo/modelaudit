@@ -23,6 +23,7 @@ from ..helpers.cache_decorator import (
     add_optional_dependency_availability_to_version_context,
     should_bypass_cache_for_safetensors_header_limit,
     should_bypass_cache_for_unavailable_hdf5_analysis,
+    should_bypass_cache_for_zip_entry_preflight,
 )
 from ..sources._huggingface_cache import _find_hf_cache_root, _path_has_part, _trusted_hf_blobs_root
 
@@ -1884,6 +1885,16 @@ def scan_advanced_large_file(
 
     # If caching is disabled, proceed with direct scan
     if not cache_enabled:
+        return _scan_advanced_large_file_internal(
+            file_path,
+            scanner,
+            progress_callback,
+            timeout,
+            allowed_shard_paths=allowed_shard_paths,
+            allowed_shard_targets=allowed_shard_targets,
+        )
+    if should_bypass_cache_for_zip_entry_preflight(file_path, config):
+        logger.debug(f"Bypassing advanced-file cache for bounded ZIP entry preflight: {file_path}")
         return _scan_advanced_large_file_internal(
             file_path,
             scanner,

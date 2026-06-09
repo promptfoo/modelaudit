@@ -6,10 +6,11 @@ import numbers
 import os
 import zipfile
 from contextlib import suppress
-from typing import Any, ClassVar
+from typing import Any, BinaryIO, ClassVar
 
 from ..scanner_results import mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
+from .zip_scanner import ZipPreflightRejected
 
 _ANALYSIS_INCONCLUSIVE_REASON = "weight_distribution_analysis_incomplete"
 _FINAL_LAYER_NAME_PATTERNS = ("fc", "classifier", "head", "output", "final", "dense")
@@ -283,6 +284,8 @@ class WeightDistributionScanner(BaseScanner):
                 result.finish(success=False)
                 return result
 
+        except ZipPreflightRejected as exc:
+            return exc.result
         except Exception as e:
             self._mark_analysis_incomplete(
                 result,
@@ -499,12 +502,19 @@ class WeightDistributionScanner(BaseScanner):
         return root, member
 
     def _pytorch_load_within_budget(self, path: str) -> bool:
+        from .zip_scanner import _open_preflighted_zip_handle
+
+        with _open_preflighted_zip_handle(path, self.config, require_zip=False) as (archive_handle, is_zip):
+            return self._pytorch_load_handle_within_budget(path, archive_handle, is_zip=is_zip)
+
+    def _pytorch_load_handle_within_budget(self, path: str, archive_handle: BinaryIO, *, is_zip: bool) -> bool:
         max_total_bytes = self._max_total_tensor_bytes()
         max_tensor_bytes = self._max_tensor_bytes()
 
         try:
-            if zipfile.is_zipfile(path):
-                with zipfile.ZipFile(path, "r") as archive:
+            archive_handle.seek(0)
+            if is_zip:
+                with zipfile.ZipFile(archive_handle) as archive:
                     selected = self._select_pytorch_data_pickle(archive)
                     if selected is None:
                         return not self.extraction_incomplete
@@ -554,8 +564,14 @@ class WeightDistributionScanner(BaseScanner):
                     if data is None or not self._pickle_object_budget_allows(data, data_pkl_info.filename):
                         return False
                 return True
-            else:
-                load_bytes = os.path.getsize(path)
+
+            try:
+                load_bytes = os.fstat(archive_handle.fileno()).st_size
+            except (AttributeError, OSError):
+                current_offset = archive_handle.tell()
+                archive_handle.seek(0, os.SEEK_END)
+                load_bytes = archive_handle.tell()
+                archive_handle.seek(current_offset)
         except (OSError, zipfile.BadZipFile):
             return True
 
@@ -910,11 +926,14 @@ class WeightDistributionScanner(BaseScanner):
             if supports_weights_only:
                 load_kwargs["weights_only"] = True
 
-            if not self._pytorch_load_within_budget(path):
-                return {}
-
             # Load model with map_location to CPU to avoid GPU requirements
-            model_data = torch.load(path, **load_kwargs)
+            from .zip_scanner import _open_preflighted_zip_handle
+
+            with _open_preflighted_zip_handle(path, self.config, require_zip=False) as (model_handle, is_zip):
+                if not self._pytorch_load_handle_within_budget(path, model_handle, is_zip=is_zip):
+                    return {}
+                model_handle.seek(0)
+                model_data = torch.load(model_handle, **load_kwargs)
 
             # Handle different PyTorch save formats
             if isinstance(model_data, dict):
@@ -958,11 +977,15 @@ class WeightDistributionScanner(BaseScanner):
                         if array is not None:
                             weights_info[key_text] = array
 
+        except ZipPreflightRejected:
+            raise
         except Exception as e:
             logger.debug(f"Failed to extract weights from {path}: {e}")
             safe_fallback_processed = False
             try:
-                with zipfile.ZipFile(path, "r") as z:
+                from .zip_scanner import open_preflighted_zip
+
+                with open_preflighted_zip(path, self.config) as z:
                     selected = self._select_pytorch_data_pickle(z)
                     if selected is not None:
                         import io
@@ -1113,6 +1136,8 @@ class WeightDistributionScanner(BaseScanner):
                                 safe_fallback_processed = True
                     elif self.extraction_incomplete:
                         safe_fallback_processed = True
+            except ZipPreflightRejected:
+                raise
             except Exception as e2:  # pragma: no cover - defensive
                 logger.debug(f"Failed to extract weights from {path}: {e2}")
 

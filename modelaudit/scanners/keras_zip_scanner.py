@@ -1,5 +1,6 @@
 """Scanner for ZIP-based Keras model files (.keras format)."""
 
+import contextlib
 import io
 import json
 import os
@@ -758,7 +759,12 @@ class KerasZipScanner(BaseScanner):
         recursive_config[ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY] = content_only_entries
         return recursive_config
 
-    def _merge_recursive_archive_scan(self, path: str, result: ScanResult) -> None:
+    def _merge_recursive_archive_scan(
+        self,
+        path: str,
+        result: ScanResult,
+        archive: zipfile.ZipFile | None = None,
+    ) -> None:
         """Recursively scan every ZIP member through the generic archive scanner."""
         if self.config.get(SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY):
             return
@@ -773,10 +779,7 @@ class KerasZipScanner(BaseScanner):
                 content_only_weights_entry=content_only_weights_entry,
             )
         )
-        nested_result = zip_scanner._scan_zip_file(
-            path,
-            depth=max(zip_scanner._get_archive_depth(), zip_scanner._get_zip_depth()),
-        )
+        nested_result = zip_scanner.scan_archive_members(path, archive=archive)
         if has_embedded_weights_limit:
             self._suppress_expected_embedded_weights_limit_noise(nested_result)
         self._redact_recursive_archive_scan_result(nested_result)
@@ -788,10 +791,15 @@ class KerasZipScanner(BaseScanner):
             result.metadata["contents"] = nested_contents
         result.success = result.success and nested_result.success
 
-    def _merge_recursive_archive_scan_after_primary_failure(self, path: str, result: ScanResult) -> None:
+    def _merge_recursive_archive_scan_after_primary_failure(
+        self,
+        path: str,
+        result: ScanResult,
+        archive: zipfile.ZipFile | None = None,
+    ) -> None:
         """Preserve independently detectable archive findings when Keras analysis is unavailable."""
         try:
-            self._merge_recursive_archive_scan(path, result)
+            self._merge_recursive_archive_scan(path, result, archive=archive)
         except Exception:
             # The primary failure already makes this scan inconclusive; a
             # failing fallback must not replace that explicit outcome.
@@ -826,8 +834,13 @@ class KerasZipScanner(BaseScanner):
         # Store the file path for use in issue locations
         self.current_file_path = path
 
+        from .zip_scanner import ZipPreflightRejected, open_preflighted_zip
+
+        archive_stack = contextlib.ExitStack()
+        zf: zipfile.ZipFile | None = None
         try:
-            with zipfile.ZipFile(path, "r") as zf:
+            zf = archive_stack.enter_context(open_preflighted_zip(path, self.config))
+            with contextlib.nullcontext():
                 result.bytes_scanned = file_size
 
                 config_info = self._get_archive_member_info(zf, _KERAS_CONFIG_ENTRY)
@@ -844,7 +857,7 @@ class KerasZipScanner(BaseScanner):
                     )
                     self._load_keras_metadata(zf, result)
                     self._check_archive_security_members(zf, path, result)
-                    self._merge_recursive_archive_scan(path, result)
+                    self._merge_recursive_archive_scan(path, result, archive=zf)
                     self._finish_scan_result(result)
                     return result
 
@@ -882,7 +895,7 @@ class KerasZipScanner(BaseScanner):
                     )
                     self._load_keras_metadata(zf, result)
                     self._check_archive_security_members(zf, path, result)
-                    self._merge_recursive_archive_scan(path, result)
+                    self._merge_recursive_archive_scan(path, result, archive=zf)
                     self._finish_scan_result(result)
                     return result
 
@@ -905,7 +918,7 @@ class KerasZipScanner(BaseScanner):
                         details={"actual_type": type(model_config).__name__, "expected_type": "dict"},
                     )
                     self._check_archive_security_members(zf, path, result)
-                    self._merge_recursive_archive_scan(path, result)
+                    self._merge_recursive_archive_scan(path, result, archive=zf)
                     self._finish_scan_result(result)
                     return result
 
@@ -914,8 +927,10 @@ class KerasZipScanner(BaseScanner):
 
                 self._check_archive_security_members(zf, path, result)
 
-                self._merge_recursive_archive_scan(path, result)
+                self._merge_recursive_archive_scan(path, result, archive=zf)
 
+        except ZipPreflightRejected as exc:
+            return exc.result
         except _AmbiguousKerasArchiveMemberError as e:
             redacted_member_name = self._redact_archive_member_name(e.member_name)
             redacted_candidate_filenames = [
@@ -935,7 +950,7 @@ class KerasZipScanner(BaseScanner):
                     "candidate_filenames": redacted_candidate_filenames,
                 },
             )
-            self._merge_recursive_archive_scan(path, result)
+            self._merge_recursive_archive_scan(path, result, archive=zf)
             result.finish(success=False)
             return result
         except OSError as e:
@@ -954,7 +969,7 @@ class KerasZipScanner(BaseScanner):
                     "scan_outcome_reason": "keras_zip_read_failed",
                 },
             )
-            self._merge_recursive_archive_scan_after_primary_failure(path, result)
+            self._merge_recursive_archive_scan_after_primary_failure(path, result, archive=zf)
             self._finish_scan_result(result)
             return result
         except Exception as e:
@@ -973,9 +988,11 @@ class KerasZipScanner(BaseScanner):
                     "scan_outcome_reason": "keras_zip_scan_failed",
                 },
             )
-            self._merge_recursive_archive_scan_after_primary_failure(path, result)
+            self._merge_recursive_archive_scan_after_primary_failure(path, result, archive=zf)
             self._finish_scan_result(result)
             return result
+        finally:
+            archive_stack.close()
 
         self._finish_scan_result(result)
         return result

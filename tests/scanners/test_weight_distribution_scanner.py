@@ -1018,6 +1018,69 @@ def test_pytorch_zip_alias_expansion_is_rejected_before_numpy(
     assert scanner.extraction_incomplete_reasons == ["pytorch_tensor_materialization_failed"]
 
 
+def test_pytorch_load_budget_ignores_incidental_eocd_in_legacy_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "legacy.pt"
+    path.write_bytes(b"legacy tensor payload" + b"PK\x05\x06" + (b"\x00" * 18))
+
+    def fail_zipfile_open(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("legacy non-ZIP files must not enter ZIP parsing")
+
+    monkeypatch.setattr(zipfile, "ZipFile", fail_zipfile_open)
+    scanner = WeightDistributionScanner()
+
+    assert scanner._pytorch_load_within_budget(str(path)) is True
+    assert scanner.extraction_incomplete is False
+
+
+def test_pytorch_primary_load_reuses_budgeted_handle_after_path_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_payload = b"original tensor payload"
+    replacement_payload = b"replacement tensor payload"
+    path = tmp_path / "model.pt"
+    replacement_path = tmp_path / "replacement.pt"
+    path.write_bytes(original_payload)
+    replacement_path.write_bytes(replacement_payload)
+
+    fake_torch: Any = types.ModuleType("torch")
+
+    class FakeTensor:
+        pass
+
+    fake_torch.Tensor = FakeTensor
+    fake_torch.device = lambda value: value
+
+    def fake_load(
+        handle: Any,
+        *,
+        map_location: object,
+        weights_only: bool = False,
+    ) -> dict[str, object]:
+        del map_location, weights_only
+        assert handle.read() == original_payload
+        return {}
+
+    fake_torch.load = fake_load
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    scanner = WeightDistributionScanner({"enable_unsafe_torch_load": True})
+    original_budget_check = scanner._pytorch_load_handle_within_budget
+
+    def replace_path_after_budget(path_text: str, handle: Any, *, is_zip: bool) -> bool:
+        within_budget = original_budget_check(path_text, handle, is_zip=is_zip)
+        os.replace(replacement_path, path)
+        return within_budget
+
+    monkeypatch.setattr(scanner, "_pytorch_load_handle_within_budget", replace_path_after_budget)
+
+    assert scanner._extract_pytorch_weights(str(path)) == {}
+    assert path.read_bytes() == replacement_payload
+
+
 def test_pytorch_zip_small_shared_sequence_is_not_treated_as_cycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

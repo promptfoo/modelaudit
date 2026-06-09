@@ -66,6 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve executable text-sidecar network findings for f-string calls, standard command wrappers, port-qualified Docker registries, and bounded xargs downloads while keeping prose references informational.
 - require explicit public progress hook egress hosts and reject internal webhook and SMTP destinations before sending scan details.
 - stabilize cache identity capture for compressed wrapper scans on Darwin `/private` path aliases and during unrelated temporary-file churn.
+- fail closed on over-entry, oversized, inconsistent, hidden-entry, or trailing-record generic ZIP directories before `zipfile` materializes their entries, keep PyTorch ZIP budgets and loading on one descriptor, and validate generic ZIP symlinks against archive-root containment.
 - detect interpolated Hydra helper configs, legacy Hydra global-state aliases, and unsafe local or remote NeMo model-loader paths.
 - bound per-tensor and cumulative weight-distribution extraction before materializing PyTorch, HDF5, TensorFlow, and ONNX payloads
 - keep bounded ExecuTorch ZIP snapshots seekable on Python 3.10 so benign and malicious pickle members remain analyzable

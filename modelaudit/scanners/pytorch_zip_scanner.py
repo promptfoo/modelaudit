@@ -49,6 +49,7 @@ from .pytorch_zip_support import (
     read_member_to_spooled_file,
     read_zip_header,
 )
+from .zip_scanner import ZipPreflightRejected
 
 logger = logging.getLogger(__name__)
 _INSTALLED_PYTORCH_VERSION_UNSET = object()
@@ -387,7 +388,9 @@ class PyTorchZipScanner(BaseScanner):
             # Store the file path for use in issue locations
             self.current_file_path = path
 
-            with zipfile.ZipFile(path, "r") as zip_file:
+            from .zip_scanner import open_preflighted_zip
+
+            with open_preflighted_zip(path, self.config) as zip_file:
                 # Validate ZIP entries and check for path traversal
                 safe_entries = self._validate_zip_entries(zip_file, result, path)
                 self._check_timeout()  # Check timeout after entry validation
@@ -442,6 +445,8 @@ class PyTorchZipScanner(BaseScanner):
             )
             result.finish(success=False)
             return result
+        except ZipPreflightRejected as exc:
+            return exc.result
         except zipfile.BadZipFile:
             return self._handle_bad_zip_error(path)
         except Exception as e:
@@ -3660,7 +3665,9 @@ class PyTorchZipScanner(BaseScanner):
         metadata = super().extract_metadata(file_path)
 
         try:
-            with zipfile.ZipFile(file_path, "r") as zip_file:
+            from .zip_scanner import open_preflighted_zip
+
+            with open_preflighted_zip(file_path, self.config) as zip_file:
                 archive_entries = zip_file.infolist()
                 total_files = len(archive_entries)
                 entries_to_process = archive_entries[: self.max_archive_entries]

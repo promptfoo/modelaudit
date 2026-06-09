@@ -2172,14 +2172,16 @@ def _looks_like_pytorch_zip_storage_members(member_names: set[str], prefix: str)
     return False
 
 
-def is_torchserve_mar_archive(path: str) -> bool:
+def is_torchserve_mar_archive(path: str, config: dict[str, Any] | None = None) -> bool:
     """Return whether a ZIP-backed `.mar` looks like a real TorchServe archive."""
     file_path = Path(path)
     if not file_path.is_file():
         return False
 
+    from ...scanners.zip_scanner import ZipPreflightRejected, open_preflighted_zip
+
     try:
-        with zipfile.ZipFile(file_path, "r") as archive:
+        with open_preflighted_zip(file_path, config) as archive:
             manifest_info = None
             manifest_name = _normalize_archive_member_name(_TORCHSERVE_MANIFEST_PATH)
             for info in archive.infolist():
@@ -2202,6 +2204,10 @@ def is_torchserve_mar_archive(path: str) -> bool:
         zipfile.BadZipFile,
         zipfile.LargeZipFile,
     ):
+        return False
+    except ZipPreflightRejected:
+        if config is not None:
+            raise
         return False
 
 
@@ -2248,27 +2254,40 @@ def _is_keras_zip_archive_content(archive: zipfile.ZipFile, *, allow_config_only
     return _looks_like_keras_config(config_data)
 
 
-def is_keras_zip_archive(path: str, *, allow_config_only: bool = False) -> bool:
+def is_keras_zip_archive(
+    path: str,
+    *,
+    allow_config_only: bool = False,
+    config: dict[str, Any] | None = None,
+) -> bool:
     """Return whether a ZIP-backed file has the minimal Keras archive structure."""
     file_path = Path(path)
     if not file_path.is_file():
         return False
 
+    from ...scanners.zip_scanner import ZipPreflightRejected, open_preflighted_zip
+
     try:
-        with zipfile.ZipFile(file_path, "r") as archive:
+        with open_preflighted_zip(file_path, config) as archive:
             return _is_keras_zip_archive_content(archive, allow_config_only=allow_config_only)
     except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
+    except ZipPreflightRejected:
+        if config is not None:
+            raise
+        return False
 
 
-def is_pytorch_zip_archive(path: str) -> bool:
+def is_pytorch_zip_archive(path: str, config: dict[str, Any] | None = None) -> bool:
     """Return whether a ZIP-backed file has a conservative PyTorch archive signature."""
     file_path = Path(path)
     if not file_path.is_file():
         return False
 
+    from ...scanners.zip_scanner import ZipPreflightRejected, open_preflighted_zip
+
     try:
-        with zipfile.ZipFile(file_path, "r") as archive:
+        with open_preflighted_zip(file_path, config) as archive:
             member_names = {
                 _normalize_archive_member_name(info.filename)
                 for info in archive.infolist()
@@ -2289,18 +2308,24 @@ def is_pytorch_zip_archive(path: str) -> bool:
                     return True
     except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
+    except ZipPreflightRejected:
+        if config is not None:
+            raise
+        return False
 
     return False
 
 
-def is_executorch_archive(path: str) -> bool:
+def is_executorch_archive(path: str, config: dict[str, Any] | None = None) -> bool:
     """Return whether a ZIP-backed file matches the mobile/ExecuTorch archive layout."""
     file_path = Path(path)
     if not file_path.is_file():
         return False
 
+    from ...scanners.zip_scanner import ZipPreflightRejected, open_preflighted_zip
+
     try:
-        with zipfile.ZipFile(file_path, "r") as archive:
+        with open_preflighted_zip(file_path, config) as archive:
             members_by_name: dict[str, list[zipfile.ZipInfo]] = {}
             for info in archive.infolist():
                 if not info.filename or info.is_dir():
@@ -2323,11 +2348,15 @@ def is_executorch_archive(path: str) -> bool:
                         return True
     except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
+    except ZipPreflightRejected:
+        if config is not None:
+            raise
+        return False
 
     return False
 
 
-def is_skops_archive(path: str) -> bool:
+def is_skops_archive(path: str, config: dict[str, Any] | None = None) -> bool:
     """Return whether a ZIP-backed file has a Skops schema payload.
 
     Oversized schema members are treated as Skops to avoid failing open on
@@ -2338,8 +2367,10 @@ def is_skops_archive(path: str) -> bool:
     if not file_path.is_file():
         return False
 
+    from ...scanners.zip_scanner import ZipPreflightRejected, open_preflighted_zip
+
     try:
-        with zipfile.ZipFile(file_path, "r") as archive:
+        with open_preflighted_zip(file_path, config) as archive:
             for info in archive.infolist():
                 if not info.filename or info.is_dir():
                     continue
@@ -2358,6 +2389,10 @@ def is_skops_archive(path: str) -> bool:
                 if _looks_like_skops_schema(schema_data):
                     return True
     except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        return False
+    except ZipPreflightRejected:
+        if config is not None:
+            raise
         return False
 
     return False

@@ -25,8 +25,30 @@ _GENERIC_CONTAINER_SCANNER_IDS = frozenset({"compressed", "rar", "sevenzip", "ta
 _PROTOBUF_MODEL_CANDIDATE_SCANNER_ID = "protobuf_model_candidate"
 _PROTOBUF_MODEL_CANDIDATE_ANALYZER_IDS = frozenset({"onnx", "coreml"})
 _ZIP_STRUCTURE_ROUTED_SCANNER_IDS = frozenset(
-    {"executorch", "keras_zip", "pytorch_zip", "skops", "torchserve_mar", "zip"}
+    {
+        "executorch",
+        "keras_zip",
+        "numpy",
+        "pytorch_zip",
+        "skops",
+        "torchserve_mar",
+        "weight_distribution",
+        "zip",
+    }
 )
+_ZIP_CONTENT_ROUTED_SCANNER_IDS = frozenset(
+    {
+        "executorch",
+        "keras_zip",
+        "pytorch_zip",
+        "skops",
+        "torchserve_mar",
+        "zip",
+    }
+)
+_ZIP_EXTENSION_ROUTE_OVERRIDES = {
+    "numpy": frozenset({".npz"}),
+}
 
 
 def scanner_catalog() -> list[dict[str, Any]]:
@@ -180,6 +202,33 @@ def allows_protobuf_model_candidate_analysis(policy: ScannerSelectionPolicy) -> 
     return policy.allows(_PROTOBUF_MODEL_CANDIDATE_SCANNER_ID) or any(
         policy.allows(scanner_id) for scanner_id in _PROTOBUF_MODEL_CANDIDATE_ANALYZER_IDS
     )
+
+
+def allows_zip_structure_analysis(policy: ScannerSelectionPolicy, path: str | None = None) -> bool:
+    """Return whether a selected route may analyze ZIP structure for this path."""
+    if "zip" in policy.exclude_scanner_ids:
+        return False
+    selected_zip_scanner_ids = {
+        scanner_id for scanner_id in _ZIP_STRUCTURE_ROUTED_SCANNER_IDS if policy.allows(scanner_id)
+    }
+    if not selected_zip_scanner_ids or path is None or not policy.active:
+        return bool(selected_zip_scanner_ids)
+    if selected_zip_scanner_ids & _ZIP_CONTENT_ROUTED_SCANNER_IDS:
+        return True
+
+    extension = os.path.splitext(path)[1].lower()
+    metadata = _scanner_metadata()
+    for scanner_id in selected_zip_scanner_ids:
+        scanner_info = metadata.get(scanner_id, {})
+        routed_extensions = {
+            str(value).lower()
+            for key in ("extensions", "content_routed_extensions", "scanner_only_extensions")
+            for value in scanner_info.get(key, ())
+        }
+        routed_extensions.update(_ZIP_EXTENSION_ROUTE_OVERRIDES.get(scanner_id, ()))
+        if extension in routed_extensions:
+            return True
+    return False
 
 
 def allows_protobuf_model_candidate_analyzer(policy: ScannerSelectionPolicy, scanner_id: str) -> bool:

@@ -22,6 +22,7 @@ from ..scanner_selection import (
     SCANNER_SELECTION_PREFERRED_KIND,
     add_scanner_selection_skip_check,
     allows_protobuf_model_candidate_analysis,
+    allows_zip_structure_analysis,
     make_scanner_selection_skip_result,
     policy_from_config,
 )
@@ -145,21 +146,27 @@ def _pickle_result_consumes_entire_payload(path: str, result: ScanResult) -> boo
     return positions[0] == positions[1] == positions[2] == file_size
 
 
-def _select_nested_scanner_id(path: str, header_format_override: str | None = None) -> str | None:
+def _select_nested_scanner_id(
+    path: str,
+    header_format_override: str | None = None,
+    config: dict[str, Any] | None = None,
+) -> str | None:
     """Select a scanner for extracted archive members using trusted file structure first."""
     header_format = header_format_override or detect_file_format(path)
     ext = os.path.splitext(path)[1].lower()
 
     if header_format == "zip":
-        if is_torchserve_mar_archive(path):
+        if config is not None and not allows_zip_structure_analysis(policy_from_config(config), path):
+            return "joblib" if ext == ".joblib" else "zip"
+        if is_torchserve_mar_archive(path, config):
             return "torchserve_mar"
-        if is_keras_zip_archive(path, allow_config_only=ext == ".keras"):
+        if is_keras_zip_archive(path, allow_config_only=ext == ".keras", config=config):
             return "keras_zip"
-        if is_pytorch_zip_archive(path):
+        if is_pytorch_zip_archive(path, config):
             return "pytorch_zip"
-        if is_executorch_archive(path):
+        if is_executorch_archive(path, config):
             return "executorch"
-        if is_skops_archive(path):
+        if is_skops_archive(path, config):
             return "skops"
         if ext == ".skops":
             return "skops"
@@ -237,6 +244,9 @@ def _nested_scanner_can_handle(
     """Honor trusted header routing even when temporary archive paths are suffix-gated."""
     if scanner_class.can_handle(path):
         return True
+
+    if scanner_id == "zip":
+        return False
 
     if not os.path.exists(path):
         return False
@@ -371,7 +381,7 @@ def merge_executable_zip_container_findings(
 ) -> None:
     """Merge all enabled subtype checks and one generic ZIP member traversal."""
     from . import _registry
-    from .zip_scanner import ZipScanner
+    from .zip_scanner import ZipPreflightRejected, ZipScanner
 
     try:
         if not zipfile.is_zipfile(path):
@@ -382,16 +392,20 @@ def merge_executable_zip_container_findings(
     scanner_selection = policy_from_config(config)
     ext = os.path.splitext(path)[1].lower()
     subtype_ids: list[str] = []
-    if is_torchserve_mar_archive(path):
-        subtype_ids.append("torchserve_mar")
-    if is_keras_zip_archive(path, allow_config_only=ext == ".keras"):
-        subtype_ids.append("keras_zip")
-    if is_pytorch_zip_archive(path):
-        subtype_ids.append("pytorch_zip")
-    if is_executorch_archive(path):
-        subtype_ids.append("executorch")
-    if is_skops_archive(path):
-        subtype_ids.append("skops")
+    try:
+        if is_torchserve_mar_archive(path, config):
+            subtype_ids.append("torchserve_mar")
+        if is_keras_zip_archive(path, allow_config_only=ext == ".keras", config=config):
+            subtype_ids.append("keras_zip")
+        if is_pytorch_zip_archive(path, config):
+            subtype_ids.append("pytorch_zip")
+        if is_executorch_archive(path, config):
+            subtype_ids.append("executorch")
+        if is_skops_archive(path, config):
+            subtype_ids.append("skops")
+    except ZipPreflightRejected as exc:
+        result.merge(exc.result)
+        return
 
     subtype_config = dict(config or {})
     subtype_config[SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY] = True
@@ -952,8 +966,21 @@ def _make_incomplete_pickle_routing_result(path: str) -> ScanResult:
 def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     """Scan an extracted archive member without importing `modelaudit.core`."""
     from . import _registry
+    from .zip_scanner import ZipPreflightRejected, ZipScanner
 
     scanner_selection = policy_from_config(config)
+    raw_config = config or {}
+    try:
+        max_zip_entries = int(raw_config.get("max_zip_entries", ZipScanner.DEFAULT_MAX_ENTRIES))
+    except (TypeError, ValueError):
+        max_zip_entries = ZipScanner.DEFAULT_MAX_ENTRIES
+    max_zip_directory_size = ZipScanner.central_directory_size_limit(raw_config)
+    if allows_zip_structure_analysis(scanner_selection, path) and ZipScanner.requires_preflight_result(
+        path,
+        max_zip_entries,
+        max_zip_directory_size,
+    ):
+        return ZipScanner(config=config).scan(path)
     scanner_class = None
     routed_content_format = detect_file_format(path)
     trusted_content_format = detect_file_format_from_magic(path)
@@ -1052,7 +1079,10 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         return result
 
     header_format_override = trusted_content_format if trusted_content_format in {"mxnet", "xgboost"} else None
-    scanner_id = _select_nested_scanner_id(path, header_format_override)
+    try:
+        scanner_id = _select_nested_scanner_id(path, header_format_override, config)
+    except ZipPreflightRejected as exc:
+        return exc.result
     pytorch_binary_supplemental_scanner_id = (
         detect_pytorch_binary_supplemental_format(path)
         if os.path.splitext(path)[1].lower() == ".bin" and scanner_id == "pytorch_binary"

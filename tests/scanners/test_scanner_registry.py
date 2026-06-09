@@ -9,7 +9,7 @@ import tarfile
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 
@@ -520,6 +520,54 @@ def test_get_scanner_for_path_routes_generic_zip_without_skops_markers_to_zip(tm
     )
 
     _assert_scanner_for_path(model_path, "zip")
+
+
+def test_get_scanner_for_file_routes_over_entry_zip_before_specialized_zip_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = _write_zip_archive(
+        tmp_path / "over-entry.zip",
+        {"one.txt": b"one", "two.txt": b"two"},
+    )
+
+    def fail_zipfile_open(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("specialized routing must not materialize an over-limit ZIP directory")
+
+    monkeypatch.setattr(zipfile, "ZipFile", fail_zipfile_open)
+
+    scanner = get_scanner_for_file(str(model_path), config={"max_zip_entries": 1})
+
+    assert scanner is not None
+    assert scanner.name == "zip"
+
+
+def test_get_scanner_for_file_honors_selection_before_zip_preflight(tmp_path: Path) -> None:
+    model_path = _write_zip_archive(
+        tmp_path / "selected-pickle.zip",
+        {"one.txt": b"one", "two.txt": b"two"},
+    )
+
+    scanner = get_scanner_for_file(
+        str(model_path),
+        config={"scanners": ["pickle"], "max_zip_entries": 1},
+    )
+
+    assert scanner is None
+
+
+def test_get_scanner_for_file_honors_numpy_route_before_plain_zip_preflight(tmp_path: Path) -> None:
+    model_path = _write_zip_archive(
+        tmp_path / "selected-numpy.zip",
+        {"one.txt": b"one", "two.txt": b"two"},
+    )
+
+    scanner = get_scanner_for_file(
+        str(model_path),
+        config={"scanners": ["numpy"], "max_zip_entries": 1},
+    )
+
+    assert scanner is None
 
 
 def test_get_scanner_for_file_routes_disguised_rar_by_header(tmp_path: Path) -> None:

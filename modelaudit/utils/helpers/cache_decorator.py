@@ -154,6 +154,21 @@ def should_bypass_cache_for_unavailable_hdf5_analysis(file_path: str) -> bool:
         return True
 
 
+def should_bypass_cache_for_zip_entry_preflight(file_path: str, config: dict[str, Any]) -> bool:
+    """Avoid cache probes that materialize an over-limit or inconsistent ZIP directory."""
+    try:
+        from ...scanner_selection import allows_zip_structure_analysis, policy_from_config
+        from ...scanners.zip_scanner import ZipScanner
+
+        if not allows_zip_structure_analysis(policy_from_config(config), file_path):
+            return False
+        max_entries = int(config.get("max_zip_entries", ZipScanner.DEFAULT_MAX_ENTRIES))
+        max_directory_size = ZipScanner.central_directory_size_limit(config)
+        return ZipScanner.requires_preflight_result(file_path, max_entries, max_directory_size)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def _h5py_runtime_available() -> bool:
     """Return whether h5py can create and close an in-memory HDF5 file."""
     if not _h5py_availability():
@@ -171,15 +186,16 @@ def _h5py_runtime_available() -> bool:
 def _has_embedded_keras_hdf5_weights(file_path: str) -> bool:
     """Return whether a Keras ZIP contains its standard HDF5 weights member."""
     try:
+        from ...scanners.zip_scanner import ZipPreflightRejected, open_preflighted_zip
         from ..file.detection import _normalize_archive_member_name
 
-        with zipfile.ZipFile(file_path) as archive:
+        with open_preflighted_zip(file_path) as archive:
             member_names = {
                 _normalize_archive_member_name(info.filename)
                 for info in archive.infolist()
                 if info.filename and not info.is_dir()
             }
-    except (OSError, zipfile.BadZipFile):
+    except (OSError, zipfile.BadZipFile, ZipPreflightRejected):
         return False
     return "config.json" in member_names and "model.weights.h5" in member_names
 
@@ -293,6 +309,11 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                     logger.debug(f"Bypassing cache for sharded model family: {file_path}")
                     return func(*args, **kwargs)
 
+                raw_config, _ = _extract_config_and_path(args, kwargs)
+                if should_bypass_cache_for_zip_entry_preflight(file_path, raw_config or {}):
+                    logger.debug(f"Bypassing cache for bounded ZIP entry preflight: {file_path}")
+                    return func(*args, **kwargs)
+
                 if should_bypass_cache_for_unavailable_hdf5_analysis(file_path):
                     logger.debug(f"Bypassing cache because HDF5 analysis is unavailable: {file_path}")
                     return func(*args, **kwargs)
@@ -301,7 +322,6 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
                     logger.debug(f"File {file_path} not suitable for caching, calling function directly")
                     return func(*args, **kwargs)
 
-                raw_config, _ = _extract_config_and_path(args, kwargs)
                 if should_bypass_cache_for_safetensors_header_limit(file_path, raw_config or {}):
                     logger.debug(f"Bypassing cache for bounded SafeTensors header failure: {file_path}")
                     return func(*args, **kwargs)
