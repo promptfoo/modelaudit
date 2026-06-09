@@ -914,6 +914,8 @@ class SevenZipScanner(BaseScanner):
             prefix[:8],
             prefix[:16],
             len(prefix),
+            pickle_probe_sample=prefix,
+            pickle_probe_is_prefix=len(prefix) == self._NESTED_MEMBER_PROBE_BYTES,
         )
         if detected_format == "unknown":
             return None
