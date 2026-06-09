@@ -28,12 +28,30 @@ EVIDENCE_REDACTION_LOOKAHEAD_CHARS: Final[int] = 4096
 EVIDENCE_URL_LOOKAHEAD_CHARS: Final[int] = 64 * 1024
 CURL_COMMAND_SCAN_CHARS: Final[int] = EVIDENCE_URL_LOOKAHEAD_CHARS
 MAX_CURL_EXECUTABLE_CANDIDATES: Final[int] = 64
+MAX_SUBPROCESS_CALL_CANDIDATES: Final[int] = 64
 MAX_URL_QUERY_DECODE_PASSES: Final[int] = 8
 MAX_NESTED_URL_QUERY_DEPTH: Final[int] = 8
 MAX_EVALUATED_KEY_CHARS: Final[int] = 256
 MAX_KEY_EXPRESSION_CHARS: Final[int] = 300
 MAX_KEY_EXPRESSION_PARSE_ATTEMPTS: Final[int] = 64
 MAX_KEY_EXPRESSION_CANDIDATES: Final[int] = 8
+SENSITIVE_KEYWORD_SIGNALS: Final[tuple[str, ...]] = (
+    "access",
+    "api",
+    "auth",
+    "cookie",
+    "credential",
+    "jwt",
+    "pass",
+    "private",
+    "pwd",
+    "sas",
+    "secret",
+    "session",
+    "sig",
+    "storage",
+    "token",
+)
 DICT_LOOKUP_MISSING: Final[object] = object()
 DICT_LOOKUP_UNKNOWN: Final[object] = object()
 NONE_COMPARABLE: Final[object] = object()
@@ -199,14 +217,15 @@ SENSITIVE_EVIDENCE_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
     rf"\b{AUTHORIZATION_KEY_PATTERN}\s*{ASSIGNMENT_SEPARATOR}\s*{AUTHORIZATION_SCHEME_PATTERN}|\bbearer\s+)"
 )
 CURL_EXECUTABLE_NAME_PATTERN: Final[str] = r"curl(?:\.exe)?"
+SHELL_COMMAND_EXECUTABLE_PATTERN: Final[str] = r"(?:bash|csh|dash|fish|ksh|mksh|sh|tcsh|zsh)"
 COMMAND_EVIDENCE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?i)\b(?:(?:os\.system|subprocess\.(?:popen|run|call|check_output|check_call)|eval|exec|__import__)\s*\(|"
-    r"(?:bash|sh)\s+-c\b|cmd\.exe\s*/c\b|powershell(?:\.exe)?\b|"
+    rf"{SHELL_COMMAND_EXECUTABLE_PATTERN}\s+-c\b|cmd\.exe\s*/c\b|powershell(?:\.exe)?\b|"
     rf"(?:{CURL_EXECUTABLE_NAME_PATTERN}|wget|nc|netcat|sshpass|redis-cli)(?=\s|$))"
     r"|(?:docker\s+login|aws\s+configure\s+set|az\s+(?:login|storage)|openssl\s+enc|poetry\s+config)\b"
 )
 COMMAND_CONTEXT_LITERAL_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?i)(?:os\.system|subprocess|__import__|bash\s+-c|sh\s+-c|cmd\.exe|powershell|"
+    rf"(?i)(?:os\.system|subprocess|__import__|{SHELL_COMMAND_EXECUTABLE_PATTERN}\s+-c|cmd\.exe|powershell|"
     rf"{CURL_EXECUTABLE_NAME_PATTERN}|wget|nc\s+|netcat|"
     r"sshpass|redis-cli|docker\s+login|aws\s+configure\s+set|az\s+(?:login|storage)|openssl\s+enc|"
     r"poetry\s+config|\b(?:cat|id|touch)\b|/[A-Za-z0-9_./-]+)"
@@ -236,7 +255,8 @@ COMMAND_SECRET_OPTION_RE: Final[re.Pattern[str]] = re.compile(
     r"(?!<\()(?:\$?\"(?:\\.|[^\"\\])*\"|\$?'(?:\\.|[^'\\])*'|[^\s\"';&|)]+)"
 )
 CURL_COMMAND_TRANSITION_PATTERN: Final[str] = (
-    rf"(?<![-/\w.])(?:bash|sh|cmd\.exe|powershell(?:\.exe)?|wget|nc|netcat|sshpass|redis-cli|docker|aws|"
+    rf"(?<![-/\w.])(?:{SHELL_COMMAND_EXECUTABLE_PATTERN}|cmd\.exe|powershell(?:\.exe)?|wget|nc|netcat|"
+    rf"sshpass|redis-cli|docker|aws|"
     rf"{CURL_EXECUTABLE_NAME_PATTERN})"
     r"(?=\s+-)"
 )
@@ -277,7 +297,9 @@ COMMAND_CERT_OPTION_ESCAPE_PATTERN: Final[str] = r"(?:\\)?"
 CURL_CERT_BUNDLE_FLAG_PATTERN: Final[str] = r"[#012346:BGIJLMNORSVZafgijklnpqsv]*"
 CURL_CONFIG_SHORT_OPTION_PATTERN: Final[str] = rf"-(?-i:{CURL_CERT_BUNDLE_FLAG_PATTERN}K)"
 CURL_USER_SHORT_OPTION_PATTERN: Final[str] = rf"-(?-i:{CURL_CERT_BUNDLE_FLAG_PATTERN}u)"
-COMMAND_USER_OPTION_PATTERN: Final[str] = rf"(?:(?<!\w)--(?:user|proxy-user)|(?<!\w){CURL_USER_SHORT_OPTION_PATTERN})"
+COMMAND_USER_OPTION_PATTERN: Final[str] = (
+    rf"(?:(?<![-\w])--(?:user|proxy-user)(?![\w-])|(?<![-\w]){CURL_USER_SHORT_OPTION_PATTERN})"
+)
 COMMAND_CERT_OPTION_PATTERN: Final[str] = (
     rf"(?:{COMMAND_CERT_OPTION_BOUNDARY_PATTERN}{COMMAND_CERT_OPTION_ESCAPE_PATTERN}"
     rf"--(?:proxy-)?cert(?:=|\s+)|{COMMAND_CERT_OPTION_BOUNDARY_PATTERN}{COMMAND_CERT_OPTION_ESCAPE_PATTERN}"
@@ -315,31 +337,39 @@ COMMAND_CERT_SHELL_WORD_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<option>{COMMAND_CERT_OPTION_PATTERN})"
     r"(?P<argument>(?:\\[\s\S]|[^\s;&|)])+)"
 )
+COMMAND_SEPARATELY_QUOTED_USER_SHELL_WORD_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<option>(?P<option_quote>[\"'])(?:--(?:user|proxy-user)|{CURL_USER_SHORT_OPTION_PATTERN})"
+    r"(?P=option_quote)\s+)"
+    r"(?P<argument>(?:\\[\s\S]|[^\s;&|)])+)"
+)
+COMMAND_SEPARATELY_QUOTED_CERT_SHELL_WORD_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<option>(?P<option_quote>[\"'])(?:--(?:proxy-)?cert|-(?-i:{CURL_CERT_BUNDLE_FLAG_PATTERN}E))"
+    r"(?P=option_quote)\s+)"
+    r"(?P<argument>(?:\\[\s\S]|[^\s;&|)])+)"
+)
 COMMAND_CONFIG_QUOTED_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?is)(?<![?&/\w-])(?P<option>(?:proxy-)?user\s*(?:=|:|\s+)\s*)"
+    r"(?is)(?<![?&/\w-])(?P<option>(?:--)?(?:proxy-)?user\s*(?:=|:|\s+)\s*)"
     rf"(?P<prefix>\$?)(?P<quote>[\"'])(?P<username>{COMMAND_QUOTED_CREDENTIAL_NAME_CHAR_PATTERN}*:)"
     rf"(?P<password>{COMMAND_QUOTED_CREDENTIAL_CHAR_PATTERN}+)(?P<closing>(?P=quote)|\Z)"
 )
 COMMAND_CONFIG_USER_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(?<![?&/\w-])((?:proxy-)?user\s*(?:=|:|\s+)\s*)(\$?[\"']?)([^:\s\"';&|]*:)"
+    r"(?i)(?<![?&/\w-])((?:--)?(?:proxy-)?user\s*(?:=|:|\s+)\s*)(\$?[\"']?)([^:\s\"';&|]*:)"
     r"([^\"'\r\n]+)([\"']?)"
 )
-CURL_INLINE_CONFIG_SOURCE_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?is)\b{CURL_EXECUTABLE_NAME_PATTERN}\b"
-    rf"(?:(?![;&|\n]|{CURL_COMMAND_TRANSITION_PATTERN}(?=\s|$)).){{0,{CURL_COMMAND_SCAN_CHARS}}}?"
-    rf"(?P<option>(?<!\w)(?:(?P<config>--config)(?:=|\s+)|"
+CURL_CONFIG_SOURCE_OPTION_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<option>(?<!\w)(?:(?P<config>--config)(?:=|\s+)|"
     rf"(?P<short_config>{CURL_CONFIG_SHORT_OPTION_PATTERN})\s*|"
     r"(?P<netrc>--netrc-file)(?:=|\s+)))"
     r"(?P<source><\(|-)"
 )
 COMMAND_CONFIG_CERT_PASSWORD_QUOTED_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?is)(?P<option>(?<![?&/\w-])(?:proxy-)?cert\s*(?:=|:|\s+)\s*)"
+    r"(?is)(?P<option>(?<![?&/\w-])(?:--)?(?:proxy-)?cert\s*(?:=|:|\s+)\s*)"
     rf"(?P<prefix>\$?)(?P<quote>[\"'])(?P<certificate>{COMMAND_QUOTED_CREDENTIAL_NAME_CHAR_PATTERN}*:)"
     rf"(?P<password>{COMMAND_QUOTED_CREDENTIAL_CHAR_PATTERN}+)(?P<closing>(?P=quote)|\Z)"
 )
 COMMAND_CONFIG_UNQUOTED_CERTIFICATE_NAME_CHAR_PATTERN: Final[str] = r"(?:\\.|(?!\\)(?!:)[^\s\"';&|)])"
 COMMAND_CONFIG_CERT_PASSWORD_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(?P<option>(?<![?&/\w-])(?:proxy-)?cert\s*(?:=|:|\s+)\s*)"
+    r"(?i)(?P<option>(?<![?&/\w-])(?:--)?(?:proxy-)?cert\s*(?:=|:|\s+)\s*)"
     rf"(?P<certificate>{COMMAND_CONFIG_UNQUOTED_CERTIFICATE_NAME_CHAR_PATTERN}*:)"
     rf"(?P<password>{COMMAND_UNQUOTED_CREDENTIAL_PASSWORD_PATTERN})"
 )
@@ -418,6 +448,9 @@ COMMAND_INLINE_SECRET_SOURCE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?:(?![;&|\n]|{CURL_COMMAND_TRANSITION_PATTERN}(?=\s|$)).){{0,{CURL_COMMAND_SCAN_CHARS}}}?"
     r"(?<!\w)-[A-Za-z]*b(?![A-Za-z])(?:=|\s+))\s*<\("
 )
+CURL_INLINE_COOKIE_SOURCE_OPTION_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?is)(?<!\w)-[A-Za-z]*b(?![A-Za-z])(?:=|\s+)\s*<\("
+)
 SHELL_HERE_STRING_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)<<<\s*(?P<value>{COMMAND_POSITIONAL_SECRET_VALUE})"
 )
@@ -467,7 +500,7 @@ SENSITIVE_ARGV_PAIR_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<prefix>(?P<collection_prefix>[\[(,])\s*(?:{PYTHON_STRING_PREFIX_RE})?(?P<key_quote>[\"'])"
     rf"(?P<key>{QUOTED_KEY_CONTENT_PATTERN})(?P=key_quote)\s*,\s*)"
     rf"(?P<value_prefix>{PYTHON_STRING_PREFIX_RE})(?P<value_quote>[\"'])"
-    rf"(?P<value>(?:\\.|(?!(?P=value_quote))[\s\S]){{0,{EVIDENCE_REDACTION_LOOKAHEAD_CHARS}}})"
+    rf"(?P<value>(?:\\.|(?!\\)(?!(?P=value_quote))[\s\S]){{0,{EVIDENCE_REDACTION_LOOKAHEAD_CHARS}}})"
     rf"(?P=value_quote)"
 )
 CURL_SHORT_COOKIE_OPTION_RE: Final[re.Pattern[str]] = re.compile(r"(?i)^-[a-z]*b$")
@@ -477,6 +510,14 @@ PYTHON_CURL_ARGV_START_RE: Final[re.Pattern[str]] = re.compile(
 )
 CURL_EXECUTABLE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(?<![-\w.])(?P<executable>{CURL_EXECUTABLE_NAME_PATTERN})(?=$|[\s\"',)\]])"
+)
+CURL_SCAN_PREFIX_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)\b{CURL_EXECUTABLE_NAME_PATTERN}\b")
+CURL_STATIC_SHELL_EXECUTABLE_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?<![-\w.])(?P<executable>"
+    r"(?=[^\s;&|(),\[\]{}]*[\"'\\])"
+    r"[\"'\\]*c[\"'\\]*u[\"'\\]*r[\"'\\]*l"
+    r"(?:[\"'\\]*\.[\"'\\]*e[\"'\\]*x[\"'\\]*e)?[\"'\\]*)"
+    r"(?=$|[\s\"',)\]])"
 )
 SERIALIZED_STRUCTURED_QUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)(?P<prefix>(?:^|[{{,])\s*)(?P<slashes>\\+)(?P<quote>[\"'])"
@@ -499,11 +540,15 @@ COMMAND_SENSITIVE_HEADER_VALUE_RE: Final[re.Pattern[str]] = re.compile(
 )
 COMMAND_QUOTED_COOKIE_HEADER_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     r"(?is)(\$?(?P<cookie_quote>[\"'])cookie\s*:\s*)"
-    r"(?:\\.|(?!(?P=cookie_quote)).)*(?P=cookie_quote)"
+    r"(?:\\.|(?!\\)(?!(?P=cookie_quote)).)*(?P=cookie_quote)"
 )
 COMMAND_STRUCTURED_SENSITIVE_VALUE_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?is)((?P<key_quote>[\"'])(?:{SENSITIVE_ASSIGNMENT_KEY}|{AUTHORIZATION_KEY_PATTERN})"
-    rf"(?P=key_quote)\s*:\s*)(?P<value_quote>[\"'])(?:\\.|(?!(?P=value_quote)).)*(?P=value_quote)"
+    rf"(?P=key_quote)\s*:\s*)(?P<value_quote>[\"'])(?:\\.|(?!\\)(?!(?P=value_quote)).)*(?P=value_quote)"
+)
+EMBEDDED_CONTROL_QUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?is)(?P<quote>[\"'])(?P<key>(?:\\.|(?!\\)(?!(?P=quote))[\s\S]){{1,128}})(?P=quote)"
+    rf"(?P<separator>\s*{ASSIGNMENT_SEPARATOR}\s*)"
 )
 STRUCTURED_SENSITIVE_KEY_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(?:^|[{{,])\s*[\"'](?:{SENSITIVE_ASSIGNMENT_KEY}|{AUTHORIZATION_KEY_PATTERN})[\"']\s*:"
@@ -876,11 +921,6 @@ def _normalize_embedded_control_sensitive_keys(text: str) -> str:
             return None
         return _normalize_sensitive_key(normalized)
 
-    quoted_pattern = re.compile(
-        rf"(?is)(?P<quote>[\"'])(?P<key>(?:\\.|(?!(?P=quote))[\s\S]){{1,128}})(?P=quote)"
-        rf"(?P<separator>\s*{ASSIGNMENT_SEPARATOR}\s*)"
-    )
-
     def replace_quoted(match: re.Match[str]) -> str:
         normalized = normalize_key(match.group("key"))
         if normalized is None:
@@ -888,7 +928,7 @@ def _normalize_embedded_control_sensitive_keys(text: str) -> str:
         quote = match.group("quote")
         return f"{quote}{normalized}{quote}{match.group('separator')}"
 
-    text = quoted_pattern.sub(replace_quoted, text)
+    text = EMBEDDED_CONTROL_QUOTED_KEY_RE.sub(replace_quoted, text)
     unquoted_pattern = re.compile(
         rf"(?is)(?<![\w.-])(?P<key>[^\s\"'=:;,\[\](){{}}]{{1,128}})"
         rf"(?P<separator>\s*{ASSIGNMENT_SEPARATOR}\s*)"
@@ -1029,6 +1069,9 @@ def _normalize_serialized_structured_sensitive_keys(text: str) -> str:
 
 
 def _normalize_unquoted_sensitive_keys(text: str) -> str:
+    if "=" not in text and ":" not in text:
+        return text
+
     def replace_key(match: re.Match[str]) -> str:
         decoded_key = _decode_key_escapes(match.group(1))
         normalized_key = _normalize_sensitive_key(decoded_key)
@@ -2284,6 +2327,11 @@ def _count_preceding_backslashes(text: str, position: int) -> int:
 
 
 def _redact_sensitive_literal_expressions(text: str) -> str:
+    folded = text.casefold()
+    if not any(signal in folded for signal in SENSITIVE_KEYWORD_SIGNALS) and "bearer" not in folded:
+        return text
+    if "=" not in text and ":" not in text and "bearer" not in folded:
+        return text
     matches = list(SENSITIVE_EVIDENCE_PREFIX_RE.finditer(text))
     if not matches:
         return text
@@ -2318,6 +2366,11 @@ def _redact_sensitive_literal_expressions(text: str) -> str:
 
 
 def _redact_unclosed_quoted_values(text: str) -> str:
+    folded = text.casefold()
+    if not any(signal in folded for signal in SENSITIVE_KEYWORD_SIGNALS) and "bearer" not in folded:
+        return text
+    if ('"' not in text and "'" not in text) or ("=" not in text and ":" not in text and "bearer" not in folded):
+        return text
     starts: list[tuple[int, str]] = []
     for pattern, slash_group, quote_group in (
         (TRIPLE_QUOTED_SENSITIVE_ASSIGNMENT_START_RE, 3, 4),
@@ -2347,6 +2400,11 @@ def _redact_unclosed_quoted_values(text: str) -> str:
 
 
 def _redact_adjacent_string_literals(text: str) -> str:
+    folded = text.casefold()
+    if not any(signal in folded for signal in SENSITIVE_KEYWORD_SIGNALS) and "bearer" not in folded:
+        return text
+    if ('"' not in text and "'" not in text) or ("=" not in text and ":" not in text and "bearer" not in folded):
+        return text
     for pattern in (
         ADJACENT_LITERAL_SENSITIVE_ASSIGNMENT_RE,
         ADJACENT_LITERAL_AUTHORIZATION_RE,
@@ -2357,6 +2415,9 @@ def _redact_adjacent_string_literals(text: str) -> str:
 
 
 def _redact_residual_expression_literals(text: str) -> str:
+    if REDACTED_EVIDENCE_VALUE not in text or ('"' not in text and "'" not in text):
+        return text
+
     def replace_residual(match: re.Match[str]) -> str:
         value = match.group(0)[len(match.group(1)) :]
         if REDACTED_STRUCTURED_VALUE_PREFIX_RE.match(value) or REDACTED_VALUE_PREFIX_RE.match(value):
@@ -2420,6 +2481,12 @@ def _redact_command_user_password(match: re.Match[str]) -> str:
 
 
 def _redact_quoted_command_user_password(match: re.Match[str]) -> str:
+    if (
+        match.start("quote") == match.end("option")
+        and match.start() > 0
+        and match.string[match.start() - 1] == match.group("quote")
+    ):
+        return match.group(0)
     return (
         f"{match.group('option')}{match.group('prefix')}{match.group('quote')}"
         f"{match.group('username')}{REDACTED_EVIDENCE_VALUE}{match.group('closing')}"
@@ -2666,14 +2733,32 @@ def _redact_openssl_password_source(match: re.Match[str]) -> str:
     return _redact_command_positional_secret(match)
 
 
-def _redact_inline_command_secret_sources(text: str) -> str:
-    for match in reversed(list(COMMAND_INLINE_SECRET_SOURCE_RE.finditer(text))):
-        source_end = _find_shell_group_end(text, match.end())
-        source = text[match.end() : source_end]
+def _redact_process_substitution_sources(text: str, source_starts: set[int]) -> str:
+    for source_start in sorted(source_starts, reverse=True):
+        source_end = _find_shell_group_end(text, source_start)
+        source = text[source_start:source_end]
         redacted_source = _redact_inline_secret_source(source)
         if redacted_source != source:
-            text = f"{text[: match.end()]}{redacted_source}{text[source_end:]}"
+            text = f"{text[:source_start]}{redacted_source}{text[source_end:]}"
     return text
+
+
+def _redact_inline_curl_cookie_sources(text: str) -> str:
+    source_starts: set[int] = set()
+    for command_start, command_end in _curl_command_ranges(text):
+        source_starts.update(
+            match.end() for match in CURL_INLINE_COOKIE_SOURCE_OPTION_RE.finditer(text, command_start, command_end)
+        )
+    return _redact_process_substitution_sources(text, source_starts)
+
+
+def _redact_inline_command_secret_sources(text: str) -> str:
+    source_starts = {match.end() for match in COMMAND_INLINE_SECRET_SOURCE_RE.finditer(text)}
+    for command_start, command_end in _curl_command_ranges(text):
+        source_starts.update(
+            match.end() for match in CURL_INLINE_COOKIE_SOURCE_OPTION_RE.finditer(text, command_start, command_end)
+        )
+    return _redact_process_substitution_sources(text, source_starts)
 
 
 def _curl_executable_token_start(text: str, curl_name_start: int) -> int | None:
@@ -2684,6 +2769,22 @@ def _curl_executable_token_start(text: str, curl_name_start: int) -> int | None:
     if "://" in candidate or candidate.startswith("//") or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", candidate) is not None:
         return None
     return token_start if candidate.endswith(("/", "\\")) else curl_name_start
+
+
+def _curl_executable_spans(text: str) -> list[tuple[int, int]]:
+    spans = [(match.start(), match.end()) for match in CURL_EXECUTABLE_RE.finditer(text)]
+    for match in CURL_STATIC_SHELL_EXECUTABLE_RE.finditer(text):
+        raw_executable = match.group("executable")
+        if CURL_EXECUTABLE_RE.search(raw_executable) is not None:
+            continue
+        try:
+            decoded = shlex.split(raw_executable)
+        except ValueError:
+            continue
+        if len(decoded) != 1 or re.fullmatch(CURL_EXECUTABLE_NAME_PATTERN, decoded[0], re.IGNORECASE) is None:
+            continue
+        spans.append((match.start(), match.end()))
+    return sorted(spans)
 
 
 def _shell_segment_context(text: str, end: int) -> tuple[int, str | None, int]:
@@ -2781,6 +2882,14 @@ def _shell_wrapper_prefix_allows_command(prefix: str) -> bool:
             while index < len(tokens) and tokens[index].startswith("-"):
                 index += 1
             continue
+        if wrapper == "busybox":
+            return index == len(tokens)
+        if wrapper == "setsid":
+            while index < len(tokens) and tokens[index].startswith("-"):
+                if tokens[index] not in {"-c", "-f", "-w", "--ctty", "--fork", "--wait"}:
+                    return False
+                index += 1
+            continue
         if wrapper in {"exec", "time"}:
             options_with_values = {"-a"} if wrapper == "exec" else {"-f", "-o", "--format", "--output"}
             while index < len(tokens) and tokens[index].startswith("-"):
@@ -2854,7 +2963,8 @@ def _curl_executable_is_command(text: str, executable_start: int) -> bool:
             return True
         return (
             re.search(
-                r"(?is)(?:\b(?:bash|sh)\s+-c|\bcmd(?:\.exe)?\s+/c|\bpowershell(?:\.exe)?\s+-c)$",
+                rf"(?is)(?:\b{SHELL_COMMAND_EXECUTABLE_PATTERN}\s+-c|\bcmd(?:\.exe)?\s+/c|"
+                r"\bpowershell(?:\.exe)?\s+-c)$",
                 before_quote,
             )
             is not None
@@ -2864,7 +2974,8 @@ def _curl_executable_is_command(text: str, executable_start: int) -> bool:
     if not prefix:
         return True
     if re.fullmatch(
-        r"(?is)(?:\b(?:bash|sh)\s+-c|\bcmd(?:\.exe)?\s+/c|\bpowershell(?:\.exe)?\s+-c)",
+        rf"(?is)(?:\b{SHELL_COMMAND_EXECUTABLE_PATTERN}\s+-c|\bcmd(?:\.exe)?\s+/c|"
+        r"\bpowershell(?:\.exe)?\s+-c)",
         prefix,
     ):
         return True
@@ -2876,17 +2987,17 @@ def _curl_executable_is_command(text: str, executable_start: int) -> bool:
 def _curl_command_ranges(text: str) -> list[tuple[int, int]]:
     ranges: list[tuple[int, int]] = []
     covered_until = -1
-    for match in CURL_EXECUTABLE_RE.finditer(text):
-        if match.start() < covered_until:
+    for candidate_start, candidate_end in _curl_executable_spans(text):
+        if candidate_start < covered_until:
             continue
-        executable_start = _curl_executable_token_start(text, match.start())
+        executable_start = _curl_executable_token_start(text, candidate_start)
         if executable_start is None or not _curl_executable_is_command(text, executable_start):
             continue
         _, enclosing_quote, _ = _shell_segment_context(text, executable_start)
         segment_end = len(text)
         quote = enclosing_quote if enclosing_quote in {"'", '"'} else None
         bracket_depth = 0
-        index = match.end()
+        index = candidate_end
         while index < len(text):
             char = text[index]
             if quote is not None:
@@ -2920,8 +3031,23 @@ def _curl_command_ranges(text: str) -> list[tuple[int, int]]:
 
 
 def _curl_candidate_limit_exceeded(text: str) -> bool:
-    for index, _ in enumerate(CURL_EXECUTABLE_RE.finditer(text), start=1):
-        if index > MAX_CURL_EXECUTABLE_CANDIDATES:
+    candidate_count = 0
+    for _ in CURL_SCAN_PREFIX_RE.finditer(text):
+        candidate_count += 1
+        if candidate_count > MAX_CURL_EXECUTABLE_CANDIDATES:
+            return True
+    for start, end in _curl_executable_spans(text):
+        if CURL_SCAN_PREFIX_RE.search(text[start:end]) is not None:
+            continue
+        candidate_count += 1
+        if candidate_count > MAX_CURL_EXECUTABLE_CANDIDATES:
+            return True
+    return False
+
+
+def _subprocess_candidate_limit_exceeded(text: str) -> bool:
+    for index, _ in enumerate(SUBPROCESS_CALL_PREFIX_RE.finditer(text), start=1):
+        if index > MAX_SUBPROCESS_CALL_CANDIDATES:
             return True
     return False
 
@@ -2931,6 +3057,8 @@ def _redact_curl_credentials(text: str) -> str:
         return REDACTED_EVIDENCE_VALUE
     for start, end in reversed(_curl_command_ranges(text)):
         fragment = text[start:end]
+        fragment = COMMAND_SEPARATELY_QUOTED_CERT_SHELL_WORD_RE.sub(_redact_shell_word_credential, fragment)
+        fragment = COMMAND_SEPARATELY_QUOTED_USER_SHELL_WORD_RE.sub(_redact_shell_word_credential, fragment)
         fragment = COMMAND_CERT_PASSWORD_QUOTED_RE.sub(_redact_quoted_certificate_password, fragment)
         fragment = COMMAND_CERT_PASSWORD_RE.sub(_redact_certificate_password, fragment)
         fragment = COMMAND_QUOTED_USER_PASSWORD_RE.sub(_redact_quoted_command_user_password, fragment)
@@ -2988,32 +3116,30 @@ def _find_preceding_shell_pipe(text: str, start: int, end: int) -> tuple[int, in
 def _redact_inline_curl_config_passwords(text: str) -> str:
     """Redact credentials only inside inline curl config and netrc sources."""
     ranges: list[tuple[int, int, bool]] = []
-    for match in CURL_INLINE_CONFIG_SOURCE_RE.finditer(text):
-        executable_start = _curl_executable_token_start(text, match.start())
-        if executable_start is None or not _curl_executable_is_command(text, executable_start):
-            continue
-        is_netrc = match.group("netrc") is not None
-        if match.group("source") == "<(":
-            ranges.append((match.end(), _find_shell_group_end(text, match.end()), is_netrc))
-            continue
+    for command_start, command_end in _curl_command_ranges(text):
+        for match in CURL_CONFIG_SOURCE_OPTION_RE.finditer(text, command_start, command_end):
+            is_netrc = match.group("netrc") is not None
+            if match.group("source") == "<(":
+                ranges.append((match.end(), _find_shell_group_end(text, match.end()), is_netrc))
+                continue
 
-        line_start = text.rfind("\n", 0, match.start()) + 1
-        pipe, input_start = _find_preceding_shell_pipe(text, line_start, match.start())
-        if pipe >= 0:
-            ranges.append((input_start, pipe, is_netrc))
-            piped_heredoc_range = _find_shell_heredoc_body_range(text, input_start)
-            if piped_heredoc_range is not None:
-                ranges.append((*piped_heredoc_range, is_netrc))
+            line_start = text.rfind("\n", 0, command_start) + 1
+            pipe, input_start = _find_preceding_shell_pipe(text, line_start, command_start)
+            if pipe >= 0:
+                ranges.append((input_start, pipe, is_netrc))
+                piped_heredoc_range = _find_shell_heredoc_body_range(text, input_start)
+                if piped_heredoc_range is not None:
+                    ranges.append((*piped_heredoc_range, is_netrc))
 
-        line_end = text.find("\n", match.end())
-        if line_end < 0:
-            line_end = len(text)
-        here_string = _search_unquoted_shell_pattern(SHELL_HERE_STRING_VALUE_RE, text, match.end(), line_end)
-        if here_string is not None:
-            ranges.append((here_string.start("value"), here_string.end("value"), is_netrc))
-        heredoc_range = _find_shell_heredoc_body_range(text, match.end())
-        if heredoc_range is not None:
-            ranges.append((*heredoc_range, is_netrc))
+            line_end = text.find("\n", match.end())
+            if line_end < 0:
+                line_end = len(text)
+            here_string = _search_unquoted_shell_pattern(SHELL_HERE_STRING_VALUE_RE, text, match.end(), line_end)
+            if here_string is not None:
+                ranges.append((here_string.start("value"), here_string.end("value"), is_netrc))
+            heredoc_range = _find_shell_heredoc_body_range(text, match.end())
+            if heredoc_range is not None:
+                ranges.append((*heredoc_range, is_netrc))
 
     for start, end, is_netrc in reversed(ranges):
         fragment = text[start:end]
@@ -3026,6 +3152,12 @@ def _redact_inline_curl_config_passwords(text: str) -> str:
 
 
 def _redact_quoted_certificate_password(match: re.Match[str]) -> str:
+    if (
+        match.start("quote") == match.end("option")
+        and match.start() > 0
+        and match.string[match.start() - 1] == match.group("quote")
+    ):
+        return match.group(0)
     return (
         f"{match.group('option')}{match.group('prefix')}{match.group('quote')}"
         f"{match.group('certificate')}{REDACTED_EVIDENCE_VALUE}{match.group('closing')}"
@@ -3058,6 +3190,13 @@ def _redact_shell_word_credential(match: re.Match[str]) -> str:
     password = argument[colon_index + 1 :]
     if REDACTED_EVIDENCE_VALUE in password:
         return match.group(0)
+    closing_quote = ""
+    if (len(argument) >= 2 and argument[0] in {"'", '"'} and argument[-1] == argument[0]) or (
+        len(argument) >= 3 and argument[0] == "$" and argument[1] in {"'", '"'} and argument[-1] == argument[1]
+    ):
+        closing_quote = argument[-1]
+    if closing_quote:
+        return f"{match.group('option')}{argument[: colon_index + 1]}{REDACTED_EVIDENCE_VALUE}{closing_quote}"
     return f"{match.group('option')}{argument[: colon_index + 1]}{_redact_positional_secret_value(password)}"
 
 
@@ -3226,16 +3365,19 @@ def _is_stdin_auth_subprocess_command(raw_argument: str) -> bool:
 
 
 def _curl_config_arguments_use_stdin(arguments: list[str]) -> bool:
+    stdin_sources = {"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"}
     for index, argument in enumerate(arguments):
-        if argument.casefold() == "--config=-":
+        option, separator, source = argument.partition("=")
+        if separator and option.casefold() in {"--config", "--netrc-file"} and source in stdin_sources:
             return True
-        if argument.casefold() == "--netrc-file=-":
+        if (
+            argument.casefold() in {"--config", "--netrc-file"}
+            and index + 1 < len(arguments)
+            and arguments[index + 1] in stdin_sources
+        ):
             return True
-        if argument.casefold() == "--config" and index + 1 < len(arguments) and arguments[index + 1] == "-":
-            return True
-        if argument.casefold() == "--netrc-file" and index + 1 < len(arguments) and arguments[index + 1] == "-":
-            return True
-        if re.fullmatch(rf"{CURL_CONFIG_SHORT_OPTION_PATTERN}-", argument) is not None:
+        short_option = re.match(rf"(?i)^(?P<option>{CURL_CONFIG_SHORT_OPTION_PATTERN})(?P<source>.*)$", argument)
+        if short_option is not None and short_option.group("source") in stdin_sources:
             return True
         if (
             re.fullmatch(CURL_CONFIG_SHORT_OPTION_PATTERN, argument) is not None
@@ -3801,7 +3943,7 @@ def _redact_command_string_literals(text: str) -> str:
 
 
 def _redact_command_evidence_text(text: str) -> str:
-    if _curl_candidate_limit_exceeded(text):
+    if _curl_candidate_limit_exceeded(text) or _subprocess_candidate_limit_exceeded(text):
         return REDACTED_EVIDENCE_VALUE
     redacted = _redact_inline_curl_config_passwords(text)
     redacted = _redact_inline_password_sources(redacted)
@@ -3878,18 +4020,25 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redaction_budget = max(0, max_chars) + EVIDENCE_REDACTION_LOOKAHEAD_CHARS
     url_budget = max(0, max_chars) + EVIDENCE_URL_LOOKAHEAD_CHARS
     redacted = text[:url_budget]
+    if _curl_candidate_limit_exceeded(redacted) or _subprocess_candidate_limit_exceeded(redacted):
+        return _truncate(REDACTED_EVIDENCE_VALUE, max_chars)
     redacted = _redact_adjacent_command_literal_groups(redacted)
     redacted = _normalize_serialized_url_slashes(redacted)
-    redacted = URL_RE.sub(_redact_url, redacted)
+    if "://" in redacted:
+        redacted = URL_RE.sub(_redact_url, redacted)
     redacted = redacted[:redaction_budget]
-    if _curl_candidate_limit_exceeded(redacted):
+    if _curl_candidate_limit_exceeded(redacted) or _subprocess_candidate_limit_exceeded(redacted):
         return _truncate(REDACTED_EVIDENCE_VALUE, max_chars)
     redacted = _normalize_serialized_assignment_separators(redacted)
     redacted = _normalize_serialized_quote_escapes(redacted)
     redacted = _normalize_embedded_control_sensitive_keys(redacted)
     redacted = _normalize_serialized_structured_sensitive_keys(redacted)
-    redacted = STRUCTURED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_structured_quoted_assignment, redacted)
+    folded = redacted.casefold()
+    has_sensitive_key_signal = any(signal in folded for signal in SENSITIVE_KEYWORD_SIGNALS)
+    if has_sensitive_key_signal and ("=" in redacted or ":" in redacted) and ('"' in redacted or "'" in redacted):
+        redacted = STRUCTURED_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_structured_quoted_assignment, redacted)
     redacted = _redact_inline_curl_config_passwords(redacted)
+    redacted = _redact_inline_curl_cookie_sources(redacted)
     redacted = _redact_inline_password_sources(redacted)
     redacted = _redact_curl_credentials(redacted)
     redacted = _redact_command_context_tokens(redacted)
@@ -3902,21 +4051,36 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = _normalize_subscript_sensitive_keys(redacted)
     redacted = _normalize_unquoted_sensitive_keys(redacted)
     redacted = _redact_sensitive_literal_expressions(redacted)
-    redacted = TRIPLE_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_prefixed_quoted_value, redacted)
-    redacted = TRIPLE_QUOTED_AUTHORIZATION_VALUE_RE.sub(_redact_prefixed_quoted_value, redacted)
-    redacted = TRIPLE_QUOTED_BEARER_VALUE_RE.sub(_redact_prefixed_quoted_value, redacted)
+    folded = redacted.casefold()
+    has_quotes = '"' in redacted or "'" in redacted
+    has_assignment_separator = "=" in redacted or ":" in redacted
+    has_sensitive_key_signal = any(signal in folded for signal in SENSITIVE_KEYWORD_SIGNALS)
+    has_authorization_signal = "auth" in folded
+    has_bearer_signal = "bearer" in folded
+    if has_quotes and has_assignment_separator and has_sensitive_key_signal:
+        redacted = TRIPLE_QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_prefixed_quoted_value, redacted)
+    if has_quotes and has_assignment_separator and has_authorization_signal:
+        redacted = TRIPLE_QUOTED_AUTHORIZATION_VALUE_RE.sub(_redact_prefixed_quoted_value, redacted)
+    if has_quotes and has_bearer_signal:
+        redacted = TRIPLE_QUOTED_BEARER_VALUE_RE.sub(_redact_prefixed_quoted_value, redacted)
     redacted = _redact_unclosed_quoted_values(redacted)
-    redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
-    redacted = QUOTED_AUTHORIZATION_VALUE_RE.sub(_redact_quoted_authorization, redacted)
-    redacted = QUOTED_BEARER_VALUE_RE.sub(_redact_quoted_authorization, redacted)
+    if has_quotes and has_assignment_separator and has_sensitive_key_signal:
+        redacted = QUOTED_SENSITIVE_ASSIGNMENT_RE.sub(_redact_quoted_assignment, redacted)
+    if has_quotes and has_assignment_separator and has_authorization_signal:
+        redacted = QUOTED_AUTHORIZATION_VALUE_RE.sub(_redact_quoted_authorization, redacted)
+    if has_quotes and has_bearer_signal:
+        redacted = QUOTED_BEARER_VALUE_RE.sub(_redact_quoted_authorization, redacted)
     redacted = _redact_adjacent_string_literals(redacted)
     redacted = _redact_residual_expression_literals(redacted)
-    redacted = COMPOUND_AUTHORIZATION_VALUE_RE.sub(_redact_authorization_value, redacted)
-    redacted = AUTHORIZATION_VALUE_RE.sub(_redact_authorization_value, redacted)
-    redacted = UNKNOWN_AUTHORIZATION_SCHEME_VALUE_RE.sub(_redact_unknown_authorization_scheme_value, redacted)
-    redacted = BARE_AUTHORIZATION_VALUE_RE.sub(_redact_bare_authorization_value, redacted)
-    redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
-    redacted = SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_sensitive_assignment, redacted)
+    if has_assignment_separator and has_authorization_signal:
+        redacted = COMPOUND_AUTHORIZATION_VALUE_RE.sub(_redact_authorization_value, redacted)
+        redacted = AUTHORIZATION_VALUE_RE.sub(_redact_authorization_value, redacted)
+        redacted = UNKNOWN_AUTHORIZATION_SCHEME_VALUE_RE.sub(_redact_unknown_authorization_scheme_value, redacted)
+        redacted = BARE_AUTHORIZATION_VALUE_RE.sub(_redact_bare_authorization_value, redacted)
+    if has_bearer_signal:
+        redacted = BEARER_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
+    if has_assignment_separator and has_sensitive_key_signal:
+        redacted = SENSITIVE_ASSIGNMENT_RE.sub(_redact_unquoted_sensitive_assignment, redacted)
     redacted = NPMRC_SCOPED_AUTH_ASSIGNMENT_RE.sub(_redact_command_positional_secret, redacted)
     redacted = NPM_CONFIG_SCOPED_AUTH_ARGUMENT_RE.sub(_redact_command_positional_secret, redacted)
     redacted = _redact_shared_provider_tokens(redacted)
