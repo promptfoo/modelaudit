@@ -23,12 +23,17 @@ from modelaudit.scanner_selection import (
     resolve_scanner_ids,
     resolve_scanner_selection_policy,
     scanner_catalog,
+    scanner_ids_for_detected_format,
     selected_scanner_extensions,
     selected_scanner_filenames,
 )
 from modelaudit.scanners.archive_dispatch import scan_nested_file
 from modelaudit.scanners.base import CheckStatus
-from modelaudit.utils.file.detection import LLAMAFILE_ROUTE_SCAN_BYTES, LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
+from modelaudit.utils.file.detection import (
+    LLAMAFILE_ROUTE_SCAN_BYTES,
+    LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+)
 from modelaudit.utils.sources.cloud_storage import filter_scannable_files as filter_cloud_scannable_files
 from modelaudit.utils.sources.jfrog import filter_scannable_files as filter_jfrog_scannable_files
 from tests.helpers import (
@@ -701,6 +706,10 @@ def test_remote_prefilters_fail_open_for_header_routed_scanners() -> None:
 
     assert {"path": "s3://bucket/model.pt"} in filter_cloud_scannable_files(files, scannable_extensions=None)
     assert {"path": "s3://bucket/model.pt"} in filter_jfrog_scannable_files(files, scannable_extensions=None)
+
+
+def test_pickle_routing_inconclusive_format_maps_to_pickle_scanner() -> None:
+    assert scanner_ids_for_detected_format(PICKLE_ROUTING_INCONCLUSIVE_FORMAT) == frozenset({"pickle"})
 
 
 def test_remote_prefilters_preserve_selected_extensionless_scanners() -> None:

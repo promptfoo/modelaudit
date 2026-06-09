@@ -1,12 +1,14 @@
 import ctypes
 import ctypes.wintypes
 import hashlib
+import logging
 import os
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
+from urllib.parse import quote
 
 import pytest
 
@@ -20,6 +22,7 @@ from modelaudit.integrations.mlflow import (
     _MlflowLocalSource,
     _normalize_mlflow_artifact_path,
     _opened_local_mlflow_path,
+    _redact_mlflow_error_for_display,
     _runs_mlflow_repository_is_scoped,
     _snapshot_local_mlflow_sources,
     scan_mlflow_model,
@@ -1160,6 +1163,181 @@ def test_mlflow_budget_failure_preserves_benign_uri_context() -> None:
     }
 
 
+def test_mlflow_budget_failure_redacts_mlflow_query_credentials_recursively() -> None:
+    model_uri = "models:/PublicModel/1?auth=QUERYSECRET123&session=SESSIONSECRET123"
+    boundary_error = "x" * 470 + " artifact_uri=///user:BUDGETPARTIALSECRET1234567890@host/model"
+    result = _mlflow_budget_failure_result(
+        model_uri,
+        "MLflow artifact download refused",
+        {
+            "model_uri": model_uri,
+            "nested": {"source": "models:/OtherModel/2?code=CODESECRET123&jwt=JWTSECRET123"},
+            "boundary_error": boundary_error,
+        },
+    )
+
+    serialized_result = result.model_dump_json()
+    for secret in ("QUERYSECRET123", "SESSIONSECRET123", "CODESECRET123", "JWTSECRET123"):
+        assert secret not in serialized_result
+    assert "BUDGETPARTIAL" not in serialized_result
+    assert result.checks[0].location == "models:/PublicModel/1?auth=<redacted>&session=<redacted>"
+    assert result.checks[0].details["nested"]["source"] == ("models:/OtherModel/2?code=<redacted>&jwt=<redacted>")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "//user:RELATIVEPASS123@mlflow.example/model?token=QUERYSECRET123",
+        "///user:RELATIVEPASS123@mlflow.example/model?token=QUERYSECRET123",
+        "\\\\user:RELATIVEPASS123@mlflow.example\\model?token=QUERYSECRET123",
+        "\\/\\/user:RELATIVEPASS123@mlflow.example\\/model?token=QUERYSECRET123",
+        "%2F%2F%2Fuser%3ARELATIVEPASS123%40mlflow.example%2Fmodel%3Ftoken%3DQUERYSECRET123",
+        "%252F%252Fuser%253ARELATIVEPASS123%2540mlflow.example%252Fmodel%253Ftoken%253DQUERYSECRET123",
+    ],
+)
+def test_redact_mlflow_error_handles_protocol_relative_userinfo(source: str) -> None:
+    redacted = _redact_mlflow_error_for_display(f"artifact_uri={source}")
+
+    assert "mlflow.example/model" in redacted
+    assert "RELATIVEPASS123" not in redacted
+    assert "QUERYSECRET123" not in redacted
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "///folder/user@mlflow.example/model",
+        "\\\\mlflow.example\\folder\\user@label",
+    ],
+)
+def test_redact_mlflow_error_preserves_non_authority_at_signs(source: str) -> None:
+    assert _redact_mlflow_error_for_display(f"artifact_uri={source}") == f"artifact_uri={source}"
+
+
+def test_redact_mlflow_error_handles_deeply_encoded_protocol_relative_userinfo() -> None:
+    source = "//user:RELATIVEPASS123@mlflow.example/model?token=QUERYSECRET123"
+    for _ in range(4):
+        source = quote(source, safe="")
+
+    redacted = _redact_mlflow_error_for_display(f"artifact_uri={source}")
+
+    assert "mlflow.example/model" in redacted
+    assert "RELATIVEPASS123" not in redacted
+    assert "QUERYSECRET123" not in redacted
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        "credentials=('user', 'CONTAINERSECRET123')",
+        "credentials=['user', 'CONTAINERSECRET123']",
+        "credentials={'username': 'user', 'password': 'CONTAINERSECRET123'}",
+        "credentials=[['user'], 'CONTAINERSECRET123']",
+        "credentials={'primary': {'username': 'user'}, 'value': 'CONTAINERSECRET123'}",
+        "credentials={'username': 'user', 'password': 'CONTAINERSECRET123'",
+    ],
+)
+def test_redact_mlflow_error_handles_credential_containers(details: str) -> None:
+    redacted = _redact_mlflow_error_for_display(details)
+
+    assert redacted == "credentials=<redacted>"
+    assert "CONTAINERSECRET123" not in redacted
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Permission denied while calling token endpoint",
+        "OAuth token endpoint returned HTTP 401",
+        "Token refresh failed",
+        "Bearer authentication failed",
+        "Basic authentication is required",
+    ],
+)
+def test_redact_mlflow_error_preserves_benign_auth_diagnostics(message: str) -> None:
+    assert _redact_mlflow_error_for_display(message) == message
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("client_secret='CLIENTSECRET123'", "client_secret='<redacted>'"),
+        ("refresh-token=REFRESHSECRET123", "refresh-token=<redacted>"),
+        ("private_key=PRIVATESECRET123", "private_key=<redacted>"),
+        ("cookie=COOKIESECRET123", "cookie=<redacted>"),
+        ("session=SESSIONSECRET123", "session=<redacted>"),
+        ("jwt=JWTSECRET123", "jwt=<redacted>"),
+        (
+            "auth=AUTHSECRET123&session=SESSIONSECRET123",
+            "auth=<redacted>&session=<redacted>",
+        ),
+        (
+            "credentials=TOPSECRET123&region=us-east-1",
+            "credentials=<redacted>&region=us-east-1",
+        ),
+        (
+            "C:/models auth=AUTHSECRET123&session=SESSIONSECRET123",
+            "C:/models auth=<redacted>&session=<redacted>",
+        ),
+    ],
+)
+def test_redact_mlflow_error_handles_sensitive_aliases(message: str, expected: str) -> None:
+    assert _redact_mlflow_error_for_display(message) == expected
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Cookie policy rejected request",
+        "JWT validation failed",
+        "Private key file missing",
+        "Client secret provider unavailable",
+        "Refresh token endpoint failed",
+        "monkey=value",
+        "key=value",
+        "session state changed",
+        "tokenizer=bert",
+    ],
+)
+def test_redact_mlflow_error_preserves_benign_sensitive_key_near_matches(message: str) -> None:
+    assert _redact_mlflow_error_for_display(message) == message
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "headers[Authorization]=BRACKETSECRET123",
+        "request.headers[proxy-authorization]=Bearer SHORT",
+        "headers[proxy_authorization]=PROXYSECRET123",
+        "headers[X-Api-Key]=HEADERSECRET123",
+        "headers[Credentials]=CREDENTIALSECRET123",
+        "headers[auth]=AUTHSECRET123",
+        "headers[Cookie]=COOKIESECRET123",
+        "headers[session]=SESSIONSECRET123",
+        "headers[jwt]=JWTSECRET123",
+        "headers[key]=KEYSECRET123",
+        "params[api_key]='PARAMSECRET123'",
+        "params[client_secret]=CLIENTSECRET123",
+        "query[refresh_token]=REFRESHSECRET123",
+    ],
+)
+def test_redact_mlflow_error_handles_bracketed_sensitive_keys(message: str) -> None:
+    redacted = _redact_mlflow_error_for_display(message)
+
+    assert "<redacted>" in redacted
+    assert "SECRET" not in redacted
+    assert "Bearer SHORT" not in redacted
+
+
+def test_redact_mlflow_error_preserves_benign_bracketed_keys() -> None:
+    for message in (
+        "headers[Content-Type]=application/json",
+        "headers[X-Api-Version]=2026-06-08",
+        "params[region]=us-east-1",
+    ):
+        assert _redact_mlflow_error_for_display(message) == message
+
+
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
 @patch("modelaudit.core.scan_model_directory_or_file")
@@ -1650,6 +1828,30 @@ def test_scan_mlflow_model_download_error(mock_mkdtemp, mock_rmtree):
 
     # Verify cleanup still happens
     mock_rmtree.assert_called_once_with(temp_dir, ignore_errors=True)
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+def test_scan_mlflow_model_debug_log_redacts_source_uri(
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    model_uri = "models:/PrivateModel/access_token=DEBUGSECRET123"
+    mock_mlflow = MagicMock()
+    mock_mlflow.artifacts.download_artifacts.side_effect = RuntimeError("Download failed")
+    mock_mkdtemp.return_value = "/tmp/modelaudit_mlflow_test"
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="modelaudit.integrations.mlflow"),
+        patch.dict(sys.modules, {"mlflow": mock_mlflow}),
+        pytest.raises(RuntimeError, match="Download failed"),
+    ):
+        scan_mlflow_model(model_uri)
+
+    assert "models:/PrivateModel/access_token=<redacted>" in caplog.text
+    assert "DEBUGSECRET123" not in caplog.text
+    mock_rmtree.assert_called_once_with("/tmp/modelaudit_mlflow_test", ignore_errors=True)
 
 
 def test_scan_mlflow_model_no_registry_uri():

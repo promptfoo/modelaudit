@@ -2,6 +2,7 @@ import base64
 import builtins
 import hashlib
 import io
+import logging
 import pickle
 import shutil
 from pathlib import Path
@@ -12,7 +13,7 @@ import pytest
 import modelaudit.scanners.tf_savedmodel_scanner as tf_savedmodel_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as has_tf_protos
 
@@ -28,6 +29,7 @@ class _RequiredNodeSpec(TypedDict):
 
 class _NodeSpec(_RequiredNodeSpec, total=False):
     name: str
+    inputs: list[str]
     string_attrs: dict[str, str]
     string_list_attrs: dict[str, list[str]]
     function_ref: str
@@ -101,8 +103,10 @@ def test_tf_savedmodel_read_failure_is_inconclusive_not_security_finding(
 ) -> None:
     path = _create_test_savedmodel_with_op(tmp_path, "Const", "unreadable_model")
 
+    raw_secret = "ATTACKER_CONTROLLED_SAVEDMODEL_READ_FAILURE"
+
     def raise_os_error(*_args: object, **_kwargs: object) -> None:
-        raise OSError("simulated SavedModel read failure")
+        raise OSError(raw_secret)
 
     monkeypatch.setattr(
         tf_savedmodel_module.TensorFlowSavedModelScanner, "can_handle", classmethod(lambda _cls, _path: True)
@@ -121,6 +125,9 @@ def test_tf_savedmodel_read_failure_is_inconclusive_not_security_finding(
     assert read_checks[0].severity == IssueSeverity.INFO
     assert read_checks[0].details["analysis_incomplete"] is True
     assert read_checks[0].details["scan_outcome_reason"] == "savedmodel_read_failed"
+    assert read_checks[0].details["exception"] == "<redacted>"
+    assert "<redacted>" in read_checks[0].message
+    assert raw_secret not in direct.to_json()
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert direct.metadata["operational_error_reason"] == "savedmodel_read_failed"
     assert "savedmodel_read_failed" in direct.metadata["scan_outcome_reasons"]
@@ -135,6 +142,42 @@ def test_tf_savedmodel_read_failure_is_inconclusive_not_security_finding(
         issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]
     assert determine_exit_code(aggregate) == 2
+
+
+def test_savedmodel_keras_metadata_failure_redacts_exception() -> None:
+    raw_secret = "ATTACKER_CONTROLLED_KERAS_METADATA_FAILURE"
+    result = ScanResult(scanner_name="tf_savedmodel")
+
+    tf_savedmodel_module.TensorFlowSavedModelScanner._mark_keras_metadata_scan_failure(
+        result,
+        "keras_metadata.pb",
+        ValueError(raw_secret),
+    )
+
+    failure_checks = [check for check in result.checks if check.name == "Keras Metadata Parsing"]
+    assert failure_checks
+    assert failure_checks[0].details["exception"] == "<redacted>"
+    assert "<redacted>" in failure_checks[0].message
+    assert raw_secret not in result.to_json()
+
+
+def test_savedmodel_graph_iteration_warning_redacts_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw_secret = "ATTACKER_CONTROLLED_GRAPH_ITERATION_FAILURE"
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
+
+    def fail_iteration(_saved_model: object) -> Any:
+        raise RuntimeError(raw_secret)
+
+    monkeypatch.setattr(scanner, "_iter_saved_model_node_contexts", fail_iteration)
+
+    with caplog.at_level(logging.WARNING, logger=tf_savedmodel_module.__name__):
+        assert scanner._scan_tf_operations(object()) == []
+
+    assert "Failed to iterate TensorFlow graph: <redacted>" in caplog.text
+    assert raw_secret not in caplog.text
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
@@ -1185,6 +1228,61 @@ def test_safe_function_definition_ops_do_not_trigger_findings(tmp_path: Path) ->
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_op_counts_preserve_redacted_key_collisions(tmp_path: Path) -> None:
+    first_secret = "sk-proj-CAND061TFOPSECRETAAAAAAAAAAAAAAAA"
+    second_secret = "sk-proj-CAND061TFOPSECRETBBBBBBBBBBBBBBBB"
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {"op": f"Custom_{first_secret}"},
+            {"op": f"Custom_{second_secret}"},
+            {"op": f"Custom_{first_secret}"},
+        ],
+        model_name="redacted_op_counts",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+
+    assert result.metadata["op_counts"] == {"Custom_<redacted>": 2, "Custom_<redacted>[2]": 1}
+    _assert_secret_absent_from_exported_result(result, first_secret)
+    _assert_secret_absent_from_exported_result(result, second_secret)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_long_input_message_redacts_node_name(tmp_path: Path) -> None:
+    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+
+    raw_secret = "sk-proj-CAND061TFNODENAMESECRET000000000000"
+    model_dir = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            graph_nodes=[
+                {
+                    "op": "Identity",
+                    "name": f"node_{raw_secret}",
+                    "inputs": ["x" * 2049],
+                }
+            ],
+            model_name="redacted_long_input_node",
+        )
+    )
+    model_path = model_dir / "saved_model.pb"
+    saved_model = SavedModel()
+    saved_model.ParseFromString(model_path.read_bytes())
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
+    scanner._initialize_context(str(model_path))
+    result = scanner._create_result()
+
+    scanner._check_protobuf_buffer_overflow(saved_model, result)
+
+    input_checks = [check for check in result.checks if check.name == "Protobuf Input Name Length Check"]
+
+    assert len(input_checks) == 1
+    assert "node_<redacted>" in input_checks[0].message
+    _assert_secret_absent_from_exported_result(result, raw_secret)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_savedmodel_graph_node_budget_marks_scan_inconclusive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1506,6 +1604,146 @@ def test_protobuf_string_injection_detected_in_list_attribute(tmp_path: Path) ->
     assert injection_checks
     assert any(check.details.get("attribute_name") == "labels" for check in injection_checks)
     assert any(check.details.get("attack_type") == "system_command" for check in injection_checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_protobuf_string_details_redact_model_controlled_values(tmp_path: Path) -> None:
+    raw_secret = "sk-proj-CAND061SAVEDDETAILSECRET000000000"
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": f"node_{raw_secret}",
+                "string_attrs": {
+                    f"payload_{raw_secret}": (f'<script src="https://cdn.example/{raw_secret}/payload.js"></script>')
+                },
+            }
+        ],
+        model_name="protobuf_detail_secret",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    injection_checks = [check for check in result.checks if check.name == "Protobuf String Injection Check"]
+
+    assert injection_checks
+    details = injection_checks[0].details
+    matches_text = repr(details["matches"])
+    assert "<redacted>" in details["node_name"]
+    assert "<redacted>" in details["attribute_name"]
+    assert "<script" in matches_text
+    assert "<redacted>" in matches_text
+    _assert_secret_absent_from_exported_result(result, raw_secret)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_oversized_node_preview_redacts_model_controlled_values(tmp_path: Path) -> None:
+    import importlib
+
+    importlib.import_module("modelaudit.protos")
+    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+
+    raw_secret = "sk-proj-CAND061SAVEDNODEPREVIEWSECRET000000000"
+    saved_model = SavedModel()
+    node = saved_model.meta_graphs.add().graph_def.node.add()
+    node.op = "Const"
+    node.name = f"node_{raw_secret}_{'A' * 2048}"
+    model_path = tmp_path / "saved_model.pb"
+    model_path.write_bytes(saved_model.SerializeToString())
+
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
+    scanner._initialize_context(str(model_path))
+    result = scanner._create_result()
+    scanner._check_protobuf_buffer_overflow(saved_model, result)
+    length_checks = [check for check in result.checks if check.name == "Protobuf Node Name Length Check"]
+
+    assert len(length_checks) == 1
+    assert "<redacted>" in length_checks[0].details["node_name_preview"]
+    _assert_secret_absent_from_exported_result(result, raw_secret)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_metadata_redacts_signature_and_tensor_identifiers(tmp_path: Path) -> None:
+    import importlib
+
+    importlib.import_module("modelaudit.protos")
+    from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+
+    raw_secret = "sk-proj-CAND061SAVEDMETADATASECRET0000000000"
+    model_dir = tmp_path / "metadata_redaction"
+    model_dir.mkdir()
+    saved_model = SavedModel()
+    meta_graph = saved_model.meta_graphs.add()
+    meta_graph.meta_info_def.tags.append(f"tag_{raw_secret}")
+    signature = meta_graph.signature_def[f"serve_{raw_secret}"]
+    signature.method_name = f"method_{raw_secret}"
+    signature.inputs[f"input_{raw_secret}"].name = f"tensor_{raw_secret}:0"
+    signature.outputs[f"output_{raw_secret}"].name = f"result_{raw_secret}:0"
+    (model_dir / "saved_model.pb").write_bytes(saved_model.SerializeToString())
+
+    metadata = tf_savedmodel_module.TensorFlowSavedModelScanner(
+        config={"allow_metadata_deserialization": True}
+    ).extract_metadata(str(model_dir))
+    serialized_metadata = repr(metadata)
+
+    assert raw_secret not in serialized_metadata
+    assert "<redacted>" in serialized_metadata
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_metadata_extraction_failure_redacts_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    importlib.import_module("modelaudit.protos")
+    from tensorflow.core.protobuf import saved_model_pb2
+
+    raw_secret = "OPAQUE_MODEL_CONTROLLED_METADATA_FAILURE"
+    model_dir = tmp_path / "metadata_failure"
+    model_dir.mkdir()
+    (model_dir / "saved_model.pb").write_bytes(b"model-controlled-content")
+
+    class FailingSavedModel:
+        def ParseFromString(self, _content: bytes) -> None:
+            raise ValueError(raw_secret)
+
+    monkeypatch.setattr(saved_model_pb2, "SavedModel", FailingSavedModel)
+
+    metadata = tf_savedmodel_module.TensorFlowSavedModelScanner(
+        config={"allow_metadata_deserialization": True}
+    ).extract_metadata(str(model_dir))
+
+    assert metadata["extraction_error"] == "<redacted>"
+    assert raw_secret not in repr(metadata)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_protobuf_string_details_preserve_public_context(tmp_path: Path) -> None:
+    model_path = _create_test_savedmodel_with_scoped_nodes(
+        tmp_path,
+        graph_nodes=[
+            {
+                "op": "Const",
+                "name": "public_script_node",
+                "string_attrs": {
+                    "html_snippet": '<script src="https://cdn.example/public/payload.js"></script>',
+                },
+            }
+        ],
+        model_name="protobuf_detail_public",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    injection_checks = [check for check in result.checks if check.name == "Protobuf String Injection Check"]
+
+    assert injection_checks
+    details = injection_checks[0].details
+    assert details["node_name"] == "public_script_node"
+    assert details["attribute_name"] == "html_snippet"
+    assert "https://cdn.example/public/payload.js" in repr(details["matches"])
+    assert "<redacted>" not in repr(details)
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
@@ -1936,6 +2174,26 @@ def test_savedmodel_collection_preview_redacts_sensitive_values(tmp_path: Path) 
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_collection_key_details_redact_sensitive_values(tmp_path: Path) -> None:
+    raw_secret = "sk-proj-CAND061SAVEDCOLLECTIONSECRET000000"
+    model_path = _create_test_savedmodel_with_collection(
+        tmp_path,
+        key=f"runtime_hook_{raw_secret}",
+        value=b'os.system("curl https://callback.example/public")',
+        model_name="collection_key_secret",
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(model_path)
+    collection_checks = [check for check in result.checks if check.name == "SavedModel Collection Executable Pattern"]
+
+    assert collection_checks
+    assert "runtime_hook" in collection_checks[0].details["collection_key"]
+    assert "<redacted>" in collection_checks[0].details["collection_key"]
+    assert "https://callback.example/public" in collection_checks[0].details["value_preview"]
+    _assert_secret_absent_from_exported_result(result, raw_secret)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_pyfunc_code_preview_redacts_sensitive_values(tmp_path: Path) -> None:
     raw_secret = "c081-pyfunc-secret-value-00000000"
     python_code = (
@@ -2057,6 +2315,30 @@ def test_keras_metadata_code_preview_redacts_sensitive_values(tmp_path: Path) ->
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_keras_metadata_decode_error_redacts_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_secret = "ATTACKER_CONTROLLED_KERAS_DECODE_FAILURE"
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(b'"class_name": "Lambda", "function": {"items": ["AAAA"]}')
+
+    def fail_decode(_value: str) -> bytes:
+        raise ValueError(raw_secret)
+
+    monkeypatch.setattr(tf_savedmodel_module.base64, "b64decode", fail_decode)
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
+    decode_checks = [
+        check for check in result.checks if check.name == "Lambda Layer Detection" and "decode_error" in check.details
+    ]
+
+    assert decode_checks
+    assert decode_checks[0].details["decode_error"] == "<redacted>"
+    assert raw_secret not in result.to_json()
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_scan_keras_metadata_pb_lambda_exec_sets_success_false(tmp_path: Path) -> None:
     """Standalone `keras_metadata.pb` scans should propagate CRITICAL Lambda findings to success=False."""
     encoded_code = base64.b64encode(b'exec("print(1)")').decode()
@@ -2155,6 +2437,23 @@ def test_savedmodel_root_sibling_directory_pickle_is_flagged(tmp_path: Path) -> 
 
     assert matching_checks
     assert any("pickle_payload" in check.details.get("detected_content_type", "") for check in matching_checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_supplemental_filename_details_redact_sensitive_values(tmp_path: Path) -> None:
+    raw_secret = "sk-proj-CAND061TFFILENAMESECRET000000000000"
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    sibling_path = model_dir / "supplemental" / f"payload_{raw_secret}.bin"
+    sibling_path.parent.mkdir()
+    sibling_path.write_text("#!/bin/sh\necho review\n", encoding="utf-8")
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
+    matching_checks = [check for check in result.checks if check.name == "SavedModel Supplemental File Security Check"]
+
+    assert matching_checks
+    assert any(check.location and "payload_<redacted>.bin" in check.location for check in matching_checks)
+    assert any(check.details.get("file_name") == "payload_<redacted>.bin" for check in matching_checks)
+    _assert_secret_absent_from_exported_result(result, raw_secret)
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
@@ -2336,6 +2635,33 @@ def test_savedmodel_asset_symlink_is_not_followed_by_blacklist_scan(
     assert asset_issues
     assert any(issue.details.get("asset_kind") == "symlink" for issue in asset_issues)
     assert all("blacklisted pattern" not in issue.message.lower() for issue in asset_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_asset_directory_stat_error_redacts_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_secret = "ATTACKER_CONTROLLED_ASSET_STAT_FAILURE"
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    assets_dir = model_dir / "assets"
+    assets_dir.mkdir(exist_ok=True)
+    real_lstat = Path.lstat
+
+    def fail_assets_lstat(path: Path) -> Any:
+        if path == assets_dir:
+            raise OSError(raw_secret)
+        return real_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", fail_assets_lstat)
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
+    stat_issues = [issue for issue in result.issues if issue.details.get("asset_kind") == "stat_error"]
+
+    assert stat_issues
+    assert stat_issues[0].details["exception"] == "<redacted>"
+    assert "<redacted>" in stat_issues[0].message
+    assert raw_secret not in result.to_json()
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
@@ -2669,6 +2995,7 @@ def _create_test_savedmodel_with_scoped_nodes(
         node = node_collection.add()
         node.name = spec.get("name", default_name)
         node.op = spec["op"]
+        node.input.extend(spec.get("inputs", []))
 
         for attr_name, attr_value in spec.get("string_attrs", {}).items():
             node.attr[attr_name].s = attr_value.encode("utf-8")

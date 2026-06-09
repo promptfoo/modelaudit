@@ -34,6 +34,7 @@ from modelaudit.scanners.sevenzip_scanner import (
     _RecursiveScanBudget,
 )
 from modelaudit.scanners.xgboost_scanner import XGBoostScanner
+from modelaudit.utils.file.detection import PICKLE_ROUTING_INCONCLUSIVE_FORMAT
 
 # Skip all tests if py7zr is not available for asset generation
 pytest_plugins: list[str] = []
@@ -2781,6 +2782,21 @@ class TestSevenZipScannerHardening:
         probe = io.BytesIO(b"cposix\nsystem\n(S'echo hidden'\ntR.")
 
         assert scanner._probe_detected_format(probe) == "pickle"
+
+    def test_probe_detected_format_recognizes_protocolless_binary_pickle(self) -> None:
+        """7z nested probes should route malicious binary pickles without PROTO."""
+        scanner = SevenZipScanner()
+        probe = io.BytesIO(
+            (b"\x8c\x01x0" * 8) + b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94\x8c\x02id\x94\x85\x94R\x94."
+        )
+
+        assert scanner._probe_detected_format(probe) == "pickle"
+
+    def test_probe_detected_format_fails_closed_at_protocolless_pickle_prefix_budget(self) -> None:
+        scanner = SevenZipScanner()
+        probe = io.BytesIO(b"\x8c\x01x0" * (scanner._NESTED_MEMBER_PROBE_BYTES // 4))
+
+        assert scanner._probe_detected_format(probe) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
 
     def test_probe_detected_format_recognizes_extensionless_xgboost_ubjson(self) -> None:
         """7z nested probes should retain extensionless XGBoost UBJSON members."""

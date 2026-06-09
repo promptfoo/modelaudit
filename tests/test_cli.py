@@ -4968,6 +4968,42 @@ def test_scan_mlflow_uri_error(mock_scan_mlflow):
 
 
 @patch("modelaudit.integrations.mlflow.scan_mlflow_model")
+def test_scan_mlflow_uri_error_redacts_registry_credentials(
+    mock_scan_mlflow: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """MLflow client errors must not expose registry URLs or auth material."""
+    raw_secret_parts = [
+        "user:pass",
+        "RELATIVEPASS1234567890",
+        "QUERYSECRET1234567890",
+        "HEADERSECRET1234567890",
+        "PROXYSECRET1234567890",
+        "PATHSECRET1234567890",
+    ]
+    mock_scan_mlflow.side_effect = RuntimeError(
+        "registry_uri=https://user:pass@mlflow.example.test/api?token=QUERYSECRET1234567890 "
+        "artifact_uri=//user:RELATIVEPASS1234567890@mlflow.example.test/model "
+        "authorization=Bearer HEADERSECRET1234567890 "
+        "proxy-authorization=ApiKey PROXYSECRET1234567890"
+    )
+
+    caplog.set_level(logging.ERROR, logger="modelaudit")
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["scan", "--verbose", "models:/PrivateModel/access_token=PATHSECRET1234567890"],
+    )
+
+    assert result.exit_code == 2
+    assert "Error downloading model from models:/PrivateModel/access_token=<redacted>" in result.output
+    assert "<redacted>" in result.output
+    for secret in raw_secret_parts:
+        assert secret not in result.output
+        assert secret not in caplog.text
+
+
+@patch("modelaudit.integrations.mlflow.scan_mlflow_model")
 def test_scan_mlflow_uri_json_format(mock_scan_mlflow):
     """Test MLflow URI scanning with JSON output format."""
     # Setup mock
@@ -5354,15 +5390,25 @@ class TestScanGlobFailFast:
         assert mock_record_failed.call_args[0][1] == "No matching paths"
         mock_flush.assert_called_once()
 
+    @patch("modelaudit.cli.record_scan_started")
+    @patch("modelaudit.cli.record_command_used")
     @patch("modelaudit.cli.record_scan_failed")
     @patch("modelaudit.cli.flush_telemetry")
-    def test_scan_invalid_max_size_records_telemetry(self, mock_flush, mock_record_failed, tmp_path):
-        """Invalid --max-size should record telemetry failure and flush before exit."""
+    def test_scan_invalid_max_size_records_telemetry(
+        self,
+        mock_flush: MagicMock,
+        mock_record_failed: MagicMock,
+        mock_record_command: MagicMock,
+        mock_record_started: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Invalid --max-size records failure telemetry without preserving its value."""
         runner = CliRunner()
         target = tmp_path / "model.pkl"
         target.write_bytes(b"content")
+        sensitive_max_size = "secret-model-name"
 
-        result = runner.invoke(cli, ["scan", str(target), "--max-size", "not-a-size"])
+        result = runner.invoke(cli, ["scan", str(target), "--max-size", sensitive_max_size])
 
         assert result.exit_code == 2
         assert "Error parsing --max-size" in result.output
@@ -5371,4 +5417,10 @@ class TestScanGlobFailFast:
         assert isinstance(duration_arg, float)
         assert duration_arg >= 0.0
         assert "Invalid max-size" in mock_record_failed.call_args[0][1]
+        command_options = mock_record_command.call_args.kwargs
+        scan_options = mock_record_started.call_args.args[1]
+        assert command_options["has_max_file_size"] is True
+        assert scan_options["has_max_file_size"] is True
+        assert sensitive_max_size not in repr(mock_record_command.call_args)
+        assert sensitive_max_size not in repr(mock_record_started.call_args)
         mock_flush.assert_called_once()

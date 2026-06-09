@@ -113,6 +113,10 @@ logger = logging.getLogger("modelaudit")
 
 def _display_path(path: str) -> str:
     """Return a path safe for user-facing CLI output."""
+    if path.startswith("models:/"):
+        from .integrations.mlflow import _redact_mlflow_error_for_display
+
+        return _redact_mlflow_error_for_display(path)
     if is_stream_url(path):
         return f"stream://{redact_stream_url_for_display(path[9:])}"
     if is_cloud_url(path) or is_cleartext_cloud_url(path) or is_cleartext_pytorch_hub_url(path):
@@ -3077,12 +3081,15 @@ def _resolve_scan_source_for_path(
             return None
 
     if is_mlflow_uri(path):
+        from .integrations.mlflow import _redact_mlflow_error_for_display
+
+        display_path = _display_path(path)
         download_spinner = None
         if runtime.show_styled_output and should_show_spinner():
-            download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(path, fg='cyan')}")
+            download_spinner = yaspin(Spinners.dots, text=f"Downloading from {style_text(display_path, fg='cyan')}")
             download_spinner.start()
         elif runtime.show_styled_output:
-            click.echo(f"Downloading from {path}...")
+            click.echo(f"Downloading from {display_path}...")
 
         try:
             record_download_started("mlflow", path)
@@ -3125,8 +3132,9 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo("Download failed")
 
-            logger.error(f"Failed to download model from {path}: {exc!s}", exc_info=verbose)
-            click.echo(f"Error downloading model from {path}: {exc!s}", err=True)
+            error_msg = _redact_mlflow_error_for_display(exc)
+            logger.error(f"Failed to download model from {display_path}: {error_msg}")
+            click.echo(f"Error downloading model from {display_path}: {error_msg}", err=True)
             path_state.mark_non_shard_error(audit_result)
             return None
 
@@ -3798,7 +3806,7 @@ def scan_command(
     telemetry_options = {
         "format": format,
         "timeout": timeout,
-        "max_file_size": max_size,
+        "has_max_file_size": bool(max_size),
         "has_blacklist": bool(blacklist),
         "num_blacklist_patterns": len(blacklist) if blacklist else 0,
         "progress": progress,
