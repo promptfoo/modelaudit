@@ -2342,7 +2342,7 @@ if marker.exists():
     assert not marker.exists()
 
 
-def test_scan_bytes_analyzes_stdlib_source_modules_without_custom_meta_path_finders(
+def test_scan_bytes_fails_closed_for_late_loaded_stdlib_source_modules_without_custom_meta_path_finders(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2376,7 +2376,11 @@ def test_scan_bytes_analyzes_stdlib_source_modules_without_custom_meta_path_find
         _clear_call_graph_caches()
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "statistics.mean"
+        for finding in report.findings
+    )
     assert not _has_call_graph_source_unavailable_notice(report, module_name, "mean", "source_unavailable")
     assert not marker.exists()
     assert statistics.mean([1, 2, 3]) == 2
@@ -3482,7 +3486,7 @@ def test_call_graph_keeps_setstate_entrypoint_for_unknown_newobj_invocation(
     )
 
 
-def test_scan_bytes_ignores_torch_layout_module_dict_lookup() -> None:
+def test_scan_bytes_fails_closed_for_late_loaded_torch_layout_module_dict_lookup() -> None:
     torch = pytest.importorskip("torch")
     if not hasattr(torch, "strided"):
         pytest.skip("usable PyTorch API is unavailable")
@@ -3490,7 +3494,12 @@ def test_scan_bytes_ignores_torch_layout_module_dict_lookup() -> None:
 
     report = scan_bytes(payload, source="torch-layout-clean.pkl")
 
-    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "torch.serialization._get_layout"
+        for finding in report.findings
+    )
     assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
 
 
