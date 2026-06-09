@@ -17,7 +17,7 @@ from ..scanner_results import mark_inconclusive_scan_result
 from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils.file.detection import read_magic_bytes
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
-from .pickle_scanner import PickleScanner, _looks_like_pickle
+from .pickle_scanner import PickleScanner
 
 _JOBLIB_NUMPY_ARRAY_WRAPPER_REF = "joblib.numpy_pickle.NumpyArrayWrapper"
 _JOBLIB_NUMPY_ARRAY_REQUIRED_REFS = {
@@ -44,6 +44,20 @@ _JOBLIB_TAIL_DANGEROUS_SEEDS = (
     b"exec",
     b"pickle.loads",
     b"marshal.loads",
+)
+_TRUNCATED_RAW_PICKLE_SIGNAL_OPCODES = frozenset(
+    {
+        "EXT1",
+        "EXT2",
+        "EXT4",
+        "GLOBAL",
+        "INST",
+        "NEWOBJ",
+        "NEWOBJ_EX",
+        "PERSID",
+        "BINPERSID",
+        "STACK_GLOBAL",
+    }
 )
 
 
@@ -112,7 +126,9 @@ def _looks_like_joblib_numpy_array_tail(tail: bytes) -> bool:
     raw_array_data = tail[1 + padding_length :]
     if not raw_array_data:
         return False
-    if _looks_like_pickle(raw_array_data):
+    # Array bytes may match protocol-less opcodes; only an explicit protocol
+    # header is strong enough evidence that this is another pickle stream.
+    if len(raw_array_data) >= 2 and raw_array_data[0] == 0x80 and raw_array_data[1] <= 5:
         return False
 
     probe = raw_array_data[:_JOBLIB_TAIL_DANGER_SCAN_BYTES].lower()
@@ -315,21 +331,20 @@ class JoblibScanner(BaseScanner):
 
     def _looks_like_raw_pickle_payload(self, data: bytes) -> bool:
         """Return True when `.joblib` bytes should be scanned directly as pickle."""
-        if _looks_like_pickle(data):
-            return True
-
         if len(data) >= 2 and data[0] == 0x80 and data[1] <= 5:
             return True
 
+        parsed_security_opcode = False
         try:
-            probe = io.BytesIO(data[:4096])
-            for _opcode_count, (opcode, _arg, _pos) in enumerate(pickletools.genops(probe), 1):
+            probe = io.BytesIO(data)
+            for opcode_count, (opcode, _arg, _pos) in enumerate(pickletools.genops(probe), 1):
+                parsed_security_opcode = parsed_security_opcode or (opcode.name in _TRUNCATED_RAW_PICKLE_SIGNAL_OPCODES)
                 if opcode.name == "STOP":
                     return True
-                if _opcode_count >= 16:
-                    break
+                if opcode_count >= 16:
+                    return True
         except Exception:
-            return False
+            return parsed_security_opcode
 
         return False
 

@@ -94,6 +94,7 @@ def pytest_runtest_setup(item):
         allowed_test_files = [
             "test_xgboost_scanner.py",
             "test_pickle_scanner.py",
+            "test_pickle_binunicode8_setitem.py",
             "test_picklescan_adapter.py",
             "test_basic.py",  # ScanResult private-metadata merge regressions
             "test_joblib_scanner.py",
