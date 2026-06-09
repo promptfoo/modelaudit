@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- require explicit boolean opt-in before weight-distribution scans call torch.load and bound primitive PyTorch ZIP fallback extraction
 - fail closed when OCI layer TAR metadata, member counts, or cumulative extracted bytes exceed inspection budgets
 - fail closed on JFrog folder downloads whose selected artifacts use unsafe, colliding, or overlapping local paths
 - detect dangerous textual byte keys in Flax MessagePack checkpoints
