@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- disable unsafe Joblib and NumPy object metadata deserialization
 - keep concrete active execution, runtime-extension, and blacklist findings from being downgraded by Hugging Face whitelists
 - keep same-fragment command/network correlations and relayed fail-closed findings active across Hugging Face whitelists
 - validate Joblib NumPy wrapper state and scan resumed pickle opcodes around raw array payloads without flagging inert array bytes.

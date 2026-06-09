@@ -9,6 +9,7 @@ import lzma
 import pickle
 import struct
 import zlib
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 
 import pytest
@@ -341,6 +342,27 @@ def test_scan_reports_unavailable_joblib_read_as_inconclusive_not_security_findi
     assert aggregate.success is False
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
     assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.parametrize("version_error", [PackageNotFoundError("joblib"), RuntimeError("broken metadata")])
+def test_metadata_extraction_with_unavailable_joblib_version_remains_a_safe_skip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version_error: Exception,
+) -> None:
+    path = tmp_path / "safe.joblib"
+    path.write_bytes(pickle.dumps(7, protocol=4))
+
+    def missing_distribution(_name: str) -> str:
+        raise version_error
+
+    monkeypatch.setattr("modelaudit.scanners.joblib_scanner.distribution_version", missing_distribution)
+
+    metadata = JoblibScanner().extract_metadata(str(path))
+
+    assert metadata["deserialization_skipped"] is True
+    assert "joblib_version" not in metadata
+    assert "extraction_error" not in metadata
 
 
 def test_scan_fails_closed_when_numpy_wrapper_prefix_has_unknown_tail(tmp_path: Path) -> None:

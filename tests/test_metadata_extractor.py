@@ -866,7 +866,7 @@ class TestModelMetadataExtractor:
         metadata = extractor.extract(str(joblib_file))
 
         assert metadata.get("deserialization_skipped") is True
-        assert metadata.get("reason") == "Deserialization disabled for metadata extraction"
+        assert metadata.get("reason") == "Unsafe in-process joblib deserialization is disabled for metadata extraction"
 
     def test_tf_savedmodel_metadata_no_deserialization(self, tmp_path: Path) -> None:
         """Ensure TensorFlow SavedModel metadata extraction does not deserialize by default."""
@@ -966,8 +966,8 @@ class TestModelMetadataExtractor:
         assert metadata.get("deserialization_skipped") is True
         assert "pickle" in metadata.get("reason", "").lower()
 
-    def test_numpy_object_array_allowed_with_deserialization(self, tmp_path: Path) -> None:
-        """Ensure NumPy object arrays load when deserialization is explicitly allowed."""
+    def test_numpy_object_array_deserialization_opt_in_is_ignored(self, tmp_path: Path) -> None:
+        """Ensure NumPy object-array metadata never performs unsafe deserialization."""
         np = pytest.importorskip("numpy")
         extractor = metadata_extractor_module.ModelMetadataExtractor()
 
@@ -976,11 +976,18 @@ class TestModelMetadataExtractor:
         np.save(str(npy_file), obj_arr, allow_pickle=True)
 
         metadata = extractor.extract(str(npy_file), allow_deserialization=True)
+        security_metadata = extractor.extract(
+            str(npy_file),
+            security_only=True,
+            allow_deserialization=True,
+        )
 
-        # With deserialization allowed, should extract metadata
-        assert metadata.get("deserialization_skipped") is not True
+        assert metadata.get("deserialization_skipped") is True
+        assert metadata.get("allow_metadata_deserialization_ignored") is True
         assert metadata.get("array_dtype") == "object"
         assert metadata.get("contains_objects") is True
+        assert security_metadata.get("deserialization_skipped") is True
+        assert security_metadata.get("allow_metadata_deserialization_ignored") is True
 
     def test_xgboost_metadata_no_deserialization(self, tmp_path: Path) -> None:
         """Ensure XGBoost metadata extraction is blocked without deserialization flag."""
@@ -1030,6 +1037,7 @@ class TestModelMetadataExtractor:
             "format": "pickle",
             "file_size": 100,
             "deserialization_skipped": True,
+            "allow_metadata_deserialization_ignored": True,
             "reason": "Deserialization disabled for metadata extraction",
             "dangerous_opcodes": ["REDUCE"],
             "has_dangerous_opcodes": True,
@@ -1040,6 +1048,7 @@ class TestModelMetadataExtractor:
         filtered = extractor._filter_security_metadata(metadata)
 
         assert filtered["deserialization_skipped"] is True
+        assert filtered["allow_metadata_deserialization_ignored"] is True
         assert filtered["reason"] == "Deserialization disabled for metadata extraction"
         assert filtered["dangerous_opcodes"] == ["REDUCE"]
         assert filtered["has_dangerous_opcodes"] is True
