@@ -33,23 +33,24 @@ _MAX_MLFLOW_ERROR_DISPLAY_CHARS = 512
 _MLFLOW_COPY_CHUNK_SIZE = 1024 * 1024
 _OS_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 _IS_WINDOWS = os.name == "nt"
+_MLFLOW_SENSITIVE_KEY = rf"(?:{SENSITIVE_CONTAINER_KEY}|credentials?|jwt|session)"
 _MLFLOW_SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"(?ix)"
     r"(?P<prefix>(?<![\w-])[\"']?"
-    r"(?:authorization|proxy-authorization|access[_-]?key|access[_-]?token|api[_-]?key|credentials?|password|secret|token)"
+    rf"{_MLFLOW_SENSITIVE_KEY}"
     r"[\"']?\s*[:=]\s*)"
-    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:(?:bearer|basic|token)\s+)?[^\s,;}\]]+)"
+    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:(?:bearer|basic|token)\s+)?[^\s,;&}\]]+)"
 )
 _MLFLOW_BRACKETED_SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"(?ix)"
     r"(?P<prefix>(?<![\w-])(?:[a-z_][\w-]*\.)*(?:headers?|params?|query)\s*\[\s*[\"']?"
-    rf"(?:{SENSITIVE_CONTAINER_KEY}|credentials?|jwt|session|key)[\"']?\s*\]\s*[:=]\s*)"
-    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:(?:bearer|basic|token)\s+)?[^\s,;}\]]+)"
+    rf"(?:{_MLFLOW_SENSITIVE_KEY}|key)[\"']?\s*\]\s*[:=]\s*)"
+    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:(?:bearer|basic|token)\s+)?[^\s,;&}\]]+)"
 )
 _MLFLOW_SENSITIVE_CONTAINER_PREFIX_RE = re.compile(
     r"(?ix)"
     r"(?P<prefix>(?<![\w-])[\"']?"
-    r"(?:authorization|proxy-authorization|access[_-]?key|access[_-]?token|api[_-]?key|credentials?|password|secret|token)"
+    rf"{_MLFLOW_SENSITIVE_KEY}"
     r"[\"']?\s*[:=]\s*)"
     r"(?P<open>[({\[])",
 )
@@ -266,7 +267,12 @@ def _redact_mlflow_error_for_display(error: object) -> str:
     redacted = _redact_sensitive_containers(redacted)
     redacted = _MLFLOW_BRACKETED_SENSITIVE_ASSIGNMENT_RE.sub(_replace_sensitive_value, redacted)
     redacted = _MLFLOW_SENSITIVE_ASSIGNMENT_RE.sub(_replace_sensitive_value, redacted)
-    redacted = redact_cloud_error_for_display(_redact_urls_in_text(redacted))
+    contains_url = bool(
+        re.search(r"(?i)(?:\b[a-z][a-z0-9+.-]*://|\bmodels:/)", redacted)
+        or _MLFLOW_PROTOCOL_RELATIVE_URL_RE.search(redacted)
+    )
+    if contains_url:
+        redacted = redact_cloud_error_for_display(_redact_urls_in_text(redacted))
     redacted = _MLFLOW_PROTOCOL_RELATIVE_URL_RE.sub(_redact_protocol_relative_url, redacted)
     redacted = _MLFLOW_BRACKETED_SENSITIVE_ASSIGNMENT_RE.sub(_replace_sensitive_value, redacted)
     redacted = _MLFLOW_SENSITIVE_ASSIGNMENT_RE.sub(_replace_sensitive_value, redacted)
@@ -279,7 +285,10 @@ def _redact_mlflow_error_for_display(error: object) -> str:
         return placeholder
 
     redacted = _MLFLOW_BENIGN_AUTH_CONTEXT_RE.sub(_protect_benign_auth_context, redacted)
-    redacted = redact_evidence_string(redacted, max_chars=None)
+    if contains_url:
+        redacted = redact_evidence_string(redacted, max_chars=None)
+    else:
+        redacted = "&".join(redact_evidence_string(part, max_chars=None) for part in redacted.split("&"))
     for placeholder, original in benign_auth_contexts:
         redacted = redacted.replace(placeholder, original)
 

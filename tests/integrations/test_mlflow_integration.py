@@ -1259,6 +1259,51 @@ def test_redact_mlflow_error_preserves_benign_auth_diagnostics(message: str) -> 
 
 
 @pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("client_secret='CLIENTSECRET123'", "client_secret='<redacted>'"),
+        ("refresh-token=REFRESHSECRET123", "refresh-token=<redacted>"),
+        ("private_key=PRIVATESECRET123", "private_key=<redacted>"),
+        ("cookie=COOKIESECRET123", "cookie=<redacted>"),
+        ("session=SESSIONSECRET123", "session=<redacted>"),
+        ("jwt=JWTSECRET123", "jwt=<redacted>"),
+        (
+            "auth=AUTHSECRET123&session=SESSIONSECRET123",
+            "auth=<redacted>&session=<redacted>",
+        ),
+        (
+            "credentials=TOPSECRET123&region=us-east-1",
+            "credentials=<redacted>&region=us-east-1",
+        ),
+        (
+            "C:/models auth=AUTHSECRET123&session=SESSIONSECRET123",
+            "C:/models auth=<redacted>&session=<redacted>",
+        ),
+    ],
+)
+def test_redact_mlflow_error_handles_sensitive_aliases(message: str, expected: str) -> None:
+    assert _redact_mlflow_error_for_display(message) == expected
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Cookie policy rejected request",
+        "JWT validation failed",
+        "Private key file missing",
+        "Client secret provider unavailable",
+        "Refresh token endpoint failed",
+        "monkey=value",
+        "key=value",
+        "session state changed",
+        "tokenizer=bert",
+    ],
+)
+def test_redact_mlflow_error_preserves_benign_sensitive_key_near_matches(message: str) -> None:
+    assert _redact_mlflow_error_for_display(message) == message
+
+
+@pytest.mark.parametrize(
     "message",
     [
         "headers[Authorization]=BRACKETSECRET123",
