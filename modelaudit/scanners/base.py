@@ -206,8 +206,6 @@ class BaseScanner(ABC):
             value = self.config["max_file_size"]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 return self.default_max_file_read_size
-            if value == 0:
-                return 0
 
         return self.default_max_file_read_size
 
