@@ -398,6 +398,24 @@ def test_flax_msgpack_respects_file_size_limit(tmp_path: Path) -> None:
     assert len(size_checks) == 1
 
 
+def test_flax_msgpack_max_file_size_zero_preserves_default_read_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Core unlimited max_file_size should not disable Flax full-read protection."""
+    monkeypatch.setattr(FlaxMsgpackScanner, "default_max_file_read_size", 10)
+    path = tmp_path / "too_large_default.msgpack"
+    create_msgpack_file(path, {"params": {"w": list(range(64))}})
+
+    result = FlaxMsgpackScanner(config={"max_file_size": 0}).scan(str(path))
+
+    assert result.success is False
+    checks = {check.name: check for check in result.checks}
+    assert checks["File Size Limit"].status == CheckStatus.FAILED
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "max_file_read_size_exceeded" in result.metadata["scan_outcome_reasons"]
+
+
 def test_flax_msgpack_scans_trailing_msgpack_objects(tmp_path: Path) -> None:
     """A malicious second msgpack object after a benign first object must still be scanned."""
     path = tmp_path / "trailing_malicious.msgpack"

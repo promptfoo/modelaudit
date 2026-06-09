@@ -86,8 +86,14 @@ class PmmlScanner(BaseScanner):
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         pmml_config = dict(config or {})
-        if "max_file_read_size" not in pmml_config and "max_file_size" in pmml_config:
-            pmml_config["max_file_read_size"] = pmml_config["max_file_size"]
+        max_file_size = pmml_config.get("max_file_size")
+        if (
+            "max_file_read_size" not in pmml_config
+            and isinstance(max_file_size, int)
+            and not isinstance(max_file_size, bool)
+            and max_file_size > 0
+        ):
+            pmml_config["max_file_read_size"] = min(max_file_size, self.default_max_file_read_size)
         super().__init__(config=pmml_config)
 
     @classmethod
