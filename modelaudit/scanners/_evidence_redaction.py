@@ -222,6 +222,10 @@ SENSITIVE_AUTH_SCHEME_ASSIGNMENT_RE: Final[re.Pattern[str]] = re.compile(
     r"(?:ApiKey|Bearer|Basic|Custom|Digest|Negotiate|NTLM|OAuth|Token|AWS4-HMAC-SHA256)"
     rf"[ \t]+{UNQUOTED_VALUE_PATTERN}"
 )
+SENSITIVE_PARAMETERIZED_AUTH_SCHEME_PREFIX_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*{SCALAR_ASSIGNMENT_OPERATOR_PATTERN}\s*"
+    rf"{VALUE_OPENERS_PATTERN})(?:Digest|AWS4-HMAC-SHA256)\b"
+)
 SENSITIVE_COMPOUND_ASSIGNMENT_START_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)\b(?P<prefix>(?:{SENSITIVE_ASSIGNMENT_KEY})\s*[:=]\s*)"
 )
@@ -1185,7 +1189,13 @@ def _redact_sensitive_auth_scheme_assignment(match: re.Match[str]) -> str:
     return f"{match.group('prefix')}{REDACTED_EVIDENCE_VALUE}"
 
 
-def _parameterized_authorization_value_end(text: str, start: int, *, fstring: bool = False) -> int:
+def _parameterized_authorization_value_end(
+    text: str,
+    start: int,
+    *,
+    fstring: bool = False,
+    stop_at_newline: bool = True,
+) -> int:
     quote: str | None = None
     escaped = False
     index = start
@@ -1209,8 +1219,11 @@ def _parameterized_authorization_value_end(text: str, start: int, *, fstring: bo
                 return index
             index = expression_end
             continue
-        elif char in "\r\n&|}]":
+        elif char in "&|}]":
             return index
+        elif char in "\r\n":
+            if stop_at_newline:
+                return index
         elif char == ";":
             parameter_start = max(start, text.rfind(",", start, index) + 1)
             parameter = text[parameter_start:index].strip()
@@ -1224,12 +1237,23 @@ def _parameterized_authorization_value_end(text: str, start: int, *, fstring: bo
     return len(text)
 
 
-def _redact_parameterized_authorization_values(text: str, *, fstring: bool = False) -> str:
+def _redact_parameterized_authorization_values(
+    text: str,
+    *,
+    fstring: bool = False,
+    prefix_re: re.Pattern[str] = PARAMETERIZED_AUTHORIZATION_PREFIX_RE,
+    stop_at_newline: bool = True,
+) -> str:
     redacted_chunks: list[str] = []
     last_index = 0
     search_index = 0
-    while match := PARAMETERIZED_AUTHORIZATION_PREFIX_RE.search(text, search_index):
-        value_end = _parameterized_authorization_value_end(text, match.end(), fstring=fstring)
+    while match := prefix_re.search(text, search_index):
+        value_end = _parameterized_authorization_value_end(
+            text,
+            match.end(),
+            fstring=fstring,
+            stop_at_newline=stop_at_newline,
+        )
         trailing_start = value_end
         while trailing_start > match.end() and text[trailing_start - 1] in " \t":
             trailing_start -= 1
@@ -1247,11 +1271,11 @@ def _redact_parameterized_authorization_values(text: str, *, fstring: bool = Fal
 def _redact_authorization_literal(literal: str | bytes) -> str | bytes:
     if isinstance(literal, bytes):
         decoded = literal.decode("latin-1")
-        redacted = _redact_parameterized_authorization_values(decoded)
+        redacted = _redact_parameterized_authorization_values(decoded, stop_at_newline=False)
         redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
         return redacted.encode("latin-1")
 
-    redacted = _redact_parameterized_authorization_values(literal)
+    redacted = _redact_parameterized_authorization_values(literal, stop_at_newline=False)
     return AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
 
 
@@ -1278,7 +1302,7 @@ def _redact_authorization_in_python_strings(text: str) -> str:
             if not source.endswith(quote):
                 continue
             body = source[string_match.end() : -len(quote)]
-            redacted_body = _redact_parameterized_authorization_values(body, fstring=True)
+            redacted_body = _redact_parameterized_authorization_values(body, fstring=True, stop_at_newline=False)
             if redacted_body != body:
                 redacted_source = f"{source[: string_match.end()]}{redacted_body}{quote}"
                 _append_ast_node_replacement(text, offsets, node, replacements, redacted_source)
@@ -3321,6 +3345,10 @@ def _redact_evidence_content(text: str, *, url_depth: int = 0, decode_percent: b
         redacted = _redact_authorization_in_python_strings(redacted)
     else:
         redacted = _redact_parameterized_authorization_values(redacted)
+        redacted = _redact_parameterized_authorization_values(
+            redacted,
+            prefix_re=SENSITIVE_PARAMETERIZED_AUTH_SCHEME_PREFIX_RE,
+        )
         redacted = AUTHORIZATION_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = AUTH_SCHEME_VALUE_RE.sub(rf"\1{REDACTED_EVIDENCE_VALUE}", redacted)
     redacted = SENSITIVE_FLAG_VALUE_RE.sub(_redact_sensitive_flag_value, redacted)
