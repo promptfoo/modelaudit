@@ -78,6 +78,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- continue probing encoded protocol 0 payloads after long scalar operands and lenient base64 prefixes
 - preserve fail-closed nested protocol 0 analysis after `INST` opcodes
 - fail closed when known-size pickle boundaries cannot be verified or contain trailing bytes, and bind file scans to one descriptor
 - fail closed before copying protocol 0 line operands larger than 8 MiB
