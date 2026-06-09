@@ -8,10 +8,12 @@ import pickletools
 import posixpath
 import re
 import stat
+import struct
 import tempfile
 import zipfile
 from collections.abc import Callable
 from contextlib import suppress
+from copy import copy
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -151,6 +153,7 @@ _WINDOWS_RESERVED_DEVICE_NAMES: frozenset[str] = frozenset(
     {"CON", "PRN", "AUX", "NUL"} | {f"COM{index}" for index in range(1, 10)} | {f"LPT{index}" for index in range(1, 10)}
 )
 _WINDOWS_DEVICE_SUPERSCRIPT_DIGITS = str.maketrans({"\u00b9": "1", "\u00b2": "2", "\u00b3": "3"})
+_UNIX_MODE_ZIP_CREATOR_SYSTEMS: frozenset[int] = frozenset({3, 19})
 
 
 def _targets_windows_reserved_device(target: str) -> bool:
@@ -162,6 +165,11 @@ def _targets_windows_reserved_device(target: str) -> bool:
         if basename.translate(_WINDOWS_DEVICE_SUPERSCRIPT_DIGITS) in _WINDOWS_RESERVED_DEVICE_NAMES:
             return True
     return False
+
+
+def _is_zip_symlink(info: zipfile.ZipInfo) -> bool:
+    """Return whether the entry uses Unix mode metadata to declare a symlink."""
+    return info.create_system in _UNIX_MODE_ZIP_CREATOR_SYSTEMS and stat.S_ISLNK(info.external_attr >> 16)
 
 
 @dataclass(frozen=True)
@@ -689,9 +697,11 @@ class PyTorchZipScanner(BaseScanner):
         self, zip_file: zipfile.ZipFile, info: zipfile.ZipInfo, result: ScanResult
     ) -> tuple[str, bool]:
         """Read a bounded ZIP symlink target and report whether it was complete."""
+        bounded_info = copy(info)
+        bounded_info.file_size = self.MAX_SYMLINK_TARGET_BYTES + 1
         target = self._read_member_prefix(
             zip_file,
-            info,
+            bounded_info,
             self.MAX_SYMLINK_TARGET_BYTES + 1,
             phase="symlink_target_validation",
             result=result,
@@ -699,6 +709,55 @@ class PyTorchZipScanner(BaseScanner):
         target_complete = len(target) <= self.MAX_SYMLINK_TARGET_BYTES
         bounded_target = target[: self.MAX_SYMLINK_TARGET_BYTES]
         return bounded_target.decode("utf-8", errors="surrogateescape"), target_complete
+
+    @staticmethod
+    def _symlink_payload_bounds_match(zip_file: zipfile.ZipFile, info: zipfile.ZipInfo) -> bool:
+        """Return whether local ZIP metadata bounds the same payload as the central entry."""
+        archive = zip_file.fp
+        end_offset = getattr(info, "_end_offset", None)
+        if archive is None or not isinstance(end_offset, int):
+            return False
+
+        original_position = archive.tell()
+        try:
+            archive.seek(info.header_offset)
+            header = archive.read(30)
+            if len(header) != 30 or header[:4] != b"PK\x03\x04":
+                return False
+
+            local_flags, local_compress_type = struct.unpack_from("<HH", header, 6)
+            local_crc, local_compressed_size, local_file_size = struct.unpack_from("<III", header, 14)
+            filename_length, extra_length = struct.unpack_from("<HH", header, 26)
+            data_offset = info.header_offset + 30 + filename_length + extra_length
+            if data_offset > end_offset or local_flags != info.flag_bits or local_compress_type != info.compress_type:
+                return False
+
+            if not (local_flags & 0x08):
+                local_sizes_match = local_compressed_size in {info.compress_size, 0xFFFFFFFF} and local_file_size in {
+                    info.file_size,
+                    0xFFFFFFFF,
+                }
+                return local_crc == info.CRC and local_sizes_match and data_offset + info.compress_size == end_offset
+
+            descriptor_offset = data_offset + info.compress_size
+            if descriptor_offset > end_offset:
+                return False
+            descriptor_length = end_offset - descriptor_offset
+            if descriptor_length not in {12, 16, 20, 24}:
+                return False
+            archive.seek(descriptor_offset)
+            descriptor = archive.read(descriptor_length)
+            if descriptor.startswith(b"PK\x07\x08"):
+                descriptor = descriptor[4:]
+            if len(descriptor) == 12:
+                crc, compressed_size, file_size = struct.unpack("<III", descriptor)
+            elif len(descriptor) == 20:
+                crc, compressed_size, file_size = struct.unpack("<IQQ", descriptor)
+            else:
+                return False
+            return (crc, compressed_size, file_size) == (info.CRC, info.compress_size, info.file_size)
+        finally:
+            archive.seek(original_position)
 
     @staticmethod
     def _resolve_symlink_target(
@@ -918,7 +977,7 @@ class PyTorchZipScanner(BaseScanner):
                 continue
 
             # Check for symlinks (ZIP slip variant attack)
-            is_symlink = (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK
+            is_symlink = _is_zip_symlink(info)
             if is_symlink:
                 scan_symlink_content = True
                 if info.file_size > self.MAX_SYMLINK_TARGET_BYTES:
@@ -952,6 +1011,21 @@ class PyTorchZipScanner(BaseScanner):
                             "target_class": "invalid",
                             "compressed_size": info.compress_size,
                             "max_compressed_size": self.MAX_SYMLINK_TARGET_COMPRESSED_BYTES,
+                        },
+                    )
+                    scan_symlink_content = False
+                elif not self._symlink_payload_bounds_match(zip_file, info):
+                    result.add_check(
+                        name="Symlink Safety Validation",
+                        passed=False,
+                        message=f"Symlink {name} has inconsistent ZIP payload bounds",
+                        severity=IssueSeverity.CRITICAL,
+                        rule_code="S406",
+                        location=f"{path}:{name}",
+                        details={
+                            "entry": name,
+                            "target": "<inconsistent-zip-metadata>",
+                            "target_class": "invalid",
                         },
                     )
                     scan_symlink_content = False

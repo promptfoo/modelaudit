@@ -229,8 +229,10 @@ class TestNumPyScannerSecurity:
         result = scanner.scan(str(npy_file))
 
         assert result.success is False
-        validation_issues = [issue for issue in result.issues if "negative dimension" in issue.message.lower()]
-        assert len(validation_issues) > 0
+        header_check = next(check for check in result.checks if check.name == "NumPy Header Read")
+        assert header_check.status == CheckStatus.FAILED
+        assert header_check.rule_code == "S902"
+        assert "Negative NumPy shape dimensions are invalid" in header_check.message
 
     def test_too_many_dimensions_rejection(self, tmp_path):
         """Test rejection of arrays with too many dimensions."""

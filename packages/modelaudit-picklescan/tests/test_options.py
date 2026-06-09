@@ -15,6 +15,7 @@ def test_scan_options_defaults_are_safe_and_finite() -> None:
     assert options.max_opcodes > 0
     assert options.post_budget_scan_bytes >= 0
     assert options.max_known_stream_read_bytes > 0
+    assert options.max_nested_pickle_bytes >= 2
 
 
 def test_scan_options_clamps_excessive_timeout() -> None:
@@ -41,8 +42,10 @@ def test_scan_options_clamps_excessive_timeout() -> None:
         ({"max_known_stream_read_bytes": True}, "max_known_stream_read_bytes must be greater than 0"),
         ({"max_string_literal_scan_chars": -1}, "max_string_literal_scan_chars must be greater than or equal to 0"),
         ({"max_string_literal_scan_chars": True}, "max_string_literal_scan_chars must be greater than or equal to 0"),
-        ({"max_nested_pickle_bytes": -1}, "max_nested_pickle_bytes must be greater than or equal to 0"),
-        ({"max_nested_pickle_bytes": False}, "max_nested_pickle_bytes must be greater than or equal to 0"),
+        ({"max_nested_pickle_bytes": 0}, "max_nested_pickle_bytes must be at least 2"),
+        ({"max_nested_pickle_bytes": 1}, "max_nested_pickle_bytes must be at least 2"),
+        ({"max_nested_pickle_bytes": -1}, "max_nested_pickle_bytes must be at least 2"),
+        ({"max_nested_pickle_bytes": False}, "max_nested_pickle_bytes must be at least 2"),
         ({"max_nested_depth": -1}, "max_nested_depth must be greater than or equal to 0"),
         ({"max_nested_depth": 1.5}, "max_nested_depth must be greater than or equal to 0"),
     ],
@@ -53,3 +56,14 @@ def test_scan_options_reject_invalid_resource_limits(
 ) -> None:
     with pytest.raises(ValueError, match=expected_error):
         ScanOptions(**kwargs)
+
+
+def test_native_scan_rejects_undersized_nested_pickle_budget() -> None:
+    rust = pytest.importorskip("modelaudit_picklescan._rust")
+    payload = b"\x80\x04N."
+
+    for limit in (0, 1):
+        with pytest.raises(ValueError, match="max_nested_pickle_bytes must be at least 2"):
+            rust.scan_bytes(payload, "native-options.pkl", {"max_nested_pickle_bytes": limit})
+
+    rust.scan_bytes(payload, "native-options.pkl", {"max_nested_pickle_bytes": 2})

@@ -10,14 +10,15 @@ use crate::expansion::{
     ExpansionHeuristicState,
 };
 use crate::nested::{
-    decode_possible_encoded_pickle, detect_oversized_encoded_pickle_prefixes,
-    encoded_literal_may_contain_pickle, encoded_nested_literal_probe_coverage_incomplete,
+    bounded_truncated_pickle_prefix_requires_fail_closed, decode_possible_encoded_pickle,
+    detect_oversized_encoded_pickle_prefixes, encoded_literal_may_contain_pickle,
+    encoded_nested_literal_probe_coverage_incomplete,
     encoded_nested_literal_probe_windows_with_limit, encoded_nested_window_char_limit,
     encoded_pickle_consumes_literal, has_binary_pickle_prefix, has_execution_opcode,
-    has_pickle_prefix, looks_like_pickle_payload, nested_pickle_probe_offsets,
-    pickle_payload_extent_result, protocol0_global_or_inst_prefix_has_import_reference_lines,
-    truncated_pickle_prefix_requires_fail_closed, DecodedNestedPayload, NestedProbeOffsets,
-    MAX_NESTED_PAYLOAD_PROBES,
+    has_pickle_prefix, is_strict_base64_literal, looks_like_pickle_payload,
+    nested_pickle_probe_offsets, pickle_payload_extent_result,
+    protocol0_global_or_inst_prefix_has_import_reference_lines, DecodedNestedPayload,
+    NestedProbeOffsets, MAX_NESTED_PAYLOAD_PROBES,
 };
 use crate::nested_surface::{
     encoded_nested_payload_finding, is_allowlisted_nested_constructor_ref,
@@ -1303,7 +1304,17 @@ impl<'a> ScanState<'a> {
             "BINBYTES" | "BINBYTES8" | "SHORT_BINBYTES" | "BYTEARRAY8" => {
                 if let Some((start, end)) = opcode.arg.byte_span(self.payload.len()) {
                     let bytes = &self.payload[start..end];
-                    self.scan_raw_nested_pickle_bytes(bytes, self.position_offset + start);
+                    let encoded_nested_pickle_outcome =
+                        self.scan_encoded_nested_pickle_bytes_literal(bytes, position);
+                    let strict_base64_literal = is_strict_base64_literal(bytes);
+                    // Complete raw pickles require STOP ('.'), which is outside the
+                    // base64 alphabet. After a decoded candidate is confirmed, raw
+                    // parsing of a strict token can only produce truncated phantoms.
+                    let skip_raw_scan = encoded_nested_pickle_outcome.1
+                        || (encoded_nested_pickle_outcome.0 && strict_base64_literal);
+                    if !skip_raw_scan {
+                        self.scan_raw_nested_pickle_bytes(bytes, self.position_offset + start);
+                    }
                     self.push_stack_value(StackValue::Bytes { start, end });
                 } else {
                     self.push_stack_value(StackValue::Bytes { start: 0, end: 0 });
@@ -5856,7 +5867,12 @@ impl<'a> ScanState<'a> {
                 return;
             }
             let candidate_truncated = remaining_len > self.options.max_nested_pickle_bytes;
-            if candidate_truncated && truncated_pickle_prefix_requires_fail_closed(probe) {
+            if candidate_truncated
+                && bounded_truncated_pickle_prefix_requires_fail_closed(
+                    &value[offset..],
+                    self.options.max_nested_pickle_bytes,
+                )
+            {
                 self.add_nested_payload_finding(
                     raw_nested_payload_finding(remaining_len, position + offset, true, false),
                     true,
@@ -5894,7 +5910,10 @@ impl<'a> ScanState<'a> {
                     && (has_binary_pickle_prefix(probe)
                         || protocol0_global_or_inst_prefix_has_import_reference_lines(probe));
                 let truncated_payload = remaining_len > self.options.max_nested_pickle_bytes
-                    && truncated_pickle_prefix_requires_fail_closed(probe);
+                    && bounded_truncated_pickle_prefix_requires_fail_closed(
+                        &value[offset..],
+                        self.options.max_nested_pickle_bytes,
+                    );
                 if !complete_payload
                     && !operand_limit_exceeded
                     && !malformed_payload
@@ -5991,9 +6010,76 @@ impl<'a> ScanState<'a> {
             && is_repeated_single_byte(value.as_bytes())
     }
 
+    fn scan_encoded_nested_pickle_bytes_literal(
+        &mut self,
+        value: &[u8],
+        position: usize,
+    ) -> (bool, bool) {
+        let scan_limit = value.len().min(self.options.max_string_literal_scan_chars);
+        if scan_limit == value.len() {
+            return self.scan_encoded_nested_pickle_bytes_slice(value, position);
+        }
+
+        let mut found_candidate = false;
+        if scan_limit > 0 {
+            for slice in [
+                &value[..scan_limit],
+                &value[value.len().saturating_sub(scan_limit)..],
+            ] {
+                found_candidate |= self
+                    .scan_encoded_nested_pickle_bytes_slice(slice, position)
+                    .0;
+            }
+        }
+        self.record_literal_scan_truncated("bytes", value.len(), "encoded_nested_pickle", position);
+        (found_candidate, false)
+    }
+
+    fn scan_encoded_nested_pickle_bytes_slice(
+        &mut self,
+        value: &[u8],
+        position: usize,
+    ) -> (bool, bool) {
+        match std::str::from_utf8(value) {
+            Ok(value) => {
+                if self.is_large_uninteresting_repeated_literal(value) {
+                    (false, false)
+                } else {
+                    self.scan_encoded_nested_pickle_literal_outcome(value, position)
+                }
+            }
+            Err(_) => {
+                let sanitized = value
+                    .iter()
+                    .map(|byte| {
+                        if byte.is_ascii() {
+                            char::from(*byte)
+                        } else {
+                            '!'
+                        }
+                    })
+                    .collect::<String>();
+                if self.is_large_uninteresting_repeated_literal(&sanitized) {
+                    (false, false)
+                } else {
+                    self.scan_encoded_nested_pickle_literal_outcome(&sanitized, position)
+                }
+            }
+        }
+    }
+
     fn scan_encoded_nested_pickle_literal(&mut self, value: &str, position: usize) -> bool {
+        self.scan_encoded_nested_pickle_literal_outcome(value, position)
+            .1
+    }
+
+    fn scan_encoded_nested_pickle_literal_outcome(
+        &mut self,
+        value: &str,
+        position: usize,
+    ) -> (bool, bool) {
         if !encoded_literal_may_contain_pickle(value) {
-            return false;
+            return (false, false);
         }
 
         let whole_literal_is_encoded_pickle = encoded_pickle_consumes_literal(value);
@@ -6016,7 +6102,11 @@ impl<'a> ScanState<'a> {
 
         let max_window_chars =
             encoded_nested_window_char_limit(value, self.options.max_nested_pickle_bytes);
-        let probe_coverage_incomplete = encoded_nested_literal_probe_coverage_incomplete(value);
+        let probe_coverage_incomplete = encoded_nested_literal_probe_coverage_incomplete(
+            value,
+            max_window_chars,
+            self.options.max_nested_pickle_bytes,
+        );
         if !found_candidate
             && (value.len() <= max_window_chars || value.chars().count() <= max_window_chars)
         {
@@ -6028,10 +6118,15 @@ impl<'a> ScanState<'a> {
         let probe_limit_exceeded = probe_windows.limit_exceeded;
         let probe_limit_exceeded_encoding = probe_windows.limit_exceeded_encoding;
         for candidate in probe_windows.windows {
-            if found_candidate && candidate == value {
+            if found_candidate && candidate.synthetic_prefix_bytes == 0 && candidate.value == value
+            {
                 continue;
             }
-            found_candidate |= self.scan_encoded_nested_pickle_candidate(&candidate, position);
+            found_candidate |= self.scan_encoded_nested_pickle_candidate_with_synthetic_prefix(
+                &candidate.value,
+                position,
+                candidate.synthetic_prefix_bytes,
+            );
         }
 
         if probe_coverage_incomplete {
@@ -6048,11 +6143,11 @@ impl<'a> ScanState<'a> {
         }
 
         if found_candidate {
-            return whole_literal_is_encoded_pickle;
+            return (true, whole_literal_is_encoded_pickle);
         }
 
         if probe_coverage_incomplete || probe_limit_exceeded {
-            return false;
+            return (false, false);
         }
 
         if value.len() > self.options.max_string_literal_scan_chars
@@ -6065,17 +6160,36 @@ impl<'a> ScanState<'a> {
                 position,
             );
         }
-        false
+        (false, whole_literal_is_encoded_pickle)
     }
 
     fn scan_encoded_nested_pickle_candidate(&mut self, value: &str, position: usize) -> bool {
+        self.scan_encoded_nested_pickle_candidate_with_synthetic_prefix(value, position, 0)
+    }
+
+    fn scan_encoded_nested_pickle_candidate_with_synthetic_prefix(
+        &mut self,
+        value: &str,
+        position: usize,
+        synthetic_prefix_bytes: usize,
+    ) -> bool {
         let mut decoded_payload_found = false;
+        let scan_limit = self
+            .options
+            .max_nested_pickle_bytes
+            .saturating_add(synthetic_prefix_bytes);
         for DecodedNestedPayload {
             encoding,
-            payload: decoded,
+            payload: mut decoded,
             analysis_incomplete,
-        } in decode_possible_encoded_pickle(value, self.options.max_nested_pickle_bytes)
+        } in decode_possible_encoded_pickle(value, scan_limit)
         {
+            if synthetic_prefix_bytes > 0 {
+                if decoded.len() < synthetic_prefix_bytes {
+                    continue;
+                }
+                decoded.drain(..synthetic_prefix_bytes);
+            }
             decoded_payload_found = true;
             let nested_has_execution_opcode = has_execution_opcode(&decoded);
             let surface_outcome = self.surface_nested_pickle_findings(&decoded, encoding, position);
@@ -6094,10 +6208,11 @@ impl<'a> ScanState<'a> {
             );
         }
         let mut oversized_prefix_found = false;
-        for (encoding, payload_size) in
-            detect_oversized_encoded_pickle_prefixes(value, self.options.max_nested_pickle_bytes)
+        for (encoding, encoded_payload_size) in
+            detect_oversized_encoded_pickle_prefixes(value, scan_limit)
         {
             oversized_prefix_found = true;
+            let payload_size = encoded_payload_size.saturating_sub(synthetic_prefix_bytes);
             self.add_nested_payload_finding(
                 encoded_nested_payload_finding(encoding, payload_size, position, true, false),
                 true,

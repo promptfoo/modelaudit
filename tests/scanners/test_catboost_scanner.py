@@ -10,6 +10,7 @@ from urllib.parse import quote
 
 import pytest
 
+from modelaudit.analysis.unified_context import UnifiedMLContext
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.integrations.sarif_formatter import format_sarif_output
@@ -259,6 +260,38 @@ def test_scan_detects_correlated_command_and_network_indicators(tmp_path: Path) 
     assert correlation_checks
     assert correlation_checks[0].status == CheckStatus.FAILED
     assert correlation_checks[0].severity == IssueSeverity.CRITICAL
+    assert correlation_checks[0].details["same_fragment_correlation"] is True
+
+
+def test_whitelisted_catboost_downgrades_cross_fragment_correlation(tmp_path: Path) -> None:
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    model_path = tmp_path / "cross_fragment.cbm"
+    model_path.write_bytes(
+        _build_cbm(
+            [
+                "metadata",
+                "os.system('echo benchmark')",
+                "callback=https://collector.evil.example/upload",
+            ],
+        ),
+    )
+    scanner = CatBoostScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=model_path,
+        file_size=model_path.stat().st_size,
+        file_type=".cbm",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner.scan(str(model_path))
+
+    correlation_check = next(check for check in result.checks if check.name == "Command/Network Correlation Check")
+    assert correlation_check.status == CheckStatus.FAILED
+    assert correlation_check.severity == IssueSeverity.INFO
+    assert correlation_check.details["same_fragment_correlation"] is False
+    assert correlation_check.details["whitelist_downgrade"] is True
 
 
 def test_scan_detects_network_indicator_warning(tmp_path: Path) -> None:

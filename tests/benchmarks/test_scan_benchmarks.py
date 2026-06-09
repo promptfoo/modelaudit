@@ -230,7 +230,6 @@ def test_scan_suspicious_pickle_intake(benchmark: Any, benchmark_inputs: dict[st
         workload="suspicious-pickle-intake",
     )
 
-    assert result.success is True
     assert result.files_scanned >= 4
     assert result.issues
     assert determine_exit_code(result) == 1

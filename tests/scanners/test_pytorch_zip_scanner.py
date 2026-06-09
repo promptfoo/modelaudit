@@ -5,6 +5,7 @@ import struct
 import time
 import warnings
 import zipfile
+import zlib
 from collections.abc import Iterator
 from pathlib import Path
 from typing import IO, Any
@@ -149,6 +150,27 @@ def _patch_zip_member_central_compressed_size(zip_path: Path, member_name: str, 
         filename_end = filename_start + filename_len
         if archive_bytes[filename_start:filename_end] == member_name.encode("utf-8"):
             struct.pack_into("<I", archive_bytes, cursor + 20, compressed_size)
+            zip_path.write_bytes(archive_bytes)
+            return
+        cursor = filename_end + extra_len + comment_len
+
+    raise AssertionError(f"Unable to locate central directory entry for {member_name}")
+
+
+def _patch_zip_member_central_target_prefix(zip_path: Path, member_name: str, prefix: bytes) -> None:
+    with zipfile.ZipFile(zip_path, "r") as zip_file:
+        central_directory_offset = zip_file.start_dir
+
+    archive_bytes = bytearray(zip_path.read_bytes())
+    cursor = central_directory_offset
+    while cursor < len(archive_bytes) and archive_bytes[cursor : cursor + 4] == b"PK\x01\x02":
+        filename_len, extra_len, comment_len = struct.unpack_from("<HHH", archive_bytes, cursor + 28)
+        filename_start = cursor + 46
+        filename_end = filename_start + filename_len
+        if archive_bytes[filename_start:filename_end] == member_name.encode("utf-8"):
+            struct.pack_into("<I", archive_bytes, cursor + 16, zlib.crc32(prefix))
+            struct.pack_into("<I", archive_bytes, cursor + 20, len(prefix))
+            struct.pack_into("<I", archive_bytes, cursor + 24, len(prefix))
             zip_path.write_bytes(archive_bytes)
             return
         cursor = filename_end + extra_len + comment_len
@@ -7382,6 +7404,26 @@ def test_pytorch_zip_symlink_parent_target_inside_archive_root_is_safe(tmp_path:
     assert not any(issue.rule_code in {"S406", "S408"} for issue in result.issues)
 
 
+def test_pytorch_zip_dos_creator_does_not_treat_unix_mode_bits_as_symlink(tmp_path: Path) -> None:
+    zip_path = tmp_path / "dos-creator-mode-bits.pt"
+    with zipfile.ZipFile(zip_path, "w") as zip_file:
+        zip_file.writestr("version", "3")
+        zip_file.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        ordinary_info = zipfile.ZipInfo("models/ordinary.bin")
+        ordinary_info.create_system = 0
+        ordinary_info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        zip_file.writestr(ordinary_info, b"ordinary data")
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "Symlink Safety Validation" and check.details.get("entry") == "models/ordinary.bin"
+        for check in result.checks
+    )
+    assert not any(check.rule_code in {"S406", "S408"} for check in result.checks)
+    assert not any(issue.rule_code in {"S406", "S408"} for issue in result.issues)
+
+
 @pytest.mark.parametrize(("target", "reason"), [(b"", "empty"), (b"safe\x00outside", "NUL byte")])
 def test_pytorch_zip_symlink_invalid_targets_are_critical(tmp_path: Path, target: bytes, reason: str) -> None:
     zip_path = tmp_path / "invalid-link-target.pt"
@@ -7436,6 +7478,26 @@ def test_pytorch_zip_symlink_non_utf8_external_target_is_critical(tmp_path: Path
     assert symlink_check.details["target_class"] == "external"
     assert not any(check.rule_code == "S902" for check in result.checks)
     assert "pytorch_zip_symlink_target_read_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_pytorch_zip_symlink_central_sizes_cannot_hide_escaping_suffix(tmp_path: Path) -> None:
+    zip_path = tmp_path / "truncated-central-size-link-target.pt"
+    link_name = "models/link"
+    _write_pytorch_zip_with_symlink(zip_path, link_name, "safe/../../../outside")
+    _patch_zip_member_central_target_prefix(zip_path, link_name, b"safe")
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    symlink_check = next(
+        check
+        for check in result.checks
+        if check.name == "Symlink Safety Validation" and check.details.get("entry") == link_name
+    )
+    assert result.success is False
+    assert symlink_check.status == CheckStatus.FAILED
+    assert symlink_check.severity == IssueSeverity.CRITICAL
+    assert symlink_check.rule_code == "S406"
+    assert symlink_check.details["target_class"] == "invalid"
 
 
 def test_pytorch_zip_symlink_target_evidence_is_bounded(tmp_path: Path) -> None:

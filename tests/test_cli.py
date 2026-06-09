@@ -6,9 +6,12 @@ import logging
 import os
 import re
 import stat
+import struct
 import subprocess
 import sys
 import types
+from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -23,6 +26,9 @@ from modelaudit.cli import (
     _create_path_progress_callback,
     _display_error,
     _display_path,
+    _display_scan_path,
+    _explicit_local_shard_family_groups,
+    _format_scan_output,
     _resolve_scan_runtime_config,
     _ScanPathState,
     _summarize_progress_tree,
@@ -112,6 +118,84 @@ def create_mock_scan_result(**kwargs: Any) -> ModelAuditResultModel:
 
     result.finalize_statistics()
     return result
+
+
+def test_format_scan_json_redacts_sources_without_corrupting_result_metadata() -> None:
+    first_url = "s3://bucket/model.pkl?token=first-secret"
+    second_url = "s3://bucket/model.pkl?token=second-secret"
+    result = create_mock_scan_result(
+        issues=[
+            {
+                "message": f"Dangerous payload from {first_url}",
+                "severity": "critical",
+                "location": first_url,
+                "details": {
+                    first_url: {"finding": "first"},
+                    second_url: {"finding": "second"},
+                    "refreshToken": "nested-secret",
+                    "password_policy": "preserve-near-match",
+                },
+            }
+        ],
+        file_metadata={
+            first_url: {"file_size": 1, "source_url": first_url},
+            second_url: {"file_size": 2, "source_url": second_url},
+        },
+    )
+    original_metadata_keys = list(result.file_metadata)
+
+    output = _format_scan_output(
+        result,
+        [first_url, second_url],
+        output_format="json",
+        verbose=True,
+    )
+
+    payload: dict[str, Any] = json.loads(output)
+    assert list(result.file_metadata) == original_metadata_keys
+    assert len(payload["file_metadata"]) == 2
+    assert [metadata["file_size"] for metadata in payload["file_metadata"].values()] == [1, 2]
+    assert list(payload["issues"][0]["details"].values()) == [
+        {"finding": "first"},
+        {"finding": "second"},
+        "<redacted>",
+        "preserve-near-match",
+    ]
+    assert "first-secret" not in output
+    assert "second-secret" not in output
+    assert "nested-secret" not in output
+
+    text_output = _format_scan_output(
+        result,
+        [first_url, second_url],
+        output_format="text",
+        verbose=True,
+    )
+    assert "first-secret" not in text_output
+    assert "second-secret" not in text_output
+    assert "nested-secret" not in text_output
+
+
+def test_format_scan_json_preserves_pydantic_json_serialization() -> None:
+    result = create_mock_scan_result(
+        issues=[
+            {
+                "message": "Serializable details",
+                "severity": "warning",
+                "details": {
+                    "path": Path("models/model.pkl"),
+                    "timestamp": datetime(2026, 6, 8, 12, 30, tzinfo=timezone.utc),
+                },
+            }
+        ]
+    )
+
+    payload = json.loads(_format_scan_output(result, [], output_format="json", verbose=True))
+
+    assert payload["issues"][0]["details"] == {
+        "path": "models/model.pkl",
+        "timestamp": "2026-06-08T12:30:00Z",
+    }
 
 
 def test_cli_help():
@@ -603,6 +687,268 @@ def test_scan_multiple_paths(tmp_path):
     )
 
 
+def test_scan_multiple_cross_directory_shards_reconciles_complete_family(tmp_path: Path) -> None:
+    """Explicit shard paths should be reconciled across their separate parent directories."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    for shard_index in range(1, 4):
+        shard_dir = tmp_path / f"part-{shard_index}"
+        shard_dir.mkdir()
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00003.safetensors"
+        shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+        shard_paths.append(str(shard_path))
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", *shard_paths, "--assume-shard-family", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 3
+    assert output_payload["success"] is True
+    assert not any(
+        check.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for check in output_payload["checks"]
+    )
+    assert not any(
+        issue.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for issue in output_payload["issues"]
+    )
+
+
+def test_scan_cross_directory_shards_ignores_duplicate_explicit_argument(tmp_path: Path) -> None:
+    """Repeating one exact shard argument must not invalidate a complete family."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    for shard_index in range(1, 3):
+        shard_dir = tmp_path / f"part-{shard_index}"
+        shard_dir.mkdir()
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+        shard_paths.append(str(shard_path))
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            *shard_paths,
+            shard_paths[0],
+            "--assume-shard-family",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 2
+    assert output_payload["success"] is True
+    assert not any(
+        record.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for record in [*output_payload["checks"], *output_payload["issues"]]
+    )
+
+
+def test_scan_cross_directory_shards_preserves_nonexistent_path_error(tmp_path: Path) -> None:
+    """Shard reconciliation must not clear a separate caller-level path error."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    for shard_index in range(1, 3):
+        shard_dir = tmp_path / f"part-{shard_index}"
+        shard_dir.mkdir()
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+        shard_paths.append(str(shard_path))
+    nonexistent_path = tmp_path / "missing.safetensors"
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            *shard_paths,
+            str(nonexistent_path),
+            "--assume-shard-family",
+            "--format",
+            "json",
+            "--no-cache",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2, result.output
+    assert f"Path does not exist: {nonexistent_path}" in result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["has_errors"] is True
+    assert output_payload["success"] is False
+    assert not any(
+        check.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for check in output_payload["checks"]
+    )
+    assert not any(
+        issue.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for issue in output_payload["issues"]
+    )
+
+
+def test_scan_multiple_cross_directory_shards_reconciles_independent_families(tmp_path: Path) -> None:
+    """Explicit opt-in should keep independently templated shard families separate."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    for family_name in ("model-a", "model-b"):
+        for shard_index, shard_directory_name in ((1, "left"), (2, "right")):
+            shard_dir = tmp_path / family_name / shard_directory_name
+            shard_dir.mkdir(parents=True)
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+            shard_paths.append(str(shard_path))
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", *shard_paths, "--assume-shard-family", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 4
+    assert output_payload["success"] is True
+    assert not any(
+        check.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for check in output_payload["checks"]
+    )
+    assert not any(
+        issue.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for issue in output_payload["issues"]
+    )
+
+
+def test_scan_cross_directory_shards_keeps_ambiguous_incomplete_families(tmp_path: Path) -> None:
+    """Unmatched shards must not complete each other through a shared fallback group."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    incomplete_paths: set[str] = set()
+    for family_name, shard_directory_name, shard_index in (
+        ("complete", "left", 1),
+        ("complete", "right", 2),
+        ("incomplete-a", "left", 1),
+        ("incomplete-b", "right", 2),
+    ):
+        shard_dir = tmp_path / family_name / shard_directory_name
+        shard_dir.mkdir(parents=True)
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+        shard_paths.append(str(shard_path))
+        if family_name.startswith("incomplete-"):
+            incomplete_paths.add(str(shard_path))
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", *shard_paths, "--assume-shard-family", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 4
+    assert output_payload["success"] is False
+    missing_locations = {
+        issue.get("location")
+        for issue in output_payload["issues"]
+        if issue.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+    }
+    assert missing_locations == incomplete_paths
+
+
+def test_scan_directory_does_not_assume_cross_directory_shard_family(tmp_path: Path) -> None:
+    """The explicit-family opt-in must not combine shards discovered through a directory input."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    for shard_index, family_name in ((1, "model-a"), (2, "model-b")):
+        shard_dir = tmp_path / family_name
+        shard_dir.mkdir()
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", str(tmp_path), "--assume-shard-family", "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is False
+    assert any(
+        check.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for check in output_payload["checks"]
+    )
+    assert any(
+        issue.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for issue in output_payload["issues"]
+    )
+
+
+def test_explicit_shard_family_groups_reject_resolved_non_shard_target(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """A shard-looking symlink must not opt its non-shard target into reconciliation."""
+    target = tmp_path / "payload.bin"
+    target.write_bytes(b"not a shard")
+    shard_link = tmp_path / "model-00001-of-00002.safetensors"
+    shard_link.symlink_to(target)
+
+    assert _explicit_local_shard_family_groups((str(shard_link),)) == {}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes are required")
+def test_explicit_shard_family_groups_reject_publicly_writable_parents(tmp_path: Path) -> None:
+    """Cross-directory reconciliation must not trust mutable public staging directories."""
+    shard_paths: list[str] = []
+    for shard_index in range(1, 3):
+        shard_dir = tmp_path / f"part-{shard_index}"
+        shard_dir.mkdir(mode=0o777)
+        shard_dir.chmod(0o777)
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(b"shard")
+        shard_paths.append(str(shard_path))
+
+    assert _explicit_local_shard_family_groups(tuple(shard_paths)) == {}
+
+
+def test_scan_multiple_cross_directory_shards_requires_explicit_family_opt_in(tmp_path: Path) -> None:
+    """Numeric directory names must not silently merge unrelated local checkpoints."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shard_paths: list[str] = []
+    for shard_index in range(1, 3):
+        shard_dir = tmp_path / f"checkpoint-{shard_index}"
+        shard_dir.mkdir()
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+        shard_paths.append(str(shard_path))
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", *shard_paths, "--format", "json", "--no-cache"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is False
+    assert any(
+        check.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for check in output_payload["checks"]
+    )
+    assert any(
+        issue.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for issue in output_payload["issues"]
+    )
+
+
 def test_scan_with_blacklist(tmp_path):
     """Test scanning with blacklist patterns."""
     test_file = tmp_path / "test_file.dat"
@@ -684,6 +1030,29 @@ def test_scan_json_output_to_file(tmp_path: Path) -> None:
     assert f"Results written to {output_file}" in result.output
 
 
+def test_scan_output_confirmation_escapes_terminal_controls(tmp_path: Path) -> None:
+    test_file = tmp_path / "test_file.dat"
+    test_file.write_bytes(b"test content")
+    output_file = tmp_path / "report\nFORGED\x1b[2J.json"
+    scan_result = create_mock_scan_result(files_scanned=1, issues=[])
+
+    with (
+        patch("modelaudit.cli.scan_model_directory_or_file", return_value=scan_result),
+        patch("modelaudit.cli._preflight_output_text_file"),
+        patch("modelaudit.cli._write_output_text_file") as mock_write_output,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["scan", str(test_file), "--format", "json", "--output", str(output_file)],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert mock_write_output.call_args.args[0] == str(output_file)
+    assert "report\\nFORGED\\x1b[2J.json" in result.output
+    assert "\nFORGED" not in result.output
+    assert "\x1b" not in result.output
+
+
 def test_scan_json_to_stdout_no_progress_interference(tmp_path):
     """Test that JSON to stdout remains valid (no progress output mixed in)."""
     test_file = tmp_path / "test_file.dat"
@@ -716,6 +1085,31 @@ def test_scan_sbom_output(tmp_path):
         json.loads(sbom_file.read_text())
     except json.JSONDecodeError:
         pytest.fail("SBOM output is not valid JSON")
+
+
+def test_scan_sbom_preserves_format_character_filename_identity(tmp_path: Path) -> None:
+    import hashlib
+    import pickle
+
+    content = pickle.dumps({"weights": [1, 2, 3]})
+    model_path = tmp_path / "model\u202ename.pkl"
+    model_path.write_bytes(content)
+    sbom_file = tmp_path / "sbom.json"
+    scan_result = create_mock_scan_result(
+        assets=[{"path": str(model_path), "type": "pickle", "size": len(content)}],
+    )
+
+    with patch("modelaudit.cli.scan_model_directory_or_file", return_value=scan_result):
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--quiet", "--no-cache", "--sbom", str(sbom_file), str(model_path)],
+        )
+
+    assert result.exit_code == 0, result.output
+    sbom = json.loads(sbom_file.read_text())
+    component = next(component for component in sbom["components"] if component["name"] == model_path.name)
+    assert component["name"] == "model\u202ename.pkl"
+    assert component["hashes"] == [{"alg": "SHA-256", "content": hashlib.sha256(content).hexdigest()}]
 
 
 def test_cli_report_writers_reject_symlink_outputs(tmp_path: Path, requires_symlinks: None) -> None:
@@ -2533,6 +2927,224 @@ def test_format_text_output():
     # Verbose might include details, but we can't guarantee it
 
 
+def test_format_text_output_escapes_terminal_controls_in_issues(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NO_COLOR", "1")
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [
+            {
+                "message": "unsafe\x1b[2Jtitle\x07",
+                "severity": "warning",
+                "location": "archive.zip\nFORGED",
+                "why": "why\ttext",
+                "details": {"detail\x7fkey": "value\rnext"},
+            },
+        ],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=True)
+
+    assert "\x1b[2J" not in output
+    assert "\x07" not in output
+    assert "\x7f" not in output
+    assert "archive.zip\nFORGED" not in output
+    assert "value\rnext" not in output
+    assert "unsafe\\x1b[2Jtitle\\x07" in output
+    assert "archive.zip\\nFORGED" in output
+    assert "why\\ttext" in output
+    assert "detail\\x7fkey:" in output
+    assert "value\\rnext" in output
+
+
+def test_format_text_output_escapes_terminal_controls_in_failed_checks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NO_COLOR", "1")
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "total_checks": 1,
+        "passed_checks": 0,
+        "failed_checks": 1,
+        "checks": [
+            {
+                "status": "failed",
+                "name": "Member\x1bName",
+                "message": "bad\r\nline",
+            },
+        ],
+        "issues": [],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+
+    assert "\x1bName" not in output
+    assert "bad\r\nline" not in output
+    assert "Member\\x1bName: bad\\r\\nline" in output
+
+
+def test_format_text_output_escapes_unicode_controls_and_preserves_missing_location(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NO_COLOR", "1")
+    results = {
+        "files_scanned": 1,
+        "issues": [
+            {
+                "message": "hidden\u200djoiner\U000e0001tag",
+                "severity": "warning",
+                "location": None,
+            },
+        ],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results)
+
+    assert "[None]" not in output
+    assert "\u200d" not in output
+    assert "\U000e0001" not in output
+    assert "hidden\\u200djoiner\\U000e0001tag" in output
+
+
+def test_format_text_output_escapes_untrusted_model_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NO_COLOR", "1")
+    results = {
+        "files_scanned": 1,
+        "file_metadata": {
+            "config.json": {
+                "model_info": {
+                    "model_type": "bert\x1b[2J",
+                    "architectures": ["Safe", "Spoof\u202eName"],
+                    "num_layers": "12\nFORGED",
+                    "hidden_size": "768\u200bhidden",
+                    "vocab_size": "oops\x07",
+                    "framework_version": "4.0\rnext",
+                },
+            },
+        },
+        "issues": [],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results)
+
+    assert "bert\\x1b[2J" in output
+    assert "Safe, Spoof\\u202eName" in output
+    assert "12\\nFORGED" in output
+    assert "768\\u200bhidden" in output
+    assert "oops\\x07" in output
+    assert "4.0\\rnext" in output
+
+
+def test_display_helpers_escape_terminal_controls() -> None:
+    path = "model\x1b[2J\u202efile.pkl"
+    error = RuntimeError("failed\nFORGED\u200btext")
+
+    assert _display_path(path) == "model\\x1b[2J\\u202efile.pkl"
+    assert _display_error(error, path) == "failed\\nFORGED\\u200btext"
+
+
+def test_display_scan_path_preserves_exact_local_path_for_reports() -> None:
+    path = "model\nname\u202e.pkl"
+
+    assert _display_scan_path(path) == path
+    assert _display_path(path) == "model\\nname\\u202e.pkl"
+
+
+def test_metadata_terminal_messages_escape_controls(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.bin"
+    model_path.write_bytes(b"model")
+    output_path = tmp_path / "metadata\nFORGED.json"
+
+    with (
+        patch("modelaudit.metadata_extractor.ModelMetadataExtractor.extract", return_value={}),
+        patch("modelaudit.cli._write_output_text_file") as mock_write_output,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["metadata", str(model_path), "--format", "json", "--output", str(output_path)],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert mock_write_output.call_args.args[0] == str(output_path)
+    assert "metadata\\nFORGED.json" in result.output
+    assert "\nFORGED" not in result.output
+
+    with patch(
+        "modelaudit.metadata_extractor.ModelMetadataExtractor.extract",
+        side_effect=RuntimeError("failed\nFORGED\x1b[2J"),
+    ):
+        error_result = CliRunner().invoke(cli, ["metadata", str(model_path)])
+
+    assert error_result.exit_code == 1
+    assert "failed\\nFORGED\\x1b[2J" in error_result.output
+    assert "\nFORGED" not in error_result.output
+    assert "\x1b" not in error_result.output
+
+
+def test_skipped_path_and_suppression_messages_escape_terminal_controls(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    runtime = cast(
+        Any,
+        types.SimpleNamespace(skip_non_model_files=True, show_styled_output=True),
+    )
+
+    skipped_path = tmp_path / "skip\x1b[2J.py"
+
+    with patch("modelaudit.cli._local_path_will_be_scanned", return_value=False):
+        assert cli_module._should_skip_non_model_file(str(skipped_path), runtime, verbose=True)
+    cli_module._announce_suppressed_preferred_scanners(
+        [{"location": "archive\nFORGED.pkl", "scanner_id": "pickle\u202escanner"}]
+    )
+
+    captured = capsys.readouterr()
+    assert "Skipping non-model file:" in captured.out
+    assert "skip\\x1b[2J.py" in captured.out
+    assert "archive\\nFORGED.pkl" in captured.err
+    assert "pickle\\u202escanner" in captured.err
+
+
+def test_format_metadata_table_escapes_untrusted_values() -> None:
+    single_output = cli_module._format_metadata_table(
+        {
+            "file": "model\x1b[2J.onnx",
+            "format": "onnx\u202e",
+            "file_size": "unknown\nFORGED",
+            "producer\u200bname": "tool\x07",
+            "metadata": {"key\rnext": "value\u2066hidden"},
+            "tags": ["safe", "tag\U000e0001hidden"],
+        }
+    )
+    directory_output = cli_module._format_metadata_table(
+        {
+            "directory": "models\nFORGED",
+            "summary": {"total_files": 1, "formats": {"gguf\u202e": 1}},
+            "files": [
+                {
+                    "file": "bad\x1b[2J.gguf",
+                    "error": "decode\rfailed",
+                }
+            ],
+        }
+    )
+
+    assert "model\\x1b[2J.onnx" in single_output
+    assert "onnx\\u202e" in single_output
+    assert "unknown\\nFORGED" in single_output
+    assert "Producer\\u200bName: tool\\x07" in single_output
+    assert "key\\rnext: value\\u2066hidden" in single_output
+    assert "tag\\U000e0001hidden" in single_output
+    assert "models\\nFORGED" in directory_output
+    assert "gguf\\u202e: 1" in directory_output
+    assert "bad\\x1b[2J.gguf (error: decode\\rfailed)" in directory_output
+
+
 def test_format_text_output_only_debug_issues():
     """Ensure debug-only issues result in a success status."""
     results = {
@@ -2733,6 +3345,72 @@ def test_scan_huggingface_url_passes_max_size_to_download(
     mock_rmtree.assert_called()
 
 
+def test_scan_huggingface_metadata_preview_escapes_model_id(tmp_path: Path) -> None:
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "model.bin").write_bytes(b"weights")
+
+    with (
+        patch("modelaudit.cli.is_huggingface_url", return_value=True),
+        patch(
+            "modelaudit.utils.sources.huggingface.get_model_info",
+            return_value={
+                "model_id": "org/model\nFORGED\u202e",
+                "total_size": 1024,
+                "file_count": "2\x1b[2J",
+            },
+        ),
+        patch("modelaudit.cli.download_model", return_value=downloaded_dir),
+        patch(
+            "modelaudit.cli.scan_model_directory_or_file",
+            return_value=create_mock_scan_result(files_scanned=1, issues=[]),
+        ),
+        patch("shutil.rmtree"),
+    ):
+        result = CliRunner().invoke(cli, ["scan", "--no-cache", "--format", "text", "hf://org/model"])
+
+    assert result.exit_code == 0, result.output
+    assert "org/model\\nFORGED\\u202e" in result.output
+    assert "2\\x1b[2J files" in result.output
+    assert "org/model\nFORGED\u202e" not in result.output
+
+
+def test_scan_huggingface_metadata_preflight_verbose_log_is_sanitized(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    url = "https://huggingface.co/org/model?token=secret-token"
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "model.bin").write_bytes(b"weights")
+
+    with (
+        patch("modelaudit.cli.is_huggingface_url", return_value=True),
+        patch(
+            "modelaudit.utils.sources.huggingface.get_model_info",
+            side_effect=RuntimeError(f"metadata failed for {url}\nFORGED"),
+        ),
+        patch("modelaudit.cli.download_model", return_value=downloaded_dir),
+        patch(
+            "modelaudit.cli.scan_model_directory_or_file",
+            return_value=create_mock_scan_result(files_scanned=1, issues=[]),
+        ),
+        patch("shutil.rmtree"),
+        caplog.at_level(logging.DEBUG, logger="modelaudit"),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--verbose", "--no-cache", "--format", "text", url],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "https://huggingface.co/org/model" in caplog.text
+    assert "metadata failed" in caplog.text
+    assert "\\nFORGED" in caplog.text
+    assert "secret-token" not in caplog.text
+    assert "?token=" not in caplog.text
+
+
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.cli.download_model")
 def test_scan_huggingface_url_download_failure(mock_download, mock_is_hf_url):
@@ -2817,23 +3495,38 @@ def test_scan_huggingface_file_passes_max_size_and_cleans_temp_dir(
 
 
 @patch("modelaudit.cli.download_file_from_hf")
-def test_scan_huggingface_file_download_failure_redacts_url(mock_download_file):
-    """Redact direct-file URL secrets from CLI download failures."""
-    mock_download_file.side_effect = Exception(
-        "Failed request https://huggingface.co/test/model/resolve/main/file.bin?token=hf_secret"
-    )
+def test_scan_huggingface_file_download_failure_redacts_url(
+    mock_download_file: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Redact secrets from chained direct-file download failures."""
+
+    def raise_chained_download_error(*_args: Any, **_kwargs: Any) -> None:
+        try:
+            raise ValueError(
+                "Failed request https://huggingface.co/test/model/resolve/main/file.bin?token=hf_secret\nFORGED\x1b[2J"
+            )
+        except ValueError as cause:
+            raise RuntimeError("Download failed") from cause
+
+    mock_download_file.side_effect = raise_chained_download_error
 
     runner = CliRunner()
-    result = runner.invoke(
-        cli,
-        ["scan", "https://huggingface.co/test/model/resolve/main/file.bin?token=hf_secret"],
-    )
+    with caplog.at_level(logging.ERROR, logger="modelaudit"):
+        result = runner.invoke(
+            cli,
+            ["scan", "--verbose", "https://huggingface.co/test/model/resolve/main/file.bin?token=hf_secret"],
+        )
 
     output = strip_ansi(result.output)
     assert result.exit_code == 2
     assert "hf_secret" not in output
     assert "token=" not in output
     assert "https://huggingface.co/test/model/resolve/main/file.bin" in output
+    assert "hf_secret" not in caplog.text
+    assert "token=" not in caplog.text
+    assert "\nFORGED" not in caplog.text
+    assert "\x1b" not in caplog.text
 
 
 @pytest.mark.parametrize(("max_size", "expected_bytes"), [("2KB", 2048), ("0", 0)])
@@ -3229,6 +3922,7 @@ def test_scan_pytorchhub_stream_passes_max_download_bytes(
     assert result.exit_code == 0
     assert mock_download_streaming.call_args.kwargs["max_size"] == 5 * 1024
     assert mock_download_streaming.call_args.kwargs["timeout"] > 0
+    assert mock_scan_streaming.call_args.kwargs["shard_family_group"].startswith("stream-invocation:")
 
 
 @pytest.mark.parametrize(
@@ -3321,6 +4015,7 @@ def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_s
     streaming_provenance = mock_scan_streaming.call_args.kwargs["_trusted_source_provenance"]
     assert streaming_provenance.model_id == "test/streaming-model"
     assert streaming_provenance.model_source == "huggingface"
+    assert mock_scan_streaming.call_args.kwargs["shard_family_group"].startswith("stream-invocation:")
 
     # Verify content_hash is in JSON output
     try:
@@ -3330,6 +4025,61 @@ def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_s
         assert output_json["files_scanned"] == 3
     except json.JSONDecodeError:
         pytest.fail("Output is not valid JSON")
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+def test_scan_huggingface_cached_stream_reconciles_snapshot_alias_shards(
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """A cache-enabled HF stream should trust aliases of one logical snapshot parent."""
+    mock_is_hf_url.return_value = True
+    header = b'{"__metadata__":{"format":"pt"}}'
+    cache_root = tmp_path / "persistent-cache"
+    snapshot_dir = cache_root / "huggingface" / "models--test--model" / "snapshots" / _HF_TEST_REVISION
+    snapshot_dir.mkdir(parents=True)
+    alias_root = cache_root / "huggingface" / "test" / "model"
+    alias_root.mkdir(parents=True)
+    first_alias = alias_root / "cache-a"
+    second_alias = alias_root / "cache-b"
+    first_alias.symlink_to(snapshot_dir, target_is_directory=True)
+    second_alias.symlink_to(snapshot_dir, target_is_directory=True)
+
+    def file_generator() -> Iterator[tuple[Path, bool]]:
+        for shard_index, alias_path in ((1, first_alias), (2, second_alias)):
+            shard_name = f"model-{shard_index:05d}-of-00002.safetensors"
+            snapshot_path = snapshot_dir / shard_name
+            snapshot_path.write_bytes(struct.pack("<Q", len(header)) + header)
+            yield (alias_path / shard_name, shard_index == 2)
+
+    mock_download_streaming.return_value = file_generator()
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--stream",
+            "--quiet",
+            "--format",
+            "json",
+            "--cache-dir",
+            str(cache_root),
+            "hf://test/model",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is True
+    assert output_payload["files_scanned"] == 2
+    assert not any(
+        record.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for record in [*output_payload["checks"], *output_payload["issues"]]
+    )
 
 
 @patch("modelaudit.cli.is_huggingface_url")
@@ -3820,6 +4570,7 @@ def test_scan_cloud_url_streaming_passes_scanner_selection_to_content_filter(
     assert mock_download_streaming.call_args.kwargs["scannable_extensions"] == frozenset({".safetensors"})
     assert mock_download_streaming.call_args.kwargs["scannable_filenames"] == frozenset()
     assert mock_download_streaming.call_args.kwargs["scanner_selection"]["enabled_scanner_ids"] == ["safetensors"]
+    assert mock_scan_streaming.call_args.kwargs["shard_family_group"].startswith("stream-invocation:")
 
 
 @patch("os.remove")
@@ -4027,6 +4778,61 @@ def test_scan_path_state_redacts_stream_fallback_for_sbom() -> None:
     path_state.track_streaming_paths_for_sbom(create_initial_audit_result(), url)
 
     assert path_state.scanned_paths == ["stream://https://bucket.s3.amazonaws.com/model.bin"]
+
+
+def test_scan_path_state_preserves_local_asset_path_for_sbom() -> None:
+    local_path = "model\nname.pkl"
+    scan_result = create_mock_scan_result(assets=[{"path": local_path, "type": "pickle"}])
+    path_state = _ScanPathState()
+
+    path_state.track_streaming_paths_for_sbom(scan_result, None)
+
+    assert path_state.scanned_paths == [local_path]
+
+
+def test_progress_callback_escapes_model_controlled_messages(tmp_path: Path) -> None:
+    model_path = tmp_path / "model\nname.pkl"
+
+    class _Stats:
+        total_bytes = 0
+        total_items = 0
+
+    class _Tracker:
+        stats = _Stats()
+
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        def set_phase(self, _phase: object, message: str) -> None:
+            self.messages.append(message)
+
+        def update_bytes(self, _bytes_processed: int, message: str) -> None:
+            self.messages.append(message)
+
+    tracker = _Tracker()
+    callback = _create_path_progress_callback(
+        spinner=None,
+        progress_tracker=tracker,
+        actual_path=str(model_path),
+    )
+
+    assert callback is not None
+    callback("Scanning member\nFORGED\x1b[2J", 50.0)
+
+    assert tracker.messages[0].endswith("model\\nname.pkl")
+    assert tracker.messages[1:] == ["Scanning member\\nFORGED\\x1b[2J", "Scanning member\\nFORGED\\x1b[2J"]
+
+
+def test_progress_callback_wrapper_escapes_spinner_message() -> None:
+    callback = MagicMock()
+    spinner = types.SimpleNamespace(text="")
+    wrapped_callback = cli_module.create_progress_callback_wrapper(callback, spinner)
+
+    assert wrapped_callback is not None
+    wrapped_callback("Scanning member\nFORGED\x1b[2J", 50.0)
+
+    callback.assert_called_once_with("Scanning member\nFORGED\x1b[2J", 50.0)
+    assert spinner.text == "Scanning member\\nFORGED\\x1b[2J"
 
 
 def test_scan_stream_unexpected_verbose_error_omits_raw_traceback(caplog: pytest.LogCaptureFixture) -> None:
@@ -4614,6 +5420,37 @@ def test_scan_mlflow_uri_budget_refusal_is_not_recorded_as_completed(
     mock_record_download_completed.assert_not_called()
 
 
+@patch("modelaudit.cli.record_download_completed")
+@patch("modelaudit.integrations.mlflow.scan_mlflow_model")
+def test_scan_mlflow_uri_path_refusal_is_not_recorded_as_completed(
+    mock_scan_mlflow: MagicMock,
+    mock_record_download_completed: MagicMock,
+) -> None:
+    """Staging safety refusals must not emit successful-download output or telemetry."""
+    mock_scan_mlflow.return_value = create_mock_scan_result(
+        bytes_scanned=0,
+        issues=[
+            {
+                "message": "MLflow staging directory changed during artifact download",
+                "severity": "info",
+                "type": "mlflow_download_path",
+            }
+        ],
+        files_scanned=0,
+        has_errors=True,
+        success=False,
+        scanners=["mlflow"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--format", "text", "models:/TestModel/1"])
+
+    assert result.exit_code == 2
+    assert "Download refused by MLflow staging safety checks" in result.output
+    assert "Downloaded and scanned successfully" not in result.output
+    mock_record_download_completed.assert_not_called()
+
+
 @patch("modelaudit.integrations.mlflow.scan_mlflow_model")
 def test_scan_mlflow_uri_with_cache_dir(mock_scan_mlflow: MagicMock, tmp_path: Path) -> None:
     """Test scanning an MLflow URI with an explicit cache directory."""
@@ -4665,18 +5502,26 @@ def test_scan_mlflow_uri_no_cache_overrides_cache_dir(mock_scan_mlflow: MagicMoc
 
 
 @patch("modelaudit.integrations.mlflow.scan_mlflow_model")
-def test_scan_mlflow_uri_error(mock_scan_mlflow):
+def test_scan_mlflow_uri_error(
+    mock_scan_mlflow: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Test error handling for MLflow URI scanning."""
-    # Setup mock to raise an error
-    mock_scan_mlflow.side_effect = Exception("MLflow connection failed")
+    mock_scan_mlflow.side_effect = Exception("MLflow connection failed token=mlflow_secret\nFORGED\x1b[2J")
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "models:/TestModel/1"])
+    with caplog.at_level(logging.ERROR, logger="modelaudit"):
+        result = runner.invoke(cli, ["scan", "--verbose", "models:/TestModel/1"])
 
-    # Should fail with error code 2
     assert result.exit_code == 2
     assert "Error downloading model" in result.output
     assert "MLflow connection failed" in result.output
+    assert "mlflow_secret" not in result.output
+    assert "\nFORGED" not in result.output
+    assert "\x1b" not in result.output
+    assert "mlflow_secret" not in caplog.text
+    assert "\nFORGED" not in caplog.text
+    assert "\x1b" not in caplog.text
 
 
 @patch("modelaudit.integrations.mlflow.scan_mlflow_model")
