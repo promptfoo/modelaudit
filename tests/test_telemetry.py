@@ -534,14 +534,17 @@ class TestTelemetryClient:
             assert sorted(properties["scanners_used"]) == ["pickle", "zip"]
             assert "files_scanned" not in properties
             assert "file_identifiers" not in properties
-            assert properties["model_references"] == ["a.pkl", "b.zip"]
+            assert "model_references" not in properties
+            assert properties["asset_reference_types"] == ["file:.pkl", "file:.zip"]
             canonical_issue = next(
                 (detail for detail in properties["issue_details"] if detail["type"] == "pickle_dangerous_global"),
                 None,
             )
             assert canonical_issue is not None, "Expected issue detail with type 'pickle_dangerous_global'"
-            assert canonical_issue["model_name"] == "a.pkl"
-            assert canonical_issue["model_reference"] == "a.pkl"
+            assert "model_name" not in canonical_issue
+            assert "model_reference" not in canonical_issue
+            assert "location_file_extension" not in canonical_issue
+            assert "location_reference_type" not in canonical_issue
             missing_location_issue = next(
                 (
                     detail
@@ -554,10 +557,13 @@ class TestTelemetryClient:
                 "Expected issue detail with type 'unknown_issue' and location_type 'unknown'"
             )
             assert missing_location_issue["location_type"] == "unknown"
-            assert missing_location_issue["model_name"] is None
-            assert missing_location_issue["model_reference"] is None
+            assert "location_file_extension" not in missing_location_issue
+            assert "location_reference_type" not in missing_location_issue
             assert "location_identifier" not in canonical_issue
-            assert str(first_model) not in json.dumps(properties)
+            serialized = json.dumps(properties)
+            assert str(first_model) not in serialized
+            assert "a.pkl" not in serialized
+            assert "b.zip" not in serialized
             assert '"None"' not in json.dumps(properties)
 
     def test_scan_started_includes_per_path_fields(self, tmp_path: Path) -> None:
@@ -586,15 +592,20 @@ class TestTelemetryClient:
 
             properties = mock_posthog.capture.call_args.kwargs["properties"]
             assert "paths" not in properties
-            assert properties["model_names"][0] == "model.pkl"
-            assert properties["model_names"][1] == "meta-llama/Llama-2-7b"
-            assert properties["model_references"][0] == "model.pkl"
-            assert properties["model_references"][1] == "hf://meta-llama/Llama-2-7b"
+            assert "model_names" not in properties
+            assert "model_references" not in properties
+            assert properties["model_reference_types"] == ["file:.pkl", "huggingface:no_extension"]
+            assert properties["file_extensions"] == [".pkl", ""]
+            assert properties["file_extension_counts"] == {".pkl": 1}
             assert properties["source_types"] == ["local", "huggingface"]
             assert properties["path_types"][0] == "file"
             assert properties["path_types"][1] == "huggingface_shorthand"
             assert "path_identifiers" not in properties
-            assert str(model_path) not in json.dumps(properties)
+            serialized = json.dumps(properties)
+            assert str(model_path) not in serialized
+            assert "model.pkl" not in serialized
+            assert "meta-llama" not in serialized
+            assert "Llama-2-7b" not in serialized
 
     def test_path_and_url_fields_omit_identifiers(self, tmp_path: Path) -> None:
         """Path and URL fields should not include raw sensitive values or identifiers."""
@@ -623,41 +634,89 @@ class TestTelemetryClient:
             client.record_file_type_detected(str(sensitive_path), "pickle")
             file_props = mock_posthog.capture.call_args.kwargs["properties"]
             assert "file_path" not in file_props
-            assert file_props["model_name"] == "model.pkl"
-            assert file_props["model_reference"] == "model.pkl"
+            assert "model_name" not in file_props
+            assert "model_reference" not in file_props
+            assert file_props["model_reference_type"] == "file:.pkl"
+            assert file_props["source_type"] == "local"
             assert "path_identifier" not in file_props
             assert str(sensitive_path) not in json.dumps(file_props)
+            assert "model.pkl" not in json.dumps(file_props)
 
             client.record_issue_found("dangerous pattern", "critical", "pickle", str(sensitive_path))
             issue_props = mock_posthog.capture.call_args.kwargs["properties"]
             assert "file_path" not in issue_props
-            assert issue_props["model_name"] == "model.pkl"
-            assert issue_props["model_reference"] == "model.pkl"
+            assert "model_name" not in issue_props
+            assert "model_reference" not in issue_props
+            assert issue_props["model_reference_type"] == "file:.pkl"
+            assert issue_props["source_type"] == "local"
             assert "path_identifier" not in issue_props
             assert str(sensitive_path) not in json.dumps(issue_props)
+            assert "model.pkl" not in json.dumps(issue_props)
 
             client.record_download_started("http", sensitive_url)
             download_props = mock_posthog.capture.call_args.kwargs["properties"]
             assert "url" not in download_props
-            assert download_props["domain"] == "example.com"
-            assert download_props["model_name"] == "model.bin"
-            assert download_props["model_reference"] == "https://example.com/model.bin"
+            assert download_props["domain"] == "custom"
+            assert "model_name" not in download_props
+            assert "model_reference" not in download_props
+            assert download_props["model_reference_type"] == "http:.bin"
+            assert download_props["file_extension"] == ".bin"
             assert "url_identifier" not in download_props
             assert sensitive_url not in json.dumps(download_props)
             assert "user:pass@" not in json.dumps(download_props)
+            assert "example.com" not in json.dumps(download_props)
+            assert "model.bin" not in json.dumps(download_props)
 
             client.record_download_completed("http", 2.0, 2048, sensitive_url)
             completed_props = mock_posthog.capture.call_args.kwargs["properties"]
             assert "url" not in completed_props
-            assert completed_props["domain"] == "example.com"
-            assert completed_props["model_name"] == "model.bin"
-            assert completed_props["model_reference"] == "https://example.com/model.bin"
+            assert completed_props["domain"] == "custom"
+            assert "model_name" not in completed_props
+            assert "model_reference" not in completed_props
+            assert completed_props["model_reference_type"] == "http:.bin"
+            assert completed_props["file_extension"] == ".bin"
             assert "url_identifier" not in completed_props
             assert sensitive_url not in json.dumps(completed_props)
             assert "user:pass@" not in json.dumps(completed_props)
+            assert "example.com" not in json.dumps(completed_props)
+            assert "model.bin" not in json.dumps(completed_props)
 
-    def test_extract_model_name_strips_query_string_for_http_urls(self) -> None:
-        """Model name extraction should not include URL query parameters."""
+    def test_download_events_preserve_explicit_source_type(self) -> None:
+        """URL classification must not overwrite the download integration name."""
+        mock_posthog = MagicMock()
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            patch.dict(
+                os.environ,
+                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                clear=False,
+            ),
+        ):
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+            client._posthog_client = mock_posthog
+            client._user_config.telemetry_enabled = True
+
+            client.record_download_started("jfrog", "https://tenant.jfrog.io/artifactory/model.pt")
+            started_props = mock_posthog.capture.call_args.kwargs["properties"]
+            assert started_props["source_type"] == "jfrog"
+            assert started_props["model_reference_type"] == "jfrog:.pt"
+
+            client.record_download_completed(
+                "mlflow",
+                duration=1.0,
+                size_bytes=1024,
+                url="models:/private-model/Production",
+            )
+            completed_props = mock_posthog.capture.call_args.kwargs["properties"]
+            assert completed_props["source_type"] == "mlflow"
+            assert completed_props["model_reference_type"] == "mlflow:no_extension"
+
+    def test_source_type_classification_uses_scheme_and_provider_boundaries(self) -> None:
+        """Provider names in local paths or unrelated hosts must not change source type."""
         with (
             tempfile.TemporaryDirectory() as temp_dir,
             patch("modelaudit.telemetry.Path.home") as mock_home,
@@ -666,14 +725,109 @@ class TestTelemetryClient:
             mock_home.return_value = Path(temp_dir)
             client = TelemetryClient()
 
-            assert client._extract_model_name("https://example.com/model.bin?token=secret") == "model.bin"
-            assert client._extract_model_name("https://example.com/model.bin#fragment") == "model.bin"
-            assert client._extract_domain("https://user:pass@example.com:8443") == "example.com:8443"
-            assert client._extract_model_name("https://user:pass@example.com") == "example.com"
-            assert client._extract_model_reference("https://user:pass@example.com/model.bin?token=secret") == (
-                "https://example.com/model.bin"
+            assert client._classify_source_type("/tmp/huggingface-private/model.pt") == "local"
+            assert client._classify_source_type("https://huggingface.evil.example/model.pt") == "http"
+            assert client._classify_source_type("https://example.com/pytorch/model.pt") == "http"
+            assert client._classify_source_type("https://tenant.jfrog.io/model.pt") == "jfrog"
+            assert client._classify_source_type("pytorch://org/repo/model.pt") == "pytorch_hub"
+            assert client._classify_source_type("azure://bucket/model.pt") == "azure"
+            assert client._classify_source_type("models:/private-model/Production") == "mlflow"
+
+    def test_model_reference_helpers_do_not_preserve_url_identifiers(self) -> None:
+        """Legacy model reference helpers should expose only coarse buckets."""
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+        ):
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+
+            assert client._extract_model_name("https://example.com/model.bin?token=secret") is None
+            assert client._extract_model_name("https://example.com/model.bin#fragment") is None
+            assert client._extract_domain("https://user:pass@example.com:8443") == "custom"
+            assert client._extract_model_name("https://user:pass@example.com") is None
+            assert (
+                client._extract_model_reference("https://user:pass@example.com/model.bin?token=secret") == "http:.bin"
             )
-            assert client._extract_model_reference("https://user:pass@example.com") == "https://example.com"
+            assert client._extract_model_reference("https://user:pass@example.com") == "http:no_extension"
+
+    def test_unknown_extensions_are_bucketed_without_preserving_identifiers(self) -> None:
+        """User-defined suffixes should collapse to one non-identifying bucket."""
+        mock_posthog = MagicMock()
+        sensitive_path = "weights.customer-secret-project"
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            patch.dict(
+                os.environ,
+                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                clear=False,
+            ),
+        ):
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+            client._posthog_client = mock_posthog
+            client._user_config.telemetry_enabled = True
+
+            client.record_scan_started([sensitive_path], {"format": "json"})
+            properties = mock_posthog.capture.call_args.kwargs["properties"]
+            assert properties["file_extensions"] == ["other_extension"]
+            assert properties["file_extension_counts"] == {"other_extension": 1}
+            assert properties["model_reference_types"] == ["unknown:other_extension"]
+            assert sensitive_path not in json.dumps(properties)
+            assert "customer-secret-project" not in json.dumps(properties)
+
+            assert (
+                client._extract_file_extension("https://example.com/model.internal?token=secret") == "other_extension"
+            )
+            assert client._extract_model_reference("https://example.com/model.internal") == "http:other_extension"
+            assert client._extract_file_extension("model.safetensors") == ".safetensors"
+
+    def test_scan_completed_omits_metadata_derived_from_free_form_locations(self) -> None:
+        """Issue location prose must not become identifying telemetry dimensions."""
+        mock_posthog = MagicMock()
+        sensitive_location = "/tmp/model.pb (node: company.secret)"
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            patch.dict(
+                os.environ,
+                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                clear=False,
+            ),
+        ):
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+            client._posthog_client = mock_posthog
+            client._user_config.telemetry_enabled = True
+
+            client.record_scan_completed(
+                0.1,
+                {
+                    "issues": [
+                        {
+                            "type": "protobuf_dangerous_node",
+                            "severity": "critical",
+                            "location": sensitive_location,
+                        }
+                    ]
+                },
+            )
+
+            properties = mock_posthog.capture.call_args.kwargs["properties"]
+            issue_detail = properties["issue_details"][0]
+            assert issue_detail == {
+                "type": "protobuf_dangerous_node",
+                "severity": "critical",
+                "location_type": "unknown",
+            }
+            assert sensitive_location not in json.dumps(properties)
+            assert "company.secret" not in json.dumps(properties)
 
     def test_cloud_url_telemetry_fields_strip_query_and_fragment(self) -> None:
         """Cloud URL telemetry should not retain presigned query material."""
@@ -697,26 +851,36 @@ class TestTelemetryClient:
 
             client.record_scan_started([cloud_url], {"format": "json"})
             started_props = mock_posthog.capture.call_args.kwargs["properties"]
-            assert started_props["model_names"] == ["model.pt"]
-            assert started_props["model_references"] == ["s3://bucket/path/model.pt"]
+            assert "model_names" not in started_props
+            assert "model_references" not in started_props
+            assert started_props["model_reference_types"] == ["s3:.pt"]
+            assert started_props["file_extensions"] == [".pt"]
             assert "SECRET" not in json.dumps(started_props)
             assert "access:secret@" not in json.dumps(started_props)
+            assert "bucket" not in json.dumps(started_props)
+            assert "path/model.pt" not in json.dumps(started_props)
 
             client.record_file_type_detected(cloud_url, "pytorch")
             file_props = mock_posthog.capture.call_args.kwargs["properties"]
             assert file_props["file_extension"] == ".pt"
-            assert file_props["model_name"] == "model.pt"
-            assert file_props["model_reference"] == "s3://bucket/path/model.pt"
+            assert "model_name" not in file_props
+            assert "model_reference" not in file_props
+            assert file_props["model_reference_type"] == "s3:.pt"
             assert "SECRET" not in json.dumps(file_props)
             assert "access:secret@" not in json.dumps(file_props)
+            assert "bucket" not in json.dumps(file_props)
+            assert "path/model.pt" not in json.dumps(file_props)
 
             client.record_download_started("s3", cloud_url)
             download_props = mock_posthog.capture.call_args.kwargs["properties"]
-            assert download_props["domain"] == "bucket"
-            assert download_props["model_name"] == "model.pt"
-            assert download_props["model_reference"] == "s3://bucket/path/model.pt"
+            assert download_props["domain"] == "s3"
+            assert "model_name" not in download_props
+            assert "model_reference" not in download_props
+            assert download_props["model_reference_type"] == "s3:.pt"
             assert "SECRET" not in json.dumps(download_props)
             assert "access:secret@" not in json.dumps(download_props)
+            assert "bucket" not in json.dumps(download_props)
+            assert "path/model.pt" not in json.dumps(download_props)
 
     def test_telemetry_available_false_when_posthog_unavailable(self):
         """Telemetry should be unavailable when transport client is missing."""
@@ -772,32 +936,56 @@ class TestTelemetryClient:
 class TestDataHandling:
     """Test data handling and sanitization."""
 
-    def test_error_sanitization(self):
-        """Test that error messages are properly sanitized."""
+    def test_error_events_omit_free_form_text(self) -> None:
+        """Error telemetry should retain categories, never exception or context prose."""
+        mock_posthog = MagicMock()
+        sensitive_error = "Invalid max-size: secret-model.pkl password=hunter2 alice@example.com"
+        sensitive_context = "s3://access:secret@bucket/customer/model.pt?token=shortsecret"
+
         with (
             tempfile.TemporaryDirectory() as temp_dir,
             patch("modelaudit.telemetry.Path.home") as mock_home,
             patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            patch.dict(
+                os.environ,
+                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                clear=False,
+            ),
         ):
             mock_home.return_value = Path(temp_dir)
             client = TelemetryClient()
+            client._posthog_client = mock_posthog
+            client._user_config.telemetry_enabled = True
 
-            # Test that paths are removed
-            error_with_path = "File not found: /home/user/secret/model.pkl"
-            sanitized = client._sanitize_error(error_with_path)
-            assert "/home/user" not in sanitized
-            assert "[PATH]" in sanitized
+            client.record_scan_failed(0.5, sensitive_error)
+            scan_failed_properties = mock_posthog.capture.call_args.kwargs["properties"]
+            assert scan_failed_properties["error_type"] == "str"
+            assert scan_failed_properties["error_category"] == "invalid_max_size"
+            assert "error_message" not in scan_failed_properties
 
-            # Test that URLs are removed
-            error_with_url = "Failed to fetch https://api.example.com/models?key=secret"
-            sanitized = client._sanitize_error(error_with_url)
-            assert "api.example.com" not in sanitized
-            assert "[URL]" in sanitized
+            client.record_error(ValueError(sensitive_error), sensitive_context)
+            error_properties = mock_posthog.capture.call_args.kwargs["properties"]
+            assert error_properties["error_type"] == "ValueError"
+            assert error_properties["has_context"] is True
+            assert "error_message" not in error_properties
+            assert "context" not in error_properties
 
-            # Test truncation
-            long_error = "x" * 200
-            sanitized = client._sanitize_error(long_error)
-            assert len(sanitized) <= 100
+            serialized = json.dumps({"scan_failed": scan_failed_properties, "error": error_properties})
+            assert sensitive_error not in serialized
+            assert "secret-model.pkl" not in serialized
+            assert "password=hunter2" not in serialized
+            assert "alice@example.com" not in serialized
+            assert sensitive_context not in serialized
+            assert "shortsecret" not in serialized
+
+    def test_scan_error_categories_do_not_depend_on_user_text(self) -> None:
+        """Known failure prefixes should map to fixed telemetry values."""
+        assert TelemetryClient._classify_scan_error("No matching paths") == "no_matching_paths"
+        assert TelemetryClient._classify_scan_error("Invalid scanner selection: customer_alpha") == (
+            "invalid_scanner_selection"
+        )
+        assert TelemetryClient._classify_scan_error("customer-specific failure") == "other"
+        assert TelemetryClient._classify_scan_error(ValueError("customer-specific failure")) == "exception"
 
 
 class TestPrivacyCompliance:

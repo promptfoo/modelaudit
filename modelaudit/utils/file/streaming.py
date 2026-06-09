@@ -3,7 +3,7 @@
 import inspect
 import io
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeGuard
 from urllib.parse import unquote, urlparse
 
 import click
@@ -26,21 +26,41 @@ def resolve_streaming_max_bytes(max_bytes: object = None) -> int:
     return max_bytes
 
 
-def _streaming_max_bytes_from_scanner_config(scanner: "BaseScanner") -> object:
-    configured_stream_max = scanner.config.get("streaming_max_bytes")
-    if (
-        isinstance(configured_stream_max, int)
-        and not isinstance(configured_stream_max, bool)
-        and configured_stream_max > 0
-    ):
-        return configured_stream_max
+def _is_positive_int(value: object) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
-    resolved_max = STREAMING_ANALYSIS_DEFAULT_MAX_BYTES
+
+def _streaming_max_bytes_from_scanner_config(scanner: "BaseScanner", max_bytes: object = None) -> int:
+    if _is_positive_int(max_bytes):
+        resolved_max = max_bytes
+    else:
+        configured_stream_max = scanner.config.get("streaming_max_bytes")
+        resolved_max = (
+            configured_stream_max
+            if _is_positive_int(configured_stream_max)
+            else STREAMING_ANALYSIS_DEFAULT_MAX_BYTES
+        )
+
     for config_key in ("max_file_size", "max_file_read_size"):
         configured_max = scanner.config.get(config_key)
-        if isinstance(configured_max, int) and not isinstance(configured_max, bool) and configured_max > 0:
+        if _is_positive_int(configured_max):
             resolved_max = min(resolved_max, configured_max)
     return resolved_max
+
+
+def _is_unproven_partial_scan_issue(issue: Any) -> bool:
+    """Return whether an issue can be explained solely by a bounded prefix ending."""
+    details = getattr(issue, "details", None)
+    if not isinstance(details, dict):
+        return False
+    if details.get("tamper_type") == "oversized_frame":
+        return True
+    if details.get("analysis_incomplete") is not True:
+        return False
+    return details.get("notice_code") == "parse_incomplete" or details.get("category") in {
+        "parse_error",
+        "short_read",
+    }
 
 
 def can_stream_analyze(url: str, scanner: "BaseScanner") -> bool:
@@ -155,14 +175,7 @@ def stream_analyze_file(
             else None
         )
 
-        configured_max_bytes: object = max_bytes
-        if (
-            not isinstance(configured_max_bytes, int)
-            or isinstance(configured_max_bytes, bool)
-            or configured_max_bytes <= 0
-        ):
-            configured_max_bytes = _streaming_max_bytes_from_scanner_config(scanner)
-        resolved_max_bytes = resolve_streaming_max_bytes(configured_max_bytes)
+        resolved_max_bytes = _streaming_max_bytes_from_scanner_config(scanner, max_bytes)
 
         # Use one spare byte of the budget to detect an object that grew after
         # the metadata lookup without exceeding the configured read cap.
@@ -174,11 +187,24 @@ def stream_analyze_file(
             bytes_to_read = resolved_max_bytes
 
         # Read partial content
+        extra_byte_observed = False
         with fs.open(url, "rb") as f:
             content = f.read(bytes_to_read)
+            if (
+                known_file_size is not None
+                and known_file_size < resolved_max_bytes
+                and len(content) == known_file_size
+            ):
+                # A legal short read can stop at the stale reported size even
+                # when the object grew. Probe EOF separately before treating
+                # exact-size coverage as complete.
+                extra_byte_observed = bool(f.read(1))
         bytes_read = len(content)
         bytes_complete = (
-            known_file_size is not None and known_file_size < resolved_max_bytes and bytes_read == known_file_size
+            known_file_size is not None
+            and known_file_size < resolved_max_bytes
+            and bytes_read == known_file_size
+            and not extra_byte_observed
         )
 
         # Create a temporary in-memory file for scanning
@@ -220,8 +246,13 @@ def stream_analyze_file(
                         scan_result = None
 
         if scan_result is not None:
-            issues.extend(scan_result.issues)
+            scanner_issues = list(scan_result.issues)
+            if not bytes_complete:
+                scanner_issues = [issue for issue in scanner_issues if not _is_unproven_partial_scan_issue(issue)]
+            issues.extend(scanner_issues)
             metadata.update(scan_result.metadata)
+            if not scanner_issues and metadata.get("pickle_verdict") == "suspicious":
+                metadata["pickle_verdict"] = "unknown"
 
         # Fallback manual checks for pickle headers when scanner doesn't support partial scans
         if scan_result is None and Path(source_path).suffix.lower() in {".pkl", ".pickle", ".joblib"}:
