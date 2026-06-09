@@ -9,6 +9,7 @@ import math
 import os
 import pickle
 import pickletools
+import struct
 import zlib
 from collections.abc import Callable
 from contextlib import suppress
@@ -31,13 +32,21 @@ _MAX_JOBLIB_DTYPE_VALIDATION_WORK = 65536
 _MAX_JOBLIB_CONTROL_OPCODES = 1000000
 _MAX_JOBLIB_ARRAY_DIMENSIONS = 64
 _NUMPY_DTYPE_HAS_OBJECT_FLAG = 1
-_JOBLIB_COMPRESSED_PREFIXES = (b"x", b"\x1f\x8b", b"BZ", b"]\x00", b"\xfd7zXZ")
+_JOBLIB_COMPRESSED_PREFIXES = (b"x", b"\x1f\x8b", b"]\x00", b"\xfd7zXZ")
 
 
 @dataclass(frozen=True)
 class _JoblibPickleGlobal:
     module: str
     name: str
+    occurrence_id: int | None = field(default=None, compare=False)
+
+
+_JOBLIB_NUMPY_ARRAY_SUBCLASSES = {
+    _JoblibPickleGlobal("numpy", "ndarray"),
+    _JoblibPickleGlobal("numpy", "matrix"),
+    _JoblibPickleGlobal("numpy", "memmap"),
+}
 
 
 @dataclass
@@ -54,9 +63,10 @@ class _JoblibDtypeValidationContext:
     remaining_work: int = _MAX_JOBLIB_DTYPE_VALIDATION_WORK
     dtype_cache: dict[int, tuple[_JoblibPickleObject, np.dtype[Any]]] = field(default_factory=dict)
     dtype_in_progress: list[_JoblibPickleObject] = field(default_factory=list)
-    metadata_cache: dict[int, tuple[tuple[object, ...], bool]] = field(default_factory=dict)
-    metadata_in_progress: list[tuple[object, ...]] = field(default_factory=list)
+    metadata_cache: dict[int, tuple[object, bool]] = field(default_factory=dict)
+    metadata_in_progress: list[object] = field(default_factory=list)
     validated_codec_encode_reduction_ids: set[int] = field(default_factory=set)
+    validated_codec_encode_global_ids: set[int] = field(default_factory=set)
 
     def consume(self, amount: int = 1) -> None:
         if amount > self.remaining_work:
@@ -83,8 +93,11 @@ def _is_safe_dtype_metadata(
     if value is None or type(value) in {bool, int, str, bytes}:
         return True
     if isinstance(value, _JoblibPickleObject):
+        reference = value.reference
+        if not isinstance(reference, _JoblibPickleGlobal):
+            return False
         is_safe_codec_encode = (
-            value.reference == _JoblibPickleGlobal("_codecs", "encode")
+            reference == _JoblibPickleGlobal("_codecs", "encode")
             and value.state is None
             and isinstance(value.args, tuple)
             and len(value.args) == 2
@@ -94,8 +107,19 @@ def _is_safe_dtype_metadata(
         )
         if is_safe_codec_encode and value.reduction_id is not None:
             context.validated_codec_encode_reduction_ids.add(value.reduction_id)
+            if reference.occurrence_id is not None:
+                context.validated_codec_encode_global_ids.add(reference.occurrence_id)
         return is_safe_codec_encode
-    if not isinstance(value, tuple) or len(value) > 16:
+    items: tuple[object, ...]
+    if isinstance(value, (tuple, list, set, frozenset)):
+        if len(value) > _MAX_JOBLIB_DTYPE_FIELDS:
+            return False
+        items = tuple(value)
+    elif isinstance(value, dict):
+        if len(value) > _MAX_JOBLIB_DTYPE_FIELDS:
+            return False
+        items = tuple(item for entry in value.items() for item in entry)
+    else:
         return False
 
     object_id = id(value)
@@ -105,7 +129,7 @@ def _is_safe_dtype_metadata(
     if any(item is value for item in context.metadata_in_progress):
         return False
 
-    context.consume(len(value))
+    context.consume(len(items))
     context.metadata_in_progress.append(value)
     try:
         result = all(
@@ -114,7 +138,7 @@ def _is_safe_dtype_metadata(
                 depth=depth + 1,
                 context=context,
             )
-            for item in value
+            for item in items
         )
     finally:
         context.metadata_in_progress.pop()
@@ -254,7 +278,9 @@ class _SafeJoblibUnpickler(pickle._Unpickler):  # type: ignore[attr-defined]
         self._stream = stream
         self.raw_array_spans: list[tuple[int, int]] = []
         self.codec_encode_reduction_ids: set[int] = set()
+        self.codec_encode_global_ids: set[int] = set()
         self.dtype_validation_context = _JoblibDtypeValidationContext()
+        self._global_count = 0
         self._reduction_count = 0
         self._remaining_control_opcodes = _MAX_JOBLIB_CONTROL_OPCODES
 
@@ -283,7 +309,11 @@ class _SafeJoblibUnpickler(pickle._Unpickler):  # type: ignore[attr-defined]
             return stop.value
 
     def find_class(self, module: str, name: str) -> _JoblibPickleGlobal:
-        return _JoblibPickleGlobal(module, name)
+        self._global_count += 1
+        reference = _JoblibPickleGlobal(module, name, self._global_count)
+        if reference == _JoblibPickleGlobal("_codecs", "encode"):
+            self.codec_encode_global_ids.add(self._global_count)
+        return reference
 
     @property
     def _pickle_stack(self) -> list[object]:
@@ -298,6 +328,25 @@ class _SafeJoblibUnpickler(pickle._Unpickler):  # type: ignore[attr-defined]
 
     def _pickle_pop_mark(self) -> list[object]:
         return cast(list[object], self.pop_mark())  # type: ignore[attr-defined]
+
+    def _remaining_pickle_bytes(self) -> int:
+        frame = self._pickle_unframer.current_frame
+        if frame is not None:
+            return len(frame.getbuffer()) - frame.tell()
+        return len(self._stream.getbuffer()) - self._stream.tell()
+
+    def load_bytearray8(self) -> None:
+        """Consume protocol-5 bytearrays without allocating their declared size."""
+        (size,) = struct.unpack("<Q", self.read(8))
+        if size > self._remaining_pickle_bytes():
+            raise pickle.UnpicklingError("Truncated Joblib BYTEARRAY8 payload")
+        remaining = size
+        while remaining:
+            chunk_size = min(remaining, 64 * 1024)
+            if len(self.read(chunk_size)) != chunk_size:
+                raise pickle.UnpicklingError("Truncated Joblib BYTEARRAY8 payload")
+            remaining -= chunk_size
+        self._pickle_append(bytearray())
 
     def load_reduce(self) -> None:
         args = self._pickle_stack.pop()
@@ -365,10 +414,7 @@ class _SafeJoblibUnpickler(pickle._Unpickler):  # type: ignore[attr-defined]
         state_keys = set(state)
         if state_keys != required_keys and state_keys != allowed_keys:
             raise pickle.UnpicklingError("Invalid NumpyArrayWrapper state fields")
-        if state.get("subclass") not in {
-            _JoblibPickleGlobal("numpy", "ndarray"),
-            _JoblibPickleGlobal("numpy", "memmap"),
-        }:
+        if state.get("subclass") not in _JOBLIB_NUMPY_ARRAY_SUBCLASSES:
             raise pickle.UnpicklingError("Unsupported NumpyArrayWrapper subclass")
         if state.get("order") not in {"C", "F"} or type(state.get("allow_mmap")) is not bool:
             raise pickle.UnpicklingError("Invalid NumpyArrayWrapper read options")
@@ -418,6 +464,7 @@ class _SafeJoblibUnpickler(pickle._Unpickler):  # type: ignore[attr-defined]
 
 
 _SafeJoblibUnpickler.dispatch[pickle.REDUCE[0]] = _SafeJoblibUnpickler.load_reduce
+_SafeJoblibUnpickler.dispatch[pickle.BYTEARRAY8[0]] = _SafeJoblibUnpickler.load_bytearray8
 _SafeJoblibUnpickler.dispatch[pickle.NEWOBJ[0]] = _SafeJoblibUnpickler.load_newobj
 _SafeJoblibUnpickler.dispatch[pickle.NEWOBJ_EX[0]] = _SafeJoblibUnpickler.load_newobj_ex
 _SafeJoblibUnpickler.dispatch[pickle.BUILD[0]] = _SafeJoblibUnpickler.load_build
@@ -455,7 +502,8 @@ def _pickle_without_joblib_numpy_array_data(payload: bytes) -> tuple[bytes, int,
         cursor = end
     sanitized.extend(payload[cursor:])
     has_only_validated_codec_encodes = (
-        bool(parser.codec_encode_reduction_ids)
+        bool(parser.codec_encode_global_ids)
+        and parser.codec_encode_global_ids == parser.dtype_validation_context.validated_codec_encode_global_ids
         and parser.codec_encode_reduction_ids == parser.dtype_validation_context.validated_codec_encode_reduction_ids
     )
     return bytes(sanitized), len(parser.raw_array_spans), has_only_validated_codec_encodes
@@ -687,7 +735,9 @@ class JoblibScanner(BaseScanner):
     @staticmethod
     def _looks_like_compressed_joblib_payload(data: bytes) -> bool:
         """Recognize the compression prefixes emitted by Joblib's bundled codecs."""
-        return data.startswith(_JOBLIB_COMPRESSED_PREFIXES)
+        if data.startswith(_JOBLIB_COMPRESSED_PREFIXES):
+            return True
+        return len(data) >= 4 and data.startswith(b"BZh") and data[3:4] in b"123456789"
 
     def _record_joblib_operational_error(self, result: ScanResult, reason: str) -> None:
         """Mark a Joblib scan as operationally incomplete for CLI exit-code aggregation."""

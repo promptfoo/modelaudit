@@ -21,6 +21,7 @@ from modelaudit.scanners.joblib_scanner import (
     _is_safe_dtype_metadata,
     _JoblibPickleGlobal,
     _JoblibPickleObject,
+    _pickle_without_joblib_numpy_array_data,
     _SafeJoblibUnpickler,
     _validated_numpy_dtype,
     np,
@@ -59,11 +60,17 @@ def _binunicode(value: str) -> bytes:
     return b"X" + struct.pack("<I", len(encoded)) + encoded
 
 
-def _joblib_numpy_wrapper_control(*, shape: int = 4, dtype: str = "i8") -> bytes:
+def _joblib_numpy_wrapper_control(
+    *,
+    shape: int = 4,
+    dtype: str = "i8",
+    subclass: tuple[str, str] = ("numpy", "ndarray"),
+) -> bytes:
+    subclass_global = b"c" + subclass[0].encode("ascii") + b"\n" + subclass[1].encode("ascii") + b"\n"
     return (
         b"cjoblib.numpy_pickle\nNumpyArrayWrapper\n)\x81}("
         + _binunicode("subclass")
-        + b"cnumpy\nndarray\n"
+        + subclass_global
         + _binunicode("shape")
         + b"K"
         + bytes([shape])
@@ -171,8 +178,17 @@ def _joblib_numpy_list_payload(
     raw_data: bytes = b"\x00" * 32,
     shape: int = 4,
     dtype: str = "i8",
+    subclass: tuple[str, str] = ("numpy", "ndarray"),
 ) -> bytes:
-    prefix = b"\x80\x02](" + leading_ops + _joblib_numpy_wrapper_control(shape=shape, dtype=dtype)
+    prefix = (
+        b"\x80\x02]("
+        + leading_ops
+        + _joblib_numpy_wrapper_control(
+            shape=shape,
+            dtype=dtype,
+            subclass=subclass,
+        )
+    )
     raw_segment = _joblib_numpy_raw_segment(len(prefix), raw_data)
     return prefix + raw_segment + resumed_ops + b"e."
 
@@ -201,6 +217,23 @@ def test_protocol2_datetime_dtype_metadata_is_bounded_and_safe() -> None:
     )
 
 
+def test_plain_numpy_dtype_metadata_is_bounded_and_safe() -> None:
+    dtype_object = _JoblibPickleObject(
+        _JoblibPickleGlobal("numpy", "dtype"),
+        ("i4", False, True),
+        state=(3, "<", None, None, None, -1, -1, 0, {"foo": "bar"}),
+    )
+
+    assert _validated_numpy_dtype(dtype_object) == np.dtype("i4")
+    assert _is_safe_dtype_metadata({"nested": {"value": [1, True, None], "flags": {"a", "b"}}}, depth=0) is True
+    unsafe_metadata = {"unsafe": _JoblibPickleObject(_JoblibPickleGlobal("os", "system"), ("echo owned",))}
+    assert _is_safe_dtype_metadata(unsafe_metadata, depth=0) is False
+
+    dtype_object.state = (3, "<", None, None, None, -1, -1, 0, unsafe_metadata)
+    with pytest.raises(pickle.UnpicklingError, match="dtype metadata"):
+        _validated_numpy_dtype(dtype_object)
+
+
 def test_dtype_validation_bounds_shared_memo_graph(monkeypatch: pytest.MonkeyPatch) -> None:
     real_dtype = np.dtype
     calls = 0
@@ -225,6 +258,30 @@ def test_safe_parser_bounds_control_opcode_materialization(monkeypatch: pytest.M
 
     with pytest.raises(pickle.UnpicklingError, match="control stream is too complex"):
         parser.load()
+
+
+def test_safe_parser_rejects_truncated_bytearray8_before_allocation(monkeypatch: pytest.MonkeyPatch) -> None:
+    allocation_requests: list[int] = []
+
+    def record_bytearray_allocation(size: int = 0) -> bytearray:
+        allocation_requests.append(size)
+        return bytearray()
+
+    monkeypatch.setattr(pickle, "bytearray", record_bytearray_allocation, raising=False)
+    payload = b"\x80\x05\x96" + struct.pack("<Q", 1 << 40) + b"NumpyArrayWrapper."
+
+    assert _pickle_without_joblib_numpy_array_data(payload) is None
+    assert allocation_requests == []
+
+
+def test_safe_parser_accepts_bounded_bytearray8_before_numpy_payload(tmp_path: Path) -> None:
+    leading_ops = b"\x96" + struct.pack("<Q", 4) + b"data0"
+    payload = _joblib_numpy_list_payload(leading_ops=leading_ops).replace(b"\x80\x02", b"\x80\x05", 1)
+
+    result = _scan_payload(tmp_path, payload, "bounded_bytearray8.joblib")
+
+    assert result.success is True
+    assert result.metadata["trusted_incomplete_tail"] is True
 
 
 def test_scan_detects_raw_protocol0_pickle_joblib(tmp_path: Path) -> None:
@@ -344,6 +401,16 @@ def test_scan_trusts_numpy_wrapper_raw_array_tail_after_build_handoff(tmp_path: 
     assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
 
 
+def test_scan_accepts_numpy_matrix_array_payload(tmp_path: Path) -> None:
+    payload = _joblib_numpy_list_payload(subclass=("numpy", "matrix"))
+
+    result = _scan_payload(tmp_path, payload, "numpy_matrix.joblib")
+
+    assert result.success is True
+    assert result.metadata["trusted_incomplete_tail"] is True
+    assert result.metadata["joblib_numpy_array_payload_count"] == 1
+
+
 def test_scan_preserves_malicious_pickle_findings_before_joblib_tail(tmp_path: Path) -> None:
     payload = _joblib_numpy_list_payload(leading_ops=b"cposix\nsystem\n(S'echo owned'\ntR0")
 
@@ -367,6 +434,25 @@ def test_scan_preserves_unvalidated_codec_encode_after_numpy_array_payload(tmp_p
     payload = _joblib_numpy_list_payload(resumed_ops=b"c_codecs\nencode\n(S'payload'\nS'utf-8'\ntR")
 
     result = _scan_payload(tmp_path, payload, "codec_encode_after_array.joblib")
+
+    assert any(issue.details.get("associated_global") == "_codecs.encode" for issue in result.issues)
+    assert "trusted_incomplete_tail" not in result.metadata
+
+
+def test_scan_preserves_unrelated_codec_global_before_validated_dtype_use(tmp_path: Path) -> None:
+    payload = _joblib_datetime_dtype_with_unsafe_codec_payload()
+    start = payload.index(b"c_codecs\nencode\nq\x1e")
+    end = payload.index(b"0", start) + 1
+    payload = payload[:start] + b"c_codecs\nencode\n0" + b"c_codecs\nencode\nq\x1e" + payload[end:]
+    prefix = payload[: payload.rfind(b"ub") + 2]
+    payload = prefix + _joblib_numpy_raw_segment(len(prefix), b"\x00" * 8) + b"e."
+
+    parser = _SafeJoblibUnpickler(io.BytesIO(payload))
+    parser.load()
+    assert len(parser.codec_encode_global_ids) == 2
+    assert len(parser.dtype_validation_context.validated_codec_encode_global_ids) == 1
+
+    result = _scan_payload(tmp_path, payload, "unrelated_codec_global.joblib")
 
     assert any(issue.details.get("associated_global") == "_codecs.encode" for issue in result.issues)
     assert "trusted_incomplete_tail" not in result.metadata
@@ -564,6 +650,17 @@ def test_scan_detects_bz2_compressed_pickle_joblib(tmp_path: Path) -> None:
 
     assert result.success is False
     assert _has_system_reduce_failure(result)
+
+
+def test_scan_detects_bz_prefixed_raw_pickle_joblib(tmp_path: Path) -> None:
+    payload = b"B" + struct.pack("<I", 90) + (b"X" * 90) + b"0" + pickle.dumps(_Payload(), protocol=0)
+    assert payload.startswith(b"BZ")
+
+    result = _scan_payload(tmp_path, payload, "bz_prefixed_raw_pickle.joblib")
+
+    assert result.success is False
+    assert _has_system_reduce_failure(result)
+    assert result.metadata.get("operational_error") is not True
 
 
 def test_scan_detects_zlib_trailer_after_compressed_joblib_stream(tmp_path: Path) -> None:
