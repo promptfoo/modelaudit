@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 import pickle
 import time
 from collections.abc import Mapping
@@ -441,7 +442,199 @@ def test_scan_bytes_keeps_raw_scan_after_invalid_base64_padding(
 
 
 @pytest.mark.parametrize("container", [bytes, bytearray])
-@pytest.mark.parametrize("decoded", [b"Pevil\nAAAAAAAA", b"\x80\x04N.Pevil\n"])
+def test_scan_bytes_ignores_benign_suffix_after_padded_base64_pickle(
+    container: type[bytes] | type[bytearray],
+) -> None:
+    benign_encoded = base64.b64encode(_benign_long_scalar_protocol0_pickle(b"V"))
+    payload = container(benign_encoded + b"ab")
+
+    report = scan_bytes(
+        pickle.dumps(payload, protocol=5),
+        source=f"base64-benign-raw-suffix-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [b" ", b"# ", b"!", b"prefix:", b"\xff", b"A", b"AA", b"AAA", b"junk", b"prefix"],
+)
+@pytest.mark.parametrize("container", [bytes, bytearray])
+def test_scan_bytes_ignores_benign_wrapped_padded_base64_suffix(
+    container: type[bytes] | type[bytearray],
+    prefix: bytes,
+) -> None:
+    benign_encoded = base64.b64encode(_benign_long_scalar_protocol0_pickle(b"V"))
+    payload = container(prefix + benign_encoded + b"ab")
+
+    report = scan_bytes(
+        pickle.dumps(payload, protocol=5),
+        source=f"wrapped-base64-benign-suffix-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+@pytest.mark.parametrize(
+    "raw_payload",
+    [
+        b"NQAAgAROLgAAAAAA",
+        b"NQAAAAAAgAROLg==",
+        b"NNQAgAROLgAAAAAA",
+        b"NNNQgAROLgAAAAAA",
+        b"N0NQgAROLgAAAAAA",
+        b"AAAANQAAgAROLgAAAAAA",
+        b"AAAANQAAAAAAgAROLg==",
+        (b"A" * 16) + b"NQAAAAAAgAROLg==",
+        b"BBBBNQAAAAAAgAROLg==",
+        b"NQ" + (b"A" * 18) + base64.b64encode(b"V" + (b"A" * 300) + b"\n."),
+        ((b"C+" + (b"A" * 43)) * 6) + b"QgAROLgAAAAAA",
+        b"N" + (b"2" * 80) + b"QgAROLgAAAAAA",
+        b"K1QgAROLgAAAAAA",
+        b"M12QgAROLg==",
+        b"J1234QgAROLgAAAAAA",
+        b"G12345678QgAROLgAAAAAA",
+        b"N2QgAROLgAAAAAA",
+        b"C+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAgAROLgAAAA",
+        b"U+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAgAROLgAAAA",
+    ],
+)
+def test_scan_bytes_preserves_raw_execution_inside_strict_base64_token(
+    container: type[bytes] | type[bytearray],
+    raw_payload: bytes,
+) -> None:
+    payload = container(raw_payload)
+
+    report = scan_bytes(
+        pickle.dumps(payload, protocol=5),
+        source=f"strict-base64-with-raw-persid-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+    assert any(
+        finding.rule_code == "S213" and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+@pytest.mark.parametrize("raw_suffix", [b"NQ", b"NNQ", b"N0NQ"])
+def test_scan_bytes_preserves_raw_execution_after_unpadded_base64_pickle(
+    container: type[bytes] | type[bytearray],
+    raw_suffix: bytes,
+) -> None:
+    benign_encoded = base64.b64encode(b"V" + (b"A" * 300) + b"\n.")
+    assert not benign_encoded.endswith(b"=")
+    payload = container(benign_encoded + raw_suffix)
+
+    report = scan_bytes(
+        pickle.dumps(payload, protocol=5),
+        source=f"unpadded-base64-raw-suffix-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+def test_scan_bytes_keeps_multiple_benign_base64_tokens_clean(
+    container: type[bytes] | type[bytearray],
+) -> None:
+    benign_encoded = base64.b64encode(_benign_long_scalar_protocol0_pickle(b"V"))
+    payload = container(benign_encoded + b"ab!" + benign_encoded)
+
+    report = scan_bytes(
+        pickle.dumps(payload, protocol=5),
+        source=f"multiple-benign-base64-tokens-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+def test_scan_bytes_detects_malicious_base64_token_after_padded_token(
+    container: type[bytes] | type[bytearray],
+) -> None:
+    benign_encoded = base64.b64encode(pickle.dumps(None, protocol=4))
+    malicious_encoded = base64.b64encode(pickle.dumps(os.system, protocol=4))
+    payload = container(benign_encoded + malicious_encoded)
+
+    report = scan_bytes(
+        pickle.dumps(payload, protocol=5),
+        source=f"padded-token-before-malicious-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_GLOBAL" for finding in report.findings)
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+def test_scan_bytes_keeps_repeated_raw_execution_near_matches_clean(
+    container: type[bytes] | type[bytearray],
+) -> None:
+    payload = container(b"ordinaryCNQHtext" * 65)
+
+    report = scan_bytes(
+        pickle.dumps(payload, protocol=5),
+        source=f"repeated-raw-near-match-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+def test_scan_bytes_detects_malicious_token_after_unterminated_base64_scalar(
+    container: type[bytes] | type[bytearray],
+) -> None:
+    unterminated_scalar = base64.b64encode(b"VAAAA")
+    malicious_encoded = base64.b64encode(_long_scalar_before_reduce_protocol0_pickle(b"V"))
+    payload = container(unterminated_scalar + b"!" + malicious_encoded)
+
+    report = scan_bytes(
+        pickle.dumps(payload, protocol=5),
+        source=f"unterminated-prefix-before-malicious-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+def test_scan_bytes_detects_binary_pickle_inside_unterminated_base64_scalar(
+    container: type[bytes] | type[bytearray],
+) -> None:
+    payload = container(base64.b64encode(b"S" + pickle.dumps(os.system, protocol=4)))
+
+    report = scan_bytes(
+        pickle.dumps(payload, protocol=5),
+        source=f"unterminated-scalar-with-binary-pickle-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_GLOBAL" for finding in report.findings)
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+@pytest.mark.parametrize(
+    "decoded",
+    [b"Pevil\nAAAAAAAA", b"\x80\x04N.Pevil\n", b"README\x80\x04NQ"],
+)
 def test_scan_bytes_fails_closed_for_encoded_truncated_execution_prefixes(
     container: type[bytes] | type[bytearray],
     decoded: bytes,
@@ -464,6 +657,33 @@ def test_scan_bytes_fails_closed_for_encoded_truncated_execution_prefixes(
     assert not any(notice.code == "encoded_nested_payload_truncated" for notice in report.notices)
 
 
+@pytest.mark.parametrize("container", [bytes, bytearray])
+@pytest.mark.parametrize(
+    "decoded",
+    [
+        b"\x80\x04N.README",
+        b"(README is ordinary text",
+        b"README is ordinary text",
+        b"ordinary CNQH text",
+        b"junkPevil\n",
+    ],
+)
+def test_scan_bytes_keeps_encoded_execution_opcode_near_matches_clean(
+    container: type[bytes] | type[bytearray],
+    decoded: bytes,
+) -> None:
+    encoded = container(base64.b64encode(decoded))
+
+    report = scan_bytes(
+        pickle.dumps(encoded, protocol=5),
+        source=f"encoded-execution-near-match-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
 def test_scan_bytes_bounds_unterminated_protocol0_base64_scalar_runtime() -> None:
     encoded = base64.b64encode(b"V" + (b"A" * 100_000))
 
@@ -475,6 +695,23 @@ def test_scan_bytes_bounds_unterminated_protocol0_base64_scalar_runtime() -> Non
     elapsed = time.monotonic() - started
 
     assert elapsed < 2.0
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+def test_scan_bytes_bounds_strict_base64_junk_runtime() -> None:
+    payload = (b"junk" * 25_000) + b"Q"
+
+    started = time.monotonic()
+    report = scan_bytes(
+        pickle.dumps(payload, protocol=5),
+        source="bounded-strict-base64-junk.pkl",
+        options=ScanOptions(timeout_s=0.05),
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
     assert report.findings == ()
@@ -492,6 +729,28 @@ def test_scan_bytes_bounds_valid_utf8_encoded_byte_literal_prefilter() -> None:
     elapsed = time.monotonic() - started
 
     assert elapsed < 1.0
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict != SafetyVerdict.CLEAN
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+@pytest.mark.parametrize("payload_bytes", [b"UA" * 2_500_000, b"N" * 5_000_000])
+def test_scan_bytes_bounds_valid_utf8_byte_literal_runtime(
+    container: type[bytes] | type[bytearray],
+    payload_bytes: bytes,
+) -> None:
+    payload = container(payload_bytes)
+
+    started = time.monotonic()
+    report = scan_bytes(
+        pickle.dumps(payload, protocol=5),
+        source=f"bounded-valid-utf8-{container.__name__}.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=1024),
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2.0
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict != SafetyVerdict.CLEAN
     assert any(notice.code == "literal_scan_truncated" for notice in report.notices)

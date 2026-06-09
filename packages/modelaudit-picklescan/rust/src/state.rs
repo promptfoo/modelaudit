@@ -10,15 +10,16 @@ use crate::expansion::{
     ExpansionHeuristicState,
 };
 use crate::nested::{
-    bounded_truncated_pickle_prefix_requires_fail_closed, decode_possible_encoded_pickle,
-    detect_oversized_encoded_pickle_prefixes, encoded_literal_may_contain_pickle,
-    encoded_nested_literal_probe_coverage_incomplete,
+    bounded_truncated_pickle_prefix_requires_fail_closed, confirmed_base64_pickle_spans,
+    decode_possible_encoded_pickle, detect_oversized_encoded_pickle_prefixes,
+    encoded_literal_may_contain_pickle, encoded_nested_literal_probe_coverage_incomplete,
     encoded_nested_literal_probe_windows_with_limit, encoded_nested_window_char_limit,
     encoded_pickle_consumes_literal, has_binary_pickle_prefix, has_execution_opcode,
-    has_pickle_prefix, is_strict_base64_literal, looks_like_pickle_payload,
-    nested_pickle_probe_offsets, pickle_payload_extent_result,
-    protocol0_global_or_inst_prefix_has_import_reference_lines, DecodedNestedPayload,
-    NestedProbeOffsets, MAX_NESTED_PAYLOAD_PROBES,
+    has_pickle_prefix, looks_like_pickle_payload, nested_pickle_probe_offsets,
+    pickle_payload_extent_result, protocol0_global_or_inst_prefix_has_import_reference_lines,
+    strict_base64_literal_has_encoded_pickle_candidate,
+    strict_base64_literal_raw_execution_probe_offsets, DecodedNestedPayload, NestedProbeOffsets,
+    MAX_NESTED_PAYLOAD_PROBES,
 };
 use crate::nested_surface::{
     encoded_nested_payload_finding, is_allowlisted_nested_constructor_ref,
@@ -1306,14 +1307,158 @@ impl<'a> ScanState<'a> {
                     let bytes = &self.payload[start..end];
                     let encoded_nested_pickle_outcome =
                         self.scan_encoded_nested_pickle_bytes_literal(bytes, position);
-                    let strict_base64_literal = is_strict_base64_literal(bytes);
-                    // Complete raw pickles require STOP ('.'), which is outside the
-                    // base64 alphabet. After a decoded candidate is confirmed, raw
-                    // parsing of a strict token can only produce truncated phantoms.
-                    let skip_raw_scan = encoded_nested_pickle_outcome.1
-                        || (encoded_nested_pickle_outcome.0 && strict_base64_literal);
+                    let sanitize = |slice: &[u8]| {
+                        slice
+                            .iter()
+                            .map(|byte| {
+                                if byte.is_ascii() {
+                                    char::from(*byte)
+                                } else {
+                                    '!'
+                                }
+                            })
+                            .collect::<String>()
+                    };
+                    let scan_limit = bytes.len().min(self.options.max_string_literal_scan_chars);
+                    let strict_base64_literal =
+                        bytes.len() <= scan_limit && crate::nested::is_strict_base64_literal(bytes);
+                    let strict_base64_has_encoded_candidate = strict_base64_literal
+                        && (encoded_nested_pickle_outcome.0
+                            || strict_base64_literal_has_encoded_pickle_candidate(bytes));
+                    let raw_execution_probes = if strict_base64_has_encoded_candidate {
+                        strict_base64_literal_raw_execution_probe_offsets(
+                            bytes,
+                            self.options.max_nested_pickle_bytes,
+                        )
+                    } else {
+                        NestedProbeOffsets {
+                            offsets: Vec::new(),
+                            limit_exceeded: false,
+                        }
+                    };
+                    let mut excluded_spans = if bytes.len() <= scan_limit
+                        && (encoded_nested_pickle_outcome.0 || strict_base64_has_encoded_candidate)
+                    {
+                        let sanitized_bytes = sanitize(bytes);
+                        confirmed_base64_pickle_spans(
+                            sanitized_bytes.as_bytes(),
+                            self.options.max_nested_pickle_bytes,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    let strict_text = strict_base64_literal
+                        .then(|| std::str::from_utf8(bytes).ok())
+                        .flatten();
+                    let mut raw_execution_probe_offset = raw_execution_probes
+                        .offsets
+                        .iter()
+                        .copied()
+                        .find(|raw_offset| {
+                            let encoded_before = strict_text.is_some_and(|text| {
+                                *raw_offset > 0
+                                    && encoded_pickle_consumes_literal(&text[..*raw_offset])
+                            });
+                            let encoded_after = excluded_spans
+                                .iter()
+                                .any(|(span_start, _)| *span_start > *raw_offset);
+                            let near_encoded_start =
+                                *raw_offset <= 16 && strict_base64_has_encoded_candidate;
+                            encoded_before || encoded_after || near_encoded_start
+                        });
+                    if raw_execution_probe_offset.is_none() && raw_execution_probes.limit_exceeded {
+                        raw_execution_probe_offset =
+                            raw_execution_probes.offsets.first().copied().or(Some(0));
+                    }
+                    if let Some(raw_offset) = raw_execution_probe_offset {
+                        excluded_spans.retain(|(span_start, span_end)| {
+                            !(*span_start <= raw_offset
+                                && raw_offset < *span_end
+                                && raw_offset <= span_start.saturating_add(16))
+                        });
+                    }
+                    let has_raw_execution_probe = raw_execution_probe_offset.is_some();
+                    let skip_raw_scan = if strict_base64_literal {
+                        !has_raw_execution_probe
+                    } else {
+                        encoded_nested_pickle_outcome.1
+                    };
                     if !skip_raw_scan {
-                        self.scan_raw_nested_pickle_bytes(bytes, self.position_offset + start);
+                        let raw_position = self.position_offset.saturating_add(start);
+                        let persistent_id_findings_before = self
+                            .findings
+                            .iter()
+                            .filter(|finding| finding.rule_code == Some("PERSISTENT_ID"))
+                            .count();
+                        if bytes.len() <= scan_limit {
+                            let mut cursor = 0usize;
+                            for (span_start, span_end) in excluded_spans.iter().copied() {
+                                if cursor < span_start {
+                                    self.scan_raw_nested_pickle_bytes(
+                                        &bytes[cursor..span_start],
+                                        raw_position.saturating_add(cursor),
+                                    );
+                                }
+                                cursor = cursor.max(span_end);
+                            }
+                            if cursor < bytes.len() {
+                                self.scan_raw_nested_pickle_bytes(
+                                    &bytes[cursor..],
+                                    raw_position.saturating_add(cursor),
+                                );
+                            }
+                        } else if scan_limit > 0 {
+                            self.scan_raw_nested_pickle_bytes(&bytes[..scan_limit], raw_position);
+                            let suffix_start =
+                                bytes.len().saturating_sub(scan_limit).max(scan_limit);
+                            if suffix_start < bytes.len() {
+                                self.scan_raw_nested_pickle_bytes(
+                                    &bytes[suffix_start..],
+                                    raw_position.saturating_add(suffix_start),
+                                );
+                            }
+                        }
+                        if let Some(raw_offset) = raw_execution_probe_offset {
+                            let raw_probe_is_excluded =
+                                excluded_spans.iter().any(|(span_start, span_end)| {
+                                    *span_start <= raw_offset && raw_offset < *span_end
+                                });
+                            let persistent_id_findings_after = self
+                                .findings
+                                .iter()
+                                .filter(|finding| finding.rule_code == Some("PERSISTENT_ID"))
+                                .count();
+                            if !raw_probe_is_excluded
+                                && persistent_id_findings_after == persistent_id_findings_before
+                            {
+                                let probe_end = excluded_spans
+                                    .iter()
+                                    .find_map(|(span_start, _)| {
+                                        (*span_start > raw_offset).then_some(*span_start)
+                                    })
+                                    .unwrap_or(bytes.len());
+                                if raw_offset < probe_end {
+                                    let probe = &bytes[raw_offset..probe_end];
+                                    let probe_position = raw_position.saturating_add(raw_offset);
+                                    let surface_outcome = self.surface_nested_pickle_findings(
+                                        probe,
+                                        "raw",
+                                        probe_position,
+                                    );
+                                    if !surface_outcome.depth_limited {
+                                        self.add_nested_payload_finding(
+                                            raw_nested_payload_finding(
+                                                probe.len(),
+                                                probe_position,
+                                                true,
+                                                true,
+                                            ),
+                                            true,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                     self.push_stack_value(StackValue::Bytes { start, end });
                 } else {
