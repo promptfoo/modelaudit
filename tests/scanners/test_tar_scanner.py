@@ -973,6 +973,146 @@ class TestTarScanner:
         finally:
             os.unlink(tmp_path)
 
+    def test_symlink_outside_extraction_root_uses_dedicated_rule(self, tmp_path: Path) -> None:
+        """External TAR links must use the dedicated symlink escape rule."""
+        archive_path = tmp_path / "external_link.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("link.txt")
+            info.type = tarfile.SYMTYPE
+            info.linkname = "../../../etc/passwd"
+            archive.addfile(info)
+
+        result = self.scanner.scan(str(archive_path))
+
+        symlink_checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert result.success is False
+        assert len(symlink_checks) == 1
+        assert symlink_checks[0].rule_code == "S406"
+        assert symlink_checks[0].severity == IssueSeverity.CRITICAL
+        assert symlink_checks[0].details == {"target": "../../../etc/passwd", "entry": "link.txt"}
+
+    def test_parent_relative_symlink_within_archive_is_safe(self, tmp_path: Path) -> None:
+        """A symlink may traverse its parent while remaining inside the archive root."""
+        archive_path = tmp_path / "parent_relative_link.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            target = tarfile.TarInfo("weights.bin")
+            target.size = 0
+            archive.addfile(target, tarfile.io.BytesIO(b""))  # type: ignore[attr-defined]
+
+            link = tarfile.TarInfo("nested/link.bin")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "../weights.bin"
+            archive.addfile(link)
+
+        result = self.scanner.scan(str(archive_path))
+
+        symlink_checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert result.success is True
+        assert symlink_checks == []
+
+    def test_archive_root_relative_hardlink_within_archive_is_safe(self, tmp_path: Path) -> None:
+        """TAR hardlink targets are resolved from the archive root, not the member parent."""
+        archive_path = tmp_path / "root_relative_hardlink.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            target = tarfile.TarInfo("weights.bin")
+            target.size = 0
+            archive.addfile(target, tarfile.io.BytesIO(b""))  # type: ignore[attr-defined]
+
+            link = tarfile.TarInfo("nested/link.bin")
+            link.type = tarfile.LNKTYPE
+            link.linkname = "weights.bin"
+            archive.addfile(link)
+
+        result = self.scanner.scan(str(archive_path))
+
+        symlink_checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert result.success is True
+        assert symlink_checks == []
+
+    def test_many_safe_links_do_not_amplify_scan_results(self, tmp_path: Path) -> None:
+        """Benign link floods must not create one passing check per TAR member."""
+        archive_path = tmp_path / "many_safe_links.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            for index in range(250):
+                link = tarfile.TarInfo(f"links/link-{index}")
+                link.type = tarfile.SYMTYPE
+                link.linkname = "../targets/model.bin"
+                archive.addfile(link)
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert not [check for check in result.checks if check.name == "Symlink Safety Validation"]
+
+    def test_hardlink_outside_extraction_root_survives_s902_suppression(self, tmp_path: Path) -> None:
+        """Suppressing generic structure noise must not suppress TAR hardlink escapes."""
+        archive_path = tmp_path / "external_link_suppressed.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("nested/link.txt")
+            info.type = tarfile.LNKTYPE
+            info.linkname = "../outside"
+            archive.addfile(info)
+
+        reset_config()
+        set_config(ModelAuditConfig(suppress={"S902"}))
+        try:
+            result = self.scanner.scan(str(archive_path))
+        finally:
+            reset_config()
+
+        symlink_checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert result.success is False
+        assert len(symlink_checks) == 1
+        assert symlink_checks[0].rule_code == "S406"
+        assert symlink_checks[0].message == "Hard link nested/link.txt resolves outside extraction directory"
+        assert symlink_checks[0].details["entry"] == "nested/link.txt"
+
+    @pytest.mark.parametrize(
+        ("link_type", "expected_kind"),
+        [(tarfile.SYMTYPE, "Symlink"), (tarfile.LNKTYPE, "Hard link")],
+    )
+    def test_empty_link_target_fails_closed(
+        self,
+        tmp_path: Path,
+        link_type: bytes,
+        expected_kind: str,
+    ) -> None:
+        """Malformed archive links with empty targets must not be reported as safe."""
+        archive_path = tmp_path / f"empty_{expected_kind.lower().replace(' ', '_')}.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("nested/link.txt")
+            info.type = link_type
+            info.linkname = ""
+            archive.addfile(info)
+
+        result = self.scanner.scan(str(archive_path))
+
+        link_checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+        assert result.success is False
+        assert len(link_checks) == 1
+        assert link_checks[0].rule_code == "S406"
+        assert link_checks[0].message == f"{expected_kind} nested/link.txt has an empty target"
+        assert link_checks[0].details == {"target": "", "entry": "nested/link.txt"}
+
+    def test_symlink_outside_extraction_root_respects_s406_suppression(self, tmp_path: Path) -> None:
+        """The dedicated link escape rule remains directly suppressible."""
+        archive_path = tmp_path / "external_link_s406_suppressed.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("link.txt")
+            info.type = tarfile.SYMTYPE
+            info.linkname = "../../../etc/passwd"
+            archive.addfile(info)
+
+        reset_config()
+        set_config(ModelAuditConfig(suppress={"S406"}))
+        try:
+            result = self.scanner.scan(str(archive_path))
+        finally:
+            reset_config()
+
+        assert result.success is True
+        assert not any(check.rule_code == "S406" for check in result.checks)
+
     def test_symlink_to_critical_path(self):
         """Symlinks targeting critical system paths should be flagged"""
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
