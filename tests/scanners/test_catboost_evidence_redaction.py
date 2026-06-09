@@ -1746,8 +1746,9 @@ def test_command_credential_redaction_has_bounded_runtime(pattern_name: str, pay
 def test_curl_command_redaction_has_bounded_runtime() -> None:
     payload = ("/curl " * 8_000) + "x --cert client.pem:public"
     code = (
+        "import sys\n"
         "from modelaudit.scanners._catboost_evidence_redaction import _redact_curl_credentials\n"
-        f"payload = {payload!r}\n"
+        "payload = sys.stdin.read()\n"
         "_redact_curl_credentials(payload)\n"
     )
     repo_root = Path(__file__).resolve().parents[2]
@@ -1758,6 +1759,8 @@ def test_curl_command_redaction_has_bounded_runtime() -> None:
         check=True,
         cwd=repo_root,
         env={**os.environ, "PYTHONPATH": python_path},
+        input=payload,
+        text=True,
         timeout=5,
     )
 
