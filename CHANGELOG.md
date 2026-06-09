@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- fail closed on PMML XML parsing when defusedxml is unavailable instead of using the stdlib parser
+- reject ambiguous, lossy, SDK-invalid, or traversal-bearing Hugging Face direct file URLs, redact rejected URL secrets, and preserve platform-valid filenames
 - scan safe OCI layer links with model-looking member names instead of treating link metadata as complete coverage
 - preserve scanner read caps when core max_file_size is unlimited
 - reject untrusted JFrog redirect hostnames unless explicitly allowed, block non-public IP targets, suppress ambient netrc credentials, and isolate redirect authentication and cookies
@@ -18,7 +20,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - redact Keras and TensorFlow scanner detail fields that echo model-controlled configs, code indicators, archive members, and external references.
 - route security-relevant protocol-less binary pickle streams through pickle analysis even when file suffixes are misleading
 - avoid routing complete benign cloud objects as protocol-less pickle prefixes when they exactly consume the content-sniff budget
-- redact proxy and camel-case authorization evidence with scheme-bearing values without hiding benign counters
 - redact folded, placeholder-adjacent, proxy, and camel-case authorization evidence with scheme-bearing values without hiding benign counters
 - bound Keras ZIP config traversal for CVE detectors and fail closed when config.json coverage budgets are exhausted
 - redact MLflow registry, source, telemetry, and client exception credentials before logging, printing, or analytics export
