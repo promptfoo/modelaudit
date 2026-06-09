@@ -641,21 +641,21 @@ class ExecuTorchScanner(BaseScanner):
         *,
         all_entries: list[zipfile.ZipInfo],
         safe_entries: list[zipfile.ZipInfo],
-    ) -> ScanResult | None:
+    ) -> bool:
         declared_uncompressed_size = sum(entry.file_size for entry in all_entries if not entry.is_dir())
         safe_uncompressed_size = sum(entry.file_size for entry in safe_entries if not entry.is_dir())
         result.metadata["executorch_zip_declared_uncompressed_size"] = declared_uncompressed_size
         result.metadata["executorch_zip_uncompressed_size"] = safe_uncompressed_size
         result.metadata["max_executorch_zip_total_uncompressed_size"] = self.max_total_uncompressed_size
         if safe_uncompressed_size > self.max_total_uncompressed_size:
-            return self._finish_zip_budget_failure(
+            self._add_zip_budget_failure(
                 result,
                 path,
                 check_name="ExecuTorch ZIP Aggregate Size Limit",
                 message=(
                     f"ExecuTorch ZIP total uncompressed size exceeds limit "
                     f"({safe_uncompressed_size} > {self.max_total_uncompressed_size} bytes); "
-                    "skipping member content scan"
+                    "limiting pickle member content scans to the configured budget"
                 ),
                 details={
                     "archive_uncompressed_size": safe_uncompressed_size,
@@ -664,6 +664,7 @@ class ExecuTorchScanner(BaseScanner):
                 },
                 reason=self.ZIP_AGGREGATE_LIMIT_INCONCLUSIVE_REASON,
             )
+            return True
 
         result.add_check(
             name="ExecuTorch ZIP Aggregate Size Limit",
@@ -679,7 +680,27 @@ class ExecuTorchScanner(BaseScanner):
                 "max_total_uncompressed_size": self.max_total_uncompressed_size,
             },
         )
-        return None
+        return False
+
+    def _limit_pickle_entries_to_aggregate_budget(
+        self,
+        result: ScanResult,
+        pickle_entries: list[zipfile.ZipInfo],
+    ) -> tuple[list[zipfile.ZipInfo], bool]:
+        bytes_selected = 0
+        scannable_entries: list[zipfile.ZipInfo] = []
+        skipped_entries: list[zipfile.ZipInfo] = []
+        for entry in pickle_entries:
+            if bytes_selected + entry.file_size > self.max_total_uncompressed_size:
+                skipped_entries.append(entry)
+                continue
+            scannable_entries.append(entry)
+            bytes_selected += entry.file_size
+
+        result.metadata["executorch_zip_pickle_scan_uncompressed_size"] = bytes_selected
+        if skipped_entries:
+            result.metadata["executorch_zip_skipped_pickle_files"] = [entry.filename for entry in skipped_entries[:20]]
+        return scannable_entries, bool(skipped_entries)
 
     @staticmethod
     def _add_python_entry_checks(result: ScanResult, path: str, safe_entries: list[zipfile.ZipInfo]) -> None:
@@ -831,22 +852,26 @@ class ExecuTorchScanner(BaseScanner):
                     safe_entries.append(entry)
 
                 self._add_python_entry_checks(result, path, safe_entries)
-                aggregate_limit_result = self._check_zip_aggregate_size(
+                aggregate_coverage_incomplete = self._check_zip_aggregate_size(
                     result,
                     path,
                     all_entries=archive_entries,
                     safe_entries=safe_entries,
                 )
-                if aggregate_limit_result:
-                    return aggregate_limit_result
 
                 pickle_entries = [entry for entry in safe_entries if entry.filename.casefold().endswith(".pkl")]
                 pickle_files = [entry.filename for entry in pickle_entries]
                 result.metadata["pickle_files"] = pickle_files
-                pickle_entries, pickle_coverage_incomplete = self._check_pickle_member_budgets(
+                pickle_entries, member_coverage_incomplete = self._check_pickle_member_budgets(
                     result,
                     path,
                     pickle_entries,
+                )
+                pickle_entries, aggregate_pickle_coverage_incomplete = self._limit_pickle_entries_to_aggregate_budget(
+                    result, pickle_entries
+                )
+                pickle_coverage_incomplete = (
+                    aggregate_coverage_incomplete or member_coverage_incomplete or aggregate_pickle_coverage_incomplete
                 )
                 bytes_scanned = 0
 

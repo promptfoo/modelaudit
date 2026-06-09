@@ -1023,6 +1023,38 @@ def test_executorch_zip_aggregate_limit_fails_before_member_content_scan(
     )
 
 
+@pytest.mark.parametrize("malicious_first", [True, False])
+def test_executorch_zip_aggregate_limit_preserves_scannable_member_detection(
+    tmp_path: Path,
+    malicious_first: bool,
+) -> None:
+    model_path = tmp_path / "mixed-aggregate.ptl"
+    malicious_payload = _pickle_payload_with_eval("print('evil')")
+    benign_payload = pickle.dumps({"weights": b"A" * 4096})
+    members = [
+        ("malicious.pkl", malicious_payload),
+        ("benign.pkl", benign_payload),
+    ]
+    if not malicious_first:
+        members.reverse()
+
+    with zipfile.ZipFile(model_path, "w", compression=zipfile.ZIP_STORED) as zipf:
+        zipf.writestr("version", "1")
+        for name, payload in members:
+            zipf.writestr(name, payload)
+
+    result = ExecuTorchScanner(config={"max_executorch_zip_total_uncompressed_size": len(malicious_payload)}).scan(
+        str(model_path)
+    )
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "executorch_zip_total_uncompressed_size_limit" in result.metadata["scan_outcome_reasons"]
+    assert result.bytes_scanned == len(malicious_payload)
+    assert result.metadata["executorch_zip_skipped_pickle_files"] == ["benign.pkl"]
+    assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
+
+
 def test_executorch_zip_aggregate_limit_allows_benign_near_match(tmp_path: Path) -> None:
     model_path = tmp_path / "aggregate-near-match.ptl"
     with zipfile.ZipFile(model_path, "w") as zipf:
