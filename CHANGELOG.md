@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - bound Jinja static render analysis and fail closed on CPU-heavy aliased, recursive, container-wrapped, and arithmetic range probes when sandbox workers are unavailable
+- restrict auth bearer-token validation to trusted Promptfoo API hosts unless custom hosts are explicitly configured
 - escape terminal and Unicode formatting controls in human-readable CLI output
 - disable unsafe Joblib and NumPy object metadata deserialization
 - keep concrete active execution, runtime-extension, and blacklist findings from being downgraded by Hugging Face whitelists
