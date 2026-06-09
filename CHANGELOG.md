@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- bound remote streaming-analysis reads and report actual received-byte coverage for truncated objects
 - avoid sending raw model identifiers, source paths, object keys, issue locations, or free-form errors in telemetry
 - cover Keras H5 callable metadata and module references, align CVE-2025-1550 attribution, and scope HDF5 external-reference checks to Keras weight trees
 - require explicit boolean opt-in before weight-distribution scans call torch.load and bound primitive PyTorch ZIP fallback extraction
