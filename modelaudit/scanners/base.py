@@ -105,6 +105,29 @@ _WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES: Final[frozenset[str]] = frozenset(
         "S509",
     }
 )
+_WHITELIST_DOWNGRADE_EXEMPT_CHECK_NAMES: Final[frozenset[str]] = frozenset(
+    {
+        "Command/Network Correlation Check",
+        "RKNN Command and Network Indicator Correlation",
+    }
+)
+_WHITELIST_DOWNGRADE_EXEMPT_CORRELATION_DETAIL = "same_fragment_correlation"
+_WHITELIST_DOWNGRADE_EXEMPT_CRITICAL_CHECK_NAMES: Final[frozenset[str]] = frozenset(
+    {
+        "Blacklist Pattern Check",
+        "Command Indicator Check",
+        "CoreML Custom Layer Check",
+        "CoreML Custom Model Class Check",
+        "Embedded PE Detection",
+        "External Library Reference Check",
+        "Protobuf String Injection Check",
+        "Python Operator Detection",
+        "Serialized Expression Payload Detection",
+        "Suspicious Layer Type Detection",
+        "TorchServe Handler Static Analysis",
+        "Torch7 Lua Execution Primitive Analysis",
+    }
+)
 # Word-boundary matching prevents incidental substrings (e.g. "executable" inside
 # "ExecuTorch", "rce" inside "force") from suppressing whitelist downgrades.
 _WHITELIST_DOWNGRADE_EXEMPT_KEYWORD_PATTERN: Final[re.Pattern[str]] = re.compile(
@@ -241,6 +264,7 @@ class BaseScanner(ABC):
     @staticmethod
     def _whitelist_downgrade_exempt(
         *,
+        severity: IssueSeverity,
         details: dict[str, Any] | None,
         result_metadata: dict[str, Any] | None = None,
         message: str | None,
@@ -254,6 +278,15 @@ class BaseScanner(ABC):
         if BaseScanner._result_metadata_whitelist_downgrade_exempt(result_metadata):
             return True
         if details.get("cve_id") or details.get("cve"):
+            return True
+
+        if (
+            check_name in _WHITELIST_DOWNGRADE_EXEMPT_CHECK_NAMES
+            and details.get(_WHITELIST_DOWNGRADE_EXEMPT_CORRELATION_DETAIL) is True
+        ):
+            return True
+
+        if severity == IssueSeverity.CRITICAL and check_name in _WHITELIST_DOWNGRADE_EXEMPT_CRITICAL_CHECK_NAMES:
             return True
 
         if rule_code and (rule_code.startswith("S2") or rule_code in _WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES):
@@ -281,11 +314,12 @@ class BaseScanner(ABC):
         Returns:
             True if the issue should be downgraded to INFO, False otherwise
         """
-        # Only downgrade severities higher than INFO
+        # Only downgrade severities higher than INFO.
         if severity in (IssueSeverity.INFO, IssueSeverity.DEBUG):
             return False
 
         if self._whitelist_downgrade_exempt(
+            severity=severity,
             details=details,
             result_metadata=result_metadata,
             message=message,
@@ -335,6 +369,17 @@ class BaseScanner(ABC):
             Tuple of (potentially modified severity, details dict)
         """
         original_severity = severity
+        details = dict(details or {})
+        if severity in (IssueSeverity.INFO, IssueSeverity.DEBUG):
+            return severity, details
+
+        has_whitelist_metadata = (
+            details.get("whitelist_downgrade") is True or details.get("whitelist_downgrade_restored") is True
+        )
+        if has_whitelist_metadata:
+            details.pop("whitelist_downgrade", None)
+            details.pop("whitelist_downgrade_restored", None)
+            details.pop("original_severity", None)
         if self._should_apply_whitelist(
             severity,
             details=details,
@@ -344,13 +389,8 @@ class BaseScanner(ABC):
             check_name=check_name,
         ):
             severity = IssueSeverity.INFO
-            # Add note about whitelisting to the details
-            if details is None:
-                details = {}
             details["whitelist_downgrade"] = True
             details["original_severity"] = original_severity.name
-        elif details is None:
-            details = {}
 
         return severity, details
 

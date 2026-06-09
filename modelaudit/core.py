@@ -5,9 +5,11 @@ import itertools
 import logging
 import os
 import stat
+import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -96,8 +98,12 @@ from modelaudit.utils.file.detection import (
     validate_file_type_with_formats,
 )
 from modelaudit.utils.file.handlers import (
+    _SHARD_ALREADY_PINNED_CONFIG_KEY,
+    MAX_RECORDED_MISSING_SHARD_INDICES,
     ShardedModelDetector,
     ValidatedShardTargets,
+    _pinned_shard_scan_path,
+    _ShardPinUnavailableError,
     scan_advanced_large_file,
     should_use_advanced_handler,
 )
@@ -347,6 +353,28 @@ _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_in
 _ShardFamilyKey = tuple[str, str, int | None]
 _ScanEntry = tuple[str, list[str], _ShardFamilyKey | None]
 _SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY = "shard_family_cache_fingerprint"
+_TRUSTED_STREAM_SHARD_PARENT_PREFIXES = (
+    "modelaudit_hf_",
+    "modelaudit_pth_stream_",
+    "modelaudit_stream_",
+)
+_TRUSTED_STREAM_SHARD_ROOT_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class _TrustedStreamShardRoot:
+    """Internal marker for a source-owned persistent streaming root."""
+
+    path: Path
+    token: object
+
+
+def _make_trusted_stream_shard_root(path: FilePath) -> object:
+    """Mark a persistent root selected by a trusted remote-source dispatcher."""
+    return _TrustedStreamShardRoot(
+        path=Path(path).expanduser().absolute(),
+        token=_TRUSTED_STREAM_SHARD_ROOT_TOKEN,
+    )
 
 
 def _redacted_stream_url_for_reporting(stream_url: str) -> str:
@@ -468,6 +496,482 @@ def _shard_family_key_for_path(path: str) -> _ShardFamilyKey | None:
         expected_total = None
 
     return (str(path_obj.parent), pattern, expected_total)
+
+
+def _trusted_stream_shard_family_group(
+    source: Path,
+    resolved_source: Path,
+    family_group: str,
+    trusted_root_marker: object | None = None,
+) -> str | None:
+    """Scope a trusted stream group to the artifact's logical staging parent."""
+
+    def trusted_root_is_private(path: Path) -> bool:
+        try:
+            root_stat = os.stat(path, follow_symlinks=False)
+        except OSError:
+            return False
+        if not stat.S_ISDIR(root_stat.st_mode):
+            return False
+        if os.name != "nt":
+            get_effective_uid = getattr(os, "geteuid", None)
+            if callable(get_effective_uid) and root_stat.st_uid != get_effective_uid():
+                return False
+            if stat.S_IMODE(root_stat.st_mode) & 0o022:
+                return False
+        return True
+
+    try:
+        logical_parent = source.absolute().parent.resolve(strict=True)
+        trusted_root: Path | None = None
+        if (
+            isinstance(trusted_root_marker, _TrustedStreamShardRoot)
+            and trusted_root_marker.token is _TRUSTED_STREAM_SHARD_ROOT_TOKEN
+        ):
+            candidate_root = trusted_root_marker.path.resolve(strict=True)
+            if trusted_root_is_private(candidate_root):
+                trusted_root = candidate_root
+
+        if trusted_root is None:
+            temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+            candidate = logical_parent
+            while candidate != temp_root and candidate != candidate.parent:
+                if (
+                    candidate.parent == temp_root
+                    and candidate.name.startswith(_TRUSTED_STREAM_SHARD_PARENT_PREFIXES)
+                    and trusted_root_is_private(candidate)
+                ):
+                    trusted_root = candidate
+                    break
+                candidate = candidate.parent
+        if trusted_root is None:
+            return None
+        if not is_within_directory(str(trusted_root), str(logical_parent)) or not is_within_directory(
+            str(trusted_root), str(resolved_source)
+        ):
+            return None
+        relative_parent = logical_parent.relative_to(trusted_root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+    scope = hashlib.sha256()
+    scope.update(family_group.encode("utf-8", errors="surrogatepass"))
+    scope.update(b"\0")
+    scope.update(os.path.normcase(relative_parent.as_posix()).encode("utf-8", errors="surrogatepass"))
+    return f"stream-staging:{scope.hexdigest()}"
+
+
+def _snapshot_validated_shard_target(
+    source_path: str,
+    *,
+    resolved_path: str | None = None,
+    family_group: str | None = None,
+    family_group_policy: str | None = None,
+    trusted_root_marker: object | None = None,
+) -> ValidatedShardTargets:
+    """Snapshot one selected shard path after resolving it to a regular file."""
+    source = Path(source_path)
+    shard_match = ShardedModelDetector.match_shard_filename(source.name)
+    if shard_match is None or not isinstance(shard_match.get("expected_total_shards"), int):
+        return {}
+
+    try:
+        resolved_source = source.resolve(strict=True)
+        resolved_target = Path(resolved_path).resolve(strict=True) if resolved_path is not None else resolved_source
+        if os.path.normcase(os.path.normpath(str(resolved_source))) != os.path.normcase(
+            os.path.normpath(str(resolved_target))
+        ):
+            return {}
+        target_stat = os.stat(resolved_target, follow_symlinks=False)
+    except (OSError, RuntimeError):
+        return {}
+    if not stat.S_ISREG(target_stat.st_mode):
+        return {}
+
+    target: dict[str, int | str] = {
+        "resolved_path": str(resolved_target),
+        "device": target_stat.st_dev,
+        "inode": target_stat.st_ino,
+        "size": target_stat.st_size,
+        "mtime_ns": target_stat.st_mtime_ns,
+        "ctime_ns": target_stat.st_ctime_ns,
+        "nlink": target_stat.st_nlink,
+    }
+    if family_group_policy == "explicit" and family_group:
+        target["family_group"] = family_group
+    elif family_group_policy == "stream_staging":
+        trusted_family_group = (
+            _trusted_stream_shard_family_group(
+                source,
+                resolved_source,
+                family_group,
+                trusted_root_marker,
+            )
+            if family_group
+            else None
+        )
+        if trusted_family_group:
+            target["family_group"] = trusted_family_group
+    return {str(source.absolute()): target}
+
+
+def _validated_shard_family_scopes(
+    source_path: str,
+    target: dict[str, int | str],
+) -> set[str]:
+    """Return validated scopes that may identify one shard family."""
+    parent = Path(source_path).absolute().parent
+    normalized_parent = os.path.normcase(os.path.normpath(str(parent)))
+    scopes = {f"directory:{normalized_parent}"}
+    family_group = target.get("family_group")
+    if isinstance(family_group, str) and family_group:
+        scopes.add(f"trusted-group:{family_group}")
+    return scopes
+
+
+def _complete_validated_shard_family_sources(validated_targets: ValidatedShardTargets) -> set[str]:
+    """Return source paths belonging to complete, uniquely targeted shard families."""
+    grouped_targets: dict[
+        tuple[str, int, str],
+        dict[int, list[tuple[str, dict[str, int | str]]]],
+    ] = {}
+    for source_path, target in validated_targets.items():
+        shard_match = ShardedModelDetector.match_shard_filename(Path(source_path).name)
+        if shard_match is None:
+            continue
+        pattern = shard_match.get("pattern")
+        shard_index = shard_match.get("current_shard_index")
+        expected_total = shard_match.get("expected_total_shards")
+        if (
+            not isinstance(pattern, str)
+            or not isinstance(shard_index, int)
+            or not isinstance(expected_total, int)
+            or expected_total <= 1
+            or not 1 <= shard_index <= expected_total
+        ):
+            continue
+        for family_scope in _validated_shard_family_scopes(source_path, target):
+            grouped_targets.setdefault((pattern, expected_total, family_scope), {}).setdefault(shard_index, []).append(
+                (source_path, target)
+            )
+
+    complete_sources: set[str] = set()
+    for (_pattern, expected_total, _family_scope), targets_by_index in grouped_targets.items():
+        # Indices are already bounded to [1, expected_total], so matching the
+        # expected cardinality proves the complete range without materializing
+        # an attacker-controlled range.
+        if len(targets_by_index) != expected_total:
+            continue
+        if any(len(records) != 1 for records in targets_by_index.values()):
+            continue
+        records = [records[0] for records in targets_by_index.values()]
+
+        inode_targets: dict[tuple[int, int], list[dict[str, int | str]]] = {}
+        path_identities: set[str] = set()
+        duplicate_target = False
+        for _source_path, target in records:
+            inode = target.get("inode")
+            device = target.get("device")
+            resolved_target = target.get("resolved_path")
+            if isinstance(inode, int) and inode and isinstance(device, int):
+                inode_key = (device, inode)
+                for existing_target in inode_targets.get(inode_key, []):
+                    existing_path = existing_target.get("resolved_path")
+                    same_resolved_path = (
+                        isinstance(existing_path, str)
+                        and isinstance(resolved_target, str)
+                        and os.path.normcase(os.path.normpath(existing_path))
+                        == os.path.normcase(os.path.normpath(resolved_target))
+                    )
+                    hardlink_observed = any(
+                        isinstance((link_count := candidate.get("nlink")), int) and link_count > 1
+                        for candidate in (existing_target, target)
+                    )
+                    generation_fields = ("size", "mtime_ns", "ctime_ns")
+                    generations_available = all(
+                        isinstance(candidate.get(field), int)
+                        for candidate in (existing_target, target)
+                        for field in generation_fields
+                    )
+                    same_generation = generations_available and all(
+                        existing_target[field] == target[field] for field in generation_fields
+                    )
+                    if same_resolved_path or hardlink_observed or same_generation or not generations_available:
+                        duplicate_target = True
+                        break
+                if duplicate_target:
+                    break
+                inode_targets.setdefault(inode_key, []).append(target)
+            elif isinstance(resolved_target, str):
+                path_identity = os.path.normcase(os.path.normpath(resolved_target))
+                if path_identity in path_identities:
+                    duplicate_target = True
+                    break
+                path_identities.add(path_identity)
+            else:
+                duplicate_target = True
+                break
+        if duplicate_target:
+            continue
+
+        complete_sources.update(
+            os.path.normcase(os.path.normpath(os.path.abspath(source_path))) for source_path, _target in records
+        )
+    return complete_sources
+
+
+def _ensure_streamed_shard_coverage_placeholder(scan_result: ScanResult, source_path: Path) -> None:
+    """Record the per-file shard gap that trusted cross-file reconciliation may later disprove."""
+    for record in itertools.chain(scan_result.checks, scan_result.issues):
+        details = getattr(record, "details", None)
+        if isinstance(details, dict) and details.get("scan_outcome_reason") == "missing_model_shards":
+            return
+
+    shard_match = ShardedModelDetector.match_shard_filename(source_path.name)
+    if shard_match is None:
+        return
+    shard_index = shard_match.get("current_shard_index")
+    expected_total = shard_match.get("expected_total_shards")
+    if (
+        not isinstance(shard_index, int)
+        or not isinstance(expected_total, int)
+        or expected_total <= 1
+        or not 1 <= shard_index <= expected_total
+    ):
+        return
+
+    missing_count = expected_total - 1
+    missing_indices = list(
+        itertools.islice(
+            (index for index in range(1, expected_total + 1) if index != shard_index),
+            MAX_RECORDED_MISSING_SHARD_INDICES,
+        )
+    )
+    _mark_inconclusive_scan_outcome(scan_result, "missing_model_shards")
+    scan_result.add_check(
+        name="Sharded Model Coverage Check",
+        passed=False,
+        message=f"Missing {missing_count} expected model shard(s); scan coverage is incomplete.",
+        severity=IssueSeverity.INFO,
+        location=str(source_path),
+        details={
+            "expected_total_shards": expected_total,
+            "present_total_shards": 1,
+            "missing_shard_count": missing_count,
+            "missing_shard_indices": missing_indices,
+            "missing_shard_indices_truncated": missing_count > len(missing_indices),
+            "unreadable_shard_count": 0,
+            "unreadable_shards": [],
+            "out_of_scope_shard_count": 0,
+            "out_of_scope_shards": [],
+            "unvalidated_shard_count": 0,
+            "unvalidated_shards": [],
+            "duplicate_shard_count": 0,
+            "duplicate_shards": [],
+            "analysis_incomplete": True,
+            "scan_outcome": "inconclusive",
+            "scan_outcome_reason": "missing_model_shards",
+        },
+    )
+    scan_result.finish(success=False)
+
+
+def _remaining_shard_coverage_outcome(details: dict[str, Any]) -> tuple[str, str] | None:
+    """Return the next visible incomplete-coverage reason after missing peers are disproven."""
+    out_of_scope_count = details.get("out_of_scope_shard_count")
+    if isinstance(out_of_scope_count, int) and out_of_scope_count > 0:
+        return (
+            "out_of_scope_model_shards",
+            f"Skipped {out_of_scope_count} model shard(s) resolving outside the direct scan directory; "
+            "scan coverage is incomplete.",
+        )
+
+    unreadable_count = details.get("unreadable_shard_count")
+    if isinstance(unreadable_count, int) and unreadable_count > 0:
+        return (
+            "unreadable_model_shards",
+            f"Unable to read {unreadable_count} model shard(s); scan coverage is incomplete.",
+        )
+
+    unvalidated_count = details.get("unvalidated_shard_count")
+    if isinstance(unvalidated_count, int) and unvalidated_count > 0:
+        return (
+            "unvalidated_model_shards",
+            f"Skipped {unvalidated_count} model shard(s) outside the validated family; scan coverage is incomplete.",
+        )
+
+    duplicate_count = details.get("duplicate_shard_count")
+    if isinstance(duplicate_count, int) and duplicate_count > 0:
+        return (
+            "duplicate_model_shard_targets",
+            f"Skipped {duplicate_count} model shard name(s) resolving to duplicate targets; "
+            "scan coverage is incomplete.",
+        )
+    return None
+
+
+def _update_missing_shard_coverage_record(record: Check | Issue, reason: str, message: str) -> None:
+    """Replace a disproven missing-shard outcome with a remaining coverage failure."""
+    details = dict(record.details) if isinstance(record.details, dict) else {}
+    for field_name in (
+        "missing_shard_count",
+        "missing_shard_indices",
+        "missing_shard_indices_truncated",
+    ):
+        details.pop(field_name, None)
+    existing_reasons = details.get("scan_outcome_reasons")
+    if isinstance(existing_reasons, list):
+        remaining_reasons = [
+            existing_reason for existing_reason in existing_reasons if existing_reason != "missing_model_shards"
+        ]
+        if reason not in remaining_reasons:
+            remaining_reasons.append(reason)
+        details["scan_outcome_reasons"] = remaining_reasons
+    details.pop("scan_outcome_message", None)
+    details["scan_outcome_reason"] = reason
+    record.details = details
+    record.message = message
+
+
+def _results_have_explicit_operational_error(results: ModelAuditResultModel) -> bool:
+    """Return whether retained result evidence identifies an operational failure."""
+    if any(bool(metadata.get("operational_error")) for metadata in results.file_metadata.values()):
+        return True
+    if any(asset.type == "error" for asset in results.assets):
+        return True
+    records: list[Check | Issue] = [*results.checks, *results.issues]
+    return any(isinstance(record.details, dict) and bool(record.details.get("operational_error")) for record in records)
+
+
+def _results_have_retained_incomplete_outcome(results: ModelAuditResultModel) -> bool:
+    """Return whether retained evidence still identifies incomplete analysis."""
+    if any(
+        bool(metadata.get("analysis_incomplete")) or metadata.get("scan_outcome") == "inconclusive"
+        for metadata in results.file_metadata.values()
+    ):
+        return True
+    records: list[Check | Issue] = [*results.checks, *results.issues]
+    return any(
+        isinstance(record.details, dict)
+        and (bool(record.details.get("analysis_incomplete")) or record.details.get("scan_outcome") == "inconclusive")
+        for record in records
+    )
+
+
+def _reconcile_cross_directory_shard_coverage(
+    results: ModelAuditResultModel,
+    validated_targets: ValidatedShardTargets,
+    *,
+    missing_shard_errors_only: bool = False,
+) -> bool:
+    """Remove missing-shard outcomes, clearing errors only with explicit ownership proof."""
+    complete_sources = _complete_validated_shard_family_sources(validated_targets)
+    if not complete_sources:
+        return False
+
+    def source_is_complete(path: str | None) -> bool:
+        if not isinstance(path, str):
+            return False
+        normalized_path = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+        return normalized_path in complete_sources
+
+    def record_key(record: Check | Issue, reason: str) -> tuple[str, str] | None:
+        if not source_is_complete(record.location):
+            return None
+        assert isinstance(record.location, str)
+        normalized_location = os.path.normcase(os.path.normpath(os.path.abspath(record.location)))
+        return (normalized_location, reason)
+
+    reconciled = False
+    existing_check_reasons = {
+        key
+        for check in results.checks
+        if check.name == "Sharded Model Coverage Check"
+        and isinstance(check.details, dict)
+        and isinstance((reason := check.details.get("scan_outcome_reason")), str)
+        and reason != "missing_model_shards"
+        and (key := record_key(check, reason)) is not None
+    }
+    retained_checks: list[Check] = []
+    for check in results.checks:
+        details = check.details if isinstance(check.details, dict) else {}
+        if (
+            check.name == "Sharded Model Coverage Check"
+            and details.get("scan_outcome_reason") == "missing_model_shards"
+            and source_is_complete(check.location)
+        ):
+            reconciled = True
+            replacement = _remaining_shard_coverage_outcome(details)
+            if replacement is None:
+                continue
+            reason, message = replacement
+            key = record_key(check, reason)
+            if key in existing_check_reasons:
+                continue
+            _update_missing_shard_coverage_record(check, reason, message)
+            if key is not None:
+                existing_check_reasons.add(key)
+        retained_checks.append(check)
+    results.checks = retained_checks
+
+    existing_issue_reasons = {
+        key
+        for issue in results.issues
+        if isinstance(issue.details, dict)
+        and isinstance((reason := issue.details.get("scan_outcome_reason")), str)
+        and reason != "missing_model_shards"
+        and (key := record_key(issue, reason)) is not None
+    }
+    retained_issues: list[Issue] = []
+    for issue in results.issues:
+        details = issue.details if isinstance(issue.details, dict) else {}
+        if details.get("scan_outcome_reason") == "missing_model_shards" and source_is_complete(issue.location):
+            reconciled = True
+            replacement = _remaining_shard_coverage_outcome(details)
+            if replacement is None:
+                continue
+            reason, message = replacement
+            key = record_key(issue, reason)
+            if key in existing_issue_reasons:
+                continue
+            _update_missing_shard_coverage_record(issue, reason, message)
+            if key is not None:
+                existing_issue_reasons.add(key)
+        retained_issues.append(issue)
+    results.issues = retained_issues
+
+    from .models import FileMetadataModel
+
+    for source_path, metadata_model in list(results.file_metadata.items()):
+        if not source_is_complete(source_path):
+            continue
+        metadata = metadata_model.model_dump(mode="python")
+        reasons = metadata.get("scan_outcome_reasons")
+        if not isinstance(reasons, list) or "missing_model_shards" not in reasons:
+            continue
+        remaining_reasons = [reason for reason in reasons if reason != "missing_model_shards"]
+        if remaining_reasons:
+            metadata["scan_outcome_reasons"] = remaining_reasons
+            if metadata.get("scan_outcome_reason") == "missing_model_shards":
+                metadata["scan_outcome_reason"] = remaining_reasons[0]
+        else:
+            metadata.pop("scan_outcome_reasons", None)
+            if metadata.get("scan_outcome_reason") == "missing_model_shards":
+                metadata.pop("scan_outcome_reason", None)
+            if metadata.get("scan_outcome") == "inconclusive":
+                metadata.pop("scan_outcome", None)
+            metadata.pop("analysis_incomplete", None)
+            metadata.pop("scan_outcome_message", None)
+        results.file_metadata[source_path] = FileMetadataModel(**metadata)
+        reconciled = True
+
+    if reconciled:
+        had_errors = results.has_errors
+        results.has_errors = _results_have_explicit_operational_error(results) or (
+            had_errors and (not missing_shard_errors_only or _results_have_retained_incomplete_outcome(results))
+        )
+        results.success = not _results_should_be_unsuccessful(results)
+    return reconciled
 
 
 def _build_shard_family_cache_fingerprint(
@@ -3674,6 +4178,8 @@ def scan_model_streaming(
     progress_callback: ProgressCallback | None = None,
     delete_after_scan: bool = True,
     scan_root: FilePath | None = None,
+    shard_family_group: str | None = None,
+    _trusted_shard_family_root: object | None = None,
     **kwargs: Any,
 ) -> ModelAuditResultModel:
     """
@@ -3688,6 +4194,8 @@ def scan_model_streaming(
         progress_callback: Optional callback for progress reporting
         delete_after_scan: Whether to delete files after scanning (default: True)
         scan_root: Optional root directory for local streaming traversal validation
+        shard_family_group: Trusted source group, admitted only for recognized ephemeral staging parents
+        _trusted_shard_family_root: Internal marker for a source-owned persistent staging root
         **kwargs: Additional arguments passed to scanners
 
     Returns:
@@ -3719,6 +4227,8 @@ def scan_model_streaming(
     )
     nearby_license_cache: dict[str, list[str]] = {}
     pending_delete_failures: dict[Path, Exception] = {}
+    validated_shard_targets: ValidatedShardTargets = {}
+    preserve_shard_reconciliation_errors = False
 
     def delete_streamed_source(source_path: Path, context: str) -> None:
         if not delete_after_scan or not (source_path.exists() or source_path.is_symlink()):
@@ -3730,6 +4240,43 @@ def scan_model_streaming(
             logger.warning(f"Failed to delete {source_path} {context}: {e}")
             pending_delete_failures[source_path] = e
 
+    def record_shard_pin_failure(source_path: Path, error: _ShardPinUnavailableError) -> None:
+        """Record a durable operational failure when a streamed shard cannot be pinned."""
+        failure = ScanResult(scanner_name="shard_pin")
+        _mark_inconclusive_scan_outcome(failure, "shard_pin_unavailable")
+        _mark_operational_scan_error(failure, "shard_pin_unavailable")
+        failure.add_check(
+            name="Shard Scan Pinning",
+            passed=False,
+            message=f"Unable to bind shard to a stable scan path: {source_path.name}",
+            severity=IssueSeverity.INFO,
+            location=str(source_path),
+            details={
+                "error": "descriptor-bound shard pinning unavailable",
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reason": "shard_pin_unavailable",
+            },
+        )
+        failure.finish(success=False)
+        results.aggregate_scan_result(
+            {
+                "bytes_scanned": 0,
+                "files_scanned": 1,
+                "has_errors": True,
+                "success": False,
+                "issues": [],
+                "checks": _serialize_streamed_records(
+                    list(failure.checks),
+                    str(source_path),
+                    str(source_path),
+                ),
+                "scanners": [failure.scanner_name],
+                "file_metadata": {str(source_path): dict(failure.metadata)},
+            }
+        )
+
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
     is_hf_cache = base_dir is not None and hf_cache_root is not None
@@ -3739,6 +4286,7 @@ def scan_model_streaming(
             source_path = Path(file_path)
             scan_path = source_path
             report_path = str(source_path)
+            pinned_scan_context: Any | None = None
 
             # Check for interruption before starting work on the yielded file.
             try:
@@ -3750,6 +4298,7 @@ def scan_model_streaming(
             # Check timeout
             if time.time() - start_time > timeout:
                 results.has_errors = True
+                preserve_shard_reconciliation_errors = True
                 aggregate_hash_complete = False
                 logger.error(f"Streaming scan timeout after {timeout}s")
                 delete_streamed_source(source_path, "after streaming timeout")
@@ -3770,6 +4319,7 @@ def scan_model_streaming(
                     )
                     if entry_unavailable:
                         results.has_errors = True
+                        preserve_shard_reconciliation_errors = True
                     if resolved_path is None:
                         continue
                     scan_path = resolved_path
@@ -3801,6 +4351,39 @@ def scan_model_streaming(
                     "timeout": timeout - int(time.time() - start_time),
                     **scan_kwargs,
                 }
+                initial_shard_target = _snapshot_validated_shard_target(
+                    str(source_path),
+                    resolved_path=str(scan_path),
+                    family_group=shard_family_group,
+                    family_group_policy="stream_staging",
+                    trusted_root_marker=_trusted_shard_family_root,
+                )
+                selected_resolved_path = str(scan_path)
+                pre_scan_shard_target: ValidatedShardTargets = {}
+                if initial_shard_target:
+                    initial_target = next(iter(initial_shard_target.values()))
+                    resolved_target = initial_target.get("resolved_path")
+                    if isinstance(resolved_target, str):
+                        selected_resolved_path = resolved_target
+                        try:
+                            pinned_scan_context = _pinned_shard_scan_path(resolved_target, initial_target)
+                            scan_path = Path(pinned_scan_context.__enter__().path)
+                            pre_scan_shard_target = _snapshot_validated_shard_target(
+                                str(source_path),
+                                resolved_path=resolved_target,
+                                family_group=shard_family_group,
+                                family_group_policy="stream_staging",
+                                trusted_root_marker=_trusted_shard_family_root,
+                            )
+                            scan_config[_SHARD_ALREADY_PINNED_CONFIG_KEY] = True
+                        except _ShardPinUnavailableError as error:
+                            if pinned_scan_context is not None:
+                                pinned_scan_context = None
+                            record_shard_pin_failure(source_path, error)
+                            preserve_shard_reconciliation_errors = True
+                            aggregate_hash_complete = False
+                            files_processed += 1
+                            continue
 
                 file_hash: str | None = None
                 defer_hash_for_max_total_size = _should_defer_hash_for_max_total_size(
@@ -3833,6 +4416,8 @@ def scan_model_streaming(
                     str(scan_path),
                     config=scan_config,
                 )
+                if pre_scan_shard_target:
+                    _ensure_streamed_shard_coverage_placeholder(scan_result, source_path)
 
                 # Merge results
                 if scan_result:
@@ -3842,8 +4427,48 @@ def scan_model_streaming(
                     metadata_dict.setdefault("file_size", scan_path.stat().st_size)
                     if report_path != resolved_report_path:
                         metadata_dict.setdefault("source_path", report_path)
-                        metadata_dict.setdefault("resolved_path", resolved_report_path)
+                        metadata_dict.setdefault("resolved_path", selected_resolved_path)
                     operational_scan_failure = _scan_result_has_operational_error(scan_result)
+                    if operational_scan_failure:
+                        preserve_shard_reconciliation_errors = True
+                    post_scan_shard_target = _snapshot_validated_shard_target(
+                        str(source_path),
+                        resolved_path=selected_resolved_path,
+                        family_group=shard_family_group,
+                        family_group_policy="stream_staging",
+                        trusted_root_marker=_trusted_shard_family_root,
+                    )
+                    stable_while_scanning = bool(
+                        pre_scan_shard_target and pre_scan_shard_target == post_scan_shard_target
+                    )
+                    if pinned_scan_context is not None:
+                        pinned_scan_context.__exit__(None, None, None)
+                        pinned_scan_context = None
+                    final_shard_target = _snapshot_validated_shard_target(
+                        str(source_path),
+                        resolved_path=selected_resolved_path,
+                        family_group=shard_family_group,
+                        family_group_policy="stream_staging",
+                        trusted_root_marker=_trusted_shard_family_root,
+                    )
+                    stable_after_unpinning = False
+                    if initial_shard_target and final_shard_target:
+                        initial_target = next(iter(initial_shard_target.values()))
+                        final_target = next(iter(final_shard_target.values()))
+                        stable_after_unpinning = all(
+                            initial_target.get(field) == final_target.get(field)
+                            for field in (
+                                "resolved_path",
+                                "device",
+                                "inode",
+                                "size",
+                                "mtime_ns",
+                                "nlink",
+                                "family_group",
+                            )
+                        )
+                    if not operational_scan_failure and stable_while_scanning and stable_after_unpinning:
+                        validated_shard_targets.update(final_shard_target)
 
                     if file_hash is not None:
                         existing_hashes = metadata_dict.get("file_hashes")
@@ -3892,16 +4517,26 @@ def scan_model_streaming(
                         details={"max_total_size": max_total_size, "analysis_incomplete": True},
                     )
                     results.has_errors = True
+                    preserve_shard_reconciliation_errors = True
                     break
 
             except Exception as e:
                 logger.error(f"Error processing {source_path}: {e}", exc_info=True)
                 results.has_errors = True
+                preserve_shard_reconciliation_errors = True
                 aggregate_hash_complete = False
 
             finally:
+                if pinned_scan_context is not None:
+                    pinned_scan_context.__exit__(None, None, None)
                 # Delete file after scanning if requested
                 delete_streamed_source(source_path, "after scanning")
+
+        _reconcile_cross_directory_shard_coverage(
+            results,
+            validated_shard_targets,
+            missing_shard_errors_only=not preserve_shard_reconciliation_errors,
+        )
 
         # Compute aggregate hash from all file hashes
         if file_hashes and aggregate_hash_complete:

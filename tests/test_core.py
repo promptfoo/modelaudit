@@ -3674,7 +3674,11 @@ def test_scan_file_fails_closed_for_renamed_flax_stream_with_scalar_padding_past
 
     assert result.scanner_name == "flax_msgpack"
     assert result.success is False
-    assert any("Msgpack stream object count exceeds configured limit" in issue.message for issue in result.issues)
+    limit_issues = [issue for issue in result.issues if "unvalidated trailing data" in issue.message]
+    assert len(limit_issues) == 1
+    assert limit_issues[0].details["max_msgpack_stream_objects"] == 4096
+    assert limit_issues[0].details["parsed_object_count"] == 4096
+    assert result.metadata["operational_error_reason"] == "msgpack_stream_object_limit_exceeded"
     assert core_module.determine_exit_code(aggregate) == 2
 
 

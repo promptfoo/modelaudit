@@ -580,7 +580,7 @@ def get_scanner_for_file(path: str, config: dict[str, Any] | None = None) -> Bas
     except (TypeError, ValueError):
         max_entries = ZipScanner.DEFAULT_MAX_ENTRIES
     max_directory_size = ZipScanner.central_directory_size_limit(raw_config)
-    if allows_zip_structure_analysis(scanner_selection) and ZipScanner.requires_preflight_result(
+    if allows_zip_structure_analysis(scanner_selection, path) and ZipScanner.requires_preflight_result(
         path,
         max_entries,
         max_directory_size,

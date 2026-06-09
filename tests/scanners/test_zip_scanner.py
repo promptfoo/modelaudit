@@ -9070,6 +9070,52 @@ class TestZipScanner:
             for check in result.checks
         )
 
+    def test_streamed_hidden_entry_with_out_of_window_padding_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class NonSeekableBuffer(io.BytesIO):
+            def seek(self, *_args: Any, **_kwargs: Any) -> int:
+                raise io.UnsupportedOperation("not seekable")
+
+            def seekable(self) -> bool:
+                return False
+
+        hidden_buffer = NonSeekableBuffer()
+        with zipfile.ZipFile(hidden_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo hidden"\ntR.')
+        hidden_archive = hidden_buffer.getvalue()
+        hidden_directory_start = hidden_archive.find(b"PK\x01\x02")
+        assert hidden_directory_start > 0
+        hidden_local_record = hidden_archive[:hidden_directory_start]
+
+        safe_buffer = io.BytesIO()
+        with zipfile.ZipFile(safe_buffer, "w") as archive:
+            archive.writestr("safe.txt", "safe")
+
+        archive_path = tmp_path / "streamed_hidden_entry_with_large_padding.zip"
+        archive_path.write_bytes(hidden_local_record + (b"X" * 70_000) + safe_buffer.getvalue())
+
+        with zipfile.ZipFile(archive_path) as archive:
+            assert archive.namelist() == ["safe.txt"]
+
+        def fail_zipfile_open(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("out-of-window streamed entries must fail before ZipFile construction")
+
+        monkeypatch.setattr(zip_scanner_module.zipfile, "ZipFile", fail_zipfile_open)
+
+        result = ZipScanner().scan(str(archive_path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert any(
+            check.name == "ZIP Central Directory Preflight"
+            and check.status == CheckStatus.FAILED
+            and "streamed local entry cannot be bounded" in check.message
+            for check in result.checks
+        )
+
     @pytest.mark.parametrize(
         "compression",
         [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA],
@@ -9187,6 +9233,34 @@ class TestZipScanner:
         with zipfile.ZipFile(archive_bytes, "w") as archive:
             archive.writestr("safe.txt", "safe")
         archive_path.write_bytes(b"SFX-STUB" + archive_bytes.getvalue())
+
+        result = ZipScanner().scan(str(archive_path))
+
+        assert result.success is True
+        assert not any(
+            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+
+    def test_sfx_local_header_near_match_with_invalid_crc_remains_clean(self, tmp_path: Path) -> None:
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, "w") as archive:
+            archive.writestr("safe.txt", "safe")
+
+        filename = b"launcher.bin"
+        payload = b"ordinary self-extracting launcher bytes"
+        local_header = bytearray(30)
+        local_header[0:4] = b"PK\x03\x04"
+        local_header[4:6] = (20).to_bytes(2, "little")
+        local_header[18:22] = len(payload).to_bytes(4, "little")
+        local_header[22:26] = len(payload).to_bytes(4, "little")
+        local_header[26:28] = len(filename).to_bytes(2, "little")
+
+        archive_path = tmp_path / "local_header_sfx_near_match.zip"
+        archive_path.write_bytes(local_header + filename + payload + archive_bytes.getvalue())
+
+        with zipfile.ZipFile(archive_path) as archive:
+            assert archive.namelist() == ["safe.txt"]
 
         result = ZipScanner().scan(str(archive_path))
 
@@ -9500,6 +9574,37 @@ class TestZipScanner:
             for check in result.checks
         )
 
+    def test_nested_routing_honors_numpy_route_before_plain_zip_preflight(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "nested_selected_numpy.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("one.txt", "one")
+            archive.writestr("two.txt", "two")
+
+        def fail_zip_preflight(*_args: Any, **_kwargs: Any) -> bool:
+            raise AssertionError("unselected nested plain ZIP routes must not be preflighted")
+
+        monkeypatch.setattr(ZipScanner, "requires_preflight_result", fail_zip_preflight)
+
+        result = scan_nested_file(
+            str(archive_path),
+            {
+                "scanners": ["numpy"],
+                "max_zip_entries": 1,
+                "cache_enabled": False,
+            },
+        )
+
+        assert result.scanner_name == "scanner_selection"
+        assert not any(check.name == "Entry Count Limit Check" for check in result.checks)
+        assert any(
+            check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "zip"
+            for check in result.checks
+        )
+
     def test_eocd_signature_in_comment_does_not_create_forged_high_count_false_positive(
         self,
         tmp_path: Path,
@@ -9600,6 +9705,86 @@ class TestZipScanner:
             and "ambiguous" in check.message
             for check in result.checks
         )
+
+    def test_local_entry_appended_after_eocd_fails_closed_before_zipfile_open(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "appended_local_entry.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("safe.txt", "safe")
+
+        filename = b"payload.pkl"
+        payload = b'cos\nsystem\n(S"echo hidden"\ntR.'
+        local_header = bytearray(30)
+        local_header[0:4] = b"PK\x03\x04"
+        local_header[4:6] = (20).to_bytes(2, "little")
+        local_header[14:18] = zlib.crc32(payload).to_bytes(4, "little")
+        local_header[18:22] = len(payload).to_bytes(4, "little")
+        local_header[22:26] = len(payload).to_bytes(4, "little")
+        local_header[26:28] = len(filename).to_bytes(2, "little")
+        archive_path.write_bytes(archive_path.read_bytes() + local_header + filename + payload)
+
+        with zipfile.ZipFile(archive_path) as archive:
+            assert archive.namelist() == ["safe.txt"]
+
+        def fail_zipfile_open(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("trailing local entries must fail before ZipFile construction")
+
+        monkeypatch.setattr(zip_scanner_module.zipfile, "ZipFile", fail_zipfile_open)
+
+        result = ZipScanner().scan(str(archive_path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert any(
+            check.name == "ZIP Central Directory Preflight"
+            and check.status == CheckStatus.FAILED
+            and "trailing data contains an unreferenced local entry" in check.message
+            for check in result.checks
+        )
+
+    def test_trailing_local_header_near_match_remains_clean(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "trailing_local_header_near_match.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("safe.txt", "safe")
+        archive_path.write_bytes(archive_path.read_bytes() + b"PK\x03\x05 benign trailer")
+
+        result = ZipScanner().scan(str(archive_path))
+
+        assert result.success is True
+        assert not any(
+            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+
+    def test_local_entry_candidate_payload_validation_has_total_work_budget(self) -> None:
+        payload = bytearray(4 * 1024 * 1024)
+        candidate_payload_size = 2 * 1024 * 1024
+        for offset in range(0, 128 * 32, 32):
+            header = bytearray(30)
+            header[0:4] = b"PK\x03\x04"
+            header[4:6] = (20).to_bytes(2, "little")
+            header[18:22] = candidate_payload_size.to_bytes(4, "little")
+            header[22:26] = candidate_payload_size.to_bytes(4, "little")
+            header[26:28] = (1).to_bytes(2, "little")
+            payload[offset : offset + 30] = header
+            payload[offset + 30] = ord("x")
+
+        class ReadTrackingBuffer(io.BytesIO):
+            bytes_read = 0
+
+            def read(self, size: int | None = -1) -> bytes:
+                data = super().read(size)
+                self.bytes_read += len(data)
+                return data
+
+        handle = ReadTrackingBuffer(payload)
+        with pytest.raises(zip_scanner_module._InvalidZipDirectory, match="bounded work budget"):
+            ZipScanner._has_unreferenced_local_entry_ending_at(handle, len(payload))
+
+        assert handle.bytes_read < 64 * 1024 * 1024
 
     def test_appended_empty_eocd_cannot_hide_invalid_real_directory(
         self,
@@ -9712,12 +9897,12 @@ class TestZipScanner:
             archive.writestr("safe.txt", "safe")
 
         opened_handle: Any = None
-        with (
-            pytest.raises(RuntimeError, match="stop scan"),
-            ZipScanner._open_archive_handle(str(archive_path), None) as handle,
-        ):
-            opened_handle = handle
-            raise RuntimeError("stop scan")
+        try:
+            with ZipScanner._open_archive_handle(str(archive_path), None) as handle:
+                opened_handle = handle
+                raise RuntimeError("stop scan")
+        except RuntimeError as exc:
+            assert str(exc) == "stop scan"
 
         assert opened_handle is not None
         assert opened_handle.closed is True

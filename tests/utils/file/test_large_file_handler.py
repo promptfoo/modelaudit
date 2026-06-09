@@ -253,6 +253,17 @@ def test_zip_entry_preflight_cache_bypass_honors_scanner_selection(tmp_path: Pat
         str(payload),
         {"scanners": ["keras_zip"], "max_zip_entries": 1},
     )
+    assert not should_bypass_cache_for_zip_entry_preflight(
+        str(payload),
+        {"scanners": ["numpy"], "max_zip_entries": 1},
+    )
+
+    npz_payload = payload.with_suffix(".npz")
+    payload.replace(npz_payload)
+    assert should_bypass_cache_for_zip_entry_preflight(
+        str(npz_payload),
+        {"scanners": ["numpy"], "max_zip_entries": 1},
+    )
 
 
 def test_large_handler_missing_h5py_does_not_return_stale_clean_cache(

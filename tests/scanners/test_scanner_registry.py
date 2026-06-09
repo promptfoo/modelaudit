@@ -556,6 +556,20 @@ def test_get_scanner_for_file_honors_selection_before_zip_preflight(tmp_path: Pa
     assert scanner is None
 
 
+def test_get_scanner_for_file_honors_numpy_route_before_plain_zip_preflight(tmp_path: Path) -> None:
+    model_path = _write_zip_archive(
+        tmp_path / "selected-numpy.zip",
+        {"one.txt": b"one", "two.txt": b"two"},
+    )
+
+    scanner = get_scanner_for_file(
+        str(model_path),
+        config={"scanners": ["numpy"], "max_zip_entries": 1},
+    )
+
+    assert scanner is None
+
+
 def test_get_scanner_for_file_routes_disguised_rar_by_header(tmp_path: Path) -> None:
     """Public helper routing should honor RAR magic even without a .rar suffix."""
     path = tmp_path / "archive.payload"

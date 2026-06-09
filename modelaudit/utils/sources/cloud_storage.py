@@ -8,11 +8,12 @@ import re
 import shutil
 import struct
 import tempfile
+import unicodedata
 import zipfile
 from collections.abc import Callable, Collection, Coroutine, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 from urllib.parse import unquote, unquote_plus, urlparse, urlsplit, urlunsplit
 
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 _CLOUD_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _CLEARTEXT_CLOUD_ERROR = "Cleartext cloud storage URL is not supported"
+_CACHE_ENTRY_NAMESPACE = ".entries-v2"
 
 _QUERY_PARAM_RE = re.compile(r"(?P<prefix>[?&#;])(?P<key>[^=\s&#;]+)=(?P<value>[^\s&#;]*)")
 _BARE_ASSIGNMENT_RE = re.compile(
@@ -50,11 +52,12 @@ _HEADER_KEY_RE = re.compile(
 _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
 _URL_TEXT_CHARACTER = r'(?:[^\s"\'<>]|<redacted>|<credentials-redacted>)'
 _URL_TOKEN_RE = re.compile(
+    rf"(?<![0-9A-Za-z+._%-])"
     rf"(stream://[a-z][a-z0-9+.-]*://{_URL_TEXT_CHARACTER}+|[a-z][a-z0-9+.-]*://{_URL_TEXT_CHARACTER}+)",
     re.IGNORECASE,
 )
 _ESCAPED_URL_DELIMITER_RE = re.compile(
-    r"\\(?P<delimiter>/|u002f|u003f|u003d|u0026|u0023|x2f|x3f|x3d|x26|x23)",
+    r"\\(?P<delimiter>/|u002f|u003a|u003f|u003d|u0026|u0023|u003b|x2f|x3a|x3f|x3d|x26|x23|x3b)",
     re.IGNORECASE,
 )
 _PERCENT_ENCODED_URL_DELIMITER_RE = re.compile(
@@ -63,6 +66,7 @@ _PERCENT_ENCODED_URL_DELIMITER_RE = re.compile(
 )
 _PERCENT_ENCODED_URL_BOUNDARY_RE = re.compile(r"%(?:25)*(?:3f|23|3b)", re.IGNORECASE)
 _PERCENT_ENCODED_URL_PREFIX_RE = re.compile(
+    r"(?<![0-9A-Za-z+._%-])"
     r"(?P<scheme>[a-z][a-z0-9+.-]*)(?:%(?:25)*3a|:)(?:%(?:25)*2f|/)(?:%(?:25)*2f|/)",
     re.IGNORECASE,
 )
@@ -117,6 +121,21 @@ _TFLITE_MAGIC_BYTES = b"TFL3"
 _MSGPACK_CONTAINER_MARKERS = frozenset((*range(0x80, 0x90), 0xDE, 0xDF))
 _MAX_CLOUD_METADATA_ERROR_SAMPLES = 3
 _MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS = 512
+_CLOUD_PROBE_SUFFIX_RE = re.compile(r"\.[0-9A-Za-z][0-9A-Za-z_-]{0,31}\Z")
+_CLOUD_LOCAL_PATH_ESCAPE_CHARS = frozenset('<>:"/\\|?*%#')
+_WINDOWS_RESERVED_LOCAL_PATH_NAMES = frozenset(
+    {"con", "conin$", "conout$", "prn", "aux", "nul"}
+    | {f"com{index}" for index in range(1, 10)}
+    | {f"lpt{index}" for index in range(1, 10)}
+    | {f"com{index}" for index in ("\u00b9", "\u00b2", "\u00b3")}
+    | {f"lpt{index}" for index in ("\u00b9", "\u00b2", "\u00b3")}
+)
+_CLOUD_LOCAL_IDENTITY_HASH_CHARS = 16
+_CLOUD_LOCAL_COMPONENT_MAX_BYTES = 240
+_CLOUD_LOCAL_GENERATED_IDENTITY_RE = re.compile(
+    rf"~[0-9a-f]{{{_CLOUD_LOCAL_IDENTITY_HASH_CHARS}}}(?:\.[0-9A-Za-z][0-9A-Za-z_-]{{0,31}})?\Z",
+    re.IGNORECASE,
+)
 _AWS_REGION_HOST_PART = r"[a-z][a-z0-9]*(?:-[a-z0-9]+)+-\d"
 _AWS_S3_DNS_SUFFIX = (
     r"(?:amazonaws\.com(?:\.cn)?|amazonaws\.eu|c2s\.ic\.gov|sc2s\.sgov\.gov|cloud\.adc-e\.uk|csp\.hci\.ic\.gov)"
@@ -288,15 +307,19 @@ def normalize_escaped_url_delimiters_for_display(value: str) -> str:
     replacements = {
         "/": "/",
         "u002f": "/",
+        "u003a": ":",
         "u003f": "?",
         "u003d": "=",
         "u0026": "&",
         "u0023": "#",
+        "u003b": ";",
         "x2f": "/",
+        "x3a": ":",
         "x3f": "?",
         "x3d": "=",
         "x26": "&",
         "x23": "#",
+        "x3b": ";",
     }
     normalized = _ESCAPED_URL_DELIMITER_RE.sub(
         lambda match: replacements[match.group("delimiter").lower()],
@@ -543,6 +566,189 @@ def _cloud_url_basename(url: str) -> str:
     return Path(path).name
 
 
+def _cloud_probe_basename(url: str) -> str:
+    """Return a credential-free, cross-platform filename for content routing."""
+    try:
+        parts = urlsplit(url)
+        basename = parts.path.rsplit("/", 1)[-1]
+        if parts.scheme.casefold() in {"s3", "gs", "gcs", "r2"}:
+            basename = url.rstrip("/").rsplit("/", 1)[-1]
+        suffix = PurePosixPath(basename).suffix
+    except Exception:
+        suffix = ""
+    if not _CLOUD_PROBE_SUFFIX_RE.fullmatch(suffix):
+        suffix = ""
+    return f"cloud-object{suffix}"
+
+
+def _encode_cloud_local_character(character: str) -> str:
+    """Return a reversible ASCII encoding for one local-path character."""
+    return "".join(f"%{byte:02X}" for byte in character.encode("utf-8", errors="surrogatepass"))
+
+
+def _truncate_cloud_local_component(text: str, max_bytes: int) -> str:
+    """Truncate a path component without splitting a UTF-8 code point."""
+    if len(text.encode("utf-8", errors="surrogatepass")) <= max_bytes:
+        return text
+    parts: list[str] = []
+    used_bytes = 0
+    for character in text:
+        character_size = len(character.encode("utf-8", errors="surrogatepass"))
+        if used_bytes + character_size > max_bytes:
+            break
+        parts.append(character)
+        used_bytes += character_size
+    return "".join(parts)
+
+
+def _cloud_local_component_identity(component: str) -> str:
+    """Return the bounded identity used for collision-resistant local paths."""
+    return hashlib.sha256(component.encode("utf-8", errors="surrogatepass")).hexdigest()[
+        :_CLOUD_LOCAL_IDENTITY_HASH_CHARS
+    ]
+
+
+def _cloud_local_reserved_stem(component: str) -> str:
+    """Return the Windows device-name stem after filesystem normalization."""
+    return component.split(".", 1)[0].rstrip(" .").casefold()
+
+
+def _cloud_local_component_is_literal_safe(component: str) -> bool:
+    """Return whether a component can be preserved literally on Windows."""
+    if not component or component != component.rstrip(" ."):
+        return False
+    if any(
+        character in _CLOUD_LOCAL_PATH_ESCAPE_CHARS or ord(character) < 0x20 or 0xD800 <= ord(character) <= 0xDFFF
+        for character in component
+    ):
+        return False
+    return (
+        _cloud_local_reserved_stem(component) not in _WINDOWS_RESERVED_LOCAL_PATH_NAMES
+        and len(component.encode("utf-8", errors="surrogatepass")) <= _CLOUD_LOCAL_COMPONENT_MAX_BYTES
+    )
+
+
+def _cloud_local_path_component(component: str) -> str:
+    """Map one cloud key component to a collision-resistant Windows-safe name."""
+    if not component:
+        return f"~{_cloud_local_component_identity(component)}"
+
+    trailing_start = len(component.rstrip(" ."))
+    encoded_parts: list[str] = []
+    changed = False
+    for index, character in enumerate(component):
+        if (
+            character in _CLOUD_LOCAL_PATH_ESCAPE_CHARS
+            or ord(character) < 0x20
+            or 0xD800 <= ord(character) <= 0xDFFF
+            or index >= trailing_start
+        ):
+            encoded_parts.append(_encode_cloud_local_character(character))
+            changed = True
+        else:
+            encoded_parts.append(character)
+
+    encoded = "".join(encoded_parts)
+    reserved_stem = _cloud_local_reserved_stem(component)
+    if reserved_stem in _WINDOWS_RESERVED_LOCAL_PATH_NAMES:
+        encoded = f"{_encode_cloud_local_character(component[0])}{encoded[1:]}"
+        changed = True
+
+    encoded_size = len(encoded.encode("utf-8", errors="surrogatepass"))
+    needs_case_identity = not component.isascii() or component != component.casefold()
+    uses_generated_identity = _CLOUD_LOCAL_GENERATED_IDENTITY_RE.search(component) is not None
+    if (
+        not changed
+        and not needs_case_identity
+        and not uses_generated_identity
+        and encoded_size <= _CLOUD_LOCAL_COMPONENT_MAX_BYTES
+    ):
+        return component
+
+    # The digest keeps transformed and case-only variants distinct on case-insensitive filesystems.
+    identity = _cloud_local_component_identity(component)
+    suffix = Path(encoded).suffix
+    if not _CLOUD_PROBE_SUFFIX_RE.fullmatch(suffix):
+        suffix = ""
+    stem = encoded[: -len(suffix)] if suffix else encoded
+    identity_suffix = f"~{identity}{suffix}"
+    stem_budget = _CLOUD_LOCAL_COMPONENT_MAX_BYTES - len(identity_suffix.encode("ascii"))
+    bounded_stem = _truncate_cloud_local_component(stem, stem_budget)
+    return f"{bounded_stem}{identity_suffix}"
+
+
+def _cloud_local_leaf_components(component: str) -> tuple[str, ...]:
+    """Preserve scanner-significant basenames while isolating case collisions."""
+    transformed = _cloud_local_path_component(component)
+    if transformed == component or not _cloud_local_component_is_literal_safe(component):
+        return (transformed,)
+    return (f"~{_cloud_local_component_identity(component)}", component)
+
+
+def _cloud_local_directory_component(component: str) -> str:
+    """Map a cloud key directory without colliding with a leaf object."""
+    transformed = _cloud_local_path_component(component)
+    identity_suffix = f"~{_cloud_local_component_identity(component)}"
+    stem_budget = _CLOUD_LOCAL_COMPONENT_MAX_BYTES - len(identity_suffix)
+    return f"{_truncate_cloud_local_component(transformed, stem_budget)}{identity_suffix}"
+
+
+def _cloud_object_relative_path(base_url: str, file_url: str) -> str:
+    """Return a listed object's path relative to the requested cloud target."""
+    normalized_base = _cloud_url_without_query(base_url)
+    normalized_file_url = _cloud_url_without_query(file_url)
+
+    if normalized_file_url.startswith(f"{normalized_base}/"):
+        relative_path = normalized_file_url[len(normalized_base) + 1 :]
+    elif normalized_file_url == normalized_base:
+        relative_path = _cloud_url_local_basename(file_url)
+    else:
+        file_parts = urlsplit(normalized_file_url)
+        file_scheme = file_parts.scheme.casefold()
+        structured_file_url = file_scheme in {"s3", "gs", "gcs", "r2"} or (
+            file_scheme in {"http", "https"} and _http_cloud_protocol(file_url) is not None
+        )
+        if structured_file_url or file_parts.netloc or "://" in normalized_file_url:
+            raise ValueError(f"Cloud object path is outside requested target: {redact_url_for_display(file_url)}")
+        relative_path = _protocol_less_cloud_relative_path(normalized_base, file_url)
+
+    if not relative_path:
+        raise ValueError(f"Invalid cloud object basename: {redact_url_for_display(file_url)}")
+    return relative_path
+
+
+def _cloud_object_prefix_conflicts(base_url: str, file_urls: Collection[str]) -> frozenset[str]:
+    """Return object keys that are also directory prefixes of selected objects."""
+    relative_paths = {_cloud_object_relative_path(base_url, file_url) for file_url in file_urls}
+    conflicts: set[str] = set()
+    for relative_path in relative_paths:
+        components = relative_path.split("/")
+        for component_count in range(1, len(components)):
+            prefix = "/".join(components[:component_count])
+            if prefix in relative_paths:
+                conflicts.add(prefix)
+    return frozenset(conflicts)
+
+
+def _cloud_url_local_basename(url: str) -> str:
+    """Return the raw final URL path segment for local file creation."""
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme.casefold() in {"s3", "gs", "gcs", "r2"}:
+            if not parsed.path or parsed.path.endswith("/"):
+                return ""
+            return url.rstrip("/").rsplit("/", 1)[-1]
+        return parsed.path.rsplit("/", 1)[-1]
+    except Exception:
+        logger.debug("Unable to parse cloud URL for local basename; using fallback path handling")
+        return url.rstrip("/").rsplit("/", 1)[-1]
+
+
+def _normalize_cloud_local_separators(path: str) -> str:
+    """Interpret backslashes as separators only on filesystems that do so."""
+    return path.replace("\\", "/") if _uses_windows_filename_rules() else path
+
+
 def _remove_path(path: Path) -> None:
     """Remove a file, directory, symlink, or special path without following symlinks."""
     if path.is_symlink() or not path.is_dir():
@@ -554,7 +760,7 @@ def _remove_path(path: Path) -> None:
 def _prepare_cache_subdirectory(cache_dir: Path, cache_key: str) -> Path:
     """Create a cache-key directory without following replaced path components."""
     cache_subdir = cache_dir
-    for component in (cache_key[:2], cache_key[2:4]):
+    for component in (_CACHE_ENTRY_NAMESPACE, cache_key[:2], cache_key[2:4], cache_key):
         cache_subdir /= component
         if cache_subdir.is_symlink() or (cache_subdir.exists() and not cache_subdir.is_dir()):
             cache_subdir.unlink()
@@ -727,6 +933,11 @@ def _is_within_directory(base_dir: Path, target: Path) -> bool:
     """Return True if target resolves within base_dir."""
     base_path = base_dir.resolve()
     target_path = target.resolve()
+    return _is_resolved_path_within_base(base_path, target_path)
+
+
+def _is_resolved_path_within_base(base_path: Path, target_path: Path) -> bool:
+    """Return True if two already-resolved paths have a base/child relationship."""
     if os.name == "nt":
         base_norm = os.path.normcase(os.path.normpath(str(base_path)))
         target_norm = os.path.normcase(os.path.normpath(str(target_path)))
@@ -739,12 +950,14 @@ def _is_within_directory(base_dir: Path, target: Path) -> bool:
 
 def _resolve_cloud_path(entry_name: str, base_dir: Path) -> tuple[Path, bool]:
     """Resolve a cloud object relative path and return whether it is safe."""
-    entry = entry_name.replace("\\", "/")
-    if entry.startswith("/") or (len(entry) > 1 and entry[1] == ":"):
+    entry = _normalize_cloud_local_separators(entry_name)
+    if entry.startswith("/") or (os.name == "nt" and len(entry) > 1 and entry[1] == ":"):
         return (base_dir / entry.lstrip("/")).resolve(), False
 
-    resolved = (base_dir / entry.lstrip("/")).resolve()
-    return resolved, _is_within_directory(base_dir, resolved)
+    candidate = base_dir / entry.lstrip("/")
+    parent = candidate.parent.resolve()
+    resolved = parent / candidate.name
+    return resolved, _is_resolved_path_within_base(base_dir.resolve(), parent)
 
 
 def _parse_size_value(size_value: Any) -> int:
@@ -1121,8 +1334,12 @@ class GCSCache:
             for cache_key, entry in self.metadata.items()
             if isinstance(entry, dict)
         }
-        temp_file = self.metadata_file.with_name(f"{self.metadata_file.name}.tmp")
-        fd = os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{self.metadata_file.name}.",
+            suffix=".tmp",
+            dir=self.cache_dir,
+        )
+        temp_file = Path(temp_name)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(self.metadata, f, indent=2)
@@ -1715,7 +1932,7 @@ def _detect_cloud_shared_skip_filter_route(
         tail_offset = size - tail_size
         tail = _read_cloud_content_range(fs, file_url, tail_offset, tail_size, sniff_budget)
 
-    basename = _cloud_url_basename(file_url) or "cloud-object"
+    basename = _cloud_probe_basename(file_url)
     with tempfile.TemporaryDirectory(prefix="modelaudit_cloud_probe_") as temp_dir:
         probe_path = Path(temp_dir) / Path(basename).name
         with probe_path.open("wb") as handle:
@@ -2045,31 +2262,241 @@ def _filter_scannable_cloud_files(
     return list(scannable_by_path.values())
 
 
-def _build_safe_local_path(base_url: str, file_url: str, download_path: Path) -> Path:
-    """Build a local path for a cloud object and reject traversal attempts."""
-    normalized_base = _cloud_url_without_query(base_url)
-    normalized_file_url = _cloud_url_without_query(file_url)
+def _build_safe_local_path(
+    base_url: str,
+    file_url: str,
+    download_path: Path,
+    *,
+    object_prefix_conflicts: Collection[str] = (),
+) -> Path:
+    """Build a collision-resistant local path for a cloud object."""
+    relative_path = _cloud_object_relative_path(base_url, file_url)
 
-    if normalized_file_url.startswith(f"{normalized_base}/"):
-        relative_path = normalized_file_url[len(normalized_base) + 1 :]
-    elif normalized_file_url == normalized_base:
-        relative_path = _cloud_url_basename(file_url)
-    else:
-        # Fallback to basename for unexpected path shapes.
-        relative_path = _cloud_url_basename(file_url)
-
-    if not relative_path:
-        raise ValueError(f"Invalid cloud object path: {file_url}")
-
-    resolved_path, is_safe = _resolve_cloud_path(relative_path, download_path)
+    remote_components = relative_path.split("/")
+    local_components: list[str] = []
+    remote_prefix_components: list[str] = []
+    for component in remote_components[:-1]:
+        remote_prefix_components.append(component)
+        remote_prefix = "/".join(remote_prefix_components)
+        if remote_prefix in object_prefix_conflicts:
+            local_components.append(_cloud_local_directory_component(component))
+        else:
+            local_components.append(_cloud_local_path_component(component))
+    local_components.extend(_cloud_local_leaf_components(remote_components[-1]))
+    local_relative_path = "/".join(local_components)
+    resolved_path, is_safe = _resolve_cloud_path(local_relative_path, download_path)
     if not is_safe:
-        raise ValueError(f"Path traversal attempt detected in cloud object path: {file_url}")
+        raise ValueError(f"Encoded cloud object path escaped download directory: {file_url}")
 
     local_path = Path(resolved_path)
-    if not _is_within_directory(download_path, local_path):
+    if not _is_local_destination_within_directory(download_path, local_path):
         raise ValueError(f"Cloud object path escaped download directory: {file_url}")
 
     return local_path
+
+
+def _protocol_less_cloud_relative_path(base_url: str, file_url: str) -> str:
+    """Preserve provider-returned bucket/prefix paths when the scheme is omitted."""
+    try:
+        base = urlsplit(base_url)
+        parsed_file = urlsplit(file_url)
+        # Provider listings commonly return bare object keys. In that form,
+        # URL delimiters are literal key text rather than query/fragment syntax.
+        file_scheme = parsed_file.scheme.casefold()
+        structured_file_url = file_scheme in {"s3", "gs", "gcs", "r2"} or (
+            file_scheme in {"http", "https"} and _http_cloud_protocol(file_url) is not None
+        )
+        file_path = parsed_file.path if structured_file_url else file_url
+        file_path = file_path.lstrip("/")
+    except Exception:
+        return _cloud_url_local_basename(file_url)
+
+    if base.scheme.casefold() in {"http", "https"}:
+        try:
+            _protocol, canonical_url, _fs_args = get_cloud_filesystem_config(base_url)
+            canonical = urlsplit(canonical_url)
+            provider_prefix = "/".join(
+                part.strip("/") for part in (canonical.netloc, canonical.path) if part.strip("/")
+            )
+        except ValueError:
+            provider_prefix = "/".join(part.strip("/") for part in (base.netloc, base.path) if part.strip("/"))
+    else:
+        provider_prefix = "/".join(part.strip("/") for part in (base.netloc, base.path) if part.strip("/"))
+    if provider_prefix and file_path.startswith(f"{provider_prefix}/"):
+        return file_path[len(provider_prefix) + 1 :]
+    if provider_prefix and file_path == provider_prefix:
+        return _cloud_url_local_basename(file_url)
+    if not structured_file_url:
+        return file_path
+    return _cloud_url_local_basename(file_url)
+
+
+def _is_local_destination_within_directory(base_dir: Path, target: Path) -> bool:
+    """Return True if a destination's resolved parent remains under base_dir."""
+    return _is_resolved_path_within_base(base_dir.resolve(), target.parent.resolve())
+
+
+def _validate_cloud_local_path(relative_path: str, file_url: str) -> None:
+    """Reject cloud object paths that cannot safely become local files."""
+    components = relative_path.split("/")
+    leaf = relative_path.rsplit("/", 1)[-1]
+    if (
+        not relative_path
+        or not leaf
+        or leaf in {".", ".."}
+        or "/" in leaf
+        or (
+            _uses_windows_filename_rules()
+            and any(_is_unsafe_windows_cloud_filename(component) for component in components if component)
+        )
+    ):
+        raise ValueError(f"Invalid cloud object basename: {redact_url_for_display(file_url)}")
+
+
+_WINDOWS_RESERVED_FILE_STEMS = {
+    "aux",
+    "con",
+    "nul",
+    "prn",
+    *(f"com{index}" for index in range(1, 10)),
+    *(f"lpt{index}" for index in range(1, 10)),
+    *(f"com{suffix}" for suffix in ("\u00b9", "\u00b2", "\u00b3")),
+    *(f"lpt{suffix}" for suffix in ("\u00b9", "\u00b2", "\u00b3")),
+}
+
+
+def _is_unsafe_windows_cloud_filename(leaf: str) -> bool:
+    """Return whether a cloud object leaf cannot safely name a Win32 file."""
+    if leaf != leaf.rstrip(" ."):
+        return True
+    if any(ord(char) < 32 or char in '<>:"|?*' for char in leaf):
+        return True
+    stem = leaf.split(".", 1)[0].rstrip(" ").casefold()
+    return stem in _WINDOWS_RESERVED_FILE_STEMS
+
+
+def _uses_windows_filename_rules() -> bool:
+    """Return whether local destinations must obey Win32 filename rules."""
+    return os.name == "nt"
+
+
+def _is_case_sensitive_directory(path: Path) -> bool:
+    """Probe the target filesystem's case behavior without retaining a file."""
+    probe_path: Path | None = None
+    probe_fd = -1
+    try:
+        probe_fd, probe_name = tempfile.mkstemp(prefix=".modelaudit_case_probe_Aa", dir=path)
+        probe_path = Path(probe_name)
+        os.close(probe_fd)
+        probe_fd = -1
+        alternate = probe_path.with_name(probe_path.name.swapcase())
+        if not alternate.exists():
+            return True
+        return not os.path.samefile(probe_path, alternate)
+    except OSError:
+        # Destination aliasing is security-sensitive, so uncertain filesystems
+        # are treated conservatively as case-insensitive.
+        return False
+    finally:
+        if probe_fd >= 0:
+            os.close(probe_fd)
+        if probe_path is not None:
+            probe_path.unlink(missing_ok=True)
+
+
+def _is_unicode_normalization_sensitive_directory(path: Path) -> bool:
+    """Probe whether canonically equivalent names remain distinct on the target filesystem."""
+    probe_path: Path | None = None
+    probe_fd = -1
+    try:
+        probe_fd, probe_name = tempfile.mkstemp(prefix=".modelaudit_unicode_probe_\u00e9_", dir=path)
+        probe_path = Path(probe_name)
+        os.close(probe_fd)
+        probe_fd = -1
+        alternate = probe_path.with_name(probe_path.name.replace("\u00e9", "e\u0301", 1))
+        if not alternate.exists():
+            return True
+        return not os.path.samefile(probe_path, alternate)
+    except OSError:
+        # Fail closed when the target filesystem's alias behavior cannot be probed.
+        return False
+    finally:
+        if probe_fd >= 0:
+            os.close(probe_fd)
+        if probe_path is not None:
+            probe_path.unlink(missing_ok=True)
+
+
+def _local_destination_key(
+    path: Path,
+    *,
+    case_sensitive: bool,
+    unicode_normalization_sensitive: bool,
+) -> str:
+    """Return a canonical key for local download destination comparisons."""
+    resolved = path.parent.resolve() / path.name
+    normalized = os.path.normpath(str(resolved))
+    if not unicode_normalization_sensitive:
+        normalized = unicodedata.normalize("NFC", normalized)
+    if not case_sensitive:
+        normalized = normalized.lower()
+    return normalized
+
+
+def _local_destination_ancestor_keys(destination_key: str) -> Iterator[str]:
+    """Yield canonical parent keys up to the filesystem root."""
+    parent = os.path.dirname(destination_key)
+    while parent and parent != destination_key:
+        yield parent
+        destination_key, parent = parent, os.path.dirname(parent)
+
+
+def _build_cloud_download_plan(
+    base_url: str,
+    files: list[dict[str, Any]],
+    download_path: Path,
+) -> list[tuple[dict[str, Any], str, Path]]:
+    """Resolve all cloud objects to local paths and fail on destination aliases."""
+    planned: list[tuple[dict[str, Any], str, Path]] = []
+    destinations: dict[str, str] = {}
+    descendant_destinations: dict[str, str] = {}
+    object_prefix_conflicts = _cloud_object_prefix_conflicts(
+        base_url,
+        [str(file_info["path"]) for file_info in files],
+    )
+    case_sensitive = _is_case_sensitive_directory(download_path)
+    unicode_normalization_sensitive = _is_unicode_normalization_sensitive_directory(download_path)
+    for file_info in files:
+        file_url = str(file_info["path"])
+        local_path = _build_safe_local_path(
+            base_url,
+            file_url,
+            download_path,
+            object_prefix_conflicts=object_prefix_conflicts,
+        )
+        destination_key = _local_destination_key(
+            local_path,
+            case_sensitive=case_sensitive,
+            unicode_normalization_sensitive=unicode_normalization_sensitive,
+        )
+        previous_url = destinations.get(destination_key) or descendant_destinations.get(destination_key)
+        ancestor_keys = tuple(_local_destination_ancestor_keys(destination_key))
+        if previous_url is None:
+            previous_url = next(
+                (destinations[ancestor_key] for ancestor_key in ancestor_keys if ancestor_key in destinations),
+                None,
+            )
+        if previous_url is not None:
+            raise ValueError(
+                "Cloud object path alias collision: "
+                f"{_redact_cloud_path_for_display(previous_url)} and "
+                f"{_redact_cloud_path_for_display(file_url)} overlap at {local_path.name}"
+            )
+        destinations[destination_key] = file_url
+        for ancestor_key in ancestor_keys:
+            descendant_destinations.setdefault(ancestor_key, file_url)
+        planned.append((file_info, file_url, local_path))
+    return planned
 
 
 def _clear_directory_contents(path: Path) -> None:
@@ -2142,6 +2569,10 @@ class _CloudDownloadBudgetExceeded(ValueError):
     """Raised when a cloud transfer exceeds its bounded acquisition budget."""
 
 
+class _UnsafeCloudDownloadDestination(ValueError):
+    """Raised when a local cloud download destination is unsafe to write."""
+
+
 class _CloudDownloadBudget:
     """Track a cloud acquisition budget across objects and retry attempts."""
 
@@ -2162,26 +2593,56 @@ class _CloudDownloadBudget:
         self.remaining_bytes -= byte_count
 
 
-def _download_cloud_object(fs: Any, file_url: str, local_path: Path, budget: _CloudDownloadBudget | None) -> int:
-    """Download one cloud object while enforcing an optional transfer budget."""
-    if budget is None:
-        fs.get(file_url, str(local_path))
-        return 0
+def _ensure_cloud_download_destination_is_safe(local_path: Path, base_dir: Path) -> None:
+    """Reject escaped parents and final-component symlinks before writing an object."""
+    if not _is_local_destination_within_directory(base_dir, local_path):
+        raise _UnsafeCloudDownloadDestination(
+            f"Refusing to download cloud object through escaped parent directory: {local_path.name}"
+        )
+    if local_path.is_symlink():
+        raise _UnsafeCloudDownloadDestination(
+            f"Refusing to download cloud object through symlink destination: {local_path.name}"
+        )
 
+
+def _download_cloud_object(
+    fs: Any,
+    file_url: str,
+    local_path: Path,
+    budget: _CloudDownloadBudget | None,
+    base_dir: Path,
+) -> int:
+    """Download one cloud object while enforcing an optional transfer budget."""
+    _ensure_cloud_download_destination_is_safe(local_path, base_dir)
+    temp_fd, temp_name = tempfile.mkstemp(prefix=".modelaudit-", dir=local_path.parent)
+    os.close(temp_fd)
+    temp_path = Path(temp_name)
+    temp_parent = temp_path.parent.resolve()
     bytes_written = 0
     try:
-        with fs.open(file_url, "rb") as remote_file, local_path.open("wb") as local_file:
-            while True:
-                chunk = remote_file.read(budget.read_size())
-                if not chunk:
-                    return bytes_written
-                if not isinstance(chunk, bytes):
-                    raise TypeError("cloud filesystem returned non-bytes content")
-                budget.consume(len(chunk))
-                bytes_written += len(chunk)
-                local_file.write(chunk)
+        if budget is None:
+            fs.get(file_url, str(temp_path))
+        else:
+            with fs.open(file_url, "rb") as remote_file, temp_path.open("wb") as local_file:
+                while True:
+                    chunk = remote_file.read(budget.read_size())
+                    if not chunk:
+                        break
+                    if not isinstance(chunk, bytes):
+                        raise TypeError("cloud filesystem returned non-bytes content")
+                    budget.consume(len(chunk))
+                    bytes_written += len(chunk)
+                    local_file.write(chunk)
+
+        _ensure_cloud_download_destination_is_safe(local_path, base_dir)
+        os.replace(temp_path, local_path)
+        return bytes_written
     except Exception:
-        local_path.unlink(missing_ok=True)
+        try:
+            if temp_path.parent.resolve() == temp_parent:
+                temp_path.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            logger.debug("Unable to remove temporary cloud download after failure: %s", cleanup_error)
         raise
 
 
@@ -2397,18 +2858,24 @@ def download_from_cloud(
 
         # Download based on type
         if metadata["type"] == "directory":
+            assert files is not None
             if cache:
+                with tempfile.TemporaryDirectory(
+                    prefix="modelaudit_cloud_plan_",
+                    dir=download_path.parent,
+                ) as preflight_dir:
+                    _build_cloud_download_plan(fs_url, files, Path(preflight_dir))
                 _clear_directory_contents(download_path)
 
-            assert files is not None
+            download_plan = _build_cloud_download_plan(fs_url, files, download_path)
+            for _, _, local_path in download_plan:
+                _ensure_cloud_download_destination_is_safe(local_path, download_path)
 
             # Download files
             download_budget = _CloudDownloadBudget(max_size) if max_size else None
             if download_budget is not None:
                 download_budget.consume(acquired_probe_bytes)
-            for file_info in files:
-                file_url = file_info["path"]
-                local_path = _build_safe_local_path(fs_url, file_url, download_path)
+            for file_info, file_url, local_path in download_plan:
                 local_path.parent.mkdir(parents=True, exist_ok=True)
 
                 if show_progress:
@@ -2416,30 +2883,32 @@ def download_from_cloud(
 
                 @retry_with_backoff(
                     max_retries=3,
-                    do_not_retry_on=(_CloudDownloadBudgetExceeded,),
+                    do_not_retry_on=(_CloudDownloadBudgetExceeded, _UnsafeCloudDownloadDestination),
                     verbose=show_progress,
                     sanitize_error=_cloud_error_sanitizer(file_url),
                 )
                 def download_file(url=file_url, path=local_path, budget=download_budget):
-                    return _download_cloud_object(fs, url, path, budget)
+                    return _download_cloud_object(fs, url, path, budget, download_path)
 
                 download_file()
         else:
             # Single file download
-            file_name = _cloud_url_basename(url)
-            local_file = download_path / file_name
+            local_file = _build_safe_local_path(url, url, download_path)
+            file_name = local_file.name
+            local_file.parent.mkdir(parents=True, exist_ok=True)
             download_budget = _CloudDownloadBudget(max_size) if max_size else None
             if cache:
                 _remove_path(local_file)
+            _ensure_cloud_download_destination_is_safe(local_file, download_path)
 
             @retry_with_backoff(
                 max_retries=3,
-                do_not_retry_on=(_CloudDownloadBudgetExceeded,),
+                do_not_retry_on=(_CloudDownloadBudgetExceeded, _UnsafeCloudDownloadDestination),
                 verbose=show_progress,
                 sanitize_error=_cloud_error_sanitizer(url),
             )
             def download_single_file():
-                return _download_cloud_object(fs, fs_url, local_file, download_budget)
+                return _download_cloud_object(fs, fs_url, local_file, download_budget, download_path)
 
             if show_progress and size > 100 * 1024 * 1024 * 1024:  # Show progress for files > 100GB
                 with yaspin(text=f"Downloading {file_name}") as spinner:
@@ -2572,13 +3041,13 @@ def download_from_cloud_streaming(
         download_budget = _CloudDownloadBudget(max_size) if max_size else None
         if download_budget is not None:
             download_budget.consume(acquired_probe_bytes)
-        for i, file_info in enumerate(files):
-            file_url = file_info["path"]
+        download_plan = _build_cloud_download_plan(fs_url, files, temp_dir)
+        for _, _, local_path in download_plan:
+            _ensure_cloud_download_destination_is_safe(local_path, temp_dir)
+        for i, (file_info, file_url, local_path) in enumerate(download_plan):
             file_name = file_info.get("name") or _cloud_url_basename(file_url)
             is_last = i == total_files - 1
 
-            # Build a safe local path relative to the requested cloud base path.
-            local_path = _build_safe_local_path(fs_url, file_url, temp_dir)
             local_path.parent.mkdir(parents=True, exist_ok=True)
 
             if show_progress:
@@ -2586,12 +3055,12 @@ def download_from_cloud_streaming(
 
             @retry_with_backoff(
                 max_retries=3,
-                do_not_retry_on=(_CloudDownloadBudgetExceeded,),
+                do_not_retry_on=(_CloudDownloadBudgetExceeded, _UnsafeCloudDownloadDestination),
                 verbose=show_progress,
                 sanitize_error=_cloud_error_sanitizer(file_url),
             )
             def download_file(url=file_url, path=local_path, budget=download_budget):
-                return _download_cloud_object(fs, url, path, budget)
+                return _download_cloud_object(fs, url, path, budget, temp_dir)
 
             download_file()
 

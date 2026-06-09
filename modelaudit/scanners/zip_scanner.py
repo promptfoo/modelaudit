@@ -55,6 +55,8 @@ _ZIP_ARCHIVE_EXTRA_DATA_SIGNATURE = b"PK\x06\x08"
 _ZIP_MAX_ARCHIVE_EXTRA_DATA_RECORDS = 1024
 _ZIP_MAX_LOCAL_PREFIX_SCAN_SIZE = 64 * 1024 * 1024
 _ZIP_MAX_LOCAL_PAYLOAD_VALIDATION_SIZE = 64 * 1024 * 1024
+_ZIP_MAX_LOCAL_PAYLOAD_VALIDATION_TOTAL = 64 * 1024 * 1024
+_ZIP_MAX_TRAILING_DATA_SCAN_SIZE = 64 * 1024 * 1024
 _ZIP_MAX_LOCAL_ENTRY_PADDING = 64 * 1024
 _ZIP_MAX_LOCAL_HEADER_CANDIDATES = 10000
 _ZIP64_EOCD_LOCATOR_SIGNATURE = b"PK\x06\x07"
@@ -820,6 +822,7 @@ class ZipScanner(BaseScanner):
         search_offset = 0
         trailing = b""
         candidate_count = 0
+        payload_validation_budget = [_ZIP_MAX_LOCAL_PAYLOAD_VALIDATION_TOTAL]
         while search_offset < boundary:
             read_size = min(64 * 1024, boundary - search_offset)
             try:
@@ -840,7 +843,12 @@ class ZipScanner(BaseScanner):
                         routing_evidence=True,
                     )
                 candidate_offset = data_offset + candidate_index
-                if cls._unreferenced_local_entry_ends_at(handle, candidate_offset, boundary):
+                if cls._unreferenced_local_entry_ends_at(
+                    handle,
+                    candidate_offset,
+                    boundary,
+                    payload_validation_budget,
+                ):
                     return True
                 candidate_index = search_data.find(_ZIP_LOCAL_FILE_HEADER_SIGNATURE, candidate_index + 1)
             trailing = search_data[-overlap:]
@@ -857,6 +865,7 @@ class ZipScanner(BaseScanner):
         compression_method: int,
         expected_crc32: int,
         flags: int,
+        payload_validation_budget: list[int],
     ) -> bool:
         """Validate a bounded local-entry payload when its central record is absent."""
         if flags & 0x0001:
@@ -872,6 +881,14 @@ class ZipScanner(BaseScanner):
             return True
         if compression_method not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2}:
             return True
+
+        validation_cost = compressed_size + uncompressed_size
+        if validation_cost > payload_validation_budget[0]:
+            raise _InvalidZipDirectory(
+                "ZIP local-entry payload validation exceeded its bounded work budget",
+                routing_evidence=True,
+            )
+        payload_validation_budget[0] -= validation_cost
 
         try:
             handle.seek(data_offset)
@@ -937,7 +954,13 @@ class ZipScanner(BaseScanner):
         return output_size == uncompressed_size and crc32 == expected_crc32
 
     @classmethod
-    def _unreferenced_local_entry_ends_at(cls, handle: BinaryIO, offset: int, boundary: int) -> bool:
+    def _unreferenced_local_entry_ends_at(
+        cls,
+        handle: BinaryIO,
+        offset: int,
+        boundary: int,
+        payload_validation_budget: list[int],
+    ) -> bool:
         try:
             handle.seek(offset)
             header = handle.read(_ZIP_LOCAL_FILE_HEADER_SIZE)
@@ -966,9 +989,7 @@ class ZipScanner(BaseScanner):
         compressed_size, uncompressed_size = local_sizes
         if not flags & 0x0008:
             entry_end = data_offset + compressed_size
-            if entry_end == boundary:
-                return True
-            if entry_end < boundary:
+            if entry_end <= boundary:
                 return cls._local_entry_payload_matches_header(
                     handle,
                     data_offset=data_offset,
@@ -977,11 +998,14 @@ class ZipScanner(BaseScanner):
                     compression_method=int.from_bytes(header[8:10], "little"),
                     expected_crc32=int.from_bytes(header[14:18], "little"),
                     flags=flags,
+                    payload_validation_budget=payload_validation_budget,
                 )
             return False
 
         raw_compressed_size = int.from_bytes(header[18:22], "little")
         raw_uncompressed_size = int.from_bytes(header[22:26], "little")
+        if data_offset >= boundary:
+            return False
         descriptor_window_start = max(
             data_offset,
             boundary - (_ZIP_MAX_LOCAL_ENTRY_PADDING + 24),
@@ -1024,8 +1048,44 @@ class ZipScanner(BaseScanner):
                         compression_method=int.from_bytes(header[8:10], "little"),
                         expected_crc32=descriptor_crc32,
                         flags=flags,
+                        payload_validation_budget=payload_validation_budget,
                     ):
                         return True
+        if boundary - data_offset > _ZIP_MAX_LOCAL_ENTRY_PADDING + 24:
+            raise _InvalidZipDirectory(
+                "ZIP streamed local entry cannot be bounded within the preflight window",
+                routing_evidence=True,
+            )
+        return False
+
+    @staticmethod
+    def _trailing_data_contains_local_entry_marker(handle: BinaryIO, start: int, end: int) -> bool:
+        trailing_size = end - start
+        if trailing_size <= 0:
+            return False
+        if trailing_size > _ZIP_MAX_TRAILING_DATA_SCAN_SIZE:
+            raise _InvalidZipDirectory(
+                "ZIP trailing data is too large to validate safely",
+                routing_evidence=True,
+            )
+
+        overlap = len(_ZIP_LOCAL_FILE_HEADER_SIGNATURE) - 1
+        offset = start
+        carried = b""
+        while offset < end:
+            read_size = min(64 * 1024, end - offset)
+            try:
+                handle.seek(offset)
+                chunk = handle.read(read_size)
+            except OSError as exc:
+                raise _InvalidZipDirectory(f"ZIP trailing data could not be read: {exc}") from exc
+            if not chunk:
+                break
+            search_data = carried + chunk
+            if _ZIP_LOCAL_FILE_HEADER_SIGNATURE in search_data:
+                return True
+            carried = search_data[-overlap:]
+            offset += len(chunk)
         return False
 
     @staticmethod
@@ -1118,6 +1178,12 @@ class ZipScanner(BaseScanner):
             assert valid_eocd_index is not None
             valid_comment_length = int.from_bytes(tail[valid_eocd_index + 20 : valid_eocd_index + 22], "little")
             valid_record_end = valid_eocd_index + _ZIP_EOCD_MIN_SIZE + valid_comment_length
+            valid_record_end_offset = file_size - tail_size + valid_record_end
+            if cls._trailing_data_contains_local_entry_marker(handle, valid_record_end_offset, file_size):
+                raise _InvalidZipDirectory(
+                    "ZIP trailing data contains an unreferenced local entry",
+                    routing_evidence=True,
+                )
             if any(
                 strong_evidence
                 and not (

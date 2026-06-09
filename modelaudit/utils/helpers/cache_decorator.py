@@ -160,7 +160,7 @@ def should_bypass_cache_for_zip_entry_preflight(file_path: str, config: dict[str
         from ...scanner_selection import allows_zip_structure_analysis, policy_from_config
         from ...scanners.zip_scanner import ZipScanner
 
-        if not allows_zip_structure_analysis(policy_from_config(config)):
+        if not allows_zip_structure_analysis(policy_from_config(config), file_path):
             return False
         max_entries = int(config.get("max_zip_entries", ZipScanner.DEFAULT_MAX_ENTRIES))
         max_directory_size = ZipScanner.central_directory_size_limit(config)
