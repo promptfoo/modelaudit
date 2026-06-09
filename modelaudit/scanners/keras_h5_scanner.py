@@ -7,7 +7,6 @@ import os
 import re
 from collections.abc import Callable
 from contextlib import suppress
-from pathlib import Path
 from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import (
@@ -21,12 +20,18 @@ from modelaudit.utils.helpers.code_validation import (
 
 from ..config.explanations import (
     get_cve_2024_3660_explanation,
+    get_cve_2025_1550_explanation,
     get_cve_2025_9905_explanation,
     get_cve_2026_1669_explanation,
     get_pattern_explanation,
 )
 from ..utils.file.hdf5 import find_hdf5_signature_offset
-from ._evidence_redaction import redact_evidence_mapping_key, redact_evidence_string, redact_evidence_value
+from ._evidence_redaction import (
+    redact_evidence_mapping_key,
+    redact_evidence_string,
+    redact_evidence_value,
+    redact_untrusted_error_message,
+)
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_custom_loss_config,
@@ -60,6 +65,112 @@ _KERAS_PRERELEASE_SUFFIX_PATTERN = re.compile(
 _KERAS_POST_OR_LOCAL_SUFFIX_PATTERN = re.compile(
     rf"(?i)^(?:{_KERAS_LOCAL_VERSION_SUFFIX}|"
     rf"{_KERAS_POST_SUFFIX}(?:{_KERAS_DEV_SUFFIX})?(?:{_KERAS_LOCAL_VERSION_SUFFIX})?)$"
+)
+
+# CVE-2025-1550: Keras safe_mode bypass via arbitrary module references.
+_SAFE_KERAS_MODULE_ROOTS: frozenset[str] = frozenset({"keras", "tensorflow", "tf_keras", "tf", "numpy", "math"})
+_DANGEROUS_CONFIG_MODULE_ROOTS = frozenset(
+    {
+        "os",
+        "sys",
+        "subprocess",
+        "builtins",
+        "__builtin__",
+        "importlib",
+        "shutil",
+        "socket",
+        "http",
+        "pickle",
+        "marshal",
+        "ctypes",
+        "code",
+        "codeop",
+        "compileall",
+        "runpy",
+        "webbrowser",
+        "tempfile",
+        "signal",
+        "multiprocessing",
+        "threading",
+        "pty",
+        "commands",
+        "pdb",
+        "profile",
+        "trace",
+        "pip",
+        "setuptools",
+        "distutils",
+    }
+)
+_DANGEROUS_EXACT_MODULE_SYMBOLS: dict[str, frozenset[str]] = {
+    "_ctypes": frozenset({"dlopen"}),
+    "_frozen_importlib": frozenset({"__import__", "_find_and_load", "_find_and_load_unlocked"}),
+    "_imp": frozenset({"create_builtin", "create_dynamic", "exec_builtin", "exec_dynamic", "load_dynamic"}),
+    "_interpreters": frozenset({"call", "exec"}),
+    "_io": frozenset({"open"}),
+    "_operator": frozenset({"attrgetter", "methodcaller"}),
+    "_pickle": frozenset({"load", "loads"}),
+    "_posixsubprocess": frozenset({"fork_exec"}),
+    "_socket": frozenset({"socket"}),
+    "_thread": frozenset({"start_new", "start_new_thread"}),
+    "_winapi": frozenset({"CreateProcess", "ShellExecute"}),
+    "_xxsubinterpreters": frozenset({"run_string"}),
+    "io": frozenset({"open"}),
+    "nt": frozenset({"popen", "startfile", "system"}),
+    "operator": frozenset({"attrgetter", "methodcaller"}),
+    "posix": frozenset({"popen", "system"}),
+}
+_DANGEROUS_EXACT_MODULE_SYMBOL_PREFIXES: dict[str, tuple[str, ...]] = {
+    "nt": ("exec", "spawn"),
+    "posix": ("exec", "spawn"),
+}
+_NESTED_SERIALIZED_OBJECT_KEYS = frozenset(
+    {
+        "activation",
+        "activity_regularizer",
+        "backward_layer",
+        "beta_initializer",
+        "bias_constraint",
+        "bias_initializer",
+        "bias_regularizer",
+        "callable",
+        "cell",
+        "cells",
+        "depthwise_constraint",
+        "depthwise_initializer",
+        "depthwise_regularizer",
+        "embeddings_constraint",
+        "embeddings_initializer",
+        "embeddings_regularizer",
+        "fn",
+        "forward_layer",
+        "function",
+        "gamma_initializer",
+        "kernel_constraint",
+        "kernel_initializer",
+        "kernel_regularizer",
+        "layer",
+        "layers",
+        "learning_rate",
+        "loss",
+        "losses",
+        "metric",
+        "metrics",
+        "moving_mean_initializer",
+        "moving_variance_initializer",
+        "optimizer",
+        "output_activation",
+        "pointwise_constraint",
+        "pointwise_initializer",
+        "pointwise_regularizer",
+        "preprocessor",
+        "recurrent_activation",
+        "recurrent_constraint",
+        "recurrent_initializer",
+        "recurrent_regularizer",
+        "schedule",
+        "weighted_metrics",
+    }
 )
 
 
@@ -233,6 +344,7 @@ class KerasH5Scanner(BaseScanner):
     _MAX_HDF5_EXTERNAL_REFERENCE_REPORTS: ClassVar[int] = 20
     _MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS: ClassVar[int] = 20
     _MAX_HDF5_REFERENCE_TEXT_CHARS: ClassVar[int] = 4096
+    _MAX_SERIALIZED_CONFIG_NODES: ClassVar[int] = 10_000
     _MODEL_CONTAINER_CLASSES: ClassVar[frozenset[str]] = frozenset({"Model", "Functional", "Sequential"})
     _WRAPPED_LAYER_SCAN_MODEL: ClassVar[dict[str, Any]] = {"class_name": "Sequential", "config": {"layers": []}}
 
@@ -247,6 +359,9 @@ class KerasH5Scanner(BaseScanner):
         if config and "suspicious_config_properties" in config:
             self.suspicious_config_props.extend(config["suspicious_config_properties"])
         self._current_h5_keras_version: str | None = None
+        self._checked_config_module_references: set[tuple[int, str, str]] = set()
+        self._remaining_serialized_config_nodes = self._MAX_SERIALIZED_CONFIG_NODES
+        self._serialized_config_limit_reported = False
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -269,6 +384,9 @@ class KerasH5Scanner(BaseScanner):
         # Initialize context for this file
         self._initialize_context(path)
         self._current_h5_keras_version = None
+        self._checked_config_module_references.clear()
+        self._remaining_serialized_config_nodes = self._MAX_SERIALIZED_CONFIG_NODES
+        self._serialized_config_limit_reported = False
 
         # Check if path is valid
         path_check_result = self._check_path(path)
@@ -402,15 +520,16 @@ class KerasH5Scanner(BaseScanner):
                         self._scan_training_config(training_config, result)
 
         except OSError as e:
+            redacted_error = redact_untrusted_error_message(e)
             self._mark_inconclusive_scan_result(result, "keras_h5_read_failed")
             result.add_check(
                 name="Keras H5 File Read",
                 passed=False,
-                message=f"Unable to read Keras H5 content: {e!s}",
+                message=f"Unable to read Keras H5 content: {redacted_error}",
                 severity=IssueSeverity.INFO,
                 location=path,
                 details={
-                    "exception": str(e),
+                    "exception": redacted_error,
                     "exception_type": type(e).__name__,
                     "analysis_incomplete": True,
                     "scan_outcome_reason": "keras_h5_read_failed",
@@ -420,15 +539,16 @@ class KerasH5Scanner(BaseScanner):
             self._finish_scan_result(result)
             return result
         except Exception as e:
+            redacted_error = redact_untrusted_error_message(e)
             self._mark_inconclusive_scan_result(result, "keras_h5_scan_failed")
             result.add_check(
                 name="Keras H5 File Scan",
                 passed=False,
-                message=f"Error scanning Keras H5 file: {e!s}",
+                message=f"Error scanning Keras H5 file: {redacted_error}",
                 severity=IssueSeverity.INFO,
                 location=path,
                 details={
-                    "exception": str(e),
+                    "exception": redacted_error,
                     "exception_type": type(e).__name__,
                     "analysis_incomplete": True,
                     "scan_outcome_reason": "keras_h5_scan_failed",
@@ -476,6 +596,7 @@ class KerasH5Scanner(BaseScanner):
                 attr_value = attr_value.decode("utf-8")
             return json.loads(attr_value)
         except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as e:
+            redacted_error = redact_untrusted_error_message(e)
             self._mark_inconclusive_scan_result(result, f"keras_h5_{attr_name}_parse_failed")
             result.add_check(
                 name="Keras H5 Config Parse",
@@ -485,7 +606,7 @@ class KerasH5Scanner(BaseScanner):
                 location=self.current_file_path,
                 details={
                     "attribute": attr_name,
-                    "exception": str(e),
+                    "exception": redacted_error,
                     "exception_type": type(e).__name__,
                 },
                 rule_code="S902",
@@ -493,15 +614,12 @@ class KerasH5Scanner(BaseScanner):
             return self._JSON_ATTRIBUTE_PARSE_FAILED
 
     @classmethod
-    def _has_weights_like_hdf5_layout(cls, h5_file: Any, path: str) -> bool:
+    def _has_weights_like_hdf5_layout(cls, h5_file: Any, _path: str) -> bool:
         """Return True for HDF5 layouts that resemble Keras weights-only files."""
-        if any(str(key).lower() in cls._KERAS_WEIGHT_ROOT_GROUPS for key in h5_file):
-            return True
-
         if cls._has_legacy_weights_layout(h5_file):
             return True
 
-        return Path(path).name.lower().endswith(".weights.h5") and cls._has_keras3_weights_layout(h5_file)
+        return cls._has_keras3_weights_layout(h5_file)
 
     @classmethod
     def _has_legacy_weights_layout(cls, h5_file: Any) -> bool:
@@ -528,9 +646,6 @@ class KerasH5Scanner(BaseScanner):
     @classmethod
     def _has_keras3_weights_layout(cls, h5_file: Any) -> bool:
         """Detect Keras 3 H5IOStore weights-only layouts without generic HDF5 overreach."""
-        if cls._has_group_or_external_link(h5_file, "vars"):
-            return True
-
         layers_link = h5_file.get("layers", getlink=True)
         if isinstance(layers_link, h5py.ExternalLink):
             return True
@@ -556,6 +671,123 @@ class KerasH5Scanner(BaseScanner):
                 return True
 
         return False
+
+    @classmethod
+    def _hdf5_weight_scan_roots(cls, h5_file: Any) -> tuple[list[str], bool]:
+        """Return loader-consumed HDF5 roots without following external links."""
+        roots: list[str] = []
+        root_set: set[str] = set()
+        roots_truncated = False
+        inspected_name_count = 0
+
+        def consume_name_budget() -> bool:
+            nonlocal inspected_name_count, roots_truncated
+            if inspected_name_count >= cls._MAX_HDF5_LINK_VISITS:
+                roots_truncated = True
+                return False
+            inspected_name_count += 1
+            return True
+
+        def add_root(path: str) -> bool:
+            nonlocal roots_truncated
+            if path in root_set:
+                return True
+            if len(roots) >= cls._MAX_HDF5_LINK_VISITS:
+                roots_truncated = True
+                return False
+            roots.append(path)
+            root_set.add(path)
+            return True
+
+        def add_weight_names(group: Any, prefix: str) -> bool:
+            for weight_name in cls._decode_hdf5_names(group.attrs.get("weight_names")):
+                if not consume_name_budget():
+                    return False
+                lookup_name = weight_name or "."
+                if group.get(lookup_name, getlink=True) is None:
+                    continue
+                if weight_name.startswith("/"):
+                    weight_path = weight_name.lstrip("/")
+                else:
+                    weight_path = f"{prefix}/{weight_name}" if prefix else weight_name
+                if not add_root(weight_path):
+                    return False
+            return True
+
+        def add_legacy_group_roots(group: Any, prefix: str) -> None:
+            nonlocal roots_truncated
+            if not add_weight_names(group, prefix):
+                return
+            for layer_name in cls._decode_hdf5_names(group.attrs.get("layer_names")):
+                if not consume_name_budget():
+                    return
+                layer_link = group.get(layer_name, getlink=True)
+                if layer_link is None:
+                    continue
+                layer_path = f"{prefix}/{layer_name}" if prefix else layer_name
+                if isinstance(layer_link, h5py.ExternalLink):
+                    if not add_root(layer_path):
+                        return
+                    continue
+                if not isinstance(layer_link, h5py.HardLink):
+                    continue
+                layer_group = group.get(layer_name, getlink=False)
+                if isinstance(layer_group, h5py.Group) and not add_weight_names(layer_group, layer_path):
+                    return
+
+        if "model_config" in h5_file.attrs:
+            for root_name in cls._KERAS_WEIGHT_ROOT_GROUPS:
+                root_link = h5_file.get(root_name, getlink=True)
+                if isinstance(root_link, h5py.ExternalLink):
+                    if not add_root(root_name):
+                        break
+                    continue
+                if not isinstance(root_link, h5py.HardLink):
+                    continue
+                root_group = h5_file.get(root_name, getlink=False)
+                if isinstance(root_group, h5py.Group):
+                    add_legacy_group_roots(root_group, root_name)
+                if roots_truncated:
+                    break
+            return roots, roots_truncated
+
+        layer_names = cls._decode_hdf5_names(h5_file.attrs.get("layer_names"))
+        if layer_names:
+            add_legacy_group_roots(h5_file, "")
+            return roots, roots_truncated
+
+        layers_link = h5_file.get("layers", getlink=True)
+        if isinstance(layers_link, h5py.ExternalLink):
+            add_root("layers")
+            return roots, roots_truncated
+        if not isinstance(layers_link, h5py.HardLink):
+            return roots, False
+
+        layers = h5_file.get("layers", getlink=False)
+        if not isinstance(layers, h5py.Group):
+            return roots, False
+
+        for layer_name in layers:
+            if not consume_name_budget():
+                break
+            layer_path = f"layers/{layer_name}"
+            layer_link = layers.get(layer_name, getlink=True)
+            if isinstance(layer_link, h5py.ExternalLink):
+                if not add_root(layer_path):
+                    break
+                continue
+            if not isinstance(layer_link, h5py.HardLink):
+                continue
+
+            layer = layers.get(layer_name, getlink=False)
+            if (
+                isinstance(layer, h5py.Group)
+                and layer.get("vars", getlink=True) is not None
+                and not add_root(f"{layer_path}/vars")
+            ):
+                break
+
+        return roots, roots_truncated
 
     @staticmethod
     def _has_group_or_external_link(group: Any, name: str) -> bool:
@@ -605,6 +837,7 @@ class KerasH5Scanner(BaseScanner):
         findings: list[dict[str, Any]] = []
         external_reference_count = 0
         external_storage_segments_truncated = False
+        weight_roots, weight_roots_truncated = self._hdf5_weight_scan_roots(h5_file)
 
         def visit(name: str, link: Any) -> None:
             nonlocal external_reference_count, external_storage_segments_truncated
@@ -634,8 +867,9 @@ class KerasH5Scanner(BaseScanner):
 
             obj = h5_file.get(name, getlink=False)
             if isinstance(obj, h5py.Dataset):
-                external_storage = obj.external
-                if external_storage:
+                storage_properties = obj.id.get_create_plist()
+                external_storage_segment_count = storage_properties.get_external_count()
+                if external_storage_segment_count > 0:
                     external_reference_count += 1
                     if len(findings) >= self._MAX_HDF5_EXTERNAL_REFERENCE_REPORTS:
                         return
@@ -645,9 +879,15 @@ class KerasH5Scanner(BaseScanner):
                             "offset": int(offset),
                             "size": int(size),
                         }
-                        for filename, offset, size in external_storage[
-                            : self._MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS
-                        ]
+                        for filename, offset, size in (
+                            storage_properties.get_external(index)
+                            for index in range(
+                                min(
+                                    external_storage_segment_count,
+                                    self._MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS,
+                                )
+                            )
+                        )
                     ]
                     hdf5_path, hdf5_path_truncated = self._bounded_hdf5_reference_text(f"/{name}".replace("//", "/"))
                     external_storage_finding: dict[str, Any] = {
@@ -657,19 +897,58 @@ class KerasH5Scanner(BaseScanner):
                     }
                     if hdf5_path_truncated:
                         external_storage_finding["hdf5_path_truncated"] = True
-                    if len(external_storage) > len(segments):
+                    if external_storage_segment_count > len(segments):
                         external_storage_segments_truncated = True
-                        external_storage_finding["segment_count"] = len(external_storage)
+                        external_storage_finding["segment_count"] = external_storage_segment_count
                         external_storage_finding["segments_truncated"] = True
                     findings.append(external_storage_finding)
 
-        visited_link_count, link_visits_truncated = self._visit_hdf5_links(
-            h5_file,
-            visit,
-            max_links=self._MAX_HDF5_LINK_VISITS,
-        )
+        visited_link_count = 0
+        link_visits_truncated = False
+        for root_path in weight_roots:
+            root_link = h5_file.get(root_path, getlink=True)
+            if root_link is None:
+                continue
+            if isinstance(root_link, h5py.ExternalLink):
+                visited_link_count += 1
+                visit(root_path, root_link)
+                continue
+            if not isinstance(root_link, h5py.HardLink):
+                continue
+
+            root_obj = h5_file.get(root_path, getlink=False)
+            if isinstance(root_obj, h5py.Dataset):
+                visited_link_count += 1
+                visit(root_path, root_link)
+                continue
+            if not isinstance(root_obj, h5py.Group):
+                continue
+
+            remaining_link_visits = max(self._MAX_HDF5_LINK_VISITS - visited_link_count, 0)
+            if remaining_link_visits == 0:
+                link_visits_truncated = True
+                break
+
+            def visit_root(name: str, link: Any, *, prefix: str = root_path) -> None:
+                visit(f"{prefix}/{name}", link)
+
+            root_visited, root_truncated = self._visit_hdf5_links(
+                root_obj,
+                visit_root,
+                max_links=remaining_link_visits,
+            )
+            visited_link_count += root_visited
+            if root_truncated:
+                link_visits_truncated = True
+                break
+
         external_references_truncated = external_reference_count > len(findings)
-        if link_visits_truncated or external_references_truncated or external_storage_segments_truncated:
+        if (
+            weight_roots_truncated
+            or link_visits_truncated
+            or external_references_truncated
+            or external_storage_segments_truncated
+        ):
             reason = "keras_h5_external_reference_analysis_limit_exceeded"
             self._mark_inconclusive_scan_result(result, reason)
             result.add_check(
@@ -683,6 +962,7 @@ class KerasH5Scanner(BaseScanner):
                     "scan_outcome_reason": reason,
                     "visited_link_count": visited_link_count,
                     "max_link_visits": self._MAX_HDF5_LINK_VISITS,
+                    "weight_roots_truncated": weight_roots_truncated,
                     "link_visits_truncated": link_visits_truncated,
                     "external_reference_count": external_reference_count,
                     "reported_external_reference_count": len(findings),
@@ -860,6 +1140,13 @@ class KerasH5Scanner(BaseScanner):
             "training_config.weighted_metrics",
         )
         self._check_custom_loss_config(training_config.get("loss"), result, "training_config.loss")
+        for key in ("optimizer_config", "loss", "metrics", "weighted_metrics"):
+            self._check_nested_serialized_module_references(
+                training_config.get(key),
+                result,
+                f"training_config.{key}",
+                trusted_container=True,
+            )
 
     def _check_custom_metric_config(self, metrics_config: Any, result: ScanResult, context: str) -> None:
         """Flag custom metrics embedded anywhere in a serialized metric tree."""
@@ -898,6 +1185,13 @@ class KerasH5Scanner(BaseScanner):
                 location=self.current_file_path,
                 details={"actual_type": type(model_class).__name__, "expected_type": "str"},
             )
+        self._check_layer_module_references(
+            model_config,
+            result,
+            "model_config",
+            config_fields=(),
+            check_nested=False,
+        )
 
         # Collect all layers
         layers = []
@@ -963,10 +1257,11 @@ class KerasH5Scanner(BaseScanner):
         # Count of each layer type
         layer_counts: dict[str, int] = {}
         layer_count_display_keys: dict[str, str] = {}
+        layer_count_next_occurrences: dict[str, int] = {}
         lambda_layer_count = 0
 
         # Check each layer
-        for layer in layers:
+        for index, layer in enumerate(layers):
             if not isinstance(layer, dict):
                 self._mark_inconclusive_scan_result(result, "keras_h5_model_layer_invalid_type")
                 result.add_check(
@@ -1013,6 +1308,38 @@ class KerasH5Scanner(BaseScanner):
                 )
                 layer_config = {}
 
+            if is_lambda_layer:
+                layer_reference_name = f"lambda_{lambda_layer_count + 1}"
+            else:
+                serialized_layer_name = layer.get("name")
+                config_layer_name = layer_config.get("name")
+                layer_reference_name = next(
+                    (
+                        name.strip()
+                        for name in (serialized_layer_name, config_layer_name)
+                        if isinstance(name, str) and name.strip()
+                    ),
+                    f"layer_{index}",
+                )
+            nested_suppress_root_reference_keys: frozenset[str] = frozenset()
+            if is_lambda_layer:
+                handled_callback_fields = {"function"}
+                for callback_field in ("mask", "output_shape"):
+                    callback_value = layer_config.get(callback_field)
+                    callback_type = layer_config.get(f"{callback_field}_type")
+                    if callback_type in {"function", "lambda"} or (
+                        isinstance(callback_value, dict) and callback_value.get("class_name") == "__lambda__"
+                    ):
+                        handled_callback_fields.add(callback_field)
+                nested_suppress_root_reference_keys = frozenset(handled_callback_fields)
+            self._check_layer_module_references(
+                layer,
+                result,
+                layer_reference_name,
+                config_fields=("fn_module",) if is_lambda_layer else ("module", "fn_module"),
+                nested_suppress_root_reference_keys=nested_suppress_root_reference_keys,
+            )
+
             # Update layer count
             layer_count_identity = (
                 f"str:{layer_count_key}"
@@ -1026,7 +1353,11 @@ class KerasH5Scanner(BaseScanner):
                     if isinstance(layer_count_key, str)
                     else f"<invalid:{type(layer_count_key).__name__}>"
                 )
-                redacted_layer_count_key = redact_evidence_mapping_key(display_key, layer_counts)
+                redacted_layer_count_key = redact_evidence_mapping_key(
+                    display_key,
+                    layer_counts,
+                    next_occurrences=layer_count_next_occurrences,
+                )
                 layer_count_display_keys[layer_count_identity] = redacted_layer_count_key
             layer_counts[redacted_layer_count_key] = layer_counts.get(redacted_layer_count_key, 0) + 1
 
@@ -1257,6 +1588,300 @@ class KerasH5Scanner(BaseScanner):
             details={"actual_type": type(nested_layer).__name__, "expected_type": "dict"},
         )
 
+    @staticmethod
+    def _config_reference_symbols(source: dict[str, Any], object_class: str) -> set[str]:
+        symbols = {object_class}
+        for key in ("config", "registered_name", "function", "function_name"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                symbols.add(value.strip())
+        return symbols
+
+    @classmethod
+    def _is_dangerous_exact_module_reference(
+        cls,
+        source: dict[str, Any],
+        module_value: str,
+        object_class: str,
+    ) -> bool:
+        symbols = cls._config_reference_symbols(source, object_class)
+        dangerous_symbols = _DANGEROUS_EXACT_MODULE_SYMBOLS.get(module_value, frozenset())
+        if symbols & dangerous_symbols:
+            return True
+        prefixes = _DANGEROUS_EXACT_MODULE_SYMBOL_PREFIXES.get(module_value, ())
+        return any(symbol.startswith(prefixes) for symbol in symbols) if prefixes else False
+
+    @classmethod
+    def _config_reference_symbol_tokens(cls, source: dict[str, Any], object_class: str) -> set[str]:
+        return {
+            token.lower()
+            for symbol in cls._config_reference_symbols(source, object_class)
+            for token in re.split(r"[^0-9A-Za-z_]+", symbol)
+            if token
+        }
+
+    @classmethod
+    def _is_allowlisted_config_callable(
+        cls,
+        source: dict[str, Any],
+        module_value: str,
+    ) -> bool:
+        symbols = {
+            value.strip()
+            for key in ("config", "registered_name", "function", "function_name")
+            if isinstance((value := source.get(key)), str) and value.strip()
+        }
+        return bool(symbols) and all(
+            cls._is_lambda_module_reference_allowlisted(module_value, symbol) for symbol in symbols
+        )
+
+    def _check_config_module_reference(
+        self,
+        source: dict[str, Any],
+        key: str,
+        module_value: str,
+        object_class: str,
+        result: ScanResult,
+        layer_name: str,
+    ) -> None:
+        reference_key = (id(source), key, module_value)
+        if reference_key in self._checked_config_module_references:
+            return
+        self._checked_config_module_references.add(reference_key)
+
+        redacted_module_value = redact_evidence_string(module_value.split(".", 1)[0])
+        redacted_object_class = redact_evidence_string(object_class)
+        redacted_layer_name = redact_evidence_string(layer_name)
+        top_module = module_value.split(".")[0]
+        symbol_tokens = self._config_reference_symbol_tokens(source, object_class)
+        is_callable_reference = key == "fn_module" or object_class == "function"
+        is_dangerous = (
+            self._is_dangerous_exact_module_reference(source, module_value, object_class)
+            or bool(symbol_tokens & self._ALWAYS_DANGEROUS_LAMBDA_FUNCTION_NAMES)
+            or top_module in _DANGEROUS_CONFIG_MODULE_ROOTS
+        )
+        is_outside_allowlist = top_module not in _SAFE_KERAS_MODULE_ROOTS
+        is_untrusted_callable = is_callable_reference and not self._is_allowlisted_config_callable(
+            source,
+            module_value,
+        )
+
+        if is_dangerous:
+            result.add_check(
+                name="CVE-2025-1550: Dangerous Module in Config",
+                passed=False,
+                message=(
+                    f"CVE-2025-1550: Layer '{redacted_layer_name}' references dangerous module "
+                    f"'{redacted_module_value}' in {key} field - arbitrary code execution via safe_mode bypass"
+                ),
+                severity=IssueSeverity.CRITICAL,
+                location=f"{self.current_file_path} (layer: {redacted_layer_name})",
+                details={
+                    "layer_name": redacted_layer_name,
+                    "layer_class": redacted_object_class,
+                    "key": key,
+                    "module": redacted_module_value,
+                    "cve_id": "CVE-2025-1550",
+                    "cvss": 7.3,
+                    "cwe": "CWE-94",
+                    "description": (
+                        "Arbitrary dangerous module references in Keras H5 metadata can bypass safe_mode "
+                        "and execute attacker-controlled code during model loading."
+                    ),
+                    "remediation": "Upgrade Keras to >= 3.9.0 or remove untrusted module references",
+                },
+                why=get_cve_2025_1550_explanation("dangerous_module"),
+            )
+        elif is_untrusted_callable or (is_outside_allowlist and self._is_lambda_layer_class(object_class)):
+            result.add_check(
+                name="CVE-2025-1550: Untrusted Module in Config",
+                passed=False,
+                message=(
+                    f"CVE-2025-1550: Layer '{redacted_layer_name}' references non-allowlisted module "
+                    f"'{redacted_module_value}' in {key} field - potential safe_mode bypass"
+                ),
+                severity=IssueSeverity.WARNING,
+                location=f"{self.current_file_path} (layer: {redacted_layer_name})",
+                details={
+                    "layer_name": redacted_layer_name,
+                    "layer_class": redacted_object_class,
+                    "key": key,
+                    "module": redacted_module_value,
+                    "cve_id": "CVE-2025-1550",
+                    "cvss": 7.3,
+                    "cwe": "CWE-94",
+                    "description": (
+                        "Non-allowlisted callable module references may indicate safe_mode bypass "
+                        "paths in untrusted Keras H5 metadata."
+                    ),
+                    "remediation": "Upgrade Keras to >= 3.9.0 or verify this module is safe",
+                },
+                why=get_cve_2025_1550_explanation("untrusted_module"),
+            )
+
+    def _check_nested_serialized_module_references(
+        self,
+        config_value: Any,
+        result: ScanResult,
+        layer_name: str,
+        *,
+        trusted_container: bool = False,
+        suppress_root_reference_keys: frozenset[str] = frozenset(),
+    ) -> None:
+        """Inspect nested Keras object configs without recursing on attacker-controlled depth."""
+        pending: list[tuple[Any, str | None, bool, bool, bool]] = [(config_value, None, trusted_container, True, False)]
+        traversal_truncated = False
+        while pending:
+            if self._remaining_serialized_config_nodes <= 0:
+                traversal_truncated = True
+                break
+
+            node, parent_key, container_is_trusted, is_root, suppress_reference_check = pending.pop()
+            self._remaining_serialized_config_nodes -= 1
+            child_capacity = max(self._remaining_serialized_config_nodes - len(pending), 0)
+            if isinstance(node, list):
+                children = list(node[: child_capacity + 1])
+                if len(children) > child_capacity:
+                    traversal_truncated = True
+                    children.pop()
+                pending.extend((item, parent_key, container_is_trusted, False, False) for item in reversed(children))
+                continue
+            if not isinstance(node, dict):
+                continue
+
+            object_class = node.get("class_name")
+            serialized_shape = isinstance(object_class, str) and "config" in node
+            is_serialized_object = serialized_shape and (
+                container_is_trusted
+                or parent_key in _NESTED_SERIALIZED_OBJECT_KEYS
+                or "registered_name" in node
+                or object_class == "function"
+                or self._is_lambda_layer_class(object_class)
+            )
+            if is_serialized_object and not suppress_reference_check:
+                assert isinstance(object_class, str)
+                for key in ("module", "fn_module"):
+                    module_value = node.get(key)
+                    if isinstance(module_value, str) and module_value.strip():
+                        self._check_config_module_reference(
+                            node,
+                            key,
+                            module_value.strip(),
+                            object_class,
+                            result,
+                            layer_name,
+                        )
+
+            next_container_is_trusted = container_is_trusted and not is_serialized_object
+            children = []
+            for key, value in node.items():
+                normalized_key = str(key).lower()
+                if normalized_key in {"module", "fn_module", "class_name", "registered_name"}:
+                    continue
+                if len(children) >= child_capacity:
+                    traversal_truncated = True
+                    break
+                children.append(
+                    (
+                        value,
+                        normalized_key,
+                        next_container_is_trusted,
+                        False,
+                        is_root and normalized_key in suppress_root_reference_keys,
+                    )
+                )
+            pending.extend(reversed(children))
+
+        if traversal_truncated and not self._serialized_config_limit_reported:
+            self._serialized_config_limit_reported = True
+            reason = "keras_h5_serialized_config_node_limit_exceeded"
+            self._mark_inconclusive_scan_result(result, reason)
+            result.add_check(
+                name="Serialized Config Traversal Limit",
+                passed=False,
+                message="Keras serialized config exceeded the bounded module-reference analysis limit",
+                rule_code="S902",
+                severity=IssueSeverity.INFO,
+                location=self.current_file_path,
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": reason,
+                    "max_nodes": self._MAX_SERIALIZED_CONFIG_NODES,
+                },
+            )
+
+    def _check_layer_module_references(
+        self,
+        layer: dict[str, Any],
+        result: ScanResult,
+        layer_name: str,
+        *,
+        config_fields: tuple[str, ...] = ("module", "fn_module"),
+        check_nested: bool = True,
+        nested_suppress_root_reference_keys: frozenset[str] = frozenset(),
+    ) -> None:
+        """Check H5 layer config for CVE-2025-1550 module references."""
+        layer_class = layer.get("class_name")
+        if not isinstance(layer_class, str) or "config" not in layer:
+            return
+
+        for key in ("module", "fn_module"):
+            layer_value = layer.get(key)
+            if isinstance(layer_value, str) and layer_value.strip():
+                self._check_config_module_reference(
+                    layer,
+                    key,
+                    layer_value.strip(),
+                    layer_class,
+                    result,
+                    layer_name,
+                )
+
+        layer_config = layer.get("config")
+        if not isinstance(layer_config, dict):
+            return
+
+        for key in config_fields:
+            config_value = layer_config.get(key)
+            if isinstance(config_value, str) and config_value.strip():
+                self._check_config_module_reference(
+                    layer_config,
+                    key,
+                    config_value.strip(),
+                    layer_class,
+                    result,
+                    layer_name,
+                )
+
+        if layer_class == "FlaxLayer":
+            self._check_nested_serialized_module_references(
+                layer_config.get("module"),
+                result,
+                layer_name,
+                trusted_container=True,
+            )
+
+        inbound_nodes = layer.get("inbound_nodes")
+        if isinstance(inbound_nodes, list):
+            for inbound_node in inbound_nodes:
+                if not isinstance(inbound_node, dict):
+                    continue
+                for key in ("args", "kwargs"):
+                    self._check_nested_serialized_module_references(
+                        inbound_node.get(key),
+                        result,
+                        layer_name,
+                        trusted_container=True,
+                    )
+
+        if check_nested:
+            self._check_nested_serialized_module_references(
+                layer_config,
+                result,
+                layer_name,
+                suppress_root_reference_keys=nested_suppress_root_reference_keys,
+            )
+
     def _check_lambda_layer(
         self,
         layer_config: dict[str, Any],
@@ -1298,7 +1923,7 @@ class KerasH5Scanner(BaseScanner):
         callback_details = {"layer_class": "Lambda", "callback_field": callback_field}
         encoded_function_handled = False
         function_requires_review = False
-        nested_callable_reference: tuple[Any, Any] | None = None
+        nested_callable_references: list[tuple[Any, Any]] = []
         if isinstance(function_str, dict):
             encoded_function_handled = check_lambda_dict_function(
                 function_str,
@@ -1306,24 +1931,23 @@ class KerasH5Scanner(BaseScanner):
                 self.current_file_path,
                 callback_layer_name,
             )
-            if not encoded_function_handled:
-                nested_callable_reference = self._lambda_callable_dict_reference(function_str)
-                if nested_callable_reference is None:
-                    function_requires_review = True
-                    result.add_check(
-                        name="Lambda Layer Code Analysis",
-                        passed=False,
-                        message="Lambda layer contains unrecognized dict-format function metadata",
-                        severity=IssueSeverity.WARNING,
-                        location=self.current_file_path,
-                        details={
-                            **callback_details,
-                            "function_format": "dict",
-                            "parse_status": "unrecognized",
-                        },
-                        why="Unrecognized Lambda function metadata cannot be safely classified.",
-                        rule_code="S507",
-                    )
+            nested_callable_references = self._lambda_callable_dict_references(function_str)
+            if not encoded_function_handled and not nested_callable_references:
+                function_requires_review = True
+                result.add_check(
+                    name="Lambda Layer Code Analysis",
+                    passed=False,
+                    message="Lambda layer contains unrecognized dict-format function metadata",
+                    severity=IssueSeverity.WARNING,
+                    location=self.current_file_path,
+                    details={
+                        **callback_details,
+                        "function_format": "dict",
+                        "parse_status": "unrecognized",
+                    },
+                    why="Unrecognized Lambda function metadata cannot be safely classified.",
+                    rule_code="S507",
+                )
         elif isinstance(function_str, list):
             encoded_function_handled = check_lambda_list_function(
                 function_str,
@@ -1431,8 +2055,7 @@ class KerasH5Scanner(BaseScanner):
         module_references: list[tuple[Any, Any, str]] = []
         if module_name is not None or reference_function_name is not None:
             module_references.append((module_name, reference_function_name, "layer_config"))
-        if nested_callable_reference is not None:
-            module_references.append((*nested_callable_reference, "function_dict"))
+        module_references.extend((*reference, "function_dict") for reference in nested_callable_references)
 
         allowlisted_references: list[tuple[str, str, str]] = []
         reference_requires_review = encoded_function_handled or function_requires_review
@@ -1542,14 +2165,21 @@ class KerasH5Scanner(BaseScanner):
         return layer_class == "Lambda" or layer_class in KerasH5Scanner._TRUSTED_LAMBDA_LAYER_CLASSES
 
     @staticmethod
-    def _lambda_callable_dict_reference(function_dict: dict[str, Any]) -> tuple[Any, Any] | None:
-        """Extract a module/function pair from a serialized callable dictionary."""
-        if "function_name" in function_dict:
-            return function_dict.get("module"), function_dict.get("function_name")
-        function_config = function_dict.get("config")
-        if "module" in function_dict and isinstance(function_config, str):
-            return function_dict.get("module"), function_config
-        return None
+    def _lambda_callable_dict_references(function_dict: dict[str, Any]) -> list[tuple[Any, Any]]:
+        """Extract every module/function pair that may drive callable lookup."""
+        if "module" not in function_dict:
+            return []
+
+        module_value = function_dict.get("module")
+        references: list[tuple[Any, Any]] = []
+        for function_key in ("function_name", "function", "config", "registered_name"):
+            if function_key not in function_dict:
+                continue
+            function_value = function_dict.get(function_key)
+            if any(type(existing) is type(function_value) and existing == function_value for _, existing in references):
+                continue
+            references.append((module_value, function_value))
+        return references
 
     @staticmethod
     def _is_vulnerable_to_cve_2024_3660(version: str) -> bool | None:
@@ -1839,6 +2469,34 @@ class KerasH5Scanner(BaseScanner):
 
         return normalized_term in value
 
+    @staticmethod
+    def _resolve_internal_hdf5_soft_link_group(root: Any, soft_link: Any) -> tuple[Any | None, bool]:
+        """Resolve a root SoftLink only through internal hard links."""
+        path = getattr(soft_link, "path", None)
+        if not isinstance(path, str) or not path:
+            return None, False
+
+        current = root
+        parts = [part for part in path.split("/") if part and part != "."]
+        if not parts or any(part == ".." for part in parts):
+            return None, False
+
+        for index, part in enumerate(parts):
+            link = current.get(part, getlink=True)
+            if isinstance(link, h5py.ExternalLink):
+                return None, True
+            if not isinstance(link, h5py.HardLink):
+                return None, False
+
+            obj = current.get(part, getlink=False)
+            if index == len(parts) - 1:
+                return (obj, False) if isinstance(obj, h5py.Group) else (None, False)
+            if not isinstance(obj, h5py.Group):
+                return None, False
+            current = obj
+
+        return (current, False) if isinstance(current, h5py.Group) else (None, False)
+
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         """Extract Keras H5 model metadata."""
         metadata = super().extract_metadata(file_path)
@@ -1851,12 +2509,13 @@ class KerasH5Scanner(BaseScanner):
 
         try:
             with h5py.File(file_path, "r") as h5_file:
+                model_weights_link = h5_file.get("model_weights", getlink=True)
                 # Basic H5 structure
                 metadata.update(
                     {
-                        "h5_keys": list(h5_file.keys()),
+                        "h5_keys": redact_evidence_value(list(h5_file.keys()), max_string_chars=200),
                         "has_model_config": "model_config" in h5_file.attrs,
-                        "has_model_weights": "model_weights" in h5_file,
+                        "has_model_weights": model_weights_link is not None,
                     }
                 )
 
@@ -1871,10 +2530,16 @@ class KerasH5Scanner(BaseScanner):
 
                         metadata.update(
                             {
-                                "model_class": config.get("class_name", "Unknown"),
-                                "keras_version": h5_file.attrs.get("keras_version", "unknown").decode("utf-8")
-                                if isinstance(h5_file.attrs.get("keras_version"), bytes)
-                                else h5_file.attrs.get("keras_version", "unknown"),
+                                "model_class": redact_evidence_value(
+                                    config.get("class_name", "Unknown"),
+                                    max_string_chars=200,
+                                ),
+                                "keras_version": redact_evidence_value(
+                                    h5_file.attrs.get("keras_version", "unknown").decode("utf-8")
+                                    if isinstance(h5_file.attrs.get("keras_version"), bytes)
+                                    else h5_file.attrs.get("keras_version", "unknown"),
+                                    max_string_chars=200,
+                                ),
                             }
                         )
 
@@ -1884,44 +2549,86 @@ class KerasH5Scanner(BaseScanner):
                             metadata.update(
                                 {
                                     "layer_count": len(layers),
-                                    "layer_types": list({layer.get("class_name", "Unknown") for layer in layers}),
+                                    "layer_types": redact_evidence_value(
+                                        list({layer.get("class_name", "Unknown") for layer in layers}),
+                                        max_string_chars=200,
+                                    ),
                                 }
                             )
 
-                # Analyze model weights structure
-                if "model_weights" in h5_file:
+                # Analyze model weights structure without resolving HDF5 external links.
+                if model_weights_link is not None:
                     with suppress(Exception):
-                        weights_group = h5_file["model_weights"]
+                        if isinstance(model_weights_link, h5py.ExternalLink):
+                            metadata["model_weights_external_reference"] = True
+                            return metadata
+
+                        if isinstance(model_weights_link, h5py.SoftLink):
+                            weights_group, points_to_external = self._resolve_internal_hdf5_soft_link_group(
+                                h5_file,
+                                model_weights_link,
+                            )
+                            if points_to_external:
+                                metadata["model_weights_external_reference"] = True
+                                return metadata
+                        else:
+                            weights_group = h5_file.get("model_weights", getlink=False)
+                        if not isinstance(weights_group, h5py.Group):
+                            if isinstance(model_weights_link, h5py.SoftLink):
+                                metadata["model_weights_internal_link_unresolved"] = True
+                            return metadata
+                        if isinstance(model_weights_link, h5py.SoftLink):
+                            metadata["model_weights_internal_link"] = True
 
                         # Count parameters
                         total_params = 0
                         weight_layers = []
+                        skipped_external_weight_entries = False
 
-                        def count_params(name, obj):
-                            nonlocal total_params
+                        def count_params(name: str, link: Any) -> None:
+                            nonlocal total_params, skipped_external_weight_entries
+                            if not isinstance(link, h5py.HardLink):
+                                skipped_external_weight_entries = True
+                                return
+                            obj = weights_group.get(name, getlink=False)
                             if isinstance(obj, h5py.Dataset):
+                                if obj.id.get_create_plist().get_external_count() > 0:
+                                    skipped_external_weight_entries = True
+                                    return
                                 param_count = obj.size
                                 total_params += param_count
                                 weight_layers.append(
                                     {
-                                        "name": name,
+                                        "name": redact_evidence_string(name, max_chars=200),
                                         "shape": list(obj.shape),
                                         "dtype": str(obj.dtype),
                                         "size": param_count,
                                     }
                                 )
 
-                        weights_group.visititems(count_params)
+                        visited_links, visits_truncated = self._visit_hdf5_links(
+                            weights_group,
+                            count_params,
+                            max_links=self._MAX_HDF5_LINK_VISITS,
+                        )
 
                         metadata.update(
                             {
                                 "total_parameters": total_params,
                                 "weight_layers": len(weight_layers),
-                                "parameter_details": weight_layers[:10],  # First 10 layers
+                                "parameter_details": redact_evidence_value(
+                                    weight_layers[:10],
+                                    max_string_chars=200,
+                                ),  # First 10 layers
+                                "weight_link_visits": visited_links,
                             }
                         )
+                        if skipped_external_weight_entries:
+                            metadata["external_weight_entries_skipped"] = True
+                        if visits_truncated:
+                            metadata["weight_link_visits_truncated"] = True
 
         except Exception as e:
-            metadata["extraction_error"] = str(e)
+            metadata["extraction_error"] = redact_untrusted_error_message(e)
 
         return metadata

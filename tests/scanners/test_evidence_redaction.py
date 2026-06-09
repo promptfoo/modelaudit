@@ -1403,6 +1403,32 @@ def test_preserves_values_when_redacted_mapping_keys_collide() -> None:
     assert secret not in json.dumps(redacted_value)
 
 
+def test_redacted_mapping_key_collision_allocation_is_linear() -> None:
+    """Collision allocation should not repeatedly scan prior suffixes."""
+
+    class CountingKeys(set[str]):
+        contains_calls = 0
+
+        def __contains__(self, key: object) -> bool:
+            self.contains_calls += 1
+            return super().__contains__(key)
+
+    existing_keys = CountingKeys()
+    next_occurrences: dict[str, int] = {}
+    key_count = 4_000
+
+    for _ in range(key_count):
+        redacted_key = evidence_redaction._unique_redacted_mapping_key(
+            existing_keys,
+            REDACTED_EVIDENCE_VALUE,
+            next_occurrences,
+        )
+        existing_keys.add(redacted_key)
+
+    assert len(existing_keys) == key_count
+    assert existing_keys.contains_calls < key_count * 3
+
+
 def test_case_variant_name_keys_cannot_bypass_value_redaction() -> None:
     """Every name/key alias must contribute to name-value sensitivity."""
     secret = "context-only-sensitive-value"
@@ -1416,6 +1442,42 @@ def test_case_variant_name_keys_cannot_bypass_value_redaction() -> None:
     )
 
     assert redacted_value["value"] == REDACTED_EVIDENCE_VALUE
+    assert secret not in json.dumps(redacted_value)
+
+
+@pytest.mark.parametrize(
+    "alias",
+    ["\uff2e\uff41\uff4d\uff45", "na\u200bme", "\uff2b\uff45\uff59", "ke\u200by"],
+)
+def test_unicode_name_key_aliases_cannot_bypass_value_redaction(alias: str) -> None:
+    secret = "unicode-context-only-sensitive-value"
+
+    redacted_value = redact_evidence_value({alias: "API_KEY", "value": secret})
+
+    assert redacted_value["value"] == REDACTED_EVIDENCE_VALUE
+    assert secret not in json.dumps(redacted_value)
+
+
+def test_unicode_sensitive_label_cannot_bypass_contextual_value_redaction() -> None:
+    secret = "unicode-sensitive-label-value"
+
+    redacted_value = redact_evidence_value(
+        {
+            "name": "\uff21\uff30\uff29\uff3f\uff2b\uff25\uff39",
+            "\uff56\uff41\uff4c\uff55\uff45": secret,
+        }
+    )
+
+    assert REDACTED_EVIDENCE_VALUE in redacted_value.values()
+    assert secret not in json.dumps(redacted_value)
+
+
+def test_unicode_sensitive_mapping_key_cannot_bypass_value_redaction() -> None:
+    secret = "unicode-sensitive-key-value"
+
+    redacted_value = redact_evidence_value({"\uff21\uff30\uff29\uff3f\uff2b\uff25\uff39": secret})
+
+    assert list(redacted_value.values()) == [REDACTED_EVIDENCE_VALUE]
     assert secret not in json.dumps(redacted_value)
 
 

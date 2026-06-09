@@ -35,7 +35,12 @@ from ..utils.file.hdf5 import (
     is_hdf5_signature_probe_complete,
 )
 from ._archive_config import get_archive_depth
-from ._evidence_redaction import redact_evidence_mapping_key, redact_evidence_string, redact_evidence_value
+from ._evidence_redaction import (
+    redact_evidence_mapping_key,
+    redact_evidence_string,
+    redact_evidence_value,
+    redact_untrusted_error_message,
+)
 from .archive_dispatch import (
     KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY,
     SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY,
@@ -199,10 +204,6 @@ _NESTED_SERIALIZED_OBJECT_KEYS = frozenset(
 # CVE-2025-8747: keras.utils.get_file used as gadget to download + execute files
 _GET_FILE_PATTERN = re.compile(r"get_file", re.IGNORECASE)
 _URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
-_ARCHIVE_EXTRACT_URL_PATTERN = re.compile(
-    r"\.(?:tar|tgz|tbz2|txz|tar\.gz|tar\.bz2|tar\.xz|tar\.zst|tar\.lz|tar\.lz4|tar\.lzma)(?:[?#]|$)",
-    re.IGNORECASE,
-)
 _URL_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 _KERAS_CONFIG_ENTRY = "config.json"
 _KERAS_CONFIG_MAX_BYTES = 10 * 1024 * 1024
@@ -222,6 +223,21 @@ def _has_get_file_reference(values: list[str]) -> bool:
     return False
 
 
+def _archive_format_may_extract_tar(value: Any) -> bool:
+    """Mirror Keras archive-format dispatch closely enough to identify tar extraction."""
+    if value == "auto" or value == "tar":
+        return True
+    if isinstance(value, str):
+        return False
+    if isinstance(value, (list, tuple, dict)):
+        for archive_type in value:
+            if archive_type == "tar":
+                return True
+            if archive_type != "zip":
+                return False
+    return False
+
+
 _KERAS_METADATA_ENTRY = "metadata.json"
 _KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
@@ -229,9 +245,6 @@ _HDF5_USERBLOCK_MAX_CONCATENATED_ZIP_SEGMENTS = 16
 _ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE = b"PK\x05\x06"
 _ZIP_END_OF_CENTRAL_DIRECTORY_FIXED_BYTES = 22
 _MAX_STRING_LITERAL_EXTRACTION_DEPTH = 100
-_KERAS_STRINGLOOKUP_EXTERNAL_VOCABULARY_INCONCLUSIVE_REASON = (
-    "keras_zip_stringlookup_external_vocabulary_metadata_inconclusive"
-)
 _KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*([0-9]+)\.([0-9]+)(?:\.([0-9]+))?([A-Za-z0-9.*+_-]*)\s*$")
 _KERAS_TORCHMODULE_VERSION_PATTERN = re.compile(
     r"^\s*[vV]?(?:([0-9]+)!)?([0-9]+(?:\.[0-9]+)*)"
@@ -750,6 +763,11 @@ class KerasZipScanner(BaseScanner):
                     raw_config_text = config_data.decode("utf-8", errors="ignore")
                     model_config = json.loads(config_data)
                 except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+                    redacted_error = (
+                        str(e)
+                        if type(e) is ValueError and str(e) == "ZIP member exceeds bounded read size"
+                        else redact_untrusted_error_message(e)
+                    )
                     self._mark_inconclusive_scan_result(result, "keras_zip_config_parse_failed")
                     # Fall back to a structure-aware raw scan only when the archive
                     # config is malformed and cannot be parsed as JSON.
@@ -758,11 +776,11 @@ class KerasZipScanner(BaseScanner):
                     result.add_check(
                         name="Config JSON Parsing",
                         passed=False,
-                        message=f"Failed to parse config.json: {e}",
+                        message=f"Failed to parse config.json: {redacted_error}",
                         severity=IssueSeverity.INFO,
                         location=f"{path}/{self._redact_archive_member_name(config_info.filename)}",
                         details={
-                            "error": str(e),
+                            "error": redacted_error,
                             "max_config_bytes": _KERAS_CONFIG_MAX_BYTES,
                         },
                     )
@@ -824,15 +842,16 @@ class KerasZipScanner(BaseScanner):
             result.finish(success=False)
             return result
         except OSError as e:
+            redacted_error = redact_untrusted_error_message(e)
             self._mark_inconclusive_scan_result(result, "keras_zip_read_failed")
             result.add_check(
                 name="Keras ZIP File Read",
                 passed=False,
-                message=f"Unable to read Keras ZIP content: {e!s}",
+                message=f"Unable to read Keras ZIP content: {redacted_error}",
                 severity=IssueSeverity.INFO,
                 location=path,
                 details={
-                    "exception": str(e),
+                    "exception": redacted_error,
                     "exception_type": type(e).__name__,
                     "analysis_incomplete": True,
                     "scan_outcome_reason": "keras_zip_read_failed",
@@ -842,15 +861,16 @@ class KerasZipScanner(BaseScanner):
             self._finish_scan_result(result)
             return result
         except Exception as e:
+            redacted_error = redact_untrusted_error_message(e)
             self._mark_inconclusive_scan_result(result, "keras_zip_scan_failed")
             result.add_check(
                 name="Keras ZIP File Scan",
                 passed=False,
-                message=f"Error scanning Keras ZIP file: {e!s}",
+                message=f"Error scanning Keras ZIP file: {redacted_error}",
                 severity=IssueSeverity.INFO,
                 location=path,
                 details={
-                    "exception": str(e),
+                    "exception": redacted_error,
                     "exception_type": type(e).__name__,
                     "analysis_incomplete": True,
                     "scan_outcome_reason": "keras_zip_scan_failed",
@@ -1114,6 +1134,7 @@ class KerasZipScanner(BaseScanner):
         # Count of each layer type
         layer_counts: dict[str, int] = {}
         layer_count_display_keys: dict[str, str] = {}
+        layer_count_next_occurrences: dict[str, int] = {}
 
         # Check each layer
         for i, layer in enumerate(layers):
@@ -1158,7 +1179,11 @@ class KerasZipScanner(BaseScanner):
             layer_count_key = layer_count_display_keys.get(layer_count_identity)
             if layer_count_key is None:
                 display_key = layer_class if isinstance(layer_class, str) else f"<invalid:{type(layer_class).__name__}>"
-                layer_count_key = redact_evidence_mapping_key(display_key, layer_counts)
+                layer_count_key = redact_evidence_mapping_key(
+                    display_key,
+                    layer_counts,
+                    next_occurrences=layer_count_next_occurrences,
+                )
                 layer_count_display_keys[layer_count_identity] = layer_count_key
             layer_counts[layer_count_key] = layer_counts.get(layer_count_key, 0) + 1
 
@@ -1265,14 +1290,15 @@ class KerasZipScanner(BaseScanner):
                     },
                 )
             elif layer_class in self.suspicious_layer_types:
+                redacted_layer_class = redact_evidence_string(layer_class)
                 result.add_check(
                     name="Suspicious Layer Type Detection",
                     passed=False,
-                    message=f"Suspicious layer type found: {layer_class}",
+                    message=f"Suspicious layer type found: {redacted_layer_class}",
                     severity=IssueSeverity.WARNING,
                     location=f"{self.current_file_path} (layer: {redacted_layer_name})",
                     details={
-                        "layer_class": layer_class,
+                        "layer_class": redacted_layer_class,
                         "layer_name": redacted_layer_name,
                         "description": self.suspicious_layer_types[layer_class],
                     },
@@ -1784,8 +1810,8 @@ class KerasZipScanner(BaseScanner):
                     "key": key,
                     "module": redacted_module_value,
                     "cve_id": "CVE-2025-1550",
-                    "cvss": 9.8,
-                    "cwe": "CWE-502",
+                    "cvss": 7.3,
+                    "cwe": "CWE-94",
                     "description": (
                         "Arbitrary dangerous module references in .keras config can bypass safe_mode "
                         "and execute attacker-controlled code during model loading."
@@ -1812,8 +1838,8 @@ class KerasZipScanner(BaseScanner):
                     "key": key,
                     "module": redacted_module_value,
                     "cve_id": "CVE-2025-1550",
-                    "cvss": 9.8,
-                    "cwe": "CWE-502",
+                    "cvss": 7.3,
+                    "cwe": "CWE-94",
                     "description": (
                         "Non-allowlisted callable module references may indicate safe_mode bypass "
                         "paths in untrusted .keras config content."
@@ -1996,38 +2022,31 @@ class KerasZipScanner(BaseScanner):
                 continue
 
             direct_string_values: list[str] = []
-            url_candidate_values: list[str] = []
-            for key, value in node.items():
+            for value in node.values():
                 direct_string_values.extend(self._extract_string_literals(value))
-                key_lower = str(key).lower()
-                if key_lower in {"url", "origin", "args", "kwargs"}:
-                    url_candidate_values.extend(self._extract_string_literals(value, include_dict_values=True))
 
             has_get_file = _has_get_file_reference(direct_string_values)
-            if not has_get_file or not self._node_has_get_file_extract_true(node):
-                continue
-
-            archive_urls = [
-                value
-                for value in url_candidate_values
-                if _URL_PATTERN.search(value) is not None and _ARCHIVE_EXTRACT_URL_PATTERN.search(value) is not None
-            ]
-            if not archive_urls:
+            origin = self._node_get_file_origin(node)
+            if (
+                not has_get_file
+                or not self._node_has_get_file_tar_extraction_semantics(node)
+                or origin is None
+                or _URL_PATTERN.match(origin.strip()) is None
+            ):
                 continue
 
             result.add_check(
                 name="CVE-2025-12060: get_file Archive Extraction Traversal",
                 passed=False,
                 message=(
-                    "CVE-2025-12060: config.json contains keras.utils.get_file with extract=True "
-                    "and a remote tar archive URL"
+                    "CVE-2025-12060: config.json contains keras.utils.get_file with remote tar extraction enabled"
                 ),
                 severity=IssueSeverity.CRITICAL,
                 location=f"{self.current_file_path}/config.json",
                 details={
                     "cve_id": "CVE-2025-12060",
                     "context": redact_evidence_string(context),
-                    "urls": [_redact_url_for_display(url) for url in archive_urls[:5]],
+                    "urls": [_redact_url_for_display(origin)],
                     "cvss": 8.8,
                     "cwe": "CWE-22",
                     "description": (
@@ -2044,21 +2063,52 @@ class KerasZipScanner(BaseScanner):
             return
 
     @staticmethod
-    def _node_has_get_file_extract_true(node: dict[str, Any]) -> bool:
-        """Return True only for direct get_file extract=True argument positions."""
-        if node.get("extract") is True:
-            return True
+    def _node_get_file_argument(node: dict[str, Any], name: str, position: int, default: Any) -> Any:
+        """Resolve one get_file argument from flattened, kwargs, or positional config forms."""
+        if name in node:
+            return node[name]
 
         kwargs = node.get("kwargs")
-        if isinstance(kwargs, dict) and kwargs.get("extract") is True:
-            return True
+        if isinstance(kwargs, dict) and name in kwargs:
+            return kwargs[name]
 
         args = node.get("args")
-        if isinstance(args, list | tuple):
-            # keras.utils.get_file positional args: fname, origin, untar, ..., extract.
-            return (len(args) > 2 and args[2] is True) or (len(args) > 7 and args[7] is True)
+        if isinstance(args, (list, tuple)) and len(args) > position:
+            return args[position]
 
-        return False
+        return default
+
+    @staticmethod
+    def _node_get_file_origin(node: dict[str, Any]) -> str | None:
+        """Return only the actual get_file origin argument, excluding other URL-valued fields."""
+        for container in (node, node.get("kwargs")):
+            if not isinstance(container, dict):
+                continue
+            for key in ("origin", "url"):
+                if key in container:
+                    value = container[key]
+                    return value if isinstance(value, str) else None
+
+        args = node.get("args")
+        if isinstance(args, (list, tuple)) and len(args) > 1:
+            value = args[1]
+            return value if isinstance(value, str) else None
+
+        return None
+
+    @staticmethod
+    def _node_has_get_file_tar_extraction_semantics(node: dict[str, Any]) -> bool:
+        """Return True when effective get_file arguments can extract a tar archive."""
+        untar = KerasZipScanner._node_get_file_argument(node, "untar", 2, False)
+        if bool(untar):
+            return True
+
+        extract = KerasZipScanner._node_get_file_argument(node, "extract", 7, False)
+        if not bool(extract):
+            return False
+
+        archive_format = KerasZipScanner._node_get_file_argument(node, "archive_format", 8, "auto")
+        return _archive_format_may_extract_tar(archive_format)
 
     def _check_unsafe_deserialization_bypass(self, model_config: Any, result: ScanResult) -> None:
         """Check for CVE-2025-9906: enable_unsafe_deserialization bypass in config.json.
@@ -2263,23 +2313,18 @@ class KerasZipScanner(BaseScanner):
         if vulnerability_status is False:
             details["keras_version"] = keras_version
             details["metadata_only_assessment"] = True
-            details["parse_status"] = "metadata_non_vulnerable"
-            details["analysis_incomplete"] = True
-            details["scan_outcome_reason"] = _KERAS_STRINGLOOKUP_EXTERNAL_VOCABULARY_INCONCLUSIVE_REASON
-            self._mark_inconclusive_scan_result(
-                result,
-                _KERAS_STRINGLOOKUP_EXTERNAL_VOCABULARY_INCONCLUSIVE_REASON,
-            )
+            details["parse_status"] = "untrusted_artifact_version"
+            details["version_source"] = "keras_archive_metadata"
             result.add_check(
-                name="StringLookup External Vocabulary Metadata Check",
+                name="StringLookup External Vocabulary Risk (Untrusted Version Metadata)",
                 passed=False,
                 message=(
                     f"StringLookup layer '{layer_name}' references external vocabulary path '{redacted_vocabulary}', "
-                    f"and archive metadata reports Keras {keras_version} outside the known CVE-2025-12058 "
-                    "vulnerable range (<3.12.0), but metadata-only assessment is inconclusive without runtime "
-                    "verification"
+                    f"and archive metadata claims Keras {keras_version} outside the known CVE-2025-12058 "
+                    "vulnerable range (<3.12.0), but artifact-controlled version metadata cannot prove the loader "
+                    "runtime is fixed"
                 ),
-                severity=IssueSeverity.INFO,
+                severity=IssueSeverity.WARNING,
                 location=location,
                 details=details,
                 why=get_cve_2025_12058_explanation("stringlookup_external_vocabulary"),

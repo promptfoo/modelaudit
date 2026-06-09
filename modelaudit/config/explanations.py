@@ -1074,24 +1074,24 @@ def get_cve_2025_12060_explanation(issue_type: str) -> str:
 
 
 def get_cve_2025_1550_explanation(issue_type: str) -> str:
-    """Get explanation for CVE-2025-1550: Keras safe_mode bypass via config.json module references.
+    """Get explanation for CVE-2025-1550: Keras safe_mode bypass via module references.
 
-    CVE-2025-1550 (CVSS 9.8 CRITICAL): Keras Model.load_model allows arbitrary code execution
-    even with safe_mode=True by specifying arbitrary Python modules/functions in config.json
-    inside .keras ZIP archives. Fixed in Keras 3.9.0.
+    CVE-2025-1550 (CVSS 7.3 HIGH): Keras Model.load_model allows arbitrary code execution
+    even with safe_mode=True by specifying arbitrary Python modules/functions in serialized model
+    configuration. Fixed in Keras 3.9.0.
     """
     explanations = {
         "dangerous_module": (
-            "CVE-2025-1550: The config.json inside this .keras archive references a dangerous "
+            "CVE-2025-1550: This Keras model artifact references a dangerous "
             "Python module (e.g., os, subprocess, builtins) in a layer's module or fn_module field. "
             "Keras versions < 3.9.0 import and execute these modules during Model.load_model even "
             "with safe_mode=True, enabling arbitrary code execution. "
             "Upgrade to Keras >= 3.9.0 and re-save models from trusted sources only."
         ),
         "untrusted_module": (
-            "CVE-2025-1550: The config.json inside this .keras archive references a Python module "
+            "CVE-2025-1550: This Keras model artifact references a Python module "
             "outside the standard Keras/TensorFlow ecosystem in a layer's module or fn_module field. "
-            "Keras versions < 3.9.0 do not restrict which modules can be referenced in config.json, "
+            "Keras versions < 3.9.0 do not restrict which modules can be referenced in serialized model configuration, "
             "allowing safe_mode bypass. While this module may be benign, verify it is not being used "
             "to execute arbitrary code. Upgrade to Keras >= 3.9.0."
         ),
@@ -1100,7 +1100,7 @@ def get_cve_2025_1550_explanation(issue_type: str) -> str:
     return _get_explanation_with_default(
         explanations,
         issue_type,
-        "CVE-2025-1550: Keras config.json module references may bypass safe_mode. Upgrade to Keras >= 3.9.0.",
+        "CVE-2025-1550: Keras model configuration module references may bypass safe_mode. Upgrade to Keras >= 3.9.0.",
     )
 
 

@@ -2,6 +2,7 @@ import base64
 import builtins
 import hashlib
 import io
+import logging
 import pickle
 import shutil
 from pathlib import Path
@@ -12,7 +13,7 @@ import pytest
 import modelaudit.scanners.tf_savedmodel_scanner as tf_savedmodel_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as has_tf_protos
 
@@ -102,8 +103,10 @@ def test_tf_savedmodel_read_failure_is_inconclusive_not_security_finding(
 ) -> None:
     path = _create_test_savedmodel_with_op(tmp_path, "Const", "unreadable_model")
 
+    raw_secret = "ATTACKER_CONTROLLED_SAVEDMODEL_READ_FAILURE"
+
     def raise_os_error(*_args: object, **_kwargs: object) -> None:
-        raise OSError("simulated SavedModel read failure")
+        raise OSError(raw_secret)
 
     monkeypatch.setattr(
         tf_savedmodel_module.TensorFlowSavedModelScanner, "can_handle", classmethod(lambda _cls, _path: True)
@@ -122,6 +125,9 @@ def test_tf_savedmodel_read_failure_is_inconclusive_not_security_finding(
     assert read_checks[0].severity == IssueSeverity.INFO
     assert read_checks[0].details["analysis_incomplete"] is True
     assert read_checks[0].details["scan_outcome_reason"] == "savedmodel_read_failed"
+    assert read_checks[0].details["exception"] == "<redacted>"
+    assert "<redacted>" in read_checks[0].message
+    assert raw_secret not in direct.to_json()
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert direct.metadata["operational_error_reason"] == "savedmodel_read_failed"
     assert "savedmodel_read_failed" in direct.metadata["scan_outcome_reasons"]
@@ -136,6 +142,42 @@ def test_tf_savedmodel_read_failure_is_inconclusive_not_security_finding(
         issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]
     assert determine_exit_code(aggregate) == 2
+
+
+def test_savedmodel_keras_metadata_failure_redacts_exception() -> None:
+    raw_secret = "ATTACKER_CONTROLLED_KERAS_METADATA_FAILURE"
+    result = ScanResult(scanner_name="tf_savedmodel")
+
+    tf_savedmodel_module.TensorFlowSavedModelScanner._mark_keras_metadata_scan_failure(
+        result,
+        "keras_metadata.pb",
+        ValueError(raw_secret),
+    )
+
+    failure_checks = [check for check in result.checks if check.name == "Keras Metadata Parsing"]
+    assert failure_checks
+    assert failure_checks[0].details["exception"] == "<redacted>"
+    assert "<redacted>" in failure_checks[0].message
+    assert raw_secret not in result.to_json()
+
+
+def test_savedmodel_graph_iteration_warning_redacts_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw_secret = "ATTACKER_CONTROLLED_GRAPH_ITERATION_FAILURE"
+    scanner = tf_savedmodel_module.TensorFlowSavedModelScanner()
+
+    def fail_iteration(_saved_model: object) -> Any:
+        raise RuntimeError(raw_secret)
+
+    monkeypatch.setattr(scanner, "_iter_saved_model_node_contexts", fail_iteration)
+
+    with caplog.at_level(logging.WARNING, logger=tf_savedmodel_module.__name__):
+        assert scanner._scan_tf_operations(object()) == []
+
+    assert "Failed to iterate TensorFlow graph: <redacted>" in caplog.text
+    assert raw_secret not in caplog.text
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
@@ -2244,6 +2286,30 @@ def test_keras_metadata_code_preview_redacts_sensitive_values(tmp_path: Path) ->
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_keras_metadata_decode_error_redacts_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_secret = "ATTACKER_CONTROLLED_KERAS_DECODE_FAILURE"
+    metadata_path = tmp_path / "keras_metadata.pb"
+    metadata_path.write_bytes(b'"class_name": "Lambda", "function": {"items": ["AAAA"]}')
+
+    def fail_decode(_value: str) -> bytes:
+        raise ValueError(raw_secret)
+
+    monkeypatch.setattr(tf_savedmodel_module.base64, "b64decode", fail_decode)
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
+    decode_checks = [
+        check for check in result.checks if check.name == "Lambda Layer Detection" and "decode_error" in check.details
+    ]
+
+    assert decode_checks
+    assert decode_checks[0].details["decode_error"] == "<redacted>"
+    assert raw_secret not in result.to_json()
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_scan_keras_metadata_pb_lambda_exec_sets_success_false(tmp_path: Path) -> None:
     """Standalone `keras_metadata.pb` scans should propagate CRITICAL Lambda findings to success=False."""
     encoded_code = base64.b64encode(b'exec("print(1)")').decode()
@@ -2540,6 +2606,33 @@ def test_savedmodel_asset_symlink_is_not_followed_by_blacklist_scan(
     assert asset_issues
     assert any(issue.details.get("asset_kind") == "symlink" for issue in asset_issues)
     assert all("blacklisted pattern" not in issue.message.lower() for issue in asset_issues)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_asset_directory_stat_error_redacts_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_secret = "ATTACKER_CONTROLLED_ASSET_STAT_FAILURE"
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    assets_dir = model_dir / "assets"
+    assets_dir.mkdir(exist_ok=True)
+    real_lstat = Path.lstat
+
+    def fail_assets_lstat(path: Path) -> Any:
+        if path == assets_dir:
+            raise OSError(raw_secret)
+        return real_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", fail_assets_lstat)
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
+    stat_issues = [issue for issue in result.issues if issue.details.get("asset_kind") == "stat_error"]
+
+    assert stat_issues
+    assert stat_issues[0].details["exception"] == "<redacted>"
+    assert "<redacted>" in stat_issues[0].message
+    assert raw_secret not in result.to_json()
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")

@@ -3396,11 +3396,12 @@ def _strip_bracket_suffixes(key: str) -> str:
 
 
 def _canonicalize_detail_key(key: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", _strip_bracket_suffixes(key).lower())
+    normalized_key = unicodedata.normalize("NFKC", key).casefold()
+    return re.sub(r"[^a-z0-9]+", "", _strip_bracket_suffixes(normalized_key))
 
 
 def _is_sensitive_detail_key(key: str) -> bool:
-    normalized = _strip_bracket_suffixes(key).lower()
+    normalized = _strip_bracket_suffixes(unicodedata.normalize("NFKC", key).casefold())
     canonical = _canonicalize_detail_key(key)
     return (
         normalized in SENSITIVE_QUERY_KEYS
@@ -3428,13 +3429,21 @@ def is_sensitive_evidence_key(key: str) -> bool:
     )
 
 
-def _unique_redacted_mapping_key(existing_keys: Collection[object], redacted_key: str) -> str:
+def _unique_redacted_mapping_key(
+    existing_keys: Collection[object],
+    redacted_key: str,
+    next_occurrences: dict[str, int] | None = None,
+) -> str:
     if redacted_key not in existing_keys:
+        if next_occurrences is not None:
+            next_occurrences.setdefault(redacted_key, 2)
         return redacted_key
 
-    occurrence = 2
+    occurrence = next_occurrences.get(redacted_key, 2) if next_occurrences is not None else 2
     while f"{redacted_key}[{occurrence}]" in existing_keys:
         occurrence += 1
+    if next_occurrences is not None:
+        next_occurrences[redacted_key] = occurrence + 1
     return f"{redacted_key}[{occurrence}]"
 
 
@@ -3442,6 +3451,8 @@ def redact_evidence_mapping_key(
     key: object,
     existing_keys: Collection[object],
     max_string_chars: int = 180,
+    *,
+    next_occurrences: dict[str, int] | None = None,
 ) -> str:
     """Return a redacted mapping key without overwriting existing evidence."""
     redacted_key = (
@@ -3449,7 +3460,11 @@ def redact_evidence_mapping_key(
         if isinstance(key, str)
         else f"<{type(key).__name__}-key>"
     )
-    return _unique_redacted_mapping_key(existing_keys, redacted_key)
+    return _unique_redacted_mapping_key(existing_keys, redacted_key, next_occurrences)
+
+
+def _is_name_or_key_alias(key: str) -> bool:
+    return _canonicalize_detail_key(key) in {"key", "name"}
 
 
 def redact_evidence_value(value: Any, max_string_chars: int = 180, *, _depth: int = 0) -> Any:
@@ -3462,16 +3477,21 @@ def redact_evidence_value(value: Any, max_string_chars: int = 180, *, _depth: in
         return redact_evidence_string(repr(value), max_chars=max_string_chars)
     if isinstance(value, dict):
         redacted_items: dict[Any, Any] = {}
+        next_key_occurrences: dict[str, int] = {}
         sensitive_name_value_pair = any(
             isinstance(key, str)
-            and key.lower() in {"name", "key"}
+            and _is_name_or_key_alias(key)
             and isinstance(child, str)
             and _is_sensitive_detail_key(child)
             for key, child in value.items()
         )
         for key, child in value.items():
             if not isinstance(key, str):
-                redacted_key = redact_evidence_mapping_key(key, redacted_items)
+                redacted_key = redact_evidence_mapping_key(
+                    key,
+                    redacted_items,
+                    next_occurrences=next_key_occurrences,
+                )
                 redacted_items[redacted_key] = redact_evidence_value(
                     child,
                     max_string_chars=max_string_chars,
@@ -3479,8 +3499,15 @@ def redact_evidence_value(value: Any, max_string_chars: int = 180, *, _depth: in
                 )
                 continue
 
-            redacted_key = redact_evidence_mapping_key(key, redacted_items, max_string_chars)
-            if _is_sensitive_detail_key(key) or (sensitive_name_value_pair and key.lower() == "value"):
+            redacted_key = redact_evidence_mapping_key(
+                key,
+                redacted_items,
+                max_string_chars,
+                next_occurrences=next_key_occurrences,
+            )
+            if _is_sensitive_detail_key(key) or (
+                sensitive_name_value_pair and _canonicalize_detail_key(key) == "value"
+            ):
                 redacted_items[redacted_key] = REDACTED_EVIDENCE_VALUE
             else:
                 redacted_items[redacted_key] = redact_evidence_value(
