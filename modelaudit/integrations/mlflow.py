@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 from ..detectors.network_comm import _redact_urls_in_text
 from ..models import Check, CheckStatus, Issue, IssueSeverity, ModelAuditResultModel, create_initial_audit_result
@@ -28,9 +28,27 @@ from ..utils.sources.cloud_storage import redact_cloud_error_for_display, redact
 logger = logging.getLogger(__name__)
 
 _MLFLOW_DOWNLOAD_BUDGET_CHECK = "MLflow Download Size Check"
+_MLFLOW_ARTIFACT_TRUST_CHECK = "MLflow Artifact Trust Check"
+_MLFLOW_ARTIFACT_TRUST_FAILURE_TYPE = "mlflow_artifact_trust"
+_MLFLOW_ALLOWED_ARTIFACT_URIS_ENV = "MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS"
 _DEFAULT_MLFLOW_MAX_ARTIFACT_ENTRIES = 10000
 _MAX_MLFLOW_ERROR_DISPLAY_CHARS = 512
 _MLFLOW_COPY_CHUNK_SIZE = 1024 * 1024
+_MLFLOW_DEFAULT_URI_PORTS = {"ftp": 21, "http": 80, "https": 443, "sftp": 22}
+_MLFLOW_URI_SCHEMES_REQUIRING_AUTHORITY = {
+    "abfss",
+    "b2",
+    "ftp",
+    "gs",
+    "http",
+    "https",
+    "mlflow-artifacts",
+    "r2",
+    "s3",
+    "sftp",
+    "wasbs",
+}
+_MLFLOW_PERCENT_ESCAPE_RE = re.compile(r"%[0-9A-Fa-f]{2}")
 _OS_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 _IS_WINDOWS = os.name == "nt"
 _MLFLOW_SENSITIVE_KEY = rf"(?:{SENSITIVE_CONTAINER_KEY}|credentials?|jwt|session)"
@@ -92,6 +110,19 @@ class _MlflowDownloadPlan:
     artifact_path: str | None
     max_artifact_entries: int
     local_sources: tuple[_MlflowLocalSource, ...] = ()
+
+
+@dataclass(frozen=True)
+class _MlflowDelegatedDownloadTarget:
+    artifact_repository: Any
+    artifact_path: str | None
+    destination_subdirectory: str | None = None
+
+
+@dataclass(frozen=True)
+class _MlflowDelegatedDownloadPlan:
+    targets: tuple[_MlflowDelegatedDownloadTarget, ...]
+    local_plan: _MlflowDownloadPlan | None = None
 
 
 class _MlflowArtifactSizeChangedError(Exception):
@@ -194,6 +225,397 @@ def _mlflow_budget_failure_result(model_uri: str, message: str, details: dict[st
     )
     result.finalize_statistics()
     return result
+
+
+def _mlflow_artifact_trust_failure_result(
+    model_uri: str,
+    message: str,
+    details: dict[str, Any],
+) -> ModelAuditResultModel:
+    result = create_initial_audit_result()
+    result.scanner_names = ["mlflow"]
+    result.has_errors = True
+    result.success = False
+    safe_model_uri = redact_evidence_string(model_uri, max_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
+    safe_details = redact_evidence_value(details, max_string_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
+
+    why = (
+        "ModelAudit requires non-local MLflow artifact repositories to match a local allowlist before delegating "
+        "artifact retrieval to MLflow. Refusing the download avoids fetching from an unapproved registry-controlled "
+        "artifact store before scanners run."
+    )
+    result.checks.append(
+        Check(
+            name=_MLFLOW_ARTIFACT_TRUST_CHECK,
+            status=CheckStatus.FAILED,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=safe_model_uri,
+            details=safe_details,
+            why=why,
+        )
+    )
+    result.issues.append(
+        Issue(
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=safe_model_uri,
+            details=safe_details,
+            why=why,
+            type=_MLFLOW_ARTIFACT_TRUST_FAILURE_TYPE,
+        )
+    )
+    result.finalize_statistics()
+    return result
+
+
+def _configured_mlflow_artifact_uri_prefixes() -> tuple[str, ...]:
+    raw_prefixes = os.getenv(_MLFLOW_ALLOWED_ARTIFACT_URIS_ENV, "")
+    return tuple(prefix for prefix in (value.strip() for value in raw_prefixes.split(",")) if prefix)
+
+
+def _uri_path_is_within_prefix(path: str, prefix: str) -> bool:
+    if prefix in {"", "/"}:
+        return True
+    normalized_prefix = prefix.removesuffix("/")
+    normalized_path = path.removesuffix("/")
+    return normalized_path == normalized_prefix or normalized_path.startswith(f"{normalized_prefix}/")
+
+
+def _strictly_decode_mlflow_uri_path(path: str) -> str | None:
+    index = 0
+    while index < len(path):
+        if path[index] != "%":
+            index += 1
+            continue
+        if index + 2 >= len(path) or not all(
+            character in "0123456789abcdefABCDEF" for character in path[index + 1 : index + 3]
+        ):
+            return None
+        index += 3
+
+    try:
+        decoded_path = unquote(path, errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if "\x00" in decoded_path or "\\" in decoded_path:
+        return None
+    if _MLFLOW_PERCENT_ESCAPE_RE.search(decoded_path):
+        return None
+    if any(segment in {".", ".."} for segment in decoded_path.split("/")):
+        return None
+    return decoded_path
+
+
+def _strictly_validate_mlflow_remote_uri_path(path: str) -> str | None:
+    if "%" in path or "\x00" in path or "\\" in path:
+        return None
+    if any(segment in {".", ".."} for segment in path.split("/")):
+        return None
+    return path
+
+
+def _normalized_mlflow_uri_authority(
+    parsed_uri: Any, scheme: str
+) -> tuple[str | None, str | None, str | None, int | None] | None:
+    if not parsed_uri.netloc:
+        if scheme in _MLFLOW_URI_SCHEMES_REQUIRING_AUTHORITY:
+            return None
+        return (None, None, None, None)
+    try:
+        hostname = parsed_uri.hostname
+        port = parsed_uri.port
+    except ValueError:
+        return None
+    if not hostname:
+        return None
+    if port is None:
+        port = _MLFLOW_DEFAULT_URI_PORTS.get(scheme)
+    return (
+        parsed_uri.username,
+        parsed_uri.password,
+        hostname.lower().rstrip("."),
+        port,
+    )
+
+
+def _local_path_from_mlflow_artifact_uri(uri: str) -> Path | None:
+    try:
+        parsed = urlparse(uri)
+    except ValueError:
+        return None
+    if parsed.scheme and parsed.scheme != "file":
+        return None
+
+    if parsed.scheme == "file":
+        if parsed.query or parsed.fragment:
+            return None
+        netloc = parsed.netloc
+        if netloc and netloc.lower() not in {"localhost", "127.0.0.1", "::1"}:
+            return None
+        path = _strictly_decode_mlflow_uri_path(parsed.path)
+        if path is None:
+            return None
+    else:
+        path = uri
+
+    try:
+        return Path(path).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _mlflow_artifact_uri_matches_prefix(artifact_uri: str, allowed_prefix: str) -> bool:
+    artifact_path = _local_path_from_mlflow_artifact_uri(artifact_uri)
+    prefix_path = _local_path_from_mlflow_artifact_uri(allowed_prefix)
+    if artifact_path is not None and prefix_path is not None:
+        try:
+            return os.path.commonpath((prefix_path, artifact_path)) == str(prefix_path)
+        except ValueError:
+            return False
+
+    try:
+        artifact = urlparse(artifact_uri)
+        prefix = urlparse(allowed_prefix)
+    except ValueError:
+        return False
+    if not artifact.scheme or not prefix.scheme:
+        return False
+    if artifact.query or artifact.fragment or prefix.query or prefix.fragment:
+        return False
+    artifact_scheme = artifact.scheme.lower()
+    prefix_scheme = prefix.scheme.lower()
+    if artifact_scheme != prefix_scheme:
+        return False
+    if artifact_scheme in {"file", "models", "runs"}:
+        return False
+    artifact_authority = _normalized_mlflow_uri_authority(artifact, artifact_scheme)
+    prefix_authority = _normalized_mlflow_uri_authority(prefix, prefix_scheme)
+    if artifact_authority is None or prefix_authority is None or artifact_authority != prefix_authority:
+        return False
+    normalized_artifact_path = _strictly_validate_mlflow_remote_uri_path(artifact.path)
+    normalized_prefix_path = _strictly_validate_mlflow_remote_uri_path(prefix.path)
+    if normalized_artifact_path is None or normalized_prefix_path is None:
+        return False
+    return _uri_path_is_within_prefix(normalized_artifact_path, normalized_prefix_path)
+
+
+def _mlflow_artifact_uri_is_allowlisted(artifact_uri: str) -> bool:
+    return any(
+        _mlflow_artifact_uri_matches_prefix(artifact_uri, allowed_prefix)
+        for allowed_prefix in _configured_mlflow_artifact_uri_prefixes()
+    )
+
+
+def _normalize_mlflow_delegated_artifact_path(artifact_path: str | None) -> str | None:
+    if artifact_path is None:
+        return None
+    validated_path = _strictly_validate_mlflow_remote_uri_path(artifact_path)
+    if validated_path is None:
+        raise ValueError("MLflow artifact path is ambiguous")
+    if not validated_path or posixpath.isabs(validated_path) or ntpath.isabs(validated_path):
+        raise ValueError("MLflow artifact path is not relative")
+    return validated_path
+
+
+def _mlflow_delegated_download_targets(
+    artifact_repository: Any,
+    artifact_path: str | None,
+) -> tuple[_MlflowDelegatedDownloadTarget, ...] | None:
+    repository = _terminal_mlflow_artifact_repository(artifact_repository)
+    if repository is None:
+        return None
+    if not _is_runs_mlflow_artifact_repository(repository):
+        try:
+            normalized_artifact_path = _normalize_mlflow_delegated_artifact_path(artifact_path)
+        except ValueError:
+            return None
+        return (_MlflowDelegatedDownloadTarget(repository, normalized_artifact_path),)
+
+    run_repository = _terminal_mlflow_artifact_repository(getattr(repository, "repo", None))
+    if run_repository is None:
+        return None
+    wrapper_uri = getattr(repository, "artifact_uri", None)
+    parse_runs_uri = getattr(repository, "parse_runs_uri", None)
+    get_logged_model_repository = getattr(repository, "_get_logged_model_artifact_repo", None)
+    if not isinstance(wrapper_uri, str) or not callable(parse_runs_uri):
+        return None
+    try:
+        run_id, wrapper_path = parse_runs_uri(wrapper_uri)
+    except Exception:
+        return None
+    try:
+        normalized_wrapper_path = _normalize_mlflow_delegated_artifact_path(wrapper_path)
+        normalized_artifact_path = _normalize_mlflow_delegated_artifact_path(artifact_path)
+    except ValueError:
+        return None
+    if any("//" in path for path in (normalized_wrapper_path, normalized_artifact_path) if path is not None):
+        return None
+    effective_path = (
+        posixpath.join(normalized_wrapper_path, normalized_artifact_path)
+        if normalized_wrapper_path and normalized_artifact_path
+        else normalized_wrapper_path or normalized_artifact_path
+    )
+    run_artifact_path = normalized_artifact_path
+    if normalized_wrapper_path and effective_path:
+        repository_is_scoped = _runs_mlflow_repository_is_scoped(repository, run_repository, wrapper_uri)
+        if repository_is_scoped is None:
+            return None
+        if not repository_is_scoped:
+            run_artifact_path = effective_path
+    targets = [_MlflowDelegatedDownloadTarget(run_repository, run_artifact_path)]
+    if not effective_path:
+        return tuple(targets)
+    if not callable(get_logged_model_repository):
+        return None
+
+    model_name = effective_path.split("/", 1)[0]
+    try:
+        logged_model_repository = get_logged_model_repository(run_id=run_id, name=model_name)
+    except Exception:
+        return None
+    if logged_model_repository is not None:
+        terminal_logged_repository = _terminal_mlflow_artifact_repository(logged_model_repository)
+        if terminal_logged_repository is None:
+            return None
+        model_name, separator, model_artifact_path = effective_path.partition("/")
+        targets.append(
+            _MlflowDelegatedDownloadTarget(
+                terminal_logged_repository,
+                model_artifact_path if separator and model_artifact_path else None,
+                model_name,
+            )
+        )
+    return tuple(targets)
+
+
+def _mlflow_artifact_repository_uris(
+    targets: tuple[_MlflowDelegatedDownloadTarget, ...],
+) -> tuple[str, ...] | None:
+    artifact_uris: list[str] = []
+    for target in targets:
+        repository = target.artifact_repository
+        if _local_mlflow_artifact_root(repository) is not None:
+            continue
+        artifact_uri = getattr(repository, "artifact_uri", None)
+        if not isinstance(artifact_uri, str) or not artifact_uri:
+            return None
+        try:
+            parsed_artifact_uri = urlparse(artifact_uri)
+            artifact_scheme = parsed_artifact_uri.scheme.lower()
+        except ValueError:
+            return None
+        if artifact_scheme in {"", "file"}:
+            return None
+        if target.artifact_path:
+            separator = "" if parsed_artifact_uri.path.endswith("/") else "/"
+            artifact_uri = parsed_artifact_uri._replace(
+                path=f"{parsed_artifact_uri.path}{separator}{target.artifact_path}"
+            ).geturl()
+        if artifact_uri not in artifact_uris:
+            artifact_uris.append(artifact_uri)
+    return tuple(artifact_uris)
+
+
+def _partition_mlflow_delegated_targets(
+    targets: tuple[_MlflowDelegatedDownloadTarget, ...],
+) -> tuple[tuple[_MlflowDelegatedDownloadTarget, ...], tuple[_MlflowLocalSource, ...]] | None:
+    remote_targets: list[_MlflowDelegatedDownloadTarget] = []
+    local_sources: list[_MlflowLocalSource] = []
+    for target in targets:
+        local_root = _local_mlflow_artifact_root(target.artifact_repository)
+        if local_root is None:
+            remote_targets.append(target)
+            continue
+        if remote_targets:
+            return None
+        local_sources.append(
+            _MlflowLocalSource(
+                local_root,
+                target.artifact_path,
+                target.destination_subdirectory,
+            )
+        )
+    return tuple(remote_targets), tuple(local_sources)
+
+
+def _unbounded_mlflow_download_policy_result(
+    model_uri: str,
+    details: dict[str, Any],
+    targets: tuple[_MlflowDelegatedDownloadTarget, ...] | None,
+) -> ModelAuditResultModel | None:
+    artifact_uris = _mlflow_artifact_repository_uris(targets) if targets is not None else None
+    untrusted_artifact_uris = (
+        [artifact_uri for artifact_uri in artifact_uris if not _mlflow_artifact_uri_is_allowlisted(artifact_uri)]
+        if artifact_uris is not None
+        else []
+    )
+    if artifact_uris is not None and not untrusted_artifact_uris:
+        return None
+
+    artifact_uri = untrusted_artifact_uris[0] if untrusted_artifact_uris else None
+    if artifact_uri is None and targets:
+        candidate_uri = getattr(targets[0].artifact_repository, "artifact_uri", None)
+        artifact_uri = candidate_uri if isinstance(candidate_uri, str) and candidate_uri else None
+    details.update(
+        {
+            "reason": "artifact_uri_not_allowlisted",
+            "artifact_repository_uri": artifact_uri,
+            "artifact_repository_uris": list(artifact_uris) if artifact_uris is not None else None,
+            "allowlist_env_var": _MLFLOW_ALLOWED_ARTIFACT_URIS_ENV,
+        }
+    )
+    return _mlflow_artifact_trust_failure_result(
+        model_uri,
+        "MLflow artifact repository is not in the configured allowlist",
+        details,
+    )
+
+
+def _trusted_mlflow_delegated_download_plan(
+    model_uri: str,
+    root_uri: str,
+    details: dict[str, Any],
+    artifact_repository: Any,
+    *,
+    max_file_size: int,
+    max_total_size: int,
+    max_artifact_entries: int,
+) -> _MlflowDelegatedDownloadPlan | ModelAuditResultModel:
+    targets = _mlflow_delegated_download_targets(artifact_repository, details.get("artifact_path"))
+    if targets is None:
+        return _mlflow_artifact_trust_failure_result(
+            model_uri,
+            "Unable to verify the MLflow artifact repository before download",
+            details,
+        )
+    partitioned_targets = _partition_mlflow_delegated_targets(targets)
+    if partitioned_targets is None:
+        return _mlflow_artifact_trust_failure_result(
+            model_uri,
+            "Unable to safely compose remote MLflow artifacts before a local overlay",
+            details,
+        )
+    remote_targets, local_sources = partitioned_targets
+    policy_failure = _unbounded_mlflow_download_policy_result(model_uri, details, remote_targets)
+    if policy_failure is not None:
+        return policy_failure
+
+    local_plan: _MlflowDownloadPlan | None = None
+    if local_sources:
+        local_plan_result = _preflight_local_mlflow_sources(
+            model_uri,
+            root_uri,
+            local_sources,
+            details,
+            max_file_size=max_file_size,
+            max_total_size=max_total_size,
+            max_artifact_entries=max_artifact_entries,
+        )
+        if isinstance(local_plan_result, ModelAuditResultModel):
+            return local_plan_result
+        local_plan = local_plan_result
+    return _MlflowDelegatedDownloadPlan(remote_targets, local_plan)
 
 
 def _redact_mlflow_error_for_display(error: object) -> str:
@@ -380,8 +802,30 @@ def _local_mlflow_artifact_root(artifact_repository: Any) -> Path | None:
     if not isinstance(repository, LocalArtifactRepository):
         return None
 
+    artifact_uri = getattr(repository, "artifact_uri", None)
+    if isinstance(artifact_uri, str):
+        try:
+            parsed_artifact_uri = urlparse(artifact_uri)
+        except ValueError:
+            return None
+        if parsed_artifact_uri.scheme == "file" and parsed_artifact_uri.netloc.lower() not in {
+            "",
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        }:
+            return None
+        if not parsed_artifact_uri.scheme and artifact_uri.startswith(("//", "\\\\")):
+            return None
+
     try:
-        artifact_root = Path(repository.artifact_dir).expanduser().resolve(strict=True)
+        raw_artifact_dir = os.fspath(repository.artifact_dir)
+    except TypeError:
+        return None
+    if raw_artifact_dir.startswith(("//", "\\\\")):
+        return None
+    try:
+        artifact_root = Path(raw_artifact_dir).expanduser().resolve(strict=True)
     except (OSError, TypeError, ValueError):
         return None
     return artifact_root if artifact_root.is_dir() else None
@@ -453,8 +897,8 @@ def _local_runs_mlflow_sources(
     try:
         logged_model_repository = get_logged_model_repository(run_id=run_id, name=model_name)
     except Exception:
-        logger.debug("MLflow logged-model lookup failed; continuing with bounded local run artifacts")
-        return tuple(sources)
+        logger.debug("MLflow logged-model lookup failed; refusing an incomplete run artifact view")
+        return None
     if logged_model_repository is None:
         return tuple(sources)
 
@@ -903,10 +1347,8 @@ def _preflight_mlflow_download_budget(
     max_file_size: int,
     max_total_size: int,
     max_artifact_entries: int,
-) -> _MlflowDownloadPlan | ModelAuditResultModel | None:
-    if not _finite_budget(max_file_size, max_total_size):
-        return None
-
+) -> _MlflowDownloadPlan | _MlflowDelegatedDownloadPlan | ModelAuditResultModel:
+    has_finite_budget = _finite_budget(max_file_size, max_total_size)
     root_uri, initial_artifact_path = _split_mlflow_artifact_uri(mlflow_module, model_uri)
     details: dict[str, Any] = {
         "model_uri": model_uri,
@@ -946,6 +1388,16 @@ def _preflight_mlflow_download_budget(
                 details,
             )
         if local_sources is None:
+            if not has_finite_budget:
+                return _trusted_mlflow_delegated_download_plan(
+                    model_uri,
+                    root_uri,
+                    details,
+                    artifact_repository,
+                    max_file_size=max_file_size,
+                    max_total_size=max_total_size,
+                    max_artifact_entries=max_artifact_entries,
+                )
             details["reason"] = "artifact_streaming_budget_unavailable"
             return _mlflow_budget_failure_result(
                 model_uri,
@@ -964,6 +1416,16 @@ def _preflight_mlflow_download_budget(
 
     local_artifact_root = _local_mlflow_artifact_root(artifact_repository)
     if local_artifact_root is None:
+        if not has_finite_budget:
+            return _trusted_mlflow_delegated_download_plan(
+                model_uri,
+                root_uri,
+                details,
+                artifact_repository,
+                max_file_size=max_file_size,
+                max_total_size=max_total_size,
+                max_artifact_entries=max_artifact_entries,
+            )
         details["reason"] = "artifact_streaming_budget_unavailable"
         return _mlflow_budget_failure_result(
             model_uri,
@@ -1376,6 +1838,26 @@ def _prepare_download_dir(model_uri: str, cache_dir: str | None) -> tuple[str, b
     return tempfile.mkdtemp(prefix=f"{cache_key}-", dir=str(download_root)), True
 
 
+def _download_trusted_mlflow_artifacts(plan: _MlflowDelegatedDownloadPlan, download_dir: str) -> str:
+    downloaded_paths: list[str] = []
+    for target in plan.targets:
+        target_download_dir = Path(download_dir)
+        if target.destination_subdirectory:
+            target_download_dir /= target.destination_subdirectory
+            target_download_dir.mkdir(parents=True, exist_ok=True)
+        downloaded_path = target.artifact_repository.download_artifacts(
+            artifact_path=target.artifact_path or "",
+            dst_path=str(target_download_dir),
+        )
+        if not isinstance(downloaded_path, str) or not downloaded_path:
+            raise RuntimeError("MLflow artifact repository did not return a download path")
+        downloaded_paths.append(downloaded_path)
+
+    if downloaded_paths:
+        return downloaded_paths[0]
+    raise RuntimeError("MLflow artifact repositories did not return a download path")
+
+
 def scan_mlflow_model(
     model_uri: str,
     *,
@@ -1448,6 +1930,7 @@ def scan_mlflow_model(
 
     try:
         logger.debug(f"Downloading MLflow model {_redact_mlflow_error_for_display(model_uri)} to {download_dir}")
+        local_path: str | None
         if isinstance(download_plan, _MlflowDownloadPlan):
             download_result = _download_preflighted_mlflow_artifacts(
                 download_plan,
@@ -1460,7 +1943,23 @@ def scan_mlflow_model(
                 return download_result
             local_path = download_result
         else:
-            local_path = mlflow.artifacts.download_artifacts(artifact_uri=model_uri, dst_path=download_dir)  # type: ignore[possibly-unbound-attribute]
+            local_path = None
+            if download_plan.local_plan is not None:
+                local_download_result = _download_preflighted_mlflow_artifacts(
+                    download_plan.local_plan,
+                    model_uri,
+                    download_dir,
+                    max_file_size=max_file_size,
+                    max_total_size=max_total_size,
+                )
+                if isinstance(local_download_result, ModelAuditResultModel):
+                    return local_download_result
+                local_path = local_download_result
+            if download_plan.targets:
+                delegated_path = _download_trusted_mlflow_artifacts(download_plan, download_dir)
+                local_path = download_dir if local_path is not None else delegated_path
+            if local_path is None:
+                raise RuntimeError("MLflow artifact download plan did not contain any targets")
         # mlflow may return a file within the download directory; ensure directory path
         download_path = os.path.dirname(local_path) if os.path.isfile(local_path) else local_path
         cache_config = {"cache_enabled": cache_enabled, "cache_dir": scan_cache_dir}

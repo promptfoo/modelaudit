@@ -125,6 +125,7 @@ modelaudit s3://bucket/model.pt
 modelaudit gs://bucket/models/
 
 # MLflow registry
+# Non-local artifact stores: export MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS=s3://trusted-bucket/models
 modelaudit models:/MyModel/Production
 
 # JFrog Artifactory (files and folders)
@@ -142,6 +143,8 @@ modelaudit model.dvc
 - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (and optional `AWS_SESSION_TOKEN`) for S3
 - `GOOGLE_APPLICATION_CREDENTIALS` for GCS
 - `MLFLOW_TRACKING_URI` for MLflow registry access
+- `MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS` for non-local MLflow artifact roots (comma-separated URI prefixes)
+- Use concrete backend roots such as `s3://bucket/prefix`; logical `models:/` or `runs:/` URIs and percent-encoded remote paths are refused.
 - `JFROG_API_TOKEN` or `JFROG_ACCESS_TOKEN` for JFrog Artifactory
 - `MODELAUDIT_JFROG_ALLOWED_HOSTS` for comma-separated custom JFrog hostnames that may receive credentials
 - `MODELAUDIT_JFROG_ALLOWED_REDIRECT_HOSTS` for comma-separated external redirect hostnames that may be downloaded without credentials

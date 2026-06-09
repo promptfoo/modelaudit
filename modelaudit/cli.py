@@ -2969,12 +2969,18 @@ def _resolve_scan_source_for_path(
             )
 
             audit_result.aggregate_scan_result(results.model_dump())
-            download_refused = any(getattr(issue, "type", None) == "mlflow_download_budget" for issue in results.issues)
+            issue_types = {getattr(issue, "type", None) for issue in results.issues}
+            download_refused = bool(issue_types & {"mlflow_download_budget", "mlflow_artifact_trust"})
             if download_refused:
                 if download_spinner:
                     download_spinner.fail(style_text("❌ Download refused", fg="red", bold=True))
                 elif runtime.show_styled_output:
-                    click.echo("Download refused by configured size budget")
+                    refusal_reason = (
+                        "MLflow artifact trust policy"
+                        if "mlflow_artifact_trust" in issue_types
+                        else "configured size budget"
+                    )
+                    click.echo(f"Download refused by {refusal_reason}")
             else:
                 record_download_completed("mlflow", time.time() - download_start, results.bytes_scanned, path)
                 if download_spinner:

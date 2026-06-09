@@ -15,13 +15,18 @@ import pytest
 from modelaudit.core import determine_exit_code
 from modelaudit.integrations.mlflow import (
     _copy_local_mlflow_artifact,
+    _download_trusted_mlflow_artifacts,
     _local_mlflow_artifact_root,
+    _mlflow_artifact_uri_matches_prefix,
     _mlflow_budget_failure_result,
     _MlflowArtifact,
     _MlflowArtifactSizeChangedError,
+    _MlflowDelegatedDownloadPlan,
+    _MlflowDelegatedDownloadTarget,
     _MlflowLocalSource,
     _normalize_mlflow_artifact_path,
     _opened_local_mlflow_path,
+    _partition_mlflow_delegated_targets,
     _redact_mlflow_error_for_display,
     _runs_mlflow_repository_is_scoped,
     _snapshot_local_mlflow_sources,
@@ -101,6 +106,47 @@ def test_snapshot_local_mlflow_sources_accepts_existing_empty_directory(tmp_path
 
     assert artifacts == {}
     assert entry_count == 0
+
+
+def test_local_mlflow_artifact_root_rejects_remote_file_authority(tmp_path: Path) -> None:
+    from mlflow.store.artifact.local_artifact_repo import LocalArtifactRepository
+
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    repository = LocalArtifactRepository(f"file://attacker.example{artifact_root.as_posix()}")
+
+    assert _local_mlflow_artifact_root(repository) is None
+
+
+def test_local_mlflow_artifact_root_rejects_remote_file_authority_before_path_lookup() -> None:
+    class LocalArtifactRepository:
+        artifact_uri = "file://attacker.example/share/model"
+
+        @property
+        def artifact_dir(self) -> str:
+            raise AssertionError("remote file authority must be rejected before path lookup")
+
+    local_module = ModuleType("mlflow.store.artifact.local_artifact_repo")
+    local_module.LocalArtifactRepository = LocalArtifactRepository  # type: ignore[attr-defined]
+
+    with patch.dict(sys.modules, {"mlflow.store.artifact.local_artifact_repo": local_module}):
+        assert _local_mlflow_artifact_root(LocalArtifactRepository()) is None
+
+
+@pytest.mark.parametrize("artifact_dir", [r"\\server\share\model", "//server/share/model"])
+def test_local_mlflow_artifact_root_rejects_unc_path_before_resolution(artifact_dir: str) -> None:
+    class LocalArtifactRepository:
+        def __init__(self, path: str) -> None:
+            self.artifact_dir = path
+
+    local_module = ModuleType("mlflow.store.artifact.local_artifact_repo")
+    local_module.LocalArtifactRepository = LocalArtifactRepository  # type: ignore[attr-defined]
+
+    with (
+        patch.dict(sys.modules, {"mlflow.store.artifact.local_artifact_repo": local_module}),
+        patch.object(Path, "resolve", side_effect=AssertionError("UNC path must not be resolved")),
+    ):
+        assert _local_mlflow_artifact_root(LocalArtifactRepository(artifact_dir)) is None
 
 
 @pytest.mark.parametrize("legacy_resolver", [False, True], ids=["current", "legacy"])
@@ -422,8 +468,8 @@ def test_scan_mlflow_model_allows_logged_model_without_run_artifact(tmp_path: Pa
     mlflow_module.artifacts.download_artifacts.assert_not_called()  # type: ignore[attr-defined]
 
 
-def test_scan_mlflow_model_allows_local_run_when_logged_model_lookup_fails(tmp_path: Path) -> None:
-    """Optional logged-model lookup failures must not hide bounded run artifacts."""
+def test_scan_mlflow_model_rejects_local_run_when_logged_model_lookup_fails(tmp_path: Path) -> None:
+    """A failed overlay lookup must not silently omit logged-model artifacts."""
 
     class LocalArtifactRepository:
         def __init__(self, artifact_dir: Path) -> None:
@@ -469,8 +515,6 @@ def test_scan_mlflow_model_allows_local_run_when_logged_model_lookup_fails(tmp_p
     mlflow_module.artifacts.get_artifact_repository.return_value = repository  # type: ignore[attr-defined]
     download_dir = tmp_path / "download"
     download_dir.mkdir()
-    scan_result: Any = {"bytes_scanned": 4, "issues": []}
-
     with (
         patch.dict(
             sys.modules,
@@ -485,7 +529,7 @@ def test_scan_mlflow_model_allows_local_run_when_logged_model_lookup_fails(tmp_p
         ),
         patch("modelaudit.integrations.mlflow.tempfile.mkdtemp", return_value=str(download_dir)),
         patch("modelaudit.integrations.mlflow.shutil.rmtree"),
-        patch("modelaudit.core.scan_model_directory_or_file", return_value=scan_result) as mock_scan,
+        patch("modelaudit.core.scan_model_directory_or_file") as mock_scan,
     ):
         result = scan_mlflow_model(
             "runs:/run-1/model",
@@ -493,9 +537,10 @@ def test_scan_mlflow_model_allows_local_run_when_logged_model_lookup_fails(tmp_p
             max_total_size=4,
         )
 
-    assert result == scan_result
-    assert (download_dir / "model" / "model.pkl").read_bytes() == b"xxxx"
-    mock_scan.assert_called_once()
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["reason"] == "artifact_streaming_budget_unavailable"
+    assert not (download_dir / "model" / "model.pkl").exists()
+    mock_scan.assert_not_called()
     mlflow_module.artifacts.download_artifacts.assert_not_called()  # type: ignore[attr-defined]
 
 
@@ -1163,6 +1208,642 @@ def test_mlflow_budget_failure_preserves_benign_uri_context() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("artifact_uri", "allowed_prefix"),
+    [
+        ("https://mlflow.example.com:443/artifacts/model.pkl", "https://mlflow.example.com/artifacts"),
+        ("https://mlflow.example.com/artifacts/model.pkl", "https://mlflow.example.com:443/artifacts"),
+        ("http://mlflow.example.com:80/artifacts/model.pkl", "http://mlflow.example.com/artifacts"),
+        ("ftp://mlflow.example.com:21/artifacts/model.pkl", "ftp://mlflow.example.com/artifacts"),
+        ("sftp://mlflow.example.com:22/artifacts/model.pkl", "sftp://mlflow.example.com/artifacts"),
+        ("dbfs:/trusted/models/model.pkl", "dbfs:/trusted/models"),
+        ("s3://trusted-bucket/models//model.pkl", "s3://trusted-bucket/models//"),
+        ("s3://trusted-bucket//model.pkl", "s3://trusted-bucket//"),
+    ],
+)
+def test_mlflow_artifact_uri_prefix_matching_accepts_equivalent_safe_uris(
+    artifact_uri: str,
+    allowed_prefix: str,
+) -> None:
+    assert _mlflow_artifact_uri_matches_prefix(artifact_uri, allowed_prefix) is True
+
+
+@pytest.mark.parametrize(
+    ("artifact_uri", "allowed_prefix"),
+    [
+        ("https://mlflow.example.com/artifacts/../evil/model.pkl", "https://mlflow.example.com/artifacts"),
+        ("https://mlflow.example.com/artifacts/%2e%2e/evil/model.pkl", "https://mlflow.example.com/artifacts"),
+        ("https://mlflow.example.com/artifacts/%252e%252e/evil/model.pkl", "https://mlflow.example.com/artifacts"),
+        ("https://mlflow.example.com/artifacts/%2", "https://mlflow.example.com/artifacts"),
+        ("https://mlflow.example.com/artifacts/%5c..%5cevil", "https://mlflow.example.com/artifacts"),
+        ("https://mlflow.example.com:invalid/artifacts/model.pkl", "https://mlflow.example.com/artifacts"),
+        ("s3://trusted-bucket/%6dodels/model.pkl", "s3://trusted-bucket/models"),
+        ("s3://trusted-bucket/models/model.pkl", "s3://trusted-bucket/models//"),
+        ("s3://trusted-bucket/model.pkl", "s3://trusted-bucket//"),
+        ("ftp:/artifacts/model.pkl", "ftp:/artifacts"),
+        ("file://attacker.example/share/model.pkl", "file://attacker.example/share"),
+        ("models:/TrustedModel/1", "models:/TrustedModel"),
+        ("runs:/run-1/model", "runs:/run-1"),
+    ],
+)
+def test_mlflow_artifact_uri_prefix_matching_rejects_ambiguous_uris(
+    artifact_uri: str,
+    allowed_prefix: str,
+) -> None:
+    assert _mlflow_artifact_uri_matches_prefix(artifact_uri, allowed_prefix) is False
+
+
+@pytest.mark.parametrize(
+    ("artifact_uri", "allowed_prefix"),
+    [
+        ("file:///private/tmp/modelaudit-evil/model.pkl", "file:///private/tmp/modelaudit-trusted"),
+        ("file:///private/tmp/modelaudit-trusted/model.pkl", "file:///private/tmp/modelaudit-trusted"),
+        ("https://mlflow.example.com/artifacts2/model.pkl", "https://mlflow.example.com/artifacts"),
+        ("s3://trusted-bucket/models2/model.pkl", "s3://trusted-bucket/models"),
+        ("https://mlflow.example.com/artifacts/../evil/model.pkl", "https://mlflow.example.com/artifacts"),
+        ("https://mlflow.example.com/artifacts/%2e%2e/evil/model.pkl", "https://mlflow.example.com/artifacts"),
+    ],
+)
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_unallowlisted_artifact_uri_before_download(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_uri: str,
+    allowed_prefix: str,
+) -> None:
+    """Remote MLflow artifact roots must match the local allowlist before download."""
+    monkeypatch.setenv("MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS", allowed_prefix)
+    mock_mlflow = MagicMock()
+    mock_mlflow.artifacts.get_artifact_repository.return_value = SimpleNamespace(artifact_uri=artifact_uri)
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    mock_mlflow.artifacts.download_artifacts.assert_not_called()
+    mock_mkdtemp.assert_not_called()
+    mock_scan.assert_not_called()
+    assert determine_exit_code(result) == 2
+    assert result.success is False
+    assert result.checks[0].name == "MLflow Artifact Trust Check"
+    assert result.checks[0].details["reason"] == "artifact_uri_not_allowlisted"
+    assert result.checks[0].details["artifact_repository_uri"] == artifact_uri
+
+
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_unallowlisted_logged_model_overlay_before_download(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runs:/ adapter must trust both its run and logged-model artifact stores."""
+
+    class RemoteArtifactRepository:
+        def __init__(self, artifact_uri: str) -> None:
+            self.artifact_uri = artifact_uri
+
+    class RunsArtifactRepository:
+        artifact_uri = "runs:/run-1/model"
+
+        def __init__(self) -> None:
+            self.repo = RemoteArtifactRepository("s3://trusted-bucket/runs/run-1/model")
+
+        @staticmethod
+        def parse_runs_uri(uri: str) -> tuple[str, str | None]:
+            assert uri == "runs:/run-1/model"
+            return "run-1", "model"
+
+        @staticmethod
+        def get_underlying_uri(uri: str, tracking_uri: str | None = None) -> str:
+            assert uri == "runs:/run-1/model"
+            assert tracking_uri is None
+            return "s3://trusted-bucket/runs/run-1/model"
+
+        @staticmethod
+        def _get_logged_model_artifact_repo(*, run_id: str, name: str) -> RemoteArtifactRepository:
+            assert run_id == "run-1"
+            assert name == "model"
+            return RemoteArtifactRepository("s3://untrusted-bucket/logged-models/model")
+
+    class ModelsArtifactRepository:
+        def __init__(self, repo: Any) -> None:
+            self.repo = repo
+
+    monkeypatch.setenv("MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS", "s3://trusted-bucket/runs")
+    mlflow_module = ModuleType("mlflow")
+    mlflow_module.artifacts = MagicMock()  # type: ignore[attr-defined]
+    mlflow_module.artifacts.get_artifact_repository.return_value = ModelsArtifactRepository(  # type: ignore[attr-defined]
+        RunsArtifactRepository()
+    )
+    store_module = ModuleType("mlflow.store")
+    artifact_module = ModuleType("mlflow.store.artifact")
+    models_module = ModuleType("mlflow.store.artifact.models_artifact_repo")
+    runs_module = ModuleType("mlflow.store.artifact.runs_artifact_repo")
+    models_module.ModelsArtifactRepository = ModelsArtifactRepository  # type: ignore[attr-defined]
+    runs_module.RunsArtifactRepository = RunsArtifactRepository  # type: ignore[attr-defined]
+
+    with patch.dict(
+        sys.modules,
+        {
+            "mlflow": mlflow_module,
+            "mlflow.store": store_module,
+            "mlflow.store.artifact": artifact_module,
+            "mlflow.store.artifact.models_artifact_repo": models_module,
+            "mlflow.store.artifact.runs_artifact_repo": runs_module,
+        },
+    ):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    mlflow_module.artifacts.download_artifacts.assert_not_called()  # type: ignore[attr-defined]
+    mock_mkdtemp.assert_not_called()
+    mock_scan.assert_not_called()
+    assert determine_exit_code(result) == 2
+    assert result.checks[0].details["artifact_repository_uri"] == "s3://untrusted-bucket/logged-models/model"
+    assert result.checks[0].details["artifact_repository_uris"] == [
+        "s3://trusted-bucket/runs/run-1/model",
+        "s3://untrusted-bucket/logged-models/model",
+    ]
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_downloads_from_the_validated_logged_model_repository(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A runs:/ download must not resolve its logged-model backend a second time."""
+
+    class RemoteArtifactRepository:
+        def __init__(self, artifact_uri: str, downloaded_path: Path) -> None:
+            self.artifact_uri = artifact_uri
+            self.download_artifacts = MagicMock(return_value=str(downloaded_path))
+
+    class RunsArtifactRepository:
+        artifact_uri = "runs:/run-1/model"
+
+        def __init__(self, run_repository: RemoteArtifactRepository) -> None:
+            self.repo = run_repository
+            self.download_artifacts = MagicMock(side_effect=AssertionError("wrapper download must not be used"))
+            self._get_logged_model_artifact_repo = MagicMock()
+
+        @staticmethod
+        def parse_runs_uri(uri: str) -> tuple[str, str | None]:
+            assert uri == "runs:/run-1/model"
+            return "run-1", "model"
+
+        @staticmethod
+        def get_underlying_uri(uri: str, tracking_uri: str | None = None) -> str:
+            assert uri == "runs:/run-1/model"
+            assert tracking_uri is None
+            return "s3://trusted-bucket/runs/run-1/model"
+
+    class ModelsArtifactRepository:
+        def __init__(self, repo: Any) -> None:
+            self.repo = repo
+
+    monkeypatch.setenv(
+        "MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS",
+        "s3://trusted-bucket/runs,s3://trusted-bucket/logged-models",
+    )
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    mock_mkdtemp.return_value = str(download_dir)
+    run_repository = RemoteArtifactRepository("s3://trusted-bucket/runs/run-1/model", download_dir)
+    trusted_logged_repository = RemoteArtifactRepository(
+        "s3://trusted-bucket/logged-models/model",
+        download_dir / "model",
+    )
+    untrusted_logged_repository = RemoteArtifactRepository(
+        "s3://untrusted-bucket/logged-models/model",
+        download_dir / "model",
+    )
+    runs_repository = RunsArtifactRepository(run_repository)
+    runs_repository._get_logged_model_artifact_repo.side_effect = [
+        trusted_logged_repository,
+        untrusted_logged_repository,
+    ]
+    mlflow_module = ModuleType("mlflow")
+    mlflow_module.artifacts = MagicMock()  # type: ignore[attr-defined]
+    mlflow_module.artifacts.get_artifact_repository.return_value = ModelsArtifactRepository(  # type: ignore[attr-defined]
+        runs_repository
+    )
+    store_module = ModuleType("mlflow.store")
+    artifact_module = ModuleType("mlflow.store.artifact")
+    models_module = ModuleType("mlflow.store.artifact.models_artifact_repo")
+    runs_module = ModuleType("mlflow.store.artifact.runs_artifact_repo")
+    models_module.ModelsArtifactRepository = ModelsArtifactRepository  # type: ignore[attr-defined]
+    runs_module.RunsArtifactRepository = RunsArtifactRepository  # type: ignore[attr-defined]
+    scan_result: Any = {"bytes_scanned": 4, "issues": []}
+    mock_scan.return_value = scan_result
+
+    with patch.dict(
+        sys.modules,
+        {
+            "mlflow": mlflow_module,
+            "mlflow.store": store_module,
+            "mlflow.store.artifact": artifact_module,
+            "mlflow.store.artifact.models_artifact_repo": models_module,
+            "mlflow.store.artifact.runs_artifact_repo": runs_module,
+        },
+    ):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    assert result == scan_result
+    runs_repository._get_logged_model_artifact_repo.assert_called_once_with(run_id="run-1", name="model")
+    runs_repository.download_artifacts.assert_not_called()
+    run_repository.download_artifacts.assert_called_once_with(artifact_path="", dst_path=str(download_dir))
+    trusted_logged_repository.download_artifacts.assert_called_once_with(
+        artifact_path="",
+        dst_path=str(download_dir / "model"),
+    )
+    untrusted_logged_repository.download_artifacts.assert_not_called()
+    mock_scan.assert_called_once()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+
+
+def test_delegated_mlflow_download_fails_closed_on_target_error(tmp_path: Path) -> None:
+    """A later overlay must not hide a failed mandatory artifact target."""
+    failed_repository = SimpleNamespace(
+        download_artifacts=MagicMock(side_effect=RuntimeError("run artifact download failed"))
+    )
+    later_repository = SimpleNamespace(download_artifacts=MagicMock(return_value=str(tmp_path / "model")))
+    plan = _MlflowDelegatedDownloadPlan(
+        (
+            _MlflowDelegatedDownloadTarget(failed_repository, None),
+            _MlflowDelegatedDownloadTarget(later_repository, None, "model"),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="run artifact download failed"):
+        _download_trusted_mlflow_artifacts(plan, str(tmp_path))
+
+    later_repository.download_artifacts.assert_not_called()
+
+
+def test_delegated_mlflow_download_fails_when_later_target_errors(tmp_path: Path) -> None:
+    """A successful run target must not hide a failed logged-model overlay."""
+    run_path = tmp_path / "run"
+    run_repository = SimpleNamespace(download_artifacts=MagicMock(return_value=str(run_path)))
+    failed_logged_repository = SimpleNamespace(
+        download_artifacts=MagicMock(side_effect=RuntimeError("logged-model download failed"))
+    )
+    plan = _MlflowDelegatedDownloadPlan(
+        (
+            _MlflowDelegatedDownloadTarget(run_repository, None),
+            _MlflowDelegatedDownloadTarget(failed_logged_repository, None, "model"),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="logged-model download failed"):
+        _download_trusted_mlflow_artifacts(plan, str(tmp_path))
+
+    run_repository.download_artifacts.assert_called_once()
+    failed_logged_repository.download_artifacts.assert_called_once()
+
+
+@pytest.mark.parametrize("returned_path", [None, ""])
+def test_delegated_mlflow_download_rejects_missing_target_path(
+    tmp_path: Path,
+    returned_path: str | None,
+) -> None:
+    """An empty repository result is incomplete even if a later target could succeed."""
+    empty_repository = SimpleNamespace(download_artifacts=MagicMock(return_value=returned_path))
+    later_repository = SimpleNamespace(download_artifacts=MagicMock(return_value=str(tmp_path / "model")))
+    plan = _MlflowDelegatedDownloadPlan(
+        (
+            _MlflowDelegatedDownloadTarget(empty_repository, None),
+            _MlflowDelegatedDownloadTarget(later_repository, None, "model"),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="did not return a download path"):
+        _download_trusted_mlflow_artifacts(plan, str(tmp_path))
+
+    later_repository.download_artifacts.assert_not_called()
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_allows_explicitly_allowlisted_remote_artifact_uri(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Explicitly allowlisted remote artifact roots may still use MLflow's downloader."""
+    artifact_uri = "s3://trusted-bucket/models/TestModel"
+    monkeypatch.setenv("MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS", "s3://trusted-bucket/models")
+    download_dir = tmp_path / "modelaudit_mlflow_allowed"
+    download_dir.mkdir()
+    mock_mkdtemp.return_value = str(download_dir)
+    scan_result: Any = {"bytes_scanned": 256, "issues": []}
+    mock_scan.return_value = scan_result
+    mock_mlflow = MagicMock()
+    artifact_repository = MagicMock()
+    artifact_repository.artifact_uri = artifact_uri
+    artifact_repository.download_artifacts.return_value = str(download_dir)
+    mock_mlflow.artifacts.get_artifact_repository.return_value = artifact_repository
+
+    with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    assert result == scan_result
+    mock_mlflow.artifacts.get_artifact_repository.assert_called_once_with("models:/TestModel/1")
+    artifact_repository.download_artifacts.assert_called_once_with(
+        artifact_path="",
+        dst_path=str(download_dir),
+    )
+    mock_mlflow.artifacts.download_artifacts.assert_not_called()
+    mock_scan.assert_called_once_with(
+        str(download_dir),
+        timeout=3600,
+        blacklist_patterns=None,
+        max_file_size=0,
+        max_total_size=0,
+        cache_enabled=True,
+        cache_dir=None,
+    )
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_combines_hardened_local_run_with_allowlisted_remote_overlay(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Mixed overlays must copy local targets safely and allowlist only remote targets."""
+
+    class LocalArtifactRepository:
+        def __init__(self, artifact_dir: Path) -> None:
+            self.artifact_dir = artifact_dir
+            self.artifact_uri = artifact_dir.as_uri()
+            self.download_artifacts = MagicMock(side_effect=AssertionError("local target must use hardened copy"))
+
+    class RemoteArtifactRepository:
+        def __init__(self, artifact_uri: str, downloaded_path: Path) -> None:
+            self.artifact_uri = artifact_uri
+            self.download_artifacts = MagicMock(return_value=str(downloaded_path))
+
+    class RunsArtifactRepository:
+        artifact_uri = "runs:/run-1/model"
+
+        def __init__(self, run_repository: LocalArtifactRepository) -> None:
+            self.repo = run_repository
+
+        @staticmethod
+        def parse_runs_uri(uri: str) -> tuple[str, str | None]:
+            assert uri == "runs:/run-1/model"
+            return "run-1", "model"
+
+        @staticmethod
+        def get_underlying_uri(uri: str, tracking_uri: str | None = None) -> str:
+            assert uri == "runs:/run-1/model"
+            assert tracking_uri is None
+            return run_repository.artifact_uri
+
+        @staticmethod
+        def _get_logged_model_artifact_repo(*, run_id: str, name: str) -> RemoteArtifactRepository:
+            assert run_id == "run-1"
+            assert name == "model"
+            return logged_repository
+
+    class ModelsArtifactRepository:
+        def __init__(self, repo: Any) -> None:
+            self.repo = repo
+
+    monkeypatch.setenv(
+        "MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS",
+        "s3://trusted-bucket/logged-models/model",
+    )
+    local_root = tmp_path / "run-artifacts"
+    _write_local_artifacts(local_root, {"run.txt": 4})
+    download_dir = tmp_path / "mixed-download"
+    download_dir.mkdir()
+    mock_mkdtemp.return_value = str(download_dir)
+    run_repository = LocalArtifactRepository(local_root)
+    logged_repository = RemoteArtifactRepository(
+        "s3://trusted-bucket/logged-models/model",
+        download_dir / "model",
+    )
+    mlflow_module = ModuleType("mlflow")
+    mlflow_module.artifacts = MagicMock()  # type: ignore[attr-defined]
+    mlflow_module.artifacts.get_artifact_repository.return_value = ModelsArtifactRepository(  # type: ignore[attr-defined]
+        RunsArtifactRepository(run_repository)
+    )
+    store_module = ModuleType("mlflow.store")
+    artifact_module = ModuleType("mlflow.store.artifact")
+    local_module = ModuleType("mlflow.store.artifact.local_artifact_repo")
+    models_module = ModuleType("mlflow.store.artifact.models_artifact_repo")
+    runs_module = ModuleType("mlflow.store.artifact.runs_artifact_repo")
+    local_module.LocalArtifactRepository = LocalArtifactRepository  # type: ignore[attr-defined]
+    models_module.ModelsArtifactRepository = ModelsArtifactRepository  # type: ignore[attr-defined]
+    runs_module.RunsArtifactRepository = RunsArtifactRepository  # type: ignore[attr-defined]
+    scan_result: Any = {"bytes_scanned": 8, "issues": []}
+    mock_scan.return_value = scan_result
+
+    with patch.dict(
+        sys.modules,
+        {
+            "mlflow": mlflow_module,
+            "mlflow.store": store_module,
+            "mlflow.store.artifact": artifact_module,
+            "mlflow.store.artifact.local_artifact_repo": local_module,
+            "mlflow.store.artifact.models_artifact_repo": models_module,
+            "mlflow.store.artifact.runs_artifact_repo": runs_module,
+        },
+    ):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    assert result == scan_result
+    assert (download_dir / "run.txt").read_bytes() == b"xxxx"
+    run_repository.download_artifacts.assert_not_called()
+    logged_repository.download_artifacts.assert_called_once_with(
+        artifact_path="",
+        dst_path=str(download_dir / "model"),
+    )
+    mock_scan.assert_called_once_with(
+        str(download_dir),
+        timeout=3600,
+        blacklist_patterns=None,
+        max_file_size=0,
+        max_total_size=0,
+        cache_enabled=True,
+        cache_dir=None,
+    )
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_honors_artifact_path_specific_allowlist(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A direct artifact may be trusted without allowlisting its repository parent."""
+    artifact_uri = "s3://trusted-bucket/models/model.pkl"
+    monkeypatch.setenv("MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS", artifact_uri)
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    mock_mkdtemp.return_value = str(download_dir)
+    scan_result: Any = {"bytes_scanned": 4, "issues": []}
+    mock_scan.return_value = scan_result
+    artifact_repository = MagicMock()
+    artifact_repository.artifact_uri = "s3://trusted-bucket/models"
+    artifact_repository.download_artifacts.return_value = str(download_dir / "model.pkl")
+    mlflow_module = ModuleType("mlflow")
+    mlflow_module.artifacts = MagicMock()  # type: ignore[attr-defined]
+    mlflow_module.artifacts._get_root_uri_and_artifact_path.return_value = (  # type: ignore[attr-defined]
+        "s3://trusted-bucket/models",
+        "model.pkl",
+    )
+    mlflow_module.artifacts.get_artifact_repository.return_value = artifact_repository  # type: ignore[attr-defined]
+
+    with patch.dict(sys.modules, {"mlflow": mlflow_module}):
+        result = scan_mlflow_model(artifact_uri)
+
+    assert result == scan_result
+    artifact_repository.download_artifacts.assert_called_once_with(
+        artifact_path="model.pkl",
+        dst_path=str(download_dir),
+    )
+    mock_scan.assert_called_once()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+
+
+def test_artifact_path_specific_allowlist_does_not_trust_sibling_object() -> None:
+    assert (
+        _mlflow_artifact_uri_matches_prefix(
+            "s3://trusted-bucket/models/other.pkl",
+            "s3://trusted-bucket/models/model.pkl",
+        )
+        is False
+    )
+
+
+def test_mixed_mlflow_overlay_fails_closed_when_local_target_follows_remote(tmp_path: Path) -> None:
+    remote_repository = object()
+    local_repository = object()
+    targets = (
+        _MlflowDelegatedDownloadTarget(remote_repository, None),
+        _MlflowDelegatedDownloadTarget(local_repository, None, "model"),
+    )
+
+    with patch(
+        "modelaudit.integrations.mlflow._local_mlflow_artifact_root",
+        side_effect=lambda repository: tmp_path if repository is local_repository else None,
+    ):
+        assert _partition_mlflow_delegated_targets(targets) is None
+
+
+@patch("modelaudit.integrations.mlflow.shutil.rmtree")
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_preserves_remote_artifact_key_separators(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Direct object-store keys must not be normalized to a different artifact."""
+    monkeypatch.setenv("MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS", "s3://trusted-bucket/models")
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    mock_mkdtemp.return_value = str(download_dir)
+    artifact_repository = MagicMock()
+    artifact_repository.artifact_uri = "s3://trusted-bucket/models"
+    artifact_repository.download_artifacts.return_value = str(download_dir)
+    mlflow_module = ModuleType("mlflow")
+    mlflow_module.artifacts = MagicMock()  # type: ignore[attr-defined]
+    mlflow_module.artifacts._get_root_uri_and_artifact_path.return_value = (  # type: ignore[attr-defined]
+        "s3://trusted-bucket/models",
+        "weights//model.pkl",
+    )
+    mlflow_module.artifacts.get_artifact_repository.return_value = artifact_repository  # type: ignore[attr-defined]
+    scan_result: Any = {"bytes_scanned": 4, "issues": []}
+    mock_scan.return_value = scan_result
+
+    with patch.dict(sys.modules, {"mlflow": mlflow_module}):
+        result = scan_mlflow_model("s3://trusted-bucket/models/weights//model.pkl")
+
+    assert result == scan_result
+    artifact_repository.download_artifacts.assert_called_once_with(
+        artifact_path="weights//model.pkl",
+        dst_path=str(download_dir),
+    )
+    mock_scan.assert_called_once()
+    mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
+
+
+def test_scan_mlflow_model_copies_local_repository_without_remote_allowlist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verified local MLflow repositories remain scannable without a remote allowlist."""
+    monkeypatch.delenv("MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS", raising=False)
+
+    class LocalArtifactRepository:
+        def __init__(self, artifact_dir: Path) -> None:
+            self.artifact_dir = artifact_dir
+
+    class ModelsArtifactRepository:
+        pass
+
+    source_root = tmp_path / "mlflow_artifacts"
+    _write_local_artifacts(source_root, {"model.pkl": 4})
+    download_dir = tmp_path / "modelaudit_mlflow_local"
+    download_dir.mkdir()
+    scan_result: Any = {"bytes_scanned": 4, "issues": []}
+    mlflow_module = ModuleType("mlflow")
+    mlflow_module.artifacts = MagicMock()  # type: ignore[attr-defined]
+    mlflow_module.artifacts.get_artifact_repository.return_value = LocalArtifactRepository(source_root)  # type: ignore[attr-defined]
+    store_module = ModuleType("mlflow.store")
+    artifact_module = ModuleType("mlflow.store.artifact")
+    local_module = ModuleType("mlflow.store.artifact.local_artifact_repo")
+    models_module = ModuleType("mlflow.store.artifact.models_artifact_repo")
+    local_module.LocalArtifactRepository = LocalArtifactRepository  # type: ignore[attr-defined]
+    models_module.ModelsArtifactRepository = ModelsArtifactRepository  # type: ignore[attr-defined]
+
+    with (
+        patch.dict(
+            sys.modules,
+            {
+                "mlflow": mlflow_module,
+                "mlflow.store": store_module,
+                "mlflow.store.artifact": artifact_module,
+                "mlflow.store.artifact.local_artifact_repo": local_module,
+                "mlflow.store.artifact.models_artifact_repo": models_module,
+            },
+        ),
+        patch("modelaudit.integrations.mlflow.tempfile.mkdtemp", return_value=str(download_dir)),
+        patch("modelaudit.integrations.mlflow.shutil.rmtree"),
+        patch("modelaudit.core.scan_model_directory_or_file", return_value=scan_result) as mock_scan,
+    ):
+        result = scan_mlflow_model("models:/TestModel/1")
+
+    assert result == scan_result
+    assert (download_dir / "model.pkl").read_bytes() == b"xxxx"
+    mlflow_module.artifacts.download_artifacts.assert_not_called()  # type: ignore[attr-defined]
+    mock_scan.assert_called_once()
+
+
 def test_mlflow_budget_failure_redacts_mlflow_query_credentials_recursively() -> None:
     model_uri = "models:/PublicModel/1?auth=QUERYSECRET123&session=SESSIONSECRET123"
     boundary_error = "x" * 470 + " artifact_uri=///user:BUDGETPARTIALSECRET1234567890@host/model"
@@ -1748,25 +2429,31 @@ def test_scan_mlflow_model_uses_cache_dir_for_downloads(
     mock_mkdtemp: MagicMock,
     mock_rmtree: MagicMock,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Test MLflow model downloads use a dedicated subdirectory under cache_dir."""
     mock_mlflow = MagicMock()
+    monkeypatch.setenv("MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS", "s3://trusted-bucket/models")
     cache_dir = tmp_path / "cache"
     cache_key = hashlib.sha256(b"models:/TestModel/1").hexdigest()[:16]
     expected_download_root = cache_dir / "mlflow"
     expected_download_dir = expected_download_root / f"{cache_key}-run"
     mock_mkdtemp.return_value = str(expected_download_dir)
-    mock_mlflow.artifacts.download_artifacts.return_value = str(expected_download_dir)
+    artifact_repository = MagicMock()
+    artifact_repository.artifact_uri = "s3://trusted-bucket/models/TestModel"
+    artifact_repository.download_artifacts.return_value = str(expected_download_dir)
+    mock_mlflow.artifacts.get_artifact_repository.return_value = artifact_repository
     mock_scan.return_value = {"bytes_scanned": 256, "issues": []}
 
     with patch.dict(sys.modules, {"mlflow": mock_mlflow}):
         scan_mlflow_model("models:/TestModel/1", cache_enabled=True, cache_dir=str(cache_dir))
 
     mock_mkdtemp.assert_called_once_with(prefix=f"{cache_key}-", dir=str(expected_download_root))
-    mock_mlflow.artifacts.download_artifacts.assert_called_once_with(
-        artifact_uri="models:/TestModel/1",
+    artifact_repository.download_artifacts.assert_called_once_with(
+        artifact_path="",
         dst_path=str(expected_download_dir),
     )
+    mock_mlflow.artifacts.download_artifacts.assert_not_called()
     mock_scan.assert_called_once_with(
         str(expected_download_dir),
         timeout=3600,
@@ -1782,15 +2469,24 @@ def test_scan_mlflow_model_uses_cache_dir_for_downloads(
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
 @patch("modelaudit.core.scan_model_directory_or_file")
-def test_scan_mlflow_model_file_path(mock_scan, mock_mkdtemp, mock_rmtree):
+def test_scan_mlflow_model_file_path(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Test MLflow model scanning when download returns a file path."""
     # Mock MLflow
     mock_mlflow = MagicMock()
+    monkeypatch.setenv("MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS", "s3://trusted-bucket/models")
 
     # Create a temporary file path (simulating MLflow returning a file)
     temp_dir = "/tmp/modelaudit_mlflow_test"
     temp_file = "/tmp/modelaudit_mlflow_test/model.pkl"
-    mock_mlflow.artifacts.download_artifacts.return_value = temp_file
+    artifact_repository = MagicMock()
+    artifact_repository.artifact_uri = "s3://trusted-bucket/models/TestModel"
+    artifact_repository.download_artifacts.return_value = temp_file
+    mock_mlflow.artifacts.get_artifact_repository.return_value = artifact_repository
     mock_mkdtemp.return_value = temp_dir
 
     # Mock os.path.isfile to return True for our temp file
@@ -1811,11 +2507,19 @@ def test_scan_mlflow_model_file_path(mock_scan, mock_mkdtemp, mock_rmtree):
 
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
-def test_scan_mlflow_model_download_error(mock_mkdtemp, mock_rmtree):
+def test_scan_mlflow_model_download_error(
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Test error handling when MLflow download fails."""
     # Mock MLflow with download error
     mock_mlflow = MagicMock()
-    mock_mlflow.artifacts.download_artifacts.side_effect = Exception("Download failed")
+    monkeypatch.setenv("MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS", "s3://trusted-bucket/models")
+    artifact_repository = MagicMock()
+    artifact_repository.artifact_uri = "s3://trusted-bucket/models/TestModel"
+    artifact_repository.download_artifacts.side_effect = Exception("Download failed")
+    mock_mlflow.artifacts.get_artifact_repository.return_value = artifact_repository
 
     temp_dir = "/tmp/modelaudit_mlflow_test"
     mock_mkdtemp.return_value = temp_dir
@@ -1836,10 +2540,15 @@ def test_scan_mlflow_model_debug_log_redacts_source_uri(
     mock_mkdtemp: MagicMock,
     mock_rmtree: MagicMock,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model_uri = "models:/PrivateModel/access_token=DEBUGSECRET123"
+    monkeypatch.setenv("MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS", "s3://trusted-bucket/models")
     mock_mlflow = MagicMock()
-    mock_mlflow.artifacts.download_artifacts.side_effect = RuntimeError("Download failed")
+    artifact_repository = MagicMock()
+    artifact_repository.artifact_uri = "s3://trusted-bucket/models/PrivateModel"
+    artifact_repository.download_artifacts.side_effect = RuntimeError("Download failed")
+    mock_mlflow.artifacts.get_artifact_repository.return_value = artifact_repository
     mock_mkdtemp.return_value = "/tmp/modelaudit_mlflow_test"
 
     with (
@@ -1854,10 +2563,14 @@ def test_scan_mlflow_model_debug_log_redacts_source_uri(
     mock_rmtree.assert_called_once_with("/tmp/modelaudit_mlflow_test", ignore_errors=True)
 
 
-def test_scan_mlflow_model_no_registry_uri():
+def test_scan_mlflow_model_no_registry_uri(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test MLflow model scanning without registry URI."""
     mock_mlflow = MagicMock()
-    mock_mlflow.artifacts.download_artifacts.return_value = "/tmp/test_model"
+    monkeypatch.setenv("MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS", "s3://trusted-bucket/models")
+    artifact_repository = MagicMock()
+    artifact_repository.artifact_uri = "s3://trusted-bucket/models/TestModel"
+    artifact_repository.download_artifacts.return_value = "/tmp/test"
+    mock_mlflow.artifacts.get_artifact_repository.return_value = artifact_repository
 
     with (
         patch.dict(sys.modules, {"mlflow": mock_mlflow}),
