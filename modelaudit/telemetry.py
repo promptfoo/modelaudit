@@ -23,6 +23,7 @@ from urllib.parse import ParseResult, urlparse
 
 import yaml
 
+from .scanner_registry_metadata import get_registered_scanner_extensions
 from .version import __version__
 
 # Type variable for generic function decoration
@@ -129,6 +130,17 @@ _TELEMETRY_FILELIKE_ISSUE_ID_RE = re.compile(
     r"\.(?:bin|ckpt|gguf|gz|h5|hdf5|json|keras|nemo|onnx|pb|pickle|pkl|pt|pth|safetensors|tar|yaml|yml|zip)$",
     re.IGNORECASE,
 )
+_TELEMETRY_SAFE_FILE_EXTENSIONS = frozenset(get_registered_scanner_extensions())
+_TELEMETRY_OTHER_EXTENSION = "other_extension"
+_TELEMETRY_SCAN_ERROR_CATEGORIES = {
+    "No matching paths": "no_matching_paths",
+    "Invalid max-size": "invalid_max_size",
+    "Invalid scanner selection": "invalid_scanner_selection",
+    "Scan completed with errors": "scan_completed_with_errors",
+    "No paths provided": "no_paths_provided",
+    "Unable to prepare scan output": "output_preparation_failed",
+    "Unable to write scan output": "output_write_failed",
+}
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "yup", "yeppers"})
 # Vars whose CI providers set a truthy literal ("true"/"1").
 _CI_TRUTHY_ENV_VARS = (
@@ -455,10 +467,13 @@ class TelemetryClient:
         return parsed if parsed.scheme else None
 
     def _extract_file_extension(self, path: str) -> str:
-        """Extract a file extension without URL query strings or fragments."""
+        """Extract a registered extension without emitting user-defined suffixes."""
         parsed = self._parse_url_reference(path)
         name_source = parsed.path if parsed else path
-        return Path(name_source).suffix.lower()
+        extension = Path(name_source).suffix.lower()
+        if not extension or extension in _TELEMETRY_SAFE_FILE_EXTENSIONS:
+            return extension
+        return _TELEMETRY_OTHER_EXTENSION
 
     def _build_path_properties(self, path: str) -> dict[str, Any]:
         """Build coarse telemetry properties for a file path."""
@@ -474,7 +489,6 @@ class TelemetryClient:
         return {
             "domain": self._extract_domain(url),
             "path_type": self._classify_path(url),
-            "source_type": self._classify_source_type(url),
             "file_extension": self._extract_file_extension(url),
             "model_reference_type": self._extract_model_reference(url),
         }
@@ -664,16 +678,28 @@ class TelemetryClient:
 
     def _classify_source_type(self, path: str) -> str:
         """Classify the source type of a path."""
-        if "huggingface" in path.lower() or path.startswith("hf://"):
+        path_type = self._classify_path(path)
+        if path_type in {"huggingface", "huggingface_shorthand"}:
             return "huggingface"
-        if "pytorch" in path.lower():
+        if path_type == "pytorch_hub":
             return "pytorch_hub"
-        if path.startswith("s3://"):
+        if path_type in {"jfrog", "mlflow"}:
+            return path_type
+
+        parsed = self._parse_url_reference(path)
+        scheme = parsed.scheme.lower() if parsed else ""
+        if scheme == "pytorch":
+            return "pytorch_hub"
+        if scheme == "s3":
             return "s3"
-        if path.startswith("gs://"):
+        if scheme == "gs":
             return "gcs"
-        if path.startswith("http"):
+        if scheme == "azure":
+            return "azure"
+        if scheme in {"http", "https"}:
             return "http"
+        if scheme and scheme != "file":
+            return "other_remote"
         return "local"
 
     def record_scan_completed(self, duration: float, results: dict[str, Any]) -> None:
@@ -698,12 +724,6 @@ class TelemetryClient:
                         "type": issue_type,
                         "severity": severity,
                         "location_type": self._classify_path(issue_location) if issue_location else "unknown",
-                        "location_file_extension": self._extract_file_extension(issue_location)
-                        if issue_location
-                        else None,
-                        "location_reference_type": self._extract_model_reference(issue_location)
-                        if issue_location
-                        else None,
                     }
                 )
 
@@ -739,7 +759,7 @@ class TelemetryClient:
             {
                 "duration": duration,
                 "error_type": type(error).__name__ if isinstance(error, Exception) else "str",
-                "error_message": self._sanitize_error(error),
+                "error_category": self._classify_scan_error(error),
             },
         )
 
@@ -812,8 +832,7 @@ class TelemetryClient:
             TelemetryEvent.ERROR_OCCURRED,
             {
                 "error_type": type(error).__name__,
-                "error_message": self._sanitize_error(error),
-                "context": context,
+                "has_context": bool(context),
             },
         )
 
@@ -918,19 +937,15 @@ class TelemetryClient:
         """Deprecated safe alias for callers that previously expected a host."""
         return self._extract_domain(url)
 
-    def _sanitize_error(self, error: Union[Exception, str]) -> str:
-        """Sanitize error message to remove sensitive information."""
-        error_str = str(error)
-        # Remove URLs FIRST (before path matching can break them)
-        error_str = re.sub(r"https?://[^\s]+", "[URL]", error_str)
-        # Remove Windows-style paths
-        error_str = re.sub(r"[A-Za-z]:\\[\w.\\-]+", "[PATH]", error_str)
-        # Remove Unix-style paths (must come after URLs)
-        error_str = re.sub(r"/[\w./-]+", "[PATH]", error_str)
-        # Remove anything that looks like a token/key
-        error_str = re.sub(r"[A-Za-z0-9_-]{20,}", "[REDACTED]", error_str)
-        # Truncate to reasonable length
-        return error_str[:100]
+    @staticmethod
+    def _classify_scan_error(error: Union[Exception, str]) -> str:
+        """Map scan failures to a fixed category without serializing error text."""
+        if isinstance(error, Exception):
+            return "exception"
+        for prefix, category in _TELEMETRY_SCAN_ERROR_CATEGORIES.items():
+            if error == prefix or error.startswith(f"{prefix}:"):
+                return category
+        return "other"
 
     def _count_issue_severities(self, results: dict[str, Any]) -> dict[str, int]:
         """Count issues by severity."""

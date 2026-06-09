@@ -199,10 +199,6 @@ _NESTED_SERIALIZED_OBJECT_KEYS = frozenset(
 # CVE-2025-8747: keras.utils.get_file used as gadget to download + execute files
 _GET_FILE_PATTERN = re.compile(r"get_file", re.IGNORECASE)
 _URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
-_ARCHIVE_EXTRACT_URL_PATTERN = re.compile(
-    r"\.(?:tar|tgz|tbz2|txz|tar\.gz|tar\.bz2|tar\.xz|tar\.zst|tar\.lz|tar\.lz4|tar\.lzma)(?:[?#]|$)",
-    re.IGNORECASE,
-)
 _URL_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 _KERAS_CONFIG_ENTRY = "config.json"
 _KERAS_CONFIG_MAX_BYTES = 10 * 1024 * 1024
@@ -219,6 +215,21 @@ def _has_get_file_reference(values: list[str]) -> bool:
         if stripped_value_lower.endswith(".get_file") or "keras.utils.get_file" in stripped_value_lower:
             return True
 
+    return False
+
+
+def _archive_format_may_extract_tar(value: Any) -> bool:
+    """Mirror Keras archive-format dispatch closely enough to identify tar extraction."""
+    if value == "auto" or value == "tar":
+        return True
+    if isinstance(value, str):
+        return False
+    if isinstance(value, (list, tuple, dict)):
+        for archive_type in value:
+            if archive_type == "tar":
+                return True
+            if archive_type != "zip":
+                return False
     return False
 
 
@@ -1709,8 +1720,8 @@ class KerasZipScanner(BaseScanner):
                     "key": key,
                     "module": redacted_module_value,
                     "cve_id": "CVE-2025-1550",
-                    "cvss": 9.8,
-                    "cwe": "CWE-502",
+                    "cvss": 7.3,
+                    "cwe": "CWE-94",
                     "description": (
                         "Arbitrary dangerous module references in .keras config can bypass safe_mode "
                         "and execute attacker-controlled code during model loading."
@@ -1737,8 +1748,8 @@ class KerasZipScanner(BaseScanner):
                     "key": key,
                     "module": redacted_module_value,
                     "cve_id": "CVE-2025-1550",
-                    "cvss": 9.8,
-                    "cwe": "CWE-502",
+                    "cvss": 7.3,
+                    "cwe": "CWE-94",
                     "description": (
                         "Non-allowlisted callable module references may indicate safe_mode bypass "
                         "paths in untrusted .keras config content."
@@ -1921,38 +1932,31 @@ class KerasZipScanner(BaseScanner):
                 continue
 
             direct_string_values: list[str] = []
-            url_candidate_values: list[str] = []
-            for key, value in node.items():
+            for value in node.values():
                 direct_string_values.extend(self._extract_string_literals(value))
-                key_lower = str(key).lower()
-                if key_lower in {"url", "origin", "args", "kwargs"}:
-                    url_candidate_values.extend(self._extract_string_literals(value, include_dict_values=True))
 
             has_get_file = _has_get_file_reference(direct_string_values)
-            if not has_get_file or not self._node_has_get_file_extract_true(node):
-                continue
-
-            archive_urls = [
-                value
-                for value in url_candidate_values
-                if _URL_PATTERN.search(value) is not None and _ARCHIVE_EXTRACT_URL_PATTERN.search(value) is not None
-            ]
-            if not archive_urls:
+            origin = self._node_get_file_origin(node)
+            if (
+                not has_get_file
+                or not self._node_has_get_file_tar_extraction_semantics(node)
+                or origin is None
+                or _URL_PATTERN.match(origin.strip()) is None
+            ):
                 continue
 
             result.add_check(
                 name="CVE-2025-12060: get_file Archive Extraction Traversal",
                 passed=False,
                 message=(
-                    "CVE-2025-12060: config.json contains keras.utils.get_file with extract=True "
-                    "and a remote tar archive URL"
+                    "CVE-2025-12060: config.json contains keras.utils.get_file with remote tar extraction enabled"
                 ),
                 severity=IssueSeverity.CRITICAL,
                 location=f"{self.current_file_path}/config.json",
                 details={
                     "cve_id": "CVE-2025-12060",
                     "context": context,
-                    "urls": [_redact_url_for_display(url) for url in archive_urls[:5]],
+                    "urls": [_redact_url_for_display(origin)],
                     "cvss": 8.8,
                     "cwe": "CWE-22",
                     "description": (
@@ -1969,21 +1973,52 @@ class KerasZipScanner(BaseScanner):
             return
 
     @staticmethod
-    def _node_has_get_file_extract_true(node: dict[str, Any]) -> bool:
-        """Return True only for direct get_file extract=True argument positions."""
-        if node.get("extract") is True:
-            return True
+    def _node_get_file_argument(node: dict[str, Any], name: str, position: int, default: Any) -> Any:
+        """Resolve one get_file argument from flattened, kwargs, or positional config forms."""
+        if name in node:
+            return node[name]
 
         kwargs = node.get("kwargs")
-        if isinstance(kwargs, dict) and kwargs.get("extract") is True:
-            return True
+        if isinstance(kwargs, dict) and name in kwargs:
+            return kwargs[name]
 
         args = node.get("args")
-        if isinstance(args, list | tuple):
-            # keras.utils.get_file positional args: fname, origin, untar, ..., extract.
-            return (len(args) > 2 and args[2] is True) or (len(args) > 7 and args[7] is True)
+        if isinstance(args, (list, tuple)) and len(args) > position:
+            return args[position]
 
-        return False
+        return default
+
+    @staticmethod
+    def _node_get_file_origin(node: dict[str, Any]) -> str | None:
+        """Return only the actual get_file origin argument, excluding other URL-valued fields."""
+        for container in (node, node.get("kwargs")):
+            if not isinstance(container, dict):
+                continue
+            for key in ("origin", "url"):
+                if key in container:
+                    value = container[key]
+                    return value if isinstance(value, str) else None
+
+        args = node.get("args")
+        if isinstance(args, (list, tuple)) and len(args) > 1:
+            value = args[1]
+            return value if isinstance(value, str) else None
+
+        return None
+
+    @staticmethod
+    def _node_has_get_file_tar_extraction_semantics(node: dict[str, Any]) -> bool:
+        """Return True when effective get_file arguments can extract a tar archive."""
+        untar = KerasZipScanner._node_get_file_argument(node, "untar", 2, False)
+        if bool(untar):
+            return True
+
+        extract = KerasZipScanner._node_get_file_argument(node, "extract", 7, False)
+        if not bool(extract):
+            return False
+
+        archive_format = KerasZipScanner._node_get_file_argument(node, "archive_format", 8, "auto")
+        return _archive_format_may_extract_tar(archive_format)
 
     def _check_unsafe_deserialization_bypass(self, model_config: Any, result: ScanResult) -> None:
         """Check for CVE-2025-9906: enable_unsafe_deserialization bypass in config.json.
