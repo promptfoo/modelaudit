@@ -143,6 +143,8 @@ modelaudit model.dvc
 - `GOOGLE_APPLICATION_CREDENTIALS` for GCS
 - `MLFLOW_TRACKING_URI` for MLflow registry access
 - `JFROG_API_TOKEN` or `JFROG_ACCESS_TOKEN` for JFrog Artifactory
+- `MODELAUDIT_JFROG_ALLOWED_HOSTS` for comma-separated custom JFrog hostnames that may receive credentials
+- `MODELAUDIT_JFROG_ALLOWED_REDIRECT_HOSTS` for comma-separated external redirect hostnames that may be downloaded without credentials
 - Store credentials in environment variables or a secrets manager, and never commit tokens/keys.
 
 ## Installation
