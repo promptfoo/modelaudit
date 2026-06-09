@@ -691,13 +691,18 @@ def test_scan_output_confirmation_escapes_terminal_controls(tmp_path: Path) -> N
     output_file = tmp_path / "report\nFORGED\x1b[2J.json"
     scan_result = create_mock_scan_result(files_scanned=1, issues=[])
 
-    with patch("modelaudit.cli.scan_model_directory_or_file", return_value=scan_result):
+    with (
+        patch("modelaudit.cli.scan_model_directory_or_file", return_value=scan_result),
+        patch("modelaudit.cli._preflight_output_text_file"),
+        patch("modelaudit.cli._write_output_text_file") as mock_write_output,
+    ):
         result = CliRunner().invoke(
             cli,
             ["scan", str(test_file), "--format", "json", "--output", str(output_file)],
         )
 
     assert result.exit_code == 0, result.output
+    assert mock_write_output.call_args.args[0] == str(output_file)
     assert "report\\nFORGED\\x1b[2J.json" in result.output
     assert "\nFORGED" not in result.output
     assert "\x1b" not in result.output
@@ -737,12 +742,12 @@ def test_scan_sbom_output(tmp_path):
         pytest.fail("SBOM output is not valid JSON")
 
 
-def test_scan_sbom_preserves_control_character_filename_identity(tmp_path: Path) -> None:
+def test_scan_sbom_preserves_format_character_filename_identity(tmp_path: Path) -> None:
     import hashlib
     import pickle
 
     content = pickle.dumps({"weights": [1, 2, 3]})
-    model_path = tmp_path / "model\nname.pkl"
+    model_path = tmp_path / "model\u202ename.pkl"
     model_path.write_bytes(content)
     sbom_file = tmp_path / "sbom.json"
     scan_result = create_mock_scan_result(
@@ -758,7 +763,7 @@ def test_scan_sbom_preserves_control_character_filename_identity(tmp_path: Path)
     assert result.exit_code == 0, result.output
     sbom = json.loads(sbom_file.read_text())
     component = next(component for component in sbom["components"] if component["name"] == model_path.name)
-    assert component["name"] == "model\nname.pkl"
+    assert component["name"] == "model\u202ename.pkl"
     assert component["hashes"] == [{"alg": "SHA-256", "content": hashlib.sha256(content).hexdigest()}]
 
 
@@ -2710,13 +2715,17 @@ def test_metadata_terminal_messages_escape_controls(tmp_path: Path) -> None:
     model_path.write_bytes(b"model")
     output_path = tmp_path / "metadata\nFORGED.json"
 
-    with patch("modelaudit.metadata_extractor.ModelMetadataExtractor.extract", return_value={}):
+    with (
+        patch("modelaudit.metadata_extractor.ModelMetadataExtractor.extract", return_value={}),
+        patch("modelaudit.cli._write_output_text_file") as mock_write_output,
+    ):
         result = CliRunner().invoke(
             cli,
             ["metadata", str(model_path), "--format", "json", "--output", str(output_path)],
         )
 
     assert result.exit_code == 0, result.output
+    assert mock_write_output.call_args.args[0] == str(output_path)
     assert "metadata\\nFORGED.json" in result.output
     assert "\nFORGED" not in result.output
 
@@ -2742,9 +2751,9 @@ def test_skipped_path_and_suppression_messages_escape_terminal_controls(
     )
 
     skipped_path = tmp_path / "skip\x1b[2J.py"
-    skipped_path.write_text("print('safe')")
 
-    assert cli_module._should_skip_non_model_file(str(skipped_path), runtime, verbose=True)
+    with patch("modelaudit.cli._local_path_will_be_scanned", return_value=False):
+        assert cli_module._should_skip_non_model_file(str(skipped_path), runtime, verbose=True)
     cli_module._announce_suppressed_preferred_scanners(
         [{"location": "archive\nFORGED.pkl", "scanner_id": "pickle\u202escanner"}]
     )
@@ -3013,7 +3022,7 @@ def test_scan_huggingface_metadata_preview_escapes_model_id(tmp_path: Path) -> N
         ),
         patch("shutil.rmtree"),
     ):
-        result = CliRunner().invoke(cli, ["scan", "--no-cache", "hf://org/model"])
+        result = CliRunner().invoke(cli, ["scan", "--no-cache", "--format", "text", "hf://org/model"])
 
     assert result.exit_code == 0, result.output
     assert "org/model\\nFORGED\\u202e" in result.output
@@ -4377,7 +4386,6 @@ def test_scan_path_state_preserves_local_asset_path_for_sbom() -> None:
 
 def test_progress_callback_escapes_model_controlled_messages(tmp_path: Path) -> None:
     model_path = tmp_path / "model\nname.pkl"
-    model_path.write_bytes(b"data")
 
     class _Stats:
         total_bytes = 0

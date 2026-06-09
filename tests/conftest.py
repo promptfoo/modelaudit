@@ -187,6 +187,7 @@ def pytest_runtest_setup(item):
             "test_oci_layer_scanner.py",  # OCI layer path safety regression tests
             "test_jfrog.py",  # JFrog utility tests
             "test_jfrog_integration.py",  # JFrog integration tests
+            "test_jfrog_redirect_security.py",  # JFrog redirect SSRF regression tests
             "test_mlflow_integration.py",  # MLflow integration tests
             "test_streaming_analysis.py",  # signed stream routing and fallback regressions
             "test_tar_scanner.py",  # TAR archive scanner tests
