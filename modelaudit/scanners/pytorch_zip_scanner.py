@@ -5,6 +5,7 @@ import io
 import logging
 import os
 import pickletools
+import posixpath
 import re
 import stat
 import tempfile
@@ -22,7 +23,7 @@ from ..scanner_results import (
     mark_inconclusive_scan_result,
 )
 from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
-from ..utils import sanitize_archive_path
+from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTES, _looks_like_proto0_or_1_pickle
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
@@ -133,6 +134,19 @@ _JIT_SCAN_MEMBER_MAX_BYTES = 32 * 1024 * 1024
 _PICKLE_DISCOVERY_LONG_PROBE_BYTES = PROTO0_1_MAX_PROBE_BYTES
 _NESTED_ZIP_HEADER_PROBE_BYTES = 4
 _ZIP_LOCAL_FILE_SIGNATURES: tuple[bytes, ...] = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+CRITICAL_SYSTEM_PATHS: tuple[str, ...] = (
+    "/etc",
+    "/bin",
+    "/usr",
+    "/var",
+    "/lib",
+    "/boot",
+    "/sys",
+    "/proc",
+    "/dev",
+    "/sbin",
+    "C:\\Windows",
+)
 
 
 @dataclass(frozen=True)
@@ -254,6 +268,7 @@ class PyTorchZipScanner(BaseScanner):
     MAX_COMPRESSION_RATIO: ClassVar[int] = 100  # 100:1 compression ratio threshold
     MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE: ClassVar[int] = 1024 * 1024
     MAX_ARCHIVE_ENTRIES: ClassVar[int] = 10000  # Maximum number of entries in archive
+    MAX_SYMLINK_TARGET_BYTES: ClassVar[int] = 64 * 1024
     MAX_VERSION_METADATA_BYTES: ClassVar[int] = 4096
     MAX_VERSION_JSON_BYTES: ClassVar[int] = 10 * 1024 * 1024
     DEFAULT_VERSION_PICKLE_PROBE_BYTES: ClassVar[int] = 1024 * 1024
@@ -654,6 +669,41 @@ class PyTorchZipScanner(BaseScanner):
             max_bytes=max_bytes,
         )
 
+    def _read_symlink_target(
+        self, zip_file: zipfile.ZipFile, info: zipfile.ZipInfo, result: ScanResult
+    ) -> tuple[str, bool]:
+        """Read a bounded ZIP symlink target and report whether it was complete."""
+        target = self._read_member_prefix(
+            zip_file,
+            info,
+            self.MAX_SYMLINK_TARGET_BYTES + 1,
+            phase="symlink_target_validation",
+            result=result,
+        )
+        target_complete = len(target) <= self.MAX_SYMLINK_TARGET_BYTES
+        bounded_target = target[: self.MAX_SYMLINK_TARGET_BYTES]
+        return bounded_target.decode("utf-8", errors="surrogateescape"), target_complete
+
+    @staticmethod
+    def _resolve_symlink_target(
+        target: str,
+        *,
+        resolved_name: str,
+        extraction_root: str,
+    ) -> tuple[str, bool]:
+        """Resolve a relative symlink target while enforcing the archive extraction root."""
+        if is_absolute_archive_path(target):
+            return target, False
+
+        normalized_target = target.replace("\\", os.sep).replace("/", os.sep)
+        target_base = os.path.dirname(resolved_name)
+        target_resolved = os.path.normpath(os.path.join(target_base, normalized_target))
+        try:
+            target_from_root = os.path.relpath(target_resolved, extraction_root)
+        except ValueError:
+            return target_resolved, False
+        return sanitize_archive_path(target_from_root, extraction_root)
+
     def _read_member_to_spooled_file(
         self,
         zip_file: zipfile.ZipFile,
@@ -838,7 +888,7 @@ class PyTorchZipScanner(BaseScanner):
                     duplicate_entry_collisions_found = True
 
             # Check for path traversal
-            _, is_safe = sanitize_archive_path(name, temp_base)
+            resolved_name, is_safe = sanitize_archive_path(name, temp_base)
             if not is_safe:
                 result.add_check(
                     name="Path Traversal Protection",
@@ -855,31 +905,101 @@ class PyTorchZipScanner(BaseScanner):
             is_symlink = (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK
             if is_symlink:
                 try:
-                    # Read only a bounded prefix (4KB) to avoid DoS from a
-                    # symlink entry that hides a large compressed payload.
-                    # Real symlink targets are short filesystem paths.
-                    target = self._read_member_prefix(
-                        zip_file,
-                        info,
-                        4096,
-                        phase="symlink_target_validation",
-                        result=result,
-                    ).decode("utf-8", "replace")
-                except Exception:
-                    target = "<unreadable>"
-                result.add_check(
-                    name="Symlink Safety Validation",
-                    passed=False,
-                    message=f"Symlink entry detected: {name} -> {target}",
-                    severity=IssueSeverity.WARNING,
-                    location=f"{path}:{name}",
-                    details={
-                        "entry": name,
-                        "target": target,
-                        "risk": "Symlinks in PyTorch models can be used for path traversal attacks",
-                    },
-                    why="Symlinks in model archives are unusual and may indicate an attack attempt",
+                    target, target_complete = self._read_symlink_target(zip_file, info, result)
+                except Exception as exc:
+                    reason = "pytorch_zip_symlink_target_read_incomplete"
+                    mark_inconclusive_scan_result(result, reason)
+                    result.add_check(
+                        name="Symlink Safety Validation",
+                        passed=False,
+                        message=f"Unable to read symlink target for {name}: {exc!s}",
+                        severity=IssueSeverity.INFO,
+                        rule_code="S902",
+                        location=f"{path}:{name}",
+                        details={
+                            "entry": name,
+                            "exception": str(exc),
+                            "exception_type": type(exc).__name__,
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": reason,
+                        },
+                    )
+                    symlink_issues_found = True
+                    continue
+
+                safe_target = redact_evidence_string(target, max_chars=1024)
+                if not target_complete:
+                    result.add_check(
+                        name="Symlink Safety Validation",
+                        passed=False,
+                        message=f"Symlink {name} has an invalid target that exceeds the maximum length",
+                        severity=IssueSeverity.CRITICAL,
+                        rule_code="S406",
+                        location=f"{path}:{name}",
+                        details={"entry": name, "target": safe_target, "target_class": "invalid"},
+                    )
+                    symlink_issues_found = True
+                    continue
+
+                if not target or "\x00" in target:
+                    invalid_reason = "empty" if not target else "contains a NUL byte"
+                    result.add_check(
+                        name="Symlink Safety Validation",
+                        passed=False,
+                        message=f"Symlink {name} has an invalid target that {invalid_reason}",
+                        severity=IssueSeverity.CRITICAL,
+                        rule_code="S406",
+                        location=f"{path}:{name}",
+                        details={"entry": name, "target": safe_target, "target_class": "invalid"},
+                    )
+                    symlink_issues_found = True
+                    continue
+
+                _target_resolved, target_safe = self._resolve_symlink_target(
+                    target,
+                    resolved_name=resolved_name,
+                    extraction_root=temp_base,
                 )
+                normalized_absolute_target = posixpath.normpath(target.replace("\\", "/"))
+                targets_critical_system_path = is_absolute_archive_path(target) and is_critical_system_path(
+                    normalized_absolute_target,
+                    CRITICAL_SYSTEM_PATHS,
+                )
+                if not target_safe:
+                    if targets_critical_system_path:
+                        message = f"Symlink {name} points to critical system path: {safe_target}"
+                        target_class = "critical_system_path"
+                    else:
+                        message = f"Symlink {name} resolves outside extraction directory"
+                        target_class = "external"
+                    result.add_check(
+                        name="Symlink Safety Validation",
+                        passed=False,
+                        message=message,
+                        severity=IssueSeverity.CRITICAL,
+                        rule_code="S406",
+                        location=f"{path}:{name}",
+                        details={"entry": name, "target": safe_target, "target_class": target_class},
+                    )
+                elif targets_critical_system_path:
+                    result.add_check(
+                        name="Symlink Safety Validation",
+                        passed=False,
+                        message=f"Symlink {name} points to critical system path: {safe_target}",
+                        severity=IssueSeverity.CRITICAL,
+                        rule_code="S408",
+                        location=f"{path}:{name}",
+                        details={"entry": name, "target": safe_target, "target_class": "critical_system_path"},
+                    )
+                else:
+                    result.add_check(
+                        name="Symlink Safety Validation",
+                        passed=True,
+                        message=f"Symlink {name} is safe",
+                        location=f"{path}:{name}",
+                        rule_code=None,
+                        details={"entry": name, "target": safe_target, "target_class": "safe"},
+                    )
                 symlink_issues_found = True
                 continue
 

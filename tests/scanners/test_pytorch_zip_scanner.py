@@ -1,5 +1,6 @@
 import json
 import pickle
+import stat
 import struct
 import time
 import warnings
@@ -111,6 +112,17 @@ def _write_zip_with_duplicate_data_pkl(zip_path: Path, first_payload: bytes, sec
             zipf.writestr("version", "3")
             zipf.writestr("data.pkl", first_payload)
             zipf.writestr("data.pkl", second_payload)
+
+
+def _write_pytorch_zip_with_symlink(zip_path: Path, link_name: str, target: str | bytes) -> None:
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        symlink_info = zipfile.ZipInfo(link_name)
+        symlink_info.create_system = 3
+        symlink_info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        symlink_info.compress_type = zipfile.ZIP_STORED
+        zipf.writestr(symlink_info, target)
 
 
 def _assert_standard_cve_details(details: dict[str, object], cve_id: str, detected_version: str) -> None:
@@ -6732,18 +6744,15 @@ def test_pytorch_zip_entry_validation_checks_timeout_between_members(
     scanner = PyTorchZipScanner(config={"max_archive_entries": 3})
     checked_members: list[str] = []
     timeout_checks = 0
-    original_read_member_prefix = scanner._read_member_prefix
+    original_read_symlink_target = scanner._read_symlink_target
 
-    def track_member_read(
+    def track_symlink_read(
         zip_file: zipfile.ZipFile,
-        name: str | zipfile.ZipInfo,
-        limit: int,
-        *,
-        phase: str,
+        info: zipfile.ZipInfo,
         result: ScanResult,
-    ) -> bytes:
-        checked_members.append(name.filename if isinstance(name, zipfile.ZipInfo) else name)
-        return original_read_member_prefix(zip_file, name, limit, phase=phase, result=result)
+    ) -> tuple[str, bool]:
+        checked_members.append(info.filename)
+        return original_read_symlink_target(zip_file, info, result)
 
     def check_timeout() -> None:
         nonlocal timeout_checks
@@ -6751,7 +6760,7 @@ def test_pytorch_zip_entry_validation_checks_timeout_between_members(
         if timeout_checks == 2:
             raise TimeoutError("entry validation deadline exceeded")
 
-    monkeypatch.setattr(scanner, "_read_member_prefix", track_member_read)
+    monkeypatch.setattr(scanner, "_read_symlink_target", track_symlink_read)
     monkeypatch.setattr(scanner, "_check_timeout", check_timeout)
 
     result = scanner.scan(str(zip_path))
@@ -7235,7 +7244,193 @@ def test_pytorch_zip_scanner_compression_ratio_passes(tmp_path):
     assert all(c.status == CheckStatus.PASSED for c in ratio_checks)
 
 
-def test_pytorch_zip_scanner_symlink_detection(tmp_path):
+@pytest.mark.parametrize(
+    ("link_name", "target", "message_fragment", "target_class"),
+    [
+        ("models/link", "../../outside.bin", "resolves outside extraction directory", "external"),
+        ("models/link", "..\\..\\outside.bin", "resolves outside extraction directory", "external"),
+        ("models/link", "/tmp/outside-model.bin", "resolves outside extraction directory", "external"),
+        ("models/link", "\\\\server\\share\\model.bin", "resolves outside extraction directory", "external"),
+        ("models/link", "/etc/passwd", "points to critical system path", "critical_system_path"),
+        ("models/link", "/tmp/../etc/passwd", "points to critical system path", "critical_system_path"),
+        ("models/link", "/etc/../tmp/benign", "resolves outside extraction directory", "external"),
+        ("models/link", "C:\\Windows\\System32\\config\\SAM", "points to critical system path", "critical_system_path"),
+    ],
+)
+def test_pytorch_zip_symlink_unsafe_targets_are_critical(
+    tmp_path: Path,
+    link_name: str,
+    target: str,
+    message_fragment: str,
+    target_class: str,
+) -> None:
+    zip_path = tmp_path / "unsafe-link-target.pt"
+    _write_pytorch_zip_with_symlink(zip_path, link_name, target)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert result.success is False
+    symlink_checks = [
+        check
+        for check in result.checks
+        if check.name == "Symlink Safety Validation" and check.details.get("entry") == link_name
+    ]
+    assert len(symlink_checks) == 1
+    assert symlink_checks[0].status == CheckStatus.FAILED
+    assert symlink_checks[0].severity == IssueSeverity.CRITICAL
+    assert symlink_checks[0].rule_code == "S406"
+    assert message_fragment in symlink_checks[0].message
+    assert symlink_checks[0].details == {
+        "entry": link_name,
+        "target": target,
+        "target_class": target_class,
+    }
+
+
+def test_pytorch_zip_symlink_parent_near_match_inside_archive_is_safe(tmp_path: Path) -> None:
+    zip_path = tmp_path / "safe-parent-target.pt"
+    _write_pytorch_zip_with_symlink(zip_path, "models/link", "safe/../target.bin")
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    symlink_checks = [
+        check
+        for check in result.checks
+        if check.name == "Symlink Safety Validation" and check.details.get("entry") == "models/link"
+    ]
+    assert len(symlink_checks) == 1
+    assert symlink_checks[0].status == CheckStatus.PASSED
+    assert symlink_checks[0].details == {
+        "entry": "models/link",
+        "target": "safe/../target.bin",
+        "target_class": "safe",
+    }
+    assert not any(check.rule_code in {"S406", "S408"} for check in result.checks)
+    assert not any(issue.rule_code in {"S406", "S408"} for issue in result.issues)
+
+
+def test_pytorch_zip_symlink_parent_target_inside_archive_root_is_safe(tmp_path: Path) -> None:
+    zip_path = tmp_path / "safe-parent-directory-target.pt"
+    _write_pytorch_zip_with_symlink(zip_path, "models/link", "../target.bin")
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    symlink_check = next(
+        check
+        for check in result.checks
+        if check.name == "Symlink Safety Validation" and check.details.get("entry") == "models/link"
+    )
+    assert symlink_check.status == CheckStatus.PASSED
+    assert symlink_check.details["target_class"] == "safe"
+    assert not any(issue.rule_code in {"S406", "S408"} for issue in result.issues)
+
+
+@pytest.mark.parametrize(("target", "reason"), [(b"", "empty"), (b"safe\x00outside", "NUL byte")])
+def test_pytorch_zip_symlink_invalid_targets_are_critical(tmp_path: Path, target: bytes, reason: str) -> None:
+    zip_path = tmp_path / "invalid-link-target.pt"
+    _write_pytorch_zip_with_symlink(zip_path, "models/link", target)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    symlink_check = next(
+        check
+        for check in result.checks
+        if check.name == "Symlink Safety Validation" and check.details.get("entry") == "models/link"
+    )
+    assert symlink_check.status == CheckStatus.FAILED
+    assert symlink_check.severity == IssueSeverity.CRITICAL
+    assert symlink_check.rule_code == "S406"
+    assert reason in symlink_check.message
+    assert symlink_check.details["target_class"] == "invalid"
+
+
+def test_pytorch_zip_symlink_non_utf8_safe_target_is_classified(tmp_path: Path) -> None:
+    zip_path = tmp_path / "non-utf8-safe-link-target.pt"
+    _write_pytorch_zip_with_symlink(zip_path, "models/link", b"safe-\xff-target")
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    symlink_check = next(
+        check
+        for check in result.checks
+        if check.name == "Symlink Safety Validation" and check.details.get("entry") == "models/link"
+    )
+    assert symlink_check.status == CheckStatus.PASSED
+    assert symlink_check.rule_code is None
+    assert symlink_check.details["target_class"] == "safe"
+    assert not any(check.rule_code in {"S406", "S408", "S902"} for check in result.checks)
+    assert "pytorch_zip_symlink_target_read_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_pytorch_zip_symlink_non_utf8_external_target_is_critical(tmp_path: Path) -> None:
+    zip_path = tmp_path / "non-utf8-external-link-target.pt"
+    _write_pytorch_zip_with_symlink(zip_path, "models/link", b"../../outside-\xff")
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    symlink_check = next(
+        check
+        for check in result.checks
+        if check.name == "Symlink Safety Validation" and check.details.get("entry") == "models/link"
+    )
+    assert symlink_check.status == CheckStatus.FAILED
+    assert symlink_check.severity == IssueSeverity.CRITICAL
+    assert symlink_check.rule_code == "S406"
+    assert symlink_check.details["target_class"] == "external"
+    assert not any(check.rule_code == "S902" for check in result.checks)
+    assert "pytorch_zip_symlink_target_read_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_pytorch_zip_symlink_target_evidence_is_bounded(tmp_path: Path) -> None:
+    zip_path = tmp_path / "long-link-target.pt"
+    target = "../../" + ("secret/" * 300)
+    _write_pytorch_zip_with_symlink(zip_path, "models/link", target)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    symlink_check = next(
+        check
+        for check in result.checks
+        if check.name == "Symlink Safety Validation" and check.details.get("entry") == "models/link"
+    )
+    assert symlink_check.status == CheckStatus.FAILED
+    assert symlink_check.rule_code == "S406"
+    assert len(str(symlink_check.details["target"])) <= 1024
+
+
+def test_pytorch_zip_symlink_target_at_size_limit_is_safe(tmp_path: Path) -> None:
+    zip_path = tmp_path / "maximum-size-link-target.pt"
+    target = b"a" * PyTorchZipScanner.MAX_SYMLINK_TARGET_BYTES
+    _write_pytorch_zip_with_symlink(zip_path, "models/link", target)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    symlink_check = next(check for check in result.checks if check.name == "Symlink Safety Validation")
+    assert symlink_check.status == CheckStatus.PASSED
+    assert symlink_check.rule_code is None
+    assert symlink_check.details["target_class"] == "safe"
+    assert not any(check.rule_code in {"S406", "S408", "S902"} for check in result.checks)
+
+
+def test_pytorch_zip_oversized_symlink_target_is_critical(tmp_path: Path) -> None:
+    zip_path = tmp_path / "oversized-link-target.pt"
+    target = b"../../outside/" + b"a" * PyTorchZipScanner.MAX_SYMLINK_TARGET_BYTES
+    _write_pytorch_zip_with_symlink(zip_path, "models/link", target)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert result.success is False
+    symlink_check = next(check for check in result.checks if check.name == "Symlink Safety Validation")
+    assert symlink_check.status == CheckStatus.FAILED
+    assert symlink_check.severity == IssueSeverity.CRITICAL
+    assert symlink_check.rule_code == "S406"
+    assert symlink_check.details["target_class"] == "invalid"
+    assert len(str(symlink_check.details["target"])) <= 1024
+    assert not any(check.rule_code == "S902" for check in result.checks)
+    assert "pytorch_zip_symlink_target_read_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_pytorch_zip_scanner_symlink_detection(tmp_path: Path) -> None:
     """Test that scanner detects symlinks in archives."""
 
     zip_path = tmp_path / "model.pt"
@@ -7257,13 +7452,15 @@ def test_pytorch_zip_scanner_symlink_detection(tmp_path):
     scanner = PyTorchZipScanner()
     result = scanner.scan(str(zip_path))
 
-    # Should have warning about symlink
-    symlink_issues = [i for i in result.issues if "symlink" in i.message.lower()]
-    assert len(symlink_issues) > 0
-    assert symlink_issues[0].severity == IssueSeverity.WARNING
+    symlink_checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+    assert len(symlink_checks) == 1
+    assert symlink_checks[0].status == CheckStatus.FAILED
+    assert symlink_checks[0].severity == IssueSeverity.CRITICAL
+    assert symlink_checks[0].rule_code == "S406"
+    assert symlink_checks[0].details["target_class"] == "critical_system_path"
 
 
-def test_pytorch_zip_scanner_no_symlinks_passes(tmp_path):
+def test_pytorch_zip_scanner_no_symlinks_passes(tmp_path: Path) -> None:
     """Test that scanner passes when no symlinks are present."""
     zip_path = tmp_path / "model.pt"
 
@@ -7311,7 +7508,7 @@ def test_pytorch_zip_scanner_combined_security_controls(tmp_path: Path) -> None:
     # Symlink should also trigger independently
     symlink_issues = [i for i in result.issues if "symlink" in i.message.lower()]
     assert len(symlink_issues) > 0
-    assert symlink_issues[0].severity == IssueSeverity.WARNING
+    assert symlink_issues[0].severity == IssueSeverity.CRITICAL
 
 
 def test_pytorch_zip_version_extraction_returns_metadata_when_present(monkeypatch: pytest.MonkeyPatch) -> None:
