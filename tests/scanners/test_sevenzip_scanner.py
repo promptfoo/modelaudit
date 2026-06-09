@@ -34,6 +34,7 @@ from modelaudit.scanners.sevenzip_scanner import (
     _RecursiveScanBudget,
 )
 from modelaudit.scanners.xgboost_scanner import XGBoostScanner
+from modelaudit.utils.file.detection import PICKLE_ROUTING_INCONCLUSIVE_FORMAT
 
 # Skip all tests if py7zr is not available for asset generation
 pytest_plugins: list[str] = []
@@ -1044,6 +1045,114 @@ class TestSevenZipScanner:
             issue = bomb_issues[0]
             assert issue.severity == IssueSeverity.CRITICAL
             assert "zip_bomb" in str(issue.details)
+
+    def test_max_entries_protection_uses_bounded_member_metadata(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
+        """Entry limits should fail closed without copying the complete 7z name table."""
+        scanner.max_entries = 2
+
+        class SizedMemberSource(list[object]):
+            def __iter__(self) -> Generator[object, None, None]:
+                raise AssertionError("oversized sized metadata should not be iterated")
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+        ):
+            mock_archive = MagicMock()
+            mock_archive.files = SizedMemberSource([object(), object(), object(), object()])
+            mock_archive.getnames.side_effect = AssertionError("getnames should not materialize all member names")
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+        assert result.success is False
+        mock_archive.getnames.assert_not_called()
+        mock_archive.extract.assert_not_called()
+        limit_check = next(check for check in result.checks if check.name == "Archive Entry Limit")
+        assert limit_check.status == CheckStatus.FAILED
+        assert limit_check.details["file_count"] == 4
+        assert limit_check.details["limit"] == 2
+        assert result.metadata["total_files"] == 4
+
+    def test_bounded_member_metadata_stops_unsized_source_at_limit(self, scanner: SevenZipScanner) -> None:
+        """Unsized member sources should consume at most one entry beyond the configured limit."""
+        scanner.max_entries = 2
+        observed: list[str] = []
+
+        def members() -> Generator[str, None, None]:
+            for name in ("one.pkl", "two.pkl", "three.pkl", "four.pkl"):
+                observed.append(name)
+                yield name
+
+        archive = MagicMock()
+        archive.files = members()
+
+        names, count, exceeded = scanner._bounded_archive_file_names(archive)
+
+        assert names == ["one.pkl", "two.pkl", "three.pkl"]
+        assert count == 3
+        assert exceeded is True
+        assert observed == names
+
+    def test_bounded_member_metadata_does_not_trust_underreported_length(self, scanner: SevenZipScanner) -> None:
+        """Iteration must retain the entry bound even when metadata length is inconsistent."""
+        scanner.max_entries = 2
+
+        class UnderreportedMemberSource:
+            def __len__(self) -> int:
+                return 1
+
+            def __iter__(self) -> Generator[str, None, None]:
+                yield from ("one.pkl", "two.pkl", "three.pkl", "four.pkl")
+
+        archive = MagicMock()
+        archive.files = UnderreportedMemberSource()
+
+        names, count, exceeded = scanner._bounded_archive_file_names(archive)
+
+        assert names == ["one.pkl", "two.pkl", "three.pkl"]
+        assert count == 3
+        assert exceeded is True
+
+    def test_real_py7zr_metadata_api_change_fails_closed(self, scanner: SevenZipScanner) -> None:
+        """A future py7zr metadata rename must not fall back to eager name collection."""
+
+        class MissingMetadataArchive:
+            __module__ = "py7zr.compat"
+
+            @staticmethod
+            def getnames() -> list[str]:
+                raise AssertionError("getnames must not materialize all member names")
+
+        with pytest.raises(ValueError, match="did not expose a bounded member source"):
+            scanner._bounded_archive_file_names(MissingMetadataArchive())
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_real_archive_entry_limit_does_not_call_getnames(
+        self,
+        scanner: SevenZipScanner,
+        temp_7z_file: str,
+    ) -> None:
+        """Supported py7zr archives expose sized metadata, so eager name collection is unnecessary."""
+        import py7zr  # type: ignore[import-untyped]
+
+        with py7zr.SevenZipFile(temp_7z_file, "w") as archive:
+            archive.writestr(b"one", "one.txt")
+            archive.writestr(b"two", "two.txt")
+            archive.writestr(b"three", "three.txt")
+
+        scanner.max_entries = 2
+        with patch.object(py7zr.SevenZipFile, "getnames", side_effect=AssertionError("getnames must not be called")):
+            result = scanner.scan(temp_7z_file)
+
+        assert result.success is False
+        limit_check = next(check for check in result.checks if check.name == "Archive Entry Limit")
+        assert limit_check.details["file_count"] == 3
+        assert result.metadata["total_files"] == 3
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_scan_with_mixed_content(self, scanner, temp_7z_file):
@@ -2673,6 +2782,21 @@ class TestSevenZipScannerHardening:
         probe = io.BytesIO(b"cposix\nsystem\n(S'echo hidden'\ntR.")
 
         assert scanner._probe_detected_format(probe) == "pickle"
+
+    def test_probe_detected_format_recognizes_protocolless_binary_pickle(self) -> None:
+        """7z nested probes should route malicious binary pickles without PROTO."""
+        scanner = SevenZipScanner()
+        probe = io.BytesIO(
+            (b"\x8c\x01x0" * 8) + b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94\x8c\x02id\x94\x85\x94R\x94."
+        )
+
+        assert scanner._probe_detected_format(probe) == "pickle"
+
+    def test_probe_detected_format_fails_closed_at_protocolless_pickle_prefix_budget(self) -> None:
+        scanner = SevenZipScanner()
+        probe = io.BytesIO(b"\x8c\x01x0" * (scanner._NESTED_MEMBER_PROBE_BYTES // 4))
+
+        assert scanner._probe_detected_format(probe) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
 
     def test_probe_detected_format_recognizes_extensionless_xgboost_ubjson(self) -> None:
         """7z nested probes should retain extensionless XGBoost UBJSON members."""

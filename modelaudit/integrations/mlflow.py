@@ -12,11 +12,18 @@ from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import unquote
 
 from ..detectors.network_comm import _redact_urls_in_text
 from ..models import Check, CheckStatus, Issue, IssueSeverity, ModelAuditResultModel, create_initial_audit_result
-from ..scanners._evidence_redaction import redact_evidence_string, redact_evidence_value
-from ..utils.sources.cloud_storage import redact_cloud_error_for_display
+from ..scanners._evidence_redaction import (
+    MAX_PERCENT_DECODE_PASSES,
+    MAX_REDACTION_VALUE_DEPTH,
+    SENSITIVE_CONTAINER_KEY,
+    redact_evidence_string,
+    redact_evidence_value,
+)
+from ..utils.sources.cloud_storage import redact_cloud_error_for_display, redact_url_for_display
 
 logger = logging.getLogger(__name__)
 
@@ -26,12 +33,32 @@ _MAX_MLFLOW_ERROR_DISPLAY_CHARS = 512
 _MLFLOW_COPY_CHUNK_SIZE = 1024 * 1024
 _OS_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 _IS_WINDOWS = os.name == "nt"
+_MLFLOW_SENSITIVE_KEY = rf"(?:{SENSITIVE_CONTAINER_KEY}|credentials?|jwt|session)"
 _MLFLOW_SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"(?ix)"
     r"(?P<prefix>(?<![\w-])[\"']?"
-    r"(?:authorization|proxy-authorization|access[_-]?key|access[_-]?token|api[_-]?key|credential|password|secret|token)"
+    rf"{_MLFLOW_SENSITIVE_KEY}"
     r"[\"']?\s*[:=]\s*)"
-    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:(?:bearer|basic|token)\s+)?[^\s,;}\]]+)"
+    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:(?:bearer|basic|token)\s+)?[^\s,;&}\]]+)"
+)
+_MLFLOW_BRACKETED_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?ix)"
+    r"(?P<prefix>(?<![\w-])(?:[a-z_][\w-]*\.)*(?:headers?|params?|query)\s*\[\s*[\"']?"
+    rf"(?:{_MLFLOW_SENSITIVE_KEY}|key)[\"']?\s*\]\s*[:=]\s*)"
+    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:(?:bearer|basic|token)\s+)?[^\s,;&}\]]+)"
+)
+_MLFLOW_SENSITIVE_CONTAINER_PREFIX_RE = re.compile(
+    r"(?ix)"
+    r"(?P<prefix>(?<![\w-])[\"']?"
+    rf"{_MLFLOW_SENSITIVE_KEY}"
+    r"[\"']?\s*[:=]\s*)"
+    r"(?P<open>[({\[])",
+)
+_MLFLOW_PROTOCOL_RELATIVE_URL_RE = re.compile(
+    r"(?i)(?:(?:[\\/]|%(?:25)*(?:2f|5c)){2,})[^\s\"'<>]+",
+)
+_MLFLOW_BENIGN_AUTH_CONTEXT_RE = re.compile(
+    r"(?i)\b(?:bearer|basic|token)(?=\s+(?:authentication|endpoint|refresh|service)\b)",
 )
 
 
@@ -134,8 +161,11 @@ def _mlflow_budget_failure_result(model_uri: str, message: str, details: dict[st
     result.scanner_names = ["mlflow"]
     result.has_errors = True
     result.success = False
-    safe_model_uri = redact_evidence_string(model_uri, max_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
-    safe_details = redact_evidence_value(details, max_string_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
+    safe_model_uri = _redact_mlflow_detail_value_for_display(model_uri)
+    safe_details = redact_evidence_value(
+        _redact_mlflow_detail_value_for_display(details),
+        max_string_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS,
+    )
 
     why = (
         "ModelAudit cannot safely acquire this MLflow artifact within the configured scan budget. "
@@ -167,17 +197,146 @@ def _mlflow_budget_failure_result(model_uri: str, message: str, details: dict[st
 
 
 def _redact_mlflow_error_for_display(error: object) -> str:
-    redacted = redact_cloud_error_for_display(_redact_urls_in_text(str(error)))
-
     def _replace_sensitive_value(match: re.Match[str]) -> str:
         value = match.group("value")
         quote = value[0] if value[:1] in {'"', "'"} else ""
         return f"{match.group('prefix')}{quote}<redacted>{quote}"
 
+    def _redact_protocol_relative_url(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        decoded = candidate
+        for _ in range(MAX_PERCENT_DECODE_PASSES):
+            next_decoded = unquote(decoded)
+            if next_decoded == decoded:
+                break
+            decoded = next_decoded
+
+        normalized = decoded.replace("\\/", "/").replace("\\", "/")
+        if len(normalized) - len(normalized.lstrip("/")) < 2:
+            return candidate
+        normalized = f"//{normalized.lstrip('/')}"
+        authority = normalized[2:].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+        if "@" not in authority:
+            return candidate
+
+        safe_url = redact_url_for_display(f"https:{normalized}")
+        return safe_url.removeprefix("https:")
+
+    def _redact_sensitive_containers(text: str) -> str:
+        parts: list[str] = []
+        cursor = 0
+        closing_delimiters = {"(": ")", "[": "]", "{": "}"}
+
+        while match := _MLFLOW_SENSITIVE_CONTAINER_PREFIX_RE.search(text, cursor):
+            parts.append(text[cursor : match.start()])
+            parts.append(f"{match.group('prefix')}<redacted>")
+            stack = [closing_delimiters[match.group("open")]]
+            quote: str | None = None
+            escaped = False
+            index = match.end()
+
+            while index < len(text) and stack:
+                character = text[index]
+                if quote is not None:
+                    if escaped:
+                        escaped = False
+                    elif character == "\\":
+                        escaped = True
+                    elif character == quote:
+                        quote = None
+                elif character in {'"', "'"}:
+                    quote = character
+                elif character in closing_delimiters:
+                    if len(stack) >= MAX_REDACTION_VALUE_DEPTH:
+                        index = len(text)
+                        break
+                    stack.append(closing_delimiters[character])
+                elif character == stack[-1]:
+                    stack.pop()
+                index += 1
+
+            if stack:
+                cursor = len(text)
+                break
+            cursor = index
+
+        parts.append(text[cursor:])
+        return "".join(parts)
+
+    redacted = _MLFLOW_PROTOCOL_RELATIVE_URL_RE.sub(_redact_protocol_relative_url, str(error))
+    redacted = _redact_sensitive_containers(redacted)
+    redacted = _MLFLOW_BRACKETED_SENSITIVE_ASSIGNMENT_RE.sub(_replace_sensitive_value, redacted)
     redacted = _MLFLOW_SENSITIVE_ASSIGNMENT_RE.sub(_replace_sensitive_value, redacted)
+    contains_url = bool(
+        re.search(r"(?i)(?:\b[a-z][a-z0-9+.-]*://|\bmodels:/)", redacted)
+        or _MLFLOW_PROTOCOL_RELATIVE_URL_RE.search(redacted)
+    )
+    if contains_url:
+        redacted = redact_cloud_error_for_display(_redact_urls_in_text(redacted))
+    redacted = _MLFLOW_PROTOCOL_RELATIVE_URL_RE.sub(_redact_protocol_relative_url, redacted)
+    redacted = _MLFLOW_BRACKETED_SENSITIVE_ASSIGNMENT_RE.sub(_replace_sensitive_value, redacted)
+    redacted = _MLFLOW_SENSITIVE_ASSIGNMENT_RE.sub(_replace_sensitive_value, redacted)
+
+    benign_auth_contexts: list[tuple[str, str]] = []
+
+    def _protect_benign_auth_context(match: re.Match[str]) -> str:
+        placeholder = f"MODELAUDITMLFLOWSAFECONTEXT{len(benign_auth_contexts)}"
+        benign_auth_contexts.append((placeholder, match.group(0)))
+        return placeholder
+
+    redacted = _MLFLOW_BENIGN_AUTH_CONTEXT_RE.sub(_protect_benign_auth_context, redacted)
+    if contains_url:
+        redacted = redact_evidence_string(redacted, max_chars=None)
+    else:
+        redacted = "&".join(redact_evidence_string(part, max_chars=None) for part in redacted.split("&"))
+    for placeholder, original in benign_auth_contexts:
+        redacted = redacted.replace(placeholder, original)
+
     if len(redacted) <= _MAX_MLFLOW_ERROR_DISPLAY_CHARS:
         return redacted
     return f"{redacted[: _MAX_MLFLOW_ERROR_DISPLAY_CHARS - 3]}..."
+
+
+def _mlflow_text_requires_specialized_redaction(text: str) -> bool:
+    if "models:/" in text.lower():
+        return True
+    if _MLFLOW_BRACKETED_SENSITIVE_ASSIGNMENT_RE.search(text) or _MLFLOW_SENSITIVE_CONTAINER_PREFIX_RE.search(text):
+        return True
+    for match in _MLFLOW_PROTOCOL_RELATIVE_URL_RE.finditer(text):
+        candidate = match.group(0)
+        if candidate.startswith("//") and re.search(r"(?i)[a-z][a-z0-9+.-]*:$", text[: match.start()]):
+            continue
+        decoded = candidate
+        for _ in range(MAX_PERCENT_DECODE_PASSES):
+            next_decoded = unquote(decoded)
+            if next_decoded == decoded:
+                break
+            decoded = next_decoded
+        normalized = decoded.replace("\\/", "/").replace("\\", "/")
+        authority = normalized.lstrip("/").split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+        if "@" in authority:
+            return True
+    return False
+
+
+def _redact_mlflow_detail_value_for_display(value: Any, *, depth: int = 0) -> Any:
+    if depth >= MAX_REDACTION_VALUE_DEPTH:
+        return "<redacted>"
+    if isinstance(value, str):
+        specialized = (
+            _redact_mlflow_error_for_display(value) if _mlflow_text_requires_specialized_redaction(value) else value
+        )
+        return redact_evidence_string(specialized, max_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
+    if isinstance(value, dict):
+        return {
+            key: _redact_mlflow_detail_value_for_display(nested_value, depth=depth + 1)
+            for key, nested_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_mlflow_detail_value_for_display(item, depth=depth + 1) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_mlflow_detail_value_for_display(item, depth=depth + 1) for item in value)
+    return value
 
 
 def _terminal_mlflow_artifact_repository(artifact_repository: Any) -> Any | None:
@@ -1288,7 +1447,7 @@ def scan_mlflow_model(
     download_dir, cleanup_download_dir = _prepare_download_dir(model_uri, scan_cache_dir)
 
     try:
-        logger.debug(f"Downloading MLflow model {model_uri} to {download_dir}")
+        logger.debug(f"Downloading MLflow model {_redact_mlflow_error_for_display(model_uri)} to {download_dir}")
         if isinstance(download_plan, _MlflowDownloadPlan):
             download_result = _download_preflighted_mlflow_artifacts(
                 download_plan,

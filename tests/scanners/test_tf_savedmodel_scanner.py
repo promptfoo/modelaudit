@@ -1691,6 +1691,35 @@ def test_savedmodel_metadata_redacts_signature_and_tensor_identifiers(tmp_path: 
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_metadata_extraction_failure_redacts_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    importlib.import_module("modelaudit.protos")
+    from tensorflow.core.protobuf import saved_model_pb2
+
+    raw_secret = "OPAQUE_MODEL_CONTROLLED_METADATA_FAILURE"
+    model_dir = tmp_path / "metadata_failure"
+    model_dir.mkdir()
+    (model_dir / "saved_model.pb").write_bytes(b"model-controlled-content")
+
+    class FailingSavedModel:
+        def ParseFromString(self, _content: bytes) -> None:
+            raise ValueError(raw_secret)
+
+    monkeypatch.setattr(saved_model_pb2, "SavedModel", FailingSavedModel)
+
+    metadata = tf_savedmodel_module.TensorFlowSavedModelScanner(
+        config={"allow_metadata_deserialization": True}
+    ).extract_metadata(str(model_dir))
+
+    assert metadata["extraction_error"] == "<redacted>"
+    assert raw_secret not in repr(metadata)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_savedmodel_protobuf_string_details_preserve_public_context(tmp_path: Path) -> None:
     model_path = _create_test_savedmodel_with_scoped_nodes(
         tmp_path,

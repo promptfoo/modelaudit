@@ -2304,6 +2304,6 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 metadata["tag_sets"] = _redact_savedmodel_detail_value(tag_sets)
 
         except Exception as e:
-            metadata["extraction_error"] = _redact_savedmodel_detail_string(e, max_chars=500)
+            metadata["extraction_error"] = redact_untrusted_error_message(e)
 
         return metadata

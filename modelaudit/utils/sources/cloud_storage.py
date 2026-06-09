@@ -1619,6 +1619,8 @@ def _detect_cloud_content_route_format(
         prefix[:16],
         max(size, len(prefix)),
         None,
+        pickle_probe_sample=prefix,
+        pickle_probe_is_prefix=not size_is_known,
     )
     if (
         detected_format == "unknown"

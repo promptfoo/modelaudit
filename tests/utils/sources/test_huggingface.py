@@ -682,6 +682,15 @@ class TestModelDownload:
                 "safetensors",
             ),
             (pickle.dumps({"weights": [1, 2, 3]}, protocol=0), "pickle"),
+            (
+                (b"\x8c\x01x0" * 8) + b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94\x8c\x02id\x94\x85\x94R\x94.",
+                "pickle",
+            ),
+            (
+                (b"\x8c\x01x0" * ((8 * 1024) // 4))
+                + b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94\x8c\x02id\x94\x85\x94R\x94.",
+                "pickle",
+            ),
             (_make_tar_payload(), "tar"),
             (b"\x0a\x07version\x0a\x03uidCompositeFunction", "cntk"),
             (
@@ -713,6 +722,8 @@ class TestModelDownload:
         ids=[
             "safetensors",
             "protocol0-pickle",
+            "delayed-protocolless-binary-pickle",
+            "protocolless-binary-pickle-beyond-probe-budget",
             "tar",
             "cntk",
             "lightgbm",
