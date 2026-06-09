@@ -125,6 +125,37 @@ def _write_pytorch_zip_with_symlink(zip_path: Path, link_name: str, target: str 
         zipf.writestr(symlink_info, target)
 
 
+def _patch_zip_member_local_name(zip_path: Path, member_name: str, replacement: bytes) -> None:
+    with zipfile.ZipFile(zip_path, "r") as zip_file:
+        info = zip_file.getinfo(member_name)
+
+    archive_bytes = bytearray(zip_path.read_bytes())
+    filename_length = struct.unpack_from("<H", archive_bytes, info.header_offset + 26)[0]
+    assert len(replacement) == filename_length
+    filename_start = info.header_offset + 30
+    archive_bytes[filename_start : filename_start + filename_length] = replacement
+    zip_path.write_bytes(archive_bytes)
+
+
+def _patch_zip_member_central_compressed_size(zip_path: Path, member_name: str, compressed_size: int) -> None:
+    with zipfile.ZipFile(zip_path, "r") as zip_file:
+        central_directory_offset = zip_file.start_dir
+
+    archive_bytes = bytearray(zip_path.read_bytes())
+    cursor = central_directory_offset
+    while cursor < len(archive_bytes) and archive_bytes[cursor : cursor + 4] == b"PK\x01\x02":
+        filename_len, extra_len, comment_len = struct.unpack_from("<HHH", archive_bytes, cursor + 28)
+        filename_start = cursor + 46
+        filename_end = filename_start + filename_len
+        if archive_bytes[filename_start:filename_end] == member_name.encode("utf-8"):
+            struct.pack_into("<I", archive_bytes, cursor + 20, compressed_size)
+            zip_path.write_bytes(archive_bytes)
+            return
+        cursor = filename_end + extra_len + comment_len
+
+    raise AssertionError(f"Unable to locate central directory entry for {member_name}")
+
+
 def _assert_standard_cve_details(details: dict[str, object], cve_id: str, detected_version: str) -> None:
     cve_info = CVE_COMBINED_PATTERNS[cve_id]
     assert details["cve_id"] == cve_id
@@ -7255,6 +7286,10 @@ def test_pytorch_zip_scanner_compression_ratio_passes(tmp_path):
         ("models/link", "/tmp/../etc/passwd", "points to critical system path", "critical_system_path"),
         ("models/link", "/etc/../tmp/benign", "resolves outside extraction directory", "external"),
         ("models/link", "C:\\Windows\\System32\\config\\SAM", "points to critical system path", "critical_system_path"),
+        ("models/link", "NUL", "reserved Windows device name", "invalid"),
+        ("models/link", "safe/NUL.txt", "reserved Windows device name", "invalid"),
+        ("models/link", "COM1.log", "reserved Windows device name", "invalid"),
+        ("models/link", "safe/LPT\u00b2.txt", "reserved Windows device name", "invalid"),
     ],
 )
 def test_pytorch_zip_symlink_unsafe_targets_are_critical(
@@ -7278,7 +7313,8 @@ def test_pytorch_zip_symlink_unsafe_targets_are_critical(
     assert len(symlink_checks) == 1
     assert symlink_checks[0].status == CheckStatus.FAILED
     assert symlink_checks[0].severity == IssueSeverity.CRITICAL
-    assert symlink_checks[0].rule_code == "S406"
+    expected_rule_code = "S408" if target_class == "critical_system_path" else "S406"
+    assert symlink_checks[0].rule_code == expected_rule_code
     assert message_fragment in symlink_checks[0].message
     assert symlink_checks[0].details == {
         "entry": link_name,
@@ -7306,6 +7342,27 @@ def test_pytorch_zip_symlink_parent_near_match_inside_archive_is_safe(tmp_path: 
         "target_class": "safe",
     }
     assert not any(check.rule_code in {"S406", "S408"} for check in result.checks)
+    assert not any(issue.rule_code in {"S406", "S408"} for issue in result.issues)
+
+
+@pytest.mark.parametrize("target", ["NULL", "COM10", "NUL-file", "safe/COM0.txt", "safe/LPT4-file"])
+def test_pytorch_zip_symlink_windows_device_near_matches_are_safe(tmp_path: Path, target: str) -> None:
+    zip_path = tmp_path / "safe-windows-device-near-match.pt"
+    _write_pytorch_zip_with_symlink(zip_path, "models/link", target)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    symlink_check = next(
+        check
+        for check in result.checks
+        if check.name == "Symlink Safety Validation" and check.details.get("entry") == "models/link"
+    )
+    assert symlink_check.status == CheckStatus.PASSED
+    assert symlink_check.details == {
+        "entry": "models/link",
+        "target": target,
+        "target_class": "safe",
+    }
     assert not any(issue.rule_code in {"S406", "S408"} for issue in result.issues)
 
 
@@ -7430,6 +7487,78 @@ def test_pytorch_zip_oversized_symlink_target_is_critical(tmp_path: Path) -> Non
     assert "pytorch_zip_symlink_target_read_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
 
 
+def test_pytorch_zip_symlink_metadata_does_not_skip_pickle_analysis(tmp_path: Path) -> None:
+    zip_path = tmp_path / "symlink-marked-data-pickle.pt"
+    with zipfile.ZipFile(zip_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3")
+        data_info = zipfile.ZipInfo("archive/data.pkl")
+        data_info.create_system = 3
+        data_info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        data_info.compress_type = zipfile.ZIP_STORED
+        zip_file.writestr(data_info, _malicious_proto0_system_payload())
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert result.success is False
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("pickle_filename") == "archive/data.pkl"
+        and "system" in issue.message.lower()
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_symlink_read_error_redacts_local_header_name(tmp_path: Path) -> None:
+    zip_path = tmp_path / "mismatched-symlink-name.pt"
+    secret = "SUPERSECRET_TOKEN_123"
+    replacement = f"password={secret}".encode()
+    central_name = "l" * len(replacement)
+    _write_pytorch_zip_with_symlink(zip_path, central_name, "safe-target")
+    _patch_zip_member_local_name(zip_path, central_name, replacement)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    symlink_check = next(
+        check
+        for check in result.checks
+        if check.name == "Symlink Safety Validation" and check.details.get("entry") == central_name
+    )
+    assert symlink_check.rule_code == "S902"
+    assert symlink_check.details["exception"] == "<redacted>"
+    assert secret not in result.to_json()
+
+
+def test_pytorch_zip_symlink_rejects_excessive_compressed_input_before_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zip_path = tmp_path / "compressed-input-symlink.pt"
+    link_name = "models/link"
+    _write_pytorch_zip_with_symlink(zip_path, link_name, "safe-target")
+    excessive_size = PyTorchZipScanner.MAX_SYMLINK_TARGET_COMPRESSED_BYTES + 1
+    _patch_zip_member_central_compressed_size(zip_path, link_name, excessive_size)
+    scanner = PyTorchZipScanner()
+
+    def fail_read(*_args: object, **_kwargs: object) -> tuple[str, bool]:
+        raise AssertionError("oversized compressed symlink target must not be opened")
+
+    monkeypatch.setattr(scanner, "_read_symlink_target", fail_read)
+
+    result = scanner.scan(str(zip_path))
+
+    symlink_check = next(
+        check
+        for check in result.checks
+        if check.name == "Symlink Safety Validation" and check.details.get("entry") == link_name
+    )
+    assert symlink_check.status == CheckStatus.FAILED
+    assert symlink_check.severity == IssueSeverity.CRITICAL
+    assert symlink_check.rule_code == "S406"
+    assert symlink_check.details["target_class"] == "invalid"
+    assert symlink_check.details["compressed_size"] == excessive_size
+
+
 def test_pytorch_zip_scanner_symlink_detection(tmp_path: Path) -> None:
     """Test that scanner detects symlinks in archives."""
 
@@ -7456,7 +7585,7 @@ def test_pytorch_zip_scanner_symlink_detection(tmp_path: Path) -> None:
     assert len(symlink_checks) == 1
     assert symlink_checks[0].status == CheckStatus.FAILED
     assert symlink_checks[0].severity == IssueSeverity.CRITICAL
-    assert symlink_checks[0].rule_code == "S406"
+    assert symlink_checks[0].rule_code == "S408"
     assert symlink_checks[0].details["target_class"] == "critical_system_path"
 
 

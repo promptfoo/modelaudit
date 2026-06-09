@@ -147,6 +147,21 @@ CRITICAL_SYSTEM_PATHS: tuple[str, ...] = (
     "/sbin",
     "C:\\Windows",
 )
+_WINDOWS_RESERVED_DEVICE_NAMES: frozenset[str] = frozenset(
+    {"CON", "PRN", "AUX", "NUL"} | {f"COM{index}" for index in range(1, 10)} | {f"LPT{index}" for index in range(1, 10)}
+)
+_WINDOWS_DEVICE_SUPERSCRIPT_DIGITS = str.maketrans({"\u00b9": "1", "\u00b2": "2", "\u00b3": "3"})
+
+
+def _targets_windows_reserved_device(target: str) -> bool:
+    """Return whether any target component names a reserved Windows device."""
+    for component in target.replace("\\", "/").split("/"):
+        if not component or component in {".", ".."}:
+            continue
+        basename = component.split(":", 1)[0].split(".", 1)[0].rstrip(" ").upper()
+        if basename.translate(_WINDOWS_DEVICE_SUPERSCRIPT_DIGITS) in _WINDOWS_RESERVED_DEVICE_NAMES:
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -269,6 +284,7 @@ class PyTorchZipScanner(BaseScanner):
     MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE: ClassVar[int] = 1024 * 1024
     MAX_ARCHIVE_ENTRIES: ClassVar[int] = 10000  # Maximum number of entries in archive
     MAX_SYMLINK_TARGET_BYTES: ClassVar[int] = 64 * 1024
+    MAX_SYMLINK_TARGET_COMPRESSED_BYTES: ClassVar[int] = 128 * 1024
     MAX_VERSION_METADATA_BYTES: ClassVar[int] = 4096
     MAX_VERSION_JSON_BYTES: ClassVar[int] = 10 * 1024 * 1024
     DEFAULT_VERSION_PICKLE_PROBE_BYTES: ClassVar[int] = 1024 * 1024
@@ -904,31 +920,8 @@ class PyTorchZipScanner(BaseScanner):
             # Check for symlinks (ZIP slip variant attack)
             is_symlink = (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK
             if is_symlink:
-                try:
-                    target, target_complete = self._read_symlink_target(zip_file, info, result)
-                except Exception as exc:
-                    reason = "pytorch_zip_symlink_target_read_incomplete"
-                    mark_inconclusive_scan_result(result, reason)
-                    result.add_check(
-                        name="Symlink Safety Validation",
-                        passed=False,
-                        message=f"Unable to read symlink target for {name}: {exc!s}",
-                        severity=IssueSeverity.INFO,
-                        rule_code="S902",
-                        location=f"{path}:{name}",
-                        details={
-                            "entry": name,
-                            "exception": str(exc),
-                            "exception_type": type(exc).__name__,
-                            "analysis_incomplete": True,
-                            "scan_outcome_reason": reason,
-                        },
-                    )
-                    symlink_issues_found = True
-                    continue
-
-                safe_target = redact_evidence_string(target, max_chars=1024)
-                if not target_complete:
+                scan_symlink_content = True
+                if info.file_size > self.MAX_SYMLINK_TARGET_BYTES:
                     result.add_check(
                         name="Symlink Safety Validation",
                         passed=False,
@@ -936,72 +929,131 @@ class PyTorchZipScanner(BaseScanner):
                         severity=IssueSeverity.CRITICAL,
                         rule_code="S406",
                         location=f"{path}:{name}",
-                        details={"entry": name, "target": safe_target, "target_class": "invalid"},
+                        details={
+                            "entry": name,
+                            "target": "<oversized>",
+                            "target_class": "invalid",
+                            "target_size": info.file_size,
+                            "max_target_size": self.MAX_SYMLINK_TARGET_BYTES,
+                        },
                     )
-                    symlink_issues_found = True
-                    continue
-
-                if not target or "\x00" in target:
-                    invalid_reason = "empty" if not target else "contains a NUL byte"
+                    scan_symlink_content = False
+                elif info.compress_size > self.MAX_SYMLINK_TARGET_COMPRESSED_BYTES:
                     result.add_check(
                         name="Symlink Safety Validation",
                         passed=False,
-                        message=f"Symlink {name} has an invalid target that {invalid_reason}",
+                        message=f"Symlink {name} has an invalid target with excessive compressed input",
                         severity=IssueSeverity.CRITICAL,
                         rule_code="S406",
                         location=f"{path}:{name}",
-                        details={"entry": name, "target": safe_target, "target_class": "invalid"},
+                        details={
+                            "entry": name,
+                            "target": "<compressed-input-too-large>",
+                            "target_class": "invalid",
+                            "compressed_size": info.compress_size,
+                            "max_compressed_size": self.MAX_SYMLINK_TARGET_COMPRESSED_BYTES,
+                        },
                     )
-                    symlink_issues_found = True
-                    continue
-
-                _target_resolved, target_safe = self._resolve_symlink_target(
-                    target,
-                    resolved_name=resolved_name,
-                    extraction_root=temp_base,
-                )
-                normalized_absolute_target = posixpath.normpath(target.replace("\\", "/"))
-                targets_critical_system_path = is_absolute_archive_path(target) and is_critical_system_path(
-                    normalized_absolute_target,
-                    CRITICAL_SYSTEM_PATHS,
-                )
-                if not target_safe:
-                    if targets_critical_system_path:
-                        message = f"Symlink {name} points to critical system path: {safe_target}"
-                        target_class = "critical_system_path"
-                    else:
-                        message = f"Symlink {name} resolves outside extraction directory"
-                        target_class = "external"
-                    result.add_check(
-                        name="Symlink Safety Validation",
-                        passed=False,
-                        message=message,
-                        severity=IssueSeverity.CRITICAL,
-                        rule_code="S406",
-                        location=f"{path}:{name}",
-                        details={"entry": name, "target": safe_target, "target_class": target_class},
-                    )
-                elif targets_critical_system_path:
-                    result.add_check(
-                        name="Symlink Safety Validation",
-                        passed=False,
-                        message=f"Symlink {name} points to critical system path: {safe_target}",
-                        severity=IssueSeverity.CRITICAL,
-                        rule_code="S408",
-                        location=f"{path}:{name}",
-                        details={"entry": name, "target": safe_target, "target_class": "critical_system_path"},
-                    )
+                    scan_symlink_content = False
                 else:
-                    result.add_check(
-                        name="Symlink Safety Validation",
-                        passed=True,
-                        message=f"Symlink {name} is safe",
-                        location=f"{path}:{name}",
-                        rule_code=None,
-                        details={"entry": name, "target": safe_target, "target_class": "safe"},
-                    )
+                    try:
+                        target, target_complete = self._read_symlink_target(zip_file, info, result)
+                    except Exception as exc:
+                        safe_error = redact_untrusted_error_message(exc)
+                        reason = "pytorch_zip_symlink_target_read_incomplete"
+                        mark_inconclusive_scan_result(result, reason)
+                        result.add_check(
+                            name="Symlink Safety Validation",
+                            passed=False,
+                            message=f"Unable to read symlink target for {name}: {safe_error}",
+                            severity=IssueSeverity.INFO,
+                            rule_code="S902",
+                            location=f"{path}:{name}",
+                            details={
+                                "entry": name,
+                                "exception": safe_error,
+                                "exception_type": type(exc).__name__,
+                                "analysis_incomplete": True,
+                                "scan_outcome_reason": reason,
+                            },
+                        )
+                        scan_symlink_content = False
+                    else:
+                        safe_target = redact_evidence_string(target, max_chars=1024)
+                        if not target_complete:
+                            result.add_check(
+                                name="Symlink Safety Validation",
+                                passed=False,
+                                message=f"Symlink {name} has an invalid target that exceeds the maximum length",
+                                severity=IssueSeverity.CRITICAL,
+                                rule_code="S406",
+                                location=f"{path}:{name}",
+                                details={"entry": name, "target": safe_target, "target_class": "invalid"},
+                            )
+                            scan_symlink_content = False
+                        elif not target or "\x00" in target:
+                            invalid_reason = "empty" if not target else "contains a NUL byte"
+                            result.add_check(
+                                name="Symlink Safety Validation",
+                                passed=False,
+                                message=f"Symlink {name} has an invalid target that {invalid_reason}",
+                                severity=IssueSeverity.CRITICAL,
+                                rule_code="S406",
+                                location=f"{path}:{name}",
+                                details={"entry": name, "target": safe_target, "target_class": "invalid"},
+                            )
+                        elif _targets_windows_reserved_device(target):
+                            result.add_check(
+                                name="Symlink Safety Validation",
+                                passed=False,
+                                message=f"Symlink {name} targets a reserved Windows device name",
+                                severity=IssueSeverity.CRITICAL,
+                                rule_code="S406",
+                                location=f"{path}:{name}",
+                                details={"entry": name, "target": safe_target, "target_class": "invalid"},
+                            )
+                        else:
+                            _target_resolved, target_safe = self._resolve_symlink_target(
+                                target,
+                                resolved_name=resolved_name,
+                                extraction_root=temp_base,
+                            )
+                            normalized_absolute_target = posixpath.normpath(target.replace("\\", "/"))
+                            targets_critical_system_path = is_absolute_archive_path(target) and is_critical_system_path(
+                                normalized_absolute_target,
+                                CRITICAL_SYSTEM_PATHS,
+                            )
+                            if not target_safe:
+                                if targets_critical_system_path:
+                                    message = f"Symlink {name} points to critical system path: {safe_target}"
+                                    target_class = "critical_system_path"
+                                    rule_code = "S408"
+                                else:
+                                    message = f"Symlink {name} resolves outside extraction directory"
+                                    target_class = "external"
+                                    rule_code = "S406"
+                                result.add_check(
+                                    name="Symlink Safety Validation",
+                                    passed=False,
+                                    message=message,
+                                    severity=IssueSeverity.CRITICAL,
+                                    rule_code=rule_code,
+                                    location=f"{path}:{name}",
+                                    details={"entry": name, "target": safe_target, "target_class": target_class},
+                                )
+                            else:
+                                result.add_check(
+                                    name="Symlink Safety Validation",
+                                    passed=True,
+                                    message=f"Symlink {name} is safe",
+                                    location=f"{path}:{name}",
+                                    rule_code=None,
+                                    details={"entry": name, "target": safe_target, "target_class": "safe"},
+                                )
+
                 symlink_issues_found = True
-                continue
+                if not scan_symlink_content:
+                    continue
 
             # Skip directories for content checks
             if name.endswith("/"):
