@@ -21,6 +21,7 @@ from .picklescan_adapter import (
 from .pytorch_binary_scanner import PyTorchBinaryScanner
 
 CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset({".bin", ".meta", ".pb"})
+PYTORCH_BINARY_PRIMARY_SCANNED_CONFIG_KEY = "_pytorch_binary_primary_scanned"
 
 
 class ExecuTorchScanner(BaseScanner):
@@ -87,8 +88,7 @@ class ExecuTorchScanner(BaseScanner):
         return raw_config
 
     def _merge_raw_binary_analysis(self, path: str, result: ScanResult, file_size: int) -> None:
-        if os.path.splitext(path)[1].lower() == ".bin":
-            # Raw .bin routing already runs PyTorchBinaryScanner as the primary scanner.
+        if self.config.get(PYTORCH_BINARY_PRIMARY_SCANNED_CONFIG_KEY) is True:
             result.bytes_scanned = max(result.bytes_scanned, file_size)
             return
 
@@ -268,5 +268,7 @@ class ExecuTorchScanner(BaseScanner):
             result.finish(success=False)
             return result
 
+        if valid_binary_program:
+            self._merge_raw_binary_analysis(path, result, file_size)
         result.finish(success=True)
         return result

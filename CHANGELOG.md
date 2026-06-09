@@ -9,9 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- cover Keras H5 callable metadata and module references, align CVE-2025-1550 attribution, and scope HDF5 external-reference checks to Keras weight trees
+- require explicit boolean opt-in before weight-distribution scans call torch.load and bound primitive PyTorch ZIP fallback extraction
+- fail closed when OCI layer TAR metadata, member counts, or cumulative extracted bytes exceed inspection budgets
+- fail closed on JFrog folder downloads whose selected artifacts use unsafe, colliding, or overlapping local paths
+- detect dangerous textual byte keys in Flax MessagePack checkpoints
 - bound Joblib decompression output to the configured scanner read budget
 - close JIT replay alias, probe-budget, and compound-clause context gaps without suppressing dangerous browser or native-library calls
 - scan raw payload indicators inside signature-valid ExecuTorch binary programs before reporting them clean
+- detect Keras get_file tar extraction from effective call arguments without relying on URL suffixes
 - reject cleartext HTTP cloud storage and PyTorch Hub model sources
 - preserve dangerous JIT embedded-Python findings after benign member overwrites while bounding replay and suppression analysis
 - fail closed when capped DVC pointer outputs are not otherwise covered, change during verification, exceed bounded tail verification, or exhaust shared scan budgets

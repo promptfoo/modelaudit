@@ -7,8 +7,10 @@ import pytest
 
 from modelaudit import core
 from modelaudit.cache import get_cache_manager, reset_cache_manager
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanners.archive_dispatch import scan_nested_file
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.executorch_scanner import ExecuTorchScanner
+from modelaudit.scanners.pytorch_binary_scanner import PyTorchBinaryScanner
 from modelaudit.utils.file.detection import detect_file_format
 
 _ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
@@ -174,10 +176,76 @@ def test_executorch_scanner_analyzes_raw_payload_in_valid_binary_program(tmp_pat
     assert any("Linux executable" in issue.message for issue in aggregate.issues)
 
 
-def test_executorch_scanner_raw_payload_analysis_ignores_benign_near_match(tmp_path: Path) -> None:
+def test_executorch_scanner_analyzes_raw_payload_in_direct_bin_scan(tmp_path: Path) -> None:
     file_path = create_executorch_binary(
         tmp_path,
         identifier=b"ET13",
+        filename="program.bin",
+        payload=b"\x00" * 128 + b"os.system('id')" + b"\x00" * 128,
+    )
+
+    result = ExecuTorchScanner().scan(str(file_path))
+
+    assert result.scanner_name == "executorch"
+    assert result.metadata["supplemental_scanners"] == ["pytorch_binary"]
+    assert any(
+        check.name == "Embedded Code Pattern Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("pattern") == "os.system"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("dispatch", ["core", "nested"])
+def test_executorch_bin_overlap_runs_raw_analysis_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dispatch: str,
+) -> None:
+    file_path = create_executorch_binary(
+        tmp_path,
+        identifier=b"ET13",
+        filename="program.bin",
+        payload=b"\x00" * 128 + b"os.system('id')" + b"\x00" * 128,
+    )
+    original_scan = PyTorchBinaryScanner.scan
+    scan_calls = 0
+
+    def counted_scan(self: PyTorchBinaryScanner, path: str) -> ScanResult:
+        nonlocal scan_calls
+        scan_calls += 1
+        return original_scan(self, path)
+
+    monkeypatch.setattr(PyTorchBinaryScanner, "scan", counted_scan)
+
+    if dispatch == "core":
+        result = core.scan_file(str(file_path), config={"cache_scan_results": False})
+    else:
+        result = scan_nested_file(str(file_path), {"cache_enabled": False})
+
+    assert result.scanner_name == "pytorch_binary"
+    assert result.metadata["supplemental_scanners"] == ["executorch"]
+    assert scan_calls == 1
+    assert (
+        sum(
+            check.name == "Embedded Code Pattern Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("pattern") == "os.system"
+            for check in result.checks
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize("filename", ["program.pte", "program.bin"])
+def test_executorch_scanner_raw_payload_analysis_ignores_benign_near_match(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    file_path = create_executorch_binary(
+        tmp_path,
+        identifier=b"ET13",
+        filename=filename,
         payload=b"\x00" * 128 + b"operator=acos.systematic_normalization" + b"\x00" * 128,
     )
 
@@ -353,6 +421,39 @@ def test_executorch_scanner_scans_polyglot_binary_zip_payload(tmp_path: Path) ->
     assert any(check.name == "ExecuTorch Binary Format Validation" for check in result.checks)
     assert any(issue.rule_code == "S507" for issue in result.issues)
     assert any(issue.rule_code == "S104" for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_failed_pattern"),
+    [
+        (b"\x00" * 128 + b"os.system('id')" + b"\x00" * 128, "os.system"),
+        (b"\x00" * 128 + b"operator=acos.systematic_normalization" + b"\x00" * 128, None),
+    ],
+    ids=["malicious-raw-prefix", "benign-raw-near-match"],
+)
+def test_executorch_scanner_analyzes_raw_payload_in_binary_zip_polyglot(
+    tmp_path: Path,
+    payload: bytes,
+    expected_failed_pattern: str | None,
+) -> None:
+    file_path = create_executorch_binary(tmp_path, identifier=b"ET13", payload=payload)
+    with zipfile.ZipFile(file_path, "a") as archive:
+        archive.writestr("version", "1")
+
+    result = ExecuTorchScanner().scan(str(file_path))
+
+    assert result.metadata["supplemental_scanners"] == ["pytorch_binary"]
+    failed_patterns = {
+        str(check.details.get("pattern"))
+        for check in result.checks
+        if check.name == "Embedded Code Pattern Detection" and check.status == CheckStatus.FAILED
+    }
+    if expected_failed_pattern is None:
+        assert result.success is True
+        assert not failed_patterns
+    else:
+        assert result.has_warnings is True
+        assert expected_failed_pattern in failed_patterns
 
 
 def test_executorch_scanner_scans_stubbed_zip_payload(tmp_path: Path) -> None:

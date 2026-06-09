@@ -213,7 +213,12 @@ def _merge_pytorch_binary_supplemental_analysis(
             supplemental_scanner_id,
         )
     else:
-        supplemental_result = scanner_class(config=config).scan(path)
+        supplemental_config = dict(config or {})
+        if supplemental_scanner_id == "executorch":
+            from .executorch_scanner import PYTORCH_BINARY_PRIMARY_SCANNED_CONFIG_KEY
+
+            supplemental_config[PYTORCH_BINARY_PRIMARY_SCANNED_CONFIG_KEY] = True
+        supplemental_result = scanner_class(config=supplemental_config).scan(path)
 
     primary_bytes_scanned = result.bytes_scanned
     result.merge(supplemental_result)

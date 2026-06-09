@@ -512,6 +512,7 @@ fn is_structured_nested_probe_anchor(name: &str) -> bool {
     matches!(
         name,
         "GLOBAL"
+            | "INST"
             | "STACK_GLOBAL"
             | "EXT1"
             | "EXT2"
@@ -1290,6 +1291,22 @@ mod tests {
     #[test]
     fn decoded_payloads_preserve_protocol0_operand_limit_failures() {
         let mut payload = b"cos\nsystem\n(S'".to_vec();
+        payload.resize(
+            payload.len() + crate::opcode::MAX_PROTOCOL0_LINE_OPERAND_BYTES,
+            b'A',
+        );
+        payload.extend_from_slice(b"'\ntR.");
+
+        let decoded = decoded_pickle_payloads(&payload, payload.len() + 16);
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0, payload);
+        assert!(decoded[0].1);
+    }
+
+    #[test]
+    fn decoded_payloads_preserve_protocol0_operand_limit_after_inst() {
+        let mut payload = b"(ios\nsystem\n(S'".to_vec();
         payload.resize(
             payload.len() + crate::opcode::MAX_PROTOCOL0_LINE_OPERAND_BYTES,
             b'A',
