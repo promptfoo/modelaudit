@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import pickletools
 import tempfile
 import zipfile
 from collections.abc import Mapping
+from contextlib import suppress
 from importlib import import_module
 from pathlib import Path
 from typing import Any, BinaryIO, cast
@@ -77,7 +79,9 @@ _PROTO0_1_TRIVIAL_LEADING_OPCODES = frozenset(
     }
 )
 _MAX_PYTORCH_ZIP_ENTRIES = 10_000
+_MAX_PYTORCH_ZIP_PICKLE_MEMBERS = 256
 _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES = 512 * 1024 * 1024
+_MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES = 512 * 1024 * 1024
 _RUST_EXTENSION_MODULE = "modelaudit_picklescan._rust"
 _MAX_INERT_INITIALIZATION_MODULES = 32
 _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES = frozenset({"BUILD", "NEWOBJ", "NEWOBJ_EX"})
@@ -221,19 +225,21 @@ class PickleScanner:
         path_obj = Path(path)
         size: int | None = None
         try:
-            size = path_obj.stat().st_size
-            if zipfile.is_zipfile(path_obj):
-                container_report = self._scan_pytorch_zip_file(
-                    path_obj,
-                    source=source,
-                    size=size,
-                    enrich_call_graph=enrich_call_graph,
-                )
-                if container_report is not None:
-                    return container_report
-                if _has_pytorch_checkpoint_suffix(path_obj):
-                    return _unsupported_zip_report(source=source, size=size)
             with path_obj.open("rb") as handle:
+                size = os.fstat(handle.fileno()).st_size
+                if zipfile.is_zipfile(handle):
+                    handle.seek(0)
+                    container_report = self._scan_pytorch_zip_file(
+                        handle,
+                        source=source,
+                        size=size,
+                        enrich_call_graph=enrich_call_graph,
+                    )
+                    if container_report is not None:
+                        return container_report
+                    if _has_pytorch_checkpoint_suffix(path_obj):
+                        return _unsupported_zip_report(source=source, size=size)
+                handle.seek(0)
                 return self.scan_stream(
                     handle,
                     source=source,
@@ -261,13 +267,13 @@ class PickleScanner:
 
     def _scan_pytorch_zip_file(
         self,
-        path: Path,
+        path_or_stream: Path | BinaryIO,
         *,
         source: str,
         size: int,
         enrich_call_graph: bool = True,
     ) -> PickleReport | None:
-        preflight_entry_count = _read_zip_entry_count(path, size)
+        preflight_entry_count = _read_zip_entry_count(path_or_stream, size)
         if preflight_entry_count is not None and preflight_entry_count > _MAX_PYTORCH_ZIP_ENTRIES:
             return _pytorch_zip_entry_limit_report(
                 source=source,
@@ -275,7 +281,7 @@ class PickleScanner:
                 entry_count=preflight_entry_count,
             )
 
-        with zipfile.ZipFile(path, "r") as archive:
+        with zipfile.ZipFile(path_or_stream, "r") as archive:
             entries = _bounded_zip_entries(archive, source=source, size=size)
             if isinstance(entries, PickleReport):
                 return entries
@@ -296,6 +302,9 @@ class PickleScanner:
 
             reports: list[PickleReport] = []
             skipped_notices: list[Notice] = list(discovery_notices)
+            scanned_pickle_member_count = 0
+            scanned_pickle_member_bytes = 0
+            budget_skipped_entries: list[zipfile.ZipInfo] = []
             for entry in pickle_entries:
                 member_name = entry.filename
                 member_source = f"{source}:{member_name}"
@@ -317,6 +326,14 @@ class PickleScanner:
                         )
                     )
                     continue
+                if (
+                    scanned_pickle_member_count >= _MAX_PYTORCH_ZIP_PICKLE_MEMBERS
+                    or scanned_pickle_member_bytes + entry.file_size > _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES
+                ):
+                    budget_skipped_entries.append(entry)
+                    continue
+                scanned_pickle_member_count += 1
+                scanned_pickle_member_bytes += entry.file_size
                 try:
                     with archive.open(entry, "r") as member_stream:
                         reports.append(
@@ -338,6 +355,18 @@ class PickleScanner:
                             bytes_total=entry.file_size,
                         )
                     )
+
+            if budget_skipped_entries:
+                skipped_notices.append(
+                    _pytorch_zip_pickle_member_budget_notice(
+                        source=source,
+                        pickle_member_count=len(pickle_entries),
+                        scanned_pickle_member_count=scanned_pickle_member_count,
+                        total_pickle_member_bytes=sum(entry.file_size for entry in pickle_entries),
+                        scanned_pickle_member_bytes=scanned_pickle_member_bytes,
+                        skipped_entries=budget_skipped_entries,
+                    )
+                )
 
             return _combine_pytorch_zip_reports(
                 source=source,
@@ -387,37 +416,55 @@ def scan_file(
     return PickleScanner(options=options).scan_file(path, enrich_call_graph=enrich_call_graph)
 
 
-def _read_zip_entry_count(path: Path, file_size: int) -> int | None:
+def _read_zip_entry_count(path_or_stream: Path | BinaryIO, file_size: int) -> int | None:
     if file_size < _ZIP_EOCD_MIN_SIZE:
         return None
 
+    if isinstance(path_or_stream, Path):
+        try:
+            with path_or_stream.open("rb") as handle:
+                return _read_zip_entry_count_from_stream(handle, file_size)
+        except OSError:
+            return None
+
+    try:
+        position = path_or_stream.tell()
+    except (AttributeError, OSError, ValueError):
+        return None
+    try:
+        return _read_zip_entry_count_from_stream(path_or_stream, file_size)
+    finally:
+        with suppress(AttributeError, OSError, ValueError):
+            path_or_stream.seek(position)
+
+
+def _read_zip_entry_count_from_stream(handle: BinaryIO, file_size: int) -> int | None:
     tail_size = min(file_size, _ZIP_EOCD_MIN_SIZE + _ZIP_MAX_COMMENT_SIZE)
     try:
-        with path.open("rb") as handle:
-            handle.seek(file_size - tail_size)
-            tail = handle.read(tail_size)
-            eocd_index = _find_zip_eocd_index(tail)
-            if eocd_index is None:
-                return None
+        handle.seek(file_size - tail_size)
+        tail = handle.read(tail_size)
+        eocd_index = _find_zip_eocd_index(tail)
+        if eocd_index is None:
+            return None
 
-            entry_count = int.from_bytes(tail[eocd_index + 10 : eocd_index + 12], "little")
-            if entry_count != _ZIP64_SENTINEL_ENTRY_COUNT:
-                return entry_count
+        entry_count = int.from_bytes(tail[eocd_index + 10 : eocd_index + 12], "little")
+        if entry_count != _ZIP64_SENTINEL_ENTRY_COUNT:
+            return entry_count
 
-            eocd_offset = file_size - tail_size + eocd_index
-            locator_offset = eocd_offset - _ZIP64_EOCD_LOCATOR_SIZE
-            if locator_offset < 0:
-                return None
-            handle.seek(locator_offset)
-            locator = handle.read(_ZIP64_EOCD_LOCATOR_SIZE)
-            if not locator.startswith(_ZIP64_EOCD_LOCATOR_SIGNATURE):
-                return None
-            zip64_eocd_offset = int.from_bytes(locator[8:16], "little")
-            handle.seek(zip64_eocd_offset)
-            zip64_eocd = handle.read(_ZIP64_EOCD_MIN_SIZE)
-            if len(zip64_eocd) < _ZIP64_EOCD_MIN_SIZE or not zip64_eocd.startswith(_ZIP64_EOCD_SIGNATURE):
-                return None
-            return int.from_bytes(zip64_eocd[32:40], "little")
+        eocd_offset = file_size - tail_size + eocd_index
+        locator_offset = eocd_offset - _ZIP64_EOCD_LOCATOR_SIZE
+        if locator_offset < 0:
+            return None
+        handle.seek(locator_offset)
+        locator = handle.read(_ZIP64_EOCD_LOCATOR_SIZE)
+        if not locator.startswith(_ZIP64_EOCD_LOCATOR_SIGNATURE):
+            return None
+        zip64_eocd_offset = int.from_bytes(locator[8:16], "little")
+        handle.seek(zip64_eocd_offset)
+        zip64_eocd = handle.read(_ZIP64_EOCD_MIN_SIZE)
+        if len(zip64_eocd) < _ZIP64_EOCD_MIN_SIZE or not zip64_eocd.startswith(_ZIP64_EOCD_SIGNATURE):
+            return None
+        return int.from_bytes(zip64_eocd[32:40], "little")
     except OSError:
         return None
 
@@ -684,6 +731,37 @@ def _pytorch_zip_entry_limit_report(*, source: str, size: int, entry_count: int)
     )
 
 
+def _pytorch_zip_pickle_member_budget_notice(
+    *,
+    source: str,
+    pickle_member_count: int,
+    scanned_pickle_member_count: int,
+    total_pickle_member_bytes: int,
+    scanned_pickle_member_bytes: int,
+    skipped_entries: list[zipfile.ZipInfo],
+) -> Notice:
+    return Notice(
+        message=(
+            "PyTorch ZIP analysis stopped scanning pickle members because the archive exceeds the standalone "
+            "aggregate pickle-member budget"
+        ),
+        severity=Severity.INFO,
+        location=source,
+        code="pytorch_zip_pickle_member_budget",
+        details={
+            "pickle_member_count": pickle_member_count,
+            "scanned_pickle_member_count": scanned_pickle_member_count,
+            "skipped_pickle_member_count": len(skipped_entries),
+            "max_pickle_members": _MAX_PYTORCH_ZIP_PICKLE_MEMBERS,
+            "total_pickle_member_bytes": total_pickle_member_bytes,
+            "scanned_pickle_member_bytes": scanned_pickle_member_bytes,
+            "max_total_pickle_member_bytes": _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES,
+            "skipped_pickle_members": [entry.filename for entry in skipped_entries[:10]],
+            "analysis_incomplete": True,
+        },
+    )
+
+
 def _combine_pytorch_zip_reports(
     *,
     source: str,
@@ -729,6 +807,8 @@ def _combine_pytorch_zip_reports(
     ):
         if any(report.metadata.get(metadata_key) is True for report in member_reports):
             metadata[metadata_key] = True
+    if any(notice.details.get("analysis_incomplete") is True for notice in extra_notices):
+        metadata["analysis_incomplete"] = True
     return PickleReport(
         source=source,
         status=status,
@@ -1025,7 +1105,7 @@ def _with_known_stream_notice(
     notices = (
         *report.notices,
         Notice(
-            message="Known-size pickle stream scan stopped at configured byte limit",
+            message="Known-size pickle stream coverage could not be proven complete",
             severity=Severity.INFO,
             location=source,
             code="known_stream_truncated",
@@ -1325,14 +1405,22 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     source_snapshot_stable = True
     callable_invocations_complete = not bool(report.metadata.get("callable_invocations_truncated"))
     non_allowlisted_global_imports_complete = not bool(report.metadata.get("non_allowlisted_global_imports_truncated"))
+    invocation_classification: (
+        tuple[
+            frozenset[int],
+            frozenset[int],
+            frozenset[tuple[str, str]],
+        ]
+        | None
+    )
     try:
-        invoked_global_positions = _invoked_global_positions(callable_invocations)
-        trusted_reconstruction_global_positions = _trusted_reconstruction_global_positions(callable_invocations)
-        trusted_reconstruction_references = _trusted_reconstruction_references(callable_invocations)
+        invocation_classification = (
+            _invoked_global_positions(callable_invocations),
+            _trusted_reconstruction_global_positions(callable_invocations),
+            _trusted_reconstruction_references(callable_invocations),
+        )
     except Exception as error:
-        invoked_global_positions = frozenset()
-        trusted_reconstruction_global_positions = frozenset()
-        trusted_reconstruction_references = frozenset()
+        invocation_classification = None
         callable_invocations_complete = False
         enrichment_errors.append(("python_import_invocation_classification", error))
     with shared_source_sensitive_caches():
@@ -1396,8 +1484,14 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         source_snapshot_stable
         and callable_invocations_complete
         and non_allowlisted_global_imports_complete
+        and invocation_classification is not None
         and (inert_initialization_modules or trusted_import_references)
     ):
+        (
+            invoked_global_positions,
+            trusted_reconstruction_global_positions,
+            trusted_reconstruction_references,
+        ) = invocation_classification
         report = _without_proven_safe_import_findings(
             report,
             inert_initialization_modules,
@@ -2044,9 +2138,32 @@ def _read_stream_payload(
                 spool.write(chunk)
                 bytes_read += len(chunk)
                 remaining -= len(chunk)
+            if not stream_truncated and _known_stream_has_uncovered_data(stream):
+                stream_truncated = True
 
         spool.seek(0)
         return spool.read(), stream_truncated
+
+
+def _known_stream_has_uncovered_data(stream: BinaryIO) -> bool:
+    if not _stream_is_seekable(stream):
+        return True
+    try:
+        position = stream.tell()
+    except (AttributeError, OSError, ValueError):
+        return True
+
+    try:
+        trailing_data = bool(stream.read(1))
+    except Exception:
+        with suppress(AttributeError, OSError, ValueError):
+            stream.seek(position)
+        return True
+    if not trailing_data:
+        return False
+    with suppress(AttributeError, OSError, ValueError):
+        stream.seek(position)
+    return True
 
 
 def _engine_error_report(
