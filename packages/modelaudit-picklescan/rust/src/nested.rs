@@ -5,6 +5,8 @@ const BASE64_LITERAL_CHARS: &[u8] =
 const HEX_LITERAL_CHARS: &[u8] = b"0123456789abcdefABCDEF";
 const ENCODED_LITERAL_PROBE_CHARS: usize = 64;
 const PROTOCOL0_SCALAR_PREFIX_PROBE_BYTES: usize = 256;
+const LONG_PROTOCOL0_SCALAR_PROBE_BYTES: usize = PROTOCOL0_SCALAR_PREFIX_PROBE_BYTES + 1;
+const LONG_PROTOCOL0_SCALAR_PROBE_CHARS: usize = LONG_PROTOCOL0_SCALAR_PROBE_BYTES.div_ceil(3) * 4;
 pub(crate) const MAX_NESTED_PAYLOAD_PROBES: usize = 64;
 const MAX_ENCODED_LITERAL_MID_SCAN_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_ENCODED_LITERAL_PREFIX_SCAN_BYTES: usize =
@@ -725,6 +727,23 @@ pub(crate) fn encoded_nested_literal_probe_windows_with_limit(
         push_unique_window(&mut windows, take_last_chars(value, max_window_chars));
     }
 
+    let long_scalar_windows = embedded_long_protocol0_base64_probe_windows(value, max_window_chars);
+    for candidate in long_scalar_windows.windows {
+        if windows.iter().any(|window| window == &candidate) {
+            continue;
+        }
+        if windows.len() >= MAX_NESTED_PAYLOAD_PROBES {
+            limit_exceeded = true;
+            limit_exceeded_encoding = Some("base64");
+            break;
+        }
+        windows.push(candidate);
+    }
+    if long_scalar_windows.limit_exceeded {
+        limit_exceeded = true;
+        limit_exceeded_encoding = Some("base64");
+    }
+
     let mid_scan_len = value.len().min(MAX_ENCODED_LITERAL_MID_SCAN_BYTES);
     for index in 0..mid_scan_len {
         if !value.is_char_boundary(index) {
@@ -791,6 +810,11 @@ pub(crate) fn encoded_literal_may_contain_pickle(value: &str) -> bool {
     if encoded_prefix_has_pickle_prefix(&suffix_probe) {
         return true;
     }
+    let long_scalar_windows =
+        embedded_long_protocol0_base64_probe_windows(stripped, LONG_PROTOCOL0_SCALAR_PROBE_CHARS);
+    if !long_scalar_windows.windows.is_empty() || long_scalar_windows.limit_exceeded {
+        return true;
+    }
 
     for index in 0..stripped.len() {
         if stripped.is_char_boundary(index)
@@ -801,6 +825,106 @@ pub(crate) fn encoded_literal_may_contain_pickle(value: &str) -> bool {
         }
     }
     false
+}
+
+fn embedded_long_protocol0_base64_probe_windows(
+    value: &str,
+    max_window_chars: usize,
+) -> EncodedNestedProbeWindows {
+    let max_input_bytes = MAX_ENCODED_LITERAL_MID_SCAN_BYTES
+        .saturating_add(max_window_chars.max(LONG_PROTOCOL0_SCALAR_PROBE_CHARS));
+    let input_truncated = value.len() > max_input_bytes;
+    let mut compact = String::with_capacity(value.len().min(max_input_bytes));
+    let mut raw_positions = Vec::with_capacity(value.len().min(max_input_bytes));
+    for (raw_index, byte) in value.bytes().take(max_input_bytes).enumerate() {
+        if base64_value(byte).is_some() {
+            compact.push(char::from(byte));
+            raw_positions.push(raw_index);
+        }
+    }
+
+    let mut windows = Vec::new();
+    for alignment in 0..4usize {
+        if compact.len().saturating_sub(alignment) < LONG_PROTOCOL0_SCALAR_PROBE_CHARS {
+            continue;
+        }
+        let mut probe_end = compact.len();
+        if (probe_end - alignment) % 4 == 1 {
+            probe_end -= 1;
+        }
+        let Some(decoded) = canonical_base64_candidate(&compact[alignment..probe_end])
+            .as_deref()
+            .and_then(decode_base64)
+        else {
+            continue;
+        };
+
+        let mut decoded_index = 0usize;
+        while decoded_index.saturating_add(LONG_PROTOCOL0_SCALAR_PROBE_BYTES) <= decoded.len() {
+            if decoded_index % 3 != 0
+                || !decoded
+                    .get(decoded_index)
+                    .is_some_and(|byte| matches!(*byte, b'I' | b'S' | b'V'))
+                || decoded[decoded_index + 1..decoded_index + LONG_PROTOCOL0_SCALAR_PROBE_BYTES]
+                    .contains(&b'\n')
+            {
+                decoded_index += 1;
+                continue;
+            }
+
+            let encoded_start = alignment + (decoded_index / 3) * 4;
+            let starts_within_mid_scan = raw_positions
+                .get(encoded_start)
+                .is_some_and(|raw_index| *raw_index < MAX_ENCODED_LITERAL_MID_SCAN_BYTES);
+            let remaining_line = &decoded[decoded_index + LONG_PROTOCOL0_SCALAR_PROBE_BYTES..];
+            let Some(newline_offset) = remaining_line.iter().position(|byte| *byte == b'\n') else {
+                if input_truncated {
+                    return EncodedNestedProbeWindows {
+                        windows,
+                        limit_exceeded: true,
+                        limit_exceeded_encoding: Some("base64"),
+                    };
+                }
+                break;
+            };
+            let probe = &decoded[decoded_index..];
+            let candidate_is_pickle = match pickle_payload_extent_result(probe, probe.len()) {
+                Ok(Some(_)) => true,
+                Err(error) if error.is_structured_protocol0_line_operand_limit() => true,
+                Ok(None) | Err(_) => false,
+            };
+            if candidate_is_pickle {
+                if !starts_within_mid_scan {
+                    return EncodedNestedProbeWindows {
+                        windows,
+                        limit_exceeded: true,
+                        limit_exceeded_encoding: Some("base64"),
+                    };
+                }
+                let candidate = take_bytes_str(&compact[encoded_start..], max_window_chars);
+                if !candidate.is_empty() && !windows.iter().any(|window| window == &candidate) {
+                    if windows.len() >= MAX_NESTED_PAYLOAD_PROBES {
+                        return EncodedNestedProbeWindows {
+                            windows,
+                            limit_exceeded: true,
+                            limit_exceeded_encoding: Some("base64"),
+                        };
+                    }
+                    windows.push(candidate);
+                }
+            }
+            decoded_index = decoded_index
+                .saturating_add(LONG_PROTOCOL0_SCALAR_PROBE_BYTES)
+                .saturating_add(newline_offset)
+                .saturating_add(1);
+        }
+    }
+
+    EncodedNestedProbeWindows {
+        windows,
+        limit_exceeded: false,
+        limit_exceeded_encoding: None,
+    }
 }
 
 pub(crate) fn encoded_pickle_consumes_literal(value: &str) -> bool {
@@ -1780,6 +1904,49 @@ mod tests {
                     .any(|candidate| candidate.payload == payload)
             );
         }
+    }
+
+    #[test]
+    fn encoded_probe_windows_keep_embedded_long_protocol0_scalar_candidates() {
+        let mut payload = b"V".to_vec();
+        payload.extend(std::iter::repeat_n(
+            b'A',
+            PROTOCOL0_SCALAR_PREFIX_PROBE_BYTES + 1,
+        ));
+        payload.extend_from_slice(b"\n0cos\nsystem\n(S'id'\ntR.");
+        let encoded = encode_base64_for_test(&payload);
+        let unpadded = encoded.trim_end_matches('=');
+        let separated = encoded
+            .as_bytes()
+            .chunks(4)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap())
+            .collect::<Vec<_>>()
+            .join("!");
+
+        for value in [format!("A{encoded}"), format!("={encoded}"), separated] {
+            assert!(encoded_literal_may_contain_pickle(&value));
+            let windows = encoded_nested_literal_probe_windows(&value, value.len());
+            assert!(
+                windows.iter().any(|window| window.starts_with(unpadded)),
+                "missing normalized payload for value prefix {:?}: {:?}",
+                take_chars(&value, 16),
+                windows
+            );
+        }
+
+        let beyond_mid_scan = format!(
+            "{}{}{}",
+            "A".repeat(MAX_ENCODED_LITERAL_MID_SCAN_BYTES + 1),
+            encoded,
+            "B".repeat(ENCODED_LITERAL_PROBE_CHARS + 1)
+        );
+        assert!(encoded_literal_may_contain_pickle(&beyond_mid_scan));
+        let probed = encoded_nested_literal_probe_windows_with_limit(
+            &beyond_mid_scan,
+            beyond_mid_scan.len(),
+        );
+        assert!(probed.limit_exceeded);
+        assert_eq!(probed.limit_exceeded_encoding, Some("base64"));
     }
 
     #[test]

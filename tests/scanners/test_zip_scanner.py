@@ -4920,6 +4920,563 @@ def test_scan_zip_python_member_emits_accurate_rule_code(
     assert expected_call in python_checks[0].details["reason"]
 
 
+@pytest.mark.parametrize(
+    ("source", "expected_rule_code", "expected_call"),
+    [
+        (b"import operator, os\noperator.attrgetter('system')(os)('id')\n", "S101", "os.system"),
+        (
+            b"import operator, os\noperator.attrgetter('system.__call__')(os)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.itemgetter('system')(os.__dict__)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.attrgetter('getcwd', 'system')(os)[1]('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.attrgetter('getcwd', 'system')(os)[-1]('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\nrun, _ = operator.attrgetter('system', 'getcwd')(os)\nrun('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.itemgetter('run')({'run': os.system})('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.itemgetter(-1)([print, os.system])('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.itemgetter(True)({1: os.system})('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.itemgetter(1.0)({1: os.system})('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.itemgetter(None)({None: os.system})('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {'run': os.system}\noperator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {'run': os.system}\noperator.methodcaller('get', 'run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\nif flag:\n    payload = {'run': print}\nelse:\n    payload = {}\n"
+            b"operator.methodcaller('get', 'run', os.system)(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\nif flag:\n    payload = {'run': os.system}\nelse:\n    payload = {}\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.methodcaller('__getitem__', 'run')({'run': os.system})('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.methodcaller('get', '_missing_', os.system)(os.__dict__)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.methodcaller('get', None, os.system)({})('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.methodcaller('pop', '_missing_', os.system)(os.__dict__)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.methodcaller('setdefault', '_missing_', os.system)(os.__dict__)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.attrgetter('__dict__')(os)['system']('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.methodcaller('__getattribute__', '__dict__')(os)['system']('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\noperator.methodcaller('__getattribute__', 'system')(os)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"from operator import methodcaller\nimport subprocess\nmethodcaller('run', ['id'])(subprocess)\n",
+            "S103",
+            "subprocess.run",
+        ),
+        (
+            b"import operator, os\npair = operator.attrgetter('getcwd', 'system')(os)\npair[1]('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npair = operator.itemgetter('safe', 'run')"
+            b"({'safe': print, 'run': os.system})\npair[-1]('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {}\npayload['run'] = os.system\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {}\npayload.update({'run': os.system})\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {}\ndict.update(payload, {'run': os.system})\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {}\npayload.__setitem__('run', os.system)\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {}\npayload.setdefault('run', os.system)\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {}\npayload |= {'run': os.system}\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {'run': print}\n"
+            b"writer = operator.methodcaller('__setitem__', 'run', os.system)\nwriter(payload)\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {}\n"
+            b"writer = operator.methodcaller('update', {'run': os.system})\nwriter(payload)\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = [print]\n"
+            b"writer = operator.methodcaller('append', os.system)\nwriter(payload)\n"
+            b"operator.itemgetter(-1)(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = [print, os.system]\npayload.pop(0)\n"
+            b"operator.itemgetter(0)(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = [print, os.system]\ndel payload[0]\n"
+            b"operator.itemgetter(0)(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = [print, os.system]\npayload.insert(0, print)\n"
+            b"operator.itemgetter(2)(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {}\npayload[dynamic_key] = os.system\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\ndel os.getcwd\n"
+            b"operator.methodcaller('get', 'getcwd', os.system)(os.__dict__)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = [print]\npayload += [os.system]\noperator.itemgetter(-1)(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = [os.system]\npayload *= 2\noperator.itemgetter(1)(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {}\n"
+            b"writer = operator.methodcaller('update', run=os.system)\nwriter(payload)\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {}\n"
+            b"writer = operator.methodcaller('update', {**{'run': print}, 'run': os.system})\n"
+            b"writer(payload)\noperator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\nupdates = {'run': os.system}\npayload = {}\n"
+            b"writer = operator.methodcaller('update', **updates)\nwriter(payload)\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\nupdates = {'run': os.system}\npayload = {}\npayload.update(**updates)\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = {**{'run': os.system}}\noperator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (b"import operator, os\noperator.itemgetter(b'run')({b'run': os.system})('id')\n", "S101", "os.system"),
+        (b"import operator, os\noperator.itemgetter(1 + 2j)({1 + 2j: os.system})('id')\n", "S101", "os.system"),
+        (b"import operator, os\noperator.itemgetter(...)({...: os.system})('id')\n", "S101", "os.system"),
+        (
+            b"import operator, os\noperator.itemgetter(('run', 1))({('run', 1): os.system})('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (b"import operator, os\noperator.itemgetter(+True)({1: os.system})('id')\n", "S101", "os.system"),
+        (
+            b"import operator, os\npayload = {}\nalias = payload\nalias['run'] = os.system\n"
+            b"operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\npayload = (print,)\nalias = payload\npayload += (os.system,)\n"
+            b"operator.itemgetter(-1)(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            b"import operator, os\nwriter = operator.methodcaller('__setitem__', 'runner', os.system)\n"
+            b"writer(os.__dict__)\nos.__dict__['runner']('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (b"import operator, os\noperator.attrgetter('system', **{})(os)('id')\n", "S101", "os.system"),
+        (b"import operator, os\noperator.itemgetter('system')(os.__dict__, **{})('id')\n", "S101", "os.system"),
+    ],
+)
+def test_high_risk_python_calls_resolves_operator_accessor_execution(
+    source: bytes, expected_rule_code: str, expected_call: str
+) -> None:
+    calls = high_risk_python_calls_in_source(source)
+
+    assert any(call.rule_code == expected_rule_code and call.name == expected_call for call in calls)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        b"import operator, os\noperator.attrgetter('getcwd')(os)()\n",
+        b"import operator\noperator.methodcaller('lower')('SAFE')\n",
+        b"import operator, subprocess\noperator.methodcaller('get', 'not_risky')(subprocess.__dict__)\n",
+        b"import operator, os\noperator.methodcaller('system.__call__', 'id')(os)\n",
+        b"import operator, os\noperator.methodcaller('__getattr__', 'system')(os)\n",
+        b"import operator, os\noperator.itemgetter(None)({None: print})('safe')\n",
+        b"import operator, os\noperator.methodcaller('get', None, print)({})('safe')\n",
+        b"import operator, os\noperator.methodcaller('__getattribute__', '__dict__')(os)['getcwd']()\n",
+        b"import operator, os\noperator.attrgetter('system', 'getcwd')(os)\n",
+        b"import operator, os\noperator.attrgetter('system', 'getcwd')(os)[1]()\n",
+        b"import operator, os\npair = operator.attrgetter('getcwd', 'system')(os)\npair[0]()\n",
+        (
+            b"import operator, os\npair = operator.itemgetter('safe', 'run')"
+            b"({'safe': print, 'run': os.system})\npair[0]('safe')\n"
+        ),
+        b"import operator, os\noperator.methodcaller('get', 'safe', os.system)({'safe': lambda: None})()\n",
+        (
+            b"import operator, os\npayload = {'run': os.system}\npayload['run'] = print\n"
+            b"operator.itemgetter('run')(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = {'run': os.system}\npayload.update({'run': print})\n"
+            b"operator.itemgetter('run')(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = {'run': os.system}\ndict.update(payload, {'run': print})\n"
+            b"operator.itemgetter('run')(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = {'run': os.system}\npayload.__setitem__('run', print)\n"
+            b"operator.itemgetter('run')(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = {'run': print}\npayload.setdefault('run', os.system)\n"
+            b"operator.itemgetter('run')(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = {'run': os.system}\npayload |= {'run': print}\n"
+            b"operator.itemgetter('run')(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = {'run': os.system}\n"
+            b"writer = operator.methodcaller('__setitem__', 'run', print)\nwriter(payload)\n"
+            b"operator.itemgetter('run')(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = {'run': os.system}\n"
+            b"writer = operator.methodcaller('update', {'run': print})\nwriter(payload)\n"
+            b"operator.itemgetter('run')(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = [os.system]\n"
+            b"writer = operator.methodcaller('append', print)\nwriter(payload)\n"
+            b"operator.itemgetter(-1)(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = {'run': os.system}\ndel payload['run']\n"
+            b"operator.itemgetter('run')(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = {'run': os.system}\npayload.clear()\n"
+            b"operator.itemgetter('run')(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = {'run': os.system}\npayload.pop('run')\n"
+            b"operator.itemgetter('run')(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = [os.system, print]\npayload.pop(0)\n"
+            b"operator.itemgetter(0)(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = {}\npayload[dynamic_key] = print\n"
+            b"operator.itemgetter('run')(payload)('safe')\n"
+        ),
+        b"import operator, os\noperator.methodcaller('get', 'getcwd', os.system)(os.__dict__)()\n",
+        (
+            b"import operator, os\npayload = {'run': os.system}\nalias = payload\nalias['run'] = print\n"
+            b"operator.itemgetter('run')(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = [os.system]\nalias = payload\nalias[0] = print\n"
+            b"operator.itemgetter(0)(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = (print,)\nalias = payload\npayload += (os.system,)\n"
+            b"operator.itemgetter(-1)(alias)('safe')\n"
+        ),
+        (
+            b"import operator, os\npayload = (print,)\n"
+            b"writer = operator.methodcaller('append', os.system)\nwriter(payload)\n"
+            b"operator.itemgetter(-1)(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\nleft = {}\nright = {}\nleft['run'] = os.system\n"
+            b"operator.itemgetter('run')(right)('safe')\n"
+        ),
+        b"import operator, os\noperator.itemgetter('run')({**[('run', os.system)]})('id')\n",
+        (
+            b"import operator, os\nupdates = {1: os.system}\n"
+            b"writer = operator.methodcaller('update', **updates)\npayload = {}\nwriter(payload)\n"
+            b"operator.itemgetter(1)(payload)('safe')\n"
+        ),
+        (
+            b"import operator, os\nwriter = operator.methodcaller('update', run=print, **{'run': os.system})\n"
+            b"payload = {}\nwriter(payload)\noperator.itemgetter('run')(payload)('safe')\n"
+        ),
+        b"import operator, os\noperator.methodcaller('get', 'run', extra=1)({'run': os.system})('id')\n",
+        b"import operator, os\noperator.methodcaller('__getitem__', 'run', 1)({'run': os.system})('id')\n",
+        (
+            b"import operator, os\npayload = {}\n"
+            b"writer = operator.methodcaller('update', {**{'run': os.system}, 'run': print})\n"
+            b"writer(payload)\noperator.itemgetter('run')(payload)('safe')\n"
+        ),
+    ],
+)
+def test_high_risk_python_calls_ignores_benign_operator_accessor_names(source: bytes) -> None:
+    calls = high_risk_python_calls_in_source(source)
+
+    assert not calls
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_rule_code", "expected_call"),
+    [
+        (
+            "import operator\nimport os\noperator.attrgetter('system')(os)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "import operator\nimport os\noperator.attrgetter('system.__call__')(os)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "import operator\nimport os\noperator.itemgetter('system')(os.__dict__)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "import operator\nimport os\noperator.attrgetter('getcwd', 'system')(os)[1]('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "import operator\nimport os\noperator.itemgetter('run')({'run': os.system})('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "import operator\nimport os\npayload = {'run': os.system}\noperator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "import operator\nimport os\noperator.methodcaller('get', '_missing_', os.system)(os.__dict__)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "import operator\nimport os\noperator.attrgetter('__dict__')(os)['system']('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "import operator\nimport os\noperator.methodcaller('__getattribute__', '__dict__')(os)['system']('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "import operator\nimport os\npayload = {}\npayload.update({'run': os.system})\n"
+            "operator.itemgetter('run')(payload)('id')\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "from operator import attrgetter\n"
+            "import subprocess\n"
+            "runner = attrgetter('run')(subprocess)\n"
+            "runner(['id'], check=False)\n",
+            "S103",
+            "subprocess.run",
+        ),
+        (
+            "import operator\nimport os\noperator.methodcaller('system', 'id')(os)\n",
+            "S101",
+            "os.system",
+        ),
+        (
+            "from operator import methodcaller\n"
+            "import subprocess\n"
+            "methodcaller('run', ['id'], check=False)(subprocess)\n",
+            "S103",
+            "subprocess.run",
+        ),
+        (
+            "from operator import methodcaller\nimport os\nmethodcaller('__getattribute__', 'system')(os)('id')\n",
+            "S101",
+            "os.system",
+        ),
+    ],
+)
+def test_scan_zip_python_member_detects_operator_accessor_execution(
+    tmp_path: Path, source: str, expected_rule_code: str, expected_call: str
+) -> None:
+    archive_path = tmp_path / "source_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert any(
+        check.rule_code == expected_rule_code and expected_call in check.details["reason"] for check in python_checks
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import operator\nimport os\noperator.attrgetter('getcwd')(os)()\n",
+        ("from operator import attrgetter\nclass Safe:\n    system = 'label'\nvalue = attrgetter('system')(Safe())\n"),
+        "import operator\noperator.methodcaller('lower')('SAFE')\n",
+        "from operator import methodcaller\nimport os\nmethodcaller('getcwd')(os)\n",
+        "import operator\nimport subprocess\noperator.methodcaller('get', 'not_risky')(subprocess.__dict__)\n",
+        "import operator\nimport os\noperator.methodcaller('system.__call__', 'id')(os)\n",
+        "import operator\nimport os\noperator.methodcaller('__getattr__', 'system')(os)\n",
+        ("import operator\nimport os\noperator.methodcaller('__getattribute__', '__dict__')(os)['getcwd']()\n"),
+        "import operator\nimport os\noperator.attrgetter('system', 'getcwd')(os)\n",
+        ("import operator\nimport os\noperator.methodcaller('get', 'safe', os.system)({'safe': lambda: None})()\n"),
+        (
+            "import operator\nimport os\npayload = {'run': os.system}\npayload.update({'run': print})\n"
+            "operator.itemgetter('run')(payload)('safe')\n"
+        ),
+    ],
+)
+def test_scan_zip_python_member_ignores_benign_operator_accessor_names(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "source_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert result.success is True
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
 def test_scan_zip_python_member_emits_separate_check_per_rule_code(tmp_path: Path) -> None:
     """Mixed-risk source should yield one finding per rule code, sorted by code."""
     archive_path = tmp_path / "source_bundle.zip"
