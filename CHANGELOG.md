@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- bound CatBoost command-evidence redaction work and cover distant, shell-concatenated, wrapped, and netrc curl credentials
 - use credential-free, cross-platform cloud routing filenames without changing native object-key suffix semantics
 - encode native cloud object keys into collision-resistant, prefix-safe Windows paths and reject out-of-target listings
 - fail closed on unsafe cloud object paths, parent-directory swaps, and download destination aliases
