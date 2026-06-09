@@ -240,9 +240,6 @@ _HDF5_USERBLOCK_MAX_CONCATENATED_ZIP_SEGMENTS = 16
 _ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE = b"PK\x05\x06"
 _ZIP_END_OF_CENTRAL_DIRECTORY_FIXED_BYTES = 22
 _MAX_STRING_LITERAL_EXTRACTION_DEPTH = 100
-_KERAS_STRINGLOOKUP_EXTERNAL_VOCABULARY_INCONCLUSIVE_REASON = (
-    "keras_zip_stringlookup_external_vocabulary_metadata_inconclusive"
-)
 _KERAS_RELEASE_VERSION_PATTERN = re.compile(r"^\s*([0-9]+)\.([0-9]+)(?:\.([0-9]+))?([A-Za-z0-9.*+_-]*)\s*$")
 _KERAS_TORCHMODULE_VERSION_PATTERN = re.compile(
     r"^\s*[vV]?(?:([0-9]+)!)?([0-9]+(?:\.[0-9]+)*)"
@@ -2220,23 +2217,18 @@ class KerasZipScanner(BaseScanner):
         if vulnerability_status is False:
             details["keras_version"] = keras_version
             details["metadata_only_assessment"] = True
-            details["parse_status"] = "metadata_non_vulnerable"
-            details["analysis_incomplete"] = True
-            details["scan_outcome_reason"] = _KERAS_STRINGLOOKUP_EXTERNAL_VOCABULARY_INCONCLUSIVE_REASON
-            self._mark_inconclusive_scan_result(
-                result,
-                _KERAS_STRINGLOOKUP_EXTERNAL_VOCABULARY_INCONCLUSIVE_REASON,
-            )
+            details["parse_status"] = "untrusted_artifact_version"
+            details["version_source"] = "keras_archive_metadata"
             result.add_check(
-                name="StringLookup External Vocabulary Metadata Check",
+                name="StringLookup External Vocabulary Risk (Untrusted Version Metadata)",
                 passed=False,
                 message=(
                     f"StringLookup layer '{layer_name}' references external vocabulary path '{redacted_vocabulary}', "
-                    f"and archive metadata reports Keras {keras_version} outside the known CVE-2025-12058 "
-                    "vulnerable range (<3.12.0), but metadata-only assessment is inconclusive without runtime "
-                    "verification"
+                    f"and archive metadata claims Keras {keras_version} outside the known CVE-2025-12058 "
+                    "vulnerable range (<3.12.0), but artifact-controlled version metadata cannot prove the loader "
+                    "runtime is fixed"
                 ),
-                severity=IssueSeverity.INFO,
+                severity=IssueSeverity.WARNING,
                 location=location,
                 details=details,
                 why=get_cve_2025_12058_explanation("stringlookup_external_vocabulary"),
