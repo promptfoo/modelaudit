@@ -1,12 +1,15 @@
 """Configuration management for ModelAudit authentication."""
 
 import os
+import re
 from contextlib import suppress
+from ipaddress import IPv6Address, ip_address
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
 from uuid import uuid4
 
+import idna
 import yaml
 from platformdirs import user_config_dir
 
@@ -19,6 +22,105 @@ from ..utils._path_hardening import (
 
 # Environment variable for API host (matches promptfoo)
 API_HOST = os.getenv("API_HOST", "https://api.promptfoo.app")
+API_HOST_ALLOWED_HOSTS_ENV = "MODELAUDIT_API_ALLOWED_HOSTS"
+_API_HOST_ENV_VARS = ("MODELAUDIT_API_HOST", "API_HOST")
+_PROMPTFOO_API_HOST_SUFFIX = "promptfoo.app"
+_DNS_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def _normalize_api_hostname(hostname: str) -> str:
+    """Normalize hostnames before trust comparisons."""
+    normalized = hostname.lower().rstrip(".")
+    if ":" in normalized:
+        try:
+            address = ip_address(normalized)
+        except ValueError as error:
+            raise ValueError("Invalid API hostname") from error
+        if isinstance(address, IPv6Address) and address.ipv4_mapped is not None:
+            return f"::ffff:{address.ipv4_mapped}"
+        return address.compressed
+
+    try:
+        ascii_hostname = idna.encode(normalized, uts46=True).decode("ascii")
+    except idna.IDNAError as error:
+        raise ValueError("Invalid API hostname") from error
+
+    labels = ascii_hostname.split(".")
+    if len(ascii_hostname) > 253 or any(not _DNS_LABEL_PATTERN.fullmatch(label) for label in labels):
+        raise ValueError("Invalid API hostname")
+    return ascii_hostname
+
+
+def _authority_from_config_value(value: str, *, allow_host_only: bool) -> tuple[str, int | None] | None:
+    """Normalize a configured hostname or base URL to an authority."""
+    candidate = value.strip()
+    if (
+        not candidate
+        or "\\" in candidate
+        or "%" in candidate
+        or any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in candidate)
+    ):
+        return None
+
+    try:
+        has_scheme = "://" in candidate
+        parsed = urlparse(candidate if has_scheme else f"//{candidate}")
+        port = parsed.port
+    except ValueError:
+        return None
+
+    if (
+        parsed.hostname is None
+        or (parsed.scheme and parsed.scheme.lower() != "https")
+        or parsed.username is not None
+        or parsed.password is not None
+        or "@" in parsed.netloc
+        or parsed.path not in ("", "/")
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or port == 0
+        or parsed.netloc.endswith(":")
+    ):
+        return None
+    try:
+        hostname = _normalize_api_hostname(parsed.hostname)
+    except ValueError:
+        return None
+    if allow_host_only and not has_scheme and port is None:
+        return hostname, None
+    return hostname, port or 443
+
+
+def _get_explicitly_trusted_api_authorities() -> set[tuple[str, int | None]]:
+    """Return caller-configured authorities allowed to receive API bearer tokens."""
+    raw_hosts = os.getenv(API_HOST_ALLOWED_HOSTS_ENV, "")
+    authorities = {
+        authority
+        for authority in (_authority_from_config_value(value, allow_host_only=True) for value in raw_hosts.split(","))
+        if authority is not None
+    }
+    authorities.update(
+        authority
+        for authority in (
+            _authority_from_config_value(os.getenv(name, ""), allow_host_only=False) for name in _API_HOST_ENV_VARS
+        )
+        if authority is not None
+    )
+    return authorities
+
+
+def _is_promptfoo_api_host(hostname: str) -> bool:
+    return hostname == _PROMPTFOO_API_HOST_SUFFIX or hostname.endswith(f".{_PROMPTFOO_API_HOST_SUFFIX}")
+
+
+def _is_trusted_api_host(hostname: str, port: int) -> bool:
+    configured_authorities = _get_explicitly_trusted_api_authorities()
+    return (
+        (_is_promptfoo_api_host(hostname) and port == 443)
+        or (hostname, port) in configured_authorities
+        or (hostname, None) in configured_authorities
+    )
 
 
 def validate_api_host_for_bearer_auth(api_host: str) -> str:
@@ -34,7 +136,7 @@ def validate_api_host_for_bearer_auth(api_host: str) -> str:
 
     try:
         parsed = urlparse(stripped_host)
-        hostname = parsed.hostname.lower() if parsed.hostname else None
+        hostname = _normalize_api_hostname(parsed.hostname) if parsed.hostname else None
         port = parsed.port
     except ValueError as error:
         raise ValueError("API host for bearer-token authentication must be a valid HTTPS URL") from error
@@ -50,8 +152,16 @@ def validate_api_host_for_bearer_auth(api_host: str) -> str:
 
     if hostname is None:
         raise ValueError("API host for bearer-token authentication must include a hostname")
+    if parsed.netloc.endswith(":"):
+        raise ValueError("API host for bearer-token authentication must include a valid port")
     if port == 0:
         raise ValueError("API host for bearer-token authentication must include a valid port")
+    normalized_port_number = port or 443
+    if not _is_trusted_api_host(hostname, normalized_port_number):
+        raise ValueError(
+            "API host for bearer-token authentication must be a trusted Promptfoo API host "
+            f"or explicitly configured through {API_HOST_ALLOWED_HOSTS_ENV}, MODELAUDIT_API_HOST, or API_HOST"
+        )
 
     normalized_hostname = f"[{hostname}]" if ":" in hostname else hostname
     normalized_port = f":{port}" if port not in (None, 443) else ""

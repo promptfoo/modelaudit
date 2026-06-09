@@ -313,6 +313,24 @@ def test_detects_rebuild_tensor_setitem_in_later_pickle_stream(tmp_path: Path, p
     )
 
 
+def test_detects_rebuild_tensor_setitem_after_unrecognized_separator(tmp_path: Path) -> None:
+    first_stream = pickle.dumps(None, protocol=4)
+    malicious_stream = (
+        b"S'\\x74orch._utils'\nS'\\x5frebuild_tensor_v2'\n\x93)R" + _binunicode8("key") + _binunicode8("value") + b"s."
+    )
+    path = tmp_path / "later-stream-after-junk.pkl"
+    path.write_bytes(first_stream + b"Z" + malicious_stream)
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        check.rule_code == "S209"
+        and check.details.get("pickle_stream_index") == 1
+        and check.details.get("pickle_stream_parse_incomplete") is False
+        for check in result.checks
+    )
+
+
 def test_detects_protocol_zero_rebuild_tensor_setitem_in_later_pickle_stream(tmp_path: Path) -> None:
     first_stream = pickle.dumps(None, protocol=4)
     malicious_stream = b"N0ctorch._utils\n_rebuild_tensor_v2\n)R" + _binunicode8("key") + _binunicode8("value") + b"s."
@@ -459,6 +477,25 @@ def test_global_name_substrings_do_not_trigger_setitem_cve(
 
     result = PickleScanner().scan(str(path))
 
+    assert _cve_2026_24747_issues(result) == []
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        _binunicode8("_rebuild_tensor documentation label"),
+        _binunicode8(__name__) + _binunicode8("_rebuild_tensor_probe") + b"\x93",
+        b"c" + __name__.encode() + b"\n_rebuild_tensor_probe\n",
+    ],
+)
+def test_complete_non_result_rebuild_targets_do_not_trigger_setitem_cve(tmp_path: Path, target: bytes) -> None:
+    payload = b"\x80\x04" + target + _binunicode8("key") + _binunicode8("value") + b"s."
+    path = tmp_path / "non-result-rebuild-target.pkl"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+
+    assert pickle_scanner._pickle_has_rebuild_tensor_setitem_abuse(payload) is False
     assert _cve_2026_24747_issues(result) == []
 
 

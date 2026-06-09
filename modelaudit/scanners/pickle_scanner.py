@@ -268,6 +268,7 @@ _PICKLE_LITERAL_OPCODE_NAMES = frozenset(
         "BYTEARRAY8",
     }
 )
+_PICKLE_OPCODE_PREFIX_BYTES = frozenset(ord(opcode.code) for opcode in pickletools.opcodes)
 _JIT_SCAN_SEEDS: tuple[bytes, ...] = (
     b"__import__",
     b"compile",
@@ -478,46 +479,38 @@ def _looks_like_pickle(data: bytes) -> bool:
     }
 
 
-def _complete_pickle_stream_extent(data: bytes, offset: int = 0) -> int | None:
+def _probe_pickle_stream(stream: io.BytesIO, offset: int = 0) -> tuple[int | None, int]:
+    stream.seek(offset)
     try:
-        stream = io.BytesIO(data)
-        stream.seek(offset)
         for opcode, _arg, position in pickletools.genops(stream):
             if opcode.name == "STOP":
-                return None if position is None else position + 1 - offset
+                extent = None if position is None else position + 1 - offset
+                return extent, max(1, stream.tell() - offset)
     except Exception:
-        return None
-    return None
-
-
-def _has_parsed_pickle_opcode_prefix(data: bytes) -> bool:
-    try:
-        next(pickletools.genops(data))
-    except Exception:
-        return False
-    return True
+        pass
+    return None, max(1, stream.tell() - offset)
 
 
 def _pickle_cve_streams(data: bytes) -> tuple[tuple[_PickleCveStream, ...], bool]:
     streams: list[_PickleCveStream] = []
+    probe = io.BytesIO(data)
     offset = 0
     while offset < len(data):
-        while offset < len(data) and data[offset] in _CVE_PICKLE_STREAM_PADDING:
+        while offset < len(data) and (
+            data[offset] in _CVE_PICKLE_STREAM_PADDING or data[offset] not in _PICKLE_OPCODE_PREFIX_BYTES
+        ):
             offset += 1
         if offset >= len(data):
             break
 
-        extent = _complete_pickle_stream_extent(data, offset)
+        extent, consumed = _probe_pickle_stream(probe, offset)
         if len(streams) >= _MAX_CVE_PICKLE_STREAMS:
-            remainder = data[offset:]
-            return tuple(streams), (
-                extent is not None or _looks_like_pickle(remainder) or _has_parsed_pickle_opcode_prefix(remainder)
-            )
+            return tuple(streams), True
         if extent is None:
-            if not _looks_like_pickle(data[offset:]) and not _has_parsed_pickle_opcode_prefix(data[offset:]):
-                break
-            streams.append(_PickleCveStream(data[offset:], offset, True))
-            break
+            end = min(len(data), offset + consumed)
+            streams.append(_PickleCveStream(data[offset:end], offset, True))
+            offset = end
+            continue
 
         streams.append(_PickleCveStream(data[offset : offset + extent], offset, False))
         offset += extent
@@ -967,6 +960,9 @@ def _analyze_pickle_setitem_entries(
             )
         return False
 
+    def is_confirmed_dangerous_target(value: tuple[str, str | None]) -> bool:
+        return value[0] == "interesting_result"
+
     def entry_for_global(arg: object) -> tuple[str, str | None]:
         parts = _global_parts(arg)
         if parts is None:
@@ -1032,7 +1028,7 @@ def _analyze_pickle_setitem_entries(
                 value = pop()
                 key = pop()
                 target = stack[-1] if stack else ("unknown", None)
-                if is_interesting_entry(target):
+                if is_confirmed_dangerous_target(target):
                     confirmed_dangerous_target = True
                 if target[0] == "unknown" and (is_interesting_entry(key) or is_interesting_entry(value)):
                     suspicious_entry_on_unknown_target = True
@@ -1040,7 +1036,7 @@ def _analyze_pickle_setitem_entries(
                 saw_setitem = True
                 values = pop_to_mark()
                 target = stack[-1] if stack else ("unknown", None)
-                if is_interesting_entry(target):
+                if is_confirmed_dangerous_target(target):
                     confirmed_dangerous_target = True
                 if target[0] == "unknown" and any(is_interesting_entry(value) for value in values):
                     suspicious_entry_on_unknown_target = True
