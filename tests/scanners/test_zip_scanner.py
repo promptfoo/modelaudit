@@ -5440,6 +5440,24 @@ def test_scan_nested_file_fails_closed_when_tensorflow_protobuf_routing_budget_i
     assert "bounded structural probe reached its limit" in check.message
 
 
+def test_scan_nested_file_fails_closed_when_protocolless_pickle_routing_budget_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    extracted_member = tmp_path / "ambiguous-routing.py"
+    extracted_member.write_bytes(b"\x8c\x01x0" * (file_detection.PROTO0_1_MAX_PROBE_OPCODES + 1))
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["operational_error_reason"] == "pickle_routing_incomplete"
+    check = next(check for check in result.checks if check.name == "Pickle Routing")
+    assert check.details["format"] == file_detection.PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert "bounded structural probe reached its limit" in check.message
+
+
 def test_scan_nested_file_fails_closed_when_unknown_prefix_hides_tensorflow_after_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

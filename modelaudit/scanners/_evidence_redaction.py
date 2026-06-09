@@ -11,7 +11,7 @@ import textwrap
 import tokenize
 import unicodedata
 from bisect import bisect_right
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from typing import Any, Final
 from urllib.parse import parse_qsl, unquote, unquote_plus, urlencode, urlsplit, urlunsplit
 
@@ -3560,11 +3560,12 @@ def _strip_bracket_suffixes(key: str) -> str:
 
 
 def _canonicalize_detail_key(key: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", _strip_bracket_suffixes(key).lower())
+    normalized_key = unicodedata.normalize("NFKC", key).casefold()
+    return re.sub(r"[^a-z0-9]+", "", _strip_bracket_suffixes(normalized_key))
 
 
 def _is_sensitive_detail_key(key: str) -> bool:
-    normalized = _strip_bracket_suffixes(key).lower()
+    normalized = _strip_bracket_suffixes(unicodedata.normalize("NFKC", key).casefold())
     canonical = _canonicalize_detail_key(key)
     return (
         normalized in SENSITIVE_QUERY_KEYS
@@ -3592,6 +3593,60 @@ def is_sensitive_evidence_key(key: str) -> bool:
     )
 
 
+def _unique_redacted_mapping_key(
+    existing_keys: Collection[object],
+    redacted_key: str,
+    next_occurrences: dict[str, int] | None = None,
+) -> str:
+    if redacted_key not in existing_keys:
+        if next_occurrences is not None:
+            next_occurrences.setdefault(redacted_key, 2)
+        return redacted_key
+
+    occurrence = next_occurrences.get(redacted_key, 2) if next_occurrences is not None else 2
+    while f"{redacted_key}[{occurrence}]" in existing_keys:
+        occurrence += 1
+    if next_occurrences is not None:
+        next_occurrences[redacted_key] = occurrence + 1
+    return f"{redacted_key}[{occurrence}]"
+
+
+def redact_evidence_mapping_key(
+    key: object,
+    existing_keys: Collection[object],
+    max_string_chars: int = 180,
+    *,
+    next_occurrences: dict[str, int] | None = None,
+) -> str:
+    """Return a redacted mapping key without overwriting existing evidence."""
+    redacted_key = (
+        redact_evidence_string(key, max_chars=max_string_chars)
+        if isinstance(key, str)
+        else f"<{type(key).__name__}-key>"
+    )
+    return _unique_redacted_mapping_key(existing_keys, redacted_key, next_occurrences)
+
+
+def _is_name_or_key_alias(key: str) -> bool:
+    return _canonicalize_detail_key(key) in {"key", "name"}
+
+
+def _is_value_alias(key: str) -> bool:
+    return _canonicalize_detail_key(key) in {"value", "values"}
+
+
+def _structured_evidence_label(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        raw_value = bytes(value)
+        if len(raw_value) > MAX_SENSITIVE_EVIDENCE_KEY_CHARS:
+            return "x" * (MAX_SENSITIVE_EVIDENCE_KEY_CHARS + 1)
+        decoded = raw_value.decode("utf-8", errors="ignore")
+        return decoded or None
+    return None
+
+
 def redact_evidence_value(value: Any, max_string_chars: int = 180, *, _depth: int = 0) -> Any:
     """Recursively redact credentials from scanner detail values."""
     if _depth >= MAX_REDACTION_VALUE_DEPTH:
@@ -3602,24 +3657,41 @@ def redact_evidence_value(value: Any, max_string_chars: int = 180, *, _depth: in
         return redact_evidence_string(repr(value), max_chars=max_string_chars)
     if isinstance(value, dict):
         redacted_items: dict[Any, Any] = {}
-        string_keys_by_lower = {key.lower(): key for key in value if isinstance(key, str)}
-        sensitive_name_value_pair = "value" in string_keys_by_lower and any(
-            isinstance(value.get(string_keys_by_lower[key]), str)
-            and _is_sensitive_detail_key(value[string_keys_by_lower[key]])
-            for key in ("name", "key")
-            if key in string_keys_by_lower
+        next_key_occurrences: dict[str, int] = {}
+        sensitive_name_value_pair = any(
+            (key_label := _structured_evidence_label(key)) is not None
+            and _is_name_or_key_alias(key_label)
+            and (label := _structured_evidence_label(child)) is not None
+            and is_sensitive_evidence_key(label)
+            for key, child in value.items()
         )
         for key, child in value.items():
+            key_label = _structured_evidence_label(key)
             if not isinstance(key, str):
-                redacted_items[f"<{type(key).__name__}-key>"] = redact_evidence_value(
-                    child,
-                    max_string_chars=max_string_chars,
-                    _depth=_depth + 1,
+                redacted_key = redact_evidence_mapping_key(
+                    key,
+                    redacted_items,
+                    next_occurrences=next_key_occurrences,
                 )
+                if key_label is not None and (
+                    is_sensitive_evidence_key(key_label) or (sensitive_name_value_pair and _is_value_alias(key_label))
+                ):
+                    redacted_items[redacted_key] = REDACTED_EVIDENCE_VALUE
+                else:
+                    redacted_items[redacted_key] = redact_evidence_value(
+                        child,
+                        max_string_chars=max_string_chars,
+                        _depth=_depth + 1,
+                    )
                 continue
 
-            redacted_key = redact_evidence_string(key, max_chars=max_string_chars)
-            if _is_sensitive_detail_key(key) or (sensitive_name_value_pair and key.lower() == "value"):
+            redacted_key = redact_evidence_mapping_key(
+                key,
+                redacted_items,
+                max_string_chars,
+                next_occurrences=next_key_occurrences,
+            )
+            if is_sensitive_evidence_key(key) or (sensitive_name_value_pair and _is_value_alias(key)):
                 redacted_items[redacted_key] = REDACTED_EVIDENCE_VALUE
             else:
                 redacted_items[redacted_key] = redact_evidence_value(
@@ -3629,12 +3701,20 @@ def redact_evidence_value(value: Any, max_string_chars: int = 180, *, _depth: in
                 )
         return redacted_items
     if isinstance(value, list):
-        if len(value) == 2 and isinstance(value[0], str) and _is_sensitive_detail_key(value[0]):
-            return [redact_evidence_string(value[0], max_chars=max_string_chars), REDACTED_EVIDENCE_VALUE]
+        label = _structured_evidence_label(value[0]) if len(value) == 2 else None
+        if label is not None and is_sensitive_evidence_key(label):
+            return [
+                redact_evidence_value(value[0], max_string_chars=max_string_chars, _depth=_depth + 1),
+                REDACTED_EVIDENCE_VALUE,
+            ]
         return [redact_evidence_value(child, max_string_chars=max_string_chars, _depth=_depth + 1) for child in value]
     if isinstance(value, tuple):
-        if len(value) == 2 and isinstance(value[0], str) and _is_sensitive_detail_key(value[0]):
-            return (redact_evidence_string(value[0], max_chars=max_string_chars), REDACTED_EVIDENCE_VALUE)
+        label = _structured_evidence_label(value[0]) if len(value) == 2 else None
+        if label is not None and is_sensitive_evidence_key(label):
+            return (
+                redact_evidence_value(value[0], max_string_chars=max_string_chars, _depth=_depth + 1),
+                REDACTED_EVIDENCE_VALUE,
+            )
         return tuple(
             redact_evidence_value(child, max_string_chars=max_string_chars, _depth=_depth + 1) for child in value
         )

@@ -75,37 +75,86 @@ def _build_advanced_shard_family_cache_fingerprint(
     hasher: Any,
 ) -> tuple[dict[str, Any] | None, bool]:
     """Return a content-bound shard-family fingerprint, or mark cache unsafe."""
+    if shard_info is None:
+        return None, True
     if not shard_info:
         return None, False
 
+    pattern = shard_info.get("pattern")
     raw_shards = shard_info.get("shards")
+    total_shards = shard_info.get("total_shards")
+    expected_total_shards = shard_info.get("expected_total_shards")
     if (
-        not isinstance(raw_shards, list)
+        type(pattern) is not str
+        or not pattern
+        or not isinstance(raw_shards, list)
         or not raw_shards
         or any(type(shard_path) is not str or not shard_path for shard_path in raw_shards)
+        or type(total_shards) is not int
+        or total_shards != len(raw_shards)
+        or (
+            expected_total_shards is not None
+            and (type(expected_total_shards) is not int or expected_total_shards != len(raw_shards))
+        )
+    ):
+        return None, False
+
+    for count_key in (
+        "duplicate_shard_count",
+        "missing_shard_count",
+        "out_of_scope_shard_count",
+        "unreadable_shard_count",
+        "unvalidated_shard_count",
+    ):
+        count = shard_info.get(count_key)
+        if count is not None and (type(count) is not int or count != 0):
+            return None, False
+
+    for members_key in (
+        "duplicate_shards",
+        "missing_shard_indices",
+        "out_of_scope_shards",
+        "unreadable_shards",
+        "unvalidated_shards",
+    ):
+        suspect_members = shard_info.get(members_key)
+        if suspect_members is not None and (not isinstance(suspect_members, list) or suspect_members):
+            return None, False
+
+    missing_indices_truncated = shard_info.get("missing_shard_indices_truncated")
+    if missing_indices_truncated is not None and (
+        type(missing_indices_truncated) is not bool or missing_indices_truncated
     ):
         return None, False
 
     members: list[dict[str, str]] = []
-    resolved_members: set[str] = set()
+    resolved_member_identities: set[tuple[int | str, ...]] = set()
     for shard_path in sorted(raw_shards):
         try:
             resolved_path = str(Path(shard_path).resolve(strict=True))
+            shard_stat = os.stat(resolved_path, follow_symlinks=False)
+            if not stat.S_ISREG(shard_stat.st_mode):
+                return None, False
             content_hash = hasher.hash_file(resolved_path)
         except Exception:
             return None, False
         normalized_resolved_path = os.path.normcase(os.path.normpath(resolved_path))
-        if normalized_resolved_path in resolved_members:
+        resolved_identity: tuple[int | str, ...]
+        if shard_stat.st_ino:
+            resolved_identity = ("inode", shard_stat.st_dev, shard_stat.st_ino)
+        else:
+            resolved_identity = ("path", normalized_resolved_path)
+        if resolved_identity in resolved_member_identities:
             return None, False
-        resolved_members.add(normalized_resolved_path)
-        if type(content_hash) is not str or not content_hash.startswith("secure:"):
+        resolved_member_identities.add(resolved_identity)
+        if type(content_hash) is not str or not content_hash.startswith("secure:") or not content_hash[7:]:
             return None, False
         members.append({"path": resolved_path, "content_hash": content_hash})
 
     return (
         {
-            "pattern": shard_info.get("pattern"),
-            "expected_total_shards": shard_info.get("expected_total_shards"),
+            "pattern": pattern,
+            "expected_total_shards": expected_total_shards,
             "members": members,
         },
         True,
