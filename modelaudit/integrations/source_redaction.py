@@ -100,7 +100,7 @@ _EXPORT_ASSIGNMENT_RE = re.compile(
     rf"(?P<key_escape>\\?)(?P<quote>[\"'])"
     rf"(?P<quoted_key>{_EXPORT_KEY_TOKEN}(?:{_EXPORT_BRACKET_KEY})*)(?P=key_escape)(?P=quote)"
     rf"|(?P<key>{_EXPORT_KEY_TOKEN}(?:{_EXPORT_BRACKET_KEY})*))"
-    r"(?P<separator>\s*(?::|=|<<?-)\s*)",
+    r"(?P<separator>\s*(?::|(?<![=!<>])=(?!=)|<<?-)\s*)",
     re.IGNORECASE,
 )
 _EXPORT_EQUALS_KEY_RE = re.compile(
@@ -806,7 +806,9 @@ def _assignment_value_end(value: str, start: int, *, key: str) -> int:
         quote = value[value_start]
         quote_end = _find_closing_quote(value, value_start, quote)
         if quote_end >= 0:
-            return quote_end + 1
+            quoted_end = quote_end + 1
+            if quoted_end >= len(value) or value[quoted_end].isspace() or value[quoted_end] in ",;)}]":
+                return quoted_end
         start = value_start
     if value_start < len(value) and value[value_start] in {"|", ">"}:
         return _yaml_block_value_end(value, value_start)

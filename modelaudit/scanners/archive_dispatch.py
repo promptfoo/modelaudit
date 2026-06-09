@@ -517,8 +517,21 @@ def merge_hdf5_userblock_zip_findings(
                     has_trailing_content = True
                 trailing_bytes -= len(chunk)
 
+        logical_start = 0
         for logical_end in logical_zip_ends:
-            temp_path = _copy_file_prefix_to_temp(path, logical_end, temp_suffix)
+            if logical_start == 0:
+                temp_path = _copy_file_prefix_to_temp(path, logical_end, temp_suffix)
+            else:
+                temp_path = _copy_file_range_to_temp(
+                    path,
+                    logical_start,
+                    logical_end,
+                    temp_suffix,
+                )
+                if not zipfile.is_zipfile(temp_path):
+                    with suppress(OSError):
+                        os.unlink(temp_path)
+                    temp_path = _copy_file_prefix_to_temp(path, logical_end, temp_suffix)
             supplemental_result = ScanResult(scanner_name="zip")
             merge_executable_zip_container_findings(temp_path, supplemental_result, config, context=context)
             _replace_scan_result_path(supplemental_result, temp_path, path)
@@ -526,6 +539,7 @@ def merge_hdf5_userblock_zip_findings(
             with suppress(OSError):
                 os.unlink(temp_path)
             temp_path = None
+            logical_start = logical_end
         if has_trailing_content:
             reason = "hdf5_userblock_zip_trailing_content_unanalyzed"
             mark_inconclusive_scan_result(result, reason)
@@ -676,13 +690,14 @@ def _find_valid_zip_logical_ends(
     return logical_ends
 
 
-def _copy_file_prefix_to_temp(path: str, length: int, suffix: str) -> str:
-    """Copy exactly one validated archive prefix to a temporary file."""
+def _copy_file_range_to_temp(path: str, start: int, end: int, suffix: str) -> str:
+    """Copy exactly one validated archive range to a temporary file."""
     temp_path: str | None = None
     try:
         with open(path, "rb") as source, tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+            source.seek(start)
             temp_path = temp_file.name
-            remaining = length
+            remaining = end - start
             while remaining > 0:
                 chunk = source.read(min(1024 * 1024, remaining))
                 if not chunk:
@@ -695,6 +710,11 @@ def _copy_file_prefix_to_temp(path: str, length: int, suffix: str) -> str:
             with suppress(OSError):
                 os.unlink(temp_path)
         raise
+
+
+def _copy_file_prefix_to_temp(path: str, length: int, suffix: str) -> str:
+    """Copy exactly one validated archive prefix to a temporary file."""
+    return _copy_file_range_to_temp(path, 0, length, suffix)
 
 
 def merge_flax_msgpack_overlap_findings(

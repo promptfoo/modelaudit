@@ -1447,7 +1447,7 @@ def test_catboost_sarif_preserves_process_context_while_redacting_command_expres
     assert "bash -c" in sarif
     assert "--password <redacted>" in sarif
     assert "--user 'alice:<redacted>'" in sarif
-    assert "-ualice:<redacted>" in sarif
+    assert "client_secret=<redacted>" in sarif
     assert "collector.evil.example" in sarif
     assert "touch /tmp/pwned" in sarif
 

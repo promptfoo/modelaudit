@@ -390,7 +390,11 @@ class PyTorchZipScanner(BaseScanner):
 
             from .zip_scanner import open_preflighted_zip
 
-            with open_preflighted_zip(path, self.config) as zip_file:
+            with open_preflighted_zip(
+                path,
+                self.config,
+                allow_local_entry_mismatch=True,
+            ) as zip_file:
                 # Validate ZIP entries and check for path traversal
                 safe_entries = self._validate_zip_entries(zip_file, result, path)
                 self._check_timeout()  # Check timeout after entry validation
@@ -3667,7 +3671,11 @@ class PyTorchZipScanner(BaseScanner):
         try:
             from .zip_scanner import open_preflighted_zip
 
-            with open_preflighted_zip(file_path, self.config) as zip_file:
+            with open_preflighted_zip(
+                file_path,
+                self.config,
+                allow_local_entry_mismatch=True,
+            ) as zip_file:
                 archive_entries = zip_file.infolist()
                 total_files = len(archive_entries)
                 entries_to_process = archive_entries[: self.max_archive_entries]

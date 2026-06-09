@@ -1780,6 +1780,7 @@ def test_command_credential_redaction_has_bounded_runtime(pattern_name: str, pay
         env={**os.environ, "PYTHONPATH": python_path},
         input=payload,
         text=True,
+        encoding="utf-8",
         timeout=5,
     )
 
@@ -1812,6 +1813,7 @@ def test_redaction_adversarial_inputs_have_bounded_runtime(payload: str) -> None
         env={**os.environ, "PYTHONPATH": python_path},
         input=payload,
         text=True,
+        encoding="utf-8",
         timeout=5,
     )
 

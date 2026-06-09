@@ -485,6 +485,21 @@ def test_redact_source_text_handles_dense_credential_assignments() -> None:
     assert redacted.count("<redacted>") == 5_000
 
 
+def test_redact_source_text_does_not_treat_comparison_as_assignment() -> None:
+    text = 'config={"client_secret" == "public": "os.system(15)"}'
+
+    assert redact_source_text(text) == text
+
+
+def test_redact_source_text_consumes_suffix_after_quoted_marker() -> None:
+    text = 'client_secret="<redacted>"MARKER_SUFFIX_SECRET; visible=yes'
+
+    redacted = redact_source_text(text)
+
+    assert "MARKER_SUFFIX_SECRET" not in redacted
+    assert redacted == "client_secret=<redacted>; visible=yes"
+
+
 @pytest.mark.parametrize(
     "text",
     [

@@ -100,6 +100,10 @@ class _InvalidZipDirectory(ValueError):
         self.routing_evidence = routing_evidence
 
 
+class _ZipLocalEntryMismatch(_InvalidZipDirectory):
+    """Raised when a central-directory entry does not match its local record."""
+
+
 class _ZipCentralDirectorySizeExceeded(_InvalidZipDirectory):
     def __init__(self, directory_size: int, max_directory_size: int):
         super().__init__(
@@ -714,6 +718,11 @@ class ZipScanner(BaseScanner):
                 for candidate in candidates
                 if (layout := cls._local_entry_layout(handle, metadata, entry, candidate)) is not None
             ]
+            if not matching_layouts:
+                raise _ZipLocalEntryMismatch(
+                    "ZIP central directory does not uniquely identify its local entry",
+                    routing_evidence=True,
+                )
             if len(matching_layouts) != 1:
                 raise _InvalidZipDirectory(
                     "ZIP central directory does not uniquely identify its local entry",
@@ -2223,6 +2232,7 @@ def _open_preflighted_zip_handle(
     config: dict[str, Any] | None = None,
     *,
     require_zip: bool = True,
+    allow_local_entry_mismatch: bool = False,
 ) -> Iterator[tuple[BinaryIO, bool]]:
     """Open once, preflight that descriptor, and yield it with its ZIP routing state."""
     scanner = ZipScanner(config=config)
@@ -2235,6 +2245,10 @@ def _open_preflighted_zip_handle(
                 scanner.max_central_directory_size,
             )
         except _InvalidZipDirectory as exc:
+            if isinstance(exc, _ZipLocalEntryMismatch) and allow_local_entry_mismatch:
+                handle.seek(0)
+                yield handle, True
+                return
             if not require_zip:
                 handle.seek(0)
                 try:
@@ -2276,9 +2290,15 @@ def open_preflighted_zip_handle(
     config: dict[str, Any] | None = None,
     *,
     require_zip: bool = True,
+    allow_local_entry_mismatch: bool = False,
 ) -> Iterator[BinaryIO]:
     """Open once, preflight that descriptor, and yield it without a pathname race."""
-    with _open_preflighted_zip_handle(path, config, require_zip=require_zip) as (handle, _is_zip):
+    with _open_preflighted_zip_handle(
+        path,
+        config,
+        require_zip=require_zip,
+        allow_local_entry_mismatch=allow_local_entry_mismatch,
+    ) as (handle, _is_zip):
         yield handle
 
 
@@ -2286,7 +2306,16 @@ def open_preflighted_zip_handle(
 def open_preflighted_zip(
     path: str | os.PathLike[str],
     config: dict[str, Any] | None = None,
+    *,
+    allow_local_entry_mismatch: bool = False,
 ) -> Iterator[zipfile.ZipFile]:
     """Construct ``ZipFile`` only after preflighting the same open descriptor."""
-    with open_preflighted_zip_handle(path, config) as handle, zipfile.ZipFile(handle, "r") as archive:
+    with (
+        open_preflighted_zip_handle(
+            path,
+            config,
+            allow_local_entry_mismatch=allow_local_entry_mismatch,
+        ) as handle,
+        zipfile.ZipFile(handle, "r") as archive,
+    ):
         yield archive

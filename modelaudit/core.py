@@ -1242,6 +1242,11 @@ def _select_hdf5_userblock_supplemental_scanner_id(
     config: dict[str, Any] | None = None,
 ) -> str | None:
     """Preserve the non-HDF5 scanner that owns a user-block prefix or path."""
+    if header_format == "zip":
+        # Complete user-block ZIP segments are routed independently below.
+        # Probing the full HDF5 file can reject valid concatenated archives
+        # because the final central directory intentionally omits earlier ZIPs.
+        return "zip"
     scanner_id = _select_non_hdf5_preferred_scanner_id(path, header_format, ext, config)
     if scanner_id is not None:
         return scanner_id
@@ -3574,15 +3579,20 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         sr.finish(success=False)
         return sr
 
+    hdf5_signature_offset = find_hdf5_signature_offset(path)
     try:
         max_zip_entries = int(config.get("max_zip_entries", ZipScanner.DEFAULT_MAX_ENTRIES))
     except (TypeError, ValueError):
         max_zip_entries = ZipScanner.DEFAULT_MAX_ENTRIES
     max_zip_directory_size = ZipScanner.central_directory_size_limit(config)
-    if allows_zip_structure_analysis(scanner_selection, path) and ZipScanner.requires_preflight_result(
-        path,
-        max_zip_entries,
-        max_zip_directory_size,
+    if (
+        hdf5_signature_offset in (None, 0)
+        and allows_zip_structure_analysis(scanner_selection, path)
+        and ZipScanner.requires_preflight_result(
+            path,
+            max_zip_entries,
+            max_zip_directory_size,
+        )
     ):
         return ZipScanner(config=config).scan(path)
 
@@ -3684,8 +3694,6 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             if nested_xgboost_route == "xgboost":
                 config[XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY] = True
     is_xgboost_pickle_spoof = ext in _XGBOOST_BINARY_EXTENSIONS and header_format == "pickle"
-    hdf5_signature_offset = find_hdf5_signature_offset(path)
-
     # Record telemetry for file type detection
     detected_format = header_format if header_format != "unknown" else ext_format
     record_file_type_detected(path, detected_format)
