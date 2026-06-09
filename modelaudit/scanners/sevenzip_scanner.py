@@ -389,6 +389,44 @@ class SevenZipScanner(BaseScanner):
         except Exception:
             return False
 
+    @classmethod
+    def _archive_member_name(cls, member_info: Any) -> str:
+        if isinstance(member_info, str):
+            return member_info
+        member_name = getattr(member_info, "filename", None)
+        if not isinstance(member_name, str) or not member_name:
+            raise ValueError("7z member metadata did not include a filename")
+        return member_name
+
+    @staticmethod
+    def _archive_member_name_source(archive: Any) -> Any | None:
+        archive_state = getattr(archive, "__dict__", None)
+        return archive_state.get("files") if isinstance(archive_state, dict) else None
+
+    def _bounded_archive_file_names(self, archive: Any) -> tuple[list[str], int, bool]:
+        """Return archive member names without building a second unbounded name table when possible."""
+        member_source = self._archive_member_name_source(archive)
+        if member_source is None:
+            if type(archive).__module__.startswith("py7zr"):
+                raise ValueError("7z archive metadata did not expose a bounded member source")
+            fallback_file_names = list(archive.getnames())
+            return fallback_file_names, len(fallback_file_names), len(fallback_file_names) > self.max_entries
+
+        try:
+            observed_entry_count = len(member_source)
+        except TypeError:
+            pass
+        else:
+            if observed_entry_count > self.max_entries:
+                return [], observed_entry_count, True
+
+        file_names: list[str] = []
+        for member_info in member_source:
+            file_names.append(self._archive_member_name(member_info))
+            if len(file_names) > self.max_entries:
+                return file_names, len(file_names), True
+        return file_names, len(file_names), False
+
     def scan(self, path: str) -> ScanResult:
         """Scan a 7-Zip archive file"""
         self._archive_member_info_cache.clear()
@@ -511,25 +549,27 @@ class SevenZipScanner(BaseScanner):
         )
 
         with py7zr.SevenZipFile(path, mode="r") as archive:
-            # Get file listing
-            file_names = archive.getnames()
+            file_names, observed_entry_count, entry_limit_exceeded = self._bounded_archive_file_names(archive)
 
             # Check per-archive entry limit
-            if len(file_names) > self.max_entries:
+            if entry_limit_exceeded:
                 budget.abort_due_to_limit()
                 result.add_check(
                     name="Archive Entry Limit",
                     passed=False,
-                    message=f"7z archive contains {len(file_names)} files, exceeding limit of {self.max_entries}",
+                    message=(
+                        f"7z archive contains at least {observed_entry_count} files, "
+                        f"exceeding limit of {self.max_entries}"
+                    ),
                     severity=IssueSeverity.CRITICAL,
                     location=path,
                     details={
-                        "file_count": len(file_names),
+                        "file_count": observed_entry_count,
                         "limit": self.max_entries,
                         "potential_threat": "zip_bomb",
                     },
                 )
-                result.metadata["total_files"] = len(file_names)
+                result.metadata["total_files"] = observed_entry_count
                 result.metadata["scannable_files"] = 0
                 result.metadata["unsafe_entries"] = 0
                 result.metadata["file_size"] = os.path.getsize(path)
@@ -874,6 +914,8 @@ class SevenZipScanner(BaseScanner):
             prefix[:8],
             prefix[:16],
             len(prefix),
+            pickle_probe_sample=prefix,
+            pickle_probe_is_prefix=len(prefix) == self._NESTED_MEMBER_PROBE_BYTES,
         )
         if detected_format == "unknown":
             return None

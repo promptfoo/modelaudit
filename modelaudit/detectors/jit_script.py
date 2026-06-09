@@ -169,7 +169,6 @@ _MAX_SNIPPET_PARSE_TRIM_ATTEMPTS = 8
 _MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS = 10
 _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS = 16
 _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES = 16_384
-_MAX_PRIORITY_ALIAS_USAGE_LINES = 8
 # Each indirect-alias probe re-parses and re-resolves the whole (<=16 KiB) snippet,
 # so an unbounded loop is quadratic in the assignment count. Cap the expensive
 # probes; the cheap direct-reference fast path still runs for every assignment.
@@ -195,7 +194,6 @@ _PROVEN_HIGH_RISK_CALL_PROBES = {
         b"\nimport ctypes as __modelaudit_ctypes\n__modelaudit_ctypes.CDLL('payload.so')\n",
     ),
 }
-_PROVEN_RUNPY_CALL_PROBE = _PROVEN_HIGH_RISK_CALL_PROBES["S108"][1]
 _TYPED_PROOF_BINDING_MARKERS = (
     b".get",
     b".open",
@@ -229,11 +227,6 @@ _TYPED_PROOF_MEMBER_NAMES = frozenset(
     }
 )
 _TYPED_STATE_MEMBER_NAMES = _TYPED_PROOF_MEMBER_NAMES | frozenset({"_dlltype"})
-_DIRECT_PRIORITY_MEMBER_STATE_PATTERN = re.compile(
-    rb"\s*([A-Za-z_]\w*)\s*\.\s*("
-    + b"|".join(re.escape(member.encode("utf-8")) for member in sorted(_TYPED_STATE_MEMBER_NAMES))
-    + rb")\s*(?::[^=\n#]+)?\s*=(?!=)"
-)
 _EMBEDDED_PYTHON_BYTE_LIMIT_REASON = "jit_embedded_python_byte_limit"
 _EMBEDDED_PYTHON_SNIPPET_LIMIT_REASON = "jit_embedded_python_snippet_limit"
 _EMBEDDED_PYTHON_START_MARKERS = (
@@ -6025,7 +6018,6 @@ def _deterministically_evaluated_statement_expressions(
         try:
             subject = ast.literal_eval(statement.subject)
         except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
-            subject = None
             subject_is_known = False
         else:
             subject_is_known = True

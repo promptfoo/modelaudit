@@ -108,6 +108,7 @@ _WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES: Final[frozenset[str]] = frozenset(
 _WHITELIST_DOWNGRADE_EXEMPT_CHECK_NAMES: Final[frozenset[str]] = frozenset(
     {
         "Command/Network Correlation Check",
+        "RKNN Command and Network Indicator Correlation",
     }
 )
 # Word-boundary matching prevents incidental substrings (e.g. "executable" inside

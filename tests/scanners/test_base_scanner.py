@@ -521,7 +521,14 @@ def test_whitelist_downgrade_critical_to_info():
     assert result.issues[0].details.get("original_severity") == "CRITICAL"
 
 
-def test_whitelist_does_not_downgrade_critical_command_network_correlation() -> None:
+@pytest.mark.parametrize(
+    "check_name",
+    [
+        "Command/Network Correlation Check",
+        "RKNN Command and Network Indicator Correlation",
+    ],
+)
+def test_whitelist_does_not_downgrade_critical_command_network_correlation(check_name: str) -> None:
     """Neutral command/network criticals must still fail whitelisted HF scans."""
     from modelaudit.whitelists import POPULAR_MODELS
 
@@ -536,7 +543,7 @@ def test_whitelist_does_not_downgrade_critical_command_network_correlation() -> 
 
     result = scanner._create_result()
     result.add_check(
-        name="Command/Network Correlation Check",
+        name=check_name,
         passed=False,
         message="Correlated command and process/network indicators detected",
         severity=IssueSeverity.CRITICAL,
@@ -548,6 +555,32 @@ def test_whitelist_does_not_downgrade_critical_command_network_correlation() -> 
     assert len(result.checks) == 1
     assert result.checks[0].severity == IssueSeverity.CRITICAL
     assert result.checks[0].details.get("whitelist_downgrade") is None
+
+
+def test_whitelist_still_downgrades_rknn_command_only_near_match() -> None:
+    """The RKNN correlation exemption must not cover command-only indicators."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.rknn"),
+        file_size=100,
+        file_type=".rknn",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name="RKNN Command Indicator Detection",
+        passed=False,
+        message="Command execution indicators detected in RKNN metadata text",
+        severity=IssueSeverity.WARNING,
+    )
+
+    assert result.issues[0].severity == IssueSeverity.INFO
+    assert result.issues[0].details.get("whitelist_downgrade") is True
+    assert result.checks[0].severity == IssueSeverity.INFO
 
 
 def test_whitelist_still_downgrades_policy_grade_high_severity_url() -> None:
