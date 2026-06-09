@@ -15,9 +15,10 @@ use crate::nested::{
     encoded_nested_literal_probe_coverage_incomplete,
     encoded_nested_literal_probe_windows_with_limit, encoded_nested_window_char_limit,
     encoded_pickle_consumes_literal, has_binary_pickle_prefix, has_execution_opcode,
-    has_pickle_prefix, looks_like_pickle_payload, nested_pickle_probe_offsets,
-    pickle_payload_extent_result, protocol0_global_or_inst_prefix_has_import_reference_lines,
-    DecodedNestedPayload, NestedProbeOffsets, MAX_NESTED_PAYLOAD_PROBES,
+    has_pickle_prefix, is_strict_base64_literal, looks_like_pickle_payload,
+    nested_pickle_probe_offsets, pickle_payload_extent_result,
+    protocol0_global_or_inst_prefix_has_import_reference_lines, DecodedNestedPayload,
+    NestedProbeOffsets, MAX_NESTED_PAYLOAD_PROBES,
 };
 use crate::nested_surface::{
     encoded_nested_payload_finding, is_allowlisted_nested_constructor_ref,
@@ -1303,7 +1304,17 @@ impl<'a> ScanState<'a> {
             "BINBYTES" | "BINBYTES8" | "SHORT_BINBYTES" | "BYTEARRAY8" => {
                 if let Some((start, end)) = opcode.arg.byte_span(self.payload.len()) {
                     let bytes = &self.payload[start..end];
-                    self.scan_raw_nested_pickle_bytes(bytes, self.position_offset + start);
+                    let encoded_nested_pickle_outcome =
+                        self.scan_encoded_nested_pickle_bytes_literal(bytes, position);
+                    let strict_base64_literal = is_strict_base64_literal(bytes);
+                    // Complete raw pickles require STOP ('.'), which is outside the
+                    // base64 alphabet. After a decoded candidate is confirmed, raw
+                    // parsing of a strict token can only produce truncated phantoms.
+                    let skip_raw_scan = encoded_nested_pickle_outcome.1
+                        || (encoded_nested_pickle_outcome.0 && strict_base64_literal);
+                    if !skip_raw_scan {
+                        self.scan_raw_nested_pickle_bytes(bytes, self.position_offset + start);
+                    }
                     self.push_stack_value(StackValue::Bytes { start, end });
                 } else {
                     self.push_stack_value(StackValue::Bytes { start: 0, end: 0 });
@@ -5999,9 +6010,76 @@ impl<'a> ScanState<'a> {
             && is_repeated_single_byte(value.as_bytes())
     }
 
+    fn scan_encoded_nested_pickle_bytes_literal(
+        &mut self,
+        value: &[u8],
+        position: usize,
+    ) -> (bool, bool) {
+        let scan_limit = value.len().min(self.options.max_string_literal_scan_chars);
+        if scan_limit == value.len() {
+            return self.scan_encoded_nested_pickle_bytes_slice(value, position);
+        }
+
+        let mut found_candidate = false;
+        if scan_limit > 0 {
+            for slice in [
+                &value[..scan_limit],
+                &value[value.len().saturating_sub(scan_limit)..],
+            ] {
+                found_candidate |= self
+                    .scan_encoded_nested_pickle_bytes_slice(slice, position)
+                    .0;
+            }
+        }
+        self.record_literal_scan_truncated("bytes", value.len(), "encoded_nested_pickle", position);
+        (found_candidate, false)
+    }
+
+    fn scan_encoded_nested_pickle_bytes_slice(
+        &mut self,
+        value: &[u8],
+        position: usize,
+    ) -> (bool, bool) {
+        match std::str::from_utf8(value) {
+            Ok(value) => {
+                if self.is_large_uninteresting_repeated_literal(value) {
+                    (false, false)
+                } else {
+                    self.scan_encoded_nested_pickle_literal_outcome(value, position)
+                }
+            }
+            Err(_) => {
+                let sanitized = value
+                    .iter()
+                    .map(|byte| {
+                        if byte.is_ascii() {
+                            char::from(*byte)
+                        } else {
+                            '!'
+                        }
+                    })
+                    .collect::<String>();
+                if self.is_large_uninteresting_repeated_literal(&sanitized) {
+                    (false, false)
+                } else {
+                    self.scan_encoded_nested_pickle_literal_outcome(&sanitized, position)
+                }
+            }
+        }
+    }
+
     fn scan_encoded_nested_pickle_literal(&mut self, value: &str, position: usize) -> bool {
+        self.scan_encoded_nested_pickle_literal_outcome(value, position)
+            .1
+    }
+
+    fn scan_encoded_nested_pickle_literal_outcome(
+        &mut self,
+        value: &str,
+        position: usize,
+    ) -> (bool, bool) {
         if !encoded_literal_may_contain_pickle(value) {
-            return false;
+            return (false, false);
         }
 
         let whole_literal_is_encoded_pickle = encoded_pickle_consumes_literal(value);
@@ -6065,11 +6143,11 @@ impl<'a> ScanState<'a> {
         }
 
         if found_candidate {
-            return whole_literal_is_encoded_pickle;
+            return (true, whole_literal_is_encoded_pickle);
         }
 
         if probe_coverage_incomplete || probe_limit_exceeded {
-            return false;
+            return (false, false);
         }
 
         if value.len() > self.options.max_string_literal_scan_chars
@@ -6082,7 +6160,7 @@ impl<'a> ScanState<'a> {
                 position,
             );
         }
-        whole_literal_is_encoded_pickle
+        (false, whole_literal_is_encoded_pickle)
     }
 
     fn scan_encoded_nested_pickle_candidate(&mut self, value: &str, position: usize) -> bool {

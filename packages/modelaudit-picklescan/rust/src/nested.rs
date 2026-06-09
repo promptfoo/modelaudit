@@ -144,6 +144,19 @@ fn decoded_pickle_payloads(decoded: &[u8], max_nested_pickle_bytes: usize) -> Ve
         Ok(None) | Err(_) => {}
     }
 
+    let remaining = &decoded[search_start..];
+    let remaining_is_complete = pickle_payload_extent_result(remaining, max_nested_pickle_bytes)
+        .is_ok_and(|extent| extent.is_some());
+    if search_start > 0
+        && remaining.len() <= max_nested_pickle_bytes
+        && !remaining_is_complete
+        && has_structurally_valid_execution_prefix(remaining)
+    {
+        let payload_len = remaining.len().min(max_nested_pickle_bytes);
+        payloads.push((remaining[..payload_len].to_vec(), true));
+        return payloads;
+    }
+
     let mut seen_spans = Vec::new();
     for offset in nested_pickle_probe_offsets_unbounded(&decoded[search_start..]) {
         let offset = search_start.saturating_add(offset);
@@ -156,6 +169,9 @@ fn decoded_pickle_payloads(decoded: &[u8], max_nested_pickle_bytes: usize) -> Ve
                 Ok(Some(payload_len)) => (payload_len, false),
                 Err(error) if error.is_structured_protocol0_line_operand_limit() => {
                     (probe.len(), true)
+                }
+                Ok(None) | Err(_) if has_structurally_valid_execution_prefix(probe) => {
+                    (probe.len().min(max_nested_pickle_bytes), true)
                 }
                 Ok(None) | Err(_) => continue,
             };
@@ -316,6 +332,41 @@ pub(crate) fn has_execution_opcode(value: &[u8]) -> bool {
                 return true;
             }
             _ => {}
+        }
+        index = parsed.next;
+        if parsed.name == "STOP" {
+            return false;
+        }
+    }
+    false
+}
+
+fn has_structurally_valid_execution_prefix(value: &[u8]) -> bool {
+    if !has_pickle_prefix(value) {
+        return false;
+    }
+
+    let mut index = 0usize;
+    let mut stack_depth = 0usize;
+    let mut mark_depths = Vec::new();
+    while index < value.len() {
+        let parsed = match parse_opcode(value, index, value.len()) {
+            Ok(parsed) => parsed,
+            Err(_) => return false,
+        };
+        if matches!(parsed.name, "GLOBAL" | "INST")
+            && !protocol0_opcode_operands_are_import_references(&parsed, value)
+        {
+            return false;
+        }
+        if !validate_pickle_stack_effect(&parsed, &mut stack_depth, &mut mark_depths) {
+            return false;
+        }
+        if matches!(
+            parsed.name,
+            "INST" | "REDUCE" | "NEWOBJ" | "NEWOBJ_EX" | "OBJ" | "BUILD" | "PERSID" | "BINPERSID"
+        ) {
+            return true;
         }
         index = parsed.next;
         if parsed.name == "STOP" {
@@ -1537,6 +1588,25 @@ fn base64_candidate_unpadded(value: &str) -> Option<&str> {
     Some(unpadded)
 }
 
+pub(crate) fn is_strict_base64_literal(value: &[u8]) -> bool {
+    let Some(padding_start) = value.iter().position(|byte| *byte == b'=') else {
+        return !value.is_empty()
+            && value.len() % 4 != 1
+            && value.iter().all(
+                |byte| matches!(*byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/'),
+            );
+    };
+    let (unpadded, padding) = value.split_at(padding_start);
+    !unpadded.is_empty()
+        && unpadded.len() % 4 != 1
+        && unpadded
+            .iter()
+            .all(|byte| matches!(*byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/'))
+        && padding.len() <= 2
+        && padding.iter().all(|byte| *byte == b'=')
+        && value.len() % 4 == 0
+}
+
 fn is_hex_candidate(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(is_hex_byte)
 }
@@ -1572,7 +1642,7 @@ fn base64_structural_prefix_has_pickle_prefix(value: &str) -> bool {
         value,
         MAX_ENCODED_LITERAL_PREFIX_SCAN_BYTES,
         max_encoded_chars,
-    )
+    ) || base64_prefix_has_complete_protocol0_line(value, MAX_ENCODED_LITERAL_PREFIX_SCAN_BYTES)
 }
 
 fn base64_prefix_has_pickle_prefix_with_limit(value: &str, max_input_bytes: usize) -> bool {
@@ -1580,7 +1650,7 @@ fn base64_prefix_has_pickle_prefix_with_limit(value: &str, max_input_bytes: usiz
         value,
         max_input_bytes,
         ENCODED_LITERAL_PROBE_CHARS,
-    ) || base64_prefix_has_complete_protocol0_line(value, max_input_bytes)
+    )
 }
 
 fn base64_prefix_has_pickle_prefix_with_probe_chars(
@@ -1614,7 +1684,6 @@ fn base64_prefix_has_nested_probe_prefix(value: &str, max_input_bytes: usize) ->
                 .and_then(decode_base64)
                 .is_some_and(|decoded| has_nested_probe_prefix(&decoded))
         })
-        || base64_prefix_has_complete_protocol0_line(value, max_input_bytes)
 }
 
 fn base64_prefix_has_complete_protocol0_line(value: &str, max_input_bytes: usize) -> bool {
@@ -2370,7 +2439,7 @@ mod tests {
             let payload = long_protocol0_line_payload_for_test(opcode);
             let encoded = encode_base64_for_test(&payload);
 
-            assert!(base64_prefix_has_pickle_prefix(&encoded));
+            assert!(base64_structural_prefix_has_pickle_prefix(&encoded));
             assert!(
                 decode_possible_encoded_pickle(&encoded, TEST_MAX_NESTED_PICKLE_BYTES)
                     .iter()
@@ -2447,6 +2516,33 @@ mod tests {
                     char::from(opcode)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn encoded_probe_windows_keep_benign_long_scalar_candidates_at_decoded_offsets() {
+        let mut payload = b"V".to_vec();
+        payload.extend(std::iter::repeat_n(
+            b'A',
+            PROTOCOL0_SCALAR_PREFIX_PROBE_BYTES + 1,
+        ));
+        payload.extend_from_slice(b"\n.");
+
+        for prefix_len in 1..3usize {
+            let mut wrapped = vec![b'X'; prefix_len];
+            wrapped.extend_from_slice(&payload);
+            let encoded = encode_base64_for_test(&wrapped);
+
+            assert!(encoded_literal_may_contain_pickle(&encoded));
+            let windows = encoded_nested_literal_probe_windows(&encoded, encoded.len());
+            assert!(
+                windows.iter().any(|window| {
+                    decode_possible_encoded_pickle(window, TEST_MAX_NESTED_PICKLE_BYTES)
+                        .iter()
+                        .any(|candidate| candidate.payload == payload)
+                }),
+                "missing benign payload at decoded offset {prefix_len}: {windows:?}",
+            );
         }
     }
 
@@ -2626,6 +2722,50 @@ mod tests {
         let error = pickle_payload_extent_result(&payload, payload.len() + 16)
             .expect_err("overlong protocol 0 string should preserve its parse error");
         assert!(!error.is_structured_protocol0_line_operand_limit());
+    }
+
+    #[test]
+    fn decoded_payloads_preserve_truncated_execution_prefixes() {
+        for payload in [b"Pevil\nAAAAAAAA".as_slice(), b"\x80\x04N.Pevil\n"] {
+            let decoded = decoded_pickle_payloads(payload, payload.len() + 16);
+
+            assert!(decoded.iter().any(|(candidate, analysis_incomplete)| {
+                *analysis_incomplete && candidate.starts_with(b"Pevil\n")
+            }));
+        }
+    }
+
+    #[test]
+    fn decoded_payloads_ignore_execution_like_benign_text_and_suffixes() {
+        let payloads = decoded_pickle_payloads(b"\x80\x04N.README", 64);
+        assert_eq!(payloads, vec![(b"\x80\x04N.".to_vec(), false)]);
+
+        assert!(decoded_pickle_payloads(b"(README benign text", 64).is_empty());
+    }
+
+    #[test]
+    fn decoded_payloads_ignore_truncated_data_only_scalars() {
+        for payload in [
+            b"F1".as_slice(),
+            b"I1",
+            b"L1",
+            b"S'value'",
+            b"Vvalue",
+            b"g0",
+            b"p0",
+        ] {
+            assert!(decoded_pickle_payloads(payload, payload.len() + 16).is_empty());
+        }
+    }
+
+    #[test]
+    fn strict_base64_literals_require_terminal_canonical_padding() {
+        assert!(is_strict_base64_literal(b"gAR9Lg=="));
+        assert!(is_strict_base64_literal(b"gAR9Lg"));
+        assert!(!is_strict_base64_literal(b"gAR9Lg==NQ"));
+        assert!(!is_strict_base64_literal(b"=gAR9Lg="));
+        assert!(!is_strict_base64_literal(b"g=AR9Lg="));
+        assert!(!is_strict_base64_literal(b"gAR9Lg===="));
     }
 
     #[test]
