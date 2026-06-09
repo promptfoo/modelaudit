@@ -112,6 +112,22 @@ _WHITELIST_DOWNGRADE_EXEMPT_CHECK_NAMES: Final[frozenset[str]] = frozenset(
     }
 )
 _WHITELIST_DOWNGRADE_EXEMPT_CORRELATION_DETAIL = "same_fragment_correlation"
+_WHITELIST_DOWNGRADE_EXEMPT_CRITICAL_CHECK_NAMES: Final[frozenset[str]] = frozenset(
+    {
+        "Blacklist Pattern Check",
+        "Command Indicator Check",
+        "CoreML Custom Layer Check",
+        "CoreML Custom Model Class Check",
+        "Embedded PE Detection",
+        "External Library Reference Check",
+        "Protobuf String Injection Check",
+        "Python Operator Detection",
+        "Serialized Expression Payload Detection",
+        "Suspicious Layer Type Detection",
+        "TorchServe Handler Static Analysis",
+        "Torch7 Lua Execution Primitive Analysis",
+    }
+)
 # Word-boundary matching prevents incidental substrings (e.g. "executable" inside
 # "ExecuTorch", "rce" inside "force") from suppressing whitelist downgrades.
 _WHITELIST_DOWNGRADE_EXEMPT_KEYWORD_PATTERN: Final[re.Pattern[str]] = re.compile(
@@ -248,6 +264,7 @@ class BaseScanner(ABC):
     @staticmethod
     def _whitelist_downgrade_exempt(
         *,
+        severity: IssueSeverity,
         details: dict[str, Any] | None,
         result_metadata: dict[str, Any] | None = None,
         message: str | None,
@@ -267,6 +284,9 @@ class BaseScanner(ABC):
             check_name in _WHITELIST_DOWNGRADE_EXEMPT_CHECK_NAMES
             and details.get(_WHITELIST_DOWNGRADE_EXEMPT_CORRELATION_DETAIL) is True
         ):
+            return True
+
+        if severity == IssueSeverity.CRITICAL and check_name in _WHITELIST_DOWNGRADE_EXEMPT_CRITICAL_CHECK_NAMES:
             return True
 
         if rule_code and (rule_code.startswith("S2") or rule_code in _WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES):
@@ -299,6 +319,7 @@ class BaseScanner(ABC):
             return False
 
         if self._whitelist_downgrade_exempt(
+            severity=severity,
             details=details,
             result_metadata=result_metadata,
             message=message,

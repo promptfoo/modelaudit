@@ -608,6 +608,85 @@ def test_whitelist_downgrades_unconfirmed_command_network_correlation(check_name
     assert result.checks[0].severity == IssueSeverity.INFO
 
 
+@pytest.mark.parametrize(
+    "check_name",
+    [
+        "Blacklist Pattern Check",
+        "Command Indicator Check",
+        "CoreML Custom Layer Check",
+        "CoreML Custom Model Class Check",
+        "Embedded PE Detection",
+        "External Library Reference Check",
+        "Protobuf String Injection Check",
+        "Python Operator Detection",
+        "Serialized Expression Payload Detection",
+        "Suspicious Layer Type Detection",
+        "TorchServe Handler Static Analysis",
+        "Torch7 Lua Execution Primitive Analysis",
+    ],
+)
+def test_whitelist_does_not_downgrade_active_critical_checks(check_name: str) -> None:
+    """Concrete active-payload criticals must still fail whitelisted HF scans."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name=check_name,
+        passed=False,
+        message="Concrete active execution or runtime-extension evidence detected",
+        severity=IssueSeverity.CRITICAL,
+    )
+
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+    assert result.checks[0].severity == IssueSeverity.CRITICAL
+
+
+@pytest.mark.parametrize(
+    "check_name",
+    [
+        "Blacklist Pattern Check",
+        "Command Indicator Check",
+        "Protobuf String Injection Check",
+        "Serialized Expression Payload Detection",
+        "Torch7 Lua Execution Primitive Analysis",
+    ],
+)
+def test_whitelist_still_downgrades_warning_variants_of_active_check_names(check_name: str) -> None:
+    """Documentation, operational, or uncorrelated warning variants stay whitelist eligible."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name=check_name,
+        passed=False,
+        message="Uncorrelated or documentation-context indicator detected",
+        severity=IssueSeverity.WARNING,
+    )
+
+    assert result.issues[0].severity == IssueSeverity.INFO
+    assert result.issues[0].details.get("whitelist_downgrade") is True
+    assert result.checks[0].severity == IssueSeverity.INFO
+
+
 def test_whitelist_still_downgrades_rknn_command_only_near_match() -> None:
     """The RKNN correlation exemption must not cover command-only indicators."""
     from modelaudit.whitelists import POPULAR_MODELS
