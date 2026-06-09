@@ -348,7 +348,7 @@ def _local_path_from_mlflow_artifact_uri(uri: str) -> Path | None:
         return None
 
     if parsed.scheme == "file":
-        if parsed.query or parsed.fragment:
+        if parsed.params or parsed.query or parsed.fragment:
             return None
         netloc = parsed.netloc
         if netloc and netloc.lower() not in {"localhost", "127.0.0.1", "::1"}:
@@ -381,7 +381,7 @@ def _mlflow_artifact_uri_matches_prefix(artifact_uri: str, allowed_prefix: str) 
         return False
     if not artifact.scheme or not prefix.scheme:
         return False
-    if artifact.query or artifact.fragment or prefix.query or prefix.fragment:
+    if artifact.params or artifact.query or artifact.fragment or prefix.params or prefix.query or prefix.fragment:
         return False
     artifact_scheme = artifact.scheme.lower()
     prefix_scheme = prefix.scheme.lower()
@@ -413,7 +413,12 @@ def _normalize_mlflow_delegated_artifact_path(artifact_path: str | None) -> str 
     validated_path = _strictly_validate_mlflow_remote_uri_path(artifact_path)
     if validated_path is None:
         raise ValueError("MLflow artifact path is ambiguous")
-    if not validated_path or posixpath.isabs(validated_path) or ntpath.isabs(validated_path):
+    if (
+        not validated_path
+        or posixpath.isabs(validated_path)
+        or ntpath.isabs(validated_path)
+        or ntpath.splitdrive(validated_path)[0]
+    ):
         raise ValueError("MLflow artifact path is not relative")
     return validated_path
 

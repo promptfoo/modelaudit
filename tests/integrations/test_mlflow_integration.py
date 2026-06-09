@@ -25,6 +25,7 @@ from modelaudit.integrations.mlflow import (
     _MlflowDelegatedDownloadTarget,
     _MlflowLocalSource,
     _normalize_mlflow_artifact_path,
+    _normalize_mlflow_delegated_artifact_path,
     _opened_local_mlflow_path,
     _partition_mlflow_delegated_targets,
     _redact_mlflow_error_for_display,
@@ -56,6 +57,18 @@ def test_normalize_mlflow_artifact_path_allows_posix_colons(monkeypatch: pytest.
     monkeypatch.setattr("modelaudit.integrations.mlflow._IS_WINDOWS", False)
 
     assert _normalize_mlflow_artifact_path("checkpoint:1/model.pkl") == "checkpoint:1/model.pkl"
+
+
+@pytest.mark.parametrize("artifact_path", ["C:evil", "z:weights/model.pkl"])
+def test_normalize_mlflow_delegated_artifact_path_rejects_windows_drive_relative_paths(
+    artifact_path: str,
+) -> None:
+    with pytest.raises(ValueError, match="not relative"):
+        _normalize_mlflow_delegated_artifact_path(artifact_path)
+
+
+def test_normalize_mlflow_delegated_artifact_path_allows_non_drive_colons() -> None:
+    assert _normalize_mlflow_delegated_artifact_path("checkpoint:1/model.pkl") == "checkpoint:1/model.pkl"
 
 
 def test_opened_local_mlflow_path_preserves_windows_handle_width(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1219,6 +1232,7 @@ def test_mlflow_budget_failure_preserves_benign_uri_context() -> None:
         ("dbfs:/trusted/models/model.pkl", "dbfs:/trusted/models"),
         ("s3://trusted-bucket/models//model.pkl", "s3://trusted-bucket/models//"),
         ("s3://trusted-bucket//model.pkl", "s3://trusted-bucket//"),
+        ("https://mlflow.example.com/artifacts;v1/model.pkl", "https://mlflow.example.com/artifacts;v1/"),
     ],
 )
 def test_mlflow_artifact_uri_prefix_matching_accepts_equivalent_safe_uris(
@@ -1237,6 +1251,8 @@ def test_mlflow_artifact_uri_prefix_matching_accepts_equivalent_safe_uris(
         ("https://mlflow.example.com/artifacts/%2", "https://mlflow.example.com/artifacts"),
         ("https://mlflow.example.com/artifacts/%5c..%5cevil", "https://mlflow.example.com/artifacts"),
         ("https://mlflow.example.com:invalid/artifacts/model.pkl", "https://mlflow.example.com/artifacts"),
+        ("https://mlflow.example.com/artifacts/model.pkl;evil", "https://mlflow.example.com/artifacts/model.pkl"),
+        ("https://mlflow.example.com/artifacts/model.pkl", "https://mlflow.example.com/artifacts/model.pkl;evil"),
         ("s3://trusted-bucket/%6dodels/model.pkl", "s3://trusted-bucket/models"),
         ("s3://trusted-bucket/models/model.pkl", "s3://trusted-bucket/models//"),
         ("s3://trusted-bucket/model.pkl", "s3://trusted-bucket//"),
@@ -1262,6 +1278,7 @@ def test_mlflow_artifact_uri_prefix_matching_rejects_ambiguous_uris(
         ("s3://trusted-bucket/models2/model.pkl", "s3://trusted-bucket/models"),
         ("https://mlflow.example.com/artifacts/../evil/model.pkl", "https://mlflow.example.com/artifacts"),
         ("https://mlflow.example.com/artifacts/%2e%2e/evil/model.pkl", "https://mlflow.example.com/artifacts"),
+        ("https://mlflow.example.com/artifacts/model.pkl;evil", "https://mlflow.example.com/artifacts/model.pkl"),
     ],
 )
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
@@ -1289,6 +1306,36 @@ def test_scan_mlflow_model_rejects_unallowlisted_artifact_uri_before_download(
     assert result.checks[0].name == "MLflow Artifact Trust Check"
     assert result.checks[0].details["reason"] == "artifact_uri_not_allowlisted"
     assert result.checks[0].details["artifact_repository_uri"] == artifact_uri
+
+
+@patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_mlflow_model_rejects_drive_relative_delegated_artifact_path(
+    mock_scan: MagicMock,
+    mock_mkdtemp: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A registry-controlled Windows drive path must not escape the staging directory."""
+    artifact_root = "s3://trusted-bucket/models"
+    monkeypatch.setenv("MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS", artifact_root)
+    artifact_repository = MagicMock()
+    artifact_repository.artifact_uri = artifact_root
+    artifact_repository.download_artifacts.side_effect = AssertionError("unsafe path reached the downloader")
+    mlflow_module = MagicMock()
+    mlflow_module.artifacts._get_root_uri_and_artifact_path.return_value = (artifact_root, "C:evil")
+    mlflow_module.artifacts.get_artifact_repository.return_value = artifact_repository
+
+    with patch.dict(sys.modules, {"mlflow": mlflow_module}):
+        result = scan_mlflow_model(f"{artifact_root}/C:evil")
+
+    artifact_repository.download_artifacts.assert_not_called()
+    mock_mkdtemp.assert_not_called()
+    mock_scan.assert_not_called()
+    assert determine_exit_code(result) == 2
+    assert result.success is False
+    assert result.checks[0].name == "MLflow Artifact Trust Check"
+    assert result.checks[0].message == "Unable to verify the MLflow artifact repository before download"
+    assert result.checks[0].details["artifact_path"] == "C:evil"
 
 
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
