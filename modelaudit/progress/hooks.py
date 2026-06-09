@@ -1,14 +1,501 @@
 """Progress hooks system for extensible progress reporting."""
 
+import http.client
+import ipaddress
+import json
 import logging
+import math
+import os
+import socket
+import ssl
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Callable, Collection
+from typing import Any, cast
+from urllib.parse import unquote, urlparse
+
+import idna
 
 from .base import ProgressPhase, ProgressStats
 
 logger = logging.getLogger("modelaudit.progress.hooks")
+
+_PROGRESS_ALLOWED_HOSTS_ENV = "MODELAUDIT_PROGRESS_ALLOWED_HOSTS"
+_PROGRESS_WEBHOOK_ALLOWED_HOSTS_ENV = "MODELAUDIT_PROGRESS_WEBHOOK_ALLOWED_HOSTS"
+_PROGRESS_SMTP_ALLOWED_HOSTS_ENV = "MODELAUDIT_PROGRESS_SMTP_ALLOWED_HOSTS"
+_DEFAULT_SLACK_WEBHOOK_HOSTS = frozenset({"hooks.slack.com", "hooks.slack-gov.com"})
+_INTERNAL_HOST_SUFFIXES = frozenset({".localhost", ".local", ".internal", ".lan", ".home", ".corp", ".intranet"})
+_NAT64_NETWORKS = (
+    ipaddress.ip_network("64:ff9b::/96"),
+    ipaddress.ip_network("64:ff9b:1::/48"),
+)
+_IPV4_TRANSLATED_NETWORK = ipaddress.ip_network("::ffff:0:0:0/96")
+_ISATAP_MARKERS = frozenset({b"\x00\x00\x5e\xfe", b"\x02\x00\x5e\xfe"})
+_IANA_GLOBAL_IP_NETWORKS = (
+    ipaddress.ip_network("192.0.0.9/32"),
+    ipaddress.ip_network("192.0.0.10/32"),
+    ipaddress.ip_network("2001:1::1/128"),
+    ipaddress.ip_network("2001:1::2/128"),
+    ipaddress.ip_network("2001:1::3/128"),
+    ipaddress.ip_network("2001:3::/32"),
+    ipaddress.ip_network("2001:4:112::/48"),
+    ipaddress.ip_network("2001:20::/28"),
+    ipaddress.ip_network("2001:30::/28"),
+)
+_IANA_NON_GLOBAL_IP_NETWORKS = (
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.0.0.0/24"),
+    ipaddress.ip_network("192.0.2.0/24"),
+    ipaddress.ip_network("192.88.99.2/32"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("198.18.0.0/15"),
+    ipaddress.ip_network("198.51.100.0/24"),
+    ipaddress.ip_network("203.0.113.0/24"),
+    ipaddress.ip_network("240.0.0.0/4"),
+    ipaddress.ip_network("::/128"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("::ffff:0:0/96"),
+    ipaddress.ip_network("64:ff9b:1::/48"),
+    ipaddress.ip_network("100::/64"),
+    ipaddress.ip_network("100:0:0:1::/64"),
+    ipaddress.ip_network("2001::/23"),
+    ipaddress.ip_network("2001:db8::/32"),
+    ipaddress.ip_network("3fff::/20"),
+    ipaddress.ip_network("5f00::/16"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+)
+_DEFAULT_NETWORK_TIMEOUT_SECONDS = 10.0
+_MAX_NETWORK_TIMEOUT_SECONDS = 60.0
+
+ResolvedAddress = tuple[socket.AddressFamily, str, int]
+
+
+def _normalize_destination_host(hostname: str) -> str:
+    return unquote(hostname).strip().lower().rstrip(".")
+
+
+def _host_from_config_value(value: str) -> str:
+    candidate = value.strip()
+    if not candidate:
+        return ""
+
+    parsed_ip = _parse_ip_literal(candidate)
+    if parsed_ip is not None:
+        return parsed_ip.compressed
+
+    try:
+        parsed = urlparse(candidate if "://" in candidate else f"//{candidate}")
+        if parsed.username is not None or parsed.password is not None:
+            return ""
+        hostname = parsed.hostname or ""
+    except ValueError:
+        return ""
+    if not hostname:
+        return ""
+    return _canonical_destination_host(hostname)
+
+
+def _get_allowed_hosts(env_name: str, configured_hosts: Collection[str] | None = None) -> set[str]:
+    hosts = {_host_from_config_value(host) for host in configured_hosts or ()}
+    for current_env_name in (_PROGRESS_ALLOWED_HOSTS_ENV, env_name):
+        raw_hosts = os.getenv(current_env_name, "")
+        hosts.update(_host_from_config_value(value) for value in raw_hosts.split(","))
+    return {host for host in hosts if host}
+
+
+def _parse_ip_literal(hostname: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    candidate = hostname.strip("[]")
+    if ":" in candidate and "%" in candidate:
+        candidate = candidate.split("%", 1)[0]
+
+    try:
+        return ipaddress.ip_address(candidate)
+    except ValueError:
+        pass
+
+    if not candidate or any(char not in "0123456789abcdefABCDEFxX." for char in candidate):
+        return None
+
+    try:
+        return ipaddress.ip_address(socket.inet_aton(candidate))
+    except OSError:
+        return None
+
+
+def _canonical_destination_host(hostname: str) -> str:
+    normalized = _normalize_destination_host(hostname)
+    parsed_ip = _parse_ip_literal(normalized)
+    if parsed_ip is not None:
+        return parsed_ip.compressed
+    try:
+        return idna.encode(normalized, uts46=True).decode("ascii").lower()
+    except idna.IDNAError as exc:
+        raise ValueError(f"Invalid internationalized destination host '{hostname}'") from exc
+
+
+def _embedded_ipv4_addresses(address: ipaddress.IPv6Address) -> tuple[ipaddress.IPv4Address, ...]:
+    embedded: list[ipaddress.IPv4Address] = []
+    if address.ipv4_mapped is not None:
+        embedded.append(address.ipv4_mapped)
+    if address.sixtofour is not None:
+        embedded.append(address.sixtofour)
+    if address.teredo is not None:
+        embedded.extend(address.teredo)
+    if int(address) >> 32 == 0:
+        embedded.append(ipaddress.IPv4Address(address.packed[-4:]))
+    if any(address in network for network in _NAT64_NETWORKS):
+        embedded.append(ipaddress.IPv4Address(address.packed[-4:]))
+    if address in _IPV4_TRANSLATED_NETWORK:
+        embedded.append(ipaddress.IPv4Address(address.packed[-4:]))
+    if address.packed[8:12] in _ISATAP_MARKERS:
+        embedded.append(ipaddress.IPv4Address(address.packed[-4:]))
+    return tuple(embedded)
+
+
+def _is_public_ip_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if address.is_multicast:
+        return False
+    if any(address in network for network in _IANA_GLOBAL_IP_NETWORKS):
+        return True
+    if any(address in network for network in _IANA_NON_GLOBAL_IP_NETWORKS):
+        return False
+    if not address.is_global:
+        return False
+    if isinstance(address, ipaddress.IPv6Address):
+        return all(_is_public_ip_address(embedded) for embedded in _embedded_ipv4_addresses(address))
+    return True
+
+
+def _is_internal_destination_host(hostname: str) -> bool:
+    if not hostname:
+        return True
+    if hostname == "localhost" or hostname.endswith(tuple(_INTERNAL_HOST_SUFFIXES)):
+        return True
+    if "." not in hostname and ":" not in hostname:
+        return True
+
+    parsed_ip = _parse_ip_literal(hostname)
+    if parsed_ip is None:
+        return False
+    return not _is_public_ip_address(parsed_ip)
+
+
+def _validate_public_destination_host(hostname: str, destination_type: str) -> None:
+    if _is_internal_destination_host(hostname):
+        raise ValueError(f"{destination_type} host '{hostname}' is not a permitted public egress destination")
+
+
+def _resolve_public_addresses(hostname: str, port: int, destination_type: str) -> tuple[ResolvedAddress, ...]:
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError(f"{destination_type} port is invalid")
+    try:
+        address_info = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ValueError(
+            f"{destination_type} host '{hostname}' could not be resolved to a permitted public address"
+        ) from exc
+
+    resolved_addresses: list[ResolvedAddress] = []
+    seen_addresses: set[tuple[socket.AddressFamily, str, int]] = set()
+    for family, socket_type, protocol, _canonical_name, socket_address in address_info:
+        if family not in {socket.AF_INET, socket.AF_INET6}:
+            raise ValueError(f"{destination_type} host '{hostname}' resolved to an unsupported socket family")
+        if socket_type not in {0, socket.SOCK_STREAM} or protocol not in {0, socket.IPPROTO_TCP}:
+            raise ValueError(f"{destination_type} host '{hostname}' resolved to a non-TCP socket")
+        expected_address_length = 2 if family == socket.AF_INET else 4
+        if not isinstance(socket_address, tuple) or len(socket_address) != expected_address_length:
+            raise ValueError(f"{destination_type} host '{hostname}' returned a malformed socket address")
+        raw_address, resolved_port = socket_address[:2]
+        if (
+            not isinstance(raw_address, str)
+            or isinstance(resolved_port, bool)
+            or not isinstance(resolved_port, int)
+            or resolved_port != port
+        ):
+            raise ValueError(f"{destination_type} host '{hostname}' returned an invalid socket address or port")
+        if "%" in raw_address:
+            raise ValueError(f"{destination_type} host '{hostname}' returned a scoped IPv6 address")
+        try:
+            parsed_address = ipaddress.ip_address(raw_address)
+        except ValueError as exc:
+            raise ValueError(f"{destination_type} host '{hostname}' returned an invalid IP address") from exc
+        if family == socket.AF_INET and not isinstance(parsed_address, ipaddress.IPv4Address):
+            raise ValueError(f"{destination_type} host '{hostname}' returned an address-family mismatch")
+        if family == socket.AF_INET6:
+            if not isinstance(parsed_address, ipaddress.IPv6Address):
+                raise ValueError(f"{destination_type} host '{hostname}' returned an address-family mismatch")
+            ipv6_socket_address = cast(tuple[str, int, int, int], socket_address)
+            flow_info = ipv6_socket_address[2]
+            scope_id = ipv6_socket_address[3]
+            if (
+                isinstance(flow_info, bool)
+                or not isinstance(flow_info, int)
+                or flow_info != 0
+                or isinstance(scope_id, bool)
+                or not isinstance(scope_id, int)
+                or scope_id != 0
+            ):
+                raise ValueError(f"{destination_type} host '{hostname}' returned a scoped IPv6 address")
+        if not _is_public_ip_address(parsed_address):
+            raise ValueError(
+                f"{destination_type} host '{hostname}' did not resolve exclusively to permitted public addresses"
+            )
+        canonical_address = parsed_address.compressed
+        address_key = (family, canonical_address, resolved_port)
+        if address_key not in seen_addresses:
+            seen_addresses.add(address_key)
+            resolved_addresses.append(address_key)
+
+    if not resolved_addresses:
+        raise ValueError(
+            f"{destination_type} host '{hostname}' did not resolve exclusively to permitted public addresses"
+        )
+    return tuple(resolved_addresses)
+
+
+def _webhook_destination(webhook_url: str, destination_type: str) -> tuple[str, int]:
+    if "\\" in webhook_url or any(ord(char) < 32 or ord(char) == 127 for char in webhook_url):
+        raise ValueError(f"{destination_type} URL has an invalid host or port")
+    parsed = urlparse(webhook_url)
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(f"{destination_type} URL must not include user information")
+    try:
+        hostname = _canonical_destination_host(parsed.hostname or "")
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"{destination_type} URL has an invalid host or port") from exc
+    if port is None:
+        port = 443 if parsed.scheme.lower() == "https" else 80
+    return hostname, port
+
+
+def _validate_allowed_destination_host(
+    hostname: str,
+    *,
+    destination_type: str,
+    allowed_hosts: Collection[str] | None,
+    env_name: str,
+    default_allowed_hosts: Collection[str] = (),
+) -> None:
+    normalized_defaults = {_host_from_config_value(host) for host in default_allowed_hosts}
+    trusted_hosts = normalized_defaults | _get_allowed_hosts(env_name, allowed_hosts)
+    if hostname not in trusted_hosts:
+        raise ValueError(
+            f"{destination_type} host '{hostname}' is not allowed; configure {env_name} or "
+            f"{_PROGRESS_ALLOWED_HOSTS_ENV} with the explicit public host"
+        )
+
+
+def _validate_progress_webhook_url(
+    webhook_url: str,
+    *,
+    destination_type: str,
+    allowed_hosts: Collection[str] | None = None,
+    default_allowed_hosts: Collection[str] = (),
+    require_https: bool = False,
+) -> str:
+    parsed = urlparse(webhook_url)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError(f"{destination_type} URL must use http or https")
+    if require_https and scheme != "https":
+        raise ValueError(f"{destination_type} URL must use https")
+
+    hostname, _port = _webhook_destination(webhook_url, destination_type)
+    _validate_public_destination_host(hostname, destination_type)
+    _validate_allowed_destination_host(
+        hostname,
+        destination_type=destination_type,
+        allowed_hosts=allowed_hosts,
+        env_name=_PROGRESS_WEBHOOK_ALLOWED_HOSTS_ENV,
+        default_allowed_hosts=default_allowed_hosts,
+    )
+    return webhook_url
+
+
+def _validate_progress_smtp_host(
+    smtp_host: str,
+    *,
+    allowed_hosts: Collection[str] | None = None,
+) -> str:
+    hostname = _host_from_config_value(smtp_host)
+    _validate_public_destination_host(hostname, "SMTP")
+    _validate_allowed_destination_host(
+        hostname,
+        destination_type="SMTP",
+        allowed_hosts=allowed_hosts,
+        env_name=_PROGRESS_SMTP_ALLOWED_HOSTS_ENV,
+    )
+    return hostname
+
+
+def _bounded_network_timeout(timeout: float) -> float:
+    try:
+        numeric_timeout = float(timeout)
+    except (TypeError, ValueError):
+        return _DEFAULT_NETWORK_TIMEOUT_SECONDS
+    if not math.isfinite(numeric_timeout) or numeric_timeout <= 0:
+        return _DEFAULT_NETWORK_TIMEOUT_SECONDS
+    return min(numeric_timeout, _MAX_NETWORK_TIMEOUT_SECONDS)
+
+
+def _secure_tls_context() -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    return context
+
+
+def _connect_pinned_socket(family: socket.AddressFamily, address: str, port: int, timeout: float) -> socket.socket:
+    connection = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        connection.settimeout(_bounded_network_timeout(timeout))
+        socket_address: tuple[Any, ...]
+        socket_address = (address, port, 0, 0) if family == socket.AF_INET6 else (address, port)
+        connection.connect(socket_address)
+        return connection
+    except Exception:
+        connection.close()
+        raise
+
+
+def _webhook_request_target(webhook_url: str, destination_type: str) -> tuple[str, str, int, str]:
+    import requests
+
+    configured_destination = _webhook_destination(webhook_url, destination_type)
+    try:
+        prepared_url = requests.Request("POST", webhook_url).prepare().url
+    except requests.RequestException as exc:
+        raise ValueError(f"{destination_type} URL could not be prepared safely") from exc
+    if not prepared_url:
+        raise ValueError(f"{destination_type} URL could not be prepared safely")
+
+    prepared = urlparse(prepared_url)
+    prepared_destination = _webhook_destination(prepared_url, destination_type)
+    if configured_destination != prepared_destination:
+        raise ValueError(f"{destination_type} URL resolves to an ambiguous network destination")
+
+    request_target = prepared.path or "/"
+    if prepared.params:
+        request_target += f";{prepared.params}"
+    if prepared.query:
+        request_target += f"?{prepared.query}"
+    return prepared.scheme.lower(), prepared_destination[0], prepared_destination[1], request_target
+
+
+def _host_header(hostname: str, port: int, scheme: str) -> str:
+    rendered_host = f"[{hostname}]" if ":" in hostname else hostname
+    default_port = 443 if scheme == "https" else 80
+    if port != default_port:
+        return f"{rendered_host}:{port}"
+    return rendered_host
+
+
+def _post_to_pinned_address(
+    *,
+    scheme: str,
+    hostname: str,
+    port: int,
+    request_target: str,
+    resolved_address: ResolvedAddress,
+    body: bytes,
+    headers: dict[str, str],
+    timeout: float,
+) -> int:
+    family, address, resolved_port = resolved_address
+    raw_socket = _connect_pinned_socket(family, address, resolved_port, timeout)
+    connection: http.client.HTTPConnection | None = None
+    try:
+        if scheme == "https":
+            context = _secure_tls_context()
+            wrapped_socket = context.wrap_socket(raw_socket, server_hostname=hostname)
+            connection = http.client.HTTPSConnection(hostname, port, timeout=timeout, context=context)
+            connection.sock = wrapped_socket
+        else:
+            connection = http.client.HTTPConnection(hostname, port, timeout=timeout)
+            connection.sock = raw_socket
+        connection.request("POST", request_target, body=body, headers=headers)
+        response = connection.getresponse()
+        return response.status
+    finally:
+        if connection is not None:
+            connection.close()
+        else:
+            raw_socket.close()
+
+
+def _connect_pinned_smtp(
+    hostname: str,
+    port: int,
+    resolved_address: ResolvedAddress,
+    timeout: float,
+) -> Any:
+    import smtplib
+
+    family, address, resolved_port = resolved_address
+
+    class PinnedSMTP(smtplib.SMTP):
+        def _get_socket(self, requested_host: str, _port: int, _timeout: float) -> socket.socket:
+            self._host = requested_host
+            return _connect_pinned_socket(family, address, resolved_port, timeout)
+
+    server = PinnedSMTP(timeout=_bounded_network_timeout(timeout))
+    try:
+        server.connect(hostname, port)
+        return server
+    except Exception:
+        server.close()
+        raise
+
+
+def _post_progress_payload(
+    webhook_url: str,
+    *,
+    payload: dict[str, Any],
+    timeout: float,
+    destination_type: str,
+    headers: dict[str, str] | None = None,
+) -> None:
+    scheme, hostname, port, request_target = _webhook_request_target(webhook_url, destination_type)
+    resolved_addresses = _resolve_public_addresses(hostname, port, destination_type)
+    request_headers = {"Content-Type": "application/json", **(headers or {})}
+    for header_name in tuple(request_headers):
+        if header_name.lower() == "host":
+            request_headers.pop(header_name)
+    request_headers["Host"] = _host_header(hostname, port, scheme)
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    bounded_timeout = _bounded_network_timeout(timeout)
+
+    last_error: Exception | None = None
+    for resolved_address in resolved_addresses:
+        try:
+            status = _post_to_pinned_address(
+                scheme=scheme,
+                hostname=hostname,
+                port=port,
+                request_target=request_target,
+                resolved_address=resolved_address,
+                body=body,
+                headers=request_headers,
+                timeout=bounded_timeout,
+            )
+        except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+            last_error = exc
+            continue
+        if 300 <= status < 400:
+            raise OSError(f"{destination_type} redirects are not permitted")
+        if status >= 400:
+            raise OSError(f"{destination_type} returned HTTP status {status}")
+        return
+
+    if last_error is not None:
+        raise last_error
+    raise OSError(f"{destination_type} could not connect to a validated public address")
 
 
 class ProgressHook(ABC):
@@ -86,6 +573,7 @@ class WebhookProgressHook(ProgressHook):
         timeout: float = 10.0,
         retry_attempts: int = 3,
         min_interval: float = 30.0,
+        allowed_hosts: Collection[str] | None = None,
     ):
         """Initialize webhook progress hook.
 
@@ -96,10 +584,15 @@ class WebhookProgressHook(ProgressHook):
             timeout: Request timeout in seconds
             retry_attempts: Number of retry attempts on failure
             min_interval: Minimum time between webhook calls
+            allowed_hosts: Optional explicit public webhook hosts or URLs
         """
         super().__init__(name)
 
-        self.webhook_url = webhook_url
+        self.webhook_url = _validate_progress_webhook_url(
+            webhook_url,
+            destination_type="progress webhook",
+            allowed_hosts=allowed_hosts,
+        )
         self.headers = headers or {}
         self.timeout = timeout
         self.retry_attempts = retry_attempts
@@ -132,16 +625,16 @@ class WebhookProgressHook(ProgressHook):
 
             for attempt in range(self.retry_attempts):
                 try:
-                    response = requests.post(
+                    _post_progress_payload(
                         self.webhook_url,
-                        json=payload,
+                        payload=payload,
                         headers=self.headers,
                         timeout=self.timeout,
+                        destination_type="progress webhook",
                     )
-                    response.raise_for_status()
                     return True
 
-                except requests.RequestException as e:
+                except (OSError, requests.RequestException, ValueError, http.client.HTTPException) as e:
                     if attempt == self.retry_attempts - 1:
                         logger.warning(f"Webhook {self.name} failed after {self.retry_attempts} attempts: {e}")
                     else:
@@ -228,6 +721,8 @@ class EmailProgressHook(ProgressHook):
         send_on_error: bool = True,
         send_periodic: bool = False,
         periodic_interval: float = 1800.0,  # 30 minutes
+        allowed_hosts: Collection[str] | None = None,
+        timeout: float = _DEFAULT_NETWORK_TIMEOUT_SECONDS,
     ):
         """Initialize email progress hook.
 
@@ -245,16 +740,19 @@ class EmailProgressHook(ProgressHook):
             send_on_error: Send email when errors occur
             send_periodic: Send periodic progress emails
             periodic_interval: Interval for periodic emails in seconds
+            allowed_hosts: Optional explicit public SMTP hosts
+            timeout: SMTP connection and operation timeout in seconds
         """
         super().__init__(name)
 
-        self.smtp_host = smtp_host
+        self.smtp_host = _validate_progress_smtp_host(smtp_host, allowed_hosts=allowed_hosts)
         self.smtp_port = smtp_port
         self.username = username
         self.password = password
         self.from_email = from_email
         self.to_emails = to_emails
         self.use_tls = use_tls
+        self.timeout = _bounded_network_timeout(timeout)
 
         self.send_on_start = send_on_start
         self.send_on_complete = send_on_complete
@@ -291,16 +789,36 @@ class EmailProgressHook(ProgressHook):
 
             msg.attach(MIMEText(body, "plain"))
 
-            # Send email
-            server = smtplib.SMTP(self.smtp_host, self.smtp_port)
-            if self.use_tls:
-                server.starttls()
-            server.login(self.username, self.password)
-            server.send_message(msg)
-            server.quit()
+            resolved_addresses = _resolve_public_addresses(self.smtp_host, self.smtp_port, "SMTP")
+            last_error: Exception | None = None
+            for resolved_address in resolved_addresses:
+                server: smtplib.SMTP | None = None
+                try:
+                    server = _connect_pinned_smtp(
+                        self.smtp_host,
+                        self.smtp_port,
+                        resolved_address,
+                        self.timeout,
+                    )
+                    if self.use_tls:
+                        server.starttls(context=_secure_tls_context())
+                    server.login(self.username, self.password)
+                    server.send_message(msg)
+                    try:
+                        server.quit()
+                    except Exception:
+                        server.close()
 
-            logger.debug(f"Email sent successfully from hook {self.name}")
-            return True
+                    logger.debug(f"Email sent successfully from hook {self.name}")
+                    return True
+                except Exception as exc:
+                    last_error = exc
+                    if server is not None:
+                        server.close()
+
+            if last_error is not None:
+                raise last_error
+            raise OSError("SMTP could not connect to a validated public address")
 
         except Exception as e:
             logger.warning(f"Failed to send email from hook {self.name}: {e}")
@@ -396,6 +914,7 @@ class SlackProgressHook(ProgressHook):
         send_on_complete: bool = True,
         send_on_error: bool = True,
         min_interval: float = 300.0,  # 5 minutes
+        allowed_hosts: Collection[str] | None = None,
     ):
         """Initialize Slack progress hook.
 
@@ -409,10 +928,17 @@ class SlackProgressHook(ProgressHook):
             send_on_complete: Send message when scanning completes
             send_on_error: Send message when errors occur
             min_interval: Minimum interval between progress messages
+            allowed_hosts: Optional explicit public custom Slack webhook hosts or URLs
         """
         super().__init__(name)
 
-        self.webhook_url = webhook_url
+        self.webhook_url = _validate_progress_webhook_url(
+            webhook_url,
+            destination_type="Slack webhook",
+            allowed_hosts=allowed_hosts,
+            default_allowed_hosts=_DEFAULT_SLACK_WEBHOOK_HOSTS,
+            require_https=True,
+        )
         self.channel = channel
         self.username = username
         self.emoji = emoji
@@ -446,8 +972,6 @@ class SlackProgressHook(ProgressHook):
             return False
 
         try:
-            import requests
-
             payload: dict[str, Any] = {
                 "text": message,
                 "username": self.username,
@@ -467,12 +991,12 @@ class SlackProgressHook(ProgressHook):
                 ]
                 payload["text"] = ""  # Move text to attachment
 
-            response = requests.post(
+            _post_progress_payload(
                 self.webhook_url,
-                json=payload,
+                payload=payload,
                 timeout=10.0,
+                destination_type="Slack webhook",
             )
-            response.raise_for_status()
 
             logger.debug(f"Slack message sent successfully from hook {self.name}")
             return True
