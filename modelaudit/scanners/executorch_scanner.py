@@ -18,8 +18,10 @@ from .pickle_scanner import PickleScanner
 from .picklescan_adapter import (
     apply_pickle_member_context,
 )
+from .pytorch_binary_scanner import PyTorchBinaryScanner
 
 CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset({".bin", ".meta", ".pb"})
+PYTORCH_BINARY_PRIMARY_SCANNED_CONFIG_KEY = "_pytorch_binary_primary_scanned"
 
 
 class ExecuTorchScanner(BaseScanner):
@@ -75,6 +77,40 @@ class ExecuTorchScanner(BaseScanner):
         result.finish(success=False)
         return result
 
+    @staticmethod
+    def _supplemental_raw_binary_config(config: dict[str, Any]) -> dict[str, Any]:
+        raw_config = dict(config)
+        try:
+            archive_depth = int(raw_config.get("_archive_depth", 0))
+        except (TypeError, ValueError):
+            archive_depth = 0
+        raw_config["_archive_depth"] = max(archive_depth, 1)
+        return raw_config
+
+    def _merge_raw_binary_analysis(self, path: str, result: ScanResult, file_size: int) -> None:
+        if self.config.get(PYTORCH_BINARY_PRIMARY_SCANNED_CONFIG_KEY) is True:
+            result.bytes_scanned = max(result.bytes_scanned, file_size)
+            return
+
+        if not self.scanner_selection.allows("pytorch_binary"):
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "pytorch_binary",
+                self.scanner_selection,
+                context="supplemental ExecuTorch binary raw payload analysis",
+            )
+            result.bytes_scanned = max(result.bytes_scanned, file_size)
+            return
+
+        primary_bytes_scanned = result.bytes_scanned
+        raw_result = PyTorchBinaryScanner(config=self._supplemental_raw_binary_config(self.config)).scan(path)
+        result.merge(raw_result)
+        result.bytes_scanned = max(primary_bytes_scanned, raw_result.bytes_scanned, file_size)
+        supplemental_scanners = result.metadata.setdefault("supplemental_scanners", [])
+        if isinstance(supplemental_scanners, list):
+            supplemental_scanners.append("pytorch_binary")
+
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
@@ -114,7 +150,8 @@ class ExecuTorchScanner(BaseScanner):
 
         if valid_binary_program and not should_scan_archive:
             result.bytes_scanned = file_size
-            result.finish(success=True)
+            self._merge_raw_binary_analysis(path, result, file_size)
+            result.finish(success=not result.has_errors)
             return result
 
         if not should_scan_archive:
@@ -231,5 +268,7 @@ class ExecuTorchScanner(BaseScanner):
             result.finish(success=False)
             return result
 
+        if valid_binary_program or not header.startswith(b"PK"):
+            self._merge_raw_binary_analysis(path, result, file_size)
         result.finish(success=True)
         return result

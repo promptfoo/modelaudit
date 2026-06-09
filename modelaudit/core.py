@@ -786,10 +786,15 @@ def _merge_pytorch_binary_supplemental_analysis(
     supplemental_scanner_id: str | None,
 ) -> None:
     """Merge strict format-specific findings without dropping raw `.bin` checks."""
+    supplemental_config = dict(config)
+    if supplemental_scanner_id == "executorch":
+        from .scanners.executorch_scanner import PYTORCH_BINARY_PRIMARY_SCANNED_CONFIG_KEY
+
+        supplemental_config[PYTORCH_BINARY_PRIMARY_SCANNED_CONFIG_KEY] = True
     _merge_supplemental_scanner_analysis(
         path,
         result,
-        config,
+        supplemental_config,
         scanner_selection,
         supplemental_scanner_id,
         context="supplemental .bin content analysis",
