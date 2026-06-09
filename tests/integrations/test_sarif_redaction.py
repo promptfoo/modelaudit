@@ -115,6 +115,8 @@ def test_noncanonical_source_credentials_are_redacted(raw_path: str, safe_path: 
         ),
         ("https:/single-key@bucket.example/model.pkl", "https://bucket.example/model.pkl", "single-key"),
         ("model.pkl;OPAQUE-SECRET", "model.pkl", "OPAQUE-SECRET"),
+        ("https://host/model.pkl%3BOPAQUE-SECRET", "https://host/model.pkl", "OPAQUE-SECRET"),
+        ("bucket/model.pkl%253BOPAQUE-SECRET", "bucket/model.pkl", "OPAQUE-SECRET"),
         (r"bucket/model.pkl\u003btoken\u003descaped-secret", "bucket/model.pkl", "escaped-secret"),
     ],
 )
@@ -247,6 +249,22 @@ def test_existing_windows_assignment_filename_is_preserved(monkeypatch: pytest.M
 )
 def test_nonexistent_windows_and_unc_credential_suffixes_are_redacted(local_path: str, safe_path: str) -> None:
     assert redact_source_identifier(local_path) == safe_path
+
+
+@pytest.mark.parametrize(
+    "local_path",
+    [
+        "./api-key@bucket.example/model.pkl?token=secret",
+        r"C:\models\user:password@bucket.example\model.pkl?token=secret",
+    ],
+)
+def test_nonexistent_local_userinfo_with_credential_suffix_fails_closed(local_path: str) -> None:
+    assert redact_source_identifier(local_path) == "<source redacted>"
+    redacted_text = redact_source_text(local_path)
+    assert "<source redacted>" in redacted_text
+    assert "api-key" not in redacted_text
+    assert "password" not in redacted_text
+    assert "secret" not in redacted_text
 
 
 @pytest.mark.parametrize(
@@ -649,6 +667,7 @@ def test_nonexistent_posix_local_credential_prefixes_fail_closed(raw_path: str) 
     [
         "/tmp/build@2026/model.pkl",
         "./artifacts/user@example.com/model.pkl",
+        "./artifacts/user@example.com/model.pkl?version=1",
     ],
 )
 def test_nonexistent_posix_at_paths_are_preserved(local_path: str) -> None:

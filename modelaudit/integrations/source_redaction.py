@@ -38,7 +38,7 @@ _USERINFO_TOKEN_RE = re.compile(
     r"(?<![0-9A-Za-z_%.-])(?P<identifier>"
     r"(?:(?:[a-z][a-z0-9+.-]*):/{1,2}|//)?"
     r"[^\s\"'<>/@?#]+(?:@|%(?:25)*40)"
-    r"[^\s\"'<>/?#@]+(?:/[^\s\"'<>]*)?"
+    r"[^\s\"'<>/\\?#@]+(?:[\\/][^\s\"'<>]*)?"
     r")",
     re.IGNORECASE,
 )
@@ -79,7 +79,7 @@ _EMAIL_SUFFIX_TOKEN_RE = re.compile(
 )
 _WINDOWS_DRIVE_PATH_RE = re.compile(r"^[a-z]:[\\/]", re.IGNORECASE)
 _ENCODED_ASSIGNMENT_SEPARATOR_RE = re.compile(r"%(?:25)*(?:3a|3d)", re.IGNORECASE)
-_ENCODED_MAJOR_SUFFIX_RE = re.compile(r"%(?:25)*(?:3f|23)", re.IGNORECASE)
+_ENCODED_MAJOR_SUFFIX_RE = re.compile(r"%(?:25)*(?:3f|23|3b)", re.IGNORECASE)
 _ENCODED_FILENAME_SUFFIX_RE = re.compile(r"^[0-9A-Za-z._~-]+\.[0-9A-Za-z]{1,16}$")
 _ENCODED_AT_RE = re.compile(r"%(?:25)*40", re.IGNORECASE)
 _EXPORT_KEY_TOKEN = r"(?:[0-9A-Za-z_%.-]|\\(?:u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2}))+"
@@ -631,15 +631,16 @@ def _redact_local_path_suffix(source: str) -> str:
 
 def _redact_local_path_identifier(source: str) -> str:
     safe_source = _redact_local_path_suffix(source)
-    if safe_source != source:
-        return safe_source
-
     normalized_source = _normalize_percent_encoded_url_delimiters_for_display(
-        _normalize_escaped_url_delimiters_for_display(source)
+        _normalize_escaped_url_delimiters_for_display(safe_source)
     )
     path_prefix = re.split(r"[?#;]", normalized_source, maxsplit=1)[0]
     if _has_sensitive_path_assignment(path_prefix):
         return "<source redacted>"
+    if safe_source != source:
+        if _has_local_userinfo_credentials(path_prefix, allow_username_only=True):
+            return "<source redacted>"
+        return safe_source
     if _is_windows_or_unc_path(source):
         return source
     if _has_local_userinfo_credentials(path_prefix):
@@ -675,12 +676,14 @@ def _mapping_key_is_direct_sensitive_assignment(key: str) -> bool:
     return False
 
 
-def _has_local_userinfo_credentials(path: str) -> bool:
+def _has_local_userinfo_credentials(path: str, *, allow_username_only: bool = False) -> bool:
     for segment in re.split(r"[\\/]", path):
         decoded_segment, decode_incomplete = _bounded_unquote(segment)
         if decode_incomplete or "@" not in decoded_segment:
             continue
         userinfo, _ = decoded_segment.rsplit("@", 1)
+        if allow_username_only and userinfo:
+            return True
         if ":" in userinfo and userinfo.split(":", 1)[1]:
             return True
     return False
