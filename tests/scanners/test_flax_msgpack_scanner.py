@@ -1085,6 +1085,8 @@ def test_stream_repeat_fallback_without_re_parser(monkeypatch: pytest.MonkeyPatc
         r"(?P<name>foo)(?P=name)",
         r"BEGIN.{5000}END",
         r"\\s+",
+        r"(a+)+b",
+        r"(a|aa){20}b",
     ):
         assert _pattern_has_stream_unsafe_repeat(pattern) is True
 
@@ -1231,6 +1233,58 @@ def test_flax_msgpack_does_not_execute_stream_unsafe_regex_on_large_values(tmp_p
         result = scanner.scan(str(path))
 
         assert result.success is True
+
+
+@pytest.mark.parametrize("payload_size", [10_000, 70_000])
+def test_flax_msgpack_does_not_execute_ambiguous_custom_regex(
+    tmp_path: Path,
+    payload_size: int,
+) -> None:
+    class FailIfSearched:
+        def search(self, _value: str) -> None:
+            raise AssertionError("ambiguous regex must not be executed")
+
+    pattern = r"(a|aa){20}b"
+    path = tmp_path / f"ambiguous_regex_{payload_size}.msgpack"
+    create_msgpack_file(path, {"params": {"blob": "a" * payload_size}})
+    scanner = FlaxMsgpackScanner(config={"suspicious_patterns": [pattern]})
+    scanner._compiled_suspicious_patterns = ((pattern, cast(Any, FailIfSearched()), pattern.lower()),)
+
+    result = scanner.scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+
+
+@pytest.mark.parametrize("as_binary", [False, True])
+def test_flax_msgpack_unsafe_pattern_anchors_preserve_unicode_ignorecase(
+    tmp_path: Path,
+    as_binary: bool,
+) -> None:
+    pattern = r"ss.*ii"
+    text = "\u017f\u017f" + ("x" * 70_000) + "\u0131\u0131"
+    payload: str | bytes = text.encode() if as_binary else text
+    path = tmp_path / f"unicode_anchors_{as_binary}.msgpack"
+    create_msgpack_file(path, {"params": {"blob": payload}})
+
+    result = FlaxMsgpackScanner(config={"suspicious_patterns": [pattern]}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    coverage = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
+    assert coverage.details["pattern"] == pattern
+
+
+def test_flax_msgpack_unicode_unsafe_pattern_near_match_remains_clean(tmp_path: Path) -> None:
+    pattern = r"ss.*ii"
+    path = tmp_path / "unicode_anchor_near_match.msgpack"
+    create_msgpack_file(path, {"params": {"blob": "\u017f\u017f" + ("x" * 70_000)}})
+
+    result = FlaxMsgpackScanner(config={"suspicious_patterns": [pattern]}).scan(str(path))
+
+    assert result.success is True
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON not in result.metadata.get("scan_outcome_reasons", [])
 
 
 def test_flax_msgpack_streams_shape_validation_beyond_evidence_limit(tmp_path: Path) -> None:
@@ -2468,3 +2522,35 @@ def test_flax_msgpack_custom_long_suspicious_key_still_matches(tmp_path: Path) -
         and check.message == f"Suspicious object attribute detected: {suspicious_key}"
         for check in result.checks
     )
+
+
+def test_flax_msgpack_redacts_custom_suspicious_key_evidence(tmp_path: Path) -> None:
+    path = tmp_path / "custom_secret_key.msgpack"
+    secret = "CUSTOMKEYSECRET123456789"
+    suspicious_key = f"danger?token={secret}"
+    create_msgpack_file(path, {suspicious_key: "safe"})
+
+    result = FlaxMsgpackScanner(config={"suspicious_keys": {suspicious_key}}).scan(str(path))
+    serialized = result.to_json()
+
+    assert any(
+        check.name == "Object Attribute Security Check"
+        and check.message == "Suspicious object attribute detected: danger?token=<redacted>"
+        and check.details["suspicious_key"] == "danger?token=<redacted>"
+        for check in result.checks
+    )
+    assert secret not in serialized
+
+
+def test_flax_msgpack_deduplicates_configured_suspicious_patterns(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate_pattern.msgpack"
+    create_msgpack_file(path, {"params": {"note": "import subprocess"}})
+
+    result = FlaxMsgpackScanner(config={"suspicious_patterns": [r"import\s+subprocess"] * 2}).scan(str(path))
+
+    findings = [
+        check
+        for check in result.checks
+        if check.name == "Code Pattern Security Check" and check.details["pattern"] == r"import\s+subprocess"
+    ]
+    assert len(findings) == 1
