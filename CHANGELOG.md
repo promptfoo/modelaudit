@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- bound 7z member-name collection before archive entry-limit failures
 - bound remote streaming-analysis reads and report actual received-byte coverage for truncated objects
 - avoid sending raw model identifiers, source paths, object keys, issue locations, or free-form errors in telemetry
 - cover Keras H5 callable metadata and module references, align CVE-2025-1550 attribution, and scope HDF5 external-reference checks to Keras weight trees
