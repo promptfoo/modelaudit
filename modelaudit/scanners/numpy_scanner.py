@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import ast
+import io
+import struct
 import sys
 import warnings
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
@@ -57,6 +60,62 @@ def _finish_with_inconclusive_contract(result: ScanResult, *, default_success: b
 
 
 NUMPY_OBJECT_EMBEDDED_PICKLE_SELECTION_SKIP_REASON = "numpy_object_embedded_pickle_scanner_selection_skip"
+NUMPY_HEADER_MAX_SIZE = 10_000
+NUMPY_V3_HEADER_MAX_BYTES = NUMPY_HEADER_MAX_SIZE * 4
+
+
+def _read_numpy_array_header(handle: BinaryIO, version: tuple[int, int]) -> tuple[tuple[int, ...], bool, Any]:
+    """Read a bounded NumPy header while preserving v3 UTF-8 field names."""
+    if version == (1, 0):
+        header_length_format = "<H"
+    elif version in {(2, 0), (3, 0)}:
+        header_length_format = "<I"
+    else:
+        raise ValueError(f"Unsupported NumPy file format version: {version}")
+
+    header_length_size = struct.calcsize(header_length_format)
+    header_length_bytes = handle.read(header_length_size)
+    if len(header_length_bytes) != header_length_size:
+        raise ValueError("EOF while reading NumPy header length")
+    header_length = struct.unpack(header_length_format, header_length_bytes)[0]
+    max_header_bytes = NUMPY_V3_HEADER_MAX_BYTES if version == (3, 0) else NUMPY_HEADER_MAX_SIZE
+    if header_length > max_header_bytes:
+        raise ValueError(
+            f"NumPy header is too large: {header_length} bytes (max: {max_header_bytes})",
+        )
+
+    header_bytes = handle.read(header_length)
+    if len(header_bytes) != header_length:
+        raise ValueError("EOF while reading NumPy header")
+
+    if version == (1, 0):
+        shape, fortran_order, dtype = fmt.read_array_header_1_0(io.BytesIO(header_length_bytes + header_bytes))
+    elif version == (2, 0):
+        shape, fortran_order, dtype = fmt.read_array_header_2_0(io.BytesIO(header_length_bytes + header_bytes))
+    else:
+        header_text = header_bytes.decode("utf-8")
+        if len(header_text) > NUMPY_HEADER_MAX_SIZE:
+            raise ValueError(
+                f"NumPy header is too large: {len(header_text)} characters (max: {NUMPY_HEADER_MAX_SIZE})",
+            )
+        header = ast.literal_eval(header_text)
+        if not isinstance(header, dict) or set(header) != {"descr", "fortran_order", "shape"}:
+            raise ValueError("Invalid NumPy v3 header dictionary")
+
+        shape = header["shape"]
+        fortran_order = header["fortran_order"]
+        if not isinstance(shape, tuple) or not all(isinstance(dim, int) for dim in shape):
+            raise ValueError("Invalid NumPy v3 array shape")
+        if not isinstance(fortran_order, bool):
+            raise ValueError("Invalid NumPy v3 fortran_order value")
+        dtype = fmt.descr_to_dtype(header["descr"])
+
+    if any(isinstance(dim, bool) for dim in shape):
+        raise ValueError("Boolean NumPy shape dimensions are invalid")
+    if any(dim < 0 for dim in shape):
+        raise ValueError("Negative NumPy shape dimensions are invalid")
+
+    return shape, fortran_order, dtype
 
 
 class NumPyScanner(BaseScanner):
@@ -325,17 +384,7 @@ class NumPyScanner(BaseScanner):
                     # Use format module with version compatibility
                     try:
                         major, minor = fmt.read_magic(f)
-                        if (major, minor) == (1, 0):
-                            shape, fortran, dtype = fmt.read_array_header_1_0(f)
-                        elif (major, minor) == (2, 0):
-                            shape, fortran, dtype = fmt.read_array_header_2_0(f)
-                        else:
-                            # For newer versions, try the private method with fallback
-                            if hasattr(fmt, "_read_array_header"):
-                                shape, fortran, dtype = fmt._read_array_header(f, version=(major, minor))
-                            else:
-                                # Fallback for newer NumPy versions
-                                shape, fortran, dtype = fmt.read_array_header_2_0(f)
+                        shape, fortran, dtype = _read_numpy_array_header(f, (major, minor))
                     except OSError:
                         raise
                     except Exception as header_error:
@@ -645,41 +694,68 @@ class NumPyScanner(BaseScanner):
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         """Extract NumPy array metadata without deserializing object arrays."""
         metadata = super().extract_metadata(file_path)
-        allow_deserialization = self.config.get("allow_metadata_deserialization", False)
 
         try:
             import numpy as np
 
-            # SECURITY: always pass allow_pickle=False to prevent code execution
-            # via crafted object-dtype .npy files or .npz containing pickled data.
-            try:
-                array = np.load(file_path, mmap_mode="r", allow_pickle=False)
-            except ValueError:
-                # File contains object arrays that require pickle deserialization
-                if not allow_deserialization:
+            with open(file_path, "rb") as handle:
+                major, minor = fmt.read_magic(handle)
+                shape, fortran_order, dtype = _read_numpy_array_header(handle, (major, minor))
+
+                array_size = 1
+                for dim in shape:
+                    array_size *= int(dim)
+                array_nbytes = array_size * int(dtype.itemsize)
+
+                metadata.update(
+                    {
+                        "numpy_version": np.__version__,
+                        "array_shape": list(shape),
+                        "array_dtype": str(dtype),
+                        "array_size": array_size,
+                        "array_nbytes": array_nbytes,
+                        "array_ndim": len(shape),
+                        "memory_usage_mb": array_nbytes / (1024 * 1024),
+                    }
+                )
+
+                has_object_dtype = dtype.kind == "O" or bool(getattr(dtype, "hasobject", False))
+                if has_object_dtype:
+                    metadata["contains_objects"] = True
+                    metadata["security_note"] = "Object arrays may contain arbitrary Python objects"
                     metadata["deserialization_skipped"] = True
-                    metadata["reason"] = "File contains object arrays requiring pickle deserialization"
+                    metadata["reason"] = "File contains object arrays requiring unsafe pickle deserialization"
+                    if self.config.get("allow_metadata_deserialization"):
+                        metadata["allow_metadata_deserialization_ignored"] = True
                     return metadata
-                array = np.load(file_path, allow_pickle=True)
 
-            metadata.update(
-                {
-                    "numpy_version": np.__version__,
-                    "array_shape": list(array.shape),
-                    "array_dtype": str(array.dtype),
-                    "array_size": array.size,
-                    "array_nbytes": array.nbytes,
-                    "array_ndim": array.ndim,
-                    "memory_usage_mb": array.nbytes / (1024 * 1024),
-                }
-            )
+                metadata["contains_objects"] = False
+                if dtype.kind in ["U", "S"]:
+                    metadata["contains_strings"] = True
 
-            # Analyze array properties
-            if array.size > 0:
-                try:
-                    # For small arrays, get some statistics
-                    if array.nbytes < 10 * 1024 * 1024:  # Less than 10MB
-                        if np.issubdtype(array.dtype, np.number):
+                data_offset = handle.tell()
+                handle.seek(0, io.SEEK_END)
+                actual_file_size = handle.tell()
+                expected_file_size = data_offset + array_nbytes
+                if actual_file_size < expected_file_size:
+                    available_bytes = max(0, actual_file_size - data_offset)
+                    raise ValueError(
+                        f"NumPy array data is truncated: expected {array_nbytes} bytes, found {available_bytes}",
+                    )
+                handle.seek(data_offset)
+
+                if array_size > 0:
+                    if array_nbytes < 10 * 1024 * 1024 and np.issubdtype(dtype, np.number):
+                        payload = handle.read(array_nbytes)
+                        if len(payload) != array_nbytes:
+                            raise ValueError(
+                                f"NumPy array data is truncated: expected {array_nbytes} bytes, found {len(payload)}",
+                            )
+                        try:
+                            array = np.frombuffer(payload, dtype=dtype, count=array_size).reshape(
+                                shape,
+                                order="F" if fortran_order else "C",
+                            )
                             metadata.update(
                                 {
                                     "min_value": float(np.min(array)),
@@ -688,18 +764,10 @@ class NumPyScanner(BaseScanner):
                                     "std_value": float(np.std(array)),
                                 }
                             )
-                    else:
+                        except Exception:
+                            pass  # Skip optional statistics if the numeric operation is unsupported
+                    elif array_nbytes >= 10 * 1024 * 1024:
                         metadata["large_array_stats"] = "Skipped statistics for large array"
-
-                except Exception:
-                    pass  # Skip stats if not numeric
-
-            # Check for unusual patterns
-            if array.dtype.kind in ["U", "S", "O"]:  # String or object arrays
-                metadata["contains_objects"] = True
-                metadata["security_note"] = "Object arrays may contain arbitrary Python objects"
-            else:
-                metadata["contains_objects"] = False
 
         except Exception as e:
             metadata["extraction_error"] = str(e)

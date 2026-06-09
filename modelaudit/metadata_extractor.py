@@ -282,6 +282,7 @@ class ModelMetadataExtractor:
             "has_external_data",
             # Deserialization status
             "deserialization_skipped",
+            "allow_metadata_deserialization_ignored",
             "reason",
             "dangerous_opcodes",
             "has_dangerous_opcodes",

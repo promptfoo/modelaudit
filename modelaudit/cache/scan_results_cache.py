@@ -1619,7 +1619,7 @@ class ScanResultsCache:
         config_data = version_context or build_cache_version_context()
 
         config_str = json.dumps(config_data, sort_keys=True)
-        return hashlib.blake2b(config_str.encode(), digest_size=8).hexdigest()
+        return hashlib.blake2b(config_str.encode(), digest_size=16).hexdigest()
 
     def _is_cache_entry_valid(self, cache_entry: dict[str, Any], file_path: str) -> bool:
         """

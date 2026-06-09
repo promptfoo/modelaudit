@@ -1008,7 +1008,8 @@ class ManifestScanner(BaseScanner):
 
         from .jinja2_template_scanner import Jinja2TemplateScanner
 
-        result.merge(Jinja2TemplateScanner(config=self.config).scan_extracted_templates(path, templates))
+        safe_templates = self._redact_jinja_template_locations(templates)
+        result.merge(Jinja2TemplateScanner(config=self.config).scan_extracted_templates(path, safe_templates))
 
     def _collect_jinja_template_fields(self, value: Any, path: str = "") -> dict[str, str]:
         return self._collect_jinja_template_fields_with_budget(value, path).templates
@@ -1217,6 +1218,17 @@ class ManifestScanner(BaseScanner):
                 "rather than recursively walking untrusted structures without limit."
             ),
         )
+
+    @classmethod
+    def _redact_jinja_template_locations(cls, templates: dict[str, str]) -> dict[str, str]:
+        safe_templates: dict[str, str] = {}
+        for path, value in templates.items():
+            context_suffix = ".chat_template" if "chat_template" in path.casefold() else ""
+            safe_path = redact_evidence_string(path, max_chars=240 - len(context_suffix))
+            if context_suffix and "chat_template" not in safe_path.casefold():
+                safe_path = f"{safe_path}{context_suffix}"
+            cls._record_jinja_template(safe_templates, safe_path, value)
+        return safe_templates
 
     @staticmethod
     def _record_jinja_template(templates: dict[str, str], path: str, value: str) -> None:

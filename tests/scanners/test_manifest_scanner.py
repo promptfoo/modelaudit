@@ -1048,6 +1048,65 @@ def test_manifest_scanner_jinja_collection_budget_redacts_path_evidence(tmp_path
     assert secret not in json.dumps(budget_checks[0].details)
 
 
+def test_manifest_scanner_redacts_embedded_jinja_template_locations(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    secret = "MANIFEST_TEMPLATE_SECRET_123"
+    config_path.write_text(
+        json.dumps(
+            {
+                f"api_key={secret}": {
+                    "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner().scan(str(config_path))
+
+    detections = [check for check in result.checks if check.name == "Jinja2 Template Injection Detection"]
+    assert detections
+    assert all(check.details["template_location"] == "api_key=<redacted>.chat_template" for check in detections)
+    assert all(check.location == f"{config_path}:api_key=<redacted>.chat_template" for check in detections)
+    assert secret not in json.dumps([check.to_dict() for check in detections])
+
+
+def test_manifest_scanner_redacts_oversized_jinja_template_locations(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    secret = "MANIFEST_TEMPLATE_SECRET_123"
+    config_path.write_text(
+        json.dumps({f"api_key={secret}": {"chat_template": "{{ value }}" + ("x" * 100)}}),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner(config={"max_template_size": 64}).scan(str(config_path))
+
+    size_checks = [check for check in result.checks if check.name == "Template Size Limit"]
+    assert len(size_checks) == 1
+    assert size_checks[0].details["skipped_template_locations"] == ["api_key=<redacted>.chat_template"]
+    assert secret not in json.dumps([check.to_dict() for check in size_checks])
+
+
+def test_manifest_scanner_preserves_benign_template_locations() -> None:
+    templates = {"metadata.chat_template.default": "{{ message['content'] }}"}
+
+    assert ManifestScanner._redact_jinja_template_locations(templates) == templates
+
+
+def test_manifest_scanner_preserves_templates_with_colliding_redacted_locations() -> None:
+    safe_templates = ManifestScanner._redact_jinja_template_locations(
+        {
+            "api_key=first-secret.chat_template": "{{ first }}",
+            "api_key=second-secret.chat_template": "{{ second }}",
+        }
+    )
+
+    assert safe_templates == {
+        "api_key=<redacted>.chat_template": "{{ first }}",
+        "api_key=<redacted>.chat_template [duplicate 2]": "{{ second }}",
+    }
+
+
 def test_manifest_scanner_nested_near_match_jinja_template_still_scanned(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     config_path.write_text(

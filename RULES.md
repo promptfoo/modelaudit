@@ -87,18 +87,18 @@ The catalog currently contains 113 rules.
 
 ### File System And Archive Security
 
-| Code   | Default severity | Name                         | Description                          |
-| ------ | ---------------- | ---------------------------- | ------------------------------------ |
-| `S401` | MEDIUM           | open() for write/append      | File write operations detected       |
-| `S402` | MEDIUM           | pathlib write operations     | Path-based file writes               |
-| `S403` | MEDIUM           | shutil operations            | File/directory operations via shutil |
-| `S404` | LOW              | tempfile operations          | Temporary file creation              |
-| `S405` | CRITICAL         | Path traversal attempts      | Directory escape attempts detected   |
-| `S406` | HIGH             | Symlink to external location | Symbolic link pointing outside scope |
-| `S407` | LOW              | Hidden file access           | Dotfile operations detected          |
-| `S408` | HIGH             | /etc or system file access   | System configuration file access     |
-| `S409` | MEDIUM           | Home directory access        | User directory operations            |
-| `S410` | HIGH             | Archive bomb detected        | Excessive compression ratio          |
+| Code   | Default severity | Name                              | Description                                          |
+| ------ | ---------------- | --------------------------------- | ---------------------------------------------------- |
+| `S401` | MEDIUM           | open() for write/append           | File write operations detected                       |
+| `S402` | MEDIUM           | pathlib write operations          | Path-based file writes                               |
+| `S403` | MEDIUM           | shutil operations                 | File/directory operations via shutil                 |
+| `S404` | LOW              | tempfile operations               | Temporary file creation                              |
+| `S405` | CRITICAL         | Path traversal attempts           | Directory escape attempts detected                   |
+| `S406` | HIGH             | Archive link to external location | Symbolic or hard archive link pointing outside scope |
+| `S407` | LOW              | Hidden file access                | Dotfile operations detected                          |
+| `S408` | HIGH             | /etc or system file access        | System configuration file access                     |
+| `S409` | MEDIUM           | Home directory access             | User directory operations                            |
+| `S410` | HIGH             | Archive bomb detected             | Excessive compression ratio                          |
 
 ### Embedded Executables And Scripts
 

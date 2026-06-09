@@ -56,6 +56,7 @@ from modelaudit_picklescan import (
 )
 from modelaudit_picklescan.call_graph import (
     _CALL_GRAPH_REGULAR_FILE_FINGERPRINT,
+    _TRUSTED_LOADED_REFERENCE_BASELINES,
     CallGraphFinding,
     StartupHookWriteFinding,
     UnanalyzedCallGraphReference,
@@ -4083,9 +4084,17 @@ def test_scan_bytes_flags_newobj_ex_dangerous_class() -> None:
     ],
 )
 def test_scan_bytes_does_not_treat_benign_stdlib_module_references_as_dangerous(
-    payload: bytes, expected_reference: str
+    payload: bytes,
+    expected_reference: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    report = scan_bytes(payload, source=f"{expected_reference}.pkl")
+    module_name, _, reference_name = expected_reference.partition(".")
+    with monkeypatch.context() as patch:
+        if (module_name, reference_name) not in _TRUSTED_LOADED_REFERENCE_BASELINES:
+            patch.delitem(sys.modules, module_name, raising=False)
+        _clear_source_sensitive_caches()
+        report = scan_bytes(payload, source=f"{expected_reference}.pkl")
+    _clear_source_sensitive_caches()
 
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
@@ -7568,6 +7577,25 @@ def test_scan_bytes_surfaces_nested_pickle_inner_findings() -> None:
         and finding.message.startswith("Nested pickle finding:")
         and finding.details.get("nested_encoding") == "raw"
         and finding.details.get("nested_details", {}).get("import_reference") in SYSTEM_GLOBALS
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_zero_nested_depth_still_flags_nested_pickle() -> None:
+    nested_payload = pickle.dumps(MaliciousPayload(), protocol=4)
+
+    report = scan_bytes(
+        pickle.dumps({"outer": nested_payload}, protocol=4),
+        source="zero-depth-nested-malicious.pkl",
+        options=ScanOptions(max_nested_depth=0),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213"
+        and finding.details.get("analysis_incomplete") is True
+        and finding.details.get("incomplete_reason") == "max_nested_depth"
         for finding in report.findings
     )
 
