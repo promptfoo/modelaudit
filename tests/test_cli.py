@@ -5066,15 +5066,25 @@ class TestScanGlobFailFast:
         assert mock_record_failed.call_args[0][1] == "No matching paths"
         mock_flush.assert_called_once()
 
+    @patch("modelaudit.cli.record_scan_started")
+    @patch("modelaudit.cli.record_command_used")
     @patch("modelaudit.cli.record_scan_failed")
     @patch("modelaudit.cli.flush_telemetry")
-    def test_scan_invalid_max_size_records_telemetry(self, mock_flush, mock_record_failed, tmp_path):
-        """Invalid --max-size should record telemetry failure and flush before exit."""
+    def test_scan_invalid_max_size_records_telemetry(
+        self,
+        mock_flush: MagicMock,
+        mock_record_failed: MagicMock,
+        mock_record_command: MagicMock,
+        mock_record_started: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Invalid --max-size records failure telemetry without preserving its value."""
         runner = CliRunner()
         target = tmp_path / "model.pkl"
         target.write_bytes(b"content")
+        sensitive_max_size = "secret-model-name"
 
-        result = runner.invoke(cli, ["scan", str(target), "--max-size", "not-a-size"])
+        result = runner.invoke(cli, ["scan", str(target), "--max-size", sensitive_max_size])
 
         assert result.exit_code == 2
         assert "Error parsing --max-size" in result.output
@@ -5083,4 +5093,10 @@ class TestScanGlobFailFast:
         assert isinstance(duration_arg, float)
         assert duration_arg >= 0.0
         assert "Invalid max-size" in mock_record_failed.call_args[0][1]
+        command_options = mock_record_command.call_args.kwargs
+        scan_options = mock_record_started.call_args.args[1]
+        assert command_options["has_max_file_size"] is True
+        assert scan_options["has_max_file_size"] is True
+        assert sensitive_max_size not in repr(mock_record_command.call_args)
+        assert sensitive_max_size not in repr(mock_record_started.call_args)
         mock_flush.assert_called_once()

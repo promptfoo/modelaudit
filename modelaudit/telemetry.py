@@ -668,7 +668,7 @@ class TelemetryClient:
                 "source_type_counts": self._count_values(source_types),
                 "path_type_counts": self._count_values(path_types),
                 "timeout": scan_options.get("timeout"),
-                "max_file_size": scan_options.get("max_file_size"),
+                "has_max_file_size": scan_options.get("has_max_file_size", False),
                 "format": scan_options.get("format", "text"),
                 "has_blacklist": scan_options.get("has_blacklist", False),
                 "num_blacklist_patterns": scan_options.get("num_blacklist_patterns", 0),
