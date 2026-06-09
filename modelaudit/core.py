@@ -9,6 +9,7 @@ import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -350,6 +351,23 @@ _TRUSTED_STREAM_SHARD_PARENT_PREFIXES = (
     "modelaudit_pth_stream_",
     "modelaudit_stream_",
 )
+_TRUSTED_STREAM_SHARD_ROOT_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class _TrustedStreamShardRoot:
+    """Internal marker for a source-owned persistent streaming root."""
+
+    path: Path
+    token: object
+
+
+def _make_trusted_stream_shard_root(path: FilePath) -> object:
+    """Mark a persistent root selected by a trusted remote-source dispatcher."""
+    return _TrustedStreamShardRoot(
+        path=Path(path).expanduser().absolute(),
+        token=_TRUSTED_STREAM_SHARD_ROOT_TOKEN,
+    )
 
 
 def _redacted_stream_url_for_reporting(stream_url: str) -> str:
@@ -473,21 +491,39 @@ def _shard_family_key_for_path(path: str) -> _ShardFamilyKey | None:
     return (str(path_obj.parent), pattern, expected_total)
 
 
-def _trusted_stream_shard_family_group(resolved_source: Path, family_group: str) -> str | None:
+def _trusted_stream_shard_family_group(
+    source: Path,
+    resolved_source: Path,
+    family_group: str,
+    trusted_root_marker: object | None = None,
+) -> str | None:
     """Scope a trusted stream group to the artifact's logical staging parent."""
     try:
-        temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
-        resolved_parent = resolved_source.parent
-        staging_root: Path | None = None
-        candidate = resolved_parent
-        while candidate != temp_root and candidate != candidate.parent:
-            if candidate.parent == temp_root and candidate.name.startswith(_TRUSTED_STREAM_SHARD_PARENT_PREFIXES):
-                staging_root = candidate
-                break
-            candidate = candidate.parent
-        if staging_root is None:
+        logical_parent = source.absolute().parent.resolve(strict=True)
+        trusted_root: Path | None = None
+        if (
+            isinstance(trusted_root_marker, _TrustedStreamShardRoot)
+            and trusted_root_marker.token is _TRUSTED_STREAM_SHARD_ROOT_TOKEN
+        ):
+            candidate_root = trusted_root_marker.path.resolve(strict=True)
+            if candidate_root.is_dir():
+                trusted_root = candidate_root
+
+        if trusted_root is None:
+            temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+            candidate = logical_parent
+            while candidate != temp_root and candidate != candidate.parent:
+                if candidate.parent == temp_root and candidate.name.startswith(_TRUSTED_STREAM_SHARD_PARENT_PREFIXES):
+                    trusted_root = candidate
+                    break
+                candidate = candidate.parent
+        if trusted_root is None:
             return None
-        relative_parent = resolved_parent.relative_to(staging_root)
+        if not is_within_directory(str(trusted_root), str(logical_parent)) or not is_within_directory(
+            str(trusted_root), str(resolved_source)
+        ):
+            return None
+        relative_parent = logical_parent.relative_to(trusted_root)
     except (OSError, RuntimeError, ValueError):
         return None
 
@@ -504,6 +540,7 @@ def _snapshot_validated_shard_target(
     resolved_path: str | None = None,
     family_group: str | None = None,
     family_group_policy: str | None = None,
+    trusted_root_marker: object | None = None,
 ) -> ValidatedShardTargets:
     """Snapshot one selected shard path after resolving it to a regular file."""
     source = Path(source_path)
@@ -536,7 +573,14 @@ def _snapshot_validated_shard_target(
         target["family_group"] = family_group
     elif family_group_policy == "stream_staging":
         trusted_family_group = (
-            _trusted_stream_shard_family_group(resolved_source, family_group) if family_group else None
+            _trusted_stream_shard_family_group(
+                source,
+                resolved_source,
+                family_group,
+                trusted_root_marker,
+            )
+            if family_group
+            else None
         )
         if trusted_family_group:
             target["family_group"] = trusted_family_group
@@ -3919,6 +3963,7 @@ def scan_model_streaming(
     delete_after_scan: bool = True,
     scan_root: FilePath | None = None,
     shard_family_group: str | None = None,
+    _trusted_shard_family_root: object | None = None,
     **kwargs: Any,
 ) -> ModelAuditResultModel:
     """
@@ -3934,6 +3979,7 @@ def scan_model_streaming(
         delete_after_scan: Whether to delete files after scanning (default: True)
         scan_root: Optional root directory for local streaming traversal validation
         shard_family_group: Trusted source group, admitted only for recognized ephemeral staging parents
+        _trusted_shard_family_root: Internal marker for a source-owned persistent staging root
         **kwargs: Additional arguments passed to scanners
 
     Returns:
@@ -4056,6 +4102,7 @@ def scan_model_streaming(
                     resolved_path=str(scan_path),
                     family_group=shard_family_group,
                     family_group_policy="stream_staging",
+                    trusted_root_marker=_trusted_shard_family_root,
                 )
 
                 file_hash: str | None = None
@@ -4107,6 +4154,7 @@ def scan_model_streaming(
                         resolved_path=str(scan_path),
                         family_group=shard_family_group,
                         family_group_policy="stream_staging",
+                        trusted_root_marker=_trusted_shard_family_root,
                     )
                     if (
                         not operational_scan_failure

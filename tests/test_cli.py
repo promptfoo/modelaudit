@@ -10,6 +10,7 @@ import struct
 import subprocess
 import sys
 import types
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -3509,6 +3510,61 @@ def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_s
         assert output_json["files_scanned"] == 3
     except json.JSONDecodeError:
         pytest.fail("Output is not valid JSON")
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+def test_scan_huggingface_cached_stream_reconciles_snapshot_alias_shards(
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """A cache-enabled HF stream should trust aliases of one logical snapshot parent."""
+    mock_is_hf_url.return_value = True
+    header = b'{"__metadata__":{"format":"pt"}}'
+    cache_root = tmp_path / "persistent-cache"
+    snapshot_dir = cache_root / "huggingface" / "models--test--model" / "snapshots" / _HF_TEST_REVISION
+    snapshot_dir.mkdir(parents=True)
+    alias_root = cache_root / "huggingface" / "test" / "model"
+    alias_root.mkdir(parents=True)
+    first_alias = alias_root / "cache-a"
+    second_alias = alias_root / "cache-b"
+    first_alias.symlink_to(snapshot_dir, target_is_directory=True)
+    second_alias.symlink_to(snapshot_dir, target_is_directory=True)
+
+    def file_generator() -> Iterator[tuple[Path, bool]]:
+        for shard_index, alias_path in ((1, first_alias), (2, second_alias)):
+            shard_name = f"model-{shard_index:05d}-of-00002.safetensors"
+            snapshot_path = snapshot_dir / shard_name
+            snapshot_path.write_bytes(struct.pack("<Q", len(header)) + header)
+            yield (alias_path / shard_name, shard_index == 2)
+
+    mock_download_streaming.return_value = file_generator()
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--stream",
+            "--quiet",
+            "--format",
+            "json",
+            "--cache-dir",
+            str(cache_root),
+            "hf://test/model",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["success"] is True
+    assert output_payload["files_scanned"] == 2
+    assert not any(
+        record.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
+        for record in [*output_payload["checks"], *output_payload["issues"]]
+    )
 
 
 @patch("modelaudit.cli.is_huggingface_url")

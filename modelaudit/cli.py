@@ -37,6 +37,7 @@ from .config.local_config import find_local_config_for_paths
 from .core import (
     DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY,
     DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY,
+    _make_trusted_stream_shard_root,
     _reconcile_cross_directory_shard_coverage,
     _snapshot_validated_shard_target,
     determine_exit_code,
@@ -2719,6 +2720,11 @@ def _resolve_scan_source_for_path(
                 streaming_result = scan_model_streaming(
                     file_generator=file_generator,
                     shard_family_group=f"stream-invocation:{id(file_generator):x}",
+                    _trusted_shard_family_root=(
+                        _make_trusted_stream_shard_root(str(hf_cache_dir / "huggingface"))
+                        if runtime.cache_enabled and trusted_source_provenance is not None
+                        else None
+                    ),
                     timeout=runtime.timeout,
                     delete_after_scan=True,
                     blacklist_patterns=list(blacklist) if blacklist else None,

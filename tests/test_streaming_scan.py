@@ -690,6 +690,39 @@ def test_scan_model_streaming_does_not_reconcile_distinct_remote_model_directori
         assert any(issue.details.get("scan_outcome_reason") == "missing_model_shards" for issue in result.issues)
 
 
+def test_scan_model_streaming_keeps_hf_snapshot_symlink_families_separate(
+    requires_symlinks: None,
+) -> None:
+    """Logical model directories must not merge through one shared HF blobs parent."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    with tempfile.TemporaryDirectory(prefix="modelaudit_stream_") as staging_directory:
+        staging_root = Path(staging_directory)
+        blobs_dir = staging_root / "huggingface" / "models--org--repo" / "blobs"
+        blobs_dir.mkdir(parents=True)
+        shards: list[Path] = []
+        for shard_index, model_id in ((1, "model-a"), (2, "model-b")):
+            blob_path = blobs_dir / f"blob-{shard_index}"
+            blob_path.write_bytes(struct.pack("<Q", len(header)) + header)
+            logical_dir = staging_root / "snapshots" / model_id
+            logical_dir.mkdir(parents=True)
+            shard_path = logical_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.symlink_to(blob_path)
+            shards.append(shard_path)
+
+        result = scan_model_streaming(
+            file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+            timeout=30,
+            delete_after_scan=False,
+            shard_family_group="trusted-stream:remote-repo",
+            cache_enabled=False,
+        )
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
+        assert any(issue.details.get("scan_outcome_reason") == "missing_model_shards" for issue in result.issues)
+
+
 def test_stream_staging_family_groups_are_scoped_to_nested_logical_parent() -> None:
     """Nested trusted staging paths must not combine unrelated remote model directories."""
     with tempfile.TemporaryDirectory(prefix="modelaudit_stream_") as staging_directory:
@@ -724,6 +757,22 @@ def test_stream_staging_family_group_rejects_nested_prefix_lookalike(tmp_path: P
         str(shard_path),
         family_group="attacker-controlled",
         family_group_policy="stream_staging",
+    )
+
+    assert snapshot
+    assert "family_group" not in next(iter(snapshot.values()))
+
+
+def test_stream_staging_family_group_rejects_plain_persistent_root(tmp_path: Path) -> None:
+    """A caller-provided path must not act as a trusted persistent stream root."""
+    shard_path = tmp_path / "model-00001-of-00002.safetensors"
+    shard_path.write_bytes(b"shard")
+
+    snapshot = _snapshot_validated_shard_target(
+        str(shard_path),
+        family_group="attacker-controlled",
+        family_group_policy="stream_staging",
+        trusted_root_marker=tmp_path,
     )
 
     assert snapshot
