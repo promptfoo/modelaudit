@@ -105,6 +105,13 @@ _WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES: Final[frozenset[str]] = frozenset(
         "S509",
     }
 )
+_WHITELIST_DOWNGRADE_EXEMPT_CHECK_NAMES: Final[frozenset[str]] = frozenset(
+    {
+        "Command/Network Correlation Check",
+        "RKNN Command and Network Indicator Correlation",
+    }
+)
+_WHITELIST_DOWNGRADE_EXEMPT_CORRELATION_DETAIL = "same_fragment_correlation"
 # Word-boundary matching prevents incidental substrings (e.g. "executable" inside
 # "ExecuTorch", "rce" inside "force") from suppressing whitelist downgrades.
 _WHITELIST_DOWNGRADE_EXEMPT_KEYWORD_PATTERN: Final[re.Pattern[str]] = re.compile(
@@ -256,6 +263,12 @@ class BaseScanner(ABC):
         if details.get("cve_id") or details.get("cve"):
             return True
 
+        if (
+            check_name in _WHITELIST_DOWNGRADE_EXEMPT_CHECK_NAMES
+            and details.get(_WHITELIST_DOWNGRADE_EXEMPT_CORRELATION_DETAIL) is True
+        ):
+            return True
+
         if rule_code and (rule_code.startswith("S2") or rule_code in _WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES):
             return True
 
@@ -281,7 +294,7 @@ class BaseScanner(ABC):
         Returns:
             True if the issue should be downgraded to INFO, False otherwise
         """
-        # Only downgrade severities higher than INFO
+        # Only downgrade severities higher than INFO.
         if severity in (IssueSeverity.INFO, IssueSeverity.DEBUG):
             return False
 
@@ -335,6 +348,17 @@ class BaseScanner(ABC):
             Tuple of (potentially modified severity, details dict)
         """
         original_severity = severity
+        details = dict(details or {})
+        if severity in (IssueSeverity.INFO, IssueSeverity.DEBUG):
+            return severity, details
+
+        has_whitelist_metadata = (
+            details.get("whitelist_downgrade") is True or details.get("whitelist_downgrade_restored") is True
+        )
+        if has_whitelist_metadata:
+            details.pop("whitelist_downgrade", None)
+            details.pop("whitelist_downgrade_restored", None)
+            details.pop("original_severity", None)
         if self._should_apply_whitelist(
             severity,
             details=details,
@@ -344,13 +368,8 @@ class BaseScanner(ABC):
             check_name=check_name,
         ):
             severity = IssueSeverity.INFO
-            # Add note about whitelisting to the details
-            if details is None:
-                details = {}
             details["whitelist_downgrade"] = True
             details["original_severity"] = original_severity.name
-        elif details is None:
-            details = {}
 
         return severity, details
 

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- keep same-fragment command/network correlations and relayed fail-closed findings active across Hugging Face whitelists
 - validate Joblib NumPy wrapper state and scan resumed pickle opcodes around raw array payloads without flagging inert array bytes.
 - bound CatBoost command-evidence redaction work and cover distant, shell-concatenated, wrapped, and netrc curl credentials
 - use credential-free, cross-platform cloud routing filenames without changing native object-key suffix semantics
