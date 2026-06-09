@@ -35,6 +35,7 @@ _DEFAULT_MLFLOW_MAX_ARTIFACT_ENTRIES = 10000
 _MAX_MLFLOW_ERROR_DISPLAY_CHARS = 512
 _MLFLOW_COPY_CHUNK_SIZE = 1024 * 1024
 _MLFLOW_DEFAULT_URI_PORTS = {"ftp": 21, "http": 80, "https": 443, "sftp": 22}
+_MLFLOW_RESOURCE_DOES_NOT_EXIST = "RESOURCE_DOES_NOT_EXIST"
 _MLFLOW_URI_SCHEMES_REQUIRING_AUTHORITY = {
     "abfss",
     "b2",
@@ -117,6 +118,7 @@ class _MlflowDelegatedDownloadTarget:
     artifact_repository: Any
     artifact_path: str | None
     destination_subdirectory: str | None = None
+    optional_when_missing: bool = False
 
 
 @dataclass(frozen=True)
@@ -468,7 +470,8 @@ def _mlflow_delegated_download_targets(
             return None
         if not repository_is_scoped:
             run_artifact_path = effective_path
-    targets = [_MlflowDelegatedDownloadTarget(run_repository, run_artifact_path)]
+    run_target = _MlflowDelegatedDownloadTarget(run_repository, run_artifact_path)
+    targets = [run_target]
     if not effective_path:
         return tuple(targets)
     if not callable(get_logged_model_repository):
@@ -484,6 +487,11 @@ def _mlflow_delegated_download_targets(
         if terminal_logged_repository is None:
             return None
         model_name, separator, model_artifact_path = effective_path.partition("/")
+        targets[0] = _MlflowDelegatedDownloadTarget(
+            run_repository,
+            run_artifact_path,
+            optional_when_missing=True,
+        )
         targets.append(
             _MlflowDelegatedDownloadTarget(
                 terminal_logged_repository,
@@ -1843,6 +1851,14 @@ def _prepare_download_dir(model_uri: str, cache_dir: str | None) -> tuple[str, b
     return tempfile.mkdtemp(prefix=f"{cache_key}-", dir=str(download_root)), True
 
 
+def _is_missing_mlflow_artifact_error(error: Exception) -> bool:
+    try:
+        from mlflow.exceptions import MlflowException
+    except Exception:
+        return False
+    return isinstance(error, MlflowException) and error.error_code == _MLFLOW_RESOURCE_DOES_NOT_EXIST
+
+
 def _download_trusted_mlflow_artifacts(plan: _MlflowDelegatedDownloadPlan, download_dir: str) -> str:
     downloaded_paths: list[str] = []
     for target in plan.targets:
@@ -1850,10 +1866,15 @@ def _download_trusted_mlflow_artifacts(plan: _MlflowDelegatedDownloadPlan, downl
         if target.destination_subdirectory:
             target_download_dir /= target.destination_subdirectory
             target_download_dir.mkdir(parents=True, exist_ok=True)
-        downloaded_path = target.artifact_repository.download_artifacts(
-            artifact_path=target.artifact_path or "",
-            dst_path=str(target_download_dir),
-        )
+        try:
+            downloaded_path = target.artifact_repository.download_artifacts(
+                artifact_path=target.artifact_path or "",
+                dst_path=str(target_download_dir),
+            )
+        except Exception as exc:
+            if target.optional_when_missing and _is_missing_mlflow_artifact_error(exc):
+                continue
+            raise
         if not isinstance(downloaded_path, str) or not downloaded_path:
             raise RuntimeError("MLflow artifact repository did not return a download path")
         downloaded_paths.append(downloaded_path)

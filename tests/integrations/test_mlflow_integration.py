@@ -1414,6 +1414,7 @@ def test_scan_mlflow_model_rejects_unallowlisted_logged_model_overlay_before_dow
     ]
 
 
+@pytest.mark.parametrize("run_artifact_state", ["present", "missing"])
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
 @patch("modelaudit.core.scan_model_directory_or_file")
@@ -1423,8 +1424,9 @@ def test_scan_mlflow_model_downloads_from_the_validated_logged_model_repository(
     mock_rmtree: MagicMock,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    run_artifact_state: str,
 ) -> None:
-    """A runs:/ download must not resolve its logged-model backend a second time."""
+    """A runs:/ download must use the validated logged-model backend even without a run overlay."""
 
     class RemoteArtifactRepository:
         def __init__(self, artifact_uri: str, downloaded_path: Path) -> None:
@@ -1462,6 +1464,13 @@ def test_scan_mlflow_model_downloads_from_the_validated_logged_model_repository(
     download_dir.mkdir()
     mock_mkdtemp.return_value = str(download_dir)
     run_repository = RemoteArtifactRepository("s3://trusted-bucket/runs/run-1/model", download_dir)
+    if run_artifact_state == "missing":
+        mlflow_exceptions = pytest.importorskip("mlflow.exceptions")
+        mlflow_proto = pytest.importorskip("mlflow.protos.databricks_pb2")
+        run_repository.download_artifacts.side_effect = mlflow_exceptions.MlflowException(
+            "run artifact path is absent",
+            error_code=mlflow_proto.RESOURCE_DOES_NOT_EXIST,
+        )
     trusted_logged_repository = RemoteArtifactRepository(
         "s3://trusted-bucket/logged-models/model",
         download_dir / "model",
@@ -1514,20 +1523,51 @@ def test_scan_mlflow_model_downloads_from_the_validated_logged_model_repository(
     mock_rmtree.assert_called_once_with(str(download_dir), ignore_errors=True)
 
 
-def test_delegated_mlflow_download_fails_closed_on_target_error(tmp_path: Path) -> None:
-    """A later overlay must not hide a failed mandatory artifact target."""
-    failed_repository = SimpleNamespace(
-        download_artifacts=MagicMock(side_effect=RuntimeError("run artifact download failed"))
-    )
+@pytest.mark.parametrize("error_kind", ["runtime", "permission_denied"])
+def test_delegated_mlflow_download_fails_closed_on_target_error(tmp_path: Path, error_kind: str) -> None:
+    """An optional run overlay must fail closed for errors other than absence."""
+    if error_kind == "permission_denied":
+        mlflow_exceptions = pytest.importorskip("mlflow.exceptions")
+        mlflow_proto = pytest.importorskip("mlflow.protos.databricks_pb2")
+        error = mlflow_exceptions.MlflowException(
+            "run artifact access denied",
+            error_code=mlflow_proto.PERMISSION_DENIED,
+        )
+    else:
+        error = RuntimeError("run artifact download failed")
+    failed_repository = SimpleNamespace(download_artifacts=MagicMock(side_effect=error))
     later_repository = SimpleNamespace(download_artifacts=MagicMock(return_value=str(tmp_path / "model")))
     plan = _MlflowDelegatedDownloadPlan(
         (
-            _MlflowDelegatedDownloadTarget(failed_repository, None),
+            _MlflowDelegatedDownloadTarget(failed_repository, None, optional_when_missing=True),
             _MlflowDelegatedDownloadTarget(later_repository, None, "model"),
         )
     )
 
-    with pytest.raises(RuntimeError, match="run artifact download failed"):
+    with pytest.raises(type(error), match=str(error)):
+        _download_trusted_mlflow_artifacts(plan, str(tmp_path))
+
+    later_repository.download_artifacts.assert_not_called()
+
+
+def test_delegated_mlflow_download_does_not_skip_missing_mandatory_target(tmp_path: Path) -> None:
+    """A direct or sole target remains mandatory even when MLflow reports it missing."""
+    mlflow_exceptions = pytest.importorskip("mlflow.exceptions")
+    mlflow_proto = pytest.importorskip("mlflow.protos.databricks_pb2")
+    missing_error = mlflow_exceptions.MlflowException(
+        "artifact path is absent",
+        error_code=mlflow_proto.RESOURCE_DOES_NOT_EXIST,
+    )
+    missing_repository = SimpleNamespace(download_artifacts=MagicMock(side_effect=missing_error))
+    later_repository = SimpleNamespace(download_artifacts=MagicMock(return_value=str(tmp_path / "model")))
+    plan = _MlflowDelegatedDownloadPlan(
+        (
+            _MlflowDelegatedDownloadTarget(missing_repository, None),
+            _MlflowDelegatedDownloadTarget(later_repository, None, "model"),
+        )
+    )
+
+    with pytest.raises(mlflow_exceptions.MlflowException, match="artifact path is absent"):
         _download_trusted_mlflow_artifacts(plan, str(tmp_path))
 
     later_repository.download_artifacts.assert_not_called()
