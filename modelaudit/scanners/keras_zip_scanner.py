@@ -1720,8 +1720,8 @@ class KerasZipScanner(BaseScanner):
                     "key": key,
                     "module": redacted_module_value,
                     "cve_id": "CVE-2025-1550",
-                    "cvss": 9.8,
-                    "cwe": "CWE-502",
+                    "cvss": 7.3,
+                    "cwe": "CWE-94",
                     "description": (
                         "Arbitrary dangerous module references in .keras config can bypass safe_mode "
                         "and execute attacker-controlled code during model loading."
@@ -1748,8 +1748,8 @@ class KerasZipScanner(BaseScanner):
                     "key": key,
                     "module": redacted_module_value,
                     "cve_id": "CVE-2025-1550",
-                    "cvss": 9.8,
-                    "cwe": "CWE-502",
+                    "cvss": 7.3,
+                    "cwe": "CWE-94",
                     "description": (
                         "Non-allowlisted callable module references may indicate safe_mode bypass "
                         "paths in untrusted .keras config content."
