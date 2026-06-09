@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- preserve scanner read caps when core max_file_size is unlimited
 - reject untrusted JFrog redirect hostnames unless explicitly allowed, block non-public IP targets, suppress ambient netrc credentials, and isolate redirect authentication and cookies
 - restrict manual Docker publishes to validated immutable version tags and their matching Git release refs before registry login or push
 - harden cloud acquisition size caps, HTTPS/R2 auto-default routing, and directory metadata failures
