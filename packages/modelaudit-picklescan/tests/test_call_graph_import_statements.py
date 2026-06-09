@@ -2342,44 +2342,65 @@ if marker.exists():
     assert not marker.exists()
 
 
-def test_scan_bytes_analyzes_stdlib_source_modules_without_custom_meta_path_finders(
+def test_scan_bytes_fails_closed_for_late_loaded_stdlib_source_modules_without_invoking_custom_meta_path_finders(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import statistics
-
-    module_name = "statistics"
     marker = tmp_path / "meta_path_called"
+    child_code = """
+import sys
+from importlib.machinery import ModuleSpec
+from pathlib import Path
 
-    class CustomMetaPathFinder:
-        @staticmethod
-        def find_spec(
-            fullname: str,
-            path: object | None = None,
-            target: object | None = None,
-        ) -> ModuleSpec | None:
-            del path, target
-            if fullname == module_name:
-                marker.write_text(fullname, encoding="utf-8")
-                return ModuleSpec(fullname, loader=None, origin="custom://module")
-            return None
+import modelaudit_picklescan.call_graph as call_graph
+from modelaudit_picklescan import SafetyVerdict, ScanStatus, scan_bytes
 
-    monkeypatch.setattr(sys, "meta_path", [CustomMetaPathFinder(), *sys.meta_path])
-    _clear_call_graph_caches()
+module_name = "statistics"
+marker = Path(sys.argv[1])
+if module_name in sys.modules:
+    raise SystemExit("statistics was loaded before the call-graph trust snapshot")
 
-    try:
-        report = scan_bytes(
-            _global_call_payload(module_name, "mean", b"]"),
-            source="stdlib-source-call-graph-source.pkl",
-        )
-    finally:
-        _clear_call_graph_caches()
+import statistics
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert not _has_call_graph_source_unavailable_notice(report, module_name, "mean", "source_unavailable")
+class CustomMetaPathFinder:
+    @staticmethod
+    def find_spec(fullname, path=None, target=None):
+        del path, target
+        if fullname == module_name:
+            marker.write_text(fullname, encoding="utf-8")
+            return ModuleSpec(fullname, loader=None, origin="custom://module")
+        return None
+
+sys.meta_path.insert(0, CustomMetaPathFinder())
+for function in call_graph._SOURCE_SENSITIVE_CACHED_FUNCTIONS:
+    function.cache_clear()
+payload = b"\\x80\\x04\\x8c\\x0astatistics\\x8c\\x04mean\\x93]\\x85R."
+report = scan_bytes(payload, source="stdlib-source-call-graph-source.pkl")
+if report.status != ScanStatus.COMPLETE or report.verdict != SafetyVerdict.SUSPICIOUS:
+    raise SystemExit(f"unexpected report: {report.to_dict()!r}")
+if not any(
+    finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+    and finding.details.get("import_reference") == "statistics.mean"
+    for finding in report.findings
+):
+    raise SystemExit(f"unexpected findings: {report.to_dict()!r}")
+if marker.exists():
+    raise SystemExit("custom meta-path finder was invoked")
+if statistics.mean([1, 2, 3]) != 2:
+    raise SystemExit("statistics.mean changed")
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(marker)],
+        cwd=str(tmp_path),
+        env=dict(os.environ),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
     assert not marker.exists()
-    assert statistics.mean([1, 2, 3]) == 2
 
 
 def test_scan_bytes_keeps_frozen_stdlib_globals_clean_without_custom_meta_path_finders(
@@ -3482,7 +3503,7 @@ def test_call_graph_keeps_setstate_entrypoint_for_unknown_newobj_invocation(
     )
 
 
-def test_scan_bytes_ignores_torch_layout_module_dict_lookup() -> None:
+def test_scan_bytes_fails_closed_for_late_loaded_torch_layout_module_dict_lookup() -> None:
     torch = pytest.importorskip("torch")
     if not hasattr(torch, "strided"):
         pytest.skip("usable PyTorch API is unavailable")
@@ -3490,7 +3511,12 @@ def test_scan_bytes_ignores_torch_layout_module_dict_lookup() -> None:
 
     report = scan_bytes(payload, source="torch-layout-clean.pkl")
 
-    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "torch.serialization._get_layout"
+        for finding in report.findings
+    )
     assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
 
 
@@ -7465,15 +7491,33 @@ def test_scan_bytes_keeps_future_pending_callback_lazy(tmp_path: Path) -> None:
     )
     payload = _builtins_help_future_callback_payload(complete=False)
 
-    report = scan_bytes(payload, source="future-pending-callback.pkl")
+    scan_child_code = """
+import sys
 
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert not any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 1
-        for invocation in report.metadata.get("callable_invocations", [])
+from modelaudit_picklescan import SafetyVerdict, scan_bytes
+
+payload = bytes.fromhex(sys.argv[1])
+report = scan_bytes(payload, source="future-pending-callback.pkl")
+if report.verdict != SafetyVerdict.CLEAN:
+    raise SystemExit(f"unexpected report: {report.to_dict()!r}")
+if any(
+    invocation.get("module") == "builtins"
+    and invocation.get("name") == "help"
+    and invocation.get("positional_arg_count") == 1
+    for invocation in report.metadata.get("callable_invocations", [])
+):
+    raise SystemExit(f"pending callback was marked invoked: {report.to_dict()!r}")
+"""
+    scan_result = subprocess.run(
+        [sys.executable, "-c", scan_child_code, payload.hex()],
+        cwd=str(tmp_path.parent),
+        env=dict(os.environ),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
+    assert scan_result.returncode == 0, scan_result.stderr
 
     child_code = """
 import pickle

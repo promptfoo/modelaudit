@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import pickle
+import time
 from collections.abc import Mapping
 
 import pytest
@@ -21,6 +22,33 @@ def _overlong_protocol0_operand_body() -> bytes:
 
 def _nested_overlong_protocol0_line_operand() -> bytes:
     return b"cos\nsystem\n(S'" + _overlong_protocol0_operand_body() + b"'\ntR."
+
+
+def _long_scalar_before_reduce_protocol0_pickle(opcode: bytes) -> bytes:
+    if opcode == b"F":
+        scalar = b"F" + (b"1" * 257) + b"\n"
+    elif opcode == b"I":
+        scalar = b"I" + (b"1" * 257) + b"\n"
+    elif opcode == b"L":
+        scalar = b"L" + (b"1" * 256) + b"L\n"
+    elif opcode == b"P":
+        scalar = b"P" + (b"A" * 257) + b"\n"
+    elif opcode == b"S":
+        scalar = b"S'" + (b"A" * 257) + b"'\n"
+    elif opcode == b"g":
+        scalar = b"Np0\n0g" + (b"0" * 257) + b"\n"
+    elif opcode == b"p":
+        scalar = b"Np" + (b"0" * 257) + b"\n"
+    else:
+        scalar = b"V" + (b"A" * 257) + b"\n"
+    return scalar + b"0cos\nsystem\n(S'id'\ntR."
+
+
+def _benign_long_scalar_protocol0_pickle(opcode: bytes) -> bytes:
+    prefix = _long_scalar_before_reduce_protocol0_pickle(opcode).split(b"cos\nsystem\n", maxsplit=1)[0]
+    if prefix.endswith(b"0"):
+        prefix = prefix[:-1]
+    return prefix + b"."
 
 
 def test_scan_bytes_accepts_exact_limit_protocol0_line_operand() -> None:
@@ -132,6 +160,500 @@ def test_scan_bytes_detects_inline_encoded_protocol0_pickle_before_suffix(
         and finding.details.get("nested_has_execution_opcode") is True
         for finding in report.findings
     )
+
+
+@pytest.mark.parametrize("opcode", [b"I", b"S", b"V"])
+def test_scan_bytes_detects_base64_pickle_after_long_protocol0_scalar(opcode: bytes) -> None:
+    nested_payload = _long_scalar_before_reduce_protocol0_pickle(opcode)
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+
+    report = scan_bytes(
+        pickle.dumps(encoded, protocol=4),
+        source="base64-long-scalar-before-reduce.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S601"
+        and finding.details.get("encoding") == "base64"
+        and finding.details.get("nested_has_execution_opcode") is True
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("module") == "os"
+        and finding.details.get("name") == "system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("opcode", [b"I", b"S", b"V"])
+@pytest.mark.parametrize("wrapper", ["A", "="])
+def test_scan_bytes_detects_wrapped_base64_pickle_after_long_protocol0_scalar(
+    opcode: bytes,
+    wrapper: str,
+) -> None:
+    nested_payload = _long_scalar_before_reduce_protocol0_pickle(opcode)
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+
+    report = scan_bytes(
+        pickle.dumps(f"{wrapper}{encoded}", protocol=4),
+        source="wrapped-base64-long-scalar-before-reduce.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
+
+
+@pytest.mark.parametrize("opcode", [b"F", b"I", b"L", b"P", b"S", b"V", b"g", b"p"])
+@pytest.mark.parametrize("decoded_prefix_len", [0, 1, 2])
+def test_scan_bytes_detects_base64_pickle_at_each_decoded_offset(
+    opcode: bytes,
+    decoded_prefix_len: int,
+) -> None:
+    nested_payload = _long_scalar_before_reduce_protocol0_pickle(opcode)
+    encoded = base64.b64encode((b"X" * decoded_prefix_len) + nested_payload).decode("ascii")
+
+    report = scan_bytes(
+        pickle.dumps(encoded, protocol=4),
+        source="base64-long-scalar-decoded-offset.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+def test_scan_bytes_detects_base64_long_protocol0_pickle_in_byte_literals(
+    container: type[bytes] | type[bytearray],
+) -> None:
+    nested_payload = _long_scalar_before_reduce_protocol0_pickle(b"V")
+    encoded = container(base64.b64encode(nested_payload))
+
+    report = scan_bytes(
+        pickle.dumps(encoded, protocol=5),
+        source=f"base64-long-protocol0-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("module") == "os"
+        and finding.details.get("name") == "system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+@pytest.mark.parametrize("invalid_utf8_position", ["prefix", "suffix"])
+def test_scan_bytes_detects_base64_byte_literals_with_invalid_utf8_wrappers(
+    container: type[bytes] | type[bytearray],
+    invalid_utf8_position: str,
+) -> None:
+    nested_payload = _long_scalar_before_reduce_protocol0_pickle(b"V")
+    encoded = base64.b64encode(nested_payload)
+    wrapped = b"\xff" + encoded if invalid_utf8_position == "prefix" else encoded + b"\xff"
+
+    report = scan_bytes(
+        pickle.dumps(container(wrapped), protocol=5),
+        source=f"wrapped-base64-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("module") == "os"
+        and finding.details.get("name") == "system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+@pytest.mark.parametrize("invalid_utf8_position", ["prefix", "suffix"])
+def test_scan_bytes_detects_over_budget_invalid_utf8_wrapped_base64_byte_literals(
+    container: type[bytes] | type[bytearray],
+    invalid_utf8_position: str,
+) -> None:
+    nested_payload = _long_scalar_before_reduce_protocol0_pickle(b"V")
+    encoded = base64.b64encode(nested_payload)
+    scan_limit = len(encoded) + 8
+    padding = b"\xff" * (scan_limit + 1)
+    wrapped = padding + encoded if invalid_utf8_position == "prefix" else encoded + padding
+
+    report = scan_bytes(
+        pickle.dumps(container(wrapped), protocol=5),
+        source=f"over-budget-wrapped-base64-{container.__name__}.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=scan_limit),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+def test_scan_bytes_fails_closed_for_invalid_utf8_encoded_payload_hidden_beyond_literal_budget(
+    container: type[bytes] | type[bytearray],
+) -> None:
+    encoded = base64.b64encode(_long_scalar_before_reduce_protocol0_pickle(b"V"))
+    scan_limit = 64
+    padding = b"\xff" * (scan_limit + 1)
+    wrapped = padding + encoded + padding
+
+    report = scan_bytes(
+        pickle.dumps(container(wrapped), protocol=5),
+        source=f"hidden-over-budget-base64-{container.__name__}.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=scan_limit),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict != SafetyVerdict.CLEAN
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+@pytest.mark.parametrize("decoded_prefix", [b"", b"X", b"junk"])
+def test_scan_bytes_keeps_benign_base64_byte_literals_clean(
+    container: type[bytes] | type[bytearray],
+    decoded_prefix: bytes,
+) -> None:
+    encoded = container(base64.b64encode(decoded_prefix + _benign_long_scalar_protocol0_pickle(b"V")))
+
+    report = scan_bytes(
+        pickle.dumps(encoded, protocol=5),
+        source=f"benign-base64-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+@pytest.mark.parametrize("invalid_utf8_position", ["prefix", "suffix"])
+def test_scan_bytes_keeps_benign_base64_byte_literals_with_invalid_utf8_clean(
+    container: type[bytes] | type[bytearray],
+    invalid_utf8_position: str,
+) -> None:
+    encoded = base64.b64encode(_benign_long_scalar_protocol0_pickle(b"V"))
+    wrapped = b"\xff" + encoded if invalid_utf8_position == "prefix" else encoded + b"\xff"
+
+    report = scan_bytes(
+        pickle.dumps(container(wrapped), protocol=5),
+        source=f"benign-wrapped-base64-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+@pytest.mark.parametrize("encoding", ["base64", "hex"])
+@pytest.mark.parametrize("decoded", [b"\x80\x04N.README", b"(README benign text"])
+def test_scan_bytes_keeps_execution_like_encoded_byte_literal_text_clean(
+    container: type[bytes] | type[bytearray],
+    encoding: str,
+    decoded: bytes,
+) -> None:
+    encoded = base64.b64encode(decoded) if encoding == "base64" else decoded.hex().encode("ascii")
+
+    report = scan_bytes(
+        pickle.dumps(container(encoded), protocol=5),
+        source=f"benign-{encoding}-execution-like-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+@pytest.mark.parametrize("encoded_first", [False, True])
+def test_scan_bytes_keeps_raw_nested_scan_for_mixed_encoded_byte_literals(
+    container: type[bytes] | type[bytearray],
+    encoded_first: bool,
+) -> None:
+    benign_encoded = base64.b64encode(_benign_long_scalar_protocol0_pickle(b"V"))
+    raw_malicious = b"cos\nsystem\n(S'id'\ntR."
+    payload = benign_encoded + b"!" + raw_malicious if encoded_first else raw_malicious + b"!" + benign_encoded
+
+    report = scan_bytes(
+        pickle.dumps(container(payload), protocol=5),
+        source=f"mixed-encoded-raw-{container.__name__}.pkl",
+    )
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("module") == "os"
+        and finding.details.get("name") == "system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+def test_scan_bytes_keeps_fail_closed_raw_scan_for_truncated_persid_after_encoded_literal(
+    container: type[bytes] | type[bytearray],
+) -> None:
+    benign_encoded = base64.b64encode(_benign_long_scalar_protocol0_pickle(b"V"))
+    payload = benign_encoded + b"!Pevil\n"
+
+    report = scan_bytes(
+        pickle.dumps(container(payload), protocol=5),
+        source=f"encoded-plus-truncated-persid-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+    assert any(
+        finding.rule_code == "S213" and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+def test_scan_bytes_keeps_raw_scan_after_invalid_base64_padding(
+    container: type[bytes] | type[bytearray],
+) -> None:
+    benign_encoded = base64.b64encode(_benign_long_scalar_protocol0_pickle(b"V"))
+    payload = benign_encoded + b"NQ"
+
+    report = scan_bytes(
+        pickle.dumps(container(payload), protocol=5),
+        source=f"base64-invalid-padding-raw-suffix-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+    assert any(
+        finding.rule_code == "S213" and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("container", [bytes, bytearray])
+@pytest.mark.parametrize("decoded", [b"Pevil\nAAAAAAAA", b"\x80\x04N.Pevil\n"])
+def test_scan_bytes_fails_closed_for_encoded_truncated_execution_prefixes(
+    container: type[bytes] | type[bytearray],
+    decoded: bytes,
+) -> None:
+    encoded = container(base64.b64encode(decoded))
+
+    report = scan_bytes(
+        pickle.dumps(encoded, protocol=5),
+        source=f"encoded-truncated-execution-{container.__name__}.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+    assert any(
+        finding.rule_code == "S601" and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+    assert any(notice.code == "nested_pickle_incomplete" for notice in report.notices)
+    assert not any(notice.code == "encoded_nested_payload_truncated" for notice in report.notices)
+
+
+def test_scan_bytes_bounds_unterminated_protocol0_base64_scalar_runtime() -> None:
+    encoded = base64.b64encode(b"V" + (b"A" * 100_000))
+
+    started = time.monotonic()
+    report = scan_bytes(
+        pickle.dumps(encoded, protocol=5),
+        source="unterminated-protocol0-base64-byte-literal.pkl",
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2.0
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+def test_scan_bytes_bounds_valid_utf8_encoded_byte_literal_prefilter() -> None:
+    literal = b"gA" * (512 * 1024)
+
+    started = time.monotonic()
+    report = scan_bytes(
+        pickle.dumps(literal, protocol=5),
+        source="bounded-valid-utf8-byte-literal.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=64, timeout_s=0.05),
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict != SafetyVerdict.CLEAN
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
+@pytest.mark.parametrize("opcode", [b"g", b"p"])
+def test_scan_bytes_does_not_charge_contextual_probe_prefix_to_nested_limit(opcode: bytes) -> None:
+    nested_payload = _long_scalar_before_reduce_protocol0_pickle(opcode)
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+
+    report = scan_bytes(
+        pickle.dumps(encoded, protocol=4),
+        source="base64-contextual-line-exact-nested-limit.pkl",
+        options=ScanOptions(
+            max_nested_pickle_bytes=len(nested_payload),
+            max_string_literal_scan_chars=len(encoded) + SCAN_LIMIT_OVERHEAD_BYTES,
+        ),
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    encoded_findings = [finding for finding in report.findings if finding.rule_code == "S601"]
+    assert encoded_findings
+    assert all(
+        isinstance(payload_size := finding.details.get("payload_size"), int)
+        and payload_size <= len(nested_payload)
+        and finding.details.get("analysis_incomplete") is not True
+        for finding in encoded_findings
+    )
+    assert not any(notice.code == "encoded_nested_payload_truncated" for notice in report.notices)
+
+
+@pytest.mark.parametrize("separator", ["!", " "])
+def test_scan_bytes_detects_lenient_base64_pickle_after_long_protocol0_scalar(
+    separator: str,
+) -> None:
+    nested_payload = _long_scalar_before_reduce_protocol0_pickle(b"V")
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+    separated = separator.join(encoded[index : index + 4] for index in range(0, len(encoded), 4))
+
+    report = scan_bytes(
+        pickle.dumps(separated, protocol=4),
+        source="lenient-base64-long-scalar-before-reduce.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
+
+
+def test_scan_bytes_detects_sparse_lenient_base64_pickle_after_long_protocol0_scalar() -> None:
+    nested_payload = _long_scalar_before_reduce_protocol0_pickle(b"V")
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+    separated = ("!" * 4000).join(encoded)
+
+    report = scan_bytes(
+        pickle.dumps(separated, protocol=4),
+        source="sparse-lenient-base64-long-scalar-before-reduce.pkl",
+    )
+
+    assert len(separated) > 1024 * 1024
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
+
+
+def test_scan_bytes_ignores_sparse_unterminated_protocol0_base64_scalar() -> None:
+    encoded = base64.b64encode(b"V" + (b"A" * 257)).decode("ascii")
+    separated = ("!" * 4000).join(encoded)
+
+    report = scan_bytes(
+        pickle.dumps(separated, protocol=4),
+        source="sparse-unterminated-protocol0-base64-scalar.pkl",
+    )
+
+    assert len(separated) > 1024 * 1024
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert not any(notice.code == "nested_probe_limit_exceeded" for notice in report.notices)
+
+
+def test_scan_bytes_ignores_large_unterminated_protocol0_base64_scalar() -> None:
+    encoded_scalar = base64.b64encode(b"V" + (b"A" * 257)).decode("ascii")
+    encoded = encoded_scalar + ("!" * ((1024 * 1024) + 512))
+
+    report = scan_bytes(
+        pickle.dumps(encoded, protocol=4),
+        source="unterminated-protocol0-base64-scalar.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert not any(notice.code == "nested_probe_limit_exceeded" for notice in report.notices)
+
+
+@pytest.mark.parametrize("opcode", [b"F", b"I", b"L", b"S", b"V", b"g", b"p"])
+def test_scan_bytes_keeps_wrapped_benign_long_scalar_base64_pickle_clean(opcode: bytes) -> None:
+    nested_payload = _long_scalar_before_reduce_protocol0_pickle(opcode).split(b"0cos", maxsplit=1)[0] + b"."
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+
+    report = scan_bytes(
+        pickle.dumps(f"A{encoded}", protocol=4),
+        source="wrapped-benign-base64-long-scalar.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+def test_scan_bytes_fails_closed_for_long_scalar_base64_pickle_beyond_mid_scan_budget() -> None:
+    nested_payload = _long_scalar_before_reduce_protocol0_pickle(b"V")
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+    wrapped = ("A" * ((1024 * 1024) + 1)) + encoded + ("B" * 65)
+
+    report = scan_bytes(
+        pickle.dumps(wrapped, protocol=4),
+        source="base64-long-scalar-beyond-mid-scan-budget.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S601" and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_detects_later_base64_pickle_after_lenient_benign_prefix() -> None:
+    benign = base64.b64encode(b"I42\n.").decode("ascii").rstrip("=")
+    malicious = base64.b64encode(b"cos\nsystem\n)R.").decode("ascii").rstrip("=")
+
+    report = scan_bytes(
+        pickle.dumps(f"{benign}!{malicious}", protocol=4),
+        source="base64-later-pickle-after-lenient-prefix.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S601"
+        and finding.details.get("encoding") == "base64"
+        and finding.details.get("nested_has_execution_opcode") is True
+        for finding in report.findings
+    )
+    assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
+
+
+def test_scan_bytes_keeps_multiple_lenient_benign_base64_pickles_clean() -> None:
+    first = base64.b64encode(b"I42\n.").decode("ascii").rstrip("=")
+    second = base64.b64encode(b"S'ok'\n.").decode("ascii").rstrip("=")
+
+    report = scan_bytes(
+        pickle.dumps(f"{first}!{second}", protocol=4),
+        source="multiple-lenient-benign-base64-pickles.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
 
 
 @pytest.mark.parametrize(

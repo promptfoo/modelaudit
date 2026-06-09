@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import _imp
 import ast
-import fnmatch
+import dis
 import hashlib
 import marshal
 import os
+import re
 import stat
 import sys
 import sysconfig
@@ -34,7 +35,7 @@ from importlib.machinery import (
 from importlib.metadata import distribution, packages_distributions
 from importlib.util import MAGIC_NUMBER, cache_from_source, source_hash
 from pathlib import Path
-from types import CodeType, FunctionType, MethodType, ModuleType
+from types import CodeType, FunctionType, GetSetDescriptorType, MappingProxyType, MethodType, ModuleType
 from typing import Any, Protocol, TypeVar, cast
 from zipimport import zipimporter
 
@@ -94,9 +95,989 @@ _MAX_DISTRIBUTIONS_PER_TOP_LEVEL = 16
 _MAX_TRUSTED_PTH_FILES = 64
 _MAX_TRUSTED_PTH_BYTES = 64 * 1024
 _MAX_TRUSTED_PTH_PATHS = 64
+_MAX_TRUSTED_REFERENCE_FUNCTIONS = 128
+_MAX_TRUSTED_REFERENCE_GLOBALS = 1024
+_MAX_TRUSTED_SLOT_NAMES = 1024
+_REGEX_SUB_METHOD_TYPE = type(re.compile("").sub)
 _CONTROLLED_GETATTR_DISPATCH_SINK = "builtins.getattr.__call__"
 _IMPORT_EXECUTION_SINK = "builtins.__import__"
-_IMPORT_EXECUTION_SAFE_MODULES = frozenset(sys.builtin_module_names)
+_BUILTIN_MODULE_NAMES = frozenset(sys.builtin_module_names)
+_IS_FROZEN_MODULE = _imp.is_frozen
+_IMPORT_RUNTIME_SYS_MODULES = sys.modules
+# Unloaded interpreter modules are trusted only while the import runtime keeps
+# the exact executable state captured here.
+_RuntimeValueSnapshot = tuple[
+    object,
+    FunctionType | None,
+    CodeType | None,
+    object | None,
+    object | None,
+    tuple[tuple[str, object], ...],
+    tuple[tuple[object, CodeType | None, object | None, object | None], ...],
+]
+_EMPTY_RUNTIME_CLOSURE_CELL = object()
+
+
+def _runtime_value_snapshot(value: object) -> _RuntimeValueSnapshot:
+    function: object = value
+    if isinstance(value, classmethod | staticmethod):
+        function = value.__func__
+    if isinstance(function, FunctionType):
+        keyword_defaults = function.__kwdefaults__
+        keyword_default_items = tuple(dict.items(keyword_defaults)) if type(keyword_defaults) is dict else ()
+        closure_values: list[tuple[object, CodeType | None, object | None, object | None]] = []
+        for cell in function.__closure__ or ():
+            try:
+                closure_value = cell.cell_contents
+            except ValueError:
+                closure_value = _EMPTY_RUNTIME_CLOSURE_CELL
+            if isinstance(closure_value, FunctionType):
+                closure_values.append(
+                    (
+                        closure_value,
+                        closure_value.__code__,
+                        closure_value.__defaults__,
+                        closure_value.__kwdefaults__,
+                    )
+                )
+            else:
+                closure_values.append((closure_value, None, None, None))
+        return (
+            value,
+            function,
+            function.__code__,
+            function.__defaults__,
+            keyword_defaults,
+            keyword_default_items,
+            tuple(closure_values),
+        )
+    return value, None, None, None, None, (), ()
+
+
+def _runtime_value_matches_snapshot(value: object, expected: _RuntimeValueSnapshot) -> bool:
+    current = _runtime_value_snapshot(value)
+    if not all(current[index] is expected[index] for index in range(5)):
+        return False
+    current_keyword_defaults = current[5]
+    expected_keyword_defaults = expected[5]
+    if len(current_keyword_defaults) != len(expected_keyword_defaults) or any(
+        type(current_name) is not str
+        or type(expected_name) is not str
+        or current_name != expected_name
+        or current_value is not expected_value
+        for (current_name, current_value), (expected_name, expected_value) in zip(
+            current_keyword_defaults,
+            expected_keyword_defaults,
+            strict=True,
+        )
+    ):
+        return False
+    return len(current[6]) == len(expected[6]) and all(
+        all(
+            current_part is expected_part
+            for current_part, expected_part in zip(current_value, expected_value, strict=True)
+        )
+        for current_value, expected_value in zip(current[6], expected[6], strict=True)
+    )
+
+
+def _module_namespace_snapshot(module: ModuleType) -> Mapping[str, _RuntimeValueSnapshot]:
+    namespace = ModuleType.__getattribute__(module, "__dict__")
+    if type(namespace) is not dict:
+        return MappingProxyType({})
+    return MappingProxyType({name: _runtime_value_snapshot(value) for name, value in namespace.items()})
+
+
+def _module_attribute_snapshot(
+    module: ModuleType,
+    names: tuple[str, ...],
+) -> Mapping[str, _RuntimeValueSnapshot]:
+    namespace = ModuleType.__getattribute__(module, "__dict__")
+    if type(namespace) is not dict or any(name not in namespace for name in names):
+        return MappingProxyType({})
+    return MappingProxyType({name: _runtime_value_snapshot(namespace[name]) for name in names})
+
+
+def _runtime_type_member_is_executable(value: object) -> bool:
+    value_type = type(value)
+    mro = type.__getattribute__(value_type, "__mro__")
+    is_descriptor = any("__get__" in type.__getattribute__(class_, "__dict__") for class_ in mro)
+    return is_descriptor or isinstance(value, FunctionType | classmethod | staticmethod | property) or callable(value)
+
+
+def _type_namespace_snapshot(class_: type[object]) -> Mapping[str, _RuntimeValueSnapshot]:
+    namespace = type.__getattribute__(class_, "__dict__")
+    return MappingProxyType(
+        {
+            name: _runtime_value_snapshot(value)
+            for name, value in namespace.items()
+            if _runtime_type_member_is_executable(value)
+        }
+    )
+
+
+_FROZEN_IMPORTLIB_MODULE = dict.get(_IMPORT_RUNTIME_SYS_MODULES, "_frozen_importlib")
+_FROZEN_IMPORTLIB_EXTERNAL_MODULE = dict.get(_IMPORT_RUNTIME_SYS_MODULES, "_frozen_importlib_external")
+_FROZEN_IMPORTLIB_NAMESPACE = (
+    ModuleType.__getattribute__(_FROZEN_IMPORTLIB_MODULE, "__dict__")
+    if type(_FROZEN_IMPORTLIB_MODULE) is ModuleType
+    else {}
+)
+_FROZEN_IMPORTLIB_EXTERNAL_NAMESPACE = (
+    ModuleType.__getattribute__(_FROZEN_IMPORTLIB_EXTERNAL_MODULE, "__dict__")
+    if type(_FROZEN_IMPORTLIB_EXTERNAL_MODULE) is ModuleType
+    else {}
+)
+_IMPORT_RUNTIME_BUILTINS = _FROZEN_IMPORTLIB_NAMESPACE.get("__builtins__")
+
+
+def _code_referenced_names(code: CodeType) -> set[str]:
+    names = set(code.co_names)
+    for value in code.co_consts:
+        if isinstance(value, CodeType):
+            names.update(_code_referenced_names(value))
+    return names
+
+
+def _code_loaded_global_names(code: CodeType) -> set[str]:
+    names = {
+        instruction.argval
+        for instruction in dis.get_instructions(code)
+        if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"} and type(instruction.argval) is str
+    }
+    for value in code.co_consts:
+        if isinstance(value, CodeType):
+            names.update(_code_loaded_global_names(value))
+    return names
+
+
+def _module_missing_loaded_global_names(
+    namespace: dict[str, object],
+) -> frozenset[str]:
+    names: set[str] = set()
+    for value in namespace.values():
+        functions: tuple[FunctionType, ...] = ()
+        if isinstance(value, FunctionType):
+            functions = (value,)
+        elif type(value) is type:
+            functions = tuple(
+                function
+                for member in type.__getattribute__(value, "__dict__").values()
+                for function in (member.__func__ if isinstance(member, classmethod | staticmethod) else member,)
+                if isinstance(function, FunctionType)
+            )
+        for function in functions:
+            if function.__globals__ is namespace:
+                names.update(_code_loaded_global_names(function.__code__))
+    return frozenset(name for name in names if name not in namespace)
+
+
+def _code_global_attribute_paths(code: CodeType) -> Mapping[str, tuple[tuple[str, ...], ...]]:
+    paths: dict[str, set[tuple[str, ...]]] = {}
+    instructions = tuple(dis.get_instructions(code))
+    for index, instruction in enumerate(instructions):
+        if instruction.opname not in {"LOAD_GLOBAL", "LOAD_NAME"} or type(instruction.argval) is not str:
+            continue
+        attributes: list[str] = []
+        for following in instructions[index + 1 :]:
+            if following.opname not in {"LOAD_ATTR", "LOAD_METHOD"} or type(following.argval) is not str:
+                break
+            attributes.append(following.argval)
+        if attributes:
+            paths.setdefault(instruction.argval, set()).add(tuple(attributes))
+    for value in code.co_consts:
+        if not isinstance(value, CodeType):
+            continue
+        for name, nested_paths in _code_global_attribute_paths(value).items():
+            paths.setdefault(name, set()).update(nested_paths)
+    return MappingProxyType({name: tuple(sorted(name_paths)) for name, name_paths in paths.items()})
+
+
+def _import_runtime_builtin_names() -> tuple[str, ...]:
+    if type(_IMPORT_RUNTIME_BUILTINS) is not dict:
+        return ()
+    names: set[str] = set()
+    for module_namespace in (_FROZEN_IMPORTLIB_NAMESPACE, _FROZEN_IMPORTLIB_EXTERNAL_NAMESPACE):
+        for value in module_namespace.values():
+            functions: tuple[FunctionType, ...] = ()
+            if isinstance(value, FunctionType):
+                functions = (value,)
+            elif type(value) is type:
+                functions = tuple(
+                    function
+                    for member in type.__getattribute__(value, "__dict__").values()
+                    for function in (member.__func__ if isinstance(member, classmethod | staticmethod) else member,)
+                    if isinstance(function, FunctionType)
+                )
+            for function in functions:
+                names.update(
+                    name
+                    for name in _code_referenced_names(function.__code__)
+                    if name not in module_namespace and name in _IMPORT_RUNTIME_BUILTINS
+                )
+    return tuple(sorted(names))
+
+
+_IMPORT_RUNTIME_BUILTIN_NAMES = _import_runtime_builtin_names()
+_IMPORT_RUNTIME_BUILTINS_SNAPSHOT = (
+    MappingProxyType(
+        {name: _runtime_value_snapshot(_IMPORT_RUNTIME_BUILTINS[name]) for name in _IMPORT_RUNTIME_BUILTIN_NAMES}
+    )
+    if type(_IMPORT_RUNTIME_BUILTINS) is dict
+    else MappingProxyType({})
+)
+_FROZEN_IMPORTLIB_DEPENDENCY_MODULE_ATTRIBUTES = {
+    "_thread": ("RLock", "allocate_lock", "get_ident"),
+    "_warnings": ("warn",),
+    "_weakref": ("_remove_dead_weakref", "ref"),
+}
+_FROZEN_IMPORTLIB_DEPENDENCY_MODULES = tuple(
+    (name, value, attributes)
+    for name, attributes in _FROZEN_IMPORTLIB_DEPENDENCY_MODULE_ATTRIBUTES.items()
+    if type(value := _FROZEN_IMPORTLIB_NAMESPACE.get(name)) is ModuleType
+)
+_FROZEN_IMPORTLIB_EXTERNAL_DEPENDENCY_MODULE_ATTRIBUTES = {
+    "_io": ("BytesIO", "FileIO", "IncrementalNewlineDecoder", "open", "open_code"),
+    "_os": (
+        "O_CREAT",
+        "O_EXCL",
+        "O_WRONLY",
+        "fspath",
+        "getcwd",
+        "listdir",
+        "mkdir",
+        "open",
+        "replace",
+        "stat",
+        "unlink",
+    ),
+    "_warnings": ("warn",),
+    "marshal": ("dumps", "loads"),
+}
+
+
+def _import_runtime_dependency_module_name(dependency_name: str, module: ModuleType) -> str | None:
+    if dict.get(_IMPORT_RUNTIME_SYS_MODULES, dependency_name) is module:
+        return dependency_name
+    module_name = ModuleType.__getattribute__(module, "__name__")
+    if type(module_name) is str and dict.get(_IMPORT_RUNTIME_SYS_MODULES, module_name) is module:
+        return module_name
+    return None
+
+
+_FROZEN_IMPORTLIB_EXTERNAL_DEPENDENCY_MODULES = tuple(
+    (module_name, value, attributes)
+    for dependency_name, attributes in _FROZEN_IMPORTLIB_EXTERNAL_DEPENDENCY_MODULE_ATTRIBUTES.items()
+    if type(value := _FROZEN_IMPORTLIB_EXTERNAL_NAMESPACE.get(dependency_name)) is ModuleType
+    and type(module_name := _import_runtime_dependency_module_name(dependency_name, value)) is str
+)
+_IMPORT_RUNTIME_TYPES = tuple(
+    dict.fromkeys(
+        (
+            *(value for value in _FROZEN_IMPORTLIB_NAMESPACE.values() if type(value) is type),
+            *(value for value in _FROZEN_IMPORTLIB_EXTERNAL_NAMESPACE.values() if type(value) is type),
+            zipimporter,
+        )
+    )
+)
+_IMPORT_RUNTIME_MODULE_SNAPSHOTS = (
+    ("_imp", _imp, _module_namespace_snapshot(_imp)),
+    (
+        "_frozen_importlib",
+        _FROZEN_IMPORTLIB_MODULE,
+        _module_namespace_snapshot(_FROZEN_IMPORTLIB_MODULE)
+        if type(_FROZEN_IMPORTLIB_MODULE) is ModuleType
+        else MappingProxyType({}),
+    ),
+    (
+        "_frozen_importlib_external",
+        _FROZEN_IMPORTLIB_EXTERNAL_MODULE,
+        _module_namespace_snapshot(_FROZEN_IMPORTLIB_EXTERNAL_MODULE)
+        if type(_FROZEN_IMPORTLIB_EXTERNAL_MODULE) is ModuleType
+        else MappingProxyType({}),
+    ),
+    *(
+        (name, module, _module_attribute_snapshot(module, attributes))
+        for name, module, attributes in _FROZEN_IMPORTLIB_DEPENDENCY_MODULES
+    ),
+    *(
+        (name, module, _module_attribute_snapshot(module, attributes))
+        for name, module, attributes in _FROZEN_IMPORTLIB_EXTERNAL_DEPENDENCY_MODULES
+    ),
+)
+_IMPORT_RUNTIME_MISSING_GLOBAL_NAMES = MappingProxyType(
+    {
+        "_frozen_importlib": _module_missing_loaded_global_names(_FROZEN_IMPORTLIB_NAMESPACE),
+        "_frozen_importlib_external": _module_missing_loaded_global_names(_FROZEN_IMPORTLIB_EXTERNAL_NAMESPACE),
+    }
+)
+_IMPORT_RUNTIME_TYPE_SNAPSHOTS = tuple((class_, _type_namespace_snapshot(class_)) for class_ in _IMPORT_RUNTIME_TYPES)
+
+
+def _exact_list_items_without_hooks(value: object) -> tuple[object, ...] | None:
+    if type(value) is not list:
+        return None
+    return tuple(list.__iter__(value))
+
+
+def _runtime_sys_modules_without_hooks() -> dict[str, object] | None:
+    modules = sys.modules
+    if type(modules) is not dict or modules is not _IMPORT_RUNTIME_SYS_MODULES:
+        return None
+    return cast(dict[str, object], modules)
+
+
+def _runtime_module_attribute_without_hooks(module_name: str, attribute: str) -> object | None:
+    modules = _runtime_sys_modules_without_hooks()
+    if modules is None:
+        return None
+    module = dict.get(modules, module_name)
+    if type(module) is not ModuleType:
+        return None
+    namespace = ModuleType.__getattribute__(module, "__dict__")
+    if type(namespace) is not dict:
+        return None
+    return dict.get(namespace, attribute)
+
+
+def _runtime_meta_path_without_hooks() -> tuple[object, ...] | None:
+    return _exact_list_items_without_hooks(sys.meta_path)
+
+
+def _runtime_path_hooks_without_hooks() -> tuple[object, ...] | None:
+    return _exact_list_items_without_hooks(sys.path_hooks)
+
+
+def _runtime_search_path_without_hooks() -> tuple[str, ...] | None:
+    entries = _exact_list_items_without_hooks(sys.path)
+    if entries is None or any(type(entry) is not str for entry in entries):
+        return None
+    return cast(tuple[str, ...], entries)
+
+
+def _runtime_path_importer_cache_without_hooks() -> dict[str, object] | None:
+    cache = sys.path_importer_cache
+    if type(cache) is not dict:
+        return None
+    return cast(dict[str, object], cache)
+
+
+def _runtime_import_containers_are_safe() -> bool:
+    return (
+        _runtime_sys_modules_without_hooks() is not None
+        and _runtime_meta_path_without_hooks() is not None
+        and _runtime_path_hooks_without_hooks() is not None
+        and _runtime_search_path_without_hooks() is not None
+        and _runtime_path_importer_cache_without_hooks() is not None
+    )
+
+
+def _namespace_matches_snapshot(
+    namespace: Mapping[str, object],
+    expected: Mapping[str, _RuntimeValueSnapshot],
+) -> bool:
+    return all(
+        key in namespace
+        and namespace[key] is expected_value[0]
+        and _runtime_value_matches_snapshot(namespace[key], expected_value)
+        for key, expected_value in expected.items()
+    )
+
+
+def _type_namespace_matches_snapshot(
+    namespace: Mapping[str, object],
+    expected: Mapping[str, _RuntimeValueSnapshot],
+) -> bool:
+    return _namespace_matches_snapshot(namespace, expected) and all(
+        name in expected or not _runtime_type_member_is_executable(value) for name, value in namespace.items()
+    )
+
+
+def _interpreter_import_runtime_is_trusted() -> bool:
+    modules = _runtime_sys_modules_without_hooks()
+    if modules is None or not _runtime_import_containers_are_safe():
+        return False
+    if type(_IMPORT_RUNTIME_BUILTINS) is not dict or not _namespace_matches_snapshot(
+        _IMPORT_RUNTIME_BUILTINS,
+        _IMPORT_RUNTIME_BUILTINS_SNAPSHOT,
+    ):
+        return False
+    for module_name, expected_module, expected_namespace in _IMPORT_RUNTIME_MODULE_SNAPSHOTS:
+        if type(expected_module) is not ModuleType or dict.get(modules, module_name) is not expected_module:
+            return False
+        namespace = ModuleType.__getattribute__(expected_module, "__dict__")
+        if (
+            type(namespace) is not dict
+            or not _namespace_matches_snapshot(namespace, expected_namespace)
+            or any(name in namespace for name in _IMPORT_RUNTIME_MISSING_GLOBAL_NAMES.get(module_name, ()))
+        ):
+            return False
+    for class_, expected_namespace in _IMPORT_RUNTIME_TYPE_SNAPSHOTS:
+        namespace = type.__getattribute__(class_, "__dict__")
+        if not _type_namespace_matches_snapshot(namespace, expected_namespace):
+            return False
+    return True
+
+
+def _interpreter_target_import_lock_state_is_safe(module_name: str) -> bool:
+    if type(_FROZEN_IMPORTLIB_MODULE) is not ModuleType:
+        return False
+    namespace = ModuleType.__getattribute__(_FROZEN_IMPORTLIB_MODULE, "__dict__")
+    if type(namespace) is not dict:
+        return False
+    module_locks = namespace.get("_module_locks")
+    if type(module_locks) is not dict:
+        return False
+    lock_names = tuple(dict.keys(module_locks))
+    return all(type(lock_name) is str for lock_name in lock_names) and all(
+        lock_name != module_name for lock_name in lock_names
+    )
+
+
+def _module_spec_fields_without_hooks(spec: ModuleSpec) -> tuple[object, object]:
+    return object.__getattribute__(spec, "origin"), object.__getattribute__(spec, "loader")
+
+
+def _loaded_module_state_without_hooks(module_name: str) -> tuple[bool, object | None, ModuleSpec | None]:
+    modules = _runtime_sys_modules_without_hooks()
+    if modules is None:
+        return True, None, None
+    if not dict.__contains__(modules, module_name):
+        return False, None, None
+    module = dict.get(modules, module_name)
+    if type(module) is not ModuleType:
+        return True, module, None
+    spec = ModuleType.__getattribute__(module, "__spec__")
+    if type(spec) is not ModuleSpec:
+        return True, module, None
+    return True, module, spec
+
+
+def _capture_trusted_loaded_interpreter_modules() -> Mapping[
+    str,
+    tuple[object, ModuleSpec, object, object, Mapping[str, object]],
+]:
+    trusted: dict[str, tuple[object, ModuleSpec, object, object, Mapping[str, object]]] = {}
+    for module_name in tuple(dict.keys(_IMPORT_RUNTIME_SYS_MODULES)):
+        try:
+            origin = _interpreter_module_origin_without_import_hooks(module_name)
+        except Exception:
+            continue
+        if origin is None:
+            continue
+        loaded, module, spec = _loaded_module_state_without_hooks(module_name)
+        if not loaded or module is None or spec is None:
+            continue
+        spec_origin, loader = _module_spec_fields_without_hooks(spec)
+        expected_loader = BuiltinImporter if origin == "built-in" else FrozenImporter
+        if type(spec_origin) is str and spec_origin == origin and loader is expected_loader:
+            module_namespace = ModuleType.__getattribute__(module, "__dict__")
+            if type(module_namespace) is not dict:
+                continue
+            trusted_names = {
+                name
+                for trusted_module, name in _TRUSTED_IMPORT_ONLY_REFERENCES
+                if trusted_module == module_name and "." not in name and name in module_namespace
+            }
+            trusted[module_name] = (
+                module,
+                spec,
+                spec_origin,
+                loader,
+                MappingProxyType({name: module_namespace[name] for name in trusted_names}),
+            )
+    return MappingProxyType(trusted)
+
+
+def _interpreter_module_origin_without_import_hooks(module_name: str) -> str | None:
+    if module_name in _BUILTIN_MODULE_NAMES:
+        return "built-in"
+    try:
+        if _IS_FROZEN_MODULE(module_name):
+            return "frozen"
+    except Exception:
+        return None
+    return None
+
+
+_LoadedInterpreterModuleState = tuple[
+    bool,
+    object | None,
+    object | None,
+    object | None,
+    object | None,
+]
+_LoadedInterpreterReferenceState = tuple[bool, object | None]
+_FunctionReferencedGlobalsSnapshot = tuple[
+    FunctionType,
+    object,
+    tuple[
+        tuple[
+            str,
+            _RuntimeValueSnapshot,
+            tuple[
+                tuple[
+                    tuple[str, ...],
+                    _RuntimeValueSnapshot,
+                    tuple[_RuntimeValueSnapshot, ...],
+                ],
+                ...,
+            ],
+            bool,
+        ],
+        ...,
+    ],
+    object,
+    tuple[tuple[str, _RuntimeValueSnapshot], ...],
+]
+_TrustedExecutableValueSnapshot = tuple[
+    _RuntimeValueSnapshot,
+    tuple[_FunctionReferencedGlobalsSnapshot, ...],
+    bool,
+]
+_TrustedReferenceExecutableSnapshot = tuple[
+    _TrustedExecutableValueSnapshot,
+    tuple[tuple[type[object], Mapping[str, _TrustedExecutableValueSnapshot]], ...],
+]
+_TrustedLoadedReferenceBaseline = tuple[
+    _LoadedInterpreterModuleState,
+    _LoadedInterpreterReferenceState,
+    _TrustedReferenceExecutableSnapshot,
+]
+
+
+def _loaded_reference_state_without_hooks(
+    module: object,
+    name: str,
+) -> _LoadedInterpreterReferenceState:
+    if type(module) is not ModuleType:
+        return False, None
+    value: object = module
+    for component in name.split("."):
+        if type(value) is ModuleType:
+            namespace = ModuleType.__getattribute__(value, "__dict__")
+            if type(namespace) is not dict or component not in namespace:
+                return False, None
+            value = namespace[component]
+            continue
+        if type(value) is type:
+            for base in type.__getattribute__(value, "__mro__"):
+                namespace = type.__getattribute__(base, "__dict__")
+                if component in namespace:
+                    value = namespace[component]
+                    break
+            else:
+                return False, None
+            continue
+        return False, None
+    return True, value
+
+
+def _trusted_reference_executable_snapshot(value: object) -> _TrustedReferenceExecutableSnapshot:
+    type_snapshots: tuple[tuple[type[object], Mapping[str, _TrustedExecutableValueSnapshot]], ...] = ()
+    if type(value) is type:
+        type_snapshots = tuple(
+            (
+                base,
+                MappingProxyType(
+                    {
+                        name: _trusted_class_member_snapshot(name, member)
+                        for name, member in type.__getattribute__(base, "__dict__").items()
+                    }
+                ),
+            )
+            for base in type.__getattribute__(value, "__mro__")
+        )
+    return _trusted_executable_value_snapshot(value), type_snapshots
+
+
+def _trusted_class_member_snapshot(name: str, member: object) -> _TrustedExecutableValueSnapshot:
+    if name in {"__new__", "__init__", "__getattribute__", "__getattr__", "__setattr__", "__setstate__"}:
+        return _trusted_executable_value_snapshot(member)
+    for base in type.__getattribute__(type(member), "__mro__"):
+        namespace = type.__getattribute__(base, "__dict__")
+        if "__set__" in namespace or "__delete__" in namespace:
+            return _trusted_executable_value_snapshot(member)
+    return _runtime_value_snapshot(member), (), True
+
+
+def _executable_value_functions(value: object) -> tuple[FunctionType, ...]:
+    if isinstance(value, classmethod | staticmethod):
+        value = value.__func__
+    if isinstance(value, FunctionType):
+        return (value,)
+    if isinstance(value, property):
+        return tuple(
+            function for function in (value.fget, value.fset, value.fdel) if isinstance(function, FunctionType)
+        )
+    if type(value) is type:
+        functions: list[FunctionType] = []
+        for name in ("__new__", "__init__"):
+            for base in type.__getattribute__(value, "__mro__"):
+                namespace = type.__getattribute__(base, "__dict__")
+                if name in namespace:
+                    functions.extend(_executable_value_functions(namespace[name]))
+                    break
+        return tuple(functions)
+    return ()
+
+
+def _type_member_without_hooks(class_: type[object], name: str) -> tuple[bool, object | None]:
+    for base in type.__getattribute__(class_, "__mro__"):
+        namespace = type.__getattribute__(base, "__dict__")
+        if name in namespace:
+            return True, namespace[name]
+    return False, None
+
+
+def _runtime_attribute_path_without_hooks(
+    value: object,
+    path: tuple[str, ...],
+) -> tuple[bool, object | None, tuple[object, ...]]:
+    current = value
+    dispatch_dependencies: list[object] = []
+    for component in path:
+        if type(current) is ModuleType:
+            namespace = ModuleType.__getattribute__(current, "__dict__")
+            if type(namespace) is not dict:
+                return False, None, ()
+            if component == "__dict__":
+                current = namespace
+                continue
+            if component not in namespace:
+                return False, None, ()
+            current = namespace[component]
+            continue
+        if type(current) is type:
+            if component == "__dict__":
+                current = type.__getattribute__(current, "__dict__")
+                continue
+            found, member = _type_member_without_hooks(current, component)
+            if not found:
+                return False, None, ()
+            current = member
+            continue
+        class_ = type(current)
+        dispatch_found, dispatch = _type_member_without_hooks(class_, "__getattribute__")
+        if not dispatch_found:
+            return False, None, ()
+        dispatch_dependencies.append(dispatch)
+        class_member_found, class_member = _type_member_without_hooks(class_, component)
+        if class_member_found and _value_is_data_descriptor(class_member):
+            descriptor_found, descriptor_get = _type_member_without_hooks(type(class_member), "__get__")
+            if descriptor_found:
+                dispatch_dependencies.append(descriptor_get)
+            current = class_member
+            continue
+
+        instance_dict_descriptor: object | None = None
+        for base in type.__getattribute__(class_, "__mro__"):
+            namespace = type.__getattribute__(base, "__dict__")
+            if "__dict__" in namespace:
+                instance_dict_descriptor = namespace["__dict__"]
+                break
+        if type(instance_dict_descriptor) is GetSetDescriptorType:
+            try:
+                instance_namespace = object.__getattribute__(current, "__dict__")
+            except AttributeError:
+                instance_namespace = None
+            if type(instance_namespace) is not dict:
+                return False, None, ()
+            if component in instance_namespace:
+                current = instance_namespace[component]
+                continue
+        elif instance_dict_descriptor is not None:
+            return False, None, ()
+        if not class_member_found:
+            return False, None, ()
+        descriptor_found, descriptor_get = _type_member_without_hooks(type(class_member), "__get__")
+        if descriptor_found:
+            dispatch_dependencies.append(descriptor_get)
+        current = class_member
+        continue
+    return True, current, tuple(dispatch_dependencies)
+
+
+def _value_is_data_descriptor(value: object) -> bool:
+    for base in type.__getattribute__(type(value), "__mro__"):
+        namespace = type.__getattribute__(base, "__dict__")
+        if "__set__" in namespace or "__delete__" in namespace:
+            return True
+    return False
+
+
+def _trusted_executable_value_snapshot(value: object) -> _TrustedExecutableValueSnapshot:
+    referenced_globals: list[_FunctionReferencedGlobalsSnapshot] = []
+    functions = deque(_executable_value_functions(value))
+    seen_functions: set[FunctionType] = set()
+    globals_seen = 0
+    while functions:
+        function = functions.popleft()
+        if function in seen_functions:
+            continue
+        if len(seen_functions) >= _MAX_TRUSTED_REFERENCE_FUNCTIONS:
+            return _runtime_value_snapshot(value), tuple(referenced_globals), False
+        seen_functions.add(function)
+        globals_namespace = function.__globals__
+        builtins_namespace = object.__getattribute__(function, "__builtins__")
+        if type(globals_namespace) is not dict or type(builtins_namespace) is not dict:
+            return _runtime_value_snapshot(value), tuple(referenced_globals), False
+        referenced_names = _code_referenced_names(function.__code__)
+        attribute_paths = _code_global_attribute_paths(function.__code__)
+        global_names = tuple(name for name in sorted(referenced_names) if name in globals_namespace)
+        builtin_names = tuple(
+            name for name in sorted(referenced_names) if name not in globals_namespace and name in builtins_namespace
+        )
+        globals_seen += len(global_names) + len(builtin_names)
+        if globals_seen > _MAX_TRUSTED_REFERENCE_GLOBALS:
+            return _runtime_value_snapshot(value), tuple(referenced_globals), False
+        global_snapshots: list[
+            tuple[
+                str,
+                _RuntimeValueSnapshot,
+                tuple[
+                    tuple[
+                        tuple[str, ...],
+                        _RuntimeValueSnapshot,
+                        tuple[_RuntimeValueSnapshot, ...],
+                    ],
+                    ...,
+                ],
+                bool,
+            ]
+        ] = []
+        for name in global_names:
+            global_value = globals_namespace[name]
+            mutable_state_safe = _trusted_mutable_global_state_is_safe(function, name, global_value)
+            dependency_snapshots: list[
+                tuple[
+                    tuple[str, ...],
+                    _RuntimeValueSnapshot,
+                    tuple[_RuntimeValueSnapshot, ...],
+                ]
+            ] = []
+            for path in () if mutable_state_safe else attribute_paths.get(name, ()):
+                resolved, dependency, dispatch_dependencies = _runtime_attribute_path_without_hooks(global_value, path)
+                if not resolved:
+                    return _runtime_value_snapshot(value), tuple(referenced_globals), False
+                dependency_snapshots.append(
+                    (
+                        path,
+                        _runtime_value_snapshot(dependency),
+                        tuple(_runtime_value_snapshot(dispatch) for dispatch in dispatch_dependencies),
+                    )
+                )
+                functions.extend(_executable_value_functions(dependency))
+                for dispatch in dispatch_dependencies:
+                    functions.extend(_executable_value_functions(dispatch))
+            global_snapshots.append(
+                (
+                    name,
+                    _runtime_value_snapshot(global_value),
+                    tuple(dependency_snapshots),
+                    mutable_state_safe,
+                )
+            )
+        referenced_globals.append(
+            (
+                function,
+                globals_namespace,
+                tuple(global_snapshots),
+                builtins_namespace,
+                tuple((name, _runtime_value_snapshot(builtins_namespace[name])) for name in builtin_names),
+            )
+        )
+        for name in global_names:
+            functions.extend(_executable_value_functions(globals_namespace[name]))
+        for name in builtin_names:
+            functions.extend(_executable_value_functions(builtins_namespace[name]))
+    return _runtime_value_snapshot(value), tuple(referenced_globals), True
+
+
+def _trusted_mutable_global_state_is_safe(function: FunctionType, name: str, value: object) -> bool:
+    return (
+        function.__module__ == "tempfile"
+        and function.__name__ == "_gettempdir"
+        and name == "tempdir"
+        and (value is None or type(value) is str)
+    ) or (
+        function.__module__ == "posixpath"
+        and function.__name__ == "expandvars"
+        and _trusted_posixpath_regex_cache_is_safe(name, value)
+    )
+
+
+def _trusted_posixpath_regex_cache_is_safe(name: str, value: object) -> bool:
+    if name in {"_varprog", "_varprogb"}:
+        return value is None or type(value) is re.Pattern
+    if name not in {"_varsub", "_varsubb"}:
+        return False
+    if value is None:
+        return True
+    if type(value) is not _REGEX_SUB_METHOD_TYPE:
+        return False
+    try:
+        owner = object.__getattribute__(value, "__self__")
+        method_name = object.__getattribute__(value, "__name__")
+    except AttributeError:
+        return False
+    return type(owner) is re.Pattern and method_name == "sub"
+
+
+def _trusted_executable_value_matches_snapshot(
+    value: object,
+    expected: _TrustedExecutableValueSnapshot,
+) -> bool:
+    if not _runtime_value_matches_snapshot(value, expected[0]):
+        return False
+    if not expected[2]:
+        return False
+    if not expected[1]:
+        return True
+    current = _trusted_executable_value_snapshot(value)
+    if not current[2]:
+        return False
+    if len(current[1]) != len(expected[1]):
+        return False
+    for current_globals, expected_globals in zip(current[1], expected[1], strict=True):
+        if (
+            current_globals[0] is not expected_globals[0]
+            or current_globals[1] is not expected_globals[1]
+            or current_globals[3] is not expected_globals[3]
+        ):
+            return False
+        if len(current_globals[2]) != len(expected_globals[2]) or len(current_globals[4]) != len(expected_globals[4]):
+            return False
+        for current_global, expected_global in zip(current_globals[2], expected_globals[2], strict=True):
+            if current_global[0] != expected_global[0] or current_global[3] is not expected_global[3]:
+                return False
+            if not expected_global[3] and not _runtime_value_matches_snapshot(
+                current_global[1][0],
+                expected_global[1],
+            ):
+                return False
+            if len(current_global[2]) != len(expected_global[2]):
+                return False
+            for current_dependency, expected_dependency in zip(
+                current_global[2],
+                expected_global[2],
+                strict=True,
+            ):
+                if current_dependency[0] != expected_dependency[0] or not _runtime_value_matches_snapshot(
+                    current_dependency[1][0],
+                    expected_dependency[1],
+                ):
+                    return False
+                if len(current_dependency[2]) != len(expected_dependency[2]) or any(
+                    not _runtime_value_matches_snapshot(current_dispatch[0], expected_dispatch)
+                    for current_dispatch, expected_dispatch in zip(
+                        current_dependency[2],
+                        expected_dependency[2],
+                        strict=True,
+                    )
+                ):
+                    return False
+        if any(
+            current_name != expected_name or not _runtime_value_matches_snapshot(current_value[0], expected_value)
+            for (current_name, current_value), (expected_name, expected_value) in zip(
+                current_globals[4],
+                expected_globals[4],
+                strict=True,
+            )
+        ):
+            return False
+    return True
+
+
+def _trusted_reference_executable_matches_snapshot(
+    value: object,
+    expected: _TrustedReferenceExecutableSnapshot,
+) -> bool:
+    if not _trusted_executable_value_matches_snapshot(value, expected[0]):
+        return False
+    if type(value) is not type:
+        return not expected[1]
+    mro = type.__getattribute__(value, "__mro__")
+    if len(mro) != len(expected[1]):
+        return False
+    for base, (expected_base, expected_namespace) in zip(mro, expected[1], strict=True):
+        if base is not expected_base:
+            return False
+        raw_namespace = type.__getattribute__(base, "__dict__")
+        if any(
+            name not in raw_namespace
+            or not _trusted_executable_value_matches_snapshot(raw_namespace[name], expected_value)
+            for name, expected_value in expected_namespace.items()
+        ) or any(
+            name not in expected_namespace and not _trusted_class_namespace_addition_is_safe(name, member)
+            for name, member in raw_namespace.items()
+        ):
+            return False
+    return True
+
+
+def _trusted_class_namespace_addition_is_safe(name: str, value: object) -> bool:
+    if name != "__slotnames__":
+        return False
+    slot_names = _exact_list_items_without_hooks(value)
+    return (
+        slot_names is not None
+        and len(slot_names) <= _MAX_TRUSTED_SLOT_NAMES
+        and all(type(slot_name) is str for slot_name in slot_names)
+    )
+
+
+def _loaded_module_metadata_matches_spec_without_hooks(
+    module_name: str,
+    module: object,
+    spec: object,
+    origin: object,
+    loader: object,
+) -> bool:
+    if type(module) is not ModuleType or type(spec) is not ModuleSpec or type(origin) is not str or loader is None:
+        return False
+    namespace = ModuleType.__getattribute__(module, "__dict__")
+    if type(namespace) is not dict:
+        return False
+    locations = object.__getattribute__(spec, "submodule_search_locations")
+    expected_package = module_name if locations is not None else module_name.rpartition(".")[0]
+    loaded_name = namespace.get("__name__")
+    loaded_package = namespace.get("__package__")
+    loaded_file = namespace.get("__file__")
+    return (
+        type(loaded_name) is str
+        and loaded_name == module_name
+        and type(loaded_package) is str
+        and loaded_package == expected_package
+        and namespace.get("__spec__") is spec
+        and namespace.get("__loader__") is loader
+        and type(loaded_file) is str
+        and loaded_file == origin
+    )
+
+
+def _capture_trusted_loaded_references() -> Mapping[tuple[str, str], _TrustedLoadedReferenceBaseline]:
+    trusted: dict[tuple[str, str], _TrustedLoadedReferenceBaseline] = {}
+    for module_name, name in _TRUSTED_IMPORT_ONLY_REFERENCES:
+        if _interpreter_module_origin_without_import_hooks(module_name) is not None:
+            continue
+        loaded, module, spec = _loaded_module_state_without_hooks(module_name)
+        if not loaded or type(module) is not ModuleType or type(spec) is not ModuleSpec:
+            continue
+        origin, loader = _module_spec_fields_without_hooks(spec)
+        reference_state = _loaded_reference_state_without_hooks(module, name)
+        if (
+            _loaded_module_metadata_matches_spec_without_hooks(module_name, module, spec, origin, loader)
+            and reference_state[0]
+        ):
+            trusted[(module_name, name)] = (
+                (True, module, spec, origin, loader),
+                reference_state,
+                _trusted_reference_executable_snapshot(reference_state[1]),
+            )
+    return MappingProxyType(trusted)
+
+
 # Only modules whose import cannot resolve additional shadowable Python modules
 # are safe here. pathlib and subprocess transitively import modules such as
 # fnmatch and selectors, so a sibling shadow can still execute during unpickling.
@@ -339,6 +1320,10 @@ _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES = (
     )
     | _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES
 )
+# Canonical-looking specs in sys.modules are forgeable. Identity trust is
+# limited to interpreter modules already loaded when this module initializes.
+_TRUSTED_LOADED_INTERPRETER_MODULES = _capture_trusted_loaded_interpreter_modules()
+_TRUSTED_LOADED_REFERENCE_BASELINES = dict(_capture_trusted_loaded_references())
 _PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS = ("__new__", "__init__")
 _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS = ("__setstate__",)
 _PICKLE_BUILD_ENTRYPOINT_METHODS = (
@@ -405,6 +1390,8 @@ class _SharedSourceSnapshot:
     module_sources: dict[str, str] = field(default_factory=dict)
     loaded_module_sources: dict[str, str] = field(default_factory=dict)
     loaded_package_paths: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    loaded_interpreter_modules: dict[str, _LoadedInterpreterModuleState] = field(default_factory=dict)
+    loaded_interpreter_references: dict[tuple[str, str], _LoadedInterpreterReferenceState] = field(default_factory=dict)
     read_fingerprints: dict[str, tuple[int, bool, bytes | None]] = field(default_factory=dict)
     generation: int = 0
     stable: bool = True
@@ -1021,16 +2008,33 @@ def import_only_reference_is_proven_trusted(module_name: str, name: str) -> bool
         return True
     origin_kind = _trusted_module_origin_kind(module_name)
     reference = (module_name, name)
-    return reference in _TRUSTED_IMPORT_ONLY_REFERENCES and (
+    if (
+        origin_kind == "stdlib"
+        and _interpreter_module_origin_without_import_hooks(module_name) is not None
+        and not _interpreter_reference_is_trusted(module_name, name)
+    ):
+        return False
+    trusted = reference in _TRUSTED_IMPORT_ONLY_REFERENCES and (
         origin_kind in {"stdlib", "site_packages"}
         or (origin_kind == "unresolved" and reference in _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES)
     )
+    if not trusted:
+        return False
+    if (
+        origin_kind in {"stdlib", "site_packages"}
+        and _interpreter_module_origin_without_import_hooks(module_name) is None
+    ):
+        return _loaded_trusted_reference_matches_baseline(module_name, name)
+    return True
 
 
 def import_only_module_requires_origin_review(module_name: str, name: str) -> bool:
     """Return whether a module resolves outside trusted install paths."""
     if module_name == "__builtin__" or _legacy_pickle_compat_reference_is_trusted(module_name, name):
         return False
+    interpreter_trusted = _interpreter_module_resolution_is_trusted(module_name)
+    if interpreter_trusted is not None:
+        return not interpreter_trusted
     origin_kind = _trusted_module_origin_kind(module_name)
     return origin_kind not in {"stdlib", "site_packages"} and not (
         origin_kind == "unresolved" and (module_name, name) in _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES
@@ -1049,43 +2053,193 @@ def _unresolved_trusted_import_reference_is_safe(module_name: str, name: str) ->
     ) == "unresolved"
 
 
-@_register_source_sensitive_cache
+def _current_loaded_interpreter_module_state(module_name: str) -> _LoadedInterpreterModuleState:
+    loaded, module, spec = _loaded_module_state_without_hooks(module_name)
+    if spec is None:
+        return loaded, module, None, None, None
+    origin, loader = _module_spec_fields_without_hooks(spec)
+    return loaded, module, spec, origin, loader
+
+
+def _track_loaded_interpreter_module_state(
+    module_name: str,
+    state: _LoadedInterpreterModuleState,
+) -> None:
+    snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+    if snapshot is None:
+        return
+    with snapshot.lock:
+        existing = snapshot.loaded_interpreter_modules.get(module_name)
+        if existing is not None and not _loaded_interpreter_states_match(existing, state):
+            snapshot.stable = False
+        snapshot.loaded_interpreter_modules[module_name] = state
+        snapshot.reusable = False
+
+
+def _loaded_interpreter_states_match(
+    left: _LoadedInterpreterModuleState,
+    right: _LoadedInterpreterModuleState,
+) -> bool:
+    origins_match = left[3] is right[3] or (type(left[3]) is str and type(right[3]) is str and left[3] == right[3])
+    return left[0] is right[0] and left[1] is right[1] and left[2] is right[2] and origins_match and left[4] is right[4]
+
+
+def _loaded_interpreter_module_state_matches(
+    module_name: str,
+    expected: _LoadedInterpreterModuleState,
+) -> bool:
+    return _loaded_interpreter_states_match(_current_loaded_interpreter_module_state(module_name), expected)
+
+
+def _loaded_interpreter_module_matches_startup(module_name: str) -> bool:
+    state = _current_loaded_interpreter_module_state(module_name)
+    _track_loaded_interpreter_module_state(module_name, state)
+    trusted = _TRUSTED_LOADED_INTERPRETER_MODULES.get(module_name)
+    if trusted is None:
+        return False
+    return (
+        state[0]
+        and state[1] is trusted[0]
+        and state[2] is trusted[1]
+        and type(state[3]) is str
+        and state[3] == trusted[2]
+        and state[4] is trusted[3]
+    )
+
+
+def _current_loaded_interpreter_reference_state(
+    module_name: str,
+    name: str,
+) -> _LoadedInterpreterReferenceState:
+    loaded, module, _ = _loaded_module_state_without_hooks(module_name)
+    if not loaded:
+        return False, None
+    return _loaded_reference_state_without_hooks(module, name)
+
+
+def _track_loaded_interpreter_reference_state(
+    module_name: str,
+    name: str,
+    state: _LoadedInterpreterReferenceState,
+) -> None:
+    snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+    if snapshot is None:
+        return
+    reference = (module_name, name)
+    with snapshot.lock:
+        existing = snapshot.loaded_interpreter_references.get(reference)
+        if existing is not None and not _loaded_interpreter_reference_states_match(existing, state):
+            snapshot.stable = False
+        snapshot.loaded_interpreter_references[reference] = state
+        snapshot.reusable = False
+
+
+def _loaded_interpreter_reference_states_match(
+    left: _LoadedInterpreterReferenceState,
+    right: _LoadedInterpreterReferenceState,
+) -> bool:
+    return left[0] is right[0] and left[1] is right[1]
+
+
+def _loaded_interpreter_reference_state_matches(
+    reference: tuple[str, str],
+    expected: _LoadedInterpreterReferenceState,
+) -> bool:
+    current = _current_loaded_interpreter_reference_state(*reference)
+    return _loaded_interpreter_reference_states_match(current, expected)
+
+
+def _interpreter_reference_is_trusted(module_name: str, name: str) -> bool:
+    loaded, _, _ = _loaded_module_state_without_hooks(module_name)
+    if not loaded:
+        return _interpreter_module_resolution_is_trusted(module_name) is True
+    if not _loaded_interpreter_module_matches_startup(module_name):
+        return False
+    trusted = _TRUSTED_LOADED_INTERPRETER_MODULES[module_name][4]
+    state = _current_loaded_interpreter_reference_state(module_name, name)
+    _track_loaded_interpreter_reference_state(module_name, name, state)
+    return state[0] and name in trusted and state[1] is trusted[name]
+
+
+def _loaded_trusted_reference_matches_baseline(module_name: str, name: str) -> bool:
+    module_state = _current_loaded_interpreter_module_state(module_name)
+    reference_state = _current_loaded_interpreter_reference_state(module_name, name)
+    _track_loaded_interpreter_module_state(module_name, module_state)
+    _track_loaded_interpreter_reference_state(module_name, name, reference_state)
+    if not module_state[0] or module_state[1] is None or module_state[2] is None or not reference_state[0]:
+        return not module_state[0]
+    if not _loaded_module_metadata_matches_spec_without_hooks(module_name, *module_state[1:]):
+        return False
+
+    expected = _TRUSTED_LOADED_REFERENCE_BASELINES.get((module_name, name))
+    if expected is None:
+        return False
+    return (
+        _loaded_interpreter_states_match(module_state, expected[0])
+        and _loaded_interpreter_reference_states_match(reference_state, expected[1])
+        and _trusted_reference_executable_matches_snapshot(reference_state[1], expected[2])
+    )
+
+
+def _interpreter_module_resolution_is_trusted(module_name: str) -> bool | None:
+    origin = _interpreter_module_origin_without_import_hooks(module_name)
+    if origin is None:
+        return None
+    loaded, _, _ = _loaded_module_state_without_hooks(module_name)
+    if loaded:
+        return _loaded_interpreter_module_matches_startup(module_name)
+    state = _current_loaded_interpreter_module_state(module_name)
+    _track_loaded_interpreter_module_state(module_name, state)
+    importer = BuiltinImporter if origin == "built-in" else FrozenImporter
+    return (
+        _interpreter_import_runtime_is_trusted()
+        and _interpreter_target_import_lock_state_is_safe(module_name)
+        and not _untrusted_meta_path_finder_precedes(
+            importer,
+            module_name,
+        )
+    )
+
+
 @lru_cache(maxsize=4096)
-def _trusted_module_origin_kind(module_name: str) -> str | None:
+def _cached_trusted_module_origin_kind(module_name: str) -> str | None:
     parts = _bounded_module_name_parts(module_name)
     if parts is None:
         return None
     _track_shared_source_candidates(parts)
+    interpreter_trusted = _interpreter_module_resolution_is_trusted(module_name)
+    if interpreter_trusted is not None:
+        return "stdlib" if interpreter_trusted else None
     try:
-        standard_spec = BuiltinImporter.find_spec(module_name)
-        if standard_spec is None:
-            standard_spec = FrozenImporter.find_spec(module_name)
-        if standard_spec is None:
-            standard_spec = _find_standard_filesystem_spec(module_name)
+        standard_spec = _find_standard_filesystem_spec(module_name)
     except Exception:
         return None
-    loaded_module = sys.modules.get(module_name)
-    loaded_spec = getattr(loaded_module, "__spec__", None)
+    loaded, _, loaded_spec = _loaded_module_state_without_hooks(module_name)
     spec: ModuleSpec | None
-    if isinstance(loaded_spec, ModuleSpec) and (standard_spec is None or loaded_spec.origin == standard_spec.origin):
+    if loaded:
+        if loaded_spec is None or _module_spec_claims_builtin_or_frozen_identity(loaded_spec):
+            return None
+        loaded_origin, _ = _module_spec_fields_without_hooks(loaded_spec)
+        if type(loaded_origin) is not str:
+            return None
+        if standard_spec is not None:
+            standard_origin, _ = _module_spec_fields_without_hooks(standard_spec)
+            if type(standard_origin) is not str or loaded_origin != standard_origin:
+                return None
         spec = loaded_spec
     else:
-        if not isinstance(loaded_spec, ModuleSpec) and (
-            _untrusted_meta_path_finder_precedes(BuiltinImporter, module_name)
-            or _untrusted_meta_path_finder_precedes(FrozenImporter, module_name)
-            or _untrusted_meta_path_finder_precedes(PathFinder, module_name)
-            or _has_untrusted_path_hook()
-        ):
+        if _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook():
             return None
         spec = standard_spec
     if spec is None:
         return "unresolved"
-    if _module_spec_uses_builtin_or_frozen_loader(spec):
-        return "stdlib"
-    if spec.origin is None:
+    if type(spec) is not ModuleSpec:
+        return None
+    spec_origin, _ = _module_spec_fields_without_hooks(spec)
+    if type(spec_origin) is not str:
         return None
     try:
-        origin = Path(spec.origin).resolve()
+        origin = Path(spec_origin).resolve()
     except (OSError, RuntimeError, ValueError):
         return None
     if _path_is_in_trusted_package_environment(origin):
@@ -1097,6 +2251,23 @@ def _trusted_module_origin_kind(module_name: str) -> str | None:
     if any(origin.is_relative_to(path) for path in _TRUSTED_STDLIB_PATHS):
         return "stdlib"
     return None
+
+
+class _TrustedModuleOriginKindResolver:
+    def __call__(self, module_name: str) -> str | None:
+        if _interpreter_module_origin_without_import_hooks(module_name) is not None:
+            loaded, _, _ = _loaded_module_state_without_hooks(module_name)
+            if loaded:
+                return _cached_trusted_module_origin_kind(module_name)
+        if not _interpreter_import_runtime_is_trusted():
+            return None
+        return _cached_trusted_module_origin_kind(module_name)
+
+    def cache_clear(self) -> None:
+        _cached_trusted_module_origin_kind.cache_clear()
+
+
+_trusted_module_origin_kind = _register_source_sensitive_cache(_TrustedModuleOriginKindResolver())
 
 
 def _mark_shared_source_snapshot_unreusable() -> None:
@@ -1535,7 +2706,10 @@ def _clear_source_sensitive_caches_now() -> None:
 
 
 def _source_search_context() -> tuple[str, ...]:
-    return tuple(str(Path(entry or os.getcwd()).absolute()) for entry in sys.path)
+    search_path = _runtime_search_path_without_hooks()
+    if search_path is None:
+        return (_UNREUSABLE_HOOK_STATE_IDENTITY,)
+    return tuple(str(Path(entry or os.getcwd()).absolute()) for entry in search_path)
 
 
 def _bounded_hook_value_identity(value: object, depth: int = 0) -> str:
@@ -1673,8 +2847,7 @@ def _import_hook_identity(hook: object) -> str:
         except (AttributeError, TypeError):
             instance_state = _UNREUSABLE_HOOK_STATE_IDENTITY
         instance_identity = _bounded_hook_value_identity(instance_state)
-        virtualenv_module = sys.modules.get("_virtualenv")
-        virtualenv_finder_type = getattr(virtualenv_module, "_Finder", None) if virtualenv_module is not None else None
+        virtualenv_finder_type = _runtime_module_attribute_without_hooks("_virtualenv", "_Finder")
         is_virtualenv_finder = isinstance(virtualenv_finder_type, type) and type(hook) is virtualenv_finder_type
         state = (
             f"self={instance_identity}"
@@ -1743,8 +2916,10 @@ def _string_sequence_identity(values: Iterable[str]) -> str:
 
 
 def _pytest_assertion_rewrite_identity(finder: object) -> str | None:
-    rewrite_module = sys.modules.get("_pytest.assertion.rewrite")
-    finder_type = getattr(rewrite_module, "AssertionRewritingHook", None) if rewrite_module is not None else None
+    finder_type = _runtime_module_attribute_without_hooks(
+        "_pytest.assertion.rewrite",
+        "AssertionRewritingHook",
+    )
     if not isinstance(finder_type, type) or type(finder) is not finder_type:
         return None
 
@@ -1805,25 +2980,35 @@ def _is_trusted_standard_path_importer(finder: object, cache_key: str) -> bool:
 
 
 def _search_path_has_untrusted_importer(search_path: Iterable[str]) -> bool:
+    path_importer_cache = _runtime_path_importer_cache_without_hooks()
+    if path_importer_cache is None or type(search_path) not in {list, tuple}:
+        return True
     for entry in search_path:
         cache_key = entry or os.getcwd()
-        finder = sys.path_importer_cache.get(cache_key)
+        finder = dict.get(path_importer_cache, cache_key)
         if finder is not None and not _is_trusted_standard_path_importer(finder, cache_key):
             return True
     return False
 
 
 def _source_resolution_context() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    search_path = _runtime_search_path_without_hooks()
+    meta_path = _runtime_meta_path_without_hooks()
+    path_hooks = _runtime_path_hooks_without_hooks()
+    path_importer_cache = _runtime_path_importer_cache_without_hooks()
+    if search_path is None or meta_path is None or path_hooks is None or path_importer_cache is None:
+        unavailable = (_UNREUSABLE_HOOK_STATE_IDENTITY,)
+        return unavailable, unavailable, unavailable
     nonstandard_importers = []
-    for entry in sys.path:
+    for entry in search_path:
         cache_key = entry or os.getcwd()
-        finder = sys.path_importer_cache.get(cache_key)
+        finder = dict.get(path_importer_cache, cache_key)
         if finder is None or _is_trusted_standard_path_importer(finder, cache_key):
             continue
         nonstandard_importers.append(f"{Path(cache_key).absolute()}={_import_hook_identity(finder)}")
     return (
-        tuple(_meta_path_finder_resolution_identity(finder) for finder in sys.meta_path),
-        tuple(_path_hook_resolution_identity(hook) for hook in sys.path_hooks),
+        tuple(_meta_path_finder_resolution_identity(finder) for finder in meta_path),
+        tuple(_path_hook_resolution_identity(hook) for hook in path_hooks),
         tuple(nonstandard_importers),
     )
 
@@ -2042,6 +3227,8 @@ def _reset_shared_source_snapshot(snapshot: _SharedSourceSnapshot) -> None:
     snapshot.module_sources.clear()
     snapshot.loaded_module_sources.clear()
     snapshot.loaded_package_paths.clear()
+    snapshot.loaded_interpreter_modules.clear()
+    snapshot.loaded_interpreter_references.clear()
     snapshot.generation += 1
     snapshot.stable = True
     snapshot.reusable = _resolution_context_is_reusable(snapshot.resolution_context)
@@ -2077,6 +3264,14 @@ def _shared_source_snapshot_is_current(snapshot: _SharedSourceSnapshot) -> bool:
         if not is_loaded or current_search_path is None or tuple(current_search_path) != expected_search_path:
             return False
         if _search_path_has_untrusted_importer(current_search_path):
+            return False
+    for module_name, expected_module_state in snapshot.loaded_interpreter_modules.items():
+        if not _loaded_interpreter_module_state_matches(module_name, expected_module_state):
+            return False
+    if snapshot.loaded_interpreter_modules and not _interpreter_import_runtime_is_trusted():
+        return False
+    for reference, expected_reference_state in snapshot.loaded_interpreter_references.items():
+        if not _loaded_interpreter_reference_state_matches(reference, expected_reference_state):
             return False
     return True
 
@@ -2156,9 +3351,13 @@ def shared_source_fingerprint_metadata() -> dict[str, Any] | None:
 
 
 def _track_shared_source_candidates(parts: tuple[str, ...]) -> None:
+    search_path = _runtime_search_path_without_hooks()
+    if search_path is None:
+        _mark_shared_source_snapshot_unreusable()
+        return
     candidates: set[Path] = set()
     import_suffixes = (*EXTENSION_SUFFIXES, *SOURCE_SUFFIXES, *BYTECODE_SUFFIXES)
-    for entry in sys.path:
+    for entry in search_path:
         root = Path(entry or os.getcwd())
         archive_path = _zipimport_archive_path(str(root))
         if archive_path is not None:
@@ -2212,7 +3411,11 @@ def _track_resolution_source_candidates(parts: tuple[str, ...]) -> None:
             snapshot.reusable = False
         return
 
-    search_path = [str(Path(entry or os.getcwd())) for entry in sys.path]
+    runtime_search_path = _runtime_search_path_without_hooks()
+    if runtime_search_path is None:
+        _mark_shared_source_snapshot_unreusable()
+        return
+    search_path = [str(Path(entry or os.getcwd())) for entry in runtime_search_path]
     for index, part in enumerate(parts):
         qualified_name = ".".join(parts[: index + 1])
         if index < len(parts) - 1:
@@ -2375,6 +3578,10 @@ def _track_shared_source_path(module_name: str, path: Path, *, loaded: bool) -> 
 
 
 def _call_graph_source_unavailable_reason(module_name: str) -> str | None:
+    interpreter_trusted = _interpreter_module_resolution_is_trusted(module_name)
+    if interpreter_trusted is not None:
+        return None if interpreter_trusted else "source_unavailable"
+
     source_path = _resolve_module_source(module_name)
     if source_path is not None:
         try:
@@ -2407,9 +3614,14 @@ def _call_graph_source_unavailable_reason(module_name: str) -> str | None:
     if spec is None:
         # Module names come from pickle metadata; do not consult executable custom meta-path finders.
         return "source_unavailable"
-    if spec.origin in {"built-in", "frozen"}:
+    if type(spec) is not ModuleSpec:
+        return "source_unavailable"
+    spec_origin, _ = _module_spec_fields_without_hooks(spec)
+    if type(spec_origin) is not str:
+        return "source_unavailable"
+    if spec_origin in {"built-in", "frozen"}:
         return None
-    if spec.origin is not None and any(spec.origin.endswith(suffix) for suffix in EXTENSION_SUFFIXES):
+    if any(spec_origin.endswith(suffix) for suffix in EXTENSION_SUFFIXES):
         return None
     return "source_unavailable"
 
@@ -2419,20 +3631,17 @@ def _find_module_spec_without_imports(module_name: str) -> ModuleSpec | None:
     if parts is None:
         return None
 
-    loaded_module = sys.modules.get(module_name)
-    loaded_spec = getattr(loaded_module, "__spec__", None)
-    if isinstance(loaded_spec, ModuleSpec):
+    interpreter_origin = _interpreter_module_origin_without_import_hooks(module_name)
+    loaded, _, loaded_spec = _loaded_module_state_without_hooks(module_name)
+    if loaded:
+        if loaded_spec is None or interpreter_origin is not None:
+            return None
+        if _module_spec_claims_builtin_or_frozen_identity(loaded_spec):
+            return None
         return loaded_spec
 
-    if not _untrusted_meta_path_finder_precedes(BuiltinImporter, module_name):
-        builtin_spec = BuiltinImporter.find_spec(module_name)
-        if builtin_spec is not None:
-            return builtin_spec
-
-    if not _untrusted_meta_path_finder_precedes(FrozenImporter, module_name):
-        frozen_spec = FrozenImporter.find_spec(module_name)
-        if frozen_spec is not None:
-            return frozen_spec
+    if interpreter_origin is not None:
+        return None
 
     if _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook():
         return None
@@ -2447,7 +3656,10 @@ def _find_standard_filesystem_spec(module_name: str) -> ModuleSpec | None:
     if not parts or any(not part or "/" in part or "\\" in part for part in parts):
         return None
 
-    search_path = [str(Path(entry or os.getcwd())) for entry in sys.path]
+    runtime_search_path = _runtime_search_path_without_hooks()
+    if runtime_search_path is None:
+        return None
+    search_path = [str(Path(entry or os.getcwd())) for entry in runtime_search_path]
     spec: ModuleSpec | None = None
     for index in range(len(parts)):
         qualified_name = ".".join(parts[: index + 1])
@@ -2471,15 +3683,24 @@ def _find_standard_filesystem_spec(module_name: str) -> ModuleSpec | None:
 
 
 def _loaded_package_search_path(module_name: str) -> tuple[bool, list[str] | None]:
-    if module_name not in sys.modules:
+    modules = _runtime_sys_modules_without_hooks()
+    if modules is None:
+        return True, None
+    if not dict.__contains__(modules, module_name):
         return False, None
-    loaded_module: Any = sys.modules[module_name]
-    if not isinstance(loaded_module, ModuleType):
+    loaded_module: Any = dict.__getitem__(modules, module_name)
+    if type(loaded_module) is not ModuleType:
         return True, None
-    raw_search_path = vars(loaded_module).get("__path__")
-    if not isinstance(raw_search_path, (list, tuple)) or not all(isinstance(entry, str) for entry in raw_search_path):
+    namespace = ModuleType.__getattribute__(loaded_module, "__dict__")
+    if type(namespace) is not dict:
         return True, None
-    return True, [str(Path(entry or os.getcwd()).absolute()) for entry in raw_search_path]
+    raw_search_path = namespace.get("__path__")
+    if type(raw_search_path) not in {list, tuple}:
+        return True, None
+    search_path = cast(list[object] | tuple[object, ...], raw_search_path)
+    if any(type(entry) is not str for entry in search_path):
+        return True, None
+    return True, [str(Path(cast(str, entry) or os.getcwd()).absolute()) for entry in search_path]
 
 
 def _source_cache_path(source_path: Path) -> Path | None:
@@ -2547,19 +3768,49 @@ def _zipimport_archive_path(entry: str) -> Path | None:
 
 
 def _loaded_module_source_path(module_name: str) -> str | None:
-    loaded_module = sys.modules.get(module_name)
-    loaded_spec = getattr(loaded_module, "__spec__", None)
-    if not isinstance(loaded_spec, ModuleSpec) or not isinstance(loaded_spec.origin, str):
+    loaded, loaded_module, loaded_spec = _loaded_module_state_without_hooks(module_name)
+    if not loaded or type(loaded_module) is not ModuleType or loaded_spec is None:
         return None
-    if not loaded_spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
+    origin, _ = _module_spec_fields_without_hooks(loaded_spec)
+    if type(origin) is not str or not origin.endswith(tuple(SOURCE_SUFFIXES)):
         return None
-    return str(Path(loaded_spec.origin).absolute())
+    return str(Path(origin).absolute())
 
 
 def _matches_loaded_finder_type(finder: object, module_name: str, type_name: str) -> bool:
-    module = sys.modules.get(module_name)
-    finder_type = getattr(module, type_name, None) if module is not None else None
+    modules = _runtime_sys_modules_without_hooks()
+    if modules is None:
+        return False
+    module = dict.get(modules, module_name)
+    if type(module) is not ModuleType:
+        return False
+    namespace = ModuleType.__getattribute__(module, "__dict__")
+    if type(namespace) is not dict:
+        return False
+    finder_type = namespace.get(type_name)
     return isinstance(finder_type, type) and type(finder) is finder_type
+
+
+def _star_glob_matches(value: str, pattern: str) -> bool | None:
+    if "?" in pattern or "[" in pattern or "]" in pattern:
+        return None
+    if "*" not in pattern:
+        return value == pattern
+    parts = pattern.split("*")
+    position = 0
+    if parts[0]:
+        if not value.startswith(parts[0]):
+            return False
+        position = len(parts[0])
+    for part in parts[1:-1]:
+        if not part:
+            continue
+        next_position = value.find(part, position)
+        if next_position < 0:
+            return False
+        position = next_position + len(part)
+    suffix = parts[-1]
+    return not suffix or (value.endswith(suffix) and position <= len(value) - len(suffix))
 
 
 def _known_meta_path_finder_cannot_handle(finder: object, module_name: str) -> bool:
@@ -2568,25 +3819,54 @@ def _known_meta_path_finder_cannot_handle(finder: object, module_name: str) -> b
         return root_name not in {"distutils", "pip", "test"}
 
     if _matches_loaded_finder_type(finder, "_virtualenv", "_Finder"):
-        virtualenv_module = sys.modules.get("_virtualenv")
-        patched_modules = getattr(virtualenv_module, "_DISTUTILS_PATCH", ()) if virtualenv_module is not None else ()
+        modules = _runtime_sys_modules_without_hooks()
+        if modules is None:
+            return False
+        virtualenv_module = dict.get(modules, "_virtualenv")
+        if type(virtualenv_module) is not ModuleType:
+            return False
+        namespace = ModuleType.__getattribute__(virtualenv_module, "__dict__")
+        if type(namespace) is not dict:
+            return False
+        patched_modules = namespace.get("_DISTUTILS_PATCH", ())
+        if type(patched_modules) not in {tuple, set, frozenset} or any(
+            type(name) is not str for name in patched_modules
+        ):
+            return False
         return module_name not in patched_modules
 
     if _matches_loaded_finder_type(finder, "_pytest.assertion.rewrite", "AssertionRewritingHook"):
         if module_name == "conftest":
             return False
-        must_rewrite = getattr(finder, "_must_rewrite", ())
+        try:
+            finder_state = object.__getattribute__(finder, "__dict__")
+        except (AttributeError, TypeError):
+            return False
+        if type(finder_state) is not dict:
+            return False
+        must_rewrite = finder_state.get("_must_rewrite", ())
+        if type(must_rewrite) not in {set, frozenset} or any(type(name) is not str for name in must_rewrite):
+            return False
         if any(module_name == name or module_name.startswith(f"{name}.") for name in must_rewrite):
             return False
-        patterns = getattr(finder, "fnpats", ())
+        patterns = finder_state.get("fnpats", ())
+        if type(patterns) not in {tuple, list} or any(type(pattern) is not str for pattern in patterns):
+            return False
         module_filename = f"{module_name.rsplit('.', maxsplit=1)[-1]}.py"
-        return all(not fnmatch.fnmatchcase(module_filename, pattern) for pattern in patterns)
+        for pattern in patterns:
+            matches = _star_glob_matches(module_filename, pattern)
+            if matches is not False:
+                return False
+        return True
 
     return False
 
 
 def _untrusted_meta_path_finder_precedes(target: object, module_name: str) -> bool:
-    for finder in sys.meta_path:
+    meta_path = _runtime_meta_path_without_hooks()
+    if meta_path is None:
+        return True
+    for finder in meta_path:
         if finder is target:
             return False
         if finder is BuiltinImporter or finder is FrozenImporter or finder is PathFinder:
@@ -2602,13 +3882,17 @@ def _is_standard_path_hook(hook: object) -> bool:
 
 
 def _has_untrusted_path_hook() -> bool:
-    if any(not _is_standard_path_hook(hook) for hook in sys.path_hooks):
+    path_hooks = _runtime_path_hooks_without_hooks()
+    search_path = _runtime_search_path_without_hooks()
+    if path_hooks is None or search_path is None:
         return True
-    return _search_path_has_untrusted_importer(sys.path)
+    if any(not _is_standard_path_hook(hook) for hook in path_hooks):
+        return True
+    return _search_path_has_untrusted_importer(search_path)
 
 
 def _find_standard_path_spec(module_name: str, search_path: list[str]) -> ModuleSpec | None:
-    if _search_path_has_untrusted_importer(search_path):
+    if not _interpreter_import_runtime_is_trusted() or _search_path_has_untrusted_importer(search_path):
         _mark_shared_source_snapshot_unreusable()
         return None
 
@@ -4910,19 +6194,10 @@ def _user_positional_argument_range(
 
 
 def _import_module_can_execute_user_code(module_name: str) -> bool:
-    if not module_name or module_name in _IMPORT_EXECUTION_SAFE_MODULES:
+    if not module_name:
         return False
-    try:
-        standard_spec = FrozenImporter.find_spec(module_name)
-    except Exception:
-        return True
-    if standard_spec is None or not _module_spec_uses_builtin_or_frozen_loader(standard_spec):
-        return True
-    loaded_module = sys.modules.get(module_name)
-    if loaded_module is not None:
-        loaded_spec = getattr(loaded_module, "__spec__", None)
-        return not (isinstance(loaded_spec, ModuleSpec) and _module_spec_uses_builtin_or_frozen_loader(loaded_spec))
-    return _untrusted_meta_path_finder_precedes(FrozenImporter, module_name)
+    interpreter_trusted = _interpreter_module_resolution_is_trusted(module_name)
+    return interpreter_trusted is not True
 
 
 def _may_use_getattr_dispatch(call_nodes: tuple[ast.Call, ...], aliases: Mapping[str, str]) -> bool:
@@ -5391,15 +6666,21 @@ def _resolve_module_source(module_name: str) -> Path | None:
         return None
     _track_shared_source_candidates(parts)
     spec = _find_standard_filesystem_spec(module_name)
-    loaded_module = sys.modules.get(module_name)
-    loaded_spec = getattr(loaded_module, "__spec__", None)
-    if isinstance(loaded_spec, ModuleSpec) and isinstance(loaded_spec.origin, str):
-        if loaded_spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
-            loaded_source_path = Path(loaded_spec.origin)
-            current_origin = spec.origin if spec is not None else None
+    loaded, _, loaded_spec = _loaded_module_state_without_hooks(module_name)
+    if loaded:
+        if loaded_spec is None:
+            return None
+        loaded_origin, _ = _module_spec_fields_without_hooks(loaded_spec)
+        if type(loaded_origin) is not str:
+            return None
+        if loaded_origin.endswith(tuple(SOURCE_SUFFIXES)):
+            loaded_source_path = Path(loaded_origin)
+            current_origin = None
+            if type(spec) is ModuleSpec:
+                current_origin, _ = _module_spec_fields_without_hooks(spec)
             try:
                 origin_matches = (
-                    isinstance(current_origin, str) and loaded_source_path.resolve() == Path(current_origin).resolve()
+                    type(current_origin) is str and loaded_source_path.resolve() == Path(current_origin).resolve()
                 )
             except (OSError, RuntimeError, ValueError):
                 origin_matches = False
@@ -5407,13 +6688,16 @@ def _resolve_module_source(module_name: str) -> Path | None:
                 _track_shared_source_paths((loaded_source_path,))
                 _track_shared_source_path(module_name, loaded_source_path, loaded=True)
                 return loaded_source_path
-        elif loaded_spec.origin not in {"built-in", "frozen"}:
+        elif loaded_origin not in {"built-in", "frozen"}:
             return None
     elif _untrusted_meta_path_finder_precedes(PathFinder, module_name) or _has_untrusted_path_hook():
         return None
 
-    if spec is not None and isinstance(spec.origin, str) and spec.origin.endswith(tuple(SOURCE_SUFFIXES)):
-        source_path = Path(spec.origin)
+    spec_origin = None
+    if type(spec) is ModuleSpec:
+        spec_origin, _ = _module_spec_fields_without_hooks(spec)
+    if type(spec_origin) is str and spec_origin.endswith(tuple(SOURCE_SUFFIXES)):
+        source_path = Path(spec_origin)
         _track_shared_source_paths((source_path,))
         if source_path.is_file():
             _track_shared_source_path(module_name, source_path, loaded=False)
@@ -5421,9 +6705,13 @@ def _resolve_module_source(module_name: str) -> Path | None:
     return None
 
 
-def _module_spec_uses_builtin_or_frozen_loader(spec: ModuleSpec) -> bool:
-    loader = cast(Any, spec.loader)
-    return (loader is BuiltinImporter or loader is FrozenImporter) and spec.origin in {"built-in", "frozen"}
+def _module_spec_claims_builtin_or_frozen_identity(spec: ModuleSpec) -> bool:
+    origin, loader = _module_spec_fields_without_hooks(spec)
+    return (
+        loader is BuiltinImporter
+        or loader is FrozenImporter
+        or (type(origin) is str and origin in {"built-in", "frozen"})
+    )
 
 
 def _rce_sink(call_name: str) -> str | None:

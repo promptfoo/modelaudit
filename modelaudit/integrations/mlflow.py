@@ -127,6 +127,14 @@ class _MlflowDelegatedDownloadPlan:
     local_plan: _MlflowDownloadPlan | None = None
 
 
+@dataclass(frozen=True)
+class _MlflowDownloadRoot:
+    path: Path
+    stat: os.stat_result
+    file_descriptor: int | None
+    creation_time_ns: int | None
+
+
 class _MlflowArtifactSizeChangedError(Exception):
     def __init__(self, actual_size: int, *, artifact_path: str | None = None, expected_size: int | None = None) -> None:
         super().__init__(f"artifact size changed to {actual_size} bytes")
@@ -238,8 +246,11 @@ def _mlflow_artifact_trust_failure_result(
     result.scanner_names = ["mlflow"]
     result.has_errors = True
     result.success = False
-    safe_model_uri = redact_evidence_string(model_uri, max_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
-    safe_details = redact_evidence_value(details, max_string_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
+    safe_model_uri = _redact_mlflow_detail_value_for_display(model_uri)
+    safe_details = redact_evidence_value(
+        _redact_mlflow_detail_value_for_display(details),
+        max_string_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS,
+    )
 
     why = (
         "ModelAudit requires non-local MLflow artifact repositories to match a local allowlist before delegating "
@@ -265,6 +276,53 @@ def _mlflow_artifact_trust_failure_result(
             details=safe_details,
             why=why,
             type=_MLFLOW_ARTIFACT_TRUST_FAILURE_TYPE,
+        )
+    )
+    result.finalize_statistics()
+    return result
+
+
+def _mlflow_download_safety_failure_result(
+    model_uri: str,
+    message: str,
+    details: dict[str, Any],
+) -> ModelAuditResultModel:
+    result = create_initial_audit_result()
+    result.scanner_names = ["mlflow"]
+    result.has_errors = True
+    result.success = False
+    safe_model_uri = _redact_mlflow_detail_value_for_display(model_uri)
+    safe_details = redact_evidence_value(
+        _redact_mlflow_detail_value_for_display(details),
+        max_string_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS,
+    )
+
+    why = (
+        "ModelAudit stages MLflow downloads in a private directory before scanning. "
+        "Refusing paths outside that directory, unavailable entries, unsupported filesystem objects, directory "
+        "links, and externally linked files "
+        "prevents a registry or artifact backend from redirecting the scan to unintended local files or devices "
+        "and from blocking or bypassing the scanner through the staged filesystem tree."
+    )
+    result.checks.append(
+        Check(
+            name="MLflow Download Path Check",
+            status=CheckStatus.FAILED,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=safe_model_uri,
+            details=safe_details,
+            why=why,
+        )
+    )
+    result.issues.append(
+        Issue(
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=safe_model_uri,
+            details=safe_details,
+            why=why,
+            type="mlflow_download_path",
         )
     )
     result.finalize_statistics()
@@ -352,9 +410,20 @@ def _local_path_from_mlflow_artifact_uri(uri: str) -> Path | None:
     if parsed.scheme == "file":
         if parsed.params or parsed.query or parsed.fragment:
             return None
-        netloc = parsed.netloc
-        if netloc and netloc.lower() not in {"localhost", "127.0.0.1", "::1"}:
-            return None
+        if parsed.netloc:
+            try:
+                hostname = parsed.hostname
+                port = parsed.port
+            except ValueError:
+                return None
+            if (
+                parsed.username is not None
+                or parsed.password is not None
+                or port is not None
+                or hostname is None
+                or hostname.lower().rstrip(".") not in {"localhost", "127.0.0.1", "::1"}
+            ):
+                return None
         path = _strictly_decode_mlflow_uri_path(parsed.path)
         if path is None:
             return None
@@ -391,9 +460,12 @@ def _mlflow_artifact_uri_matches_prefix(artifact_uri: str, allowed_prefix: str) 
         return False
     if artifact_scheme in {"file", "models", "runs"}:
         return False
-    artifact_authority = _normalized_mlflow_uri_authority(artifact, artifact_scheme)
-    prefix_authority = _normalized_mlflow_uri_authority(prefix, prefix_scheme)
-    if artifact_authority is None or prefix_authority is None or artifact_authority != prefix_authority:
+    if artifact_scheme in _MLFLOW_URI_SCHEMES_REQUIRING_AUTHORITY:
+        artifact_authority = _normalized_mlflow_uri_authority(artifact, artifact_scheme)
+        prefix_authority = _normalized_mlflow_uri_authority(prefix, prefix_scheme)
+        if artifact_authority is None or prefix_authority is None or artifact_authority != prefix_authority:
+            return False
+    elif artifact.netloc != prefix.netloc:
         return False
     normalized_artifact_path = _strictly_validate_mlflow_remote_uri_path(artifact.path)
     normalized_prefix_path = _strictly_validate_mlflow_remote_uri_path(prefix.path)
@@ -464,10 +536,12 @@ def _mlflow_delegated_download_targets(
         else normalized_wrapper_path or normalized_artifact_path
     )
     run_artifact_path = normalized_artifact_path
+    repository_is_scoped = False
     if normalized_wrapper_path and effective_path:
-        repository_is_scoped = _runs_mlflow_repository_is_scoped(repository, run_repository, wrapper_uri)
-        if repository_is_scoped is None:
+        repository_scope = _runs_mlflow_repository_is_scoped(repository, run_repository, wrapper_uri)
+        if repository_scope is None:
             return None
+        repository_is_scoped = repository_scope
         if not repository_is_scoped:
             run_artifact_path = effective_path
     run_target = _MlflowDelegatedDownloadTarget(run_repository, run_artifact_path)
@@ -496,7 +570,7 @@ def _mlflow_delegated_download_targets(
             _MlflowDelegatedDownloadTarget(
                 terminal_logged_repository,
                 model_artifact_path if separator and model_artifact_path else None,
-                model_name,
+                None if repository_is_scoped else model_name,
             )
         )
     return tuple(targets)
@@ -821,13 +895,20 @@ def _local_mlflow_artifact_root(artifact_repository: Any) -> Path | None:
             parsed_artifact_uri = urlparse(artifact_uri)
         except ValueError:
             return None
-        if parsed_artifact_uri.scheme == "file" and parsed_artifact_uri.netloc.lower() not in {
-            "",
-            "localhost",
-            "127.0.0.1",
-            "::1",
-        }:
-            return None
+        if parsed_artifact_uri.scheme == "file" and parsed_artifact_uri.netloc:
+            try:
+                hostname = parsed_artifact_uri.hostname
+                port = parsed_artifact_uri.port
+            except ValueError:
+                return None
+            if (
+                parsed_artifact_uri.username is not None
+                or parsed_artifact_uri.password is not None
+                or port is not None
+                or hostname is None
+                or hostname.lower().rstrip(".") not in {"localhost", "127.0.0.1", "::1"}
+            ):
+                return None
         if not parsed_artifact_uri.scheme and artifact_uri.startswith(("//", "\\\\")):
             return None
 
@@ -1248,6 +1329,8 @@ def _normalize_mlflow_artifact_path(artifact_path: object) -> str:
         or ntpath.isabs(artifact_path)
     ):
         raise ValueError(f"Artifact entry path is not relative: {artifact_path}")
+    if any(segment in {".", ".."} for segment in artifact_path.split("/")):
+        raise ValueError(f"Artifact entry path escapes the repository root: {artifact_path}")
     normalized = posixpath.normpath(artifact_path)
     if normalized in {"", ".", ".."} or normalized.startswith("../") or ntpath.splitdrive(normalized)[0]:
         raise ValueError(f"Artifact entry path escapes the repository root: {artifact_path}")
@@ -1298,7 +1381,7 @@ def _preflight_local_mlflow_sources(
             f"MLflow artifact listing exceeded {max_artifact_entries} entries before download",
             details,
         )
-    except (OSError, TypeError, ValueError) as exc:
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
         details.update(
             {
                 "reason": "artifact_size_unavailable",
@@ -1859,29 +1942,514 @@ def _is_missing_mlflow_artifact_error(error: Exception) -> bool:
     return isinstance(error, MlflowException) and error.error_code == _MLFLOW_RESOURCE_DOES_NOT_EXIST
 
 
-def _download_trusted_mlflow_artifacts(plan: _MlflowDelegatedDownloadPlan, download_dir: str) -> str:
+def _validate_mlflow_delegated_artifact_listing(
+    artifact_repository: Any,
+    artifact_path: str | None,
+    max_artifact_entries: int,
+) -> tuple[str, ...]:
+    """Reject unsafe remote artifact names before MLflow creates destination paths."""
+    list_artifacts = getattr(artifact_repository, "list_artifacts", None)
+    if not callable(list_artifacts):
+        raise ValueError("MLflow artifact repository does not expose a safe listing API")
+
+    normalized_initial_path = _normalize_mlflow_artifact_path(artifact_path) if artifact_path else None
+    pending_directories: list[str | None] = [normalized_initial_path]
+    visited_directories: set[str | None] = set()
+    entry_count = 0
+    artifact_paths: list[str] = []
+
+    while pending_directories:
+        current_path = pending_directories.pop()
+        if current_path in visited_directories:
+            continue
+        visited_directories.add(current_path)
+        artifact_infos, listing_exceeded = _bounded_artifact_listing(
+            list_artifacts,
+            current_path,
+            max_artifact_entries - entry_count,
+        )
+        if listing_exceeded:
+            raise _MlflowArtifactListingExceededError
+
+        single_file = False
+        if not artifact_infos and current_path:
+            artifact_info, parent_entry_count, parent_listing_exceeded = _find_single_file_artifact_info(
+                list_artifacts,
+                current_path,
+                max_artifact_entries - entry_count,
+            )
+            if parent_listing_exceeded:
+                raise _MlflowArtifactListingExceededError
+            entry_count += parent_entry_count
+            artifact_infos = [artifact_info] if artifact_info is not None else []
+            single_file = artifact_info is not None
+
+        for artifact_info in artifact_infos:
+            if not single_file:
+                entry_count += 1
+                if entry_count > max_artifact_entries:
+                    raise _MlflowArtifactListingExceededError
+            listed_path = (
+                current_path
+                if single_file and current_path is not None
+                else _normalize_mlflow_artifact_path(getattr(artifact_info, "path", None))
+            )
+            if not _artifact_path_is_within(listed_path, current_path):
+                raise ValueError(f"Artifact entry path escaped listed directory: {listed_path}")
+            if getattr(artifact_info, "is_dir", False):
+                pending_directories.append(listed_path)
+            else:
+                artifact_paths.append(listed_path)
+    return tuple(artifact_paths)
+
+
+def _is_standard_mlflow_artifact_repository(artifact_repository: Any) -> bool:
+    try:
+        from mlflow.store.artifact.artifact_repo import ArtifactRepository
+    except Exception:
+        return False
+    return isinstance(artifact_repository, ArtifactRepository)
+
+
+def _download_validated_mlflow_files(
+    artifact_repository: Any,
+    artifact_paths: tuple[str, ...],
+    target_download_dir: Path,
+    model_uri: str,
+    download_dir: str,
+    max_artifact_entries: int,
+    expected_download_root: _MlflowDownloadRoot,
+) -> str | ModelAuditResultModel:
+    download_file = getattr(artifact_repository, "_download_file", None)
+    if not callable(download_file):
+        return _mlflow_artifact_trust_failure_result(
+            model_uri,
+            "MLflow artifact repository cannot perform guarded file downloads",
+            {"reason": "artifact_guarded_download_unavailable"},
+        )
+
+    for artifact_path in artifact_paths:
+        local_path = target_download_dir.joinpath(*PurePosixPath(artifact_path).parts)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        parent_check = _resolve_mlflow_download_path(
+            model_uri,
+            str(local_path.parent),
+            download_dir,
+            max_artifact_entries,
+            expected_download_root,
+        )
+        if isinstance(parent_check, ModelAuditResultModel):
+            return parent_check
+        download_file(remote_file_path=artifact_path, local_path=str(local_path))
+        file_check = _resolve_mlflow_download_path(
+            model_uri,
+            str(local_path),
+            download_dir,
+            max_artifact_entries,
+            expected_download_root,
+        )
+        if isinstance(file_check, ModelAuditResultModel):
+            return file_check
+    return str(target_download_dir)
+
+
+def _download_trusted_mlflow_artifacts(
+    plan: _MlflowDelegatedDownloadPlan,
+    model_uri: str,
+    download_dir: str,
+    max_artifact_entries: int,
+    expected_download_root: _MlflowDownloadRoot,
+) -> str | ModelAuditResultModel:
     downloaded_paths: list[str] = []
     for target in plan.targets:
+        try:
+            artifact_paths = _validate_mlflow_delegated_artifact_listing(
+                target.artifact_repository,
+                target.artifact_path,
+                max_artifact_entries,
+            )
+        except _MlflowArtifactListingExceededError:
+            return _mlflow_budget_failure_result(
+                model_uri,
+                f"MLflow artifact listing exceeded {max_artifact_entries} entries before download",
+                {
+                    "reason": "artifact_listing_budget_exceeded",
+                    "max_artifact_entries": max_artifact_entries,
+                },
+            )
+        except (TypeError, ValueError) as exc:
+            return _mlflow_artifact_trust_failure_result(
+                model_uri,
+                "MLflow artifact repository returned an unsafe artifact listing",
+                {
+                    "reason": "artifact_listing_unsafe",
+                    "error": _redact_mlflow_error_for_display(exc),
+                },
+            )
+        if target.optional_when_missing and not artifact_paths:
+            continue
         target_download_dir = Path(download_dir)
         if target.destination_subdirectory:
             target_download_dir /= target.destination_subdirectory
             target_download_dir.mkdir(parents=True, exist_ok=True)
+        destination_check = _resolve_mlflow_download_path(
+            model_uri,
+            str(target_download_dir),
+            download_dir,
+            max_artifact_entries,
+            expected_download_root,
+        )
+        if isinstance(destination_check, ModelAuditResultModel):
+            return destination_check
         try:
-            downloaded_path = target.artifact_repository.download_artifacts(
-                artifact_path=target.artifact_path or "",
-                dst_path=str(target_download_dir),
-            )
+            if _is_standard_mlflow_artifact_repository(target.artifact_repository):
+                downloaded_path = _download_validated_mlflow_files(
+                    target.artifact_repository,
+                    artifact_paths,
+                    target_download_dir,
+                    model_uri,
+                    download_dir,
+                    max_artifact_entries,
+                    expected_download_root,
+                )
+                if isinstance(downloaded_path, ModelAuditResultModel):
+                    return downloaded_path
+            else:
+                downloaded_path = target.artifact_repository.download_artifacts(
+                    artifact_path=target.artifact_path or "",
+                    dst_path=str(target_download_dir),
+                )
         except Exception as exc:
             if target.optional_when_missing and _is_missing_mlflow_artifact_error(exc):
                 continue
             raise
         if not isinstance(downloaded_path, str) or not downloaded_path:
             raise RuntimeError("MLflow artifact repository did not return a download path")
+        download_check = _resolve_mlflow_download_path(
+            model_uri,
+            downloaded_path,
+            download_dir,
+            max_artifact_entries,
+            expected_download_root,
+        )
+        if isinstance(download_check, ModelAuditResultModel):
+            return download_check
         downloaded_paths.append(downloaded_path)
 
+    if len(downloaded_paths) > 1:
+        return download_dir
     if downloaded_paths:
         return downloaded_paths[0]
     raise RuntimeError("MLflow artifact repositories did not return a download path")
+
+
+def _mlflow_entry_is_reparse_point(path: Path, path_stat: os.stat_result) -> bool:
+    """Return whether an entry is a symlink, junction, or other Windows reparse point."""
+    if stat.S_ISLNK(path_stat.st_mode):
+        return True
+
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction) and is_junction():
+        return True
+
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(path_stat, "st_file_attributes", 0)
+    return bool(reparse_flag and file_attributes & reparse_flag)
+
+
+def _capture_mlflow_download_root(
+    model_uri: str,
+    download_dir: str,
+) -> _MlflowDownloadRoot | ModelAuditResultModel:
+    """Capture the private staging directory identity before backend code runs."""
+    root_file_descriptor: int | None = None
+    try:
+        download_dir_path = Path(download_dir).expanduser()
+        download_dir_stat = download_dir_path.stat(follow_symlinks=False)
+        download_root = download_dir_path.resolve(strict=True)
+        download_root_stat = download_root.stat(follow_symlinks=False)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "Unable to establish the MLflow staging directory",
+            {
+                "reason": "artifact_download_root_unavailable",
+                "error": _redact_mlflow_error_for_display(exc),
+            },
+        )
+
+    if (
+        not stat.S_ISDIR(download_dir_stat.st_mode)
+        or not stat.S_ISDIR(download_root_stat.st_mode)
+        or _mlflow_entry_is_reparse_point(download_dir_path, download_dir_stat)
+        or _mlflow_entry_is_reparse_point(download_root, download_root_stat)
+        or not os.path.samestat(download_dir_stat, download_root_stat)
+    ):
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "MLflow staging directory is not a stable private directory",
+            {"reason": "artifact_download_root_unsupported"},
+        )
+
+    try:
+        if os.name != "nt":
+            open_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+            root_file_descriptor = os.open(download_root, open_flags)
+            held_root_stat = os.fstat(root_file_descriptor)
+            if not stat.S_ISDIR(held_root_stat.st_mode) or not os.path.samestat(held_root_stat, download_root_stat):
+                raise OSError("MLflow staging directory changed while its identity was captured")
+            download_root_stat = held_root_stat
+    except OSError as exc:
+        if root_file_descriptor is not None:
+            os.close(root_file_descriptor)
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "Unable to hold the MLflow staging directory open",
+            {
+                "reason": "artifact_download_root_unavailable",
+                "error": _redact_mlflow_error_for_display(exc),
+            },
+        )
+
+    creation_time_ns = getattr(download_root_stat, "st_birthtime_ns", None)
+    if creation_time_ns is None and os.name == "nt":
+        creation_time_ns = download_root_stat.st_ctime_ns
+    return _MlflowDownloadRoot(download_root, download_root_stat, root_file_descriptor, creation_time_ns)
+
+
+def _validate_mlflow_download_tree(
+    model_uri: str,
+    download_root: Path,
+    max_artifact_entries: int,
+) -> ModelAuditResultModel | None:
+    """Fail closed on staged entries that core cannot safely and completely scan."""
+    pending_directories = [download_root]
+    hardlink_counts: dict[tuple[int, int], int] = {}
+    hardlink_totals: dict[tuple[int, int], int] = {}
+    entry_count = 0
+
+    while pending_directories:
+        current_directory = pending_directories.pop()
+        try:
+            with os.scandir(current_directory) as entries:
+                for entry in entries:
+                    entry_count += 1
+                    if entry_count > max_artifact_entries:
+                        return _mlflow_download_safety_failure_result(
+                            model_uri,
+                            "MLflow staging validation exceeded the artifact entry budget",
+                            {
+                                "reason": "artifact_download_path_entry_limit",
+                                "max_artifact_entries": max_artifact_entries,
+                            },
+                        )
+
+                    entry_path = Path(entry.path)
+                    relative_path = entry_path.relative_to(download_root).as_posix()
+                    entry_stat = entry.stat(follow_symlinks=False)
+
+                    if stat.S_ISLNK(entry_stat.st_mode):
+                        resolved_target = entry_path.resolve(strict=True)
+                        if not resolved_target.is_relative_to(download_root):
+                            return _mlflow_download_safety_failure_result(
+                                model_uri,
+                                "MLflow staging contains a link outside the staging directory",
+                                {
+                                    "reason": "artifact_download_path_escape",
+                                    "artifact_path": relative_path,
+                                },
+                            )
+                        target_stat = resolved_target.stat(follow_symlinks=False)
+                        if _mlflow_entry_is_reparse_point(resolved_target, target_stat):
+                            return _mlflow_download_safety_failure_result(
+                                model_uri,
+                                "MLflow staging contains a link to an unsupported reparse point",
+                                {
+                                    "reason": "artifact_download_path_unsupported",
+                                    "artifact_path": relative_path,
+                                },
+                            )
+                        if stat.S_ISDIR(target_stat.st_mode):
+                            return _mlflow_download_safety_failure_result(
+                                model_uri,
+                                "MLflow staging contains a directory link that would not be scanned",
+                                {
+                                    "reason": "artifact_download_directory_link_unsupported",
+                                    "artifact_path": relative_path,
+                                },
+                            )
+                        if not stat.S_ISREG(target_stat.st_mode):
+                            return _mlflow_download_safety_failure_result(
+                                model_uri,
+                                "MLflow staging contains a link to an unsupported filesystem object",
+                                {
+                                    "reason": "artifact_download_path_unsupported",
+                                    "artifact_path": relative_path,
+                                },
+                            )
+                        continue
+
+                    if stat.S_ISDIR(entry_stat.st_mode):
+                        if _mlflow_entry_is_reparse_point(entry_path, entry_stat):
+                            return _mlflow_download_safety_failure_result(
+                                model_uri,
+                                "MLflow staging contains a directory link that would not be scanned",
+                                {
+                                    "reason": "artifact_download_directory_link_unsupported",
+                                    "artifact_path": relative_path,
+                                },
+                            )
+                        pending_directories.append(entry_path)
+                        continue
+
+                    if _mlflow_entry_is_reparse_point(entry_path, entry_stat):
+                        return _mlflow_download_safety_failure_result(
+                            model_uri,
+                            "MLflow staging contains an unsupported reparse point",
+                            {
+                                "reason": "artifact_download_path_unsupported",
+                                "artifact_path": relative_path,
+                            },
+                        )
+
+                    if not stat.S_ISREG(entry_stat.st_mode):
+                        return _mlflow_download_safety_failure_result(
+                            model_uri,
+                            "MLflow staging contains an unsupported filesystem object",
+                            {
+                                "reason": "artifact_download_path_unsupported",
+                                "artifact_path": relative_path,
+                            },
+                        )
+
+                    link_count = int(getattr(entry_stat, "st_nlink", 1))
+                    if link_count > 1:
+                        inode_key = (entry_stat.st_dev, entry_stat.st_ino)
+                        hardlink_counts[inode_key] = hardlink_counts.get(inode_key, 0) + 1
+                        previous_total = hardlink_totals.setdefault(inode_key, link_count)
+                        if previous_total != link_count:
+                            raise OSError("staged hardlink count changed during validation")
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return _mlflow_download_safety_failure_result(
+                model_uri,
+                "Unable to validate the MLflow staging directory",
+                {
+                    "reason": "artifact_download_path_unavailable",
+                    "error": _redact_mlflow_error_for_display(exc),
+                },
+            )
+
+    if any(hardlink_counts[inode_key] != link_total for inode_key, link_total in hardlink_totals.items()):
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "MLflow staging contains a file with hardlink aliases outside the staging directory",
+            {"reason": "artifact_download_hardlink_escape"},
+        )
+    return None
+
+
+def _resolve_mlflow_download_path(
+    model_uri: str,
+    local_path: str,
+    download_dir: str,
+    max_artifact_entries: int,
+    expected_download_root: _MlflowDownloadRoot,
+) -> str | ModelAuditResultModel:
+    try:
+        download_dir_path = Path(download_dir).expanduser()
+        current_download_dir_stat = download_dir_path.stat(follow_symlinks=False)
+        download_root = download_dir_path.resolve(strict=True)
+        current_download_root_stat = download_root.stat(follow_symlinks=False)
+        returned_path = Path(local_path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "Unable to verify MLflow artifact download path",
+            {
+                "reason": "artifact_download_path_unavailable",
+                "error": _redact_mlflow_error_for_display(exc),
+            },
+        )
+
+    try:
+        held_download_root_stat = (
+            os.fstat(expected_download_root.file_descriptor)
+            if expected_download_root.file_descriptor is not None
+            else expected_download_root.stat
+        )
+    except OSError as exc:
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "Unable to verify the MLflow staging directory identity",
+            {
+                "reason": "artifact_download_root_unavailable",
+                "error": _redact_mlflow_error_for_display(exc),
+            },
+        )
+
+    current_creation_time_ns = getattr(current_download_root_stat, "st_birthtime_ns", None)
+    if current_creation_time_ns is None and os.name == "nt":
+        current_creation_time_ns = current_download_root_stat.st_ctime_ns
+
+    if (
+        download_root != expected_download_root.path
+        or not stat.S_ISDIR(current_download_dir_stat.st_mode)
+        or not stat.S_ISDIR(current_download_root_stat.st_mode)
+        or _mlflow_entry_is_reparse_point(download_dir_path, current_download_dir_stat)
+        or _mlflow_entry_is_reparse_point(download_root, current_download_root_stat)
+        or not os.path.samestat(current_download_dir_stat, held_download_root_stat)
+        or not os.path.samestat(current_download_root_stat, held_download_root_stat)
+        or (
+            expected_download_root.file_descriptor is None
+            and current_creation_time_ns != expected_download_root.creation_time_ns
+        )
+    ):
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "MLflow staging directory changed during artifact download",
+            {"reason": "artifact_download_root_changed"},
+        )
+
+    if not returned_path.is_relative_to(download_root):
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "MLflow artifact download returned a path outside the staging directory",
+            {"reason": "artifact_download_path_escape"},
+        )
+
+    try:
+        returned_stat = returned_path.stat(follow_symlinks=False)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "Unable to inspect MLflow artifact download path",
+            {
+                "reason": "artifact_download_path_unavailable",
+                "error": _redact_mlflow_error_for_display(exc),
+            },
+        )
+
+    if stat.S_ISREG(returned_stat.st_mode):
+        scan_path = returned_path.parent
+    elif stat.S_ISDIR(returned_stat.st_mode):
+        scan_path = returned_path
+    else:
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "MLflow artifact download returned an unsupported filesystem object",
+            {"reason": "artifact_download_path_unsupported"},
+        )
+
+    if not scan_path.is_relative_to(download_root):
+        return _mlflow_download_safety_failure_result(
+            model_uri,
+            "MLflow artifact download resolved outside the staging directory",
+            {"reason": "artifact_download_scan_path_escape"},
+        )
+    staging_failure = _validate_mlflow_download_tree(model_uri, download_root, max_artifact_entries)
+    if staging_failure is not None:
+        return staging_failure
+    return str(scan_path)
 
 
 def scan_mlflow_model(
@@ -1953,8 +2521,14 @@ def scan_mlflow_model(
         return download_plan
 
     download_dir, cleanup_download_dir = _prepare_download_dir(model_uri, scan_cache_dir)
+    download_root_identity: _MlflowDownloadRoot | None = None
 
     try:
+        captured_download_root = _capture_mlflow_download_root(model_uri, download_dir)
+        if isinstance(captured_download_root, ModelAuditResultModel):
+            return captured_download_root
+        download_root_identity = captured_download_root
+
         logger.debug(f"Downloading MLflow model {_redact_mlflow_error_for_display(model_uri)} to {download_dir}")
         local_path: str | None
         if isinstance(download_plan, _MlflowDownloadPlan):
@@ -1982,12 +2556,27 @@ def scan_mlflow_model(
                     return local_download_result
                 local_path = local_download_result
             if download_plan.targets:
-                delegated_path = _download_trusted_mlflow_artifacts(download_plan, download_dir)
+                delegated_path = _download_trusted_mlflow_artifacts(
+                    download_plan,
+                    model_uri,
+                    download_dir,
+                    max_artifact_entries,
+                    download_root_identity,
+                )
+                if isinstance(delegated_path, ModelAuditResultModel):
+                    return delegated_path
                 local_path = download_dir if local_path is not None else delegated_path
             if local_path is None:
                 raise RuntimeError("MLflow artifact download plan did not contain any targets")
-        # mlflow may return a file within the download directory; ensure directory path
-        download_path = os.path.dirname(local_path) if os.path.isfile(local_path) else local_path
+        download_path = _resolve_mlflow_download_path(
+            model_uri,
+            local_path,
+            download_dir,
+            max_artifact_entries,
+            download_root_identity,
+        )
+        if isinstance(download_path, ModelAuditResultModel):
+            return download_path
         cache_config = {"cache_enabled": cache_enabled, "cache_dir": scan_cache_dir}
 
         # Import here to avoid circular dependency
@@ -2003,5 +2592,7 @@ def scan_mlflow_model(
             **scan_kwargs,
         )
     finally:
+        if download_root_identity is not None and download_root_identity.file_descriptor is not None:
+            os.close(download_root_identity.file_descriptor)
         if cleanup_download_dir:
             shutil.rmtree(download_dir, ignore_errors=True)
