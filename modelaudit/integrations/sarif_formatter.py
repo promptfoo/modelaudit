@@ -6,12 +6,9 @@ integration with security tools and CI/CD pipelines.
 
 import contextlib
 import json
-import re
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit, urlunsplit
-
-from pydantic import BaseModel
+from urllib.parse import quote
 
 from modelaudit import __version__
 from modelaudit.core_results import (
@@ -19,22 +16,17 @@ from modelaudit.core_results import (
     results_have_inconclusive_outcome,
     results_have_operational_error,
 )
+from modelaudit.integrations.source_redaction import (
+    redact_source_identifier as _redact_path_for_sarif,
+)
+from modelaudit.integrations.source_redaction import (
+    redact_source_text as _redact_text_for_sarif,
+)
+from modelaudit.integrations.source_redaction import (
+    redact_source_value as _redact_value_for_sarif,
+)
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import IssueSeverity
-from modelaudit.utils.sources.cloud_storage import is_sensitive_credential_key, is_stream_url
-from modelaudit.utils.sources.cloud_storage import (
-    normalize_escaped_url_delimiters_for_display as _normalize_escaped_url_delimiters_for_display,
-)
-from modelaudit.utils.sources.cloud_storage import redact_cloud_error_for_display as _redact_cloud_error_for_display
-from modelaudit.utils.sources.cloud_storage import redact_stream_url_for_display as _redact_stream_url_for_display
-from modelaudit.utils.sources.cloud_storage import redact_url_for_display as _redact_url_for_display
-
-_URL_TEXT_CHARACTER = r'(?:[^\s"\'<>]|<redacted>|<credentials-redacted>)'
-_URL_TOKEN_RE = re.compile(
-    rf"(stream://[a-z][a-z0-9+.-]*://{_URL_TEXT_CHARACTER}+|[a-z][a-z0-9+.-]*://{_URL_TEXT_CHARACTER}+)",
-    re.IGNORECASE,
-)
-_URL_LIKE_PREFIX_RE = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
 
 
 def format_sarif_output(
@@ -261,7 +253,7 @@ def _create_results(
         import hashlib
 
         fingerprint_message = _redact_text_for_sarif(issue.message)
-        fingerprint_location = _redact_text_for_sarif(issue.location or "")
+        fingerprint_location = _redact_path_for_sarif(issue.location or "")
         fingerprint = hashlib.sha256(
             f"{fingerprint_message}{fingerprint_location}{issue.severity}".encode()
         ).hexdigest()[:16]
@@ -460,81 +452,6 @@ def _normalize_path_to_uri(path: str) -> str:
 
     # URL-encode special characters
     return quote(uri_path, safe="/")
-
-
-def _redact_path_for_sarif(path: str) -> str:
-    """Return a SARIF-safe path without signed URL material."""
-    normalized_path = _normalize_escaped_url_delimiters_for_display(path)
-    if is_stream_url(normalized_path):
-        return f"stream://{_redact_stream_url_for_display(normalized_path[9:])}"
-    if _URL_LIKE_PREFIX_RE.match(normalized_path):
-        return _redact_url_for_display(normalized_path)
-    return path
-
-
-def _redact_text_for_sarif(text: str) -> str:
-    """Redact signed URL tokens embedded in SARIF text fields."""
-    normalized_text = _normalize_escaped_url_delimiters_for_display(text)
-    redacted_text = _URL_TOKEN_RE.sub(lambda match: _redact_url_token_for_sarif(match.group(0)), normalized_text)
-    return _redact_cloud_error_for_display(redacted_text)
-
-
-def _redact_url_token_for_sarif(url: str) -> str:
-    """Preserve benign query context while removing credentials from evidence URLs."""
-    if is_stream_url(url):
-        return _redact_path_for_sarif(url)
-    preserve_redacted_params = "<redacted>" in url
-    redacted_url = _redact_cloud_error_for_display(url)
-    parts = urlsplit(url) if redacted_url == url else urlsplit(redacted_url)
-
-    safe_query = _filter_sarif_url_params(parts.query, preserve_redacted_params=preserve_redacted_params)
-    safe_fragment = _filter_sarif_url_params(parts.fragment, preserve_redacted_params=preserve_redacted_params)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, safe_query, safe_fragment))
-
-
-def _filter_sarif_url_params(value: str, *, preserve_redacted_params: bool) -> str:
-    """Keep structured safe URL parameters and discard opaque credential material."""
-    safe_parts: list[str] = []
-    for part in re.split(r"[&;]", value):
-        if "=" not in part:
-            continue
-        if part.endswith("=<redacted>") and not preserve_redacted_params:
-            continue
-        safe_parts.append(part)
-    return "&".join(safe_parts)
-
-
-def _redact_value_for_sarif(value: Any) -> Any:
-    if isinstance(value, BaseModel):
-        return _redact_value_for_sarif(value.model_dump(mode="python"))
-    if isinstance(value, str):
-        return _redact_text_for_sarif(value)
-    if isinstance(value, (bytes, bytearray)):
-        try:
-            return _redact_text_for_sarif(bytes(value).decode("utf-8"))
-        except UnicodeDecodeError:
-            return "<binary data>"
-    if isinstance(value, dict):
-        return {
-            _redact_mapping_key_for_sarif(key): (
-                "<redacted>" if is_sensitive_credential_key(key) else _redact_value_for_sarif(item)
-            )
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_redact_value_for_sarif(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_redact_value_for_sarif(item) for item in value)
-    if isinstance(value, (set, frozenset)):
-        return sorted((_redact_value_for_sarif(item) for item in value), key=repr)
-    return value
-
-
-def _redact_mapping_key_for_sarif(value: Any) -> str | int | float | bool | None:
-    redacted = _redact_value_for_sarif(value)
-    if isinstance(redacted, (str, int, float, bool)) or redacted is None:
-        return redacted
-    return str(redacted)
 
 
 def _get_mime_type(file_type: str) -> str:

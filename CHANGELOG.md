@@ -46,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fail closed on JFrog folder downloads whose selected artifacts use unsafe, colliding, or overlapping local paths
 - detect dangerous textual byte keys in Flax MessagePack checkpoints
 - bound Joblib decompression output to the configured scanner read budget
+- redact credential-bearing source identifiers in exported SARIF and SBOM reports
 - reconcile validated streamed shard families across staging directories and add an explicit opt-in for local cross-directory shards
 - stream Flax MessagePack containers with bounded traversal, object, and metadata-key handling instead of a whole-file size cutoff
 - bound ExecuTorch ZIP metadata and member scans while preserving eligible pickle detections across archive limits and mutations

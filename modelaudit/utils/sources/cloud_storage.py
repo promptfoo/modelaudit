@@ -52,11 +52,12 @@ _HEADER_KEY_RE = re.compile(
 _URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
 _URL_TEXT_CHARACTER = r'(?:[^\s"\'<>]|<redacted>|<credentials-redacted>)'
 _URL_TOKEN_RE = re.compile(
+    rf"(?<![0-9A-Za-z+._%-])"
     rf"(stream://[a-z][a-z0-9+.-]*://{_URL_TEXT_CHARACTER}+|[a-z][a-z0-9+.-]*://{_URL_TEXT_CHARACTER}+)",
     re.IGNORECASE,
 )
 _ESCAPED_URL_DELIMITER_RE = re.compile(
-    r"\\(?P<delimiter>/|u002f|u003f|u003d|u0026|u0023|x2f|x3f|x3d|x26|x23)",
+    r"\\(?P<delimiter>/|u002f|u003a|u003f|u003d|u0026|u0023|u003b|x2f|x3a|x3f|x3d|x26|x23|x3b)",
     re.IGNORECASE,
 )
 _PERCENT_ENCODED_URL_DELIMITER_RE = re.compile(
@@ -65,6 +66,7 @@ _PERCENT_ENCODED_URL_DELIMITER_RE = re.compile(
 )
 _PERCENT_ENCODED_URL_BOUNDARY_RE = re.compile(r"%(?:25)*(?:3f|23|3b)", re.IGNORECASE)
 _PERCENT_ENCODED_URL_PREFIX_RE = re.compile(
+    r"(?<![0-9A-Za-z+._%-])"
     r"(?P<scheme>[a-z][a-z0-9+.-]*)(?:%(?:25)*3a|:)(?:%(?:25)*2f|/)(?:%(?:25)*2f|/)",
     re.IGNORECASE,
 )
@@ -305,15 +307,19 @@ def normalize_escaped_url_delimiters_for_display(value: str) -> str:
     replacements = {
         "/": "/",
         "u002f": "/",
+        "u003a": ":",
         "u003f": "?",
         "u003d": "=",
         "u0026": "&",
         "u0023": "#",
+        "u003b": ";",
         "x2f": "/",
+        "x3a": ":",
         "x3f": "?",
         "x3d": "=",
         "x26": "&",
         "x23": "#",
+        "x3b": ";",
     }
     normalized = _ESCAPED_URL_DELIMITER_RE.sub(
         lambda match: replacements[match.group("delimiter").lower()],
