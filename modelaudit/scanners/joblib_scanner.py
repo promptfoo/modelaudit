@@ -5,118 +5,460 @@ from __future__ import annotations
 import bz2
 import io
 import lzma
+import math
 import os
+import pickle
 import pickletools
 import zlib
 from collections.abc import Callable
 from contextlib import suppress
-from typing import Any, ClassVar
+from dataclasses import dataclass, field
+from typing import Any, ClassVar, cast
+
+import numpy as np
 
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
 from ..scanner_results import mark_inconclusive_scan_result
 from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils.file.detection import read_magic_bytes
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner, _looks_like_pickle
 
-_JOBLIB_NUMPY_ARRAY_WRAPPER_REF = "joblib.numpy_pickle.NumpyArrayWrapper"
-_JOBLIB_NUMPY_ARRAY_REQUIRED_REFS = {
-    _JOBLIB_NUMPY_ARRAY_WRAPPER_REF,
-    "numpy.ndarray",
-    "numpy.dtype",
-}
-_JOBLIB_NUMPY_ARRAY_MODULE_PREFIXES = ("joblib.numpy_pickle", "numpy")
-_MAX_JOBLIB_ARRAY_ALIGNMENT_PADDING = 64
-_JOBLIB_TAIL_DANGER_SCAN_BYTES = 4096
-_JOBLIB_TAIL_DANGEROUS_SEEDS = (
-    b"\x80\x01",
-    b"\x80\x02",
-    b"\x80\x03",
-    b"\x80\x04",
-    b"\x80\x05",
-    b"cos\n",
-    b"cposix\n",
-    b"cnt\n",
-    b"subprocess",
-    b"os.system",
-    b"builtins",
-    b"eval",
-    b"exec",
-    b"pickle.loads",
-    b"marshal.loads",
-)
+_MAX_JOBLIB_DTYPE_SPEC_CHARS = 256
+_MAX_JOBLIB_DTYPE_DEPTH = 16
+_MAX_JOBLIB_DTYPE_FIELDS = 1024
+_MAX_JOBLIB_DTYPE_VALIDATION_WORK = 65536
+_MAX_JOBLIB_CONTROL_OPCODES = 1000000
+_MAX_JOBLIB_ARRAY_DIMENSIONS = 64
+_NUMPY_DTYPE_HAS_OBJECT_FLAG = 1
+_JOBLIB_COMPRESSED_PREFIXES = (b"x", b"\x1f\x8b", b"BZ", b"]\x00", b"\xfd7zXZ")
 
 
-def _has_trusted_joblib_numpy_array_refs(references: object) -> bool:
-    """Return True for the narrow benign import set used by Joblib numpy arrays."""
-    if not isinstance(references, list):
+@dataclass(frozen=True)
+class _JoblibPickleGlobal:
+    module: str
+    name: str
+
+
+@dataclass
+class _JoblibPickleObject:
+    reference: object
+    args: object
+    state: object = None
+    constructor_opcode: str = "UNKNOWN"
+    reduction_id: int | None = None
+
+
+@dataclass
+class _JoblibDtypeValidationContext:
+    remaining_work: int = _MAX_JOBLIB_DTYPE_VALIDATION_WORK
+    dtype_cache: dict[int, tuple[_JoblibPickleObject, np.dtype[Any]]] = field(default_factory=dict)
+    dtype_in_progress: list[_JoblibPickleObject] = field(default_factory=list)
+    metadata_cache: dict[int, tuple[tuple[object, ...], bool]] = field(default_factory=dict)
+    metadata_in_progress: list[tuple[object, ...]] = field(default_factory=list)
+    validated_codec_encode_reduction_ids: set[int] = field(default_factory=set)
+
+    def consume(self, amount: int = 1) -> None:
+        if amount > self.remaining_work:
+            raise pickle.UnpicklingError("NumpyArrayWrapper dtype validation is too complex")
+        self.remaining_work -= amount
+
+    def clear_caches(self) -> None:
+        self.dtype_cache.clear()
+        self.metadata_cache.clear()
+
+
+def _is_safe_dtype_metadata(
+    value: object,
+    *,
+    depth: int,
+    context: _JoblibDtypeValidationContext | None = None,
+) -> bool:
+    """Accept the bounded primitive metadata used by datetime and timedelta dtypes."""
+    if context is None:
+        context = _JoblibDtypeValidationContext()
+    if depth > _MAX_JOBLIB_DTYPE_DEPTH:
+        return False
+    context.consume()
+    if value is None or type(value) in {bool, int, str, bytes}:
+        return True
+    if isinstance(value, _JoblibPickleObject):
+        is_safe_codec_encode = (
+            value.reference == _JoblibPickleGlobal("_codecs", "encode")
+            and value.state is None
+            and isinstance(value.args, tuple)
+            and len(value.args) == 2
+            and isinstance(value.args[0], str)
+            and len(value.args[0]) <= _MAX_JOBLIB_DTYPE_SPEC_CHARS
+            and value.args[1] == "latin1"
+        )
+        if is_safe_codec_encode and value.reduction_id is not None:
+            context.validated_codec_encode_reduction_ids.add(value.reduction_id)
+        return is_safe_codec_encode
+    if not isinstance(value, tuple) or len(value) > 16:
         return False
 
-    observed_refs: set[str] = set()
-    for reference in references:
-        if not isinstance(reference, dict) or bool(reference.get("is_dangerous")):
-            return False
-        import_reference = reference.get("import_reference")
-        module = reference.get("module")
-        if not isinstance(import_reference, str) or not isinstance(module, str):
-            return False
-        if module not in _JOBLIB_NUMPY_ARRAY_MODULE_PREFIXES and not any(
-            module.startswith(f"{prefix}.") for prefix in _JOBLIB_NUMPY_ARRAY_MODULE_PREFIXES
-        ):
-            return False
-        observed_refs.add(import_reference)
+    object_id = id(value)
+    cached_metadata = context.metadata_cache.get(object_id)
+    if cached_metadata is not None and cached_metadata[0] is value:
+        return cached_metadata[1]
+    if any(item is value for item in context.metadata_in_progress):
+        return False
 
-    return _JOBLIB_NUMPY_ARRAY_REQUIRED_REFS.issubset(observed_refs)
-
-
-def _parse_unknown_opcode_position(result: ScanResult) -> int | None:
-    for issue in result.issues:
-        if issue.rule_code != "S901" or issue.details.get("category") != "parse_error":
-            continue
-        position = _parse_position_from_exception(issue.details.get("parse_error"))
-        if position is not None:
-            return position
-
-    for check in result.checks:
-        if check.rule_code != "S902" or check.details.get("notice_code") != "parse_incomplete":
-            continue
-        position = _parse_position_from_exception(check.details.get("exception"))
-        if position is not None:
-            return position
-
-    return None
-
-
-def _parse_position_from_exception(exception: object) -> int | None:
-    if not isinstance(exception, str) or "at position " not in exception:
-        return None
-    position_text = exception.split("at position ", 1)[1].split(",", 1)[0]
+    context.consume(len(value))
+    context.metadata_in_progress.append(value)
     try:
-        return int(position_text)
-    except ValueError:
+        result = all(
+            _is_safe_dtype_metadata(
+                item,
+                depth=depth + 1,
+                context=context,
+            )
+            for item in value
+        )
+    finally:
+        context.metadata_in_progress.pop()
+    context.metadata_cache[object_id] = (value, result)
+    return result
+
+
+def _validated_numpy_dtype(
+    dtype_object: object,
+    *,
+    depth: int = 0,
+    context: _JoblibDtypeValidationContext | None = None,
+) -> np.dtype[Any]:
+    """Reconstruct only the non-object dtype facts needed to size raw array data."""
+    if context is None:
+        context = _JoblibDtypeValidationContext()
+    if depth > _MAX_JOBLIB_DTYPE_DEPTH:
+        raise pickle.UnpicklingError("NumpyArrayWrapper dtype nesting is too deep")
+    if (
+        not isinstance(dtype_object, _JoblibPickleObject)
+        or dtype_object.reference != _JoblibPickleGlobal("numpy", "dtype")
+        or not isinstance(dtype_object.args, tuple)
+        or not 1 <= len(dtype_object.args) <= 3
+        or not all(type(argument) is bool for argument in dtype_object.args[1:])
+    ):
+        raise pickle.UnpicklingError("Invalid NumpyArrayWrapper dtype")
+
+    object_id = id(dtype_object)
+    cached_dtype = context.dtype_cache.get(object_id)
+    if cached_dtype is not None and cached_dtype[0] is dtype_object:
+        return cached_dtype[1]
+    if any(item is dtype_object for item in context.dtype_in_progress):
+        raise pickle.UnpicklingError("Recursive NumpyArrayWrapper dtype")
+    context.consume()
+    context.dtype_in_progress.append(dtype_object)
+
+    try:
+        dtype_spec = dtype_object.args[0]
+        if not isinstance(dtype_spec, str) or len(dtype_spec) > _MAX_JOBLIB_DTYPE_SPEC_CHARS:
+            raise pickle.UnpicklingError("Unsupported NumpyArrayWrapper dtype specification")
+        try:
+            dtype = np.dtype(dtype_spec)
+        except (TypeError, ValueError) as exc:
+            raise pickle.UnpicklingError("Invalid NumpyArrayWrapper dtype specification") from exc
+        if dtype.hasobject:
+            raise pickle.UnpicklingError("Object arrays require nested pickle analysis")
+
+        state = dtype_object.state
+        if state is None:
+            context.dtype_cache[object_id] = (dtype_object, dtype)
+            return dtype
+        if not isinstance(state, tuple) or len(state) not in {8, 9}:
+            raise pickle.UnpicklingError("Invalid NumpyArrayWrapper dtype state")
+
+        version, byteorder, subarray, names, fields, itemsize, alignment, flags = state[:8]
+        if type(version) is not int or not 0 <= version <= 4:
+            raise pickle.UnpicklingError("Invalid NumpyArrayWrapper dtype version")
+        if byteorder not in {"<", ">", "|", "="}:
+            raise pickle.UnpicklingError("Invalid NumpyArrayWrapper dtype byte order")
+        if type(itemsize) is not int or itemsize not in {-1, dtype.itemsize}:
+            raise pickle.UnpicklingError("Inconsistent NumpyArrayWrapper dtype item size")
+        if type(alignment) is not int or alignment < -1:
+            raise pickle.UnpicklingError("Invalid NumpyArrayWrapper dtype alignment")
+        if type(flags) is not int or flags < 0 or flags & _NUMPY_DTYPE_HAS_OBJECT_FLAG:
+            raise pickle.UnpicklingError("Object arrays require nested pickle analysis")
+
+        if subarray is not None:
+            if (
+                not isinstance(subarray, tuple)
+                or len(subarray) != 2
+                or not isinstance(subarray[1], tuple)
+                or not 1 <= len(subarray[1]) <= _MAX_JOBLIB_ARRAY_DIMENSIONS
+                or not all(type(dimension) is int and dimension > 0 for dimension in subarray[1])
+            ):
+                raise pickle.UnpicklingError("Invalid NumpyArrayWrapper subarray dtype")
+            context.consume(len(subarray[1]))
+            base_dtype = _validated_numpy_dtype(
+                subarray[0],
+                depth=depth + 1,
+                context=context,
+            )
+            subarray_items = math.prod(subarray[1])
+            if subarray_items > dtype.itemsize or base_dtype.itemsize * subarray_items != dtype.itemsize:
+                raise pickle.UnpicklingError("Inconsistent NumpyArrayWrapper subarray dtype")
+
+        if names is None or fields is None:
+            if names is not None or fields is not None:
+                raise pickle.UnpicklingError("Incomplete NumpyArrayWrapper structured dtype")
+        else:
+            if (
+                not isinstance(names, tuple)
+                or not isinstance(fields, dict)
+                or len(names) > _MAX_JOBLIB_DTYPE_FIELDS
+                or len(fields) > _MAX_JOBLIB_DTYPE_FIELDS * 2
+                or not all(isinstance(name, str) for name in names)
+                or not all(name in fields for name in names)
+            ):
+                raise pickle.UnpicklingError("Invalid NumpyArrayWrapper structured dtype")
+            context.consume(len(names) + len(fields))
+            for field_name, field in fields.items():
+                if (
+                    not isinstance(field_name, str)
+                    or not isinstance(field, tuple)
+                    or len(field) not in {2, 3}
+                    or type(field[1]) is not int
+                    or field[1] < 0
+                    or (len(field) == 3 and field[2] is not None and not isinstance(field[2], str))
+                ):
+                    raise pickle.UnpicklingError("Invalid NumpyArrayWrapper dtype field")
+                field_dtype = _validated_numpy_dtype(
+                    field[0],
+                    depth=depth + 1,
+                    context=context,
+                )
+                if field[1] > dtype.itemsize or field_dtype.itemsize > dtype.itemsize - field[1]:
+                    raise pickle.UnpicklingError("NumpyArrayWrapper dtype field exceeds its item size")
+
+        if len(state) == 9 and not _is_safe_dtype_metadata(
+            state[8],
+            depth=depth + 1,
+            context=context,
+        ):
+            raise pickle.UnpicklingError("Invalid NumpyArrayWrapper dtype metadata")
+        context.dtype_cache[object_id] = (dtype_object, dtype)
+        return dtype
+    finally:
+        context.dtype_in_progress.pop()
+
+
+class _SafeJoblibUnpickler(pickle._Unpickler):  # type: ignore[attr-defined]
+    """Parse Joblib pickle control data without importing or invoking globals."""
+
+    dispatch: ClassVar[dict[int, Callable[[Any], None]]] = pickle._Unpickler.dispatch.copy()  # type: ignore[attr-defined]
+
+    def __init__(self, stream: io.BytesIO):
+        super().__init__(stream)
+        self._stream = stream
+        self.raw_array_spans: list[tuple[int, int]] = []
+        self.codec_encode_reduction_ids: set[int] = set()
+        self.dtype_validation_context = _JoblibDtypeValidationContext()
+        self._reduction_count = 0
+        self._remaining_control_opcodes = _MAX_JOBLIB_CONTROL_OPCODES
+
+    def load(self) -> object:
+        """Parse one pickle while bounding control-stream materialization."""
+        if not hasattr(self, "_file_read"):
+            raise pickle.UnpicklingError(f"{self.__class__.__name__}.__init__() was not called")
+        self._unframer = pickle._Unframer(self._file_read, self._file_readline)  # type: ignore[attr-defined]
+        self.read = self._unframer.read
+        self.readinto = self._unframer.readinto
+        self.readline = self._unframer.readline
+        self.metastack: list[list[object]] = []
+        self.stack: list[object] = []
+        self.append = self.stack.append
+        self.proto = 0
+        try:
+            while True:
+                if self._remaining_control_opcodes <= 0:
+                    raise pickle.UnpicklingError("Joblib pickle control stream is too complex")
+                self._remaining_control_opcodes -= 1
+                key = self.read(1)
+                if not key:
+                    raise EOFError
+                self.dispatch[key[0]](self)
+        except pickle._Stop as stop:  # type: ignore[attr-defined]
+            return stop.value
+
+    def find_class(self, module: str, name: str) -> _JoblibPickleGlobal:
+        return _JoblibPickleGlobal(module, name)
+
+    @property
+    def _pickle_stack(self) -> list[object]:
+        return self.stack
+
+    @property
+    def _pickle_unframer(self) -> Any:
+        return self._unframer  # type: ignore[attr-defined,no-any-return]
+
+    def _pickle_append(self, value: object) -> None:
+        self.append(value)  # type: ignore[attr-defined]
+
+    def _pickle_pop_mark(self) -> list[object]:
+        return cast(list[object], self.pop_mark())  # type: ignore[attr-defined]
+
+    def load_reduce(self) -> None:
+        args = self._pickle_stack.pop()
+        reference = self._pickle_stack.pop()
+        self._reduction_count += 1
+        instance = _JoblibPickleObject(
+            reference,
+            args,
+            constructor_opcode="REDUCE",
+            reduction_id=self._reduction_count,
+        )
+        if reference == _JoblibPickleGlobal("_codecs", "encode"):
+            self.codec_encode_reduction_ids.add(self._reduction_count)
+        self._pickle_append(instance)
+
+    def load_newobj(self) -> None:
+        args = self._pickle_stack.pop()
+        reference = self._pickle_stack.pop()
+        self._pickle_append(_JoblibPickleObject(reference, args, constructor_opcode="NEWOBJ"))
+
+    def load_newobj_ex(self) -> None:
+        kwargs = self._pickle_stack.pop()
+        args = self._pickle_stack.pop()
+        reference = self._pickle_stack.pop()
+        self._pickle_append(_JoblibPickleObject(reference, (args, kwargs), constructor_opcode="NEWOBJ_EX"))
+
+    def load_build(self) -> None:
+        state = self._pickle_stack.pop()
+        instance = self._pickle_stack[-1]
+        if not isinstance(instance, _JoblibPickleObject):
+            raise pickle.UnpicklingError("Unsupported Joblib BUILD target")
+        self.dtype_validation_context.clear_caches()
+        instance.state = state
+        if instance.reference == _JoblibPickleGlobal("joblib.numpy_pickle", "NumpyArrayWrapper"):
+            self._skip_numpy_array_payload(instance, state)
+
+    def load_inst(self) -> None:
+        readline = cast(Callable[[], bytes], self.readline)  # type: ignore[attr-defined]
+        module = readline()[:-1].decode("ascii")
+        name = readline()[:-1].decode("ascii")
+        self._pickle_append(
+            _JoblibPickleObject(
+                _JoblibPickleGlobal(module, name),
+                tuple(self._pickle_pop_mark()),
+                constructor_opcode="INST",
+            )
+        )
+
+    def load_obj(self) -> None:
+        args = self._pickle_pop_mark()
+        reference = args.pop(0)
+        self._pickle_append(_JoblibPickleObject(reference, tuple(args), constructor_opcode="OBJ"))
+
+    def load_unsupported_reference(self) -> None:
+        raise pickle.UnpicklingError("Unsupported persistent or extension reference")
+
+    def _skip_numpy_array_payload(self, instance: _JoblibPickleObject, state: object) -> None:
+        if instance.constructor_opcode != "NEWOBJ" or instance.args != ():
+            raise pickle.UnpicklingError("Invalid NumpyArrayWrapper construction")
+        if not isinstance(state, dict):
+            raise pickle.UnpicklingError("Invalid NumpyArrayWrapper state")
+
+        required_keys = {"subclass", "shape", "order", "dtype", "allow_mmap"}
+        allowed_keys = required_keys | {"numpy_array_alignment_bytes"}
+        state_keys = set(state)
+        if state_keys != required_keys and state_keys != allowed_keys:
+            raise pickle.UnpicklingError("Invalid NumpyArrayWrapper state fields")
+        if state.get("subclass") not in {
+            _JoblibPickleGlobal("numpy", "ndarray"),
+            _JoblibPickleGlobal("numpy", "memmap"),
+        }:
+            raise pickle.UnpicklingError("Unsupported NumpyArrayWrapper subclass")
+        if state.get("order") not in {"C", "F"} or type(state.get("allow_mmap")) is not bool:
+            raise pickle.UnpicklingError("Invalid NumpyArrayWrapper read options")
+
+        shape = state.get("shape")
+        if (
+            not isinstance(shape, tuple)
+            or len(shape) > _MAX_JOBLIB_ARRAY_DIMENSIONS
+            or not all(type(dimension) is int and dimension >= 0 for dimension in shape)
+        ):
+            raise pickle.UnpicklingError("Invalid NumpyArrayWrapper shape")
+        dtype = _validated_numpy_dtype(
+            state.get("dtype"),
+            context=self.dtype_validation_context,
+        )
+
+        frame = self._pickle_unframer.current_frame
+        if frame is not None:
+            if frame.read(1):
+                raise pickle.UnpicklingError("NumpyArrayWrapper BUILD did not end the pickle frame")
+            self._pickle_unframer.current_frame = None
+
+        raw_start = self._stream.tell()
+        alignment = state.get("numpy_array_alignment_bytes")
+        if alignment is not None:
+            if type(alignment) is not int or not 1 <= alignment <= 255:
+                raise pickle.UnpicklingError("Invalid NumpyArrayWrapper alignment")
+            padding_byte = self._stream.read(1)
+            if len(padding_byte) != 1:
+                raise pickle.UnpicklingError("Missing NumpyArrayWrapper alignment byte")
+            padding_length = padding_byte[0]
+            expected_padding = alignment - ((raw_start + 1) % alignment)
+            if padding_length != expected_padding or self._stream.read(padding_length) != b"\xff" * padding_length:
+                raise pickle.UnpicklingError("Invalid NumpyArrayWrapper alignment padding")
+
+        remaining_bytes = len(self._stream.getbuffer()) - self._stream.tell()
+        item_count = 1
+        for dimension in shape:
+            if dimension and item_count > remaining_bytes // dimension:
+                raise pickle.UnpicklingError("NumpyArrayWrapper shape exceeds the remaining payload")
+            item_count *= dimension
+        if dtype.itemsize and item_count > remaining_bytes // dtype.itemsize:
+            raise pickle.UnpicklingError("NumpyArrayWrapper data exceeds the remaining payload")
+        raw_size = item_count * dtype.itemsize
+        self._stream.seek(raw_size, io.SEEK_CUR)
+        self.raw_array_spans.append((raw_start, self._stream.tell()))
+
+
+_SafeJoblibUnpickler.dispatch[pickle.REDUCE[0]] = _SafeJoblibUnpickler.load_reduce
+_SafeJoblibUnpickler.dispatch[pickle.NEWOBJ[0]] = _SafeJoblibUnpickler.load_newobj
+_SafeJoblibUnpickler.dispatch[pickle.NEWOBJ_EX[0]] = _SafeJoblibUnpickler.load_newobj_ex
+_SafeJoblibUnpickler.dispatch[pickle.BUILD[0]] = _SafeJoblibUnpickler.load_build
+_SafeJoblibUnpickler.dispatch[pickle.INST[0]] = _SafeJoblibUnpickler.load_inst
+_SafeJoblibUnpickler.dispatch[pickle.OBJ[0]] = _SafeJoblibUnpickler.load_obj
+_SafeJoblibUnpickler.dispatch[pickle.PERSID[0]] = _SafeJoblibUnpickler.load_unsupported_reference
+_SafeJoblibUnpickler.dispatch[pickle.BINPERSID[0]] = _SafeJoblibUnpickler.load_unsupported_reference
+_SafeJoblibUnpickler.dispatch[pickle.EXT1[0]] = _SafeJoblibUnpickler.load_unsupported_reference
+_SafeJoblibUnpickler.dispatch[pickle.EXT2[0]] = _SafeJoblibUnpickler.load_unsupported_reference
+_SafeJoblibUnpickler.dispatch[pickle.EXT4[0]] = _SafeJoblibUnpickler.load_unsupported_reference
+
+
+def _pickle_without_joblib_numpy_array_data(payload: bytes) -> tuple[bytes, int, bool] | None:
+    """Remove only raw ndarray spans proven by static NumpyArrayWrapper state."""
+    if b"NumpyArrayWrapper" not in payload:
         return None
 
+    stream = io.BytesIO(payload)
+    parser = _SafeJoblibUnpickler(stream)
+    try:
+        parser.load()
+    except Exception:
+        return None
 
-def _looks_like_joblib_numpy_array_tail(tail: bytes) -> bool:
-    """Return True for Joblib's raw ndarray tail framing after NumpyArrayWrapper metadata."""
-    if not tail:
-        return False
-    padding_length = tail[0]
-    if padding_length > _MAX_JOBLIB_ARRAY_ALIGNMENT_PADDING or padding_length >= len(tail):
-        return False
+    frame = parser._pickle_unframer.current_frame
+    if (frame is not None and frame.read(1)) or stream.tell() != len(payload) or not parser.raw_array_spans:
+        return None
 
-    padding = tail[1 : 1 + padding_length]
-    if padding != (b"\xff" * padding_length):
-        return False
-
-    raw_array_data = tail[1 + padding_length :]
-    if not raw_array_data:
-        return False
-    if _looks_like_pickle(raw_array_data):
-        return False
-
-    probe = raw_array_data[:_JOBLIB_TAIL_DANGER_SCAN_BYTES].lower()
-    return not any(seed in probe for seed in _JOBLIB_TAIL_DANGEROUS_SEEDS)
+    sanitized = bytearray()
+    cursor = 0
+    for start, end in parser.raw_array_spans:
+        if start < cursor or end < start or end > len(payload):
+            return None
+        sanitized.extend(payload[cursor:start])
+        cursor = end
+    sanitized.extend(payload[cursor:])
+    has_only_validated_codec_encodes = (
+        bool(parser.codec_encode_reduction_ids)
+        and parser.codec_encode_reduction_ids == parser.dtype_validation_context.validated_codec_encode_reduction_ids
+    )
+    return bytes(sanitized), len(parser.raw_array_spans), has_only_validated_codec_encodes
 
 
 class JoblibScanner(BaseScanner):
@@ -255,8 +597,12 @@ class JoblibScanner(BaseScanner):
 
     def _scan_pickle_payload(self, payload: bytes, result: ScanResult, context: str) -> None:
         """Analyze a raw or decompressed pickle payload with CVE and opcode checks."""
-        self._detect_cve_patterns(payload, result, context)
-        self._scan_for_joblib_specific_threats(payload, result, context)
+        sanitized = _pickle_without_joblib_numpy_array_data(payload)
+        scan_payload, raw_array_count, has_only_validated_codec_encodes = (
+            sanitized if sanitized is not None else (payload, 0, False)
+        )
+        self._detect_cve_patterns(scan_payload, result, context)
+        self._scan_for_joblib_specific_threats(scan_payload, result, context)
 
         if self.pickle_scanner is None:
             add_scanner_selection_skip_check(
@@ -269,16 +615,45 @@ class JoblibScanner(BaseScanner):
             result.bytes_scanned = len(payload)
             return
 
-        with io.BytesIO(payload) as file_like:
+        with io.BytesIO(scan_payload) as file_like:
             sub_result = self.pickle_scanner.scan_stream(
                 file_like,
-                len(payload),
+                len(scan_payload),
                 source=context,
             )
         result.merge(sub_result)
-        self._downgrade_embedded_pickle_parse_errors(result)
-        self._mark_trusted_numpy_wrapper_tail(result, payload)
+        if has_only_validated_codec_encodes:
+            self._remove_validated_dtype_codec_findings(result)
+        result.metadata.pop("trusted_incomplete_tail", None)
+        result.metadata.pop("trusted_incomplete_tail_reason", None)
+        has_security_findings = any(
+            issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues
+        ) or any(
+            check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            for check in result.checks
+        )
+        if (
+            raw_array_count
+            and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+            and not has_security_findings
+        ):
+            result.metadata["trusted_incomplete_tail"] = True
+            result.metadata["trusted_incomplete_tail_reason"] = "joblib_numpy_array_payload"
+            result.metadata["joblib_numpy_array_payload_count"] = raw_array_count
+        else:
+            self._downgrade_embedded_pickle_parse_errors(result)
         result.bytes_scanned = len(payload)
+
+    @staticmethod
+    def _remove_validated_dtype_codec_findings(result: ScanResult) -> None:
+        def is_validated_dtype_codec_finding(finding: Any) -> bool:
+            return (
+                finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+                and finding.details.get("associated_global") == "_codecs.encode"
+            )
+
+        result.issues = [issue for issue in result.issues if not is_validated_dtype_codec_finding(issue)]
+        result.checks = [check for check in result.checks if not is_validated_dtype_codec_finding(check)]
 
     @staticmethod
     def _downgrade_embedded_pickle_parse_errors(result: ScanResult) -> None:
@@ -288,30 +663,6 @@ class JoblibScanner(BaseScanner):
         for check in result.checks:
             if check.rule_code == "S901" and check.details.get("category") == "parse_error":
                 check.severity = IssueSeverity.INFO
-
-    @staticmethod
-    def _mark_trusted_numpy_wrapper_tail(result: ScanResult, payload: bytes) -> None:
-        if result.metadata.get("trusted_incomplete_tail") is True:
-            result.trust_merged_child_failures()
-            return
-        if result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME:
-            return
-        if result.metadata.get("failure_reason") != "unknown_opcode_or_format_error":
-            return
-        if any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues):
-            return
-        if not _has_trusted_joblib_numpy_array_refs(result.metadata.get("import_references")):
-            return
-
-        tail_start = _parse_unknown_opcode_position(result)
-        if tail_start is None or tail_start >= len(payload):
-            return
-        if not _looks_like_joblib_numpy_array_tail(payload[tail_start:]):
-            return
-
-        result.metadata["trusted_incomplete_tail"] = True
-        result.metadata["trusted_incomplete_tail_reason"] = "joblib_numpy_array_payload"
-        result.trust_merged_child_failures()
 
     def _looks_like_raw_pickle_payload(self, data: bytes) -> bool:
         """Return True when `.joblib` bytes should be scanned directly as pickle."""
@@ -332,6 +683,11 @@ class JoblibScanner(BaseScanner):
             return False
 
         return False
+
+    @staticmethod
+    def _looks_like_compressed_joblib_payload(data: bytes) -> bool:
+        """Recognize the compression prefixes emitted by Joblib's bundled codecs."""
+        return data.startswith(_JOBLIB_COMPRESSED_PREFIXES)
 
     def _record_joblib_operational_error(self, result: ScanResult, reason: str) -> None:
         """Mark a Joblib scan as operationally incomplete for CLI exit-code aggregation."""
@@ -466,7 +822,7 @@ class JoblibScanner(BaseScanner):
                 result.finish(success=sub_result.success)
                 return result
 
-            if self._looks_like_raw_pickle_payload(data):
+            if not self._looks_like_compressed_joblib_payload(data) and self._looks_like_raw_pickle_payload(data):
                 self._scan_pickle_payload(data, result, path)
             else:
                 # Try safe decompression

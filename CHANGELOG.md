@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- validate Joblib NumPy wrapper state and scan resumed pickle opcodes around raw array payloads without flagging inert array bytes.
 - preserve scanner read caps when core max_file_size is unlimited
 - reject untrusted JFrog redirect hostnames unless explicitly allowed, block non-public IP targets, suppress ambient netrc credentials, and isolate redirect authentication and cookies
 - restrict manual Docker publishes to validated immutable version tags and their matching Git release refs before registry login or push
