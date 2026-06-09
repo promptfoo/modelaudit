@@ -2108,6 +2108,16 @@ class TestModelDownloadStreaming:
         _mock_monotonic: MagicMock,
     ) -> None:
         """The scan deadline should stop acquisition before a late remote probe begins."""
+
+        def finish_listing_after_deadline(
+            *_args: object,
+            **_kwargs: object,
+        ) -> tuple[list[str], str, None]:
+            _mock_monotonic.return_value = 102.0
+            return ["pytorch_model.bin", "hidden.payload"], _HF_TEST_REVISION, None
+
+        _mock_list_repo_files.side_effect = finish_listing_after_deadline
+
         with pytest.raises(Exception, match=r"hidden\.payload \(TimeoutError\)"):
             list(download_model_streaming("https://huggingface.co/test/model", timeout_seconds=1))
 
