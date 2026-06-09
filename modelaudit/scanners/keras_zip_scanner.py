@@ -414,6 +414,50 @@ class KerasZipScanner(BaseScanner):
     MAX_CONFIG_TRAVERSAL_ITEMS: ClassVar[int] = 100_000
     MAX_CONFIG_STRING_LITERALS: ClassVar[int] = 100_000
     MAX_CONFIG_STRING_CHARS: ClassVar[int] = 2 * 1024 * 1024
+    MAX_CONFIG_SECURITY_LITERAL_CHARS: ClassVar[int] = 256
+    _CONFIG_PROJECTION_KEYS_AFTER_STRING_LIMIT: ClassVar[frozenset[str]] = frozenset(
+        {
+            "args",
+            "backward_layer",
+            "callable",
+            "cell",
+            "cells",
+            "class_name",
+            "compile_config",
+            "config",
+            "fn",
+            "fn_module",
+            "function",
+            "function_name",
+            "inbound_nodes",
+            "kwargs",
+            "layer",
+            "layers",
+            "loss",
+            "metrics",
+            "module",
+            "name",
+            "registered_name",
+            "weighted_metrics",
+        }
+    )
+    _CONFIG_SECURITY_STRING_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "callable",
+            "class_name",
+            "config",
+            "fn",
+            "fn_module",
+            "function",
+            "function_name",
+            "loss",
+            "metrics",
+            "module",
+            "name",
+            "registered_name",
+            "weighted_metrics",
+        }
+    )
     _MODEL_CONTAINER_CLASSES: ClassVar[frozenset[str]] = frozenset({"Model", "Functional", "Sequential"})
     _NESTED_LAYER_CONFIG_KEYS: ClassVar[tuple[str, ...]] = ("layer", "backward_layer", "cell", "cells")
     _NESTED_LAYER_LIST_CONFIG_KEYS: ClassVar[frozenset[str]] = frozenset({"cell", "cells"})
@@ -1190,10 +1234,12 @@ class KerasZipScanner(BaseScanner):
 
     def _validate_config_traversal_budget(self, model_config: Any, result: ScanResult) -> Any:
         """Return the admitted config.json projection and fail closed on omitted coverage."""
-        state = self._new_config_traversal_state()
+        traversal_state = self._new_config_traversal_state()
+        literal_state = self._new_config_traversal_state()
+        security_literal_state = self._new_config_traversal_state()
         root: dict[str, Any] = {}
-        pending: deque[tuple[Any, int, str, dict[Any, Any] | list[Any], Any]] = deque(
-            [(model_config, 0, "root", root, "value")]
+        pending: deque[tuple[Any, int, str, dict[Any, Any] | list[Any], Any, bool]] = deque(
+            [(model_config, 0, "root", root, "value", False)]
         )
 
         def attach(parent: dict[Any, Any] | list[Any], slot: Any, value: Any) -> None:
@@ -1202,13 +1248,13 @@ class KerasZipScanner(BaseScanner):
             else:
                 parent[slot] = value
 
-        state.items_pending = 1
-        while pending and not state.halted:
-            node, depth, context, parent, slot = pending.popleft()
-            state.items_pending -= 1
+        traversal_state.items_pending = 1
+        while pending:
+            node, depth, context, parent, slot, preserve_security_string = pending.popleft()
+            traversal_state.items_pending -= 1
             allow_depth_exceeded = not isinstance(node, (dict, list))
             if not self._reserve_config_traversal_item(
-                state,
+                traversal_state,
                 result,
                 context=context,
                 depth=depth,
@@ -1217,7 +1263,21 @@ class KerasZipScanner(BaseScanner):
                 continue
 
             if isinstance(node, str):
-                bounded_value = self._record_config_string_literal(node, state, result, context=context)
+                bounded_value = None
+                if not literal_state.halted:
+                    bounded_value = self._record_config_string_literal(node, literal_state, result, context=context)
+                if (
+                    bounded_value is None
+                    and preserve_security_string
+                    and not security_literal_state.halted
+                    and len(node) <= self.MAX_CONFIG_SECURITY_LITERAL_CHARS
+                ):
+                    bounded_value = self._record_config_string_literal(
+                        node,
+                        security_literal_state,
+                        result,
+                        context=context,
+                    )
                 if bounded_value is not None:
                     attach(parent, slot, bounded_value)
                 continue
@@ -1225,12 +1285,12 @@ class KerasZipScanner(BaseScanner):
             if isinstance(node, dict):
                 bounded_node: dict[Any, Any] = {}
                 attach(parent, slot, bounded_node)
-                if state.item_limit_reached:
+                if traversal_state.item_limit_reached:
                     for key, value in node.items():
                         redacted_key = redact_evidence_string(str(key), max_chars=64)
                         child_context = self._config_child_path(context, f".{redacted_key}")
                         if not self._reserve_config_direct_item(
-                            state,
+                            traversal_state,
                             result,
                             context=child_context,
                             depth=depth + 1,
@@ -1240,26 +1300,45 @@ class KerasZipScanner(BaseScanner):
                         key_context = self._config_child_path(context, f".<key:{redacted_key}>")
                         bounded_key = key
                         if isinstance(key, str):
-                            bounded_key = self._record_config_string_literal(
-                                key,
-                                state,
-                                result,
-                                context=key_context,
-                            )
+                            bounded_key = None
+                            if not literal_state.halted:
+                                bounded_key = self._record_config_string_literal(
+                                    key,
+                                    literal_state,
+                                    result,
+                                    context=key_context,
+                                )
+                            if bounded_key is None and key in self._CONFIG_PROJECTION_KEYS_AFTER_STRING_LIMIT:
+                                bounded_key = key
                             if bounded_key is None:
-                                break
+                                continue
                         if isinstance(value, (dict, list)):
                             continue
                         bounded_value = value
                         if isinstance(value, str):
-                            bounded_value = self._record_config_string_literal(
-                                value,
-                                state,
-                                result,
-                                context=child_context,
-                            )
+                            bounded_value = None
+                            if not literal_state.halted:
+                                bounded_value = self._record_config_string_literal(
+                                    value,
+                                    literal_state,
+                                    result,
+                                    context=child_context,
+                                )
+                            if (
+                                bounded_value is None
+                                and isinstance(key, str)
+                                and key in self._CONFIG_SECURITY_STRING_KEYS
+                                and not security_literal_state.halted
+                                and len(value) <= self.MAX_CONFIG_SECURITY_LITERAL_CHARS
+                            ):
+                                bounded_value = self._record_config_string_literal(
+                                    value,
+                                    security_literal_state,
+                                    result,
+                                    context=child_context,
+                                )
                             if bounded_value is None:
-                                break
+                                continue
                         bounded_node[bounded_key] = bounded_value
                     continue
                 for key, value in node.items():
@@ -1267,16 +1346,40 @@ class KerasZipScanner(BaseScanner):
                     key_context = self._config_child_path(context, f".<key:{redacted_key}>")
                     bounded_key = key
                     if isinstance(key, str):
-                        bounded_key = self._record_config_string_literal(key, state, result, context=key_context)
+                        bounded_key = None
+                        if not literal_state.halted:
+                            bounded_key = self._record_config_string_literal(
+                                key,
+                                literal_state,
+                                result,
+                                context=key_context,
+                            )
+                        if bounded_key is None and key in self._CONFIG_PROJECTION_KEYS_AFTER_STRING_LIMIT:
+                            bounded_key = key
                         if bounded_key is None:
-                            break
+                            if not self._reserve_config_direct_item(
+                                traversal_state,
+                                result,
+                                context=key_context,
+                                depth=depth + 1,
+                                allow_depth_exceeded=True,
+                            ):
+                                break
+                            continue
 
                     child_context = self._config_child_path(context, f".{redacted_key}")
                     child_is_scalar = not isinstance(value, (dict, list))
                     if not self._queue_config_traversal_item(
                         pending,
-                        (value, depth + 1, child_context, bounded_node, bounded_key),
-                        state,
+                        (
+                            value,
+                            depth + 1,
+                            child_context,
+                            bounded_node,
+                            bounded_key,
+                            isinstance(key, str) and key in self._CONFIG_SECURITY_STRING_KEYS,
+                        ),
+                        traversal_state,
                         result,
                         context=child_context,
                         depth=depth + 1,
@@ -1288,15 +1391,22 @@ class KerasZipScanner(BaseScanner):
             if isinstance(node, list):
                 bounded_node_list: list[Any] = []
                 attach(parent, slot, bounded_node_list)
-                if state.item_limit_reached:
+                if traversal_state.item_limit_reached:
                     continue
                 for index, value in enumerate(node):
                     child_context = self._config_child_path(context, f"[{index}]")
                     child_is_scalar = not isinstance(value, (dict, list))
                     if not self._queue_config_traversal_item(
                         pending,
-                        (value, depth + 1, child_context, bounded_node_list, None),
-                        state,
+                        (
+                            value,
+                            depth + 1,
+                            child_context,
+                            bounded_node_list,
+                            None,
+                            preserve_security_string,
+                        ),
+                        traversal_state,
                         result,
                         context=child_context,
                         depth=depth + 1,
@@ -2346,77 +2456,80 @@ class KerasZipScanner(BaseScanner):
         for context, node in self._iter_dict_nodes(model_config, result, state=traversal_state):
             if self._is_primarily_documentation(context, node):
                 continue
-            if literal_state.direct_item_limit_reached:
-                continue
-            direct_string_values: list[str] = []
-            url_candidate_values: list[str] = []
-            nested_url_candidates: list[tuple[Any, str]] = []
-            for key, value in node.items():
-                if literal_state.halted:
-                    break
-                value_context = self._config_child_path(context, f".{redact_evidence_string(str(key), max_chars=64)}")
-                value_is_direct_string = isinstance(value, str)
-                if value_is_direct_string:
-                    if not self._reserve_config_direct_item(
-                        literal_state,
-                        result,
-                        context=value_context,
-                        depth=1,
-                    ):
-                        break
-                elif literal_state.item_limit_reached:
-                    if not self._reserve_config_direct_item(
-                        literal_state,
-                        result,
-                        context=value_context,
-                        depth=1,
-                    ):
-                        break
-                    continue
-                key_lower = str(key).lower()
-                is_url_candidate_field = key_lower in {"url", "origin", "args", "kwargs"}
-                extracted_literals = self._extract_string_literals(
-                    value,
-                    result=result,
-                    state=literal_state,
-                    context=value_context,
-                    root_reserved=value_is_direct_string,
-                )
-                if not isinstance(value, dict):
-                    direct_string_values.extend(extracted_literals)
-                if is_url_candidate_field:
-                    if isinstance(value, dict):
-                        nested_url_candidates.append((value, value_context))
-                    else:
-                        url_candidate_values.extend(extracted_literals)
-            has_get_file = _has_get_file_reference(direct_string_values)
-            if has_get_file:
-                for value, value_context in nested_url_candidates:
-                    if url_literal_state.halted:
-                        break
-                    for key, candidate in value.items():
-                        candidate_context = self._config_child_path(
-                            value_context,
-                            f".{redact_evidence_string(str(key), max_chars=64)}",
-                        )
+            has_get_file = self._node_has_direct_get_file_reference(node)
+            has_url = has_get_file and self._node_has_direct_get_file_url(node)
+            if not literal_state.halted and not literal_state.direct_item_limit_reached:
+                direct_string_values: list[str] = []
+                url_candidate_values: list[str] = []
+                nested_url_candidates: list[tuple[Any, str]] = []
+                for key, value in node.items():
+                    value_context = self._config_child_path(
+                        context,
+                        f".{redact_evidence_string(str(key), max_chars=64)}",
+                    )
+                    value_is_direct_string = isinstance(value, str)
+                    if value_is_direct_string:
                         if not self._reserve_config_direct_item(
-                            url_literal_state,
+                            literal_state,
                             result,
-                            context=candidate_context,
+                            context=value_context,
                             depth=1,
                         ):
                             break
-                        if not isinstance(candidate, str):
-                            continue
-                        bounded_candidate = self._record_config_string_literal(
-                            candidate,
-                            url_literal_state,
+                    elif literal_state.item_limit_reached:
+                        if not self._reserve_config_direct_item(
+                            literal_state,
                             result,
-                            context=candidate_context,
-                        )
-                        if bounded_candidate is not None:
-                            url_candidate_values.append(bounded_candidate)
-            has_url = any(_URL_PATTERN.search(value) is not None for value in url_candidate_values)
+                            context=value_context,
+                            depth=1,
+                        ):
+                            break
+                        continue
+                    key_lower = str(key).lower()
+                    is_url_candidate_field = key_lower in {"url", "origin", "args", "kwargs"}
+                    extracted_literals = self._extract_string_literals(
+                        value,
+                        result=result,
+                        state=literal_state,
+                        context=value_context,
+                        root_reserved=value_is_direct_string,
+                    )
+                    if not isinstance(value, dict):
+                        direct_string_values.extend(extracted_literals)
+                    if is_url_candidate_field:
+                        if isinstance(value, dict):
+                            nested_url_candidates.append((value, value_context))
+                        else:
+                            url_candidate_values.extend(extracted_literals)
+                bounded_has_get_file = _has_get_file_reference(direct_string_values)
+                has_get_file = has_get_file or bounded_has_get_file
+                if bounded_has_get_file:
+                    for value, value_context in nested_url_candidates:
+                        if url_literal_state.halted:
+                            break
+                        for key, candidate in value.items():
+                            candidate_context = self._config_child_path(
+                                value_context,
+                                f".{redact_evidence_string(str(key), max_chars=64)}",
+                            )
+                            if not self._reserve_config_direct_item(
+                                url_literal_state,
+                                result,
+                                context=candidate_context,
+                                depth=1,
+                            ):
+                                break
+                            if not isinstance(candidate, str):
+                                continue
+                            bounded_candidate = self._record_config_string_literal(
+                                candidate,
+                                url_literal_state,
+                                result,
+                                context=candidate_context,
+                            )
+                            if bounded_candidate is not None:
+                                url_candidate_values.append(bounded_candidate)
+                has_url = has_url or any(_URL_PATTERN.search(value) is not None for value in url_candidate_values)
             if not (has_get_file and has_url):
                 continue
             result.add_check(
@@ -2451,43 +2564,43 @@ class KerasZipScanner(BaseScanner):
         for context, node in self._iter_dict_nodes(model_config, result, state=traversal_state):
             if self._is_primarily_documentation(context, node):
                 continue
-            if literal_state.direct_item_limit_reached:
-                continue
-
-            direct_string_values: list[str] = []
-            for key, value in node.items():
-                if literal_state.halted:
-                    break
-                value_context = self._config_child_path(context, f".{redact_evidence_string(str(key), max_chars=64)}")
-                value_is_direct_string = isinstance(value, str)
-                if value_is_direct_string:
-                    if not self._reserve_config_direct_item(
-                        literal_state,
-                        result,
-                        context=value_context,
-                        depth=1,
-                    ):
-                        break
-                elif literal_state.item_limit_reached:
-                    if not self._reserve_config_direct_item(
-                        literal_state,
-                        result,
-                        context=value_context,
-                        depth=1,
-                    ):
-                        break
-                    continue
-                direct_string_values.extend(
-                    self._extract_string_literals(
-                        value,
-                        result=result,
-                        state=literal_state,
-                        context=value_context,
-                        root_reserved=value_is_direct_string,
+            has_get_file = self._node_has_direct_get_file_reference(node)
+            if not literal_state.halted and not literal_state.direct_item_limit_reached:
+                direct_string_values: list[str] = []
+                for key, value in node.items():
+                    value_context = self._config_child_path(
+                        context,
+                        f".{redact_evidence_string(str(key), max_chars=64)}",
                     )
-                )
+                    value_is_direct_string = isinstance(value, str)
+                    if value_is_direct_string:
+                        if not self._reserve_config_direct_item(
+                            literal_state,
+                            result,
+                            context=value_context,
+                            depth=1,
+                        ):
+                            break
+                    elif literal_state.item_limit_reached:
+                        if not self._reserve_config_direct_item(
+                            literal_state,
+                            result,
+                            context=value_context,
+                            depth=1,
+                        ):
+                            break
+                        continue
+                    direct_string_values.extend(
+                        self._extract_string_literals(
+                            value,
+                            result=result,
+                            state=literal_state,
+                            context=value_context,
+                            root_reserved=value_is_direct_string,
+                        )
+                    )
 
-            has_get_file = _has_get_file_reference(direct_string_values)
+                has_get_file = has_get_file or _has_get_file_reference(direct_string_values)
             origin = self._node_get_file_origin(node)
             if (
                 not has_get_file
@@ -2526,6 +2639,45 @@ class KerasZipScanner(BaseScanner):
             return
 
     @staticmethod
+    def _node_has_direct_get_file_reference(node: dict[str, Any]) -> bool:
+        """Check bounded callable fields without consuming the shared literal budget."""
+        for key in ("fn", "function", "callable", "class_name", "registered_name", "config", "module"):
+            value = node.get(key)
+            if (
+                isinstance(value, str)
+                and len(value) <= KerasZipScanner.MAX_CONFIG_SECURITY_LITERAL_CHARS
+                and _has_get_file_reference([value])
+            ):
+                return True
+            if key not in {"fn", "function", "callable"} or not isinstance(value, dict):
+                continue
+            for nested_key in ("fn", "function", "callable", "class_name", "registered_name", "config", "module"):
+                nested_value = value.get(nested_key)
+                if (
+                    isinstance(nested_value, str)
+                    and len(nested_value) <= KerasZipScanner.MAX_CONFIG_SECURITY_LITERAL_CHARS
+                    and _has_get_file_reference([nested_value])
+                ):
+                    return True
+        return False
+
+    @staticmethod
+    def _node_has_direct_get_file_url(node: dict[str, Any]) -> bool:
+        """Check bounded get_file argument positions for an HTTP(S) URL."""
+        candidates: list[Any] = [node.get("origin"), node.get("url")]
+        kwargs = node.get("kwargs")
+        if isinstance(kwargs, dict):
+            candidates.extend((kwargs.get("origin"), kwargs.get("url")))
+        args = node.get("args")
+        if isinstance(args, (list, tuple)):
+            candidates.extend(args[:9])
+        return any(
+            isinstance(value, str)
+            and _URL_PATTERN.search(value[: KerasZipScanner.MAX_CONFIG_SECURITY_LITERAL_CHARS]) is not None
+            for value in candidates
+        )
+
+    @staticmethod
     def _node_get_file_argument(node: dict[str, Any], name: str, position: int, default: Any) -> Any:
         """Resolve one get_file argument from flattened, kwargs, or positional config forms."""
         if name in node:
@@ -2550,12 +2702,14 @@ class KerasZipScanner(BaseScanner):
             for key in ("origin", "url"):
                 if key in container:
                     value = container[key]
-                    return value if isinstance(value, str) else None
+                    return (
+                        value[: KerasZipScanner.MAX_CONFIG_SECURITY_LITERAL_CHARS] if isinstance(value, str) else None
+                    )
 
         args = node.get("args")
         if isinstance(args, (list, tuple)) and len(args) > 1:
             value = args[1]
-            return value if isinstance(value, str) else None
+            return value[: KerasZipScanner.MAX_CONFIG_SECURITY_LITERAL_CHARS] if isinstance(value, str) else None
 
         return None
 
@@ -2667,6 +2821,8 @@ class KerasZipScanner(BaseScanner):
                 continue
 
             if isinstance(node, str):
+                if state.halted:
+                    continue
                 token = self._unsafe_deserialization_token(node, state, result, context)
                 if token is None:
                     continue
@@ -2680,14 +2836,19 @@ class KerasZipScanner(BaseScanner):
                 continue
 
             if isinstance(node, dict):
+                if self._node_has_direct_unsafe_deserialization_reference(
+                    node,
+                    has_ancestor_keras_config_context=has_ancestor_keras_config_context,
+                ):
+                    return True
+                if state.halted:
+                    continue
                 if state.direct_item_limit_reached:
                     continue
                 has_enable_unsafe = False
                 has_keras_config_context = False
                 deferred_children: list[tuple[Any, int, str]] = []
                 for key, value in node.items():
-                    if state.halted:
-                        return False
                     child_context = self._config_child_path(
                         context,
                         f".{redact_evidence_string(str(key), max_chars=64)}",
@@ -2757,6 +2918,31 @@ class KerasZipScanner(BaseScanner):
                         break
 
         return False
+
+    @classmethod
+    def _node_has_direct_unsafe_deserialization_reference(
+        cls,
+        node: dict[str, Any],
+        *,
+        has_ancestor_keras_config_context: bool,
+    ) -> bool:
+        """Check fixed executable fields after generic literal accounting stops."""
+        has_enable_unsafe = False
+        has_keras_config_context = False
+        for key in ("loader", "fn", "function", "callable", "module", "fn_module"):
+            value = node.get(key)
+            if not isinstance(value, str) or len(value) > cls.MAX_CONFIG_SECURITY_LITERAL_CHARS:
+                continue
+            token = value.strip().lower()
+            if token in {
+                "keras.config.enable_unsafe_deserialization",
+                "keras.src.config.enable_unsafe_deserialization",
+            }:
+                return True
+            has_enable_unsafe = has_enable_unsafe or cls._is_enable_unsafe_token(token)
+            has_keras_config_context = has_keras_config_context or cls._is_keras_config_context_token(token)
+
+        return has_enable_unsafe and (has_keras_config_context or has_ancestor_keras_config_context)
 
     def _unsafe_deserialization_token(
         self,

