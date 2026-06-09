@@ -489,6 +489,7 @@ class TestJFrogDownload:
     ) -> None:
         """Full artifact downloads may follow an off-origin redirect without credentials."""
         monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_REDIRECT_HOSTS", "evil.example")
         redirect_response = _FakeStreamingResponse(
             b"",
             status_code=302,
@@ -584,6 +585,31 @@ class TestJFrogDownload:
 
         assert result.read_bytes() == b"data"
         assert mock_get.call_args_list[1].args[0] == redirected_url
+        assert mock_get.call_args_list[1].kwargs["headers"] == {"X-JFrog-Art-Api": "test-token"}
+        assert redirect_response.closed is True
+        assert final_response.closed is True
+
+    @patch("modelaudit.utils.sources.jfrog.requests.get")
+    def test_download_strips_credentials_on_alternate_port_redirect(
+        self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Credentials must not cross an effective-origin port boundary."""
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        redirected_url = "https://company.jfrog.io:8443/artifactory/repo/model.bin"
+        redirect_response = _FakeStreamingResponse(b"", status_code=302, headers={"Location": redirected_url})
+        final_response = _FakeStreamingResponse(b"data")
+        mock_get.side_effect = [redirect_response, final_response]
+
+        result = download_artifact(
+            "https://company.jfrog.io/artifactory/repo/model.bin",
+            cache_dir=tmp_path,
+            api_token="test-token",
+        )
+
+        assert result.read_bytes() == b"data"
+        assert mock_get.call_args_list[0].kwargs["headers"] == {"X-JFrog-Art-Api": "test-token"}
+        assert mock_get.call_args_list[1].args[0] == redirected_url
+        assert mock_get.call_args_list[1].kwargs["headers"] == {}
         assert redirect_response.closed is True
         assert final_response.closed is True
 
@@ -743,6 +769,7 @@ class TestJFrogDownload:
         final_response.iter_content.return_value = [b"data"]
         mock_get.side_effect = [redirect_response, final_response]
         monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_REDIRECT_HOSTS", "evil.example")
 
         result = download_artifact(
             "https://company.jfrog.io/artifactory/repo/model.bin",
@@ -797,6 +824,7 @@ class TestJFrogDownload:
         final_response.iter_content.return_value = [b"123", b"456"]
         mock_get.side_effect = [redirect_response, final_response]
         monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_REDIRECT_HOSTS", "evil.example")
 
         with pytest.raises(Exception, match="exceeds maximum allowed size"):
             download_artifact(
@@ -914,10 +942,10 @@ class TestJFrogDownload:
         assert second_cookie_jar.get("ROUTEID") == "backend-a"
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
-    def test_download_redirect_isolates_cookies_across_trust_boundaries(
+    def test_download_redirect_does_not_restore_credentials_across_trust_boundaries(
         self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Trusted JFrog cookies must not cross an untrusted redirect hop."""
+        """An untrusted hop must permanently drop trusted credentials and session state."""
         trusted_redirect = MagicMock(spec=requests.Response)
         trusted_redirect.status_code = 302
         trusted_redirect.headers = {"Location": "https://evil.example/artifacts/model.bin"}
@@ -933,6 +961,7 @@ class TestJFrogDownload:
         final_response.iter_content.return_value = [b"data"]
         mock_get.side_effect = [trusted_redirect, untrusted_redirect, final_response]
         monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_REDIRECT_HOSTS", "evil.example")
 
         result = download_artifact(
             "https://company.jfrog.io/artifactory/repo/model.bin",
@@ -943,15 +972,18 @@ class TestJFrogDownload:
         assert result.read_bytes() == b"data"
         trusted_cookie_jar = mock_get.call_args_list[0].kwargs["cookies"]
         untrusted_cookie_jar = mock_get.call_args_list[1].kwargs["cookies"]
-        returning_trusted_cookie_jar = mock_get.call_args_list[2].kwargs["cookies"]
-        assert trusted_cookie_jar is returning_trusted_cookie_jar
+        returning_cookie_jar = mock_get.call_args_list[2].kwargs["cookies"]
+        assert returning_cookie_jar is not trusted_cookie_jar
+        assert returning_cookie_jar is not untrusted_cookie_jar
         assert trusted_cookie_jar is not untrusted_cookie_jar
         assert trusted_cookie_jar.get("JFROG_SESSION") == "trusted-session"
         assert trusted_cookie_jar.get("EVIL_SESSION") is None
         assert untrusted_cookie_jar.get("JFROG_SESSION") is None
         assert untrusted_cookie_jar.get("EVIL_SESSION") == "untrusted-session"
+        assert returning_cookie_jar.get("JFROG_SESSION") is None
+        assert returning_cookie_jar.get("EVIL_SESSION") is None
         assert mock_get.call_args_list[1].kwargs["headers"] == {}
-        assert mock_get.call_args_list[2].kwargs["headers"] == {"X-JFrog-Art-Api": "test-token"}
+        assert mock_get.call_args_list[2].kwargs["headers"] == {}
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_download_redirect_without_location_fails_closed(
@@ -1085,6 +1117,7 @@ class TestJFrogDownload:
         final_response = _fake_json_response({"repo": "repo", "path": "/model.bin", "size": 12})
         mock_get.side_effect = [redirect_response, final_response]
         monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "company.jfrog.io")
+        monkeypatch.setenv("MODELAUDIT_JFROG_ALLOWED_REDIRECT_HOSTS", "evil.example")
 
         result = detect_jfrog_target_type(
             "https://company.jfrog.io/artifactory/repo/model.bin",
