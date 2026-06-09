@@ -6601,8 +6601,8 @@ class TestCVE20251550ModuleReferences:
         assert len(cve_issues) >= 1
         details = cve_issues[0].details
         assert details["cve_id"] == "CVE-2025-1550"
-        assert details["cvss"] == 9.8
-        assert details["cwe"] == "CWE-502"
+        assert details["cvss"] == 7.3
+        assert details["cwe"] == "CWE-94"
         assert details["description"]
 
     def test_none_module_value_not_flagged(self, tmp_path: Path) -> None:
