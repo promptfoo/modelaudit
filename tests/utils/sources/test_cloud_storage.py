@@ -112,6 +112,12 @@ def make_safetensors_payload() -> bytes:
     return struct.pack("<Q", len(header)) + header + b"\x00" * 4
 
 
+def make_incomplete_pickle_probe_payload(*, malicious: bool) -> bytes:
+    operand = b"a" * _CLOUD_CONTENT_SNIFF_BYTES
+    prefix = b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94" if malicious else b"\x88\x89"
+    return prefix + b"\x8d" + struct.pack("<Q", len(operand)) + operand + (b"0." if malicious else b".")
+
+
 def make_coreml_payload(tmp_path: Path) -> bytes:
     return create_mock_coreml(tmp_path / "model.jpg").read_bytes()
 
@@ -1486,9 +1492,9 @@ def test_filter_scannable_cloud_files_routes_large_protocolless_pickle_at_exact_
     assert transferred == [len(payload)]
 
 
-def test_filter_scannable_cloud_files_keeps_pickle_route_without_tail_seek() -> None:
+def test_filter_scannable_cloud_files_preserves_prefix_only_pickle_route_without_tail_seek() -> None:
     url = "s3://bucket/models/evil.payload"
-    payload = b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94\x8c\x02id\x94\x85\x94R\x94."
+    payload = make_incomplete_pickle_probe_payload(malicious=True)
     transferred = [0]
     fs = make_fs_mock()
     fs.open.side_effect = lambda _path, _mode="rb": _NoTailSeekCountingBytesIO(payload, transferred)
@@ -1497,21 +1503,67 @@ def test_filter_scannable_cloud_files_keeps_pickle_route_without_tail_seek() -> 
     assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=len(payload)) == [
         {**files[0], "content_detected_format": "pickle"}
     ]
-    assert transferred == [len(payload)]
+    assert transferred == [_CLOUD_CONTENT_SNIFF_BYTES]
 
 
-def test_filter_scannable_cloud_files_fails_closed_for_ambiguous_prefix_without_tail_seek() -> None:
+def test_filter_scannable_cloud_files_fails_closed_for_benign_near_match_without_tail_seek() -> None:
     url = "s3://bucket/models/preview.payload"
-    payload = b"\x89PNG\r\n\x1a\n"
+    payload = make_incomplete_pickle_probe_payload(malicious=False)
     transferred = [0]
     fs = make_fs_mock()
     fs.open.side_effect = lambda _path, _mode="rb": _NoTailSeekCountingBytesIO(payload, transferred)
-    files = [{"path": url, "name": "preview.payload", "size": len(payload), "human_size": "8 B"}]
+    files = [{"path": url, "name": "preview.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
 
     with pytest.raises(ValueError, match="unable to inspect skipped object"):
         _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=len(payload))
 
-    assert transferred == [len(payload)]
+    assert transferred == [_CLOUD_CONTENT_SNIFF_BYTES]
+
+
+def test_filter_scannable_cloud_files_preserves_pickle_route_when_prefix_extension_fails() -> None:
+    url = "s3://bucket/models/evil.payload"
+    payload = make_incomplete_pickle_probe_payload(malicious=True)
+    transferred = [0]
+    open_count = [0]
+    fs = make_fs_mock()
+
+    def open_side_effect(_path: str, _mode: str = "rb") -> _CountingBytesIO:
+        open_count[0] += 1
+        if open_count[0] == 3:
+            raise OSError("second ranged read is unavailable")
+        return _CountingBytesIO(payload, transferred)
+
+    fs.open.side_effect = open_side_effect
+    files = [{"path": url, "name": "evil.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=len(payload)) == [
+        {**files[0], "content_detected_format": "pickle"}
+    ]
+    assert open_count == [3]
+    assert transferred == [_CLOUD_CONTENT_SNIFF_BYTES]
+
+
+def test_filter_scannable_cloud_files_fails_closed_for_benign_near_match_when_prefix_extension_fails() -> None:
+    url = "s3://bucket/models/preview.payload"
+    payload = make_incomplete_pickle_probe_payload(malicious=False)
+    transferred = [0]
+    open_count = [0]
+    fs = make_fs_mock()
+
+    def open_side_effect(_path: str, _mode: str = "rb") -> _CountingBytesIO:
+        open_count[0] += 1
+        if open_count[0] == 3:
+            raise OSError("second ranged read is unavailable")
+        return _CountingBytesIO(payload, transferred)
+
+    fs.open.side_effect = open_side_effect
+    files = [{"path": url, "name": "preview.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    with pytest.raises(ValueError, match="unable to inspect skipped object"):
+        _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=len(payload))
+
+    assert open_count == [3]
+    assert transferred == [_CLOUD_CONTENT_SNIFF_BYTES]
 
 
 def test_filter_scannable_cloud_files_caps_json_probe_at_shared_sniff_budget() -> None:
@@ -1927,6 +1979,122 @@ def test_selective_cloud_download_caps_content_sniffing_at_max_size(
     assert "secret" not in error
     assert transferred == [32]
     fs.get.assert_not_called()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("probe_failure", ["size-proof", "prefix-extension"])
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+def test_selective_cloud_download_preserves_prefix_only_pickle_route_after_optional_probe_failure(
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+    probe_failure: str,
+    streaming: bool,
+) -> None:
+    url = "s3://bucket/models/"
+    file_url = "s3://bucket/models/evil.payload"
+    payload = make_incomplete_pickle_probe_payload(malicious=True)
+    transferred = [0]
+    open_count = [0]
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": len(payload)}
+
+    def open_side_effect(_path: str, _mode: str = "rb") -> _CountingBytesIO:
+        open_count[0] += 1
+        if probe_failure == "prefix-extension" and open_count[0] == 3:
+            raise OSError("second ranged read is unavailable")
+        stream_type = _NoTailSeekCountingBytesIO if probe_failure == "size-proof" else _CountingBytesIO
+        return stream_type(payload, transferred)
+
+    fs.open.side_effect = open_side_effect
+    mock_fs_class.return_value = fs
+    mock_analyze.return_value = {
+        "type": "directory",
+        "file_count": 1,
+        "total_size": len(payload),
+        "human_size": f"{len(payload)} B",
+        "estimated_time": "instant",
+        "files": [{"path": file_url, "name": "evil.payload", "size": len(payload), "human_size": f"{len(payload)} B"}],
+    }
+    max_size = _CLOUD_CONTENT_SNIFF_BYTES + len(payload)
+
+    if streaming:
+        streamed = list(download_from_cloud_streaming(url, max_size=max_size, show_progress=False))
+        assert len(streamed) == 1
+        assert streamed[0][1] is True
+    else:
+        download_path = download_from_cloud(
+            url,
+            cache_dir=tmp_path,
+            max_size=max_size,
+            use_cache=False,
+            show_progress=False,
+        )
+        assert isinstance(download_path, Path)
+        assert download_path.exists()
+
+    assert transferred == [_CLOUD_CONTENT_SNIFF_BYTES + len(payload)]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("probe_failure", ["size-proof", "prefix-extension"])
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("fsspec.filesystem")
+def test_selective_cloud_download_fails_closed_for_benign_near_match_after_optional_probe_failure(
+    mock_fs_class: MagicMock,
+    mock_analyze: AsyncMock,
+    tmp_path: Path,
+    probe_failure: str,
+    streaming: bool,
+) -> None:
+    url = "s3://bucket/models/"
+    file_url = "s3://bucket/models/preview.payload"
+    payload = make_incomplete_pickle_probe_payload(malicious=False)
+    transferred = [0]
+    open_count = [0]
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": len(payload)}
+
+    def open_side_effect(_path: str, _mode: str = "rb") -> _CountingBytesIO:
+        open_count[0] += 1
+        if probe_failure == "prefix-extension" and open_count[0] == 3:
+            raise OSError("second ranged read is unavailable")
+        stream_type = _NoTailSeekCountingBytesIO if probe_failure == "size-proof" else _CountingBytesIO
+        return stream_type(payload, transferred)
+
+    fs.open.side_effect = open_side_effect
+    mock_fs_class.return_value = fs
+    mock_analyze.return_value = {
+        "type": "directory",
+        "file_count": 1,
+        "total_size": len(payload),
+        "human_size": f"{len(payload)} B",
+        "estimated_time": "instant",
+        "files": [
+            {
+                "path": file_url,
+                "name": "preview.payload",
+                "size": len(payload),
+                "human_size": f"{len(payload)} B",
+            }
+        ],
+    }
+    max_size = _CLOUD_CONTENT_SNIFF_BYTES + len(payload)
+
+    with pytest.raises(ValueError, match="unable to inspect skipped object"):
+        if streaming:
+            list(download_from_cloud_streaming(url, max_size=max_size, show_progress=False))
+        else:
+            download_from_cloud(
+                url,
+                cache_dir=tmp_path,
+                max_size=max_size,
+                use_cache=False,
+                show_progress=False,
+            )
+
+    assert transferred == [_CLOUD_CONTENT_SNIFF_BYTES]
 
 
 @pytest.mark.parametrize("streaming", [False, True])

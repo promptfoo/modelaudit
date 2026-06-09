@@ -1879,16 +1879,7 @@ def _detect_cloud_content_route_format(
         try:
             proven_size = _get_cloud_content_size_for_routing(fs, file_url)
         except ValueError:
-            complete_prefix_format = detect_format_from_magic_bytes(
-                cached_prefix[:4],
-                cached_prefix[:8],
-                cached_prefix[:16],
-                len(cached_prefix),
-                None,
-                pickle_probe_sample=cached_prefix,
-                pickle_probe_is_prefix=False,
-            )
-            if complete_prefix_format != "pickle":
+            if detected_format != "pickle":
                 raise
             proven_size = None
         if (
@@ -1896,20 +1887,25 @@ def _detect_cloud_content_route_format(
             and proven_size >= len(cached_prefix)
             and proven_size - len(cached_prefix) <= sniff_budget.remaining_bytes
         ):
-            complete_probe = _read_cloud_content_prefix(fs, file_url, proven_size, sniff_budget)
-            if len(complete_probe) == proven_size:
-                prefix = complete_probe
-                size = proven_size
-                size_is_known = True
-                detected_format = detect_format_from_magic_bytes(
-                    prefix[:4],
-                    prefix[:8],
-                    prefix[:16],
-                    size,
-                    None,
-                    pickle_probe_sample=prefix,
-                    pickle_probe_is_prefix=False,
-                )
+            try:
+                complete_probe = _read_cloud_content_prefix(fs, file_url, proven_size, sniff_budget)
+            except ValueError:
+                if detected_format != "pickle":
+                    raise
+            else:
+                if len(complete_probe) == proven_size:
+                    prefix = complete_probe
+                    size = proven_size
+                    size_is_known = True
+                    detected_format = detect_format_from_magic_bytes(
+                        prefix[:4],
+                        prefix[:8],
+                        prefix[:16],
+                        size,
+                        None,
+                        pickle_probe_sample=prefix,
+                        pickle_probe_is_prefix=False,
+                    )
     if (
         detected_format == "unknown"
         and prefix[_TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + len(_TFLITE_MAGIC_BYTES)] == _TFLITE_MAGIC_BYTES
