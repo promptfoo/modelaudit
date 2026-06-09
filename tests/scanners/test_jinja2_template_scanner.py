@@ -1480,6 +1480,7 @@ class TestJinja2TemplateScannerEdgeCases:
             "{% set r = range %}{% set s = r %}{{ s(100001)|min }}",
             "{% set r = range %}{{ r(100001)|min }}{% set r = small %}",
             "{% set r, n = range, 100001 %}{{ r(n)|max }}",
+            "{% set (r,) = [range] %}{{ r(100001)|min }}",
             "{% macro small(_count) %}12{% endmacro %}{% set range, r = small, range %}{{ r(100001)|min }}",
             "{% set n = 100000 %}{{ range(n + 1)|min }}",
             "{% set n = 100001 %}{{ range(n)|min }}{% set n = 1 %}",
@@ -1493,6 +1494,7 @@ class TestJinja2TemplateScannerEdgeCases:
             "{% macro m(r, n) %}{{ r(n)|min }}{% endmacro %}{{ m(range, 100001) }}",
             "{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}{% set alias = m %}{{ alias(range) }}",
             "{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}{% set alias, _ = m, 0 %}{{ alias(range) }}",
+            "{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}{% set (alias,) = [m] %}{{ alias(range) }}",
             "{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}" + "{% set ns = namespace(m=m) %}{{ ns.m(range) }}",
             "{% macro m(r) %}{{ r(100001)|min }}{% endmacro %}"
             + "{% set ns = namespace() %}{% set ns.m = m %}{{ ns.m(range) }}",
@@ -1537,6 +1539,14 @@ class TestJinja2TemplateScannerEdgeCases:
             "{% set ns=namespace() %}{% set other=ns %}{% set other.r=range %}{{ ns.r(100001)|min }}",
             "{% set ns=namespace() %}{% macro bind(x) %}{% set x.r=range %}{% endmacro %}"
             + "{{ bind(ns) }}{{ ns.r(100001)|min }}",
+            "{% macro bad() %}{{ range(100001)|min }}{% endmacro %}{% set ns=namespace() %}"
+            + "{% macro bind(x) %}{% set x.m=bad %}{% endmacro %}{{ bind(ns) }}{{ ns.m() }}",
+            "{% macro bad() %}{{ range(100001)|min }}{% endmacro %}{% set ns=namespace() %}{% set other=ns %}"
+            + "{% macro bind(x) %}{% set x.m=bad %}{% endmacro %}{{ bind(other) }}{{ ns.m() }}",
+            "{{ [range][0](100001)|min }}",
+            "{{ (range,)[0](100001)|min }}",
+            "{{ {'r': range}['r'](100001)|min }}",
+            "{% macro bad() %}{{ range(100001)|min }}{% endmacro %}{{ [bad][0]() }}",
             "{% if condition %}{% set n=100001 %}{% else %}{% set n=1 %}{% endif %}{{ range(n)|min }}",
             "{% if condition %}{% set n=1 %}{% else %}{% set n=200001 %}{% endif %}" + "{{ range(0, 200001, n)|min }}",
             "{% if condition %}{% set n=-1 %}{% else %}{% set n=-200001 %}{% endif %}"
@@ -1556,6 +1566,7 @@ class TestJinja2TemplateScannerEdgeCases:
             "{% set ns=namespace() %}{% with %}{% set ns.r=range %}{% endwith %}" + "{{ ns.r(100001)|min }}",
             "{{ range((10 ** 1000 + 1) - 10 ** 999)|min }}",
             "{{ range(3 ** 1000 - 2 ** 1000)|min }}",
+            "{{ range((-(10 ** 1000)) ** 3, 0)|min }}",
         ],
     )
     def test_unavailable_sandbox_worker_fails_closed_for_wrapped_scalar_range_filters(
@@ -1635,6 +1646,12 @@ class TestJinja2TemplateScannerEdgeCases:
             "{% macro m() %}{{ range(100001)|min }}{% endmacro %}{{ m(foo=1) }}",
             "{% macro m() %}{{ range(100001)|min }}{% endmacro %}" + "{% set ns = namespace(m=m) %}{{ ns.m(foo=1) }}",
             "{% set ns = 1 %}{% set ns.r = range %}{{ ns.r(100001)|min }}",
+            "{% macro bad() %}{{ range(100001)|min }}{% endmacro %}"
+            + "{% set ns = 1 %}{% set ns.m = bad %}{{ ns.m() }}",
+            "{% macro bad() %}{{ range(100001)|min }}{% endmacro %}{% set ns=namespace() %}"
+            + "{% macro bind(x) %}{% set x=namespace(m=bad) %}{% endmacro %}{{ bind(ns) }}{{ ns.m() }}",
+            "{{ [range][0](100000)|min }}",
+            "{{ range((-(10 ** 1000)) ** 2, 0)|min }}",
             "{% set r = range %}{{ r(4)|list }}",
             "{% set r = range %}{{ r(10)|join }}",
             "{% for n in [100001] if false %}{{ range(n)|min }}{% else %}ok{% endfor %}",

@@ -1770,7 +1770,12 @@ class Jinja2TemplateScanner(BaseScanner):
                 int_bindings,
                 namespace_range_attrs,
             )
-            self._collect_static_macro_assignment(node.target, node.node, macro_bindings)
+            self._collect_static_macro_assignment(
+                node.target,
+                node.node,
+                macro_bindings,
+                namespace_range_attrs,
+            )
             return False
 
         if isinstance(node, jinja2.nodes.AssignBlock):
@@ -2013,7 +2018,12 @@ class Jinja2TemplateScanner(BaseScanner):
                         item_int_bindings,
                         item_namespace_attrs,
                     )
-                    self._collect_static_macro_assignment(node.target, item, item_macro_bindings)
+                    self._collect_static_macro_assignment(
+                        node.target,
+                        item,
+                        item_macro_bindings,
+                        item_namespace_attrs,
+                    )
 
                     test_condition: bool | None = True
                     if node.test is not None:
@@ -2151,7 +2161,12 @@ class Jinja2TemplateScanner(BaseScanner):
                     with_int_bindings,
                     with_namespace_attrs,
                 )
-                self._collect_static_macro_assignment(target, value, with_macro_bindings)
+                self._collect_static_macro_assignment(
+                    target,
+                    value,
+                    with_macro_bindings,
+                    with_namespace_attrs,
+                )
             has_risk = any(
                 self._static_node_has_oversized_sandbox_range_call(
                     child,
@@ -2317,7 +2332,7 @@ class Jinja2TemplateScanner(BaseScanner):
             argument.name: value for argument, value in zip(macro.args, positional_arguments, strict=False)
         }
         supplied_arguments.update(dict(keyword_arguments))
-        namespace_argument_sources: dict[str, str] = {}
+        namespace_argument_sources: dict[str, tuple[tuple[str, ...], set[str]]] = {}
         default_offset = len(macro.args) - len(macro.defaults)
         for index, argument in enumerate(macro.args):
             value = supplied_arguments.get(argument.name)
@@ -2327,8 +2342,12 @@ class Jinja2TemplateScanner(BaseScanner):
                 uses_default = True
             if value is None:
                 continue
+            namespace_source_names: tuple[str, ...] = ()
             if isinstance(value, jinja2.nodes.Name) and value.name in namespace_range_attrs:
-                namespace_argument_sources[argument.name] = value.name
+                call_source_attrs = namespace_range_attrs[value.name]
+                namespace_source_names = tuple(
+                    name for name, attrs in namespace_range_attrs.items() if attrs is call_source_attrs
+                )
             if uses_default and self._static_node_has_oversized_sandbox_range_call(
                 value,
                 range_aliases,
@@ -2350,6 +2369,11 @@ class Jinja2TemplateScanner(BaseScanner):
                 macro_namespace_attrs,
                 nested_macro_bindings,
             )
+            if namespace_source_names and argument.name in macro_namespace_attrs:
+                namespace_argument_sources[argument.name] = (
+                    namespace_source_names,
+                    macro_namespace_attrs[argument.name],
+                )
 
         if accepts_kwargs:
             kwargs_range_attrs = {
@@ -2399,15 +2423,27 @@ class Jinja2TemplateScanner(BaseScanner):
         )
         if has_risk:
             return True
-        for argument_name, source_name in namespace_argument_sources.items():
-            argument_attrs = macro_namespace_attrs.get(argument_name)
-            source_attrs = namespace_range_attrs.get(source_name)
-            if argument_attrs is None or source_attrs is None:
+        for argument_name, (source_names, bound_argument_attrs) in namespace_argument_sources.items():
+            if macro_namespace_attrs.get(argument_name) is not bound_argument_attrs:
                 continue
-            if argument_attrs is source_attrs:
-                continue
-            source_attrs.clear()
-            source_attrs.update(argument_attrs)
+            argument_prefix = f"{argument_name}."
+            argument_macro_attrs = {
+                name.removeprefix(argument_prefix): macros
+                for name, macros in nested_macro_bindings.items()
+                if name.startswith(argument_prefix)
+            }
+            for source_name in source_names:
+                outer_source_attrs = namespace_range_attrs.get(source_name)
+                if outer_source_attrs is None:
+                    continue
+                if outer_source_attrs is not bound_argument_attrs:
+                    outer_source_attrs.clear()
+                    outer_source_attrs.update(bound_argument_attrs)
+                source_prefix = f"{source_name}."
+                for name in [name for name in macro_bindings if name.startswith(source_prefix)]:
+                    macro_bindings.pop(name, None)
+                for attribute, macros in argument_macro_attrs.items():
+                    macro_bindings[f"{source_prefix}{attribute}"] = macros
         return False
 
     @staticmethod
@@ -2515,6 +2551,9 @@ class Jinja2TemplateScanner(BaseScanner):
                     candidate_ids.add(id(macro))
                     candidates.append(macro)
             return tuple(candidates)
+        literal_item = cls._static_literal_container_item(node)
+        if literal_item is not None:
+            return cls._static_macro_binding_for_node(literal_item, macro_bindings)
         key = cls._static_macro_binding_key(node)
         return macro_bindings.get(key, ()) if key is not None else ()
 
@@ -2532,8 +2571,9 @@ class Jinja2TemplateScanner(BaseScanner):
         target: Any,
         value: Any,
         macro_bindings: dict[str, tuple[Any, ...]],
+        namespace_range_attrs: dict[str, set[str]],
     ) -> None:
-        if isinstance(target, jinja2.nodes.Tuple) and isinstance(value, jinja2.nodes.Tuple):
+        if isinstance(target, jinja2.nodes.Tuple) and isinstance(value, jinja2.nodes.List | jinja2.nodes.Tuple):
             if len(target.items) != len(value.items):
                 cls._clear_static_macro_binding(target, macro_bindings)
                 return
@@ -2550,7 +2590,7 @@ class Jinja2TemplateScanner(BaseScanner):
         source_macros = cls._static_macro_binding_for_node(value, original_bindings)
         cls._clear_static_macro_binding(target, macro_bindings)
         if isinstance(target, jinja2.nodes.NSRef):
-            if source_macros:
+            if target.name in namespace_range_attrs and source_macros:
                 macro_bindings[f"{target.name}.{target.attr}"] = source_macros
             return
         if isinstance(target, jinja2.nodes.Name) and source_macros:
@@ -2566,7 +2606,7 @@ class Jinja2TemplateScanner(BaseScanner):
                 keyword_macros = cls._static_macro_binding_for_node(keyword.value, original_bindings)
                 if keyword_macros:
                     macro_bindings[f"{target.name}.{keyword.key}"] = keyword_macros
-        elif isinstance(value, jinja2.nodes.Name):
+        elif isinstance(value, jinja2.nodes.Name) and value.name in namespace_range_attrs:
             source_prefix = f"{value.name}."
             target_prefix = f"{target.name}."
             for name, namespace_macro in original_bindings.items():
@@ -2756,7 +2796,7 @@ class Jinja2TemplateScanner(BaseScanner):
         int_bindings: dict[str, _StaticIntBinding],
         namespace_range_attrs: dict[str, set[str]],
     ) -> bool:
-        if isinstance(target, jinja2.nodes.Tuple) and isinstance(value, jinja2.nodes.Tuple):
+        if isinstance(target, jinja2.nodes.Tuple) and isinstance(value, jinja2.nodes.List | jinja2.nodes.Tuple):
             if len(target.items) != len(value.items):
                 self._clear_static_range_binding(target, range_aliases, int_bindings, namespace_range_attrs)
                 return False
@@ -2838,8 +2878,9 @@ class Jinja2TemplateScanner(BaseScanner):
                 for keyword in value.kwargs
                 if self._is_static_range_callable(keyword.value, range_aliases, namespace_range_attrs)
             }
-            if namespace_range_attrs.get(target.name) != attrs:
-                namespace_range_attrs[target.name] = attrs
+            previous_attrs = namespace_range_attrs.get(target.name)
+            namespace_range_attrs[target.name] = attrs
+            if previous_attrs is not attrs:
                 changed = True
         elif isinstance(value, jinja2.nodes.Name) and value.name in namespace_range_attrs:
             attrs = namespace_range_attrs[value.name]
@@ -2902,6 +2943,9 @@ class Jinja2TemplateScanner(BaseScanner):
                 branch is not None and cls._is_static_range_callable(branch, range_aliases, namespace_range_attrs)
                 for branch in branches
             )
+        literal_item = cls._static_literal_container_item(node)
+        if literal_item is not None:
+            return cls._is_static_range_callable(literal_item, range_aliases, namespace_range_attrs)
         if (
             isinstance(node, jinja2.nodes.Getitem)
             and isinstance(node.node, jinja2.nodes.Name)
@@ -2914,6 +2958,22 @@ class Jinja2TemplateScanner(BaseScanner):
             and isinstance(node.node, jinja2.nodes.Name)
             and node.attr in namespace_range_attrs.get(node.node.name, set())
         )
+
+    @staticmethod
+    def _static_literal_container_item(node: Any) -> Any | None:
+        if not isinstance(node, jinja2.nodes.Getitem) or not isinstance(node.arg, jinja2.nodes.Const):
+            return None
+        key = node.arg.value
+        if isinstance(node.node, jinja2.nodes.List | jinja2.nodes.Tuple) and isinstance(key, int):
+            try:
+                return node.node.items[key]
+            except IndexError:
+                return None
+        if isinstance(node.node, jinja2.nodes.Dict):
+            for pair in reversed(node.node.items):
+                if isinstance(pair.key, jinja2.nodes.Const) and pair.key.value == key:
+                    return pair.value
+        return None
 
     def _constant_int_expression_results_with_bindings(
         self,
@@ -3413,8 +3473,13 @@ class Jinja2TemplateScanner(BaseScanner):
                 if right_saturated:
                     return None
                 return self._constant_int_result(-1 if right % 2 else 1, cap)
-            if left_saturated or right_saturated:
+            if right_saturated:
+                if left < 0:
+                    return None
                 return self._saturated_constant_int_result(cap)
+            if left_saturated:
+                sign = -1 if left < 0 and right % 2 else 1
+                return self._saturated_constant_int_result(cap, sign)
             magnitude_cap = self._constant_int_magnitude_cap(cap)
             if abs(left) > 1 and (abs(left).bit_length() - 1) * right >= magnitude_cap.bit_length():
                 sign = -1 if left < 0 and right % 2 else 1
