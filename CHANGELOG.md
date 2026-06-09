@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - escape terminal and Unicode formatting controls in human-readable CLI output
+- bind direct sharded-model cache entries to sibling shard and selected model configuration content fingerprints, and strengthen cache configuration hashes
+- fail closed on PMML XML parsing when defusedxml is unavailable instead of using the stdlib parser
+- reject ambiguous, lossy, SDK-invalid, or traversal-bearing Hugging Face direct file URLs, redact rejected URL secrets, and preserve platform-valid filenames
 - scan safe OCI layer links with model-looking member names instead of treating link metadata as complete coverage
 - preserve scanner read caps when core max_file_size is unlimited
 - reject untrusted JFrog redirect hostnames unless explicitly allowed, block non-public IP targets, suppress ambient netrc credentials, and isolate redirect authentication and cookies
@@ -18,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect operator attrgetter, itemgetter, and methodcaller archive-member Python paths to command execution while preserving benign accessor names
 - redact Keras and TensorFlow scanner detail fields that echo model-controlled configs, code indicators, archive members, and external references.
 - route security-relevant protocol-less binary pickle streams through pickle analysis even when file suffixes are misleading
+- avoid routing complete benign cloud objects as protocol-less pickle prefixes when they exactly consume the content-sniff budget
 - redact folded, placeholder-adjacent, proxy, and camel-case authorization evidence with scheme-bearing values without hiding benign counters
 - bound Keras ZIP config traversal for CVE detectors and fail closed when config.json coverage budgets are exhausted
 - redact MLflow registry, source, telemetry, and client exception credentials before logging, printing, or analytics export
@@ -30,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fail closed on JFrog folder downloads whose selected artifacts use unsafe, colliding, or overlapping local paths
 - detect dangerous textual byte keys in Flax MessagePack checkpoints
 - bound Joblib decompression output to the configured scanner read budget
+- stream Flax MessagePack containers with bounded traversal, object, and metadata-key handling instead of a whole-file size cutoff
 - bound ExecuTorch ZIP metadata and member scans while preserving eligible pickle detections across archive limits and mutations
 - close JIT replay alias, probe-budget, and compound-clause context gaps without suppressing dangerous browser or native-library calls
 - scan raw payload indicators inside signature-valid ExecuTorch binaries and launcher-prefixed archives before reporting them clean

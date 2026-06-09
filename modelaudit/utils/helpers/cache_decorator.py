@@ -102,11 +102,24 @@ def _h5py_availability() -> bool:
     return HAS_H5PY
 
 
+def _defusedxml_availability() -> bool:
+    """Return whether hardened PMML XML analysis is available in this process."""
+    try:
+        from ...scanners.pmml_scanner import HAS_DEFUSEDXML
+    except Exception:
+        return False
+
+    return HAS_DEFUSEDXML
+
+
 def add_optional_dependency_availability_to_version_context(version_context: dict[str, Any]) -> dict[str, Any]:
     """Key caches on optional dependencies that change scan coverage."""
     return {
         **version_context,
-        "optional_dependency_availability": {"h5py": _h5py_availability()},
+        "optional_dependency_availability": {
+            "defusedxml": _defusedxml_availability(),
+            "h5py": _h5py_availability(),
+        },
     }
 
 
