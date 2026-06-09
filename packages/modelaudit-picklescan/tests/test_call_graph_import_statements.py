@@ -31,10 +31,9 @@ import pytest
 import modelaudit_picklescan.api as api_module
 import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, ScanStatus, Severity, scan_bytes
-from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
 
 pytestmark = pytest.mark.skipif(
-    find_spec(_RUST_EXTENSION_MODULE) is None,
+    find_spec(api_module._RUST_EXTENSION_MODULE) is None,
     reason="Rust picklescan extension is not built",
 )
 

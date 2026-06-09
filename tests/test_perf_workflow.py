@@ -334,6 +334,7 @@ def test_docs_workflow_rejects_invalid_utf8_and_invalid_revisions(tmp_path: Path
     )
     assert invalid_utf8_result.returncode != 0
     assert "Changed filename is not valid UTF-8" in invalid_utf8_result.stderr
+    assert not changed_json.exists()
 
     invalid_revision_result = _run_node_script(
         collect_script,
@@ -347,6 +348,7 @@ def test_docs_workflow_rejects_invalid_utf8_and_invalid_revisions(tmp_path: Path
     )
     assert invalid_revision_result.returncode != 0
     assert "Invalid workflow diff boundary" in invalid_revision_result.stderr
+    assert not changed_json.exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Git empty-tree behavior is covered on POSIX CI")

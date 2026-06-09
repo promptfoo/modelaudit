@@ -25,9 +25,11 @@ A security vulnerability is any bug that threatens the safety of ModelAudit user
 
 ## Telemetry and privacy
 
-ModelAudit includes telemetry for product reliability and usage analytics. When telemetry is enabled, events may include sanitized model identifiers, including model IDs, model names, repository or artifact IDs, remote model references, URL domains, file extensions, scanner/file-type usage, issue severity/type aggregates, command usage, and timing metadata.
+ModelAudit includes telemetry for product reliability and usage analytics. Events may include command and feature usage, scan and download timing or size metadata, scanner and file-type usage, stable rule or CVE identifiers, severity aggregates, registered file extensions, coarse source or provider categories, and runtime version, platform, and CI metadata.
 
-URL telemetry strips userinfo, query strings, and fragments from model references, but model identifiers and remote paths may still identify private models, buckets, repositories, or artifacts. Do not put credentials in model IDs, model names, or artifact paths when telemetry is enabled. ModelAudit does not upload model binary contents as telemetry events. Disable telemetry with `PROMPTFOO_DISABLE_TELEMETRY=1`, `NO_ANALYTICS=1`, `CI=true`, or `IS_TESTING=true`.
+Telemetry does not include raw local paths, filenames, model IDs or names, repository or artifact identifiers, bucket or object keys, remote URL paths, free-form issue or error text, URL userinfo, query strings, fragments, or model binary contents. Events use a persistent pseudonymous user ID shared with Promptfoo and a per-telemetry-session ID. A legacy email value in `~/.modelaudit/user_config.json`, if present, may be attached to the analytics user profile.
+
+Packaged installs enable telemetry by default. Editable development installs disable it unless `MODELAUDIT_TELEMETRY_DEV=1`. Disable telemetry with `PROMPTFOO_DISABLE_TELEMETRY=1` or `NO_ANALYTICS=1`; `CI=true` and `IS_TESTING=true` also disable it. See [Telemetry and Privacy](README.md#telemetry-and-privacy) for configuration details.
 
 ## How to report a vulnerability
 
