@@ -2,10 +2,12 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pmml_scanner import PmmlScanner
 
 
@@ -730,6 +732,42 @@ def test_pmml_scanner_enforces_size_limit(tmp_path: Path) -> None:
 
     assert result.success is False
     assert any("file too large" in issue.message.lower() for issue in result.issues)
+
+
+def test_pmml_scanner_max_file_size_zero_preserves_default_read_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(PmmlScanner, "default_max_file_read_size", 16)
+    path = tmp_path / "oversized-default.pmml"
+    path.write_text("<PMML version='4.4'><Header/></PMML>", encoding="utf-8")
+
+    result = PmmlScanner(config={"max_file_size": 0}).scan(str(path))
+
+    assert result.success is False
+    checks = {check.name: check for check in result.checks}
+    assert checks["File Size Limit"].status == CheckStatus.FAILED
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "max_file_read_size_exceeded" in result.metadata["scan_outcome_reasons"]
+
+
+def test_pmml_scanner_explicit_zero_read_limit_keeps_opt_out() -> None:
+    scanner = PmmlScanner(config={"max_file_size": 0, "max_file_read_size": 0})
+
+    assert scanner.max_file_read_size == 0
+
+
+@pytest.mark.parametrize(("max_file_size", "expected_read_cap"), [(8, 8), (32, 16)])
+def test_pmml_scanner_core_file_limit_only_tightens_default_read_cap(
+    max_file_size: int,
+    expected_read_cap: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(PmmlScanner, "default_max_file_read_size", 16)
+
+    scanner = PmmlScanner(config={"max_file_size": max_file_size})
+
+    assert scanner.max_file_read_size == expected_read_cap
 
 
 def test_pmml_scanner_comment_doctype_is_not_xxe(tmp_path: Path) -> None:
