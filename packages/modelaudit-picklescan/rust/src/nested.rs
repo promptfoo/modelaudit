@@ -894,8 +894,18 @@ fn embedded_long_protocol0_base64_probe_windows(
                 .is_some_and(|raw_index| *raw_index < MAX_ENCODED_LITERAL_MID_SCAN_BYTES);
             let remaining_line = &decoded[decoded_index + LONG_PROTOCOL0_SCALAR_PROBE_BYTES..];
             let Some(newline_offset) = remaining_line.iter().position(|byte| *byte == b'\n') else {
-                // A scalar prefix alone is not enough evidence of a pickle. Without the
-                // terminating line, no later opcode can establish structured content.
+                let Some(raw_start) = raw_positions.get(encoded_start).copied() else {
+                    break;
+                };
+                if base64_protocol0_scalar_has_line_terminator(value, raw_start) {
+                    return EncodedNestedProbeWindows {
+                        windows,
+                        limit_exceeded: true,
+                        limit_exceeded_encoding: Some("base64"),
+                    };
+                }
+                // A fully scanned scalar prefix without a terminating line cannot hide
+                // later pickle opcodes and is safe to treat as an encoded near-match.
                 break;
             };
             let probe = &decoded[decoded_index..];
@@ -936,6 +946,48 @@ fn embedded_long_protocol0_base64_probe_windows(
         limit_exceeded: false,
         limit_exceeded_encoding: None,
     }
+}
+
+fn base64_protocol0_scalar_has_line_terminator(value: &str, raw_start: usize) -> bool {
+    let Some(raw_candidate) = value.as_bytes().get(raw_start..) else {
+        return false;
+    };
+    let mut quartet = [0u8; 4];
+    let mut quartet_len = 0usize;
+    let mut decoded_index = 0usize;
+
+    let mut is_terminator = |byte: u8| {
+        let result = decoded_index >= LONG_PROTOCOL0_SCALAR_PROBE_BYTES && byte == b'\n';
+        decoded_index = decoded_index.saturating_add(1);
+        result
+    };
+
+    for byte in raw_candidate {
+        let Some(value) = base64_value(*byte) else {
+            continue;
+        };
+        quartet[quartet_len] = value;
+        quartet_len += 1;
+        if quartet_len < quartet.len() {
+            continue;
+        }
+
+        for decoded in [
+            (quartet[0] << 2) | (quartet[1] >> 4),
+            (quartet[1] << 4) | (quartet[2] >> 2),
+            (quartet[2] << 6) | quartet[3],
+        ] {
+            if is_terminator(decoded) {
+                return true;
+            }
+        }
+        quartet_len = 0;
+    }
+
+    if quartet_len >= 2 && is_terminator((quartet[0] << 2) | (quartet[1] >> 4)) {
+        return true;
+    }
+    quartet_len >= 3 && is_terminator((quartet[1] << 4) | (quartet[2] >> 2))
 }
 
 pub(crate) fn encoded_pickle_consumes_literal(value: &str) -> bool {
@@ -2028,6 +2080,25 @@ mod tests {
         assert!(encoded.len() > MAX_ENCODED_LITERAL_PREFIX_SCAN_BYTES);
         assert!(probes.windows.is_empty());
         assert!(!probes.limit_exceeded);
+    }
+
+    #[test]
+    fn long_protocol0_base64_probe_fails_closed_on_terminator_beyond_window() {
+        let body_len = (MAX_ENCODED_LITERAL_PREFIX_SCAN_BYTES * 3 / 4) + 1024;
+        let mut payload = b"V".to_vec();
+        payload.extend(std::iter::repeat_n(b'A', body_len));
+        payload.extend_from_slice(b"\n0cos\nsystem\n(S'id'\ntR.");
+        let encoded = encode_base64_for_test(&payload);
+
+        let probes = embedded_long_protocol0_base64_probe_windows(
+            &encoded,
+            LONG_PROTOCOL0_SCALAR_PROBE_CHARS,
+        );
+
+        assert!(encoded.len() > MAX_ENCODED_LITERAL_PREFIX_SCAN_BYTES);
+        assert!(probes.windows.is_empty());
+        assert!(probes.limit_exceeded);
+        assert_eq!(probes.limit_exceeded_encoding, Some("base64"));
     }
 
     #[test]
