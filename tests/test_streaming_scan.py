@@ -3,19 +3,32 @@
 import logging
 import os
 import pickle
+import shutil
 import struct
+import subprocess
+import sys
 import tempfile
 import time
+import uuid
 from collections.abc import Iterator
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
 
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file, scan_model_streaming
+from modelaudit.core import (
+    _complete_validated_shard_family_sources,
+    _reconcile_cross_directory_shard_coverage,
+    _snapshot_validated_shard_target,
+    determine_exit_code,
+    scan_file,
+    scan_model_directory_or_file,
+    scan_model_streaming,
+)
 from modelaudit.integrations.sarif_formatter import format_sarif_output
-from modelaudit.models import LicenseInfoModel
+from modelaudit.models import FileMetadataModel, LicenseInfoModel, create_initial_audit_result
 from modelaudit.scanners import safetensors_scanner
 from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
@@ -568,6 +581,815 @@ def test_scan_model_streaming_basic(temp_test_files: list[Path]) -> None:
         assert result.has_errors is False
         assert result.content_hash is not None
         assert len(result.content_hash) == 64  # SHA256 hex string
+
+
+@pytest.mark.parametrize("delete_after_scan", [False, True])
+def test_scan_model_streaming_reconciles_cross_directory_shard_coverage(
+    delete_after_scan: bool,
+) -> None:
+    """A complete streamed family should not fail merely because each shard has its own directory."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    with ExitStack() as stack:
+        shards: list[Path] = []
+        for shard_index in range(1, 4):
+            staging_root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_dir = staging_root / "huggingface" / "models--org--repo" / "snapshots" / "revision"
+            shard_dir.mkdir(parents=True)
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00003.safetensors"
+            shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+            shards.append(shard_path)
+
+        result = scan_model_streaming(
+            file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+            timeout=30,
+            delete_after_scan=delete_after_scan,
+            shard_family_group="trusted-stream:model-a",
+            cache_enabled=False,
+        )
+
+        assert result.files_scanned == 3
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+        assert not any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
+        assert not any(issue.details.get("scan_outcome_reason") == "missing_model_shards" for issue in result.issues)
+        assert all(
+            "missing_model_shards" not in metadata.model_dump().get("scan_outcome_reasons", [])
+            for metadata in result.file_metadata.values()
+        )
+        assert all(
+            "scan_outcome_message" not in metadata.model_dump(exclude_none=True)
+            for metadata in result.file_metadata.values()
+        )
+
+
+def test_scan_model_streaming_preserves_max_total_size_failure_after_shard_reconciliation() -> None:
+    """Completing a shard family must not erase an independent aggregate size failure."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    with ExitStack() as stack:
+        shards: list[Path] = []
+        for shard_index in range(1, 3):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+            shards.append(shard_path)
+
+        max_total_size = sum(shard.stat().st_size for shard in shards) - 1
+        result = scan_model_streaming(
+            file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+            timeout=30,
+            delete_after_scan=False,
+            max_total_size=max_total_size,
+            shard_family_group="trusted-stream:model-a",
+            cache_enabled=False,
+        )
+
+        assert not any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
+        assert not any(issue.details.get("scan_outcome_reason") == "missing_model_shards" for issue in result.issues)
+        assert any(issue.details.get("max_total_size") == max_total_size for issue in result.issues)
+        assert result.has_errors is True
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+
+
+def test_scan_model_streaming_preserves_malicious_cross_directory_shard_findings() -> None:
+    """Coverage reconciliation must not suppress a malicious finding from a complete family."""
+    safe_header = b'{"__metadata__":{"format":"pt"}}'
+    malicious_header = (
+        b'{"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]},"__metadata__":{"api_key":"SECRET_METADATA_TOKEN"}}'
+    )
+    with ExitStack() as stack:
+        shards: list[Path] = []
+        for shard_index in range(1, 4):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00003.safetensors"
+            header = malicious_header if shard_index == 2 else safe_header
+            tensor_data = b"\x00" if shard_index == 2 else b""
+            shard_path.write_bytes(struct.pack("<Q", len(header)) + header + tensor_data)
+            shards.append(shard_path)
+
+        result = scan_model_streaming(
+            file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+            timeout=30,
+            delete_after_scan=False,
+            shard_family_group="trusted-stream:model-a",
+            cache_enabled=False,
+        )
+
+        assert result.files_scanned == 3
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert determine_exit_code(result) == 1
+        assert not any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
+        assert not any(issue.details.get("scan_outcome_reason") == "missing_model_shards" for issue in result.issues)
+
+
+def test_streaming_shard_alias_aba_cannot_hide_malicious_content() -> None:
+    """Scanning must stay bound to the shard target selected before inspection."""
+    safe_header = b'{"__metadata__":{"format":"pt"}}'
+    malicious_header = (
+        b'{"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]},"__metadata__":{"api_key":"SECRET_METADATA_TOKEN"}}'
+    )
+    with ExitStack() as stack:
+        shards: list[Path] = []
+        swaps: dict[str, tuple[Path, Path, Path]] = {}
+        for shard_index in range(1, 3):
+            root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            malicious = root / "malicious.safetensors"
+            safe = root / "safe.safetensors"
+            malicious.write_bytes(struct.pack("<Q", len(malicious_header)) + malicious_header + b"\0")
+            safe.write_bytes(struct.pack("<Q", len(safe_header)) + safe_header)
+            alias = root / f"model-{shard_index:05d}-of-00002.safetensors"
+            alias.symlink_to(malicious.name)
+            shards.append(alias)
+            swaps[str(alias)] = (alias, malicious, safe)
+
+        real_scan_file = scan_file
+
+        def swap_during_scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+            entry = swaps.get(path)
+            if entry is None:
+                return real_scan_file(path, config=config)
+            alias, _malicious, safe = entry
+            alias.unlink()
+            alias.symlink_to(safe.name)
+            try:
+                return real_scan_file(path, config=config)
+            finally:
+                alias.unlink()
+                alias.symlink_to("malicious.safetensors")
+
+        with patch("modelaudit.core.scan_file", side_effect=swap_during_scan):
+            result = scan_model_streaming(
+                file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+                timeout=30,
+                delete_after_scan=False,
+                shard_family_group="trusted-stream:test",
+                cache_enabled=False,
+            )
+
+        assert all(shard.resolve().name == "malicious.safetensors" for shard in shards)
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert determine_exit_code(result) == 1
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir() and not Path("/dev/fd").is_dir(),
+    reason="descriptor-relative scan paths are unavailable",
+)
+def test_streaming_shard_staging_directory_aba_cannot_hide_malicious_content() -> None:
+    """Replacing the staging pathname cannot redirect a descriptor-bound shard scan."""
+    safe_header = b'{"__metadata__":{"format":"pt"}}'
+    malicious_header = (
+        b'{"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]},"__metadata__":{"api_key":"SECRET_METADATA_TOKEN"}}'
+    )
+    with ExitStack() as stack:
+        shards: list[Path] = []
+        for shard_index in range(1, 3):
+            root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard = root / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard.write_bytes(struct.pack("<Q", len(malicious_header)) + malicious_header + b"\0")
+            shards.append(shard)
+
+        real_scan_file = scan_file
+
+        def exchange_staging_directory(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+            scan_path = Path(path)
+            if not path.startswith(("/proc/self/fd/", "/dev/fd/")):
+                return real_scan_file(path, config=config)
+            staging_directory = Path(os.readlink(scan_path.parent))
+            preserved_directory = staging_directory.with_name(f"{staging_directory.name}.preserved")
+            staging_directory.rename(preserved_directory)
+            staging_directory.mkdir(mode=0o700)
+            benign_path = staging_directory / scan_path.name
+            benign_path.write_bytes(struct.pack("<Q", len(safe_header)) + safe_header)
+            try:
+                return real_scan_file(path, config=config)
+            finally:
+                shutil.rmtree(staging_directory)
+                preserved_directory.rename(staging_directory)
+
+        with patch("modelaudit.core.scan_file", side_effect=exchange_staging_directory):
+            result = scan_model_streaming(
+                file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+                timeout=30,
+                delete_after_scan=False,
+                shard_family_group="trusted-stream:test",
+                cache_enabled=False,
+            )
+
+        assert all(b"SECRET_METADATA_TOKEN" in shard.read_bytes() for shard in shards)
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert determine_exit_code(result) == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor pinning does not require hard links")
+def test_streaming_shard_scan_does_not_require_hard_link_support() -> None:
+    """Descriptor-bound shard scans must work on filesystems without hard links."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    with ExitStack() as stack:
+        shards: list[Path] = []
+        for shard_index in range(1, 3):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard.write_bytes(struct.pack("<Q", len(header)) + header)
+            shards.append(shard)
+
+        with patch("modelaudit.utils.file.handlers.os.link", side_effect=OSError("hard links unavailable")):
+            result = scan_model_streaming(
+                file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+                timeout=30,
+                delete_after_scan=False,
+                shard_family_group="trusted-stream:test",
+                cache_enabled=False,
+            )
+
+        assert result.success is True
+        assert result.has_errors is False
+        assert determine_exit_code(result) == 0
+        assert not any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses open-handle hard-link pinning")
+def test_streaming_shard_pin_failure_is_explicit_operational_error() -> None:
+    """Platforms without descriptor paths must report the pin failure explicitly."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    with tempfile.TemporaryDirectory(prefix="modelaudit_stream_") as shard_directory:
+        shard = Path(shard_directory) / "model-00001-of-00002.safetensors"
+        shard.write_bytes(struct.pack("<Q", len(header)) + header)
+
+        with patch("modelaudit.utils.file.handlers._descriptor_path_for_open_file", return_value=None):
+            result = scan_model_streaming(
+                file_generator=iter([(shard, True)]),
+                timeout=30,
+                delete_after_scan=False,
+                shard_family_group="trusted-stream:test",
+                cache_enabled=False,
+            )
+
+        assert result.success is False
+        assert result.has_errors is True
+        assert determine_exit_code(result) == 2
+        assert any(check.details.get("scan_outcome_reason") == "shard_pin_unavailable" for check in result.checks)
+        assert not any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
+
+
+def test_scan_model_streaming_does_not_reconcile_distinct_remote_model_directories() -> None:
+    """One remote stream must not combine complementary shards from distinct logical parents."""
+    with tempfile.TemporaryDirectory(prefix="modelaudit_stream_") as staging_directory:
+        staging_root = Path(staging_directory)
+        shards: list[Path] = []
+        for shard_index, model_id in ((1, "model-a"), (2, "model-b")):
+            shard_dir = staging_root / model_id
+            shard_dir.mkdir()
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            header = f'{{"__metadata__":{{"format":"pt","model_id":"{model_id}"}}}}'.encode()
+            shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+            shards.append(shard_path)
+
+        result = scan_model_streaming(
+            file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+            timeout=30,
+            delete_after_scan=False,
+            shard_family_group="trusted-stream:remote-repo",
+            cache_enabled=False,
+        )
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
+        assert any(issue.details.get("scan_outcome_reason") == "missing_model_shards" for issue in result.issues)
+
+
+def test_scan_model_streaming_keeps_hf_snapshot_symlink_families_separate(
+    requires_symlinks: None,
+) -> None:
+    """Logical model directories must not merge through one shared HF blobs parent."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    with tempfile.TemporaryDirectory(prefix="modelaudit_stream_") as staging_directory:
+        staging_root = Path(staging_directory)
+        blobs_dir = staging_root / "huggingface" / "models--org--repo" / "blobs"
+        blobs_dir.mkdir(parents=True)
+        shards: list[Path] = []
+        for shard_index, model_id in ((1, "model-a"), (2, "model-b")):
+            blob_path = blobs_dir / f"blob-{shard_index}"
+            blob_path.write_bytes(struct.pack("<Q", len(header)) + header)
+            logical_dir = staging_root / "snapshots" / model_id
+            logical_dir.mkdir(parents=True)
+            shard_path = logical_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.symlink_to(blob_path)
+            shards.append(shard_path)
+
+        result = scan_model_streaming(
+            file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+            timeout=30,
+            delete_after_scan=False,
+            shard_family_group="trusted-stream:remote-repo",
+            cache_enabled=False,
+        )
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
+        assert any(issue.details.get("scan_outcome_reason") == "missing_model_shards" for issue in result.issues)
+
+
+def test_stream_staging_family_groups_are_scoped_to_nested_logical_parent() -> None:
+    """Nested trusted staging paths must not combine unrelated remote model directories."""
+    with tempfile.TemporaryDirectory(prefix="modelaudit_stream_") as staging_directory:
+        staging_root = Path(staging_directory)
+        snapshots = []
+        for shard_index, model_id in ((1, "model-a"), (2, "model-b")):
+            shard_dir = staging_root / "remote" / model_id
+            shard_dir.mkdir(parents=True)
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(b"shard")
+            snapshots.append(
+                _snapshot_validated_shard_target(
+                    str(shard_path),
+                    family_group="trusted-stream:remote-repo",
+                    family_group_policy="stream_staging",
+                )
+            )
+
+    family_groups = [next(iter(snapshot.values())).get("family_group") for snapshot in snapshots]
+    assert all(isinstance(family_group, str) for family_group in family_groups)
+    assert family_groups[0] != family_groups[1]
+
+
+def test_stream_staging_family_group_rejects_nested_prefix_lookalike(tmp_path: Path) -> None:
+    """A prefixed directory outside the direct temp root must not gain trusted grouping."""
+    shard_dir = tmp_path / "modelaudit_stream_untrusted" / "remote" / "model-a"
+    shard_dir.mkdir(parents=True)
+    shard_path = shard_dir / "model-00001-of-00002.safetensors"
+    shard_path.write_bytes(b"shard")
+
+    snapshot = _snapshot_validated_shard_target(
+        str(shard_path),
+        family_group="attacker-controlled",
+        family_group_policy="stream_staging",
+    )
+
+    assert snapshot
+    assert "family_group" not in next(iter(snapshot.values()))
+
+
+def test_stream_staging_family_group_rejects_plain_persistent_root(tmp_path: Path) -> None:
+    """A caller-provided path must not act as a trusted persistent stream root."""
+    shard_path = tmp_path / "model-00001-of-00002.safetensors"
+    shard_path.write_bytes(b"shard")
+
+    snapshot = _snapshot_validated_shard_target(
+        str(shard_path),
+        family_group="attacker-controlled",
+        family_group_policy="stream_staging",
+        trusted_root_marker=tmp_path,
+    )
+
+    assert snapshot
+    assert "family_group" not in next(iter(snapshot.values()))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes are required")
+def test_stream_staging_family_group_rejects_publicly_writable_temp_root(tmp_path: Path) -> None:
+    """A forgeable temp prefix must not authorize a publicly mutable shard family."""
+    shard_dir = Path(tempfile.gettempdir()) / f"modelaudit_stream_public_{uuid.uuid4().hex}"
+    shard_dir.mkdir(mode=0o777)
+    shard_dir.chmod(0o777)
+    try:
+        shard_path = shard_dir / "model-00001-of-00002.safetensors"
+        shard_path.write_bytes(b"shard")
+
+        snapshot = _snapshot_validated_shard_target(
+            str(shard_path),
+            family_group="attacker-controlled",
+            family_group_policy="stream_staging",
+        )
+
+        assert snapshot
+        assert "family_group" not in next(iter(snapshot.values()))
+    finally:
+        shutil.rmtree(shard_dir)
+
+
+def test_cross_directory_shard_reconciliation_bounds_untrusted_expected_total() -> None:
+    """An attacker-controlled shard count must not allocate the declared range."""
+    script = "\n".join(
+        (
+            "from modelaudit.core import _complete_validated_shard_family_sources",
+            "total = '9' * 100",
+            "source = f'/tmp/part-1/model-00001-of-{total}.safetensors'",
+            "targets = {source: {'resolved_path': '/tmp/one', 'device': 1, 'inode': 1}}",
+            "assert _complete_validated_shard_family_sources(targets) == set()",
+        )
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_cross_directory_shard_reconciliation_distinguishes_reused_inode_generations() -> None:
+    """Sequential streamed files may legitimately reuse an inode after deletion."""
+    shard_one = "/tmp/part-1/model-00001-of-00002.safetensors"
+    shard_two = "/tmp/part-2/model-00002-of-00002.safetensors"
+    targets: dict[str, dict[str, int | str]] = {
+        shard_one: {
+            "resolved_path": "/tmp/part-1/target",
+            "device": 1,
+            "inode": 7,
+            "size": 10,
+            "mtime_ns": 100,
+            "ctime_ns": 100,
+            "nlink": 1,
+            "family_group": "stream-staging:test",
+        },
+        shard_two: {
+            "resolved_path": "/tmp/part-2/target",
+            "device": 1,
+            "inode": 7,
+            "size": 10,
+            "mtime_ns": 200,
+            "ctime_ns": 200,
+            "nlink": 1,
+            "family_group": "stream-staging:test",
+        },
+    }
+
+    expected_sources = {
+        os.path.normcase(os.path.normpath(os.path.abspath(shard_one))),
+        os.path.normcase(os.path.normpath(os.path.abspath(shard_two))),
+    }
+    assert _complete_validated_shard_family_sources(targets) == expected_sources
+
+
+def test_cross_directory_shard_reconciliation_rejects_sequential_hardlinks() -> None:
+    """Deleting one hardlink must not make its peer look like a reused inode generation."""
+    shard_one = "/tmp/part-1/model-00001-of-00002.safetensors"
+    shard_two = "/tmp/part-2/model-00002-of-00002.safetensors"
+    targets: dict[str, dict[str, int | str]] = {
+        shard_one: {
+            "resolved_path": "/tmp/part-1/target",
+            "device": 1,
+            "inode": 7,
+            "size": 10,
+            "mtime_ns": 100,
+            "ctime_ns": 100,
+            "nlink": 2,
+            "family_group": "stream-staging:test",
+        },
+        shard_two: {
+            "resolved_path": "/tmp/part-2/target",
+            "device": 1,
+            "inode": 7,
+            "size": 10,
+            "mtime_ns": 100,
+            "ctime_ns": 200,
+            "nlink": 1,
+            "family_group": "stream-staging:test",
+        },
+    }
+
+    assert _complete_validated_shard_family_sources(targets) == set()
+
+
+def test_cross_directory_shard_reconciliation_updates_stale_scalar_reason() -> None:
+    """Removing one reason must leave scalar outcome metadata aligned with the remaining reason."""
+    with ExitStack() as stack:
+        shards: list[Path] = []
+        validated_targets = {}
+        for shard_index in range(1, 3):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(b"shard")
+            shards.append(shard_path)
+            validated_targets.update(
+                _snapshot_validated_shard_target(
+                    str(shard_path),
+                    family_group="trusted-stream:model-a",
+                    family_group_policy="stream_staging",
+                )
+            )
+
+        result = create_initial_audit_result()
+        result.success = False
+        for shard in shards:
+            result.file_metadata[str(shard)] = FileMetadataModel(
+                analysis_incomplete=True,
+                scan_outcome="inconclusive",
+                scan_outcome_reason="missing_model_shards",
+                scan_outcome_reasons=["missing_model_shards", "shard_scan_error"],
+            )
+
+        assert _reconcile_cross_directory_shard_coverage(result, validated_targets) is True
+        assert result.success is False
+        for metadata_model in result.file_metadata.values():
+            metadata = metadata_model.model_dump()
+            assert metadata["scan_outcome_reasons"] == ["shard_scan_error"]
+            assert metadata["scan_outcome_reason"] == "shard_scan_error"
+            assert metadata["analysis_incomplete"] is True
+            assert metadata["scan_outcome"] == "inconclusive"
+
+
+def test_cross_directory_shard_reconciliation_preserves_secondary_coverage_failure() -> None:
+    """Disproving missing peers must retain another incomplete-coverage explanation."""
+    with ExitStack() as stack:
+        shards: list[Path] = []
+        validated_targets = {}
+        for shard_index in range(1, 3):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(b"shard")
+            shards.append(shard_path)
+            validated_targets.update(
+                _snapshot_validated_shard_target(
+                    str(shard_path),
+                    family_group="trusted-stream:model-a",
+                    family_group_policy="stream_staging",
+                )
+            )
+
+        source_result = ScanResult(scanner_name="safetensors")
+        source_result.add_check(
+            name="Sharded Model Coverage Check",
+            passed=False,
+            message="Missing 1 expected model shard(s); scan coverage is incomplete.",
+            severity=IssueSeverity.INFO,
+            location=str(shards[0]),
+            details={
+                "missing_shard_count": 1,
+                "unreadable_shard_count": 1,
+                "unreadable_shards": [str(shards[0].with_name("unreadable.safetensors"))],
+                "analysis_incomplete": True,
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reason": "missing_model_shards",
+                "scan_outcome_reasons": ["missing_model_shards", "unreadable_model_shards"],
+                "scan_outcome_message": "Missing model shards prevented complete analysis.",
+            },
+        )
+        result = create_initial_audit_result()
+        result.success = False
+        result.checks = list(source_result.checks)
+        result.issues = list(source_result.issues)
+        for shard in shards:
+            result.file_metadata[str(shard)] = FileMetadataModel(
+                analysis_incomplete=True,
+                scan_outcome="inconclusive",
+                scan_outcome_reason="missing_model_shards",
+                scan_outcome_reasons=["missing_model_shards", "unreadable_model_shards"],
+            )
+
+        assert _reconcile_cross_directory_shard_coverage(result, validated_targets) is True
+        assert result.success is False
+        assert len(result.checks) == 1
+        assert result.checks[0].details["scan_outcome_reason"] == "unreadable_model_shards"
+        assert result.checks[0].details["scan_outcome_reasons"] == ["unreadable_model_shards"]
+        assert "scan_outcome_message" not in result.checks[0].details
+        assert "Unable to read 1 model shard(s)" in result.checks[0].message
+        assert len(result.issues) == 1
+        assert result.issues[0].details["scan_outcome_reason"] == "unreadable_model_shards"
+        assert result.issues[0].details["scan_outcome_reasons"] == ["unreadable_model_shards"]
+        assert "scan_outcome_message" not in result.issues[0].details
+        assert "Unable to read 1 model shard(s)" in result.issues[0].message
+
+
+def test_cross_directory_shard_reconciliation_clears_stale_outcome_message() -> None:
+    """Removing the final inconclusive reason must remove its stale explanation."""
+    with ExitStack() as stack:
+        shards: list[Path] = []
+        validated_targets = {}
+        for shard_index in range(1, 3):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(b"shard")
+            shards.append(shard_path)
+            validated_targets.update(
+                _snapshot_validated_shard_target(
+                    str(shard_path),
+                    family_group="trusted-stream:model-a",
+                    family_group_policy="stream_staging",
+                )
+            )
+
+        result = create_initial_audit_result()
+        result.success = False
+        for shard in shards:
+            result.file_metadata[str(shard)] = FileMetadataModel(
+                analysis_incomplete=True,
+                scan_outcome="inconclusive",
+                scan_outcome_reason="missing_model_shards",
+                scan_outcome_reasons=["missing_model_shards"],
+                scan_outcome_message="Scan analysis incomplete; failed closed because full coverage was not available.",
+            )
+
+        assert _reconcile_cross_directory_shard_coverage(result, validated_targets) is True
+        assert result.success is True
+        for metadata_model in result.file_metadata.values():
+            metadata = metadata_model.model_dump(exclude_none=True)
+            assert "analysis_incomplete" not in metadata
+            assert "scan_outcome" not in metadata
+            assert "scan_outcome_reason" not in metadata
+            assert "scan_outcome_reasons" not in metadata
+            assert "scan_outcome_message" not in metadata
+
+
+def test_cross_directory_shard_reconciliation_clears_stale_operational_error_state() -> None:
+    """A disproven missing-shard failure must not leave the aggregate at exit code 2."""
+    with ExitStack() as stack:
+        validated_targets = {}
+        result = create_initial_audit_result()
+        result.files_scanned = 2
+        result.has_errors = True
+        result.success = False
+        for shard_index in range(1, 3):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(b"shard")
+            validated_targets.update(
+                _snapshot_validated_shard_target(
+                    str(shard_path),
+                    family_group="trusted-stream:model-a",
+                    family_group_policy="stream_staging",
+                )
+            )
+            result.file_metadata[str(shard_path)] = FileMetadataModel(
+                analysis_incomplete=True,
+                scan_outcome="inconclusive",
+                scan_outcome_reason="missing_model_shards",
+                scan_outcome_reasons=["missing_model_shards"],
+            )
+
+        assert (
+            _reconcile_cross_directory_shard_coverage(
+                result,
+                validated_targets,
+                missing_shard_errors_only=True,
+            )
+            is True
+        )
+        assert result.has_errors is False
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+
+
+def test_cross_directory_shard_reconciliation_preserves_retained_aggregate_failure() -> None:
+    """A retained incomplete-analysis issue must keep the aggregate at exit code 2."""
+    with ExitStack() as stack:
+        validated_targets = {}
+        result = create_initial_audit_result()
+        result.files_scanned = 2
+        result.has_errors = True
+        result.success = False
+        for shard_index in range(1, 3):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(b"shard")
+            validated_targets.update(
+                _snapshot_validated_shard_target(
+                    str(shard_path),
+                    family_group="trusted-stream:model-a",
+                    family_group_policy="stream_staging",
+                )
+            )
+            result.file_metadata[str(shard_path)] = FileMetadataModel(
+                analysis_incomplete=True,
+                scan_outcome="inconclusive",
+                scan_outcome_reason="missing_model_shards",
+                scan_outcome_reasons=["missing_model_shards"],
+            )
+        result.issues.append(
+            Issue(
+                message="Total scan size limit exceeded",
+                severity=IssueSeverity.INFO,
+                details={"max_total_size": 1, "analysis_incomplete": True},
+            )
+        )
+
+        assert (
+            _reconcile_cross_directory_shard_coverage(
+                result,
+                validated_targets,
+                missing_shard_errors_only=True,
+            )
+            is True
+        )
+        assert result.has_errors is True
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+
+
+def test_cross_directory_shard_reconciliation_preserves_unattributed_runtime_failure() -> None:
+    """Caller provenance must preserve a runtime failure without durable result evidence."""
+    with ExitStack() as stack:
+        validated_targets = {}
+        result = create_initial_audit_result()
+        result.files_scanned = 2
+        result.has_errors = True
+        result.success = False
+        for shard_index in range(1, 3):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(b"shard")
+            validated_targets.update(
+                _snapshot_validated_shard_target(
+                    str(shard_path),
+                    family_group="trusted-stream:model-a",
+                    family_group_policy="stream_staging",
+                )
+            )
+            result.file_metadata[str(shard_path)] = FileMetadataModel(
+                analysis_incomplete=True,
+                scan_outcome="inconclusive",
+                scan_outcome_reason="missing_model_shards",
+                scan_outcome_reasons=["missing_model_shards"],
+            )
+
+        assert (
+            _reconcile_cross_directory_shard_coverage(
+                result,
+                validated_targets,
+            )
+            is True
+        )
+        assert result.has_errors is True
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+
+
+def test_cross_directory_shard_reconciliation_preserves_independent_operational_error() -> None:
+    """Clearing a shard gap must retain an unrelated explicit operational failure."""
+    with ExitStack() as stack:
+        validated_targets = {}
+        result = create_initial_audit_result()
+        result.files_scanned = 3
+        result.has_errors = True
+        result.success = False
+        for shard_index in range(1, 3):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(b"shard")
+            validated_targets.update(
+                _snapshot_validated_shard_target(
+                    str(shard_path),
+                    family_group="trusted-stream:model-a",
+                    family_group_policy="stream_staging",
+                )
+            )
+            result.file_metadata[str(shard_path)] = FileMetadataModel(
+                analysis_incomplete=True,
+                scan_outcome="inconclusive",
+                scan_outcome_reason="missing_model_shards",
+                scan_outcome_reasons=["missing_model_shards"],
+            )
+        result.file_metadata["failed-download"] = FileMetadataModel(
+            operational_error=True,
+            operational_error_reason="download_failed",
+        )
+
+        assert (
+            _reconcile_cross_directory_shard_coverage(
+                result,
+                validated_targets,
+                missing_shard_errors_only=True,
+            )
+            is True
+        )
+        assert result.has_errors is True
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+
+
+def test_scan_model_streaming_does_not_reconcile_duplicate_shard_targets(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """Two shard indices resolving to one target must remain incomplete."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    shared_target = tmp_path / "shared-target"
+    shared_target.write_bytes(struct.pack("<Q", len(header)) + header)
+    shards: list[Path] = []
+    for shard_index in range(1, 3):
+        shard_dir = tmp_path / f"part-{shard_index}"
+        shard_dir.mkdir()
+        shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.symlink_to(shared_target)
+        shards.append(shard_path)
+
+    result = scan_model_streaming(
+        file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+        timeout=30,
+        delete_after_scan=False,
+        shard_family_group="trusted-stream:model-a",
+        cache_enabled=False,
+    )
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
 
 
 def test_scan_model_streaming_skips_non_model_files(tmp_path: Path) -> None:
