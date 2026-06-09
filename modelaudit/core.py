@@ -786,10 +786,15 @@ def _merge_pytorch_binary_supplemental_analysis(
     supplemental_scanner_id: str | None,
 ) -> None:
     """Merge strict format-specific findings without dropping raw `.bin` checks."""
+    supplemental_config = dict(config)
+    if supplemental_scanner_id == "executorch":
+        from .scanners.executorch_scanner import PYTORCH_BINARY_PRIMARY_SCANNED_CONFIG_KEY
+
+        supplemental_config[PYTORCH_BINARY_PRIMARY_SCANNED_CONFIG_KEY] = True
     _merge_supplemental_scanner_analysis(
         path,
         result,
-        config,
+        supplemental_config,
         scanner_selection,
         supplemental_scanner_id,
         context="supplemental .bin content analysis",
@@ -1549,7 +1554,14 @@ def scan_model_directory_or_file(
 
             scanner = get_scanner_for_file(stream_source_path(stream_url), config=config)
             if scanner:
-                scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
+                if max_file_size > 0:
+                    scan_result, analysis_complete = stream_analyze_file(
+                        stream_url,
+                        scanner,
+                        max_bytes=max_file_size,
+                    )
+                else:
+                    scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:
                     _redact_stream_scan_result_for_reporting(scan_result, stream_url, report_url)
                     if not analysis_complete:

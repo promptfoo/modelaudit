@@ -198,6 +198,46 @@ def create_h5_with_external_storage(
     return model_path
 
 
+def create_h5_with_sensitive_external_references(tmp_path: Path, raw_secret: str) -> Path:
+    """Create a Keras H5 file whose external-reference metadata contains sensitive evidence."""
+    raw_storage = tmp_path / f"{raw_secret}.raw"
+    raw_storage.write_bytes(b"\x00" * 8)
+
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": "sequential",
+                "layers": [{"class_name": "Dense", "config": {"units": 1}}],
+            },
+        },
+        keras_version=f"3.13.1+{raw_secret}",
+        file_name="sensitive_external_refs.h5",
+    )
+
+    with h5py.File(model_path, "a") as f:
+        weights_group = f.require_group("model_weights")
+        layer_name = f"layer_{raw_secret}"
+        linked_weight_name = f"linked_{raw_secret}"
+        external_weight_name = f"external_{raw_secret}_kernel"
+        weights_group.attrs["layer_names"] = [layer_name.encode()]
+        layer_group = weights_group.create_group(layer_name)
+        layer_group.attrs["weight_names"] = [linked_weight_name.encode(), external_weight_name.encode()]
+        layer_group[linked_weight_name] = h5py.ExternalLink(
+            f"https://user:very-secret-password@example.com/private/model.h5?token={raw_secret}",
+            f"/payload/{raw_secret}",
+        )
+        layer_group.create_dataset(
+            external_weight_name,
+            shape=(2,),
+            dtype="float32",
+            external=[(raw_storage.name, 0, 8)],
+        )
+
+    return model_path
+
+
 def test_keras_h5_scanner_safe_model(tmp_path):
     """Test scanning a safe Keras H5 model."""
     model_path = create_mock_h5_file(tmp_path)
@@ -253,6 +293,136 @@ def test_keras_h5_scanner_detects_cve_2026_1669_external_storage(tmp_path: Path)
     ]
 
 
+def test_keras_h5_external_reference_details_redact_model_controlled_values(tmp_path: Path) -> None:
+    """HDF5 external-reference details should not serialize secrets, URL creds, or private path tokens."""
+    raw_secret = "sk-proj-CAND061H5DETAILSECRET000000000000"
+    model_path = create_h5_with_sensitive_external_references(tmp_path, raw_secret)
+
+    result = KerasH5Scanner().scan(str(model_path))
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+
+    assert len(cve_issues) == 1
+    serialized_result = result.to_json()
+    assert raw_secret not in serialized_result
+    assert "very-secret-password" not in serialized_result
+    details_json = json.dumps(cve_issues[0].details, sort_keys=True)
+    assert "model_weights" in details_json
+    assert "https://" in details_json
+    assert "<redacted>" in details_json
+
+
+def test_keras_h5_custom_layer_config_details_redact_model_controlled_values(tmp_path: Path) -> None:
+    """Custom layer details should keep benign config keys while redacting sensitive model-controlled values."""
+    raw_secret = "sk-proj-CAND061H5CONFIGSECRET000000000000"
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "CustomAuditLayer",
+                        "config": {
+                            "api_key": raw_secret,
+                            "callback": f"https://callback.example/hook?token={raw_secret}",
+                            "safe_label": "public_label",
+                        },
+                    }
+                ]
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+    custom_issues = [check for check in result.checks if check.name == "Custom Layer Class Detection"]
+
+    assert custom_issues
+    layer_config = custom_issues[0].details["layer_config"]
+    assert layer_config["api_key"] == "<redacted>"
+    assert layer_config["safe_label"] == "public_label"
+    assert raw_secret not in result.to_json()
+
+
+def test_keras_h5_layer_counts_preserve_colliding_redacted_classes(tmp_path: Path) -> None:
+    """Distinct model-controlled class names must not collapse into one count."""
+    first_secret = "sk-proj-" + "A" * 24
+    second_secret = "sk-proj-" + "B" * 24
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {"class_name": f"token={first_secret}", "config": {}},
+                    {"class_name": f"token={second_secret}", "config": {}},
+                    {"class_name": f"token={first_secret}", "config": {}},
+                ]
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert result.metadata["layer_counts"] == {"token=<redacted>": 2, "token=<redacted>[2]": 1}
+    assert first_secret not in result.to_json()
+    assert second_secret not in result.to_json()
+
+
+def test_keras_h5_non_string_layer_class_fails_closed_without_abort(tmp_path: Path) -> None:
+    """Malformed structured class names should remain explicit and serializable."""
+    raw_secret = "sk-proj-CAND061H5CLASSSECRET000000000000"
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {"class_name": {"api_key": raw_secret}, "config": {}},
+                    {"class_name": "Dense", "config": {"units": 2}},
+                ]
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    type_checks = [check for check in result.checks if check.name == "Layer Class Type Validation"]
+    assert len(type_checks) == 1
+    assert type_checks[0].severity == IssueSeverity.WARNING
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "keras_h5_layer_class_invalid_type" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["layer_counts"]["<invalid:dict>"] == 1
+    assert raw_secret not in result.to_json()
+
+
+def test_keras_h5_non_string_model_class_preserves_nested_cve_detection(tmp_path: Path) -> None:
+    """Malformed root metadata must not suppress scanning of nested layers."""
+    raw_secret = "sk-proj-CAND061H5MODELCLASSSECRET000000000000"
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": {"api_key": raw_secret},
+            "config": {
+                "layers": [
+                    {"class_name": "Lambda", "config": {"function": "lambda x: x"}},
+                ]
+            },
+        },
+        keras_version="3.10.0",
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    type_checks = [check for check in result.checks if check.name == "Model Class Type Validation"]
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-9905"]
+    assert len(type_checks) == 1
+    assert len(cve_issues) == 1
+    assert cve_issues[0].severity == IssueSeverity.CRITICAL
+    assert result.metadata["model_class"] == "<invalid:dict>"
+    assert "keras_h5_model_class_invalid_type" in result.metadata["scan_outcome_reasons"]
+    assert raw_secret not in result.to_json()
+
+
 @pytest.mark.parametrize(
     "fixture_factory",
     [create_h5_with_external_link, create_h5_with_external_storage],
@@ -298,6 +468,53 @@ def test_keras_h5_scanner_fixed_metadata_without_external_refs_stays_quiet(tmp_p
 
     assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
     assert not any(check.name.startswith("HDF5 External Weight Reference") for check in result.checks)
+
+
+def test_keras_h5_metadata_redacts_model_controlled_identifiers(tmp_path: Path) -> None:
+    raw_secret = "sk-proj-KERASH5METADATASECRET1234567890"
+    model_path = tmp_path / "metadata_redaction.h5"
+    model_config = {
+        "class_name": f"Model_{raw_secret}",
+        "config": {"layers": [{"class_name": f"Layer_{raw_secret}", "config": {}}]},
+    }
+
+    with h5py.File(model_path, "w") as h5_file:
+        h5_file.attrs["model_config"] = json.dumps(model_config)
+        h5_file.attrs["keras_version"] = f"3.10.0+{raw_secret}"
+        h5_file.create_group(f"group_{raw_secret}")
+        weights = h5_file.create_group("model_weights")
+        weights.create_dataset(f"kernel_{raw_secret}", data=[1.0])
+
+    metadata = KerasH5Scanner().extract_metadata(str(model_path))
+    serialized_metadata = json.dumps(metadata, default=str)
+
+    assert raw_secret not in serialized_metadata
+    assert metadata["has_model_config"] is True
+    assert metadata["has_model_weights"] is True
+    assert metadata["total_parameters"] == 1
+    assert metadata["model_class"] == "Model_<redacted>"
+    assert metadata["keras_version"] == "3.10.0+<redacted>"
+    assert metadata["layer_types"] == ["Layer_<redacted>"]
+    assert metadata["parameter_details"] == [{"name": "kernel_<redacted>", "shape": [1], "dtype": "float64", "size": 1}]
+    assert "group_<redacted>" in metadata["h5_keys"]
+
+
+def test_keras_h5_metadata_redacts_extraction_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_secret = "ATTACKER_CONTROLLED_KERAS_H5_METADATA_FAILURE"
+    model_path = create_mock_h5_file(tmp_path)
+
+    def fail_h5py_open(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError(raw_secret)
+
+    monkeypatch.setattr(keras_h5_scanner_module.h5py, "File", fail_h5py_open)
+
+    metadata = KerasH5Scanner().extract_metadata(str(model_path))
+
+    assert metadata["extraction_error"] == "<redacted>"
+    assert raw_secret not in json.dumps(metadata, default=str)
 
 
 @pytest.mark.parametrize("keras_version", ["3.13.x", "2.12.0-gpu", "3.13.2rc1junk", "3.13.2+"])
@@ -643,15 +860,21 @@ def test_h5py_runtime_failure_bypasses_stale_clean_cache(
         cache_manager = get_cache_manager(str(cache_dir), enabled=True)
         assert cache_manager.get_stats()["total_entries"] == 1
 
+        raw_secret = "ATTACKER_CONTROLLED_KERAS_H5_RUNTIME_FAILURE"
+
         def fail_h5py_open(*_args: Any, **_kwargs: Any) -> None:
-            raise RuntimeError("simulated h5py runtime failure")
+            raise RuntimeError(raw_secret)
 
         monkeypatch.setattr(keras_h5_scanner_module.h5py, "File", fail_h5py_open)
 
         failed_result = KerasH5Scanner(config=config).scan_with_cache(str(model_path))
         assert failed_result.success is False
         assert "keras_h5_scan_failed" in failed_result.metadata["scan_outcome_reasons"]
-        assert any(check.name == "Keras H5 File Scan" for check in failed_result.checks)
+        failure_checks = [check for check in failed_result.checks if check.name == "Keras H5 File Scan"]
+        assert failure_checks
+        assert failure_checks[0].details["exception"] == "<redacted>"
+        assert "<redacted>" in failure_checks[0].message
+        assert raw_secret not in failed_result.to_json()
         assert cache_manager.get_stats()["total_entries"] == 1
 
         audit_result = scan_model_directory_or_file(
@@ -857,8 +1080,10 @@ def test_keras_h5_read_failure_returns_inconclusive_exit2(
         file_name="unavailable_content.h5",
     )
 
+    raw_secret = "ATTACKER_CONTROLLED_KERAS_H5_READ_FAILURE"
+
     def raise_os_error(_self: KerasH5Scanner, _h5_file: Any, _result: Any, _path: str) -> None:
-        raise OSError("simulated Keras H5 content read failure")
+        raise OSError(raw_secret)
 
     monkeypatch.setattr(KerasH5Scanner, "_check_hdf5_external_references", raise_os_error)
 
@@ -869,6 +1094,11 @@ def test_keras_h5_read_failure_returns_inconclusive_exit2(
         "Unable to read Keras H5 content",
     )
     result = KerasH5Scanner().scan(str(model_path))
+    read_checks = [check for check in result.checks if check.name == "Keras H5 File Read"]
+    assert read_checks
+    assert read_checks[0].details["exception"] == "<redacted>"
+    assert "<redacted>" in read_checks[0].message
+    assert raw_secret not in result.to_json()
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
     _assert_inconclusive_keras_h5_scan_not_cached(
         model_path,
@@ -5579,6 +5809,34 @@ class TestCVE20259905H5SafeMode:
         cve_issues = [i for i in result.issues if "CVE-2025-9905" in i.message]
         assert len(cve_issues) >= 1, "Lambda in H5 should trigger CVE-2025-9905"
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_redacted_local_version_still_triggers_cve_2025_9905(self, tmp_path: Path) -> None:
+        """Display redaction must not downgrade a valid vulnerable local version."""
+        raw_secret = "sk-proj-CAND061H5VERSIONSECRET000000000000"
+        model_path = create_custom_h5_file(
+            tmp_path,
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "Lambda",
+                            "config": {"function": "lambda x: x"},
+                        }
+                    ]
+                },
+            },
+            keras_version=f"3.10.0+{raw_secret}",
+            file_name="redacted_local_version.h5",
+        )
+
+        result = KerasH5Scanner().scan(str(model_path))
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-9905"]
+
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["keras_version"] == "3.10.0+<redacted>"
+        assert raw_secret not in result.to_json()
 
     @pytest.mark.parametrize(
         "layer_class",
