@@ -764,6 +764,42 @@ def test_manifest_scanner_nested_chat_template_collection_enforces_timeout(monke
         scanner._collect_jinja_template_fields({"chat_template": {"default": "{{ harmless }}"}})
 
 
+def test_manifest_scanner_shared_jinja_aliases_are_expanded_once_per_mode() -> None:
+    scanner = ManifestScanner(config={"jinja_template_collection_max_items": 1_100})
+    shared = {"chat_template": "{{ harmless }}"}
+
+    collection = scanner._collect_jinja_template_fields_with_budget(
+        {"model_type": "llama", "aliases": [shared] * 1_000}
+    )
+
+    assert collection.budget_exceeded is False
+    assert collection.items_visited == 1_004
+    assert collection.templates == {"aliases[0].chat_template": "{{ harmless }}"}
+
+
+def test_manifest_scanner_recursive_jinja_alias_preserves_sibling_template() -> None:
+    scanner = ManifestScanner(config={"jinja_template_collection_max_depth": 4})
+    recursive: dict[str, Any] = {}
+    recursive["self"] = recursive
+    recursive["chat_template"] = "{{ harmless }}"
+
+    collection = scanner._collect_jinja_template_fields_with_budget(recursive)
+
+    assert collection.budget_exceeded is False
+    assert collection.items_visited == 3
+    assert collection.templates == {"chat_template": "{{ harmless }}"}
+
+
+def test_manifest_scanner_shared_jinja_alias_is_revisited_when_mode_changes() -> None:
+    scanner = ManifestScanner()
+    shared = {"default": "{{ harmless }}"}
+
+    collection = scanner._collect_jinja_template_fields_with_budget({"metadata": shared, "chat_template": shared})
+
+    assert collection.budget_exceeded is False
+    assert collection.templates == {"chat_template.default": "{{ harmless }}"}
+
+
 def test_manifest_scanner_deep_jinja_collection_budget_fails_closed(tmp_path: Path) -> None:
     config_path = tmp_path / "config.json"
     nested_config: dict[str, Any] = {"leaf": "plain metadata"}
@@ -805,8 +841,8 @@ def test_manifest_scanner_jinja_collection_budget_preserves_malicious_template_d
         json.dumps(
             {
                 "model_type": "llama",
-                "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
                 "metadata": nested_config,
+                "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
             }
         ),
         encoding="utf-8",

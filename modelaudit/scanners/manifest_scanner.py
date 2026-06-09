@@ -1046,6 +1046,7 @@ class ManifestScanner(BaseScanner):
                 allow_plain_field_scalar=mode == _JINJA_COLLECTION_MODE_CONTAINER,
             )
         ]
+        expanded_container_ids: set[tuple[str, int]] = set()
 
         while stack:
             self._check_timeout()
@@ -1059,7 +1060,8 @@ class ManifestScanner(BaseScanner):
                     break
                 if frame.depth > max_depth:
                     self._mark_jinja_collection_budget_exceeded(collection, "depth", frame.path)
-                    break
+                    stack.pop()
+                    continue
 
                 if isinstance(frame.value, str):
                     self._record_jinja_scalar_if_template(
@@ -1073,10 +1075,20 @@ class ManifestScanner(BaseScanner):
                     continue
 
                 if isinstance(frame.value, dict):
+                    container_key = (frame.mode, id(frame.value))
+                    if container_key in expanded_container_ids:
+                        stack.pop()
+                        continue
+                    expanded_container_ids.add(container_key)
                     frame.iterator = iter(frame.value.items())
                     continue
 
                 if isinstance(frame.value, list):
+                    container_key = (frame.mode, id(frame.value))
+                    if container_key in expanded_container_ids:
+                        stack.pop()
+                        continue
+                    expanded_container_ids.add(container_key)
                     frame.iterator = enumerate(frame.value)
                     continue
 
