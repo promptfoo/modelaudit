@@ -373,7 +373,11 @@ class RknnScanner(BaseScanner):
                 message="Correlated command execution and network indicators detected in RKNN metadata text",
                 severity=IssueSeverity.CRITICAL,
                 location=path,
-                details={"examples": command_network_hits[:5], "signal_type": "command_and_network"},
+                details={
+                    "examples": command_network_hits[:5],
+                    "signal_type": "command_and_network",
+                    "same_fragment_correlation": True,
+                },
             )
         elif command_hits:
             result.add_check(

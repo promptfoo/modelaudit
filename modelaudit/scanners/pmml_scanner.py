@@ -10,17 +10,15 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 try:
     from defusedxml import ElementTree as DefusedET
 
+    if not callable(getattr(DefusedET, "fromstring", None)):
+        raise ImportError("defusedxml.ElementTree.fromstring is unavailable")
     HAS_DEFUSEDXML = True
-except ImportError:  # pragma: no cover - defusedxml may not be installed
+except Exception:  # pragma: no cover - defusedxml may be unavailable or broken
     HAS_DEFUSEDXML = False
     if TYPE_CHECKING:
         from defusedxml import ElementTree as DefusedET  # type: ignore[no-redef]
     else:
         DefusedET = None  # type: ignore[assignment]
-
-# Only import unsafe XML as fallback
-if not HAS_DEFUSEDXML:
-    import xml.etree.ElementTree as UnsafeET
 
 
 SUSPICIOUS_PATTERNS = [
@@ -69,7 +67,7 @@ class PmmlScanner(BaseScanner):
     external references.
 
     Security features:
-    - Uses defusedxml for safe XML parsing when available
+    - Requires defusedxml for safe XML parsing and fails closed when it is unavailable
     - Detects DOCTYPE and ENTITY declarations that could enable XXE attacks
     - Scans for suspicious patterns in Extension elements
     - Identifies external resource references
@@ -83,11 +81,18 @@ class PmmlScanner(BaseScanner):
     FILE_READ_INCOMPLETE_REASON: ClassVar[str] = "pmml_file_read_failed"
     EXTENSION_TRAVERSAL_INCOMPLETE_REASON: ClassVar[str] = "pmml_extension_traversal_limit_exceeded"
     XML_PARSE_INCOMPLETE_REASON: ClassVar[str] = "pmml_xml_parse_failed"
+    XML_PARSER_UNAVAILABLE_INCOMPLETE_REASON: ClassVar[str] = "pmml_safe_xml_parser_unavailable"
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         pmml_config = dict(config or {})
-        if "max_file_read_size" not in pmml_config and "max_file_size" in pmml_config:
-            pmml_config["max_file_read_size"] = pmml_config["max_file_size"]
+        max_file_size = pmml_config.get("max_file_size")
+        if (
+            "max_file_read_size" not in pmml_config
+            and isinstance(max_file_size, int)
+            and not isinstance(max_file_size, bool)
+            and max_file_size > 0
+        ):
+            pmml_config["max_file_read_size"] = min(max_file_size, self.default_max_file_read_size)
         super().__init__(config=pmml_config)
 
     @classmethod
@@ -173,23 +178,30 @@ class PmmlScanner(BaseScanner):
         # Check for dangerous XML constructs before parsing
         self._check_dangerous_xml_constructs(text, result, path)
 
-        # Parse XML using safe parser when available
+        if not HAS_DEFUSEDXML or DefusedET is None:
+            mark_inconclusive_scan_result(result, self.XML_PARSER_UNAVAILABLE_INCOMPLETE_REASON)
+            result.add_check(
+                name="XML Parser Security Check",
+                passed=False,
+                message="PMML XML parsing skipped because defusedxml is unavailable",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "required_package": "defusedxml",
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self.XML_PARSER_UNAVAILABLE_INCOMPLETE_REASON,
+                },
+                why=(
+                    "PMML parsing requires defusedxml. Falling back to the standard XML parser would parse "
+                    "attacker-controlled XML without the hardened entity-expansion protections."
+                ),
+            )
+            result.finish(success=False)
+            return result
+
+        # Parse XML using the safe parser
         try:
-            if HAS_DEFUSEDXML:
-                root = DefusedET.fromstring(text)
-            else:
-                # Warn about using unsafe parser
-                result.add_check(
-                    name="XML Parser Security Check",
-                    passed=False,
-                    message="Using unsafe XML parser - defusedxml not available",
-                    severity=IssueSeverity.WARNING,
-                    location=path,
-                    why="defusedxml is not installed. The standard XML parser may be vulnerable to XXE attacks. "
-                    "Install defusedxml for better security.",
-                    rule_code="S902",
-                )
-                root = UnsafeET.fromstring(text)
+            root = DefusedET.fromstring(text)
         except Exception as e:
             mark_inconclusive_scan_result(result, self.XML_PARSE_INCOMPLETE_REASON)
             result.add_check(
