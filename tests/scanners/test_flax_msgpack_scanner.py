@@ -518,8 +518,8 @@ def test_flax_msgpack_scans_trailing_msgpack_objects(tmp_path: Path) -> None:
     )
 
 
-def test_flax_msgpack_preserves_trailing_scan_after_first_object_exhausts_node_budget(tmp_path: Path) -> None:
-    """A large first object must not starve a small malicious trailing object."""
+def test_flax_msgpack_stops_when_first_object_exhausts_node_budget(tmp_path: Path) -> None:
+    """Coverage exhaustion must stop before unbounded work on the object remainder."""
     path = tmp_path / "trailing_after_budget.msgpack"
     payload = msgpack.packb({"params": list(range(8))}, use_bin_type=True)
     payload += msgpack.packb("eval('x')", use_bin_type=True)
@@ -529,12 +529,8 @@ def test_flax_msgpack_preserves_trailing_scan_after_first_object_exhausts_node_b
 
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL
-        and issue.message == r"Suspicious code pattern detected: eval\s*\("
-        and issue.location == "root[msgpack_object_1]"
-        for issue in result.issues
-    )
+    assert FlaxMsgpackScanner.STRUCTURE_BUDGET_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert not any(issue.location == "root[msgpack_object_1]" for issue in result.issues)
 
 
 def test_flax_msgpack_trailing_objects_do_not_dilute_primary_scan_budget(tmp_path: Path) -> None:
@@ -571,12 +567,35 @@ def test_flax_msgpack_trailing_objects_share_an_aggregate_node_budget(tmp_path: 
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert FlaxMsgpackScanner.STRUCTURE_BUDGET_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
-    assert result.metadata["msgpack_object_count"] == 13
-    assert result.metadata["msgpack_stream_analyzed_nodes"] <= 10
-    assert result.metadata["msgpack_stream_node_budget"] == 10
     budget_checks = [check for check in result.checks if check.name == "Flax MessagePack Structure Budget"]
     assert len(budget_checks) == 1
     assert budget_checks[0].details["max_allowed"] == 5
+
+
+def test_flax_msgpack_node_budget_does_not_call_unbounded_skip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback = pytest.importorskip("msgpack.fallback")
+
+    def fail_skip(_self: Any) -> None:
+        raise AssertionError("coverage exhaustion must not skip an unbounded nested object")
+
+    monkeypatch.setattr(fallback.Unpacker, "skip", fail_skip)
+    monkeypatch.setattr(msgpack, "Unpacker", fallback.Unpacker)
+    path = tmp_path / "nested_after_node_budget.msgpack"
+    create_msgpack_file(path, [[0] * 100])
+
+    result = FlaxMsgpackScanner(
+        config={
+            "max_items_per_container": 10,
+            "max_msgpack_structure_nodes": 1,
+        }
+    ).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.STRUCTURE_BUDGET_INCONCLUSIVE_REASON]
+    assert not [check for check in result.checks if check.name == "Msgpack Parse Check"]
 
 
 def test_flax_msgpack_benign_trailing_dict_object_is_info_only(tmp_path: Path) -> None:
@@ -696,6 +715,29 @@ def test_flax_msgpack_truncated_trailer_at_stream_object_limit_fails_closed(tmp_
     assert not [check for check in result.checks if check.name == "Msgpack Stream Object Limit"]
 
 
+@pytest.mark.parametrize(
+    "trailer",
+    [
+        pytest.param(b"\xa5ab", id="fixstr-body"),
+        pytest.param(b"\xd9\x05ab", id="str8-body"),
+        pytest.param(b"\xc6\x00\x00\x00\x05ab", id="bin32-body"),
+        pytest.param(b"\xc1", id="reserved-marker"),
+    ],
+)
+def test_flax_msgpack_truncated_scalar_at_stream_object_limit_fails_closed(
+    tmp_path: Path,
+    trailer: bytes,
+) -> None:
+    path = tmp_path / "truncated_scalar_at_object_limit.msgpack"
+    path.write_bytes(msgpack.packb({"params": {"w": [1]}}, use_bin_type=True) + trailer)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_stream_objects": 1}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.TRUNCATED_STREAM_INCONCLUSIVE_REASON]
+    assert not [check for check in result.checks if check.name == "Msgpack Stream Object Limit"]
+
+
 def test_flax_msgpack_caps_trailing_stream_object_count(tmp_path: Path) -> None:
     """Too many trailing msgpack objects should fail closed without materializing the full stream."""
     path = tmp_path / "many_objects.msgpack"
@@ -715,6 +757,99 @@ def test_flax_msgpack_caps_trailing_stream_object_count(tmp_path: Path) -> None:
     ]
     assert len(object_limit_checks) == 1
     assert object_limit_checks[0].details["max_msgpack_stream_objects"] == 4
+
+
+def test_flax_msgpack_stream_object_limit_does_not_decode_extra_object(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback = pytest.importorskip("msgpack.fallback")
+
+    def fail_skip(_self: Any) -> None:
+        raise AssertionError("object limit must not decode the extra object")
+
+    monkeypatch.setattr(fallback.Unpacker, "skip", fail_skip)
+    monkeypatch.setattr(msgpack, "Unpacker", fallback.Unpacker)
+    path = tmp_path / "large_extra_object.msgpack"
+    path.write_bytes(msgpack.packb({}, use_bin_type=True) + msgpack.packb([0] * 100, use_bin_type=True))
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_stream_objects": 1}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "msgpack_stream_object_limit_exceeded"
+    assert not [check for check in result.checks if check.name == "Msgpack Parse Check"]
+
+
+@pytest.mark.parametrize(
+    "trailer",
+    [
+        pytest.param(b"\x92\x01", id="partial-array-body"),
+        pytest.param(b"\x81\xa1k", id="partial-map-body"),
+    ],
+)
+def test_flax_msgpack_stream_object_limit_reports_unvalidated_container_trailer(
+    tmp_path: Path,
+    trailer: bytes,
+) -> None:
+    path = tmp_path / "unvalidated_container_at_object_limit.msgpack"
+    path.write_bytes(msgpack.packb({}, use_bin_type=True) + trailer)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_stream_objects": 1}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "msgpack_stream_object_limit_exceeded"
+    limit_check = next(check for check in result.checks if check.name == "Msgpack Stream Object Limit")
+    assert "unvalidated trailing data" in limit_check.message
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param("x" * 17, id="string"),
+        pytest.param(b"x" * 17, id="binary"),
+        pytest.param(msgpack.ExtType(1, b"x" * 17), id="extension"),
+    ],
+)
+def test_flax_msgpack_fails_closed_before_stringifying_oversized_map_key(tmp_path: Path, key: object) -> None:
+    path = tmp_path / "oversized_key.msgpack"
+    create_msgpack_file(path, {key: 0})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_key_length": 16}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.DECODE_LIMIT_INCONCLUSIVE_REASON]
+    decode_check = next(check for check in result.checks if check.name == "Msgpack Decode Budget")
+    assert "map key length 17 exceeds max_msgpack_key_length(16)" in decode_check.details["error"]
+
+
+def test_flax_msgpack_oversized_map_key_is_rejected_before_unpack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback = pytest.importorskip("msgpack.fallback")
+
+    def fail_unpack(_self: Any) -> object:
+        raise AssertionError("oversized map key must be rejected before scalar materialization")
+
+    monkeypatch.setattr(fallback.Unpacker, "unpack", fail_unpack)
+    monkeypatch.setattr(msgpack, "Unpacker", fallback.Unpacker)
+    path = tmp_path / "oversized_key_preflight.msgpack"
+    create_msgpack_file(path, {b"x" * 17: 0})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_key_length": 16}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.DECODE_LIMIT_INCONCLUSIVE_REASON]
+    assert not [check for check in result.checks if check.name == "Msgpack Parse Check"]
+
+
+def test_flax_msgpack_accepts_map_key_at_length_limit(tmp_path: Path) -> None:
+    path = tmp_path / "bounded_key.msgpack"
+    create_msgpack_file(path, {"params": {b"x" * 16: 0}})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_key_length": 16}).scan(str(path))
+
+    assert result.success is True
 
 
 def test_flax_msgpack_streaming_decode_does_not_call_unpackb(

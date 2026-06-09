@@ -33,6 +33,7 @@ _MAX_STREAM_SEQUENCE_EVIDENCE = 64
 _STREAM_MARKER_CHUNK_BYTES = 64 * 1024
 _STREAM_TEXT_CHUNK_BYTES = 64 * 1024
 _STREAM_TEXT_OVERLAP_CHARS = 4096
+_DEFAULT_MAX_STREAM_KEY_LENGTH = 1024 * 1024
 _UNBOUNDED_GETATTR_PATTERN = r"getattr\s*\(\s*.*\s*,\s*['\"]__.*__['\"]"
 _WHITESPACE_RUN_PATTERN = re.compile(r"\s+")
 _JAX_TRANSFORM_DEDUP_METADATA_KEY = "flax_msgpack_jax_transform_findings"
@@ -69,10 +70,10 @@ class _StreamMarkerReader:
     chunk_start: int = -1
     chunk: bytes = b""
 
-    def peek(self, offset: int) -> int | None:
+    def read(self, offset: int, max_bytes: int) -> bytes:
         chunk_offset = offset - self.chunk_start
-        if 0 <= chunk_offset < len(self.chunk):
-            return self.chunk[chunk_offset]
+        if chunk_offset >= 0 and chunk_offset + max_bytes <= len(self.chunk):
+            return self.chunk[chunk_offset : chunk_offset + max_bytes]
 
         source_offset = self.source.tell()
         try:
@@ -81,7 +82,11 @@ class _StreamMarkerReader:
             self.chunk = self.source.read(_STREAM_MARKER_CHUNK_BYTES)
         finally:
             self.source.seek(source_offset)
-        return self.chunk[0] if self.chunk else None
+        return self.chunk[:max_bytes]
+
+    def peek(self, offset: int) -> int | None:
+        prefix = self.read(offset, 1)
+        return prefix[0] if prefix else None
 
 
 @dataclass
@@ -115,6 +120,54 @@ class _FlaxStreamSummary:
     embedding_evidence: list[str] = field(default_factory=list)
     suspicious_tensor_count: int = 0
     bounded_text_chars: int = 0
+
+
+_MSGPACK_MARKER_HEADER_BYTES = {
+    0xC4: 2,
+    0xC5: 3,
+    0xC6: 5,
+    0xC7: 3,
+    0xC8: 4,
+    0xC9: 6,
+    0xCA: 5,
+    0xCB: 9,
+    0xCC: 2,
+    0xCD: 3,
+    0xCE: 5,
+    0xCF: 9,
+    0xD0: 2,
+    0xD1: 3,
+    0xD2: 5,
+    0xD3: 9,
+    0xD4: 2,
+    0xD5: 2,
+    0xD6: 2,
+    0xD7: 2,
+    0xD8: 2,
+    0xD9: 2,
+    0xDA: 3,
+    0xDB: 5,
+    0xDC: 3,
+    0xDD: 5,
+    0xDE: 3,
+    0xDF: 5,
+}
+
+
+def _msgpack_marker_header_bytes(marker: int) -> int:
+    return _MSGPACK_MARKER_HEADER_BYTES.get(marker, 1)
+
+
+def _msgpack_declared_data_bytes(marker: int, prefix: bytes) -> int | None:
+    if 0xA0 <= marker <= 0xBF:
+        return marker & 0x1F
+    if marker in {0xC4, 0xC7, 0xD9} and len(prefix) >= 2:
+        return prefix[1]
+    if marker in {0xC5, 0xC8, 0xDA} and len(prefix) >= 3:
+        return int.from_bytes(prefix[1:3], "big")
+    if marker in {0xC6, 0xC9, 0xDB} and len(prefix) >= 5:
+        return int.from_bytes(prefix[1:5], "big")
+    return {0xD4: 1, 0xD5: 2, 0xD6: 4, 0xD7: 8, 0xD8: 16}.get(marker)
 
 
 def _matching_jax_transforms(key_str: str, value_str: str) -> list[str]:
@@ -429,6 +482,10 @@ class FlaxMsgpackScanner(BaseScanner):
         self.max_structure_nodes = self._positive_int_config(
             "max_msgpack_structure_nodes",
             self.DEFAULT_MAX_STRUCTURE_NODES,
+        )
+        self.max_stream_key_length = self._positive_int_config(
+            "max_msgpack_key_length",
+            _DEFAULT_MAX_STREAM_KEY_LENGTH,
         )
         self.max_bounded_text_chars = self._positive_int_config(
             "max_msgpack_bounded_text_chars",
@@ -2106,6 +2163,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 "error_type": type(error).__name__,
                 "max_msgpack_decode_bytes": self.max_msgpack_decode_bytes,
                 "max_items_per_container": self.max_items_per_container,
+                "max_msgpack_key_length": self.max_stream_key_length,
             },
         )
         result.finish(success=False)
@@ -2150,7 +2208,10 @@ class FlaxMsgpackScanner(BaseScanner):
         result.add_check(
             name="Msgpack Stream Object Limit",
             passed=False,
-            message=f"Msgpack stream object count exceeds configured limit ({self.max_msgpack_stream_objects})",
+            message=(
+                "Msgpack stream has unvalidated trailing data after the configured object limit "
+                f"({self.max_msgpack_stream_objects})"
+            ),
             severity=IssueSeverity.WARNING,
             location=path,
             details={
@@ -2197,8 +2258,7 @@ class FlaxMsgpackScanner(BaseScanner):
     ) -> _StreamValue:
         if state.node_budget_reported:
             summary.analysis_complete = False
-            unpacker.skip()
-            return _StreamValue("skipped")
+            raise _StreamCoverageStopped
         if count_node:
             state.nodes += 1
         if count_node and state.nodes > state.max_nodes:
@@ -2212,8 +2272,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     maximum=state.max_nodes,
                 )
                 state.node_budget_reported = True
-            unpacker.skip()
-            return _StreamValue("skipped")
+            raise _StreamCoverageStopped
 
         if depth > self.max_recursion_depth:
             summary.analysis_complete = False
@@ -2235,8 +2294,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     details={"depth": depth, "max_allowed": self.max_recursion_depth},
                 )
                 state.recursion_limit_reported = True
-            unpacker.skip()
-            return _StreamValue("skipped")
+            raise _StreamCoverageStopped
 
         marker = marker_reader.peek(unpacker.tell())
         if marker is not None and (0x80 <= marker <= 0x8F or marker in {0xDE, 0xDF}):
@@ -2286,6 +2344,20 @@ class FlaxMsgpackScanner(BaseScanner):
             }
 
             for index in range(visible_items):
+                key_offset = unpacker.tell()
+                key_prefix = marker_reader.read(key_offset, 6)
+                if key_prefix:
+                    declared_key_length = _msgpack_declared_data_bytes(key_prefix[0], key_prefix)
+                    if declared_key_length is not None and declared_key_length > self.max_stream_key_length:
+                        summary.analysis_complete = False
+                        self._report_stream_decode_limit(
+                            state,
+                            result,
+                            path,
+                            "map key length "
+                            f"{declared_key_length} exceeds max_msgpack_key_length({self.max_stream_key_length})",
+                        )
+                        raise _StreamCoverageStopped
                 key_value = self._read_stream_value(
                     unpacker,
                     marker_reader,
@@ -2301,6 +2373,20 @@ class FlaxMsgpackScanner(BaseScanner):
                 key = key_value.value
                 if key_value.is_container or key_value.type_name == "skipped":
                     key = f"<{key_value.type_name}_key>"
+                key_length: int | None = None
+                if HAS_MSGPACK and isinstance(key, msgpack.ExtType):
+                    key_length = len(key.data)
+                elif isinstance(key, str | bytes | bytearray):
+                    key_length = len(key)
+                if key_length is not None and key_length > self.max_stream_key_length:
+                    summary.analysis_complete = False
+                    self._report_stream_decode_limit(
+                        state,
+                        result,
+                        path,
+                        f"map key length {key_length} exceeds max_msgpack_key_length({self.max_stream_key_length})",
+                    )
+                    raise _StreamCoverageStopped
                 key_str, safe_key_str = self._analyze_stream_key(key, location, result, summary)
                 key_text = _text_for_security_matching(key)
                 key_location = f"{location}/{safe_key_str}" if location else safe_key_str
@@ -2455,21 +2541,32 @@ class FlaxMsgpackScanner(BaseScanner):
                 while True:
                     previous_offset = unpacker.tell()
                     if len(object_types) >= self.max_msgpack_stream_objects:
-                        try:
-                            unpacker.skip()
-                        except Exception as error:
-                            if self._is_msgpack_out_of_data(error):
-                                current_offset = unpacker.tell()
-                                if current_offset == previous_offset and previous_offset == stream_size:
-                                    break
-                                self._add_msgpack_truncated_stream_check(
-                                    result,
-                                    path,
-                                    stream_offset=current_offset,
-                                    stream_size=stream_size,
-                                )
-                                return None
-                            raise
+                        if previous_offset == stream_size:
+                            break
+                        marker = marker_reader.peek(previous_offset)
+                        required_header_bytes = 1 if marker is None else _msgpack_marker_header_bytes(marker)
+                        remaining_bytes = stream_size - previous_offset
+                        marker_prefix = marker_reader.read(previous_offset, required_header_bytes)
+                        declared_data_bytes = (
+                            None if marker is None else _msgpack_declared_data_bytes(marker, marker_prefix)
+                        )
+                        scalar_is_truncated = (
+                            declared_data_bytes is not None
+                            and remaining_bytes < required_header_bytes + declared_data_bytes
+                        )
+                        if (
+                            marker is None
+                            or marker == 0xC1
+                            or remaining_bytes < required_header_bytes
+                            or scalar_is_truncated
+                        ):
+                            self._add_msgpack_truncated_stream_check(
+                                result,
+                                path,
+                                stream_offset=previous_offset,
+                                stream_size=stream_size,
+                            )
+                            return None
                         self._add_msgpack_stream_object_limit_check(result, path, len(object_types))
                         return None
 
@@ -2506,6 +2603,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     if object_index == 0:
                         primary_summary.top_level_type = value.type_name
         except _StreamCoverageStopped:
+            result.finish(success=False)
             return None
         except Exception as error:
             if self._is_msgpack_limit_error(error):
