@@ -81,6 +81,13 @@ class _CountingBytesIO(io.BytesIO):
         return chunk
 
 
+class _NoTailSeekCountingBytesIO(_CountingBytesIO):
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        if whence == os.SEEK_END:
+            raise OSError("end-relative seek is unavailable")
+        return super().seek(offset, whence)
+
+
 def make_tar_payload() -> bytes:
     payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
     output = io.BytesIO()
@@ -1431,6 +1438,79 @@ def test_filter_scannable_cloud_files_skips_complete_benign_content_at_exact_sni
     files = [{"path": url, "name": "preview.payload", "size": len(payload), "human_size": "8 B"}]
 
     assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=len(payload)) == []
+    assert transferred == [len(payload)]
+
+
+def test_filter_scannable_cloud_files_routes_protocolless_pickle_at_exact_sniff_budget() -> None:
+    url = "s3://bucket/models/evil.payload"
+    payload = b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94\x8c\x02id\x94\x85\x94R\x94."
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
+    files = [{"path": url, "name": "evil.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=len(payload)) == [
+        {**files[0], "content_detected_format": "pickle"}
+    ]
+    assert transferred == [len(payload)]
+
+
+def test_filter_scannable_cloud_files_reclassifies_complete_benign_content_beyond_initial_prefix() -> None:
+    url = "s3://bucket/models/preview.payload"
+    sniff_budget = _CLOUD_CONTENT_SNIFF_BYTES + 32
+    string_size = sniff_budget - 12
+    payload = b"\x88\x89\x8d" + struct.pack("<Q", string_size) + b"a" * string_size + b"."
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
+    files = [{"path": url, "name": "preview.payload", "size": 1, "human_size": "1 B"}]
+
+    assert len(payload) == sniff_budget
+    assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=sniff_budget) == []
+    assert transferred == [len(payload)]
+
+
+def test_filter_scannable_cloud_files_routes_large_protocolless_pickle_at_exact_sniff_budget() -> None:
+    url = "s3://bucket/models/evil.payload"
+    pickle_payload = b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94\x8c\x02id\x94\x85\x94R\x94."
+    sniff_budget = _CLOUD_CONTENT_SNIFF_BYTES + 32
+    payload = pickle_payload + b"x" * (sniff_budget - len(pickle_payload))
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _CountingBytesIO(payload, transferred)
+    files = [{"path": url, "name": "evil.payload", "size": 1, "human_size": "1 B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=sniff_budget) == [
+        {**files[0], "content_detected_format": "pickle"}
+    ]
+    assert transferred == [len(payload)]
+
+
+def test_filter_scannable_cloud_files_keeps_pickle_route_without_tail_seek() -> None:
+    url = "s3://bucket/models/evil.payload"
+    payload = b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94\x8c\x02id\x94\x85\x94R\x94."
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _NoTailSeekCountingBytesIO(payload, transferred)
+    files = [{"path": url, "name": "evil.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
+
+    assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=len(payload)) == [
+        {**files[0], "content_detected_format": "pickle"}
+    ]
+    assert transferred == [len(payload)]
+
+
+def test_filter_scannable_cloud_files_fails_closed_for_ambiguous_prefix_without_tail_seek() -> None:
+    url = "s3://bucket/models/preview.payload"
+    payload = b"\x89PNG\r\n\x1a\n"
+    transferred = [0]
+    fs = make_fs_mock()
+    fs.open.side_effect = lambda _path, _mode="rb": _NoTailSeekCountingBytesIO(payload, transferred)
+    files = [{"path": url, "name": "preview.payload", "size": len(payload), "human_size": "8 B"}]
+
+    with pytest.raises(ValueError, match="unable to inspect skipped object"):
+        _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=len(payload))
+
     assert transferred == [len(payload)]
 
 

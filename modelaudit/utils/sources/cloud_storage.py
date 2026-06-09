@@ -1810,6 +1810,7 @@ def _detect_cloud_content_route_format(
     size_is_known = sniff_budget.prefix_is_complete(file_url) if sniff_budget is not None else size < prefix_limit
 
     from modelaudit.utils.file.detection import (
+        PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
         PROTO0_1_MAX_PROBE_BYTES,
         _could_start_proto0_or_1_pickle,
         _is_cntk_signature,
@@ -1870,21 +1871,45 @@ def _detect_cloud_content_route_format(
         pickle_probe_is_prefix=not size_is_known,
     )
     if (
-        detected_format == "pickle"
-        and sniff_budget is not None
-        and sniff_budget.remaining_bytes == 0
+        sniff_budget is not None
         and not size_is_known
-        and _get_cloud_content_size_for_routing(fs, file_url) == len(prefix)
+        and detected_format in {"pickle", PICKLE_ROUTING_INCONCLUSIVE_FORMAT}
     ):
-        detected_format = detect_format_from_magic_bytes(
-            prefix[:4],
-            prefix[:8],
-            prefix[:16],
-            len(prefix),
-            None,
-            pickle_probe_sample=prefix,
-            pickle_probe_is_prefix=False,
-        )
+        cached_prefix = sniff_budget.cached_prefix(file_url)
+        try:
+            proven_size = _get_cloud_content_size_for_routing(fs, file_url)
+        except ValueError:
+            complete_prefix_format = detect_format_from_magic_bytes(
+                cached_prefix[:4],
+                cached_prefix[:8],
+                cached_prefix[:16],
+                len(cached_prefix),
+                None,
+                pickle_probe_sample=cached_prefix,
+                pickle_probe_is_prefix=False,
+            )
+            if complete_prefix_format != "pickle":
+                raise
+            proven_size = None
+        if (
+            proven_size is not None
+            and proven_size >= len(cached_prefix)
+            and proven_size - len(cached_prefix) <= sniff_budget.remaining_bytes
+        ):
+            complete_probe = _read_cloud_content_prefix(fs, file_url, proven_size, sniff_budget)
+            if len(complete_probe) == proven_size:
+                prefix = complete_probe
+                size = proven_size
+                size_is_known = True
+                detected_format = detect_format_from_magic_bytes(
+                    prefix[:4],
+                    prefix[:8],
+                    prefix[:16],
+                    size,
+                    None,
+                    pickle_probe_sample=prefix,
+                    pickle_probe_is_prefix=False,
+                )
     if (
         detected_format == "unknown"
         and prefix[_TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + len(_TFLITE_MAGIC_BYTES)] == _TFLITE_MAGIC_BYTES
@@ -1937,9 +1962,8 @@ def _detect_cloud_content_route_format(
         sniff_budget=sniff_budget,
     )
     if shared_detected_format is None and sniff_budget is not None:
-        if (
+        if size_is_known or (
             sniff_budget.remaining_bytes == 0
-            and not sniff_budget.prefix_is_complete(file_url)
             and _get_cloud_content_size_for_routing(fs, file_url) == len(sniff_budget.cached_prefix(file_url))
         ):
             return None

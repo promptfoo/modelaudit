@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect operator attrgetter, itemgetter, and methodcaller archive-member Python paths to command execution while preserving benign accessor names
 - redact Keras and TensorFlow scanner detail fields that echo model-controlled configs, code indicators, archive members, and external references.
 - route security-relevant protocol-less binary pickle streams through pickle analysis even when file suffixes are misleading
+- avoid routing complete benign cloud objects as protocol-less pickle prefixes when they exactly consume the content-sniff budget
+- redact proxy and camel-case authorization evidence with scheme-bearing values without hiding benign counters
 - redact folded, placeholder-adjacent, proxy, and camel-case authorization evidence with scheme-bearing values without hiding benign counters
 - bound Keras ZIP config traversal for CVE detectors and fail closed when config.json coverage budgets are exhausted
 - redact MLflow registry, source, telemetry, and client exception credentials before logging, printing, or analytics export
