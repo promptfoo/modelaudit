@@ -464,9 +464,11 @@ def test_loaded_trusted_function_code_mutation_is_not_allowlisted() -> None:
     if baseline is None:
         pytest.skip("tempfile.gettempdir was not loaded before the call-graph trust snapshot")
     assert baseline is not None
-    function = baseline[1][1]
-    if not isinstance(function, FunctionType):
+    function_value = baseline[1][1]
+    if not isinstance(function_value, FunctionType):
         pytest.skip("tempfile.gettempdir was not loaded before the call-graph trust snapshot")
+    assert isinstance(function_value, FunctionType)
+    function = function_value
     original_code = function.__code__
 
     def hostile_gettempdir() -> str:
@@ -666,6 +668,7 @@ def test_loaded_trusted_tempdir_posixpath_regex_cache_transition_remains_allowli
     baseline = call_graph._TRUSTED_LOADED_REFERENCE_BASELINES.get(("tempfile", "gettempdir"))
     if baseline is None:
         pytest.skip("tempfile.gettempdir was not loaded before the call-graph trust snapshot")
+    assert baseline is not None
     assert baseline[2][0][2] is True
     namespace = ModuleType.__getattribute__(posixpath, "__dict__")
     monkeypatch.setitem(namespace, "_varprog", None)
