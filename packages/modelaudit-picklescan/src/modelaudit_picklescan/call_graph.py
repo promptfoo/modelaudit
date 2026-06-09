@@ -8,6 +8,7 @@ import dis
 import hashlib
 import marshal
 import os
+import re
 import stat
 import sys
 import sysconfig
@@ -96,6 +97,7 @@ _MAX_TRUSTED_PTH_BYTES = 64 * 1024
 _MAX_TRUSTED_PTH_PATHS = 64
 _MAX_TRUSTED_REFERENCE_FUNCTIONS = 128
 _MAX_TRUSTED_REFERENCE_GLOBALS = 1024
+_MAX_TRUSTED_SLOT_NAMES = 1024
 _CONTROLLED_GETATTR_DISPATCH_SINK = "builtins.getattr.__call__"
 _IMPORT_EXECUTION_SINK = "builtins.__import__"
 _BUILTIN_MODULE_NAMES = frozenset(sys.builtin_module_names)
@@ -845,6 +847,7 @@ def _trusted_executable_value_snapshot(value: object) -> _TrustedExecutableValue
         ] = []
         for name in global_names:
             global_value = globals_namespace[name]
+            mutable_state_safe = _trusted_mutable_global_state_is_safe(function, name, global_value)
             dependency_snapshots: list[
                 tuple[
                     tuple[str, ...],
@@ -852,7 +855,7 @@ def _trusted_executable_value_snapshot(value: object) -> _TrustedExecutableValue
                     tuple[_RuntimeValueSnapshot, ...],
                 ]
             ] = []
-            for path in attribute_paths.get(name, ()):
+            for path in () if mutable_state_safe else attribute_paths.get(name, ()):
                 resolved, dependency, dispatch_dependencies = _runtime_attribute_path_without_hooks(global_value, path)
                 if not resolved:
                     return _runtime_value_snapshot(value), tuple(referenced_globals), False
@@ -871,7 +874,7 @@ def _trusted_executable_value_snapshot(value: object) -> _TrustedExecutableValue
                     name,
                     _runtime_value_snapshot(global_value),
                     tuple(dependency_snapshots),
-                    _trusted_mutable_global_state_is_safe(function, name, global_value),
+                    mutable_state_safe,
                 )
             )
         referenced_globals.append(
@@ -896,6 +899,11 @@ def _trusted_mutable_global_state_is_safe(function: FunctionType, name: str, val
         and function.__name__ == "_gettempdir"
         and name == "tempdir"
         and (value is None or type(value) is str)
+    ) or (
+        function.__module__ == "posixpath"
+        and function.__name__ == "expandvars"
+        and name in {"_varprog", "_varprogb"}
+        and (value is None or type(value) is re.Pattern)
     )
 
 
@@ -979,12 +987,27 @@ def _trusted_reference_executable_matches_snapshot(
         if base is not expected_base:
             return False
         raw_namespace = type.__getattribute__(base, "__dict__")
-        if raw_namespace.keys() != expected_namespace.keys() or any(
-            not _trusted_executable_value_matches_snapshot(raw_namespace[name], expected_value)
+        if any(
+            name not in raw_namespace
+            or not _trusted_executable_value_matches_snapshot(raw_namespace[name], expected_value)
             for name, expected_value in expected_namespace.items()
+        ) or any(
+            name not in expected_namespace and not _trusted_class_namespace_addition_is_safe(name, member)
+            for name, member in raw_namespace.items()
         ):
             return False
     return True
+
+
+def _trusted_class_namespace_addition_is_safe(name: str, value: object) -> bool:
+    if name != "__slotnames__":
+        return False
+    slot_names = _exact_list_items_without_hooks(value)
+    return (
+        slot_names is not None
+        and len(slot_names) <= _MAX_TRUSTED_SLOT_NAMES
+        and all(type(slot_name) is str for slot_name in slot_names)
+    )
 
 
 def _loaded_module_metadata_matches_spec_without_hooks(

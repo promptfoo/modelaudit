@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import _imp
+import os
+import posixpath
+import re
 import subprocess
 import sys
+import tarfile
+from collections.abc import Iterator
 from importlib.machinery import BuiltinImporter, FileFinder, FrozenImporter, ModuleSpec, PathFinder
 from pathlib import Path
 from types import FunctionType, ModuleType
@@ -458,6 +463,7 @@ def test_loaded_trusted_function_code_mutation_is_not_allowlisted() -> None:
     baseline = call_graph._TRUSTED_LOADED_REFERENCE_BASELINES.get((module, name))
     if baseline is None:
         pytest.skip("tempfile.gettempdir was not loaded before the call-graph trust snapshot")
+    assert baseline is not None
     function = baseline[1][1]
     if not isinstance(function, FunctionType):
         pytest.skip("tempfile.gettempdir was not loaded before the call-graph trust snapshot")
@@ -489,6 +495,7 @@ def test_loaded_trusted_function_global_mutation_is_not_allowlisted(
     baseline = call_graph._TRUSTED_LOADED_REFERENCE_BASELINES.get((module, name))
     if baseline is None:
         pytest.skip("tempfile.gettempdir was not loaded before the call-graph trust snapshot")
+    assert baseline is not None
     loaded_reference = baseline[1][1]
     if not isinstance(loaded_reference, FunctionType):
         pytest.skip("tempfile.gettempdir was not loaded before the call-graph trust snapshot")
@@ -651,6 +658,58 @@ def test_loaded_trusted_tempdir_cache_transition_remains_allowlisted(
     assert call_graph._loaded_trusted_reference_matches_baseline("tempfile", "gettempdir") is True
 
 
+def test_loaded_trusted_tempdir_posixpath_regex_cache_transition_remains_allowlisted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.path is not posixpath:
+        pytest.skip("tempfile does not use posixpath on this platform")
+    baseline = call_graph._TRUSTED_LOADED_REFERENCE_BASELINES.get(("tempfile", "gettempdir"))
+    if baseline is None:
+        pytest.skip("tempfile.gettempdir was not loaded before the call-graph trust snapshot")
+    assert baseline[2][0][2] is True
+    namespace = ModuleType.__getattribute__(posixpath, "__dict__")
+    monkeypatch.setitem(namespace, "_varprog", None)
+    _clear_call_graph_caches()
+
+    initial_report = package_api.scan_bytes(b"ctempfile\ngettempdir\n.", source="tempdir-before-regex.pkl")
+    assert initial_report.verdict == SafetyVerdict.CLEAN
+
+    assert posixpath.expandvars("$MODELAUDIT_MISSING_VARIABLE") == "$MODELAUDIT_MISSING_VARIABLE"
+    assert type(namespace["_varprog"]) is re.Pattern
+    _clear_call_graph_caches()
+    populated_report = package_api.scan_bytes(b"ctempfile\ngettempdir\n.", source="tempdir-after-regex.pkl")
+
+    assert populated_report.verdict == SafetyVerdict.CLEAN
+
+
+def test_loaded_trusted_tempdir_rejects_hostile_posixpath_regex_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.path is not posixpath:
+        pytest.skip("tempfile does not use posixpath on this platform")
+    calls: list[str] = []
+
+    class HostileRegex:
+        def search(self, value: object) -> object:
+            del value
+            calls.append("search")
+            raise AssertionError("hostile regex cache executed")
+
+    namespace = ModuleType.__getattribute__(posixpath, "__dict__")
+    monkeypatch.setitem(namespace, "_varprog", HostileRegex())
+    _clear_call_graph_caches()
+
+    report = package_api.scan_bytes(b"ctempfile\ngettempdir\n.", source="hostile-posixpath-regex.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "tempfile.gettempdir"
+        for finding in report.findings
+    )
+    assert calls == []
+
+
 def test_loaded_trusted_function_builtin_mutation_is_not_allowlisted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -675,6 +734,32 @@ def test_loaded_trusted_function_builtin_mutation_is_not_allowlisted(
     report = package_api.scan_bytes(b"ctempfile\ngettempdir\n)R.", source="mutated-next.pkl")
 
     assert report.verdict == SafetyVerdict.SUSPICIOUS
+
+
+def test_loaded_trusted_class_rejects_hostile_slotnames_cache_without_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = call_graph._TRUSTED_LOADED_REFERENCE_BASELINES.get(("tarfile", "TarInfo"))
+    if baseline is None:
+        pytest.skip("tarfile.TarInfo was not loaded before the call-graph trust snapshot")
+    calls: list[str] = []
+
+    class HostileSlotNames(list[str]):
+        def __iter__(self) -> Iterator[str]:
+            calls.append("__iter__")
+            return super().__iter__()
+
+    monkeypatch.setattr(tarfile.TarInfo, "__slotnames__", HostileSlotNames(), raising=False)
+    _clear_call_graph_caches()
+
+    report = package_api.scan_bytes(b"ctarfile\nTarInfo\n)R.", source="hostile-slotnames.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == "tarfile.TarInfo"
+        for finding in report.findings
+    )
+    assert calls == []
 
 
 def test_loaded_trusted_class_namespace_mutation_is_not_allowlisted() -> None:
