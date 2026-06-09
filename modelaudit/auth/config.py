@@ -9,6 +9,7 @@ from typing import Any, cast
 from urllib.parse import urlparse
 from uuid import uuid4
 
+import idna
 import yaml
 from platformdirs import user_config_dir
 
@@ -40,8 +41,8 @@ def _normalize_api_hostname(hostname: str) -> str:
         return address.compressed
 
     try:
-        ascii_hostname = normalized.encode("idna").decode("ascii")
-    except UnicodeError as error:
+        ascii_hostname = idna.encode(normalized, uts46=True).decode("ascii")
+    except idna.IDNAError as error:
         raise ValueError("Invalid API hostname") from error
 
     labels = ascii_hostname.split(".")

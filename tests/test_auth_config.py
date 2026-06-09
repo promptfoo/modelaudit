@@ -5,6 +5,7 @@ from types import ModuleType
 from typing import Any
 
 import pytest
+import requests
 import yaml
 
 from modelaudit.auth import client as auth_client_module
@@ -285,6 +286,46 @@ def test_validate_api_host_for_bearer_auth_canonicalizes_allowed_ipv6_hosts(
     monkeypatch.setenv("MODELAUDIT_API_ALLOWED_HOSTS", configured_host)
 
     assert auth_config.validate_api_host_for_bearer_auth(api_host) == expected
+
+
+@pytest.mark.parametrize(
+    ("configured_host", "api_host", "expected"),
+    [
+        ("faß.example", "https://faß.example", "https://xn--fa-hia.example"),
+        ("βόλος.example", "https://βόλος.example", "https://xn--nxasmm1c.example"),
+        ("ς.example", "https://ς.example", "https://xn--3xa.example"),
+    ],
+)
+def test_validate_api_host_for_bearer_auth_matches_requests_idna_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_host: str,
+    api_host: str,
+    expected: str,
+) -> None:
+    monkeypatch.setenv("MODELAUDIT_API_ALLOWED_HOSTS", configured_host)
+
+    normalized = auth_config.validate_api_host_for_bearer_auth(api_host)
+
+    assert normalized == expected
+    assert requests.Request("GET", api_host).prepare().url == f"{normalized}/"
+
+
+@pytest.mark.parametrize(
+    ("configured_host", "api_host"),
+    [
+        ("faß.example", "https://fass.example"),
+        ("fass.example", "https://faß.example"),
+    ],
+)
+def test_validate_api_host_for_bearer_auth_does_not_merge_distinct_idna_hosts(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_host: str,
+    api_host: str,
+) -> None:
+    monkeypatch.setenv("MODELAUDIT_API_ALLOWED_HOSTS", configured_host)
+
+    with pytest.raises(ValueError, match="trusted Promptfoo API host"):
+        auth_config.validate_api_host_for_bearer_auth(api_host)
 
 
 def test_validate_api_host_for_bearer_auth_rejects_allowlisted_invalid_ip_literal(
