@@ -182,6 +182,7 @@ HEX_PATTERN = re.compile(r"^[a-fA-F0-9]+$")
 JINJA_TEMPLATE_FIELD_NAMES = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
 JINJA_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
 JINJA_TEMPLATE_COLLECTION_BUDGET_REASON: Final[str] = "manifest_jinja_template_collection_budget_exceeded"
+MANIFEST_SCAN_TIMEOUT_REASON: Final[str] = "manifest_scan_timeout"
 JINJA_TEMPLATE_COLLECTION_MAX_DEPTH_CONFIG_KEY: Final[str] = "jinja_template_collection_max_depth"
 JINJA_TEMPLATE_COLLECTION_MAX_ITEMS_CONFIG_KEY: Final[str] = "jinja_template_collection_max_items"
 DEFAULT_JINJA_TEMPLATE_COLLECTION_MAX_DEPTH: Final[int] = 64
@@ -758,15 +759,22 @@ class ManifestScanner(BaseScanner):
                 self._mark_inconclusive_scan_result(result, "manifest_unsupported_root_type")
 
         except TimeoutError as e:
+            self._mark_inconclusive_scan_result(result, MANIFEST_SCAN_TIMEOUT_REASON)
+            mark_operational_scan_error(result, MANIFEST_SCAN_TIMEOUT_REASON)
             result.add_check(
                 name="Manifest Scan Timeout",
                 passed=False,
                 message=f"Scan timed out: {e!s}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"timeout_seconds": self.timeout},
+                details={
+                    "timeout_seconds": self.timeout,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": MANIFEST_SCAN_TIMEOUT_REASON,
+                },
+                why="Manifest scanning exceeded the configured timeout before all checks completed",
             )
-            result.finish(success=True)
+            self._finish_manifest_result(result)
             return result
         except Exception as e:
             result.add_check(
