@@ -133,6 +133,7 @@ def test_valid_empty_tensor_offsets(tmp_path: Path) -> None:
     assert load_file(str(file_path))["empty"].shape == (0,)
 
     result = SafeTensorsScanner().scan(str(file_path))
+    aggregate = scan_model_directory_or_file(str(file_path))
 
     assert result.success is True
     assert not result.has_errors
@@ -149,6 +150,7 @@ def test_valid_empty_tensor_offsets(tmp_path: Path) -> None:
         and check.status == CheckStatus.PASSED
         for check in result.checks
     )
+    assert determine_exit_code(aggregate) == 0
 
 
 def test_zero_length_offsets_require_empty_shape(tmp_path: Path) -> None:
@@ -160,6 +162,7 @@ def test_zero_length_offsets_require_empty_shape(tmp_path: Path) -> None:
     )
 
     result = SafeTensorsScanner().scan(str(file_path))
+    aggregate = scan_model_directory_or_file(str(file_path))
 
     assert result.success is False
     assert any(
@@ -171,6 +174,7 @@ def test_zero_length_offsets_require_empty_shape(tmp_path: Path) -> None:
         and check.status == CheckStatus.FAILED
         for check in result.checks
     )
+    assert determine_exit_code(aggregate) == 1
 
 
 def test_empty_tensor_offset_sort_matches_safetensors(tmp_path: Path) -> None:
@@ -188,12 +192,14 @@ def test_empty_tensor_offset_sort_matches_safetensors(tmp_path: Path) -> None:
         assert set(handle.keys()) == {"empty", "nonempty"}
 
     result = SafeTensorsScanner().scan(str(file_path))
+    aggregate = scan_model_directory_or_file(str(file_path))
 
     assert result.success is True
     assert result.metadata.get("scan_outcome") != "inconclusive"
     assert not any(
         check.status == CheckStatus.FAILED and check.name == "Offset Continuity Check" for check in result.checks
     )
+    assert determine_exit_code(aggregate) == 0
 
 
 @pytest.mark.parametrize(
