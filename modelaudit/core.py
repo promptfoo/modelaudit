@@ -3587,7 +3587,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         max_zip_entries = ZipScanner.DEFAULT_MAX_ENTRIES
     max_zip_directory_size = ZipScanner.central_directory_size_limit(config)
     if (
-        hdf5_signature_offset is None
+        hdf5_signature_offset in (None, 0)
         and allows_zip_structure_analysis(scanner_selection, path)
         and ZipScanner.requires_preflight_result(
             path,

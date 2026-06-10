@@ -2125,6 +2125,32 @@ def test_scan_file_rejects_over_entry_zip_before_routing_opens_zipfile(
     )
 
 
+def test_scan_file_enforces_zip_entry_preflight_for_offset_zero_hdf5(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    model_path = tmp_path / "appended-over-entry.h5"
+    with h5py.File(model_path, "w") as h5_file:
+        h5_file.attrs["model_config"] = json.dumps({"class_name": "Sequential", "config": {"layers": []}})
+    with zipfile.ZipFile(model_path, "a") as archive:
+        archive.writestr("one.txt", "one")
+        archive.writestr("two.txt", "two")
+
+    assert find_hdf5_signature_offset(str(model_path)) == 0
+
+    result = scan_file(
+        str(model_path),
+        config={"max_zip_entries": 1, "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert any(
+        check.name == "Entry Count Limit Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry_count_source"] == "central_directory_preflight"
+        for check in result.checks
+    )
+
+
 def test_scan_file_selected_keras_still_enforces_zip_entry_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

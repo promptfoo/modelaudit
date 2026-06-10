@@ -103,6 +103,15 @@ _EXPORT_ASSIGNMENT_RE = re.compile(
     r"(?P<separator>\s*(?::|(?<![!<=>])=(?!=)|<<?-)\s*)",
     re.IGNORECASE,
 )
+_EXPORT_COMPARISON_RE = re.compile(
+    r"(?<![0-9A-Za-z_%.-])(?:"
+    rf"(?P<key_escape>\\?)(?P<quote>[\"'])"
+    rf"(?P<quoted_key>{_EXPORT_KEY_TOKEN}(?:{_EXPORT_BRACKET_KEY})*)(?P=key_escape)(?P=quote)"
+    rf"|(?P<key>{_EXPORT_KEY_TOKEN}(?:{_EXPORT_BRACKET_KEY})*))"
+    r"(?P<separator>\s*(?:==|!=|>=|<=)\s*)",
+    re.IGNORECASE,
+)
+_EXPORT_COMPARISON_BARE_LITERAL_RE = re.compile(r"[^\s,;:(){}\[\]\"']+")
 _EXPORT_EQUALS_KEY_RE = re.compile(
     r"(?<![0-9A-Za-z_%.-])(?P<key>[0-9A-Za-z_%.-]+)(?P<separator>\s*=\s*)",
     re.IGNORECASE,
@@ -327,6 +336,8 @@ def _redact_assignments_outside_url_tokens(
     preserve_redacted_assignments: bool,
 ) -> str:
     """Redact free-text assignments after source tokens have been sanitized."""
+    if preserve_redacted_assignments:
+        text = _redact_sensitive_comparison_literals(text)
     return _redact_export_alias_assignments(
         text,
         preserve_redacted_assignments=preserve_redacted_assignments,
@@ -866,6 +877,57 @@ def _redact_export_alias_assignments(
 
     redacted = _EXPORT_OPTION_RE.sub(redact_whitespace_value, redacted)
     return _EXPORT_AUTHORIZATION_RE.sub(redact_whitespace_value, redacted)
+
+
+def _redact_sensitive_comparison_literals(value: str) -> str:
+    """Remove credential-shaped comparison operands from prevalidated evidence."""
+    redacted_parts: list[str] = []
+    previous_end = 0
+    for match in _EXPORT_COMPARISON_RE.finditer(value):
+        if match.start() < previous_end:
+            continue
+        key = match.group("key") or match.group("quoted_key")
+        if not _is_sensitive_export_key(key) or _assignment_value_is_already_redacted(value, match.end()):
+            continue
+        value_end = _comparison_literal_end(value, match.end())
+        if value_end is None:
+            continue
+        redacted_parts.extend((value[previous_end : match.end()], "<redacted>"))
+        previous_end = value_end
+    redacted_parts.append(value[previous_end:])
+    return "".join(redacted_parts)
+
+
+def _comparison_literal_end(value: str, start: int) -> int | None:
+    value_start = start
+    while value_start < len(value) and value[value_start].isspace() and value[value_start] not in "\r\n":
+        value_start += 1
+    prefix_match = re.match(r"(?i:[rubf]{0,3})(?P<quote>[\"'])", value[value_start:])
+    if prefix_match is not None:
+        quote_start = value_start + prefix_match.end() - 1
+        quote_end = _find_comparison_literal_end(value, quote_start, prefix_match.group("quote"))
+        return len(value) if quote_end is None else quote_end
+    bare_literal = _EXPORT_COMPARISON_BARE_LITERAL_RE.match(value, value_start)
+    if bare_literal is None or (bare_literal.end() < len(value) and value[bare_literal.end()] in "([{"):
+        return None
+    return bare_literal.end()
+
+
+def _find_comparison_literal_end(value: str, quote_start: int, quote: str) -> int | None:
+    delimiter = quote * 3 if value.startswith(quote * 3, quote_start) else quote
+    cursor = quote_start + len(delimiter)
+    escaped = False
+    while cursor < len(value):
+        character = value[cursor]
+        if character == "\\":
+            escaped = not escaped
+            cursor += 1
+            continue
+        if not escaped and value.startswith(delimiter, cursor):
+            return cursor + len(delimiter)
+        escaped = False
+        cursor += 1
+    return None
 
 
 def _normalize_encoded_sensitive_assignment_separators(value: str) -> str:
