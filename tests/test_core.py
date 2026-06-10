@@ -589,7 +589,8 @@ def test_directory_scan_applies_file_budgets_before_orbax_owner(
     result = scan_model_directory_or_file(
         str(model_dir),
         cache_scan_results=False,
-        **{budget_name: budget_value},
+        max_file_size=budget_value if budget_name == "max_file_size" else 0,
+        max_total_size=budget_value if budget_name == "max_total_size" else 0,
     )
 
     owner_metadata = result.file_metadata[str(model_dir)]
