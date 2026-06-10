@@ -2065,6 +2065,19 @@ class TestNetworkCommDetector:
         assert "urlopen" in funcs
         assert all(finding.get("position") == data.find(finding["function"].encode()) for finding in func_findings)
 
+    def test_executable_script_network_control_stays_detected(self) -> None:
+        """README calibration must not weaken equivalent executable script findings."""
+        detector = NetworkCommDetector()
+        data = b"""import json, urllib.request
+req = urllib.request.Request("http://127.0.0.1:8080/v1/chat/completions")
+return_value = urllib.request.urlopen(req).read()
+"""
+
+        findings = detector.scan(data, "client.py")
+        actionable_types = {finding["type"] for finding in findings if finding["severity"] in {"HIGH", "CRITICAL"}}
+
+        assert {"network_function", "network_library", "url_detected"} <= actionable_types
+
     def test_network_function_snippets_redact_url_path_tokens(self) -> None:
         """URL-bearing snippets should not leak capability tokens after URL findings are redacted."""
         detector = NetworkCommDetector()

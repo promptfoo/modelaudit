@@ -82,6 +82,10 @@ DOCUMENTATION_EXECUTABLE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN = re.compile(rb"\b(?:href|src)\s*=\s*[\"']?$", re.IGNORECASE)
+DOCUMENTATION_FENCE_LINE_PATTERN = re.compile(
+    rb"^[ \t]{0,3}(?P<marker>`{3,}|~{3,})(?P<suffix>[^\r\n]*)$",
+    re.MULTILINE,
+)
 DOCUMENTATION_CODE_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$")
 DOCUMENTATION_MARKDOWN_PREFIX_PATTERN = re.compile(rb"(?:(?:[-*+>]|[0-9]{1,9}[.)])\s+){1,8}")
 DOCUMENTATION_CONFIG_NETWORK_KEY = rb"(?:endpoint|callback|webhook)(?:s|[_-][A-Za-z0-9_.-]{1,128}|(?:url|uri)s?)?"
@@ -1199,6 +1203,35 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
+    def _documentation_fenced_code_ranges(payload: bytes) -> tuple[tuple[int, int], ...]:
+        ranges: list[tuple[int, int]] = []
+        opening_marker: bytes | None = None
+        content_start = 0
+        for match in DOCUMENTATION_FENCE_LINE_PATTERN.finditer(payload):
+            marker = match.group("marker")
+            suffix = match.group("suffix")
+            line_end = payload.find(b"\n", match.end())
+            next_line_start = len(payload) if line_end < 0 else line_end + 1
+            if opening_marker is None:
+                opening_marker = marker
+                content_start = next_line_start
+                continue
+            if marker[:1] != opening_marker[:1] or len(marker) < len(opening_marker) or suffix.strip():
+                continue
+            ranges.append((content_start, match.start()))
+            opening_marker = None
+        if opening_marker is not None:
+            ranges.append((content_start, len(payload)))
+        return tuple(ranges)
+
+    @staticmethod
+    def _documentation_position_is_fenced_code(
+        position: int,
+        fenced_code_ranges: tuple[tuple[int, int], ...],
+    ) -> bool:
+        return any(start <= position < end for start, end in fenced_code_ranges)
+
+    @staticmethod
     def _documentation_finding_tokens(finding: dict[str, Any]) -> tuple[bytes, ...]:
         finding_type = finding.get("type")
         if finding_type == "network_function":
@@ -1240,6 +1273,7 @@ class TextScanner(BaseScanner):
         payload: bytes,
         lowered_payload: bytes,
         finding: dict[str, Any],
+        fenced_code_ranges: tuple[tuple[int, int], ...],
         remaining_occurrences: int,
         allow_exhaustion_probe: bool,
     ) -> tuple[dict[str, Any], bool, int]:
@@ -1277,7 +1311,9 @@ class TextScanner(BaseScanner):
             candidate = {**finding, "position": position}
             if finding_type == "network_library":
                 candidate["pattern"] = token_bytes.decode()
-            if cls._documentation_comment_contains_position(payload, position):
+            if cls._documentation_comment_contains_position(
+                payload, position
+            ) or cls._documentation_position_is_fenced_code(position, fenced_code_ranges):
                 actionable = False
             elif finding_type == "network_function":
                 actionable = not cls._documentation_network_function_is_prose(payload, candidate)
@@ -1511,11 +1547,14 @@ class TextScanner(BaseScanner):
         path: str,
         payload: bytes,
         finding: dict[str, Any],
+        fenced_code_ranges: tuple[tuple[int, int], ...] = (),
     ) -> bool:
         if cls._is_documentation_sidecar(path):
             finding_type = finding.get("type")
             position = finding.get("position")
             if isinstance(position, int) and cls._documentation_comment_contains_position(payload, position):
+                return True
+            if isinstance(position, int) and cls._documentation_position_is_fenced_code(position, fenced_code_ranges):
                 return True
             return (
                 (
@@ -1552,6 +1591,7 @@ class TextScanner(BaseScanner):
         remaining_occurrences = MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES
         documentation_sidecar = cls._is_documentation_sidecar(path)
         lowered_payload = payload.lower() if documentation_sidecar else b""
+        fenced_code_ranges = cls._documentation_fenced_code_ranges(payload) if documentation_sidecar else ()
         last_retargetable_index = max(
             (index for index, finding in enumerate(findings) if cls._documentation_finding_tokens(finding)),
             default=-1,
@@ -1563,11 +1603,17 @@ class TextScanner(BaseScanner):
                     payload,
                     lowered_payload,
                     finding,
+                    fenced_code_ranges,
                     remaining_occurrences,
                     index == last_retargetable_index,
                 )
                 classification_incomplete = classification_incomplete or retarget_incomplete
-            if not retarget_incomplete and cls._sidecar_network_finding_is_informational(path, payload, finding):
+            if not retarget_incomplete and cls._sidecar_network_finding_is_informational(
+                path,
+                payload,
+                finding,
+                fenced_code_ranges,
+            ):
                 finding = {**finding, "severity": "INFO"}
             classified_findings.append(finding)
         return classified_findings, classification_incomplete
