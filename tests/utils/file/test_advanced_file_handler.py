@@ -1679,6 +1679,7 @@ class TestAdvancedFileHandler:
     def test_cached_advanced_scan_keys_selected_model_config(
         self,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Adding, changing, or removing the selected config must select matching shard results."""
         shard_one = tmp_path / "checkpoint_1.pt"
@@ -1698,6 +1699,10 @@ class TestAdvancedFileHandler:
                 scanned_paths.append(shard_path)
                 return super().scan(shard_path)
 
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers._supports_reliable_shard_cache_identity",
+            lambda: True,
+        )
         scanner = RecordingShardScanner({"cache_enabled": True, "cache_dir": str(tmp_path / "cache")})
 
         reset_cache_manager()
