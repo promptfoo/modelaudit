@@ -405,8 +405,8 @@ def test_partial_hdf5_weight_extraction_preserves_analyzed_findings(tmp_path: Pa
     import numpy as np
 
     path = tmp_path / "partial_external_weights.h5"
-    anomalous_weights = np.zeros((2, 10), dtype=np.float32)
-    anomalous_weights[0, 0] = 1000.0
+    anomalous_weights = np.zeros((100, 10), dtype=np.float32)
+    anomalous_weights[50:55, 0] = 1000.0
 
     with h5py.File(path, "w") as hdf5_file:
         hdf5_file.create_dataset("model_weights/a_dense/weight:0", data=anomalous_weights)
@@ -1294,6 +1294,14 @@ def test_onnx_external_and_unknown_initializers_fail_closed_before_materializati
             external_data=[],
         ),
         types.SimpleNamespace(
+            name="stale_external_metadata_weight",
+            dims=[2, 2],
+            data_type=1,
+            data_location=0,
+            external_data=[object()],
+            raw_data=b"x" * 16,
+        ),
+        types.SimpleNamespace(
             name="custom_numeric_weight",
             dims=[2, 2],
             data_type=16,
@@ -1326,8 +1334,8 @@ def test_onnx_external_and_unknown_initializers_fail_closed_before_materializati
     scanner = WeightDistributionScanner()
     weights = scanner._extract_onnx_weights(str(path))
 
-    assert list(weights) == ["valid_weight", "custom_numeric_weight"]
-    assert materialized == ["valid_weight", "custom_numeric_weight"]
+    assert list(weights) == ["valid_weight", "stale_external_metadata_weight", "custom_numeric_weight"]
+    assert materialized == ["valid_weight", "stale_external_metadata_weight", "custom_numeric_weight"]
     assert scanner.extraction_incomplete_reasons == [
         "onnx_external_initializer_skipped",
         "onnx_initializer_size_limit",
@@ -1436,6 +1444,44 @@ class TestWeightDistributionScanner:
         assert scanner.weight_magnitude_threshold == 2.0
         assert scanner.max_array_size == 50 * 1024 * 1024
 
+    def test_onnx_semantic_views_count_physical_initializer_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import numpy as np
+
+        weights = np.broadcast_to(np.asarray(0.0, dtype=np.float32), (5120, 5120))
+        specs = [
+            types.SimpleNamespace(
+                initializer_index=7,
+                analysis_id=analysis_id,
+                weights=weights,
+                output_axes=(output_axis,),
+                matrix_analysis=True,
+                context={"initializer": "embedding"},
+            )
+            for analysis_id, output_axis in enumerate((0, 1))
+        ]
+        captured_architectures: list[dict[str, Any]] = []
+        scanner = WeightDistributionScanner()
+
+        def capture_architecture(
+            _layer_name: str,
+            _weights: Any,
+            architecture_analysis: dict[str, Any],
+        ) -> list[dict[str, Any]]:
+            captured_architectures.append(dict(architecture_analysis))
+            return []
+
+        monkeypatch.setattr(scanner, "_analyze_layer_weights", capture_architecture)
+
+        assert scanner._analyze_onnx_weight_specs(specs) == []
+        assert len(captured_architectures) == 2
+        for architecture in captured_architectures:
+            assert architecture["total_parameters"] == 5120 * 5120
+            assert architecture["layer_count"] == 1
+            assert architecture["is_likely_llm"] is False
+
     def test_numeric_byte_limit_config_is_coerced(self) -> None:
         import numpy as np
 
@@ -1449,7 +1495,10 @@ class TestWeightDistributionScanner:
         assert scanner._max_tensor_bytes() == 1
         assert scanner._max_total_tensor_bytes() == 32
 
-    @pytest.mark.parametrize("invalid_limit", [True, False, "unbounded", -1, float("inf"), float("nan")])
+    @pytest.mark.parametrize(
+        "invalid_limit",
+        [True, False, "unbounded", -1, float("inf"), float("nan"), pytest.param(10**1000, id="oversized-integer")],
+    )
     def test_invalid_tensor_byte_limit_uses_secure_default(self, invalid_limit: Any) -> None:
         scanner = WeightDistributionScanner({"max_array_size": invalid_limit})
 
@@ -1562,7 +1611,19 @@ class TestWeightDistributionScanner:
         assert dissimilar_anomaly is not None
         assert dissimilar_anomaly["details"]["neuron_index"] == 9
 
-    def test_analyze_layer_weights_extreme_values(self):
+    def test_analyze_layer_weights_ignores_fully_dissimilar_small_head(self) -> None:
+        import numpy as np
+
+        weights = np.eye(3, dtype=np.float32)
+        anomalies = WeightDistributionScanner()._analyze_layer_weights(
+            "three_class_head",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        assert not any("dissimilar weights" in anomaly["description"] for anomaly in anomalies)
+
+    def test_analyze_layer_weights_extreme_values(self) -> None:
         """Test detection of extreme weight values"""
         import numpy as np
 
@@ -1585,6 +1646,481 @@ class TestWeightDistributionScanner:
         )
         assert extreme_anomaly is not None
         assert 3 in extreme_anomaly["details"]["affected_neurons"]
+        assert extreme_anomaly["details"]["num_extreme_weights"] == 5
+        assert extreme_anomaly["details"]["max_extreme_weights_per_output"] == 5
+        assert extreme_anomaly["details"]["threshold_scope"] == "per_output"
+
+    def test_extreme_value_check_ignores_ordinary_gaussian_tails(self) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.random.default_rng(20260609).normal(size=(2, 384))
+
+        anomalies = scanner._analyze_layer_weights(
+            "ordinary_projection",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        assert not any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
+
+    def test_extreme_value_check_requires_repeated_values_per_output(self) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50, 3] = 100.0
+
+        anomalies = scanner._analyze_layer_weights(
+            "single_scalar",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        assert not any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
+
+    def test_extreme_value_check_detects_small_binary_head_with_contaminated_threshold(self) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((50, 2), dtype=np.float32)
+        weights[:5, 0] = 1_000_000.0
+
+        anomalies = scanner._analyze_layer_weights(
+            "small_binary_head",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
+        assert extreme["details"]["affected_neurons"] == [0]
+        assert extreme["details"]["max_to_threshold_ratio"] < 2.0
+        assert extreme["details"]["per_output_evidence"][0]["detection_path"] == "robust_small_tensor_fallback"
+
+    def test_extreme_value_check_ignores_nonqualifying_decoy_output(self) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+        weights[0, 4] = 3.0
+
+        anomalies = scanner._analyze_layer_weights(
+            "decoy_output",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
+        assert extreme["details"]["affected_neurons"] == [3]
+        assert extreme["details"]["num_extreme_weights"] == 5
+
+    def test_extreme_value_check_detects_target_despite_larger_decoy_output(self) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+        weights[0, 4] = 1_000_000.0
+
+        anomalies = scanner._analyze_layer_weights(
+            "large_decoy_output",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
+        assert extreme["details"]["affected_neurons"] == [3]
+        assert extreme["details"]["total_affected"] == 1
+
+    def test_extreme_value_check_detects_target_despite_two_value_decoy_output(self) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+        weights[60:62, 4] = 10.0
+
+        anomalies = scanner._analyze_layer_weights(
+            "two_value_decoy_output",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
+        assert extreme["details"]["affected_neurons"] == [3]
+        assert extreme["details"]["total_affected"] == 1
+        assert extreme["details"]["tail_affected_outputs"] == 2
+        assert extreme["details"]["localized"] is True
+
+    def test_extreme_value_conditions_cannot_mix_across_outputs(self) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((100, 2000), dtype=np.float32)
+        weights[0, 0] = 100.0
+        weights[0:2, 1] = 0.70
+
+        anomalies = scanner._analyze_layer_weights(
+            "cross_output_mismatch",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        assert not any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
+
+    def test_extreme_value_check_reports_two_poisoned_outputs_as_nonlocalized(self) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+        weights[60:65, 4] = 10.0
+
+        anomalies = scanner._analyze_layer_weights(
+            "two_affected_outputs",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
+        assert extreme["details"]["affected_neurons"] == [3, 4]
+        assert extreme["details"]["total_affected"] == 2
+        assert extreme["details"]["affected_output_limit"] == 1
+        assert extreme["details"]["localized"] is False
+
+    def test_extreme_value_check_ignores_two_value_material_tail(self) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50:52, 3] = 10.0
+
+        anomalies = scanner._analyze_layer_weights(
+            "two_repeated_values",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        assert not any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
+
+    def test_extreme_value_check_preserves_five_value_material_effect(self) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+
+        anomalies = scanner._analyze_layer_weights(
+            "five_repeated_values",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
+        assert extreme["details"]["affected_neurons"] == [3]
+        assert extreme["details"]["minimum_extreme_weights_per_output"] == 5
+
+    def test_extreme_value_check_ignores_nonzero_constant_matrix(self) -> None:
+        import numpy as np
+
+        weights = np.full((100, 10), 3.0, dtype=np.float32)
+
+        anomalies = WeightDistributionScanner()._analyze_layer_weights(
+            "constant_matrix",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        assert not any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
+
+    def test_extreme_value_check_does_not_count_constant_outputs_as_robust_tails(self) -> None:
+        import numpy as np
+
+        weights = np.ones((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+
+        anomalies = WeightDistributionScanner()._analyze_layer_weights(
+            "constant_outputs_with_target",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
+        assert extreme["details"]["affected_neurons"] == [3]
+        assert extreme["details"]["tail_affected_outputs"] == 1
+        evidence = extreme["details"]["per_output_evidence"][0]
+        assert evidence["robust_count"] == 5
+        assert evidence["robust_support_count"] == 5
+
+    def test_extreme_value_check_preserves_sampled_zero_mad_plateau(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import numpy as np
+
+        monkeypatch.setattr(
+            "modelaudit.scanners.weight_distribution_scanner._EXTREME_WEIGHT_ROBUST_SAMPLE_SIZE",
+            32,
+        )
+        weights = np.zeros((352, 1), dtype=np.float32)
+        weights[::11, 0] = 10_000.0
+
+        anomalies = WeightDistributionScanner()._analyze_tensor_weight_extremes(
+            "sampled_zero_mad_plateau",
+            weights,
+            output_axes=(1,),
+        )
+
+        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
+        evidence = extreme["details"]["per_output_evidence"][0]
+        assert evidence["robust_median_magnitude"] == 10_000.0
+        assert evidence["robust_mad_scale"] == 0.0
+        assert evidence["robust_count"] == 32
+
+    def test_extreme_value_check_detects_single_output_with_contaminated_threshold(self) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((50, 1), dtype=np.float64)
+        weights[:5, 0] = 10.0
+
+        anomalies = scanner._analyze_tensor_weight_extremes(
+            "single_output_contaminated_threshold",
+            weights,
+            output_axes=(1,),
+        )
+
+        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
+        assert extreme["details"]["affected_neurons"] == [0]
+        assert extreme["details"]["per_output_evidence"][0]["detection_path"] == "robust_small_tensor_fallback"
+
+    @pytest.mark.parametrize("nonfinite_value", [float("nan"), float("inf"), float("-inf")])
+    def test_extreme_value_check_reports_nonfinite_without_suppressing_finite_target(
+        self,
+        nonfinite_value: float,
+    ) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((100, 10), dtype=np.float64)
+        weights[50:55, 3] = 10.0
+        weights[0, 4] = nonfinite_value
+
+        anomalies = scanner._analyze_tensor_weight_extremes(
+            "nonfinite_decoy",
+            weights,
+            output_axes=(1,),
+        )
+
+        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
+        assert extreme["details"]["affected_neurons"] == [3, 4]
+        assert extreme["details"]["num_nonfinite_weights"] == 1
+        assert extreme["details"]["per_output_evidence"][1]["detection_path"] == "nonfinite_values"
+
+    def test_extreme_value_check_handles_finite_float64_square_overflow(self) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((100, 10), dtype=np.float64)
+        weights[50:55, 3] = 1e154
+
+        anomalies = scanner._analyze_tensor_weight_extremes(
+            "finite_float64_extremes",
+            weights,
+            output_axes=(1,),
+        )
+
+        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
+        assert extreme["details"]["affected_neurons"] == [3]
+        assert np.isfinite(extreme["details"]["threshold"])
+
+    def test_extreme_value_check_handles_signed_integer_minimum(self) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((100, 10), dtype=np.int64)
+        weights[50:55, 3] = np.iinfo(np.int64).min
+
+        anomalies = scanner._analyze_tensor_weight_extremes(
+            "signed_integer_minimum",
+            weights,
+            output_axes=(1,),
+        )
+
+        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
+        assert extreme["details"]["affected_neurons"] == [3]
+        assert extreme["details"]["max_weight"] > 0
+
+    @pytest.mark.parametrize(
+        ("degrees_of_freedom", "seed", "shape"),
+        [
+            (3, 94, (50, 2)),
+            (5, 26, (50, 2)),
+            (7, 785, (50, 2)),
+            (3, 3, (256, 64)),
+            (3, 22, (512, 64)),
+            (3, 1, (1024, 64)),
+        ],
+    )
+    def test_extreme_value_check_ignores_deterministic_clean_heavy_tails(
+        self,
+        degrees_of_freedom: int,
+        seed: int,
+        shape: tuple[int, int],
+    ) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.random.default_rng(seed).standard_t(degrees_of_freedom, size=shape)
+
+        anomalies = scanner._analyze_layer_weights(
+            f"clean_student_t_df{degrees_of_freedom}",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        assert not any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
+
+    @pytest.mark.parametrize(
+        ("seed", "shape"),
+        [(1, (256, 64)), (2, (256, 64)), (25, (512, 64)), (48, (128, 512))],
+    )
+    def test_extreme_value_check_ignores_deterministic_clean_lognormal_tails(
+        self,
+        seed: int,
+        shape: tuple[int, int],
+    ) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.random.default_rng(seed).lognormal(size=shape)
+
+        anomalies = scanner._analyze_layer_weights(
+            "clean_lognormal",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        assert not any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
+
+    @pytest.mark.parametrize("distribution", ["student_t", "lognormal"])
+    def test_extreme_value_check_ignores_large_clean_single_output_heavy_tail(
+        self,
+        distribution: str,
+    ) -> None:
+        import numpy as np
+
+        random = np.random.default_rng(12345)
+        if distribution == "student_t":
+            weights = random.standard_t(3, size=(100_000, 1))
+        else:
+            weights = random.lognormal(size=(100_000, 1))
+
+        anomalies = WeightDistributionScanner()._analyze_tensor_weight_extremes(
+            f"clean_{distribution}",
+            weights,
+            output_axes=(1,),
+        )
+
+        assert not any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
+
+    @pytest.mark.parametrize("sample_offset", [0, 1])
+    def test_extreme_value_check_cannot_be_evaded_by_regular_sample_alignment(self, sample_offset: int) -> None:
+        import numpy as np
+
+        weights = np.zeros((262_144 * 11, 1), dtype=np.float32)
+        sampled_tail = weights[sample_offset::11, 0]
+        sampled_tail[:] = np.linspace(9_000.0, 10_000.0, sampled_tail.size, dtype=np.float32)
+
+        anomalies = WeightDistributionScanner()._analyze_tensor_weight_extremes(
+            "sample_alignment",
+            weights,
+            output_axes=(1,),
+        )
+
+        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
+        assert extreme["details"]["affected_neurons"] == [0]
+
+    def test_tensor_extreme_analysis_batches_noncontiguous_output_prefixes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import numpy as np
+
+        weights = np.zeros((2, 100, 6_000), dtype=np.float32)
+        weights[1, 50:55, 777] = 10_000.0
+
+        def fail_unravel_index(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("output prefixes should be processed in bounded blocks")
+
+        monkeypatch.setattr(np, "unravel_index", fail_unravel_index)
+
+        anomalies = WeightDistributionScanner()._analyze_tensor_weight_extremes(
+            "noncontiguous_output_prefixes",
+            weights,
+            output_axes=(0, 2),
+        )
+
+        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
+        assert extreme["details"]["affected_neurons"] == [6_777]
+
+    def test_tensor_extreme_analysis_bounds_temporary_chunks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((1024, 4096), dtype=np.float32)
+        weights[:5, 3] = 1_000_000.0
+        original_absolute = np.absolute
+        work_buffer_sizes: list[int] = []
+
+        def tracked_absolute(value: Any, *args: Any, **kwargs: Any) -> Any:
+            output = kwargs.get("out")
+            if output is not None:
+                work_buffer_sizes.append(int(getattr(output, "nbytes", 0)))
+            return original_absolute(value, *args, **kwargs)
+
+        monkeypatch.setattr(np, "absolute", tracked_absolute)
+        anomalies = scanner._analyze_tensor_weight_extremes("large_tensor", weights, output_axes=(1,))
+
+        assert any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
+        assert max(work_buffer_sizes) <= 8 * 1024 * 1024
+
+    def test_tensor_extreme_analysis_chunks_single_wide_output(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((1_100_000, 1), dtype=np.float32)
+        weights[:5, 0] = 1_000_000.0
+        original_absolute = np.absolute
+        work_buffer_sizes: list[int] = []
+
+        def tracked_absolute(value: Any, *args: Any, **kwargs: Any) -> Any:
+            output = kwargs.get("out")
+            if output is not None:
+                work_buffer_sizes.append(int(getattr(output, "nbytes", 0)))
+            return original_absolute(value, *args, **kwargs)
+
+        monkeypatch.setattr(np, "absolute", tracked_absolute)
+        anomalies = scanner._analyze_tensor_weight_extremes("wide_output", weights, output_axes=(1,))
+
+        assert any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
+        assert len(work_buffer_sizes) > 2
+        assert max(work_buffer_sizes) <= 8 * 1024 * 1024
+
+    def test_tensor_extreme_analysis_does_not_overflow_float16_squares(self) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((100, 10), dtype=np.float16)
+        weights[50:55, 3] = np.float16(10_000)
+
+        anomalies = scanner._analyze_tensor_weight_extremes("float16_tensor", weights, output_axes=(1,))
+
+        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
+        assert extreme["details"]["affected_neurons"] == [3]
+        assert np.isfinite(extreme["details"]["threshold"])
+        assert np.isfinite(extreme["details"]["max_to_threshold_ratio"])
 
     @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
     def test_pytorch_model_scan(self, tmp_path: Path) -> None:
