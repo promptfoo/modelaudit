@@ -878,12 +878,13 @@ class SafeTensorsScanner(BaseScanner):
             if dim > _MAX_PLATFORM_USIZE or (dim and total > _MAX_PLATFORM_USIZE // dim):
                 return None
             total *= dim
-        if total > _MAX_PLATFORM_USIZE // bits:
-            return None
         total_bits = total * bits
         if total_bits % 8:
             return None
-        return total_bits // 8
+        total_bytes = total_bits // 8
+        if total_bytes > _MAX_PLATFORM_USIZE:
+            return None
+        return total_bytes
 
     def _detect_metadata_injection_attacks(
         self,

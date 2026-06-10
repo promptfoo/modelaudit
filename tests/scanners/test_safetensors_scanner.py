@@ -135,7 +135,7 @@ def test_zero_length_offsets_require_empty_shape(tmp_path: Path) -> None:
     )
 
 
-def test_empty_tensor_offset_order_does_not_create_false_overlap(tmp_path: Path) -> None:
+def test_empty_tensor_offset_sort_matches_safetensors(tmp_path: Path) -> None:
     file_path = tmp_path / "empty_tensor_before_nonempty_range.safetensors"
     write_raw_safetensors(
         file_path,
@@ -146,8 +146,12 @@ def test_empty_tensor_offset_order_does_not_create_false_overlap(tmp_path: Path)
         b"\x00",
     )
 
+    with safe_open(str(file_path), framework="np") as handle:
+        assert set(handle.keys()) == {"empty", "nonempty"}
+
     result = SafeTensorsScanner().scan(str(file_path))
 
+    assert result.success is True
     assert result.metadata.get("scan_outcome") != "inconclusive"
     assert not any(
         check.status == CheckStatus.FAILED and check.name == "Offset Continuity Check" for check in result.checks
@@ -213,11 +217,13 @@ def test_zero_before_large_dimensions_remains_valid_empty_shape(tmp_path: Path) 
     assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
 
 
-def test_tensor_size_overflow_uses_native_bit_width(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tensor_size_overflow_uses_native_byte_width(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("modelaudit.scanners.safetensors_scanner._MAX_PLATFORM_USIZE", 15)
 
-    assert SafeTensorsScanner._expected_size("U8", [1]) == 1
-    assert SafeTensorsScanner._expected_size("U8", [2]) is None
+    assert SafeTensorsScanner._expected_size("U8", [15]) == 15
+    assert SafeTensorsScanner._expected_size("U8", [16]) is None
+    assert SafeTensorsScanner._expected_size("U16", [7]) == 14
+    assert SafeTensorsScanner._expected_size("U16", [8]) is None
 
 
 def test_offsets_must_fit_native_usize(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
