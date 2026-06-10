@@ -1676,7 +1676,10 @@ class TestAdvancedFileHandler:
             check.name == "Malicious Shard Payload" and check.status == CheckStatus.FAILED for check in second.checks
         )
 
-    @pytest.mark.skipif(os.name == "nt", reason="Windows bypasses sharded caching without reliable sibling identity")
+    @pytest.mark.skipif(
+        os.name == "nt" or sys.platform == "darwin",
+        reason="Requires descriptor-bound sharded caching with reliable sibling identity",
+    )
     def test_cached_advanced_scan_keys_selected_model_config(
         self,
         tmp_path: Path,
