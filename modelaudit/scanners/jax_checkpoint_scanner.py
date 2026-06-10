@@ -15,7 +15,11 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
-from ..utils.file.detection import JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES, is_jax_json_checkpoint_file
+from ..utils.file.detection import (
+    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
+    is_confirmed_jax_json_checkpoint_file,
+    is_jax_json_checkpoint_file,
+)
 from ._evidence_redaction import redact_evidence_string
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -122,6 +126,9 @@ class JaxCheckpointScanner(BaseScanner):
     DEFAULT_MAX_ORBAX_CHECKPOINT_FILES: ClassVar[int] = 4096
     DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES: ClassVar[int] = 8192
     _ORBAX_CHECKPOINT_ENTRY_PREFIXES: ClassVar[tuple[str, ...]] = ("step_", "params_", "state_", "model_")
+    _ORBAX_NUMBERED_CHECKPOINT_ENTRY_RE: ClassVar[re.Pattern[str]] = re.compile(
+        r"^(?:checkpoint|step|params|state|model)_\d+$"
+    )
     _DANGEROUS_PICKLE_GLOBALS: ClassVar[frozenset[tuple[str, str]]] = frozenset(
         {
             ("builtins", "__import__"),
@@ -789,27 +796,52 @@ class JaxCheckpointScanner(BaseScanner):
         """Check if directory looks like a JAX/Orbax checkpoint."""
         path_obj = Path(path)
 
-        # Orbax checkpoint indicators
-        orbax_files = ["metadata.json", "_CHECKPOINT", "orbax_checkpoint_metadata.json"]
-
-        # Check for Orbax files
-        for orbax_file in orbax_files:
+        # These names are specific to Orbax/JAX. A bare ``metadata.json`` is
+        # common across unrelated packages and must be content-validated.
+        for orbax_file in ("_CHECKPOINT", "orbax_checkpoint_metadata.json"):
             if (path_obj / orbax_file).exists():
                 return True
 
-        # Probe once and route oversized directories into the scanner's
-        # fail-closed entry-limit handling.
+        metadata_path = path_obj / "metadata.json"
+        if metadata_path.is_symlink():
+            # Do not follow the link during routing. Core directory discovery
+            # resolves containment before the deferred owner scan.
+            return True
+        if metadata_path.exists() and is_confirmed_jax_json_checkpoint_file(metadata_path):
+            return True
+
+        # Keep routing bounded without treating size alone as a JAX signal.
+        # The scanner enforces the same entry limit after a real Orbax marker
+        # has selected it; an ordinary large directory must remain ordinary.
         for entry_index, entry in enumerate(path_obj.iterdir(), start=1):
             if entry_index > cls.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES:
+                return False
+            if not cls._is_orbax_checkpoint_entry_name(entry.name):
+                continue
+            if entry.name == "checkpoint" or cls._ORBAX_NUMBERED_CHECKPOINT_ENTRY_RE.fullmatch(entry.name):
                 return True
-            if cls._is_orbax_checkpoint_entry_name(entry.name):
-                return True
+            # Broad prefixes such as ``model_`` are common in ordinary model
+            # repositories. Preserve non-numbered legacy checkpoint files only
+            # when their bounded contents independently identify JAX/pickle.
+            with suppress(OSError):
+                if entry.is_file() and cls.can_handle(str(entry)):
+                    return True
         return False
 
     @classmethod
     def _is_orbax_checkpoint_entry_name(cls, name: str) -> bool:
         """Return whether a top-level entry has a recognized Orbax/JAX checkpoint name."""
         return name == "checkpoint" or name.startswith(("checkpoint_", *cls._ORBAX_CHECKPOINT_ENTRY_PREFIXES))
+
+    @classmethod
+    def directory_owner_source_in_scope(cls, relative_parts: tuple[str, ...]) -> bool:
+        """Bind only top-level files that the Orbax directory scanner can inspect."""
+        if len(relative_parts) != 1:
+            return False
+        name = relative_parts[0]
+        return name in {"metadata.json", "orbax_checkpoint_metadata.json", "_CHECKPOINT"} or (
+            cls._is_orbax_checkpoint_entry_name(name)
+        )
 
     @classmethod
     def _header_starts_with_legacy_pickle_opcode(cls, header: bytes) -> bool:
@@ -1844,6 +1876,7 @@ class JaxCheckpointScanner(BaseScanner):
 
         except Exception as e:
             mark_inconclusive_scan_result(result, "jax_checkpoint_scan_failed")
+            mark_operational_scan_error(result, "jax_checkpoint_scan_failed")
             result.add_check(
                 name="JAX Checkpoint Scan",
                 passed=False,

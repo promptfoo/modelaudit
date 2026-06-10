@@ -2849,6 +2849,50 @@ def test_scan_savedmodel_directory_trivial_probe_boundary_padding_stays_clean(
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_asset_growth_during_extended_probe_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A concurrent asset mutation must not be accepted from a stale bounded read."""
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "growing-payload.dat"
+    asset_path.write_bytes(b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4 + 1))
+    original_prefix_check = tf_savedmodel_module._is_trivial_proto0_padding_prefix
+    mutated = False
+
+    def mutate_after_initial_read(sample: bytes) -> bool:
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            with asset_path.open("ab") as file_obj:
+                file_obj.write(
+                    b"0" * tf_savedmodel_module._ASSET_TRIVIAL_PADDING_COMPLETE_BYTES
+                    + b'cos\nsystem\n(S"echo pwned"\ntR.',
+                )
+        return original_prefix_check(sample)
+
+    monkeypatch.setattr(
+        tf_savedmodel_module,
+        "_is_trivial_proto0_padding_prefix",
+        mutate_after_initial_read,
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
+
+    assert mutated is True
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "savedmodel_asset_source_changed" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "savedmodel_asset_source_changed"
+    stability_checks = [check for check in result.checks if check.name == "SavedModel Asset Source Stability"]
+    assert len(stability_checks) == 1
+    assert stability_checks[0].location == str(asset_path)
+    assert stability_checks[0].details["analysis_incomplete"] is True
+    assert stability_checks[0].details["final_size"] > stability_checks[0].details["initial_size"]
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_scan_savedmodel_directory_benign_list_prefix_asset_stays_clean(tmp_path: Path) -> None:
     """Plain-text near-matches should not become pickle findings in full directory scans."""
     model_dir = Path(create_tf_savedmodel(tmp_path))

@@ -470,6 +470,164 @@ def test_directory_scan_invokes_savedmodel_directory_owner_once(
     assert result.file_metadata[str(model_dir)]["directory_owner_scan"] is True
 
 
+def test_savedmodel_owner_snapshot_does_not_rehash_opaque_variable_shards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_tf_protos()
+    model_dir = tmp_path / "saved-model"
+    model_dir.mkdir()
+    saved_model_path = model_dir / "saved_model.pb"
+    _write_safe_savedmodel(saved_model_path)
+    variables_dir = model_dir / "variables"
+    variables_dir.mkdir()
+    variable_path = variables_dir / "variables.data-00000-of-00001"
+    variable_path.write_bytes(b"opaque tensor values" * 32)
+    hashed_paths: list[str] = []
+    original_hash = core_module._calculate_file_hash
+
+    def record_hash(path: str) -> str:
+        hashed_paths.append(path)
+        return original_hash(path)
+
+    monkeypatch.setattr(core_module, "_calculate_file_hash", record_hash)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    assert determine_exit_code(result) == 0
+    assert hashed_paths.count(str(variable_path.resolve())) == 1
+    assert hashed_paths.count(str(saved_model_path.resolve())) == 2
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_does_not_follow_external_orbax_marker_before_containment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outside_metadata = tmp_path / "outside-metadata.json"
+    outside_metadata.write_text('{"format":"orbax","restore_fn":"os.system"}', encoding="utf-8")
+    model_dir = tmp_path / "orbax-model"
+    model_dir.mkdir()
+    marker_path = model_dir / "metadata.json"
+    marker_path.symlink_to(outside_metadata)
+    owner_calls: list[str] = []
+
+    def record_owner_scan(_scanner: JaxCheckpointScanner, owner_path: str) -> ScanResult:
+        owner_calls.append(owner_path)
+        raise AssertionError("owner scan must not run before path containment")
+
+    monkeypatch.setattr(JaxCheckpointScanner, "scan", record_owner_scan)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    assert owner_calls == []
+    assert any(
+        issue.message == "Path traversal outside scanned directory"
+        and issue.location == str(marker_path)
+        and issue.details["resolved_path"] == str(outside_metadata.resolve())
+        for issue in result.issues
+    )
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_does_not_follow_external_savedmodel_marker_before_containment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_tf_protos()
+    from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
+
+    outside_model = tmp_path / "outside-saved-model.pb"
+    outside_model.write_bytes(_build_malicious_tf_savedmodel())
+    model_dir = tmp_path / "saved-model"
+    model_dir.mkdir()
+    marker_path = model_dir / "saved_model.pb"
+    marker_path.symlink_to(outside_model)
+    owner_calls: list[str] = []
+
+    def record_owner_scan(_scanner: TensorFlowSavedModelScanner, owner_path: str) -> ScanResult:
+        owner_calls.append(owner_path)
+        raise AssertionError("owner scan must not run before path containment")
+
+    monkeypatch.setattr(TensorFlowSavedModelScanner, "scan", record_owner_scan)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    assert owner_calls == []
+    assert any(
+        issue.message == "Path traversal outside scanned directory"
+        and issue.location == str(marker_path)
+        and issue.details["resolved_path"] == str(outside_model.resolve())
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize(
+    ("budget_name", "budget_value", "reason"),
+    [
+        ("max_file_size", 1, "directory_owner_max_file_size"),
+        ("max_total_size", 1, "directory_owner_max_total_size"),
+    ],
+)
+def test_directory_scan_applies_file_budgets_before_orbax_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    budget_name: str,
+    budget_value: int,
+    reason: str,
+) -> None:
+    model_dir = tmp_path / "orbax-model"
+    _write_orbax_metadata(model_dir, restore_fn="os.system")
+    owner_calls: list[str] = []
+
+    def record_owner_scan(_scanner: JaxCheckpointScanner, owner_path: str) -> ScanResult:
+        owner_calls.append(owner_path)
+        raise AssertionError("owner scan must not bypass aggregate file budgets")
+
+    monkeypatch.setattr(JaxCheckpointScanner, "scan", record_owner_scan)
+
+    result = scan_model_directory_or_file(
+        str(model_dir),
+        cache_scan_results=False,
+        **{budget_name: budget_value},
+    )
+
+    owner_metadata = result.file_metadata[str(model_dir)]
+    assert owner_calls == []
+    assert owner_metadata["directory_owner_scan"] is False
+    assert owner_metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert reason in owner_metadata["scan_outcome_reasons"]
+    assert owner_metadata["operational_error"] is True
+
+
+def test_directory_scan_fails_closed_when_orbax_source_changes_during_owner_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "orbax-model"
+    metadata_path = _write_orbax_metadata(model_dir)
+    original_scan = JaxCheckpointScanner.scan
+
+    def replace_after_owner_scan(scanner: JaxCheckpointScanner, owner_path: str) -> ScanResult:
+        owner_result = original_scan(scanner, owner_path)
+        metadata_path.write_text(
+            '{"format":"orbax","restore_fn":"os.system","version":1}',
+            encoding="utf-8",
+        )
+        return owner_result
+
+    monkeypatch.setattr(JaxCheckpointScanner, "scan", replace_after_owner_scan)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    owner_metadata = result.file_metadata[str(model_dir)]
+    assert owner_metadata["directory_owner_scan"] is True
+    assert owner_metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "directory_owner_source_changed" in owner_metadata["scan_outcome_reasons"]
+    assert owner_metadata["operational_error"] is True
+    assert any(check.name == "Directory Owner Source Stability" for check in result.checks)
+
+
 def test_directory_scan_without_logical_owner_keeps_file_walk_semantics(tmp_path: Path) -> None:
     notes_path = tmp_path / "README.md"
     notes_path.write_text("ordinary model documentation", encoding="utf-8")

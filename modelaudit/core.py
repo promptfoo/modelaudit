@@ -1687,12 +1687,34 @@ def _calculate_file_hash(file_path: str) -> str:
     Raises:
         Exception: If file cannot be hashed (security: prevents hash collision attacks)
     """
-    hash_sha256 = hashlib.sha256()
-    with open(file_path, "rb") as f:
-        # Read file in chunks to handle large files efficiently
-        for chunk in iter(lambda: f.read(8192), b""):
-            hash_sha256.update(chunk)
-    return hash_sha256.hexdigest()
+    identity_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+    path_stat_before = os.stat(file_path, follow_symlinks=False)
+    if not stat.S_ISREG(path_stat_before.st_mode):
+        raise OSError(f"Refusing to hash non-regular file: {file_path}")
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(file_path, flags)
+    try:
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            opened_stat = os.fstat(source.fileno())
+            if any(getattr(path_stat_before, field) != getattr(opened_stat, field) for field in identity_fields):
+                raise OSError(f"File changed before hashing: {file_path}")
+
+            hash_sha256 = hashlib.sha256()
+            for chunk in iter(lambda: source.read(8192), b""):
+                hash_sha256.update(chunk)
+
+            final_stat = os.fstat(source.fileno())
+            path_stat_after = os.stat(file_path, follow_symlinks=False)
+            if any(
+                getattr(opened_stat, field) != getattr(candidate, field)
+                for candidate in (final_stat, path_stat_after)
+                for field in identity_fields
+            ):
+                raise OSError(f"File changed while hashing: {file_path}")
+            return hash_sha256.hexdigest()
+    finally:
+        os.close(descriptor)
 
 
 def _should_defer_hash_for_safetensors_header_limit(file_path: str, config: dict[str, Any]) -> bool:
@@ -2154,22 +2176,29 @@ def scan_model_directory_or_file(
             # in metadata instead of counting the same files twice.
             directory_owner_result: ScanResult | None = None
             directory_owner_class: type[BaseScanner] | None = None
-            directory_owner_dispatched = False
+            directory_owner_source_paths: set[str] = set()
+
+            def merge_directory_owner_result(owner_result: ScanResult, *, dispatched: bool) -> None:
+                owner_bytes_scanned = owner_result.bytes_scanned if dispatched else 0
+                if not dispatched:
+                    owner_result.metadata.pop("file_size", None)
+                owner_result.metadata.update(
+                    {
+                        "directory_owner_scan": dispatched,
+                        "directory_owner_bytes_scanned": owner_bytes_scanned,
+                        "aggregate_bytes_accounted_by": "child_file_walk",
+                    }
+                )
+                owner_result.bytes_scanned = 0
+                _add_scan_result_to_model(results, scan_metadata, owner_result, path)
+                _add_asset_to_results(results, path, owner_result)
+
             try:
                 directory_owner_class = _registry.get_scanner_for_path(
                     path,
                     scanner_selection=scanner_selection if scanner_selection.active else None,
                 )
-                if directory_owner_class is not None:
-                    directory_owner_dispatched = True
-                    directory_scan_started_at = time.time()
-                    directory_owner_result = directory_owner_class(config=config).scan(path)
-                    record_scanner_used(
-                        directory_owner_class.name,
-                        "directory",
-                        time.time() - directory_scan_started_at,
-                    )
-                elif scanner_selection.active:
+                if directory_owner_class is None and scanner_selection.active:
                     candidate_owner_class = _registry.get_scanner_for_path(path)
                     if candidate_owner_class is not None:
                         candidate_owner_id = (
@@ -2205,19 +2234,7 @@ def scan_model_directory_or_file(
                 directory_owner_result.finish(success=False)
 
             if directory_owner_result is not None:
-                owner_bytes_scanned = directory_owner_result.bytes_scanned if directory_owner_dispatched else 0
-                if not directory_owner_dispatched:
-                    directory_owner_result.metadata.pop("file_size", None)
-                directory_owner_result.metadata.update(
-                    {
-                        "directory_owner_scan": directory_owner_dispatched,
-                        "directory_owner_bytes_scanned": owner_bytes_scanned,
-                        "aggregate_bytes_accounted_by": "child_file_walk",
-                    }
-                )
-                directory_owner_result.bytes_scanned = 0
-                _add_scan_result_to_model(results, scan_metadata, directory_owner_result, path)
-                _add_asset_to_results(results, path, directory_owner_result)
+                merge_directory_owner_result(directory_owner_result, dispatched=False)
 
             # Scan all files in the directory. File counts are only needed for
             # progress percentages, so avoid the extra tree walk when callers do
@@ -2385,6 +2402,12 @@ def scan_model_directory_or_file(
                         continue
                     if not resolved_file.is_file() and record_dvc_directory_special_file(file_path_obj):
                         continue
+                    if resolved_file.is_file() and directory_owner_class is not None:
+                        relative_parts = Path(os.path.relpath(file_path_obj, path)).parts
+                        if ".." not in relative_parts and directory_owner_class.directory_owner_source_in_scope(
+                            relative_parts
+                        ):
+                            directory_owner_source_paths.add(str(resolved_file))
                     snapshot_path = Path(file_path).absolute()
                     snapshot_shard_family_key = _shard_family_key_for_path(str(snapshot_path))
                     route_hf_shard_alias = (
@@ -2665,6 +2688,44 @@ def scan_model_directory_or_file(
                         limit=dvc_total_size_limit if isinstance(dvc_total_size_limit, int) else max_total_size,
                     )
 
+            owner_sources = sorted(directory_owner_source_paths)
+            owner_block_reason: str | None = None
+            owner_block_details: dict[str, Any] = {}
+            owner_sizes: dict[str, int] = {}
+            owner_total_size = 0
+            if directory_owner_class is not None and directory_owner_result is None:
+                if reported_traversal_targets:
+                    owner_block_reason = "directory_owner_path_traversal"
+                    owner_block_details = {"traversal_target_count": len(reported_traversal_targets)}
+                else:
+                    try:
+                        for source in owner_sources:
+                            source_stat = os.stat(source, follow_symlinks=False)
+                            if not stat.S_ISREG(source_stat.st_mode):
+                                raise OSError(f"Directory owner source is not a regular file: {source}")
+                            owner_sizes[source] = source_stat.st_size
+                        owner_total_size = sum(owner_sizes.values())
+                    except OSError as error:
+                        owner_block_reason = "directory_owner_source_unavailable"
+                        owner_block_details = {"error_type": type(error).__name__}
+                if owner_block_reason is None and max_file_size > 0:
+                    oversized_sources = [source for source, size in owner_sizes.items() if size > max_file_size]
+                    if oversized_sources:
+                        owner_block_reason = "directory_owner_max_file_size"
+                        owner_block_details = {
+                            "max_file_size": max_file_size,
+                            "oversized_source_count": len(oversized_sources),
+                        }
+                if owner_block_reason is None and max_total_size > 0 and owner_total_size > max_total_size:
+                    owner_block_reason = "directory_owner_max_total_size"
+                    owner_block_details = {
+                        "max_total_size": max_total_size,
+                        "owner_source_bytes": owner_total_size,
+                    }
+                if owner_block_reason is None and time.time() - start_time > timeout:
+                    owner_block_reason = "directory_owner_timeout"
+                    owner_block_details = {"timeout": timeout}
+
             # Second pass: scan every non-shard path independently and every shard
             # family once. Shard scans already expand to sibling shards in the
             # advanced handler, so scanning each shard path would duplicate work.
@@ -2687,10 +2748,27 @@ def scan_model_directory_or_file(
                             hash_sources.append(hash_source)
                             seen_hash_sources.add(hash_source)
 
+                # Logical directory owners can inspect metadata and assets that
+                # ordinary file routing skips. Bind every such source into the
+                # same pre/post-owner snapshot so owner findings cannot be
+                # separated from the bytes later reported by the child walk.
+                if owner_block_reason is None:
+                    for owner_source in owner_sources:
+                        if owner_source not in seen_hash_sources:
+                            hash_sources.append(owner_source)
+                            seen_hash_sources.add(owner_source)
+
                 top_level_hashing_started_at = _start_phase_timing(phase_timings)
                 routing_paths_by_source = {
                     hash_source: scanned_file_path for scanned_file_path, hash_source in hash_source_by_path.items()
                 }
+                routing_paths_by_source.update(
+                    {
+                        owner_source: owner_source
+                        for owner_source in directory_owner_source_paths
+                        if owner_source not in routing_paths_by_source
+                    }
+                )
                 hashed_identities_by_source: dict[str, dict[str, int]] = {}
                 hashes_by_source = _hash_files_by_path(
                     hash_sources,
@@ -2698,6 +2776,110 @@ def scan_model_directory_or_file(
                     routing_paths=routing_paths_by_source,
                     hashed_identities=hashed_identities_by_source,
                 )
+
+                if directory_owner_class is not None and directory_owner_result is None:
+                    owner_hashes_before = {
+                        source: hashes_by_source.get(source, f"unhashable_{id(source)}") for source in owner_sources
+                    }
+                    if owner_block_reason is None and any(
+                        hash_value.startswith("unhashable_") for hash_value in owner_hashes_before.values()
+                    ):
+                        owner_block_reason = "directory_owner_snapshot_incomplete"
+
+                    if owner_block_reason is not None:
+                        directory_owner_result = ScanResult(scanner_name=directory_owner_class.name)
+                        directory_owner_result.add_check(
+                            name="Directory Owner Scan Budget",
+                            passed=False,
+                            message=(
+                                "Logical model-directory analysis was not run because its bounded source "
+                                "snapshot was incomplete"
+                            ),
+                            severity=IssueSeverity.INFO,
+                            location=path,
+                            details={
+                                **owner_block_details,
+                                "analysis_incomplete": True,
+                                "scan_outcome_reason": owner_block_reason,
+                            },
+                        )
+                        _mark_inconclusive_scan_outcome(directory_owner_result, owner_block_reason)
+                        _mark_operational_scan_error(directory_owner_result, owner_block_reason)
+                        directory_owner_result.finish(success=False)
+                        merge_directory_owner_result(directory_owner_result, dispatched=False)
+                    else:
+                        owner_config = dict(config)
+                        owner_config["timeout"] = max(1, timeout - int(time.time() - start_time))
+                        directory_scan_started_at = time.time()
+                        try:
+                            directory_owner_result = directory_owner_class(config=owner_config).scan(path)
+                        except Exception as error:
+                            directory_owner_result = ScanResult(scanner_name=directory_owner_class.name)
+                            directory_owner_result.add_check(
+                                name="Directory Owner Scan",
+                                passed=False,
+                                message=(
+                                    "Unable to complete logical model-directory analysis: "
+                                    f"{_redacted_scan_error_for_reporting(error, path)}"
+                                ),
+                                severity=IssueSeverity.INFO,
+                                location=path,
+                                details={
+                                    "exception_type": type(error).__name__,
+                                    "analysis_incomplete": True,
+                                    "scan_outcome_reason": "directory_owner_scan_failed",
+                                },
+                            )
+                            _mark_inconclusive_scan_outcome(directory_owner_result, "directory_owner_scan_failed")
+                            _mark_operational_scan_error(directory_owner_result, "directory_owner_scan_failed")
+                            directory_owner_result.finish(success=False)
+                            merge_directory_owner_result(directory_owner_result, dispatched=True)
+                        else:
+                            record_scanner_used(
+                                directory_owner_class.name,
+                                "directory",
+                                time.time() - directory_scan_started_at,
+                            )
+
+                            post_owner_identities: dict[str, dict[str, int]] = {}
+                            owner_hashes_after = _hash_files_by_path(
+                                owner_sources,
+                                config=config,
+                                routing_paths={source: source for source in owner_sources},
+                                hashed_identities=post_owner_identities,
+                            )
+                            changed_owner_sources = [
+                                source
+                                for source in owner_sources
+                                if owner_hashes_before.get(source) != owner_hashes_after.get(source)
+                            ]
+                            hashes_by_source.update(owner_hashes_after)
+                            hashed_identities_by_source.update(post_owner_identities)
+                            if changed_owner_sources:
+                                aggregate_hash_complete = False
+                                directory_owner_result.add_check(
+                                    name="Directory Owner Source Stability",
+                                    passed=False,
+                                    message="Logical model-directory sources changed during owner analysis",
+                                    severity=IssueSeverity.INFO,
+                                    location=path,
+                                    details={
+                                        "changed_source_count": len(changed_owner_sources),
+                                        "analysis_incomplete": True,
+                                        "scan_outcome_reason": "directory_owner_source_changed",
+                                    },
+                                )
+                                _mark_inconclusive_scan_outcome(
+                                    directory_owner_result,
+                                    "directory_owner_source_changed",
+                                )
+                                _mark_operational_scan_error(
+                                    directory_owner_result,
+                                    "directory_owner_source_changed",
+                                )
+                                directory_owner_result.finish(success=False)
+                            merge_directory_owner_result(directory_owner_result, dispatched=True)
+
                 for family_targets in shard_family_targets.values():
                     for validated_target in family_targets.values():
                         resolved_path = validated_target.get("resolved_path")

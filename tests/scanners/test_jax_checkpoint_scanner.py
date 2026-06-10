@@ -535,7 +535,7 @@ def test_orbax_directory_entry_count_limit_fails_closed(tmp_path: Path) -> None:
     )
 
 
-def test_orbax_directory_probe_routes_entry_limit_to_fail_closed_scan(
+def test_orbax_directory_probe_does_not_route_on_entry_count_alone(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -552,7 +552,7 @@ def test_orbax_directory_probe_routes_entry_limit_to_fail_closed_scan(
 
     monkeypatch.setattr(Path, "iterdir", synthetic_entries)
 
-    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is True
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is False
     assert entries_yielded == JaxCheckpointScanner.DEFAULT_MAX_ORBAX_DIRECTORY_ENTRIES + 1
 
 
@@ -2315,6 +2315,8 @@ def test_unexpected_checkpoint_dispatch_failure_is_inconclusive_and_not_cached(
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "jax_checkpoint_scan_failed" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "jax_checkpoint_scan_failed"
     assert any(
         check.name == "JAX Checkpoint Scan"
         and check.severity == IssueSeverity.INFO
@@ -2417,6 +2419,45 @@ def test_malformed_orbax_metadata_is_inconclusive(tmp_path: Path) -> None:
         and check.severity == IssueSeverity.INFO
         for check in result.checks
     )
+
+
+def test_generic_metadata_json_is_not_routed_as_jax(tmp_path: Path) -> None:
+    ordinary_directory = tmp_path / "backup-package"
+    ordinary_directory.mkdir()
+    (ordinary_directory / "metadata.json").write_text(
+        '{"package":"backup-tool","restore_fn":"os.system"}',
+        encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(ordinary_directory)) is False
+
+    result = scan_model_directory_or_file(str(ordinary_directory), cache_scan_results=False)
+
+    assert "jax_checkpoint" not in result.scanner_names
+    assert not any(issue.rule_code == "S302" for issue in result.issues)
+    assert determine_exit_code(result) == 0
+
+
+def test_large_ambiguous_generic_metadata_json_is_not_routed_as_jax(tmp_path: Path) -> None:
+    ordinary_directory = tmp_path / "large-backup-package"
+    ordinary_directory.mkdir()
+    (ordinary_directory / "metadata.json").write_text(
+        '{"package":"backup-tool","notes":"' + "A" * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1),
+        encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(ordinary_directory)) is False
+
+
+def test_huggingface_model_index_filename_is_not_an_orbax_directory_marker(tmp_path: Path) -> None:
+    ordinary_directory = tmp_path / "diffusers-model"
+    ordinary_directory.mkdir()
+    (ordinary_directory / "model_index.json").write_text(
+        '{"_class_name":"StableDiffusionPipeline"}',
+        encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(ordinary_directory)) is False
 
 
 def test_oversized_orbax_metadata_fails_closed_without_json_load(

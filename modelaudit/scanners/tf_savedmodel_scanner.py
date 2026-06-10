@@ -432,6 +432,22 @@ class TensorFlowSavedModelScanner(BaseScanner):
     description = "Scans TensorFlow SavedModel for suspicious operations"
     supported_extensions: ClassVar[list[str]] = [".pb", ""]  # Empty string for directories
 
+    @classmethod
+    def directory_owner_source_in_scope(cls, relative_parts: tuple[str, ...]) -> bool:
+        """Bind files whose contents can be read by SavedModel directory analysis."""
+        if not relative_parts:
+            return False
+        root_name = relative_parts[0]
+        if root_name in _CORE_ROOT_ASSET_DIRS:
+            return True
+        if root_name == "variables":
+            return (
+                relative_parts[-1].lower().endswith((".txt", ".md", ".json", ".yaml", ".yml", ".py", ".cfg", ".conf"))
+            )
+        if len(relative_parts) == 1 and root_name in {"saved_model.pb", "keras_metadata.pb"}:
+            return True
+        return not (len(relative_parts) == 1 and root_name == "fingerprint.pb")
+
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         # Additional scanner-specific configuration
@@ -1297,12 +1313,16 @@ class TensorFlowSavedModelScanner(BaseScanner):
             )
             return []
 
+        source_changed = False
+        final_file_size = file_stat.st_size
         try:
             with file_path.open("rb") as file_obj:
-                content_head = file_obj.read(_ASSET_PROBE_BYTES)
+                opened_stat = os.fstat(file_obj.fileno())
+                content_sample = file_obj.read(_ASSET_PROBE_BYTES + 1)
+                content_head = content_sample[:_ASSET_PROBE_BYTES]
                 if (
-                    file_stat.st_size > len(content_head)
-                    and file_stat.st_size <= _ASSET_TRIVIAL_PADDING_COMPLETE_BYTES
+                    opened_stat.st_size > len(content_head)
+                    and opened_stat.st_size <= _ASSET_TRIVIAL_PADDING_COMPLETE_BYTES
                     and _is_trivial_proto0_padding_prefix(content_head)
                 ):
                     # Resolve the narrow boundary case where a harmless opcode
@@ -1310,7 +1330,32 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     # bounded and also exposes a payload immediately after the
                     # otherwise-trivial padding.
                     file_obj.seek(0)
-                    content_head = file_obj.read(_ASSET_TRIVIAL_PADDING_COMPLETE_BYTES)
+                    content_sample = file_obj.read(_ASSET_TRIVIAL_PADDING_COMPLETE_BYTES + 1)
+                    content_head = content_sample[:_ASSET_TRIVIAL_PADDING_COMPLETE_BYTES]
+                final_stat = os.fstat(file_obj.fileno())
+                final_file_size = final_stat.st_size
+                initial_identity = (
+                    file_stat.st_dev,
+                    file_stat.st_ino,
+                    file_stat.st_size,
+                    file_stat.st_mtime_ns,
+                    file_stat.st_ctime_ns,
+                )
+                opened_identity = (
+                    opened_stat.st_dev,
+                    opened_stat.st_ino,
+                    opened_stat.st_size,
+                    opened_stat.st_mtime_ns,
+                    opened_stat.st_ctime_ns,
+                )
+                final_identity = (
+                    final_stat.st_dev,
+                    final_stat.st_ino,
+                    final_stat.st_size,
+                    final_stat.st_mtime_ns,
+                    final_stat.st_ctime_ns,
+                )
+                source_changed = initial_identity != opened_identity or opened_identity != final_identity
         except OSError as exc:
             redacted_error = redact_untrusted_error_message(exc)
             result.add_check(
@@ -1330,7 +1375,25 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 rule_code="S902",
             )
             return []
-        content_head_is_prefix = file_stat.st_size > len(content_head)
+        if source_changed:
+            mark_inconclusive_scan_result(result, "savedmodel_asset_source_changed")
+            mark_operational_scan_error(result, "savedmodel_asset_source_changed")
+            result.add_check(
+                name="SavedModel Asset Source Stability",
+                passed=False,
+                message=f"Asset changed during bounded security analysis: {redacted_file_name}",
+                severity=IssueSeverity.INFO,
+                location=redacted_location,
+                details={
+                    "file_name": redacted_file_name,
+                    "initial_size": file_stat.st_size,
+                    "final_size": final_file_size,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "savedmodel_asset_source_changed",
+                },
+            )
+            return []
+        content_head_is_prefix = len(content_sample) > len(content_head) or final_file_size > len(content_head)
 
         detected_types: list[str] = []
 
@@ -1375,7 +1438,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 location=redacted_location,
                 details={
                     "file_name": redacted_file_name,
-                    "asset_size": file_stat.st_size,
+                    "asset_size": final_file_size,
                     "probe_bytes": len(content_head),
                     "analysis_incomplete": True,
                 },
