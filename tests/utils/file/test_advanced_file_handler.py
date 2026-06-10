@@ -1647,6 +1647,10 @@ class TestAdvancedFileHandler:
             }
 
         monkeypatch.setattr(ShardedModelDetector, "detect_shards", classmethod(stable_detect_shards))
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers._supports_reliable_shard_cache_identity",
+            lambda: True,
+        )
         scanner = RecordingShardScanner({"cache_enabled": True, "cache_dir": str(cache_dir)})
 
         reset_cache_manager()
