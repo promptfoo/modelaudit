@@ -1963,7 +1963,9 @@ def test_manifest_scanner_enforces_timeout(
 
     result = scanner.scan(str(test_file))
 
-    assert result.success is True
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "manifest_scan_timeout"
+    assert result.metadata["analysis_incomplete"] is True
     timeout_checks = [check for check in result.checks if check.name == "Manifest Scan Timeout"]
     assert len(timeout_checks) == 1
     assert timeout_checks[0].status == CheckStatus.FAILED
@@ -1992,7 +1994,8 @@ def test_manifest_scanner_blacklist_timeout_reports_only_timeout(
 
     result = scanner.scan(str(test_file))
 
-    assert result.success is True
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "manifest_scan_timeout"
     assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
 
 
@@ -2015,7 +2018,8 @@ def test_manifest_scanner_parse_timeout_reports_only_timeout(
 
     result = scanner.scan(str(test_file))
 
-    assert result.success is True
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "manifest_scan_timeout"
     assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
     assert not any(check.name == "File Parse Error" for check in result.checks)
     assert not any(check.name == "Manifest Parse Attempt" for check in result.checks)
@@ -2044,7 +2048,8 @@ def test_manifest_scanner_cloud_url_timeout_reports_only_timeout(
 
     result = scanner.scan(str(test_file))
 
-    assert result.success is True
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "manifest_scan_timeout"
     assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
     assert not any(check.name == "Manifest File Scan" for check in result.checks)
 
@@ -2070,7 +2075,8 @@ def test_manifest_scanner_weak_hash_timeout_reports_only_timeout(
 
     result = scanner.scan(str(test_file))
 
-    assert result.success is True
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "manifest_scan_timeout"
     assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
     assert not any(check.name == "Manifest File Scan" for check in result.checks)
 
