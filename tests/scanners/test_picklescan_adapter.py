@@ -17,6 +17,7 @@ from modelaudit_picklescan import (
 )
 
 from modelaudit.cache.cache_policy import should_cache_scan_result
+from modelaudit.config.rule_config import ModelAuditConfig, set_config
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.executorch_scanner import ExecuTorchScanner
 from modelaudit.scanners.picklescan_adapter import (
@@ -423,6 +424,7 @@ def test_pickle_report_to_scan_result_falls_back_for_unmapped_persistent_id_opco
         ("PERSISTENT_ID", {"opcode": "BINPERSID"}, "S212"),
         ("PERSISTENT_ID", {"opcode": "CUSTOM_PERSISTENT_OPCODE"}, "S212"),
         ("DANGEROUS_CALL", {"opcode": "REDUCE"}, "S201"),
+        ("DANGEROUS_CALL", {"opcode": "NEWOBJ_EX"}, "S204"),
         ("DANGEROUS_CALL", {"module": "sys", "name": "exit"}, "S102"),
         ("DANGEROUS_CALL", {"module": "builtins", "name": "exec"}, "S104"),
         ("DANGEROUS_CALL", {"module": "custom", "name": "loader"}, "S201"),
@@ -469,6 +471,36 @@ def test_pickle_report_to_scan_result_maps_pickle_rule_codes_to_legacy_namespace
     assert len(result.issues) == 1
     assert result.issues[0].rule_code == expected_legacy_rule_code
     assert result.issues[0].details["pickle_rule_code"] == pickle_rule_code
+
+
+def test_pickle_report_to_scan_result_does_not_suppress_newobj_ex_as_reduce() -> None:
+    set_config(ModelAuditConfig(suppress={"S201"}))
+    report = PickleReport(
+        source="newobj-ex.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="Found NEWOBJ_EX opcode invoking dangerous global: custom.loader",
+                severity=Severity.CRITICAL,
+                location="newobj-ex.pkl (pos 1)",
+                rule_code="DANGEROUS_CALL",
+                details={
+                    "opcode": "NEWOBJ_EX",
+                    "module": "custom",
+                    "name": "loader",
+                    "import_reference": "custom.loader",
+                },
+            ),
+        ),
+        metadata={"opcode_counts": {"NEWOBJ_EX": 1}},
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert len(result.issues) == 1
+    assert result.issues[0].rule_code == "S204"
+    assert result.issues[0].details["opcode"] == "NEWOBJ_EX"
 
 
 def test_pickle_report_to_scan_result_emits_passed_import_checks() -> None:

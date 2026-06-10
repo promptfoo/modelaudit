@@ -658,6 +658,45 @@ def test_scan_bytes_detects_follow_on_malicious_pickle_streams(separator: bytes)
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert any(notice.code == "follow_on_stream_detected" for notice in report.notices)
     assert any(finding.details.get("import_reference") in SYSTEM_GLOBALS for finding in report.findings)
+    assert report.metadata["follow_on_opcode_counts"]["REDUCE"] == 1
+
+
+def test_scan_bytes_counts_each_follow_on_opcode_once() -> None:
+    follow_on = b"\x80\x04cclick\nopen_file\n)\x810cclick\nopen_file\n)\x810cclick\necho\n)R."
+    payload = pickle.dumps({"safe": True}, protocol=4) + (b"\x00" * 64) + follow_on
+
+    report = scan_bytes(payload, source="follow-on-exact-counts.pkl")
+
+    assert report.metadata["follow_on_opcode_counts"]["GLOBAL"] == 3
+    assert report.metadata["follow_on_opcode_counts"]["NEWOBJ"] == 2
+    assert report.metadata["follow_on_opcode_counts"]["REDUCE"] == 1
+
+
+def test_scan_bytes_counts_separate_follow_on_streams_once() -> None:
+    click_stream = b"\x80\x04cclick\nopen_file\n)\x810cclick\nopen_file\n)\x810cclick\necho\n)R."
+    help_stream = b"\x80\x04\x8c\x08builtins\x8c\x04help\x93)R."
+    padding = b"\x00" * 64
+    payload = pickle.dumps({"safe": True}, protocol=4) + padding + click_stream + padding + help_stream
+
+    report = scan_bytes(payload, source="separate-follow-on-exact-counts.pkl")
+
+    counts = report.metadata["follow_on_opcode_counts"]
+    assert counts["PROTO"] == 2
+    assert counts["STOP"] == 2
+    assert counts["GLOBAL"] == 3
+    assert counts["NEWOBJ"] == 2
+    assert counts["REDUCE"] == 2
+    assert counts["STACK_GLOBAL"] == 1
+
+
+def test_scan_bytes_follow_on_callable_alias_import_without_invocation_has_no_call_graph_finding() -> None:
+    import_only = b"\x80\x04\x8c\x08builtins\x8c\x04help\x93."
+    payload = pickle.dumps({"safe": True}, protocol=4) + (b"\x00" * 64) + import_only
+
+    report = scan_bytes(payload, source="follow-on-callable-alias-import.pkl")
+
+    assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+    assert report.metadata["follow_on_opcode_counts"]["STACK_GLOBAL"] == 1
 
 
 @pytest.mark.parametrize(
@@ -935,6 +974,19 @@ def test_scan_bytes_recurses_into_nested_persid_payload() -> None:
         finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "PERSID"
         for finding in report.findings
     )
+
+
+def test_scan_bytes_merges_nested_opcode_counts_without_flattening_invocations() -> None:
+    inner = b"\x80\x04cclick\nopen_file\n)\x810cclick\nopen_file\n)\x810cclick\necho\n)R."
+    outer = pickle.dumps({"inner": inner}, protocol=4)
+
+    report = scan_bytes(outer, source="nested-callable-invocations.pkl")
+
+    assert not report.metadata.get("callable_invocations")
+    assert "NEWOBJ" not in report.metadata["opcode_counts"]
+    assert "REDUCE" not in report.metadata["opcode_counts"]
+    assert report.metadata["nested_opcode_counts"]["NEWOBJ"] == 2
+    assert report.metadata["nested_opcode_counts"]["REDUCE"] == 1
 
 
 def test_scan_bytes_continues_raw_nested_scan_after_data_only_payload() -> None:
@@ -8002,6 +8054,10 @@ def test_scan_bytes_preserves_compact_base64_execution_payload_detection(
         ("=TlEu", "PERSISTENT_ID"),
         ("!ly4!=", "S601"),
         ("!UAo!u", "PERSISTENT_ID"),
+        ("AAAA=ly4=", "S601"),
+        ("AAAA==ly4=", "S601"),
+        ("grou=ly4=", "S601"),
+        ("A" * 64 + "=ly4=", "S601"),
     ],
 )
 def test_scan_bytes_preserves_lenient_compact_base64_security_evidence(
@@ -8015,6 +8071,33 @@ def test_scan_bytes_preserves_lenient_compact_base64_security_evidence(
 
     assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
     assert any(finding.rule_code == expected_rule for finding in report.findings)
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        "AAA=ly4=",
+        "AA==ly4=",
+        "A" * 63 + "=ly4=",
+        "A" * 63 + "==ly4=",
+        "A" * 66 + "==ly4=",
+    ],
+)
+def test_scan_bytes_ignores_compact_base64_tail_after_terminal_padding(encoded: str) -> None:
+    assert encoded.endswith("ly4=")
+    assert base64.b64decode(encoded[-4:]) == b"\x97."
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": encoded}, protocol=4),
+        source="terminal-padding-base64-tail.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert all(
+        notice.code not in {"encoded_nested_payload_detected", "nested_pickle_incomplete"} for notice in report.notices
+    )
 
 
 def test_scan_bytes_preserves_four_byte_data_only_base64_boundary() -> None:
