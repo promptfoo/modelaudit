@@ -2131,24 +2131,70 @@ def test_scan_file_enforces_zip_entry_preflight_for_offset_zero_hdf5(tmp_path: P
     with h5py.File(model_path, "w") as h5_file:
         h5_file.attrs["model_config"] = json.dumps({"class_name": "Sequential", "config": {"layers": []}})
     with zipfile.ZipFile(model_path, "a") as archive:
-        archive.writestr("one.txt", "one")
-        archive.writestr("two.txt", "two")
+        archive.writestr("payload.pkl", _build_malicious_pickle())
+        archive.writestr("README.txt", "benign model notes")
 
     assert find_hdf5_signature_offset(str(model_path)) == 0
+    assert zipfile.is_zipfile(model_path)
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+        "max_zip_entries": 1,
+    }
+
+    reset_cache_manager()
+    try:
+        for _ in range(2):
+            result = scan_file(str(model_path), config=config)
+
+            assert result.scanner_name == "zip"
+            assert result.success is False
+            assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+            assert any(
+                check.name == "Entry Count Limit Check"
+                and check.status == CheckStatus.FAILED
+                and check.rule_code == "S410"
+                and check.details["entries"] == 2
+                and check.details["entry_count_source"] == "central_directory_preflight"
+                for check in result.checks
+            )
+
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        aggregate = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            max_zip_entries=1,
+        )
+        assert determine_exit_code(aggregate) == 1
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_keeps_within_limit_appended_zip_on_offset_zero_hdf5_route(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    model_path = tmp_path / "appended-within-entry.h5"
+    with h5py.File(model_path, "w") as h5_file:
+        h5_file.attrs["model_config"] = json.dumps({"class_name": "Sequential", "config": {"layers": []}})
+    with zipfile.ZipFile(model_path, "a") as archive:
+        archive.writestr("README.txt", "benign model notes")
+
+    assert find_hdf5_signature_offset(str(model_path)) == 0
+    assert zipfile.is_zipfile(model_path)
 
     result = scan_file(
         str(model_path),
         config={"max_zip_entries": 1, "cache_enabled": False},
     )
 
-    assert result.scanner_name == "zip"
-    assert result.success is False
-    assert any(
-        check.name == "Entry Count Limit Check"
-        and check.status == CheckStatus.FAILED
-        and check.details["entry_count_source"] == "central_directory_preflight"
-        for check in result.checks
-    )
+    assert result.scanner_name == "keras_h5"
+    assert result.success is True
+    assert "zip_analysis_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.rule_code == "S410" for check in result.checks)
 
 
 def test_scan_file_selected_keras_still_enforces_zip_entry_preflight(
