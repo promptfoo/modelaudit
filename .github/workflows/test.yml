@@ -457,7 +457,10 @@ jobs:
     # Only run if Python files changed
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # The main-branch Python 3.12 step runs the fast suite under branch
+    # coverage, which costs ~3x the uninstrumented lanes (~25 min); the
+    # tracer overhead concentrates in CPU-bound detector replay tests.
+    timeout-minutes: 75
     strategy:
       matrix:
         # For PRs, only test min and max Python versions to save time
