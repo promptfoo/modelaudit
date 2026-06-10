@@ -156,7 +156,15 @@ def create_transformed_onnx_weight_model(
     transform: str,
 ) -> Path:
     """Create a MatMul whose weight reaches it through one intermediate operator."""
-    assert transform in {"Identity", "Transpose", "Reshape", "ReshapeDynamic", "AddDynamic", "Cast"}
+    assert transform in {
+        "Identity",
+        "Transpose",
+        "Reshape",
+        "ReshapeDynamic",
+        "AddDynamic",
+        "Cast",
+        "CastFloat16",
+    }
     initializers: list[Any] = []
     if transform == "Transpose":
         stored_weights = analysis_weights.T.copy()
@@ -204,12 +212,13 @@ def create_transformed_onnx_weight_model(
             "Cast",
             ["W"],
             ["W_view"],
-            name="unsupported_weight_cast",
-            to=TensorProto.FLOAT,
+            name="weight_cast",
+            to=TensorProto.FLOAT16 if transform == "CastFloat16" else TensorProto.FLOAT,
         )
 
-    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, analysis_weights.shape[0]])
-    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, analysis_weights.shape[1]])
+    value_type = TensorProto.FLOAT16 if transform == "CastFloat16" else TensorProto.FLOAT
+    X = helper.make_tensor_value_info("input", value_type, [1, analysis_weights.shape[0]])
+    Y = helper.make_tensor_value_info("output", value_type, [1, analysis_weights.shape[1]])
     graph_inputs = [X]
     if transform == "ReshapeDynamic":
         graph_inputs.append(helper.make_tensor_value_info("dynamic_shape", TensorProto.INT64, [2]))
@@ -454,6 +463,34 @@ def create_recurrent_dynamic_weight_model(tmp_path: Path) -> Path:
     model.ir_version = 8
     onnx.checker.check_model(model)
     path = tmp_path / "recurrent-dynamic-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_projected_dynamic_matmul_weight_model(tmp_path: Path, *, left: bool) -> Path:
+    """Use a projected runtime value as a later left- or right-hand MatMul weight."""
+    projection = onnx.numpy_helper.from_array(np.zeros((100, 100), dtype=np.float32), name="P")
+    if left:
+        seed = helper.make_tensor_value_info("weight_seed", TensorProto.FLOAT, [10, 100])
+        X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [100, 1])
+        Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [10, 1])
+        generator_inputs = ["weight_seed", "P"]
+        linear_inputs = ["W_dynamic", "X"]
+    else:
+        seed = helper.make_tensor_value_info("weight_seed", TensorProto.FLOAT, [100, 10])
+        X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])
+        Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])
+        generator_inputs = ["P", "weight_seed"]
+        linear_inputs = ["X", "W_dynamic"]
+    nodes = [
+        helper.make_node("MatMul", generator_inputs, ["W_dynamic"], name="generate_weight"),
+        helper.make_node("MatMul", linear_inputs, ["Y"], name="linear"),
+    ]
+    graph = helper.make_graph(nodes, "projected_dynamic_weight_graph", [seed, X], [Y], initializer=[projection])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / f"projected-dynamic-matmul-weight-{left}.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -3645,7 +3682,7 @@ class TestWeightDistributionSemantics:
         assert checks[0].details["lineage_transform_count"] == len(expected_lineage)
         assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
 
-    @pytest.mark.parametrize("transform", ["ReshapeDynamic"])
+    @pytest.mark.parametrize("transform", ["ReshapeDynamic", "CastFloat16"])
     def test_unsupported_initializer_lineage_fails_closed(self, tmp_path: Path, transform: str) -> None:
         weights = np.zeros((100, 10), dtype=np.float32)
         weights[50:55, 3] = 10.0
@@ -3714,6 +3751,24 @@ class TestWeightDistributionSemantics:
         assert sample["reason"] == "dynamic_activation_lineage"
         assert sample["consumer_op"] == "GRU"
         assert sample["consumer_input_index"] == 1
+
+    @pytest.mark.parametrize("left", [False, True])
+    def test_projected_dynamic_matmul_weight_fails_closed(self, tmp_path: Path, left: bool) -> None:
+        model_path = create_projected_dynamic_matmul_weight_model(tmp_path, left=left)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert self._extreme_checks(result) == []
+        assert result.success is False
+        assert len(coverage) == 1
+        assert coverage[0].details["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+        samples = result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
+        assert len(samples) == 1
+        assert samples[0]["initializer"] == "P"
+        assert samples[0]["reason"] == "dynamic_activation_lineage"
+        assert samples[0]["consumer_op"] == "MatMul"
+        assert samples[0]["consumer_input_index"] == (0 if left else 1)
 
     def test_broadcast_dynamic_weight_lineage_fails_closed(self, tmp_path: Path) -> None:
         model_path = create_broadcast_dynamic_weight_model(tmp_path)
