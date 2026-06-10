@@ -1,3 +1,4 @@
+import base64
 import json
 import pickle
 import stat
@@ -8042,6 +8043,26 @@ def _legacy_s207_pickle_result(opcode_counts: dict[str, int]) -> ScanResult:
     return result
 
 
+@pytest.mark.parametrize(
+    ("message", "details", "opcode", "expected_count"),
+    [
+        ("ignored", {"opcode_name": "BUILD"}, "BUILD", 1),
+        ("ignored", {"opcodes": ["OBJ", "OBJ", "REDUCE"]}, "OBJ", 2),
+        ("ignored", {"opcode_counts": {"NEWOBJ_EX": 2}}, "NEWOBJ_EX", 2),
+        ("Found GLOBAL opcode", {}, "GLOBAL", 1),
+        ("Found NEWOBJ_EXTRA opcode", {}, "NEWOBJ", 0),
+        ("Found BUILD opcode", {"opcode_counts": {"BUILD": True}}, "BUILD", 0),
+    ],
+)
+def test_pytorch_zip_cve_2025_32434_reads_exact_opcode_evidence(
+    message: str,
+    details: dict[str, Any],
+    opcode: str,
+    expected_count: int,
+) -> None:
+    assert PyTorchZipScanner._issue_pickle_opcode_count(message, details, opcode) == expected_count
+
+
 def test_pytorch_zip_cve_2025_32434_empty_imports_stay_suspicious(tmp_path: Path) -> None:
     """Dangerous opcodes without import evidence must not be downgraded to INFO."""
     scanner = PyTorchZipScanner()
@@ -8118,6 +8139,7 @@ def test_pytorch_zip_cve_2025_32434_reports_newobj_ex(tmp_path: Path) -> None:
 
     check = _weights_only_analysis_check(result)
     assert check.status == CheckStatus.FAILED
+    assert check.rule_code == "S204"
     assert check.details["opcode_counts"] == {"STACK_GLOBAL": 1, "NEWOBJ_EX": 1}
     assert check.details["total_dangerous_opcodes"] == 2
     assert set(check.details["unique_opcode_types"]) == {"STACK_GLOBAL", "NEWOBJ_EX"}
@@ -8204,6 +8226,177 @@ def test_pytorch_zip_cve_2025_32434_reports_real_file_write_call_graph_invocatio
     check = _weights_only_analysis_check(result)
     assert check.status == CheckStatus.FAILED
     assert check.details["opcode_counts"] == {"NEWOBJ": 1, "REDUCE": 1}
+
+
+def test_pytorch_zip_cve_2025_32434_reports_nested_execution_opcode_counts(tmp_path: Path) -> None:
+    inner = b"\x80\x04cclick\nopen_file\n)\x810cclick\nopen_file\n)\x810cclick\necho\n)R."
+    model_path = create_mock_pytorch_zip(tmp_path / "nested_file_write.pt", with_pickle=False)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("data.pkl", pickle.dumps({"payload": inner}, protocol=4))
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(issue.details.get("nested_has_execution_opcode") is True for issue in result.issues)
+    check = _weights_only_analysis_check(result)
+    assert check.status == CheckStatus.FAILED
+    assert check.details["opcode_counts"] == {"NEWOBJ": 2, "REDUCE": 1}
+
+
+def test_pytorch_zip_cve_2025_32434_does_not_correlate_separate_nested_streams(tmp_path: Path) -> None:
+    opener = b"\x80\x04cclick\nopen_file\n)\x81."
+    writer = b"\x80\x04cclick\necho\n)R."
+    model_path = create_mock_pytorch_zip(tmp_path / "separate_nested_streams.pt", with_pickle=False)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("data.pkl", pickle.dumps({"opener": opener, "writer": writer}, protocol=4))
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert not any(
+        issue.details.get("pickle_rule_code") == "DANGEROUS_CALL_GRAPH_FILE_WRITE" for issue in result.issues
+    )
+    check = _weights_only_analysis_check(result)
+    assert check.status == CheckStatus.FAILED
+    assert check.details["opcode_counts"] == {"NEWOBJ": 1, "REDUCE": 1}
+
+
+def test_pytorch_zip_cve_2025_32434_reports_encoded_nested_execution_opcodes(tmp_path: Path) -> None:
+    inner = b"\x80\x04cclick\nopen_file\n)\x810cclick\necho\n)R."
+    model_path = create_mock_pytorch_zip(tmp_path / "encoded_nested.pt", with_pickle=False)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("data.pkl", pickle.dumps({"payload": base64.b64encode(inner).decode()}, protocol=4))
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        issue.rule_code == "S601" and issue.details.get("nested_has_execution_opcode") is True
+        for issue in result.issues
+    )
+    check = _weights_only_analysis_check(result)
+    assert check.status == CheckStatus.FAILED
+    assert check.details["opcode_counts"] == {"NEWOBJ": 1, "REDUCE": 1}
+
+
+def test_pytorch_zip_cve_2025_32434_nested_evidence_does_not_unlock_outer_opcodes(tmp_path: Path) -> None:
+    pickle_result = ScanResult(scanner_name="pickle")
+    pickle_result.metadata["opcode_counts"] = {"STACK_GLOBAL": 1, "REDUCE": 1}
+    pickle_result.metadata["nested_opcode_counts"] = {"NEWOBJ": 1}
+    pickle_result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Nested pickle payload detected",
+        severity=IssueSeverity.CRITICAL,
+        details={"nested_has_execution_opcode": True},
+        rule_code="S213",
+    )
+    pytorch_result = ScanResult(scanner_name="pytorch_zip")
+
+    PyTorchZipScanner()._add_weights_only_safety_warnings(
+        pickle_result,
+        pytorch_result,
+        str(tmp_path / "model.pt"),
+        "data.pkl",
+    )
+
+    check = _weights_only_analysis_check(pytorch_result)
+    assert check.status == CheckStatus.FAILED
+    assert check.details["opcode_counts"] == {"NEWOBJ": 1}
+
+
+@pytest.mark.parametrize("nested_rule_code", ["S213", "S601"])
+def test_pytorch_zip_cve_2025_32434_fails_closed_for_legacy_nested_execution_evidence(
+    tmp_path: Path,
+    nested_rule_code: str,
+) -> None:
+    pickle_result = ScanResult(scanner_name="pickle")
+    pickle_result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Nested pickle payload detected",
+        severity=IssueSeverity.CRITICAL,
+        details={"nested_has_execution_opcode": True},
+        rule_code=nested_rule_code,
+    )
+    pytorch_result = ScanResult(scanner_name="pytorch_zip")
+
+    PyTorchZipScanner()._add_weights_only_safety_warnings(
+        pickle_result,
+        pytorch_result,
+        str(tmp_path / "model.pt"),
+        "data.pkl",
+    )
+
+    check = _weights_only_analysis_check(pytorch_result)
+    assert check.status == CheckStatus.FAILED
+    assert check.rule_code == nested_rule_code
+    assert check.details["opcode_counts"] == {}
+    assert check.details["nested_execution_opcode_evidence"] is True
+
+
+def test_pytorch_zip_cve_2025_32434_correlates_callable_singleton_alias(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "callable_alias.pt", with_pickle=False)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("data.pkl", b"\x80\x04\x8c\x08builtins\x8c\x04help\x93)R.")
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        issue.details.get("pickle_rule_code") == "DANGEROUS_CALL_GRAPH"
+        and issue.details.get("invocation_import_reference") == "builtins.help"
+        and issue.details.get("opcode") == "REDUCE"
+        for issue in result.issues
+    )
+    check = _weights_only_analysis_check(result)
+    assert check.status == CheckStatus.FAILED
+    assert check.details["opcode_counts"] == {"REDUCE": 1}
+
+
+def test_pytorch_zip_cve_2025_32434_correlates_all_callable_singleton_alias_invocations(tmp_path: Path) -> None:
+    pickle_result = ScanResult(scanner_name="pickle")
+    pickle_result.metadata["opcode_counts"] = {"NEWOBJ": 1, "REDUCE": 1}
+    pickle_result.metadata["callable_invocations"] = [
+        {"import_reference": "builtins.help", "opcode": "NEWOBJ"},
+        {"import_reference": "builtins.help", "opcode": "REDUCE"},
+    ]
+    pickle_result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message=(
+            "Pickle global '_sitebuiltins._Helper.__call__' reaches dangerous Python primitive "
+            "'builtins.__import__' through the installed call graph"
+        ),
+        severity=IssueSeverity.CRITICAL,
+        details={
+            "import_reference": "_sitebuiltins._Helper.__call__",
+            "invocation_import_reference": "builtins.help",
+            "opcode": "REDUCE",
+        },
+    )
+    pytorch_result = ScanResult(scanner_name="pytorch_zip")
+
+    PyTorchZipScanner()._add_weights_only_safety_warnings(
+        pickle_result,
+        pytorch_result,
+        str(tmp_path / "model.pt"),
+        "data.pkl",
+    )
+
+    check = _weights_only_analysis_check(pytorch_result)
+    assert check.status == CheckStatus.FAILED
+    assert check.details["opcode_counts"] == {"NEWOBJ": 1, "REDUCE": 1}
+
+
+def test_pytorch_zip_cve_2025_32434_callable_singleton_import_without_invocation_stays_clean(
+    tmp_path: Path,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "callable_alias_import.pt", with_pickle=False)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("data.pkl", b"\x80\x04\x8c\x08builtins\x8c\x04help\x93.")
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    check = _weights_only_analysis_check(result)
+    assert check.status == CheckStatus.PASSED
+    assert check.details["dangerous_opcodes_found"] is False
 
 
 def test_pytorch_zip_cve_2025_32434_file_write_imports_without_invocation_stay_clean(tmp_path: Path) -> None:

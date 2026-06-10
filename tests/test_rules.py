@@ -533,7 +533,8 @@ class TestRulePatterns:
             ("pickle opcode REDUCE detected", "S201"),
             ("dangerous INST opcode", "S202"),
             ("pickle OBJ found", "S203"),
-            ("NEWOBJ opcode", "S203"),  # Matches OBJ pattern first
+            ("NEWOBJ opcode", "S204"),
+            ("NEWOBJ_EX opcode", "S204"),
             ("STACK_GLOBAL opcode", "S205"),
             ("GLOBAL opcode imports module", "S206"),
         ]

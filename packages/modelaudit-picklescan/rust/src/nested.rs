@@ -282,10 +282,12 @@ fn oversized_decoded_pickle_prefix_requires_fail_closed(
         })
 }
 
+#[cfg(test)]
 pub(crate) fn looks_like_pickle_payload(value: &[u8], max_bytes: usize) -> bool {
     pickle_payload_extent(value, max_bytes).is_some()
 }
 
+#[cfg(test)]
 pub(crate) fn pickle_payload_extent(value: &[u8], max_bytes: usize) -> Option<usize> {
     pickle_payload_extent_result(value, max_bytes)
         .ok()

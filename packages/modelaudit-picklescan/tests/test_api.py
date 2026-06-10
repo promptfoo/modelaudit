@@ -658,6 +658,45 @@ def test_scan_bytes_detects_follow_on_malicious_pickle_streams(separator: bytes)
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert any(notice.code == "follow_on_stream_detected" for notice in report.notices)
     assert any(finding.details.get("import_reference") in SYSTEM_GLOBALS for finding in report.findings)
+    assert report.metadata["follow_on_opcode_counts"]["REDUCE"] == 1
+
+
+def test_scan_bytes_counts_each_follow_on_opcode_once() -> None:
+    follow_on = b"\x80\x04cclick\nopen_file\n)\x810cclick\nopen_file\n)\x810cclick\necho\n)R."
+    payload = pickle.dumps({"safe": True}, protocol=4) + (b"\x00" * 64) + follow_on
+
+    report = scan_bytes(payload, source="follow-on-exact-counts.pkl")
+
+    assert report.metadata["follow_on_opcode_counts"]["GLOBAL"] == 3
+    assert report.metadata["follow_on_opcode_counts"]["NEWOBJ"] == 2
+    assert report.metadata["follow_on_opcode_counts"]["REDUCE"] == 1
+
+
+def test_scan_bytes_counts_separate_follow_on_streams_once() -> None:
+    click_stream = b"\x80\x04cclick\nopen_file\n)\x810cclick\nopen_file\n)\x810cclick\necho\n)R."
+    help_stream = b"\x80\x04\x8c\x08builtins\x8c\x04help\x93)R."
+    padding = b"\x00" * 64
+    payload = pickle.dumps({"safe": True}, protocol=4) + padding + click_stream + padding + help_stream
+
+    report = scan_bytes(payload, source="separate-follow-on-exact-counts.pkl")
+
+    counts = report.metadata["follow_on_opcode_counts"]
+    assert counts["PROTO"] == 2
+    assert counts["STOP"] == 2
+    assert counts["GLOBAL"] == 3
+    assert counts["NEWOBJ"] == 2
+    assert counts["REDUCE"] == 2
+    assert counts["STACK_GLOBAL"] == 1
+
+
+def test_scan_bytes_follow_on_callable_alias_import_without_invocation_has_no_call_graph_finding() -> None:
+    import_only = b"\x80\x04\x8c\x08builtins\x8c\x04help\x93."
+    payload = pickle.dumps({"safe": True}, protocol=4) + (b"\x00" * 64) + import_only
+
+    report = scan_bytes(payload, source="follow-on-callable-alias-import.pkl")
+
+    assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+    assert report.metadata["follow_on_opcode_counts"]["STACK_GLOBAL"] == 1
 
 
 @pytest.mark.parametrize(
@@ -935,6 +974,19 @@ def test_scan_bytes_recurses_into_nested_persid_payload() -> None:
         finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "PERSID"
         for finding in report.findings
     )
+
+
+def test_scan_bytes_merges_nested_opcode_counts_without_flattening_invocations() -> None:
+    inner = b"\x80\x04cclick\nopen_file\n)\x810cclick\nopen_file\n)\x810cclick\necho\n)R."
+    outer = pickle.dumps({"inner": inner}, protocol=4)
+
+    report = scan_bytes(outer, source="nested-callable-invocations.pkl")
+
+    assert not report.metadata.get("callable_invocations")
+    assert "NEWOBJ" not in report.metadata["opcode_counts"]
+    assert "REDUCE" not in report.metadata["opcode_counts"]
+    assert report.metadata["nested_opcode_counts"]["NEWOBJ"] == 2
+    assert report.metadata["nested_opcode_counts"]["REDUCE"] == 1
 
 
 def test_scan_bytes_continues_raw_nested_scan_after_data_only_payload() -> None:

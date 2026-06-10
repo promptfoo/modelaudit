@@ -97,7 +97,7 @@ def get_pickle_opcode_rule_code(opcode_name: str) -> str | None:
         return _rule("S202")
     elif opcode_upper == "OBJ":
         return _rule("S203")
-    elif opcode_upper == "NEWOBJ":
+    elif opcode_upper in {"NEWOBJ", "NEWOBJ_EX"}:
         return _rule("S204")
     elif opcode_upper == "STACK_GLOBAL":
         return _rule("S205")

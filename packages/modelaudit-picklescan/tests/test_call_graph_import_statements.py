@@ -3078,6 +3078,7 @@ def test_call_graph_models_builtins_help_singleton_invocations() -> None:
         {
             "module": "builtins",
             "name": "help",
+            "opcode": "REDUCE",
             "positional_arg_count": 0,
         }
     ]
@@ -3091,6 +3092,8 @@ def test_call_graph_models_builtins_help_singleton_invocations() -> None:
     assert findings[0].name == "_Helper.__call__"
     assert findings[0].sink == "builtins.__import__"
     assert findings[0].call_path == ("_sitebuiltins._Helper.__call__", "builtins.__import__")
+    assert findings[0].invocation_import_reference == "builtins.help"
+    assert findings[0].invocation_opcode == "REDUCE"
 
 
 def test_scan_bytes_ignores_benign_torch_extension_metadata_globals() -> None:
@@ -3788,6 +3791,9 @@ def test_scan_bytes_blocks_builtins_help_singleton_import_rce(tmp_path: Path) ->
         and invocation.get("positional_arg_count") == 0
         for invocation in report.metadata.get("callable_invocations", [])
     )
+    call_graph_finding = next(finding for finding in report.findings if finding.rule_code == "DANGEROUS_CALL_GRAPH")
+    assert call_graph_finding.details["invocation_import_reference"] == "builtins.help"
+    assert call_graph_finding.details["opcode"] == "REDUCE"
 
     assert not marker.exists()
     child_code = """
