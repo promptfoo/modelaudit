@@ -231,6 +231,13 @@ def allows_zip_structure_analysis(policy: ScannerSelectionPolicy, path: str | No
     return False
 
 
+def allows_zip_content_analysis(policy: ScannerSelectionPolicy) -> bool:
+    """Return whether selection permits content-routed ZIP container analysis."""
+    if "zip" in policy.exclude_scanner_ids:
+        return False
+    return any(policy.allows(scanner_id) for scanner_id in _ZIP_CONTENT_ROUTED_SCANNER_IDS)
+
+
 def allows_protobuf_model_candidate_analyzer(policy: ScannerSelectionPolicy, scanner_id: str) -> bool:
     """Keep internal candidate delegation within the user's scanner policy."""
     if scanner_id not in _PROTOBUF_MODEL_CANDIDATE_ANALYZER_IDS:

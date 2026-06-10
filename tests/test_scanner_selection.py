@@ -17,6 +17,7 @@ from modelaudit.cli import cli
 from modelaudit.core import scan_file, scan_model_directory_or_file
 from modelaudit.scanner_registry_metadata import get_scanner_registry_metadata
 from modelaudit.scanner_selection import (
+    allows_zip_content_analysis,
     allows_zip_structure_analysis,
     collect_suppressed_preferred_scanners,
     normalize_scanner_selection_config,
@@ -115,6 +116,20 @@ def test_zip_structure_analysis_honors_explicit_zip_exclusion() -> None:
     policy = resolve_scanner_selection_policy(exclude_scanners=["zip"])
 
     assert allows_zip_structure_analysis(policy, "archive.zip") is False
+
+
+def test_zip_content_analysis_requires_a_content_owner() -> None:
+    extension_analyzer = resolve_scanner_selection_policy(scanners=["weight_distribution"])
+    subtype_owner = resolve_scanner_selection_policy(scanners=["pytorch_zip"])
+    excluded_container = resolve_scanner_selection_policy(
+        scanners=["pytorch_zip"],
+        exclude_scanners=["zip"],
+    )
+
+    assert allows_zip_structure_analysis(extension_analyzer, "model.h5") is True
+    assert allows_zip_content_analysis(extension_analyzer) is False
+    assert allows_zip_content_analysis(subtype_owner) is True
+    assert allows_zip_content_analysis(excluded_container) is False
 
 
 def test_normalize_scanner_selection_config_reuses_normalized_payload(

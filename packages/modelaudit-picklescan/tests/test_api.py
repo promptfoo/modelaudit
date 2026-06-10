@@ -1509,16 +1509,24 @@ def test_scan_file_combines_pytorch_zip_private_source_fingerprints(
 ) -> None:
     source_root = tmp_path / "src"
     source_root.mkdir()
-    helper_path = source_root / "helper.py"
+    helper_module = "modelaudit_picklescan_test_combined_helper"
+    other_module = "modelaudit_picklescan_test_combined_other"
+    helper_path = source_root / f"{helper_module}.py"
     helper_path.write_text("def entrypoint():\n    return 1\n")
-    other_path = source_root / "other.py"
+    other_path = source_root / f"{other_module}.py"
     other_path.write_text("def entrypoint():\n    return 2\n")
     monkeypatch.syspath_prepend(str(source_root))
 
     archive_path = tmp_path / "model.pt"
     with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("archive/data.pkl", b"\x80\x04" + _global(b"helper", b"entrypoint") + b")R.")
-        archive.writestr("archive/extra.pkl", b"\x80\x04" + _global(b"other", b"entrypoint") + b")R.")
+        archive.writestr(
+            "archive/data.pkl",
+            b"\x80\x04" + _global(helper_module.encode(), b"entrypoint") + b")R.",
+        )
+        archive.writestr(
+            "archive/extra.pkl",
+            b"\x80\x04" + _global(other_module.encode(), b"entrypoint") + b")R.",
+        )
         archive.writestr("archive/version", "3\n")
         archive.writestr("archive/byteorder", "little")
 
@@ -1533,8 +1541,8 @@ def test_scan_file_combines_pytorch_zip_private_source_fingerprints(
     assert str(helper_path.absolute()) in source_fingerprints["read_fingerprints"]
     assert str(other_path.absolute()) in source_fingerprints["read_fingerprints"]
     assert source_fingerprints["module_sources"] == {
-        "helper": str(helper_path.absolute()),
-        "other": str(other_path.absolute()),
+        helper_module: str(helper_path.absolute()),
+        other_module: str(other_path.absolute()),
     }
     assert source_fingerprints["loaded_module_sources"] == {}
 
@@ -1726,6 +1734,112 @@ def test_scan_file_does_not_route_large_trivial_proto0_text_as_hidden_pickle(tmp
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+
+
+def test_scan_file_stops_hidden_pickle_discovery_at_aggregate_probe_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    probe_budget = package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES + package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    monkeypatch.setattr(
+        package_api,
+        "_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES",
+        probe_budget,
+        raising=False,
+    )
+    archive_path = tmp_path / "hidden-probe-budget.pt"
+    decoy = b"I0\n0" * 20_000
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("archive/decoy-0", decoy)
+        archive.writestr("archive/decoy-1", decoy)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+
+    decompressed_probe_bytes = 0
+    original_read = zipfile.ZipExtFile.read
+
+    def count_probe_bytes(member: zipfile.ZipExtFile, size: int = -1) -> bytes:
+        nonlocal decompressed_probe_bytes
+        data = original_read(member, size)
+        if str(member.name).startswith("archive/decoy-"):
+            decompressed_probe_bytes += len(data)
+        return data
+
+    monkeypatch.setattr(zipfile.ZipExtFile, "read", count_probe_bytes)
+
+    report = scan_file(archive_path)
+
+    assert decompressed_probe_bytes == probe_budget
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.metadata["analysis_incomplete"] is True
+    assert report.coverage.raw_scan_complete is False
+    assert report.coverage.opcode_scan_complete is False
+    budget_notices = [notice for notice in report.notices if notice.code == "pytorch_zip_pickle_discovery_probe_budget"]
+    assert len(budget_notices) == 1
+    assert budget_notices[0].details["analysis_incomplete"] is True
+    assert budget_notices[0].details["probe_bytes_read"] == probe_budget
+    assert budget_notices[0].details["max_probe_bytes"] == probe_budget
+    assert budget_notices[0].details["probed_member_count"] == 1
+    assert budget_notices[0].details["skipped_member_count"] == 3
+    assert next(iter(budget_notices[0].details["skipped_members"])) == "archive/decoy-1"
+
+
+def test_scan_file_detects_hidden_pickle_at_aggregate_probe_budget_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    hidden_payload = b"cposix\nsystem\n(S'echo hidden'\ntR."
+    probe_budget = len("3\n") + len("little") + package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES + len(hidden_payload)
+    monkeypatch.setattr(
+        package_api,
+        "_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES",
+        probe_budget,
+        raising=False,
+    )
+    archive_path = tmp_path / "hidden-probe-boundary.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/payload", hidden_payload)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/payload"]
+    assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
+    assert all(notice.code != "pytorch_zip_pickle_discovery_probe_budget" for notice in report.notices)
+
+
+def test_scan_file_keeps_small_benign_archive_complete_at_aggregate_probe_budget_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    version = b"3\n"
+    byteorder = b"little"
+    notes = b"weights"
+    probe_budget = len(version) + len(byteorder) + len(notes)
+    monkeypatch.setattr(
+        package_api,
+        "_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES",
+        probe_budget,
+        raising=False,
+    )
+    archive_path = tmp_path / "benign-probe-boundary.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/version", version)
+        archive.writestr("archive/byteorder", byteorder)
+        archive.writestr("archive/notes", notes)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.is_clean
+    assert "analysis_incomplete" not in report.metadata
+    assert all(notice.code != "pytorch_zip_pickle_discovery_probe_budget" for notice in report.notices)
 
 
 def test_scan_file_marks_hidden_pytorch_zip_probe_failure_inconclusive(
@@ -7649,7 +7763,7 @@ def test_scan_bytes_default_depth_surfaces_two_layer_encoded_nested_findings() -
     )
 
 
-def test_scan_bytes_marks_parent_inconclusive_when_nested_analysis_is_incomplete() -> None:
+def test_scan_bytes_respects_literal_budget_before_nested_analysis() -> None:
     nested_payload = pickle.dumps({"code": "A" * 128}, protocol=4)
 
     report = scan_bytes(
@@ -7659,14 +7773,15 @@ def test_scan_bytes_marks_parent_inconclusive_when_nested_analysis_is_incomplete
     )
 
     assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(finding.rule_code == "S213" for finding in report.findings)
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
     assert any(
-        notice.code == "nested_pickle_incomplete"
-        and notice.details.get("nested_status") == ScanStatus.INCONCLUSIVE.value
+        notice.code == "literal_scan_truncated"
+        and notice.details.get("max_string_literal_scan_chars") == 8
         and notice.details.get("analysis_incomplete") is True
         for notice in report.notices
     )
+    assert not any(notice.code == "nested_pickle_incomplete" for notice in report.notices)
 
 
 def test_scan_bytes_flags_oversized_nested_pickle_prefix_without_deep_parse() -> None:
@@ -7732,6 +7847,302 @@ def test_scan_bytes_does_not_flag_stack_invalid_encoded_pickle_fragments(fragmen
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
     assert all(finding.rule_code != "S601" for finding in report.findings)
+
+
+def test_scan_bytes_ignores_short_base64_pickle_collision_in_plain_text() -> None:
+    assert base64.b64decode("grou") == b"\x82\xba."
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": "grouped convolution"}, protocol=4),
+        source="short-base64-collision.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert all(notice.code != "encoded_nested_payload_detected" for notice in report.notices)
+
+
+def test_scan_bytes_preserves_single_quartet_base64_execution_payload() -> None:
+    nested_payload = b"NQ."
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+    report = scan_bytes(
+        pickle.dumps({"metadata": encoded}, protocol=4),
+        source="single-quartet-base64-execution.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "PERSISTENT_ID" and finding.details.get("nested_details", {}).get("opcode") == "BINPERSID"
+        for finding in report.findings
+    )
+    assert any(
+        notice.code == "encoded_nested_payload_detected"
+        and notice.details.get("payload_size") == len(nested_payload)
+        and notice.details.get("nested_has_execution_opcode") is True
+        for notice in report.notices
+    )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "Analytics",
+        "Analyze",
+        "AnomalyDetector",
+        "AvgPool2D",
+        "CustomDense",
+        "CustomLoader",
+        "DynamicTypeCallableAttribute",
+        "BloomForCausalLM",
+        "PyTorchZipScanner",
+        "RandomForest",
+        "253DQUERYLEAKSECRET",
+        "00bc356079fe8ecc8f9c504bfa310c0a33958a8d",
+        "34341261800329426",
+        "fullyconnected",
+        "lyrics",
+        "lzma",
+        "org/domains/root/db/wanggou",
+        "ordinary ApiDef metadata",
+        "ordinary BloomModel metadata",
+        "ordinary VOCABULARY metadata",
+        "/long_grou",
+        "BIO_lookup_ex",
+        "UIBarAppearance",
+        "UIProgressView",
+        "UNIXConnectable",
+        "CATEGORY_LINEBREAK: CATEGORY_UNI_LINEBREAK,",
+        "if group and not (len(group)==1 and group[0][0] == 'equal'):",
+        "if group.title not in title_group_map:",
+        "#         next rollover is simply 6 - 2 - 1, or 3.",
+        "# compute product y*log(x) = yc*lxc*10**(-p-b-1+ye) = pc*10**(-p-1)",
+        "'HTTPPasswordMgrWithPriorAuth', 'AbstractBasicAuthHandler',",
+    ],
+)
+def test_scan_bytes_ignores_short_word_base64_near_matches(metadata: str) -> None:
+    report = scan_bytes(
+        pickle.dumps({"metadata": metadata}, protocol=4),
+        source="short-base64-word-near-match.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert all(
+        notice.code not in {"encoded_nested_payload_detected", "nested_pickle_incomplete"} for notice in report.notices
+    )
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        "ggEpUi4=",
+        "ggEpUi4==",
+        "ggEpUi4===",
+        "ggEp!Ui4=",
+        "g!gEpUi4=",
+        "ggEp Ui4=",
+        "ggEp\nUi4=",
+        "ggEp.Ui4=",
+        "g=gEpUi4=",
+        "gg=EpUi4=",
+        "ggEpU=i4=",
+        "ggEpUi=4=",
+        "=ggEpUi4=",
+    ],
+)
+def test_scan_bytes_preserves_compact_base64_execution_payload_detection(
+    encoded: str,
+) -> None:
+    nested_payload = b"\x82\x01)R."
+    assert base64.b64decode(encoded) == nested_payload
+    report = scan_bytes(
+        pickle.dumps({"metadata": encoded}, protocol=4),
+        source="compact-base64-execution.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S601"
+        and finding.details.get("payload_size") == len(nested_payload)
+        and finding.details.get("nested_has_execution_opcode") is True
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("nested_details", {}).get("opaque_extension") is True
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("encoded", "expected_rule"),
+    [
+        ("gA!Q=", "S601"),
+        ("ly!4=", "S601"),
+        ("l5!gu", "S601"),
+        ("UA!ou", "PERSISTENT_ID"),
+        ("Tl!Eu", "PERSISTENT_ID"),
+        ("l=y4=", "S601"),
+        ("ly=4=", "S601"),
+        ("l=5gu", "S601"),
+        ("l5=gu", "S601"),
+        ("l5gu============", "S601"),
+        ("ly4=============", "S601"),
+        ("U=Aou", "PERSISTENT_ID"),
+        ("UA=ou", "PERSISTENT_ID"),
+        ("T=lEu", "PERSISTENT_ID"),
+        ("Tl=Eu", "PERSISTENT_ID"),
+        ("=ly4=", "S601"),
+        ("=l5gu", "S601"),
+        ("=UAou", "PERSISTENT_ID"),
+        ("=TlEu", "PERSISTENT_ID"),
+        ("!ly4!=", "S601"),
+        ("!UAo!u", "PERSISTENT_ID"),
+        ("AAAA=ly4=", "S601"),
+        ("AAAA==ly4=", "S601"),
+        ("grou=ly4=", "S601"),
+        ("A" * 64 + "=ly4=", "S601"),
+    ],
+)
+def test_scan_bytes_preserves_lenient_compact_base64_security_evidence(
+    encoded: str,
+    expected_rule: str,
+) -> None:
+    report = scan_bytes(
+        pickle.dumps({"metadata": encoded}, protocol=4),
+        source="lenient-compact-base64.pkl",
+    )
+
+    assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
+    assert any(finding.rule_code == expected_rule for finding in report.findings)
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        "AAA=ly4=",
+        "AA==ly4=",
+        "A" * 63 + "=ly4=",
+        "A" * 63 + "==ly4=",
+        "A" * 66 + "==ly4=",
+    ],
+)
+def test_scan_bytes_ignores_compact_base64_tail_after_terminal_padding(encoded: str) -> None:
+    assert encoded.endswith("ly4=")
+    assert base64.b64decode(encoded[-4:]) == b"\x97."
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": encoded}, protocol=4),
+        source="terminal-padding-base64-tail.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert all(
+        notice.code not in {"encoded_nested_payload_detected", "nested_pickle_incomplete"} for notice in report.notices
+    )
+
+
+def test_scan_bytes_preserves_four_byte_data_only_base64_boundary() -> None:
+    nested_payload = b"\x80\x04N."
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+    report = scan_bytes(
+        pickle.dumps({"metadata": encoded}, protocol=4),
+        source="four-byte-base64-boundary.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert any(
+        notice.code == "encoded_nested_payload_detected"
+        and notice.details.get("payload_size") == len(nested_payload)
+        and notice.details.get("nested_has_execution_opcode") is False
+        for notice in report.notices
+    )
+
+
+@pytest.mark.parametrize(
+    "nested_payload",
+    [
+        b"\x80\x04",
+        b"\x97",
+        b"\x97.",
+        b"\x97\x98.",
+    ],
+)
+def test_scan_bytes_fails_closed_for_compact_base64_prefixes(
+    nested_payload: bytes,
+) -> None:
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+    report = scan_bytes(
+        pickle.dumps({"metadata": encoded}, protocol=4),
+        source="compact-base64-incomplete.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S601" and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+    assert any(
+        notice.code == "nested_pickle_incomplete"
+        and notice.details.get("nested_encoding") == "base64"
+        and notice.details.get("analysis_incomplete") is True
+        for notice in report.notices
+    )
+
+
+@pytest.mark.parametrize("nested_payload", [b"cos\nsystem\n", b"Xcos\nsystem\n"])
+def test_scan_bytes_fails_closed_for_encoded_dangerous_global_prefix(
+    nested_payload: bytes,
+) -> None:
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+    report = scan_bytes(
+        pickle.dumps({"metadata": encoded}, protocol=4),
+        source="dangerous-global-base64-incomplete.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_GLOBAL" and finding.details.get("import_reference") == "os.system"
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "S601" and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    ["gAQ==", "=gAQ=", "!gAQ!=", "lw==============", "lw=!=", "lw= ="],
+)
+def test_scan_bytes_fails_closed_for_lenient_compact_base64_prefix(encoded: str) -> None:
+    report = scan_bytes(
+        pickle.dumps({"metadata": encoded}, protocol=4),
+        source="lenient-compact-base64-incomplete.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S601" and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+    assert any(
+        notice.code == "nested_pickle_incomplete"
+        and notice.details.get("nested_encoding") == "base64"
+        and notice.details.get("analysis_incomplete") is True
+        for notice in report.notices
+    )
 
 
 def test_scan_bytes_records_data_only_base64_nested_pickle_payloads_as_notices() -> None:

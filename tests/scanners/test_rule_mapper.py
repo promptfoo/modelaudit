@@ -41,9 +41,10 @@ def test_embedded_code_rule_maps_dynamic_module_execution_before_executable_text
     [
         ("Web browser launch detected", "S109"),
         ("Native library loading detected", "S110"),
+        ("Custom ONNX operator detected", "S1111"),
     ],
 )
-def test_embedded_code_rule_maps_browser_and_native_loading(message: str, expected_rule_code: str) -> None:
+def test_embedded_code_rule_maps_specific_finding_types(message: str, expected_rule_code: str) -> None:
     assert get_embedded_code_rule_code(message) == expected_rule_code
 
 

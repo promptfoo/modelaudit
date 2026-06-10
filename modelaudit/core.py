@@ -38,6 +38,7 @@ from modelaudit.scanner_selection import (
     ScannerSelectionPolicy,
     add_scanner_selection_skip_check,
     allows_protobuf_model_candidate_analysis,
+    allows_zip_content_analysis,
     allows_zip_structure_analysis,
     make_scanner_selection_skip_result,
     normalize_scanner_selection_config,
@@ -1242,6 +1243,11 @@ def _select_hdf5_userblock_supplemental_scanner_id(
     config: dict[str, Any] | None = None,
 ) -> str | None:
     """Preserve the non-HDF5 scanner that owns a user-block prefix or path."""
+    if header_format in {"zip", EXECUTABLE_ZIP_POLYGLOT_FORMAT}:
+        # The HDF5 user-block dispatcher validates and scans each complete ZIP
+        # segment independently; probing the concatenated prefix here would
+        # reject valid earlier segments as undeclared local records.
+        return "zip"
     scanner_id = _select_non_hdf5_preferred_scanner_id(path, header_format, ext, config)
     if scanner_id is not None:
         return scanner_id
@@ -3574,15 +3580,20 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         sr.finish(success=False)
         return sr
 
+    hdf5_signature_offset = find_hdf5_signature_offset(path)
     try:
         max_zip_entries = int(config.get("max_zip_entries", ZipScanner.DEFAULT_MAX_ENTRIES))
     except (TypeError, ValueError):
         max_zip_entries = ZipScanner.DEFAULT_MAX_ENTRIES
     max_zip_directory_size = ZipScanner.central_directory_size_limit(config)
-    if allows_zip_structure_analysis(scanner_selection, path) and ZipScanner.requires_preflight_result(
-        path,
-        max_zip_entries,
-        max_zip_directory_size,
+    if (
+        hdf5_signature_offset in (None, 0)
+        and allows_zip_structure_analysis(scanner_selection, path)
+        and ZipScanner.requires_preflight_result(
+            path,
+            max_zip_entries,
+            max_zip_directory_size,
+        )
     ):
         return ZipScanner(config=config).scan(path)
 
@@ -3684,8 +3695,6 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             if nested_xgboost_route == "xgboost":
                 config[XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY] = True
     is_xgboost_pickle_spoof = ext in _XGBOOST_BINARY_EXTENSIONS and header_format == "pickle"
-    hdf5_signature_offset = find_hdf5_signature_offset(path)
-
     # Record telemetry for file type detection
     detected_format = header_format if header_format != "unknown" else ext_format
     record_file_type_detected(path, detected_format)
@@ -3996,10 +4005,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     result = make_scanner_selection_skip_result(path, candidate_scanner_id, scanner_selection)
                     if result.bytes_scanned == 0 and file_size > 0:
                         result.bytes_scanned = file_size
-                    userblock_zip_allowed = hdf5_signature_offset not in (None, 0) and (
-                        scanner_selection.allows("zip")
-                        or scanner_selection.allows(hdf5_userblock_supplemental_scanner_id)
-                    )
+                    userblock_zip_allowed = hdf5_signature_offset not in (
+                        None,
+                        0,
+                    ) and allows_zip_content_analysis(scanner_selection)
                     if userblock_zip_allowed:
                         assert hdf5_signature_offset is not None
                         result.scanner_name = "zip"
@@ -4100,11 +4109,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     if hdf5_signature_offset not in (None, 0):
         assert hdf5_signature_offset is not None
-        userblock_zip_allowed = (
-            not scanner_selection.active
-            or scanner_selection.allows("zip")
-            or scanner_selection.allows(hdf5_userblock_supplemental_scanner_id)
-        )
+        userblock_zip_allowed = allows_zip_content_analysis(scanner_selection)
         if userblock_zip_allowed:
             merge_hdf5_userblock_zip_findings(
                 path,
@@ -4159,6 +4164,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 "header_format": detail_header_format,
                 "file_type_validation_failed": not file_type_valid,
             },
+            rule_code="S901" if not file_type_valid else None,
         )
 
     # Ensure bytes_scanned reflects the actual file size even when a scanner

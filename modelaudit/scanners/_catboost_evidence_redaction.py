@@ -29,6 +29,7 @@ EVIDENCE_URL_LOOKAHEAD_CHARS: Final[int] = 64 * 1024
 CURL_COMMAND_SCAN_CHARS: Final[int] = EVIDENCE_URL_LOOKAHEAD_CHARS
 MAX_CURL_EXECUTABLE_CANDIDATES: Final[int] = 64
 MAX_SUBPROCESS_CALL_CANDIDATES: Final[int] = 64
+MAX_COMPARISON_CANDIDATES: Final[int] = 64
 MAX_URL_QUERY_DECODE_PASSES: Final[int] = 8
 MAX_NESTED_URL_QUERY_DEPTH: Final[int] = 8
 MAX_EVALUATED_KEY_CHARS: Final[int] = 256
@@ -194,6 +195,13 @@ KNOWN_AUTHORIZATION_SCHEME_PATTERN: Final[str] = (
 COMPOUND_AUTHORIZATION_SCHEME_PATTERN: Final[str] = r"(?:digest|aws4-hmac-sha256)"
 AUTHORIZATION_SCHEME_PATTERN: Final[str] = rf"(?:{KNOWN_AUTHORIZATION_SCHEME_PATTERN}\s+)?"
 SENSITIVE_ASSIGNMENT_KEY_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)^{SENSITIVE_ASSIGNMENT_KEY}$")
+COMPARISON_OPERATOR_PATTERN: Final[str] = (
+    r"(?:===|!==|==|!=|>=|<=|<>|"
+    r"(?<![<>])<(?![<=>]|redacted>|credentials-redacted>)|"
+    r"(?<![<>])(?<!<redacted)(?<!<credentials-redacted)>(?![=>])|"
+    r"(?<!\w)is(?:\s+not)?(?!\w)|(?<!\w)(?:not\s+)?in(?!\w))"
+)
+COMPARISON_OPERATOR_RE: Final[re.Pattern[str]] = re.compile(COMPARISON_OPERATOR_PATTERN, re.IGNORECASE)
 AUTHORIZATION_KEY_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)^{AUTHORIZATION_KEY_PATTERN}$")
 QUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(\\*)([\"'])({QUOTED_KEY_CONTENT_PATTERN})\1\2\s*{ASSIGNMENT_SEPARATOR}\s*"
@@ -2317,6 +2325,131 @@ def _find_value_expression_end(text: str, start: int, default_end: int) -> int:
     return default_end
 
 
+def _sensitive_comparison_key_from_expression(
+    expression: str,
+    *,
+    allow_literal: bool,
+) -> str | None:
+    expression = expression.strip()
+    if not expression or len(expression) > MAX_KEY_EXPRESSION_CHARS:
+        return None
+    folded = expression.casefold()
+    if not any(signal in folded for signal in SENSITIVE_KEYWORD_SIGNALS):
+        return None
+    try:
+        node = ast.parse(expression, mode="eval").body
+    except SyntaxError:
+        return None
+
+    value: str | None = None
+    if isinstance(node, ast.Name):
+        value = node.id
+    elif isinstance(node, ast.Attribute):
+        value = node.attr
+    elif isinstance(node, ast.Subscript):
+        subscript_value = _safe_eval_string_expr(node.slice)
+        value = subscript_value if isinstance(subscript_value, str) else None
+    elif allow_literal:
+        evaluated = _safe_eval_string_expr(node)
+        value = evaluated if isinstance(evaluated, str) else None
+    return _normalize_sensitive_key(value) if value is not None else None
+
+
+def _left_comparison_operand_has_sensitive_key(text: str, statement_start: int, operator_start: int) -> bool:
+    window_start = max(statement_start, operator_start - MAX_KEY_EXPRESSION_CHARS)
+    segment = text[window_start:operator_start].rstrip()
+    starts = {0}
+    for index, char in enumerate(segment):
+        if char.isspace() or char in ";,&|?:=<>!":
+            starts.add(index + 1)
+    attempts = 0
+    for start in sorted(starts, reverse=True):
+        candidate = segment[start:].strip()
+        if not candidate:
+            continue
+        attempts += 1
+        if _sensitive_comparison_key_from_expression(candidate, allow_literal=True) is not None:
+            return True
+        if attempts >= MAX_KEY_EXPRESSION_PARSE_ATTEMPTS:
+            break
+    return False
+
+
+def _right_comparison_operand_has_sensitive_key(
+    text: str,
+    operator_end: int,
+    statement_end: int,
+    *,
+    allow_literal: bool = False,
+) -> bool:
+    segment = text[operator_end : min(statement_end, operator_end + MAX_KEY_EXPRESSION_CHARS)].lstrip()
+    ends = {len(segment)}
+    for index, char in enumerate(segment):
+        if char.isspace() or char in ";,&|?:=<>!":
+            ends.add(index)
+    attempts = 0
+    for end in sorted(ends):
+        candidate = segment[:end].strip()
+        if not candidate:
+            continue
+        attempts += 1
+        if _sensitive_comparison_key_from_expression(candidate, allow_literal=allow_literal) is not None:
+            return True
+        if attempts >= MAX_KEY_EXPRESSION_PARSE_ATTEMPTS:
+            break
+    return False
+
+
+def _comparison_left_operand_is_string_literal(text: str, statement_start: int, operator_start: int) -> bool:
+    return text[statement_start:operator_start].rstrip().endswith(('"', "'"))
+
+
+def _redact_sensitive_comparison_statements(text: str) -> str:
+    spans: list[tuple[int, int]] = []
+    candidate_count = 0
+    for match in COMPARISON_OPERATOR_RE.finditer(text):
+        if _is_inside_quoted_literal(text, 0, match.start()):
+            continue
+        start = _last_unquoted_statement_boundary(text, 0, match.start())
+        end = _find_value_expression_end(text, match.end(), len(text))
+        if start >= end or not (
+            _left_comparison_operand_has_sensitive_key(text, start, match.start())
+            or _right_comparison_operand_has_sensitive_key(
+                text,
+                match.end(),
+                end,
+                # A literal sensitive key on the right only marks the statement
+                # when the left operand is itself a literal candidate value;
+                # identifier-vs-key-name dispatches stay untouched.
+                allow_literal=_comparison_left_operand_is_string_literal(text, start, match.start()),
+            )
+        ):
+            continue
+        candidate_count += 1
+        if candidate_count > MAX_COMPARISON_CANDIDATES:
+            return REDACTED_EVIDENCE_VALUE
+        spans.append((start, end))
+
+    if not spans:
+        return text
+
+    merged_spans: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged_spans and start <= merged_spans[-1][1]:
+            merged_spans[-1] = (merged_spans[-1][0], max(merged_spans[-1][1], end))
+        else:
+            merged_spans.append((start, end))
+
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in merged_spans:
+        pieces.append(text[cursor:start])
+        pieces.append(_redact_sensitive_command_value(text[start:end]))
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
 def _count_preceding_backslashes(text: str, position: int) -> int:
     count = 0
     index = position - 1
@@ -4050,6 +4183,7 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = _normalize_quoted_sensitive_keys(redacted)
     redacted = _normalize_subscript_sensitive_keys(redacted)
     redacted = _normalize_unquoted_sensitive_keys(redacted)
+    redacted = _redact_sensitive_comparison_statements(redacted)
     redacted = _redact_sensitive_literal_expressions(redacted)
     folded = redacted.casefold()
     has_quotes = '"' in redacted or "'" in redacted
