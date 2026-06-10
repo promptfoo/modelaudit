@@ -2281,7 +2281,31 @@ fn follows_terminal_base64_padding(value: &str, index: usize) -> bool {
         .iter()
         .rposition(|byte| *byte != b'=')
         .map_or(0, |position| position.saturating_add(1));
-    padding_start > 0 && base64_value(lookback[padding_start - 1]).is_some()
+    if padding_start == 0 || base64_value(lookback[padding_start - 1]).is_none() {
+        return false;
+    }
+
+    let padding_start = lookback_start.saturating_add(padding_start);
+    let data_scan_start = padding_start.saturating_sub(MAX_ENCODED_LITERAL_PREFIX_SCAN_BYTES);
+    let data_run_start = value.as_bytes()[data_scan_start..padding_start]
+        .iter()
+        .rposition(|byte| base64_value(*byte).is_none())
+        .map_or(data_scan_start, |position| {
+            data_scan_start.saturating_add(position).saturating_add(1)
+        });
+    if data_run_start == data_scan_start
+        && data_scan_start > 0
+        && value
+            .as_bytes()
+            .get(data_scan_start - 1)
+            .is_some_and(|byte| base64_value(*byte).is_some())
+    {
+        // The bounded scan cannot prove that this padding terminates an
+        // incomplete quartet, so keep the security-relevant suffix visible.
+        return false;
+    }
+
+    (padding_start - data_run_start) % 4 != 0
 }
 
 fn hex_prefix_has_pickle_prefix(value: &str) -> bool {
@@ -2830,6 +2854,39 @@ mod tests {
             strip_escaped_hex_markers("63 6f 73 0a 73 79 73 74 65 6d 0a 29 52 2e"),
             "636f730a73797374656d0a29522e"
         );
+        assert!(!follows_terminal_base64_padding("AAAA=ly4=", 5));
+        assert!(!follows_terminal_base64_padding("AAAA==ly4=", 6));
+        assert!(follows_terminal_base64_padding("AAA=ly4=", 4));
+        assert!(follows_terminal_base64_padding("AA==ly4=", 4));
+        assert_eq!(encoded_pickle_kind_at("AAAA=ly4=", 5), Some("base64"));
+        assert_eq!(encoded_pickle_kind_at("AAA=ly4=", 4), None);
+
+        let bounded_aligned_prefix = format!("{}=ly4=", "A".repeat(64));
+        assert!(!follows_terminal_base64_padding(
+            &bounded_aligned_prefix,
+            65
+        ));
+        assert_eq!(
+            encoded_pickle_kind_at(&bounded_aligned_prefix, 65),
+            Some("base64")
+        );
+
+        let bounded_terminal_prefix = format!("{}=ly4=", "A".repeat(63));
+        assert!(follows_terminal_base64_padding(
+            &bounded_terminal_prefix,
+            64
+        ));
+        assert_eq!(encoded_pickle_kind_at(&bounded_terminal_prefix, 64), None);
+
+        for (prefix_chars, padding_chars) in [(63, "=="), (66, "==")] {
+            let padded_prefix = format!("{}{}ly4=", "A".repeat(prefix_chars), padding_chars);
+            let payload_index = prefix_chars + padding_chars.len();
+            assert!(follows_terminal_base64_padding(
+                &padded_prefix,
+                payload_index
+            ));
+            assert_eq!(encoded_pickle_kind_at(&padded_prefix, payload_index), None);
+        }
     }
 
     #[test]
