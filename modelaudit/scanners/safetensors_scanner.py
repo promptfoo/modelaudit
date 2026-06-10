@@ -516,7 +516,7 @@ class SafeTensorsScanner(BaseScanner):
 
                 try:
                     header = json.loads(header_bytes.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as e:
                     result.add_check(
                         name="SafeTensors JSON Parse",
                         passed=False,
