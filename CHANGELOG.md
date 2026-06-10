@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - assign ONNX custom operator domains to the dedicated S1111 framework rule instead of the HTTP-client S302 rule
+- emit Hugging Face whitelist model IDs and organization summaries as safe generated Python
+- preserve bounded and fail-closed SafeTensors routing when header lengths resemble compression magic
 - allow equal offsets for supported empty SafeTensors tensors while preserving deterministic range checks and rejecting native size overflow
 - attribute core file-type validation failures directly to S901 instead of message-matching unrelated rules
 - fail closed when manifest scanning exceeds its configured timeout
