@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - allow equal offsets for supported empty SafeTensors tensors while preserving deterministic range checks and rejecting native size overflow
+- fail closed when manifest scanning exceeds its configured timeout
 - stop cloud directory analysis as soon as download size or object-count budgets are exhausted
 - preserve sanitized CatBoost command context in SARIF without exposing injected or neighboring credential values
 - redact values compared against sensitive keys in generic exports and literal credential comparisons in CatBoost evidence
