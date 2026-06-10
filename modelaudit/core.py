@@ -38,6 +38,7 @@ from modelaudit.scanner_selection import (
     ScannerSelectionPolicy,
     add_scanner_selection_skip_check,
     allows_protobuf_model_candidate_analysis,
+    allows_zip_content_analysis,
     allows_zip_structure_analysis,
     make_scanner_selection_skip_result,
     normalize_scanner_selection_config,
@@ -4004,10 +4005,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     result = make_scanner_selection_skip_result(path, candidate_scanner_id, scanner_selection)
                     if result.bytes_scanned == 0 and file_size > 0:
                         result.bytes_scanned = file_size
-                    userblock_zip_allowed = hdf5_signature_offset not in (None, 0) and allows_zip_structure_analysis(
-                        scanner_selection,
-                        path,
-                    )
+                    userblock_zip_allowed = hdf5_signature_offset not in (
+                        None,
+                        0,
+                    ) and allows_zip_content_analysis(scanner_selection)
                     if userblock_zip_allowed:
                         assert hdf5_signature_offset is not None
                         result.scanner_name = "zip"
@@ -4108,7 +4109,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     if hdf5_signature_offset not in (None, 0):
         assert hdf5_signature_offset is not None
-        userblock_zip_allowed = allows_zip_structure_analysis(scanner_selection, path)
+        userblock_zip_allowed = allows_zip_content_analysis(scanner_selection)
         if userblock_zip_allowed:
             merge_hdf5_userblock_zip_findings(
                 path,

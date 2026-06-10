@@ -1762,6 +1762,22 @@ def test_curl_user_complex_password_is_fully_redacted(credential: str, secret: s
             '"pass\u200bword' + (r"\(" * 26),
         ),
     ],
+    ids=[
+        "quoted-cert-unterminated",
+        "quoted-user-unterminated",
+        "substitution-user-unterminated",
+        "config-user-unterminated",
+        "quoted-cert-long-colons",
+        "quoted-user-long-colons",
+        "config-user-long-colons",
+        "cert-long-colons",
+        "cert-option-near-match",
+        "curl-executable-near-match",
+        "sensitive-argv-unterminated",
+        "cookie-header-unterminated",
+        "structured-value-unterminated",
+        "zero-width-key-unterminated",
+    ],
 )
 def test_command_credential_redaction_has_bounded_runtime(pattern_name: str, payload: str) -> None:
     code = (
@@ -1794,6 +1810,14 @@ def test_command_credential_redaction_has_bounded_runtime(pattern_name: str, pay
         "subprocess.run(" * 8_000,
         "a-" * 8_000,
         ("a-" * 8_000) + ':"',
+    ],
+    ids=[
+        "repeated-slash-curl",
+        "repeated-curl-prefix",
+        "split-curl",
+        "repeated-subprocess",
+        "repeated-option",
+        "repeated-option-quote",
     ],
 )
 def test_redaction_adversarial_inputs_have_bounded_runtime(payload: str) -> None:

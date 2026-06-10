@@ -5,12 +5,6 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Bug Fixes
-
-- preserve bounded raw nested-pickle analysis and avoid duplicate probes inside complete encoded pickles
-
 ## [0.1.6](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.5...modelaudit-picklescan-v0.1.6) (2026-06-05)
 
 ### Bug Fixes
@@ -84,6 +78,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- preserve bounded raw nested-pickle analysis and avoid duplicate probes inside complete encoded pickles
 - preserve raw persistent-ID probes and later encoded payloads when byte literals also contain complete or unterminated Base64 pickles
 - scan encoded nested pickles in bounded byte and bytearray literals without treating benign execution-like text or complete encoded payloads as raw pickle fragments
 - continue probing encoded protocol 0 payloads after long line operands, lenient base64 separators, and wrapper alignment shifts while failing closed beyond bounded mid-scan coverage

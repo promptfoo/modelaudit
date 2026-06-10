@@ -4310,6 +4310,67 @@ def test_scan_file_honors_zip_only_selection_for_hdf5_userblock(tmp_path: Path) 
     )
 
 
+def test_scan_file_honors_pytorch_zip_only_selection_for_hdf5_userblock(tmp_path: Path) -> None:
+    polyglot = tmp_path / "selected-pytorch-zip-userblock.h5"
+    _create_misnamed_zip(
+        polyglot,
+        {
+            "archive/data.pkl": pickle.dumps(
+                {"endpoint": "http://attacker.example/model"},
+                protocol=4,
+            ),
+            "archive/version": b"3\n",
+            "archive/byteorder": b"little",
+        },
+    )
+    _append_hdf5_userblock_candidate(polyglot, plausible=True)
+
+    result = scan_file(
+        str(polyglot),
+        config={"scanners": ["pytorch_zip"], "cache_scan_results": False},
+    )
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{polyglot}:archive/data.pkl"
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "pytorch_zip"
+        for check in result.checks
+    )
+
+
+def test_scan_file_selected_weight_distribution_ignores_hdf5_userblock_zip_near_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "selected-weight-distribution-userblock.h5"
+    model_path.write_bytes(b"PK\x03\x04 benign model notes")
+    _append_hdf5_userblock_candidate(model_path, plausible=True)
+
+    def fake_weight_scan(_self: Any, path: str) -> ScanResult:
+        assert path == str(model_path)
+        result = ScanResult(scanner_name="weight_distribution")
+        result.finish(success=True)
+        return result
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.weight_distribution_scanner.WeightDistributionScanner.scan",
+        fake_weight_scan,
+    )
+
+    result = scan_file(
+        str(model_path),
+        config={"scanners": ["weight_distribution"], "cache_scan_results": False},
+    )
+
+    assert result.scanner_name == "weight_distribution"
+    assert result.success is True
+    assert not any(check.name == "HDF5 User Block ZIP Analysis" for check in result.checks)
+
+
 def test_scan_file_honors_zip_only_selection_for_large_hdf5_userblock(tmp_path: Path) -> None:
     polyglot = tmp_path / "selected-large-zip-userblock.h5"
     _create_misnamed_zip(polyglot, {"payload.pkl": _build_malicious_pickle()})
