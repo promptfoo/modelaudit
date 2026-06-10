@@ -1,3 +1,4 @@
+import builtins
 import bz2
 import gzip
 import importlib
@@ -9041,12 +9042,49 @@ class TestZipScanner:
             member.write(b"safe")
 
         archive_path = tmp_path / "force_zip64_streamed.zip"
-        archive_path.write_bytes(archive_buffer.getvalue())
+        archive_bytes = bytearray(archive_buffer.getvalue())
+        local_header = archive_bytes.find(b"PK\x03\x04")
+        assert local_header >= 0
+        archive_bytes[local_header + 18 : local_header + 26] = b"\x00" * 8
+        archive_path.write_bytes(archive_bytes)
 
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is True
         assert not any(
+            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+
+    def test_force_zip64_streamed_entry_rejects_invalid_64bit_descriptor(self, tmp_path: Path) -> None:
+        class NonSeekableBuffer(io.BytesIO):
+            def seek(self, *_args: Any, **_kwargs: Any) -> int:
+                raise io.UnsupportedOperation("not seekable")
+
+            def seekable(self) -> bool:
+                return False
+
+        archive_buffer = NonSeekableBuffer()
+        with (
+            zipfile.ZipFile(archive_buffer, "w") as archive,
+            archive.open("safe.txt", "w", force_zip64=True) as member,
+        ):
+            member.write(b"safe")
+
+        archive_bytes = bytearray(archive_buffer.getvalue())
+        local_header = archive_bytes.find(b"PK\x03\x04")
+        descriptor = archive_bytes.find(b"PK\x07\x08")
+        assert local_header >= 0
+        assert descriptor >= 0
+        archive_bytes[local_header + 18 : local_header + 26] = b"\x00" * 8
+        archive_bytes[descriptor + 12 : descriptor + 16] = (1).to_bytes(4, "little")
+        archive_path = tmp_path / "invalid-force-zip64-streamed.zip"
+        archive_path.write_bytes(archive_bytes)
+
+        result = ZipScanner().scan(str(archive_path))
+
+        assert result.success is False
+        assert any(
             check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
             for check in result.checks
         )
@@ -9427,7 +9465,11 @@ class TestZipScanner:
             for check in exc_info.value.result.checks
         )
 
-    def test_archive_member_scan_reuses_open_archive_after_path_replacement(self, tmp_path: Path) -> None:
+    def test_archive_member_scan_reuses_open_archive_after_path_replacement(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         archive_path = tmp_path / "original.zip"
         replacement_path = tmp_path / "replacement.zip"
         with zipfile.ZipFile(archive_path, "w") as archive:
@@ -9435,8 +9477,15 @@ class TestZipScanner:
         with zipfile.ZipFile(replacement_path, "w") as archive:
             archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo replacement"\ntR.')
 
+        original_open = builtins.open
+
+        def redirect_archive_reopen(file: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(file, (str, os.PathLike)) and Path(file) == archive_path:
+                file = replacement_path
+            return original_open(file, *args, **kwargs)
+
         with zipfile.ZipFile(archive_path) as archive:
-            os.replace(replacement_path, archive_path)
+            monkeypatch.setattr(builtins, "open", redirect_archive_reopen)
             result = ZipScanner().scan_archive_members(str(archive_path), archive=archive)
 
         assert result.success is True
@@ -9987,6 +10036,37 @@ class TestZipScanner:
             check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
             for check in result.checks
         )
+
+    def test_symlink_local_metadata_mismatch_reports_critical_finding(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "mismatched-symlink-name.zip"
+        link_name = "link.txt"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            info = zipfile.ZipInfo(link_name)
+            info.create_system = 3
+            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(info, "safe-target")
+
+        with zipfile.ZipFile(archive_path) as archive:
+            header_offset = archive.getinfo(link_name).header_offset
+        archive_bytes = bytearray(archive_path.read_bytes())
+        filename_length = struct.unpack_from("<H", archive_bytes, header_offset + 26)[0]
+        filename_start = header_offset + 30
+        archive_bytes[filename_start : filename_start + filename_length] = b"x" * filename_length
+        archive_path.write_bytes(archive_bytes)
+
+        result = ZipScanner().scan(str(archive_path))
+
+        assert result.success is False
+        assert any(check.rule_code == "S902" for check in result.checks)
+        symlink_check = next(
+            check
+            for check in result.checks
+            if check.name == "Symlink Safety Validation" and check.details.get("entry") == link_name
+        )
+        assert symlink_check.status == CheckStatus.FAILED
+        assert symlink_check.severity == IssueSeverity.CRITICAL
+        assert symlink_check.rule_code == "S406"
+        assert symlink_check.details["target_class"] == "invalid"
 
     def test_many_eocd_signatures_in_stored_member_are_not_treated_as_candidates(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "many_eocd_signatures.zip"

@@ -6760,7 +6760,8 @@ def test_pytorch_zip_scanner_entry_limit_skips_late_entries(tmp_path: Path) -> N
         zipf.writestr("entry_0.txt", "data")
         zipf.writestr("entry_1.txt", "data")
         symlink_info = zipfile.ZipInfo("late_symlink")
-        symlink_info.external_attr = 0o120777 << 16
+        symlink_info.create_system = 3
+        symlink_info.external_attr = (stat.S_IFLNK | 0o777) << 16
         symlink_info.compress_type = zipfile.ZIP_STORED
         zipf.writestr(symlink_info, str(symlink_target))
 
@@ -6790,7 +6791,8 @@ def test_pytorch_zip_entry_validation_checks_timeout_between_members(
     with zipfile.ZipFile(zip_path, "w") as zipf:
         for index in range(3):
             symlink_info = zipfile.ZipInfo(f"link_{index}")
-            symlink_info.external_attr = 0o120777 << 16
+            symlink_info.create_system = 3
+            symlink_info.external_attr = (stat.S_IFLNK | 0o777) << 16
             symlink_info.compress_type = zipfile.ZIP_STORED
             zipf.writestr(symlink_info, str(tmp_path / f"target_{index}"))
 
@@ -6909,6 +6911,7 @@ def test_pytorch_zip_entry_limit_reads_selected_symlink_duplicate(tmp_path: Path
     symlink_target = tmp_path / "selected-target"
     with zipfile.ZipFile(zip_path, "w") as zipf:
         symlink_info = zipfile.ZipInfo("duplicate-entry")
+        symlink_info.create_system = 3
         symlink_info.external_attr = 0o120777 << 16
         symlink_info.compress_type = zipfile.ZIP_STORED
         zipf.writestr(symlink_info, str(symlink_target))
@@ -7488,12 +7491,12 @@ def test_pytorch_zip_symlink_central_sizes_cannot_hide_escaping_suffix(tmp_path:
 
     result = PyTorchZipScanner().scan(str(zip_path))
 
+    assert result.success is False
     symlink_check = next(
         check
         for check in result.checks
         if check.name == "Symlink Safety Validation" and check.details.get("entry") == link_name
     )
-    assert result.success is False
     assert symlink_check.status == CheckStatus.FAILED
     assert symlink_check.severity == IssueSeverity.CRITICAL
     assert symlink_check.rule_code == "S406"
@@ -7586,8 +7589,10 @@ def test_pytorch_zip_symlink_read_error_redacts_local_header_name(tmp_path: Path
         for check in result.checks
         if check.name == "Symlink Safety Validation" and check.details.get("entry") == central_name
     )
-    assert symlink_check.rule_code == "S902"
-    assert symlink_check.details["exception"] == "<redacted>"
+    assert symlink_check.status == CheckStatus.FAILED
+    assert symlink_check.severity == IssueSeverity.CRITICAL
+    assert symlink_check.rule_code == "S406"
+    assert symlink_check.details["target_class"] == "invalid"
     assert secret not in result.to_json()
 
 
@@ -7635,6 +7640,7 @@ def test_pytorch_zip_scanner_symlink_detection(tmp_path: Path) -> None:
         # The external_attr field encodes the Unix file mode
         # S_IFLNK = 0o120000 (symlink)
         symlink_info = zipfile.ZipInfo("malicious_link")
+        symlink_info.create_system = 3
         # Set external attributes to indicate symlink (Unix mode in upper 16 bits)
         symlink_info.external_attr = 0o120777 << 16  # symlink with full permissions
         symlink_info.compress_type = zipfile.ZIP_STORED
@@ -7678,7 +7684,8 @@ def test_pytorch_zip_scanner_combined_security_controls(tmp_path: Path) -> None:
         zipf.writestr("version", "3")
         # Add a symlink entry before the entry cap, then enough entries to exceed a low limit.
         symlink_info = zipfile.ZipInfo("evil_link")
-        symlink_info.external_attr = 0o120777 << 16
+        symlink_info.create_system = 3
+        symlink_info.external_attr = (stat.S_IFLNK | 0o777) << 16
         symlink_info.compress_type = zipfile.ZIP_STORED
         zipf.writestr(symlink_info, str(symlink_target))
         for i in range(12):

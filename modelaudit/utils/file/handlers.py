@@ -136,6 +136,8 @@ def _pinned_windows_shard_scan_path(
     except _ShardPinUnavailableError:
         raise
     except OSError as error:
+        if pinned_scan is not None:
+            raise
         raise _ShardPinUnavailableError(str(error)) from error
     finally:
         if pinned_scan is not None and pinned_stat is not None and pinned_fd is not None:
@@ -235,6 +237,8 @@ def _pinned_shard_scan_path(
     except _ShardPinUnavailableError:
         raise
     except OSError as error:
+        if pinned_scan is not None:
+            raise
         raise _ShardPinUnavailableError(str(error)) from error
     finally:
         if pinned_scan is not None and pinned_stat is not None and source_fd is not None:
