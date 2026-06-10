@@ -12,7 +12,8 @@ import pytest
 # Skip if safetensors is not available before importing it
 pytest.importorskip("safetensors")
 
-from safetensors.numpy import save_file
+from safetensors import SafetensorError, safe_open
+from safetensors.numpy import load_file, save_file
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
@@ -75,6 +76,176 @@ def test_valid_safetensors_file(tmp_path: Path) -> None:
     header_limit_check = next((check for check in result.checks if check.name == "Header Size Limit"), None)
     assert header_limit_check is not None
     assert header_limit_check.status.value == "passed"
+
+
+def test_valid_empty_tensor_offsets(tmp_path: Path) -> None:
+    file_path = tmp_path / "empty_tensor.safetensors"
+    save_file(
+        {
+            "empty": np.empty((0,), dtype=np.float32),
+            "value": np.ones((1,), dtype=np.float32),
+        },
+        str(file_path),
+    )
+
+    with file_path.open("rb") as handle:
+        header_len = struct.unpack("<Q", handle.read(8))[0]
+        header = json.loads(handle.read(header_len))
+
+    assert header["empty"]["data_offsets"][0] == header["empty"]["data_offsets"][1]
+    assert load_file(str(file_path))["empty"].shape == (0,)
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is True
+    assert not result.has_errors
+    assert any(
+        check.name == "Tensor Offset Validation"
+        and check.details.get("tensor") == "empty"
+        and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Tensor Size Consistency Check"
+        and check.details.get("tensor") == "empty"
+        and check.details.get("size") == 0
+        and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+
+
+def test_zero_length_offsets_require_empty_shape(tmp_path: Path) -> None:
+    file_path = tmp_path / "invalid_zero_length_tensor.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {"not_empty": {"dtype": "F32", "shape": [1], "data_offsets": [0, 0]}},
+        b"",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Tensor Size Consistency Check"
+        and check.details.get("tensor") == "not_empty"
+        and check.details.get("expected_size") == 4
+        and check.details.get("actual_size") == 0
+        and check.severity == IssueSeverity.CRITICAL
+        and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_empty_tensor_offset_sort_matches_safetensors(tmp_path: Path) -> None:
+    file_path = tmp_path / "empty_tensor_before_nonempty_range.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {
+            "nonempty": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "empty": {"dtype": "U8", "shape": [0], "data_offsets": [0, 0]},
+        },
+        b"\x00",
+    )
+
+    with safe_open(str(file_path), framework="np") as handle:
+        assert set(handle.keys()) == {"empty", "nonempty"}
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != "inconclusive"
+    assert not any(
+        check.status == CheckStatus.FAILED and check.name == "Offset Continuity Check" for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("dtype", "shape"),
+    [
+        ("U8", [1 << (8 * struct.calcsize("P") - 1), 2, 0]),
+        ("U16", [1 << (8 * struct.calcsize("P") - 1)]),
+        ("U8", [1 << (8 * struct.calcsize("P")), 0]),
+    ],
+)
+def test_shape_size_overflow_cannot_be_masked_by_zero_dimension(
+    tmp_path: Path,
+    dtype: str,
+    shape: list[int],
+) -> None:
+    file_path = tmp_path / "overflow_masked_empty_tensor.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {"tensor": {"dtype": dtype, "shape": shape, "data_offsets": [0, 0]}},
+        b"",
+    )
+
+    with pytest.raises(SafetensorError, match=r"(?i)(overflow|invalid.*(?:header|json))"):
+        safe_open(str(file_path), framework="np")
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(
+        check.name == "Tensor Size Computation Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("shape") == shape
+        for check in result.checks
+    )
+
+
+def test_zero_before_large_dimensions_remains_valid_empty_shape(tmp_path: Path) -> None:
+    file_path = tmp_path / "zero_first_large_empty_tensor.safetensors"
+    shape = [0, 1 << (8 * struct.calcsize("P") - 1), 2]
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {
+                "dtype": "U8",
+                "shape": shape,
+                "data_offsets": [0, 0],
+            }
+        },
+        b"",
+    )
+
+    with safe_open(str(file_path), framework="np") as handle:
+        assert handle.get_slice("tensor").get_shape() == shape
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+
+
+def test_tensor_size_overflow_uses_native_byte_width(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("modelaudit.scanners.safetensors_scanner._MAX_PLATFORM_USIZE", 15)
+
+    assert SafeTensorsScanner._expected_size("U8", [15]) == 15
+    assert SafeTensorsScanner._expected_size("U8", [16]) is None
+    assert SafeTensorsScanner._expected_size("U16", [7]) == 14
+    assert SafeTensorsScanner._expected_size("U16", [8]) is None
+
+
+def test_offsets_must_fit_native_usize(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    file_path = tmp_path / "native_offset_overflow.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {"empty": {"dtype": "U8", "shape": [0], "data_offsets": [4, 4]}},
+        b"\x00" * 4,
+    )
+    monkeypatch.setattr("modelaudit.scanners.safetensors_scanner._MAX_PLATFORM_USIZE", 3)
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Tensor Offset Validation"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("max_platform_offset") == 3
+        for check in result.checks
+    )
 
 
 def test_valid_empty_safetensors_custom_metadata(tmp_path: Path) -> None:

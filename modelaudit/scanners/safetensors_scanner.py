@@ -14,25 +14,26 @@ from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
 from ..core_results import mark_operational_scan_error
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
-# Map SafeTensors dtypes to byte sizes for integrity checking
-_DTYPE_SIZES = {
-    "BOOL": 1,
-    "BF16": 2,
-    "F16": 2,
-    "F32": 4,
-    "F64": 8,
-    "F8_E4M3": 1,
-    "F8_E5M2": 1,
-    "I8": 1,
-    "I16": 2,
-    "I32": 4,
-    "I64": 8,
-    "U8": 1,
-    "U16": 2,
-    "U32": 4,
-    "U64": 8,
+# Map supported SafeTensors dtypes to bit sizes for integrity checking
+_DTYPE_BITS = {
+    "BOOL": 8,
+    "BF16": 16,
+    "F16": 16,
+    "F32": 32,
+    "F64": 64,
+    "F8_E4M3": 8,
+    "F8_E5M2": 8,
+    "I8": 8,
+    "I16": 16,
+    "I32": 32,
+    "I64": 64,
+    "U8": 8,
+    "U16": 16,
+    "U32": 32,
+    "U64": 64,
 }
 MAX_HEADER_BYTES = 16 * 1024 * 1024
+_MAX_PLATFORM_USIZE = (1 << (8 * struct.calcsize("P"))) - 1
 SAFETENSORS_HEADER_INCONCLUSIVE_REASON = "safetensors_header_validation_failed"
 SAFETENSORS_STRUCTURE_INCONCLUSIVE_REASON = "safetensors_structure_validation_failed"
 SAFETENSORS_HEADER_LIMIT_INCONCLUSIVE_REASON = "safetensors_header_size_limit_exceeded"
@@ -633,14 +634,26 @@ class SafeTensorsScanner(BaseScanner):
                         structural_validation_failed = True
                         continue
 
-                    if begin < 0 or end <= begin or end > data_size:
+                    if (
+                        begin < 0
+                        or end < begin
+                        or begin > _MAX_PLATFORM_USIZE
+                        or end > _MAX_PLATFORM_USIZE
+                        or end > data_size
+                    ):
                         result.add_check(
                             name="Tensor Offset Validation",
                             passed=False,
                             message=f"Tensor {name} offsets out of bounds",
                             severity=IssueSeverity.CRITICAL,
                             location=path,
-                            details={"tensor": name, "begin": begin, "end": end, "data_size": data_size},
+                            details={
+                                "tensor": name,
+                                "begin": begin,
+                                "end": end,
+                                "data_size": data_size,
+                                "max_platform_offset": _MAX_PLATFORM_USIZE,
+                            },
                         )
                         continue
                     else:
@@ -655,7 +668,7 @@ class SafeTensorsScanner(BaseScanner):
                     offsets.append((begin, end))
 
                     # Validate dtype/shape size
-                    if not isinstance(dtype, str) or dtype not in _DTYPE_SIZES:
+                    if not isinstance(dtype, str) or dtype not in _DTYPE_BITS:
                         result.add_check(
                             name="Tensor Dtype Validation",
                             passed=False,
@@ -733,7 +746,7 @@ class SafeTensorsScanner(BaseScanner):
                         )
 
                 # Check offset continuity
-                offsets.sort(key=lambda x: x[0])
+                offsets.sort()
                 last_end = 0
                 has_gap_or_overlap = False
                 for begin, end in offsets:
@@ -853,17 +866,25 @@ class SafeTensorsScanner(BaseScanner):
     @staticmethod
     def _expected_size(dtype: str | None, shape: Any) -> int | None:
         """Return expected tensor byte size from dtype and shape."""
-        if dtype not in _DTYPE_SIZES:
+        if dtype not in _DTYPE_BITS:
             return None
         if not isinstance(shape, list):
             return None
-        size = _DTYPE_SIZES[dtype]
+        bits = _DTYPE_BITS[dtype]
         total = 1
         for dim in shape:
             if not isinstance(dim, int) or isinstance(dim, bool) or dim < 0:
                 return None
+            if dim > _MAX_PLATFORM_USIZE or (dim and total > _MAX_PLATFORM_USIZE // dim):
+                return None
             total *= dim
-        return total * size
+        total_bits = total * bits
+        if total_bits % 8:
+            return None
+        total_bytes = total_bits // 8
+        if total_bytes > _MAX_PLATFORM_USIZE:
+            return None
+        return total_bytes
 
     def _detect_metadata_injection_attacks(
         self,
