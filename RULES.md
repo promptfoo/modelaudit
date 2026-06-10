@@ -33,7 +33,7 @@ modelaudit scan --suppress S101 --severity S301=HIGH model.pkl
 
 ## Rule Catalog
 
-The catalog currently contains 113 rules.
+The catalog currently contains 114 rules.
 
 ### Module And Import Security
 
@@ -190,18 +190,19 @@ The catalog currently contains 113 rules.
 
 ### Framework-Specific Risks
 
-| Code    | Default severity | Name                        | Description                           |
-| ------- | ---------------- | --------------------------- | ------------------------------------- |
-| `S1101` | HIGH             | PyTorch unsafe load         | torch.load without weights_only=True  |
-| `S1102` | MEDIUM           | TensorFlow SavedModel risks | TensorFlow SavedModel security issues |
-| `S1103` | MEDIUM           | Keras Lambda layers         | Keras Lambda layers with code         |
-| `S1104` | LOW              | ONNX opset version          | ONNX version compatibility issue      |
-| `S1105` | MEDIUM           | JAX compilation risks       | JAX JIT compilation security          |
-| `S1106` | MEDIUM           | MXNet custom operators      | MXNet custom operator risks           |
-| `S1107` | MEDIUM           | PaddlePaddle dynamic graph  | PaddlePaddle dynamic mode risks       |
-| `S1108` | MEDIUM           | CoreML custom layers        | CoreML custom layer risks             |
-| `S1109` | MEDIUM           | TensorRT plugins            | TensorRT plugin security              |
-| `S1110` | LOW              | GGUF/GGML format risks      | GGUF/GGML format security issues      |
+| Code    | Default severity | Name                         | Description                                                         |
+| ------- | ---------------- | ---------------------------- | ------------------------------------------------------------------- |
+| `S1101` | HIGH             | PyTorch unsafe load          | torch.load without weights_only=True                                |
+| `S1102` | MEDIUM           | TensorFlow SavedModel risks  | TensorFlow SavedModel security issues                               |
+| `S1103` | MEDIUM           | Keras Lambda layers          | Keras Lambda layers with code                                       |
+| `S1104` | LOW              | ONNX opset version           | ONNX version compatibility issue                                    |
+| `S1105` | MEDIUM           | JAX compilation risks        | JAX JIT compilation security                                        |
+| `S1106` | MEDIUM           | MXNet custom operators       | MXNet custom operator risks                                         |
+| `S1107` | MEDIUM           | PaddlePaddle dynamic graph   | PaddlePaddle dynamic mode risks                                     |
+| `S1108` | MEDIUM           | CoreML custom layers         | CoreML custom layer risks                                           |
+| `S1109` | MEDIUM           | TensorRT plugins             | TensorRT plugin security                                            |
+| `S1110` | LOW              | GGUF/GGML format risks       | GGUF/GGML format security issues                                    |
+| `S1111` | INFO             | ONNX custom operator domains | ONNX model may depend on an external custom operator implementation |
 
 ## Maintenance
 

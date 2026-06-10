@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import zipfile
+import zlib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -26,8 +27,10 @@ from modelaudit import core as core_module
 from modelaudit.analysis.unified_context import UnifiedMLContext
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import normalize_material_scan_config
+from modelaudit.config import ModelAuditConfig, set_config
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
+from modelaudit.rules import Severity
 from modelaudit.scanners import (
     archive_dispatch,
     flax_msgpack_scanner,
@@ -7030,12 +7033,22 @@ def test_scan_file_routes_misnamed_keras_hdf5_by_header(tmp_path: Path) -> None:
     assert any("CVE-2025-9905" in issue.message for issue in result.issues)
 
 
+@pytest.mark.parametrize(
+    ("filename", "header_len"),
+    [
+        ("weights.jpg", SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1),
+        ("zlib-shaped.unknown", SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 0x9C78),
+    ],
+    ids=["generic", "zlib-shaped"],
+)
 def test_scan_file_routes_oversized_renamed_safetensors_to_inconclusive_scan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    header_len: int,
 ) -> None:
-    disguised_safetensors = tmp_path / "weights.jpg"
-    _write_sparse_oversized_safetensors_candidate(disguised_safetensors)
+    disguised_safetensors = tmp_path / filename
+    _write_sparse_oversized_safetensors_candidate(disguised_safetensors, header_len=header_len)
     monkeypatch.setattr(
         safetensors_scanner.SafeTensorsScanner,
         "calculate_file_hashes",
@@ -7053,12 +7066,22 @@ def test_scan_file_routes_oversized_renamed_safetensors_to_inconclusive_scan(
     assert limit_check.severity == IssueSeverity.INFO
 
 
+@pytest.mark.parametrize(
+    ("filename", "header_len"),
+    [
+        ("weights.jpg", SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1),
+        ("zlib-shaped.unknown", SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 0x9C78),
+    ],
+    ids=["generic", "zlib-shaped"],
+)
 def test_scan_top_level_oversized_renamed_safetensors_fails_before_hashing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    header_len: int,
 ) -> None:
-    disguised_safetensors = tmp_path / "weights.jpg"
-    _write_sparse_oversized_safetensors_candidate(disguised_safetensors)
+    disguised_safetensors = tmp_path / filename
+    _write_sparse_oversized_safetensors_candidate(disguised_safetensors, header_len=header_len)
     monkeypatch.setattr(
         safetensors_scanner.SafeTensorsScanner,
         "calculate_file_hashes",
@@ -8880,6 +8903,64 @@ def test_scan_file_routes_onnx_pb_by_content(tmp_path: Path) -> None:
     assert not any(check.name == "Format Validation" for check in result.checks)
 
 
+def test_scan_file_attributes_format_mismatch_to_s901(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.safetensors"
+    malicious_pickle = b"cbuiltins\neval\n(S'1+1'\ntR."
+    model_path.write_bytes(zlib.compress(malicious_pickle))
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+    format_check = next(
+        check for check in result.checks if check.name == "Format Validation" and check.location == str(model_path)
+    )
+    format_issue = next(
+        issue for issue in result.issues if issue.message == format_check.message and issue.location == str(model_path)
+    )
+
+    assert format_check.status == CheckStatus.FAILED
+    assert format_check.rule_code == "S901"
+    assert format_check.details == {
+        "extension_format": "safetensors",
+        "header_format": "zlib",
+        "file_type_validation_failed": True,
+    }
+    assert format_issue.rule_code == "S901"
+    assert any(issue.rule_code == "S104" and "builtins.eval" in issue.message for issue in result.issues)
+
+
+def test_scan_file_accepts_matching_zlib_format_without_mismatch(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.zlib"
+    model_path.write_bytes(zlib.compress(b"benign model metadata"))
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "compressed"
+    assert result.success is True
+    assert not any(check.name == "Format Validation" for check in result.checks)
+    assert not any(issue.rule_code == "S901" for issue in result.issues)
+
+
+def test_scan_file_does_not_attribute_compatible_container_discrepancy_to_s901(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
+    rule_config = ModelAuditConfig()
+    rule_config.severity = {"S901": Severity.CRITICAL}
+    set_config(rule_config)
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+    format_check = next(
+        check for check in result.checks if check.name == "Format Validation" and check.location == str(model_path)
+    )
+    format_issue = next(
+        issue for issue in result.issues if issue.message == format_check.message and issue.location == str(model_path)
+    )
+
+    assert result.success is True
+    assert format_check.details["file_type_validation_failed"] is False
+    assert format_check.rule_code is None
+    assert format_check.severity == IssueSeverity.DEBUG
+    assert format_issue.rule_code is None
+    assert format_issue.severity == IssueSeverity.DEBUG
+
+
 def test_scan_file_detects_malicious_onnx_pb_by_content(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     onnx_pb = tmp_path / "malicious.pb"
@@ -10192,12 +10273,22 @@ def test_scan_file_incomplete_xml_routing_result_is_not_cached(tmp_path: Path) -
         reset_cache_manager()
 
 
+@pytest.mark.parametrize(
+    ("filename", "header_len"),
+    [
+        ("oversized.safetensors", (1024 * 1024) + 1),
+        ("zlib-shaped.unknown", SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 0x9C78),
+    ],
+    ids=["native-suffix", "zlib-shaped"],
+)
 def test_scan_file_inconclusive_safetensors_header_limit_result_is_not_cached(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    header_len: int,
 ) -> None:
-    payload = tmp_path / "oversized.safetensors"
-    _write_sparse_oversized_safetensors_candidate(payload, header_len=(1024 * 1024) + 1)
+    payload = tmp_path / filename
+    _write_sparse_oversized_safetensors_candidate(payload, header_len=header_len)
     cache_dir = tmp_path / "cache"
     config = {
         "cache_enabled": True,

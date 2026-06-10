@@ -174,9 +174,11 @@ def _proto_length_field(field_number: int, payload: bytes) -> bytes:
     return _encode_proto_varint((field_number << 3) | 2) + _encode_proto_varint(len(payload)) + payload
 
 
-def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
+def _write_sparse_oversized_safetensors_candidate(
+    path: Path,
+    header_len: int = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1,
+) -> None:
     """Write framing beyond the routing parse budget without allocating its header."""
-    header_len = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1
     with path.open("wb") as handle:
         handle.write(struct.pack("<Q", header_len))
         handle.write(b"{")
@@ -694,6 +696,40 @@ def test_detect_pickle_shaped_safetensors_header_remains_safetensors(tmp_path: P
     safetensors_path.write_bytes(struct.pack("<Q", header_length) + metadata + b"\x00\x00\x00\x00")
 
     assert safetensors_path.read_bytes()[:2] == b"\x80\x04"
+    assert detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
+    assert detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
+    assert detect_file_format(str(safetensors_path)) == "safetensors"
+
+
+def test_detect_zlib_shaped_safetensors_header_remains_safetensors(tmp_path: Path) -> None:
+    header_length = 0x9C78
+    metadata = b'{"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}'
+    metadata += b" " * (header_length - len(metadata))
+    safetensors_path = tmp_path / "zlib-shaped-header.zlib"
+    safetensors_path.write_bytes(struct.pack("<Q", header_length) + metadata + b"\x00")
+
+    assert safetensors_path.read_bytes()[:2] == b"\x78\x9c"
+    assert detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
+    assert detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
+    assert detect_file_format(str(safetensors_path)) == "safetensors"
+
+
+def test_detect_genuine_zlib_payload_remains_zlib(tmp_path: Path) -> None:
+    zlib_path = tmp_path / "genuine-zlib.unknown"
+    zlib_path.write_bytes(zlib.compress(b'{"tensor":{"dtype":"U8"}}'))
+
+    assert zlib_path.read_bytes()[:2] == b"\x78\x9c"
+    assert detect_file_format_from_magic(str(zlib_path)) == "zlib"
+    assert detect_file_format_for_skip_filter(str(zlib_path)) == "zlib"
+    assert detect_file_format(str(zlib_path)) == "zlib"
+
+
+def test_detect_oversized_zlib_shaped_safetensors_candidate_remains_safetensors(tmp_path: Path) -> None:
+    header_length = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 0x9C78
+    safetensors_path = tmp_path / "oversized-zlib-shaped.unknown"
+    _write_sparse_oversized_safetensors_candidate(safetensors_path, header_length)
+
+    assert safetensors_path.read_bytes()[:2] == b"\x78\x9c"
     assert detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
     assert detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
     assert detect_file_format(str(safetensors_path)) == "safetensors"
