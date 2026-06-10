@@ -15,6 +15,7 @@ pytest.importorskip("safetensors")
 from safetensors import SafetensorError, safe_open
 from safetensors.numpy import load_file, save_file
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.safetensors_scanner import SAFETENSORS_READ_INCONCLUSIVE_REASON, SafeTensorsScanner
@@ -746,6 +747,65 @@ def test_safetensors_with_torch7_like_metadata_keeps_safetensors_routing(tmp_pat
     assert direct.scanner_name == "safetensors"
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in direct.issues)
     assert determine_exit_code(aggregate) == 1
+
+
+def test_zlib_shaped_header_keeps_safetensors_security_routing(tmp_path: Path) -> None:
+    file_path = tmp_path / "zlib-shaped-header.unknown"
+    header_len = 0x9C78
+    header = json.dumps(
+        {
+            "__metadata__": {"description": "<script>alert('xss')</script>"},
+            "tensor": {
+                "dtype": "U8",
+                "shape": [1],
+                "data_offsets": [0, 1],
+            },
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    write_raw_safetensors_header(file_path, header + b" " * (header_len - len(header)), b"\x00")
+
+    result = scan_file(str(file_path))
+
+    assert file_path.read_bytes()[:2] == b"\x78\x9c"
+    assert result.scanner_name == "safetensors"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_zlib_shaped_deep_header_fails_closed(tmp_path: Path) -> None:
+    file_path = tmp_path / "deep-zlib-shaped.unknown"
+    header_len = 0x9C78
+    depth = 10_000
+    header = b'{"a":' + (b"[" * depth) + b"0" + (b"]" * depth) + b"}"
+    write_raw_safetensors_header(file_path, header + b" " * (header_len - len(header)), b"\x00")
+
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        result = scan_file(str(file_path), config=config)
+        repeated_result = scan_file(str(file_path), config=config)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    aggregate = scan_model_directory_or_file(str(file_path), cache_scan_results=False)
+
+    parse_check = next(check for check in result.checks if check.name == "SafeTensors JSON Parse")
+    assert file_path.read_bytes()[:2] == b"\x78\x9c"
+    assert result.scanner_name == "safetensors"
+    assert result.success is False
+    assert repeated_result.success is False
+    assert parse_check.status == CheckStatus.FAILED
+    assert parse_check.details["exception_type"] == "RecursionError"
+    assert "maximum recursion depth exceeded" in parse_check.message
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert determine_exit_code(aggregate) == 2
 
 
 @pytest.mark.parametrize(
