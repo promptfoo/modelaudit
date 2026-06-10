@@ -7838,6 +7838,7 @@ def scan_archive_member_for_known_risks(
     executable_analysis_incomplete_reason: str,
     analyze_python_source: bool = True,
     analyze_executable_content: bool = True,
+    sniff_python_source: bool = False,
 ) -> None:
     """Inspect generic archive members that nested dispatch would otherwise ignore.
 
@@ -7958,7 +7959,7 @@ def scan_archive_member_for_known_risks(
 
     if (
         analyze_python_source
-        and "." not in normalized_lower.rsplit("/", maxsplit=1)[-1]
+        and (sniff_python_source or "." not in normalized_lower.rsplit("/", maxsplit=1)[-1])
         and total_size <= max_python_analysis_bytes
         and tmp_path is not None
     ):

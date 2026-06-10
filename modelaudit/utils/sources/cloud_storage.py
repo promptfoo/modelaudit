@@ -1591,6 +1591,7 @@ def _cloud_directory_cache_scope(
     if selective:
         payload.update(
             {
+                "routing_version": 2,
                 "extensions": (
                     None
                     if scannable_extensions is None

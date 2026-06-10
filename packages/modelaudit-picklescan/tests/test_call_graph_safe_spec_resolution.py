@@ -1518,6 +1518,7 @@ def test_unloaded_frozen_module_with_pristine_import_runtime_remains_safe(
             name
             for name in frozen_names
             if name not in call_graph._TRUSTED_LOADED_INTERPRETER_MODULES
+            and name not in sys.modules
             and call_graph._interpreter_module_origin_without_import_hooks(name) == "frozen"
         ),
         None,
@@ -1545,6 +1546,7 @@ def test_unloaded_frozen_module_with_mutated_importer_fails_closed(
             name
             for name in frozen_names
             if name not in call_graph._TRUSTED_LOADED_INTERPRETER_MODULES
+            and name not in sys.modules
             and call_graph._interpreter_module_origin_without_import_hooks(name) == "frozen"
         ),
         None,
@@ -1584,6 +1586,7 @@ def test_in_place_importer_closure_code_mutation_blocks_unloaded_frozen() -> Non
             name
             for name in frozen_names
             if name not in call_graph._TRUSTED_LOADED_INTERPRETER_MODULES
+            and name not in sys.modules
             and call_graph._interpreter_module_origin_without_import_hooks(name) == "frozen"
         ),
         None,

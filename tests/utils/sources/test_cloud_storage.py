@@ -2752,8 +2752,25 @@ def test_download_from_cloud_isolates_selective_directory_cache_by_scanner_selec
     assert safetensors_path != pickle_path
     assert cached_pickle_path == pickle_path
     assert {path.name for path in safetensors_path.iterdir()} == {"weights.safetensors"}
-    assert {path.name for path in pickle_path.iterdir()} == {"model.pkl"}
-    assert [call.args[0] for call in fs.get.call_args_list] == list(payloads)
+    assert {path.name for path in pickle_path.iterdir()} == {"model.pkl", "weights.safetensors"}
+    assert [call.args[0] for call in fs.get.call_args_list] == [
+        "s3://bucket/models/weights.safetensors",
+        "s3://bucket/models/model.pkl",
+        "s3://bucket/models/weights.safetensors",
+    ]
+
+
+def test_cloud_directory_cache_scope_versions_selective_routing() -> None:
+    scope = _cloud_directory_cache_scope(
+        {"type": "directory"},
+        selective=True,
+        scannable_extensions={".pkl", ".safetensors"},
+        scannable_filenames=None,
+        scanner_selection=resolve_scanner_selection_policy(scanners=["pickle"]).to_config(),
+    )
+
+    assert scope is not None
+    assert json.loads(scope)["routing_version"] == 2
 
 
 @patch("fsspec.filesystem")

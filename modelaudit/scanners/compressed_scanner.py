@@ -21,6 +21,8 @@ from ._archive_outcomes import member_scan_incomplete
 from .archive_member_security import scan_archive_member_for_known_risks
 from .base import BaseScanner, IssueSeverity, ScanResult
 
+ALLOW_SAFETENSORS_NONMEMBER_TRAILING_CONFIG_KEY = "_compressed_allow_safetensors_nonmember_trailing"
+
 
 class _DecompressionLimitExceeded(ValueError):
     """Raised when decompression policies are exceeded."""
@@ -272,16 +274,24 @@ class CompressedScanner(BaseScanner):
         compressed_size: int,
         chunk_size: int,
         on_new_member: Callable[[], None] | None = None,
+        allow_nonmember_trailing: bool = False,
     ) -> int:
         decompressor = decompressor_factory()
         total_out = 0
+        ignored_nonmember_trailing = False
+
+        def should_ignore_proven_nonmember_trailing(pending: bytes) -> bool:
+            return bool(pending) and allow_nonmember_trailing and codec == "gzip"
 
         def _consume_pending(pending: bytes) -> None:
-            nonlocal decompressor, total_out
+            nonlocal decompressor, ignored_nonmember_trailing, total_out
             while pending or not getattr(decompressor, "needs_input", True):
                 if getattr(decompressor, "eof", False):
                     if not pending:
                         break
+                    if should_ignore_proven_nonmember_trailing(pending):
+                        ignored_nonmember_trailing = True
+                        return
                     if on_new_member is not None:
                         on_new_member()
                     decompressor = decompressor_factory()
@@ -311,6 +321,9 @@ class CompressedScanner(BaseScanner):
 
                 unused_data = getattr(decompressor, "unused_data", b"")
                 if unused_data:
+                    if should_ignore_proven_nonmember_trailing(unused_data):
+                        ignored_nonmember_trailing = True
+                        return
                     pending = unused_data
                     if on_new_member is not None:
                         on_new_member()
@@ -321,8 +334,13 @@ class CompressedScanner(BaseScanner):
             if not pending:
                 break
             _consume_pending(pending)
+            if ignored_nonmember_trailing:
+                break
 
         _consume_pending(b"")
+
+        if ignored_nonmember_trailing:
+            return total_out
 
         if not getattr(decompressor, "eof", False):
             raise _CorruptStreamError(f"Invalid {codec} stream: missing end-of-stream marker")
@@ -384,6 +402,7 @@ class CompressedScanner(BaseScanner):
         compressed_size: int,
         chunk_size: int,
         on_new_member: Callable[[], None] | None = None,
+        allow_nonmember_trailing: bool = False,
     ) -> int:
         return CompressedScanner._read_concatenated_stream_with_limits(
             source=source,
@@ -396,6 +415,7 @@ class CompressedScanner(BaseScanner):
             compressed_size=compressed_size,
             chunk_size=chunk_size,
             on_new_member=on_new_member,
+            allow_nonmember_trailing=allow_nonmember_trailing,
         )
 
     @staticmethod
@@ -619,6 +639,7 @@ class CompressedScanner(BaseScanner):
                         compressed_size=compressed_size,
                         chunk_size=self.chunk_size,
                         on_new_member=lambda: outputs.start_new_member(suffix),
+                        allow_nonmember_trailing=bool(self.config.get(ALLOW_SAFETENSORS_NONMEMBER_TRAILING_CONFIG_KEY)),
                     )
                 elif codec == "bzip2":
                     total_out = self._read_bzip2_stream_with_limits(
@@ -734,6 +755,7 @@ class CompressedScanner(BaseScanner):
         member_temp_paths: list[str],
         decompressed_bytes: int,
         inner_owns_executable_content: bool,
+        sniff_python_source: bool,
         result: ScanResult,
     ) -> None:
         first_issue = len(result.issues)
@@ -749,6 +771,7 @@ class CompressedScanner(BaseScanner):
             python_analysis_incomplete_reason=self._PYTHON_PAYLOAD_INCONCLUSIVE_REASON,
             executable_analysis_incomplete_reason=self._EXECUTABLE_PAYLOAD_INCONCLUSIVE_REASON,
             analyze_executable_content=not inner_owns_executable_content,
+            sniff_python_source=sniff_python_source,
         )
         self._set_compressed_provenance(
             result,
@@ -782,6 +805,7 @@ class CompressedScanner(BaseScanner):
                 python_analysis_incomplete_reason=self._PYTHON_PAYLOAD_INCONCLUSIVE_REASON,
                 executable_analysis_incomplete_reason=self._EXECUTABLE_PAYLOAD_INCONCLUSIVE_REASON,
                 analyze_python_source=aggregate_python_incomplete,
+                sniff_python_source=sniff_python_source,
             )
             self._set_compressed_provenance(
                 result,
@@ -912,6 +936,7 @@ class CompressedScanner(BaseScanner):
             )
 
             nested_config = dict(self.config)
+            nested_config.pop(ALLOW_SAFETENSORS_NONMEMBER_TRAILING_CONFIG_KEY, None)
             nested_config["_compressed_depth"] = depth + 1
             nested_config["_archive_depth"] = depth + 1
             # Extracted temp paths are removed after this scan and cannot yield reusable cache entries.
@@ -936,6 +961,7 @@ class CompressedScanner(BaseScanner):
                 inner_owns_executable_content=(
                     len(member_temp_paths) == 1 and inner_result.scanner_name == "llamafile" and inner_result.success
                 ),
+                sniff_python_source=bool(self.config.get(ALLOW_SAFETENSORS_NONMEMBER_TRAILING_CONFIG_KEY)),
                 result=result,
             )
 
