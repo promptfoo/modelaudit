@@ -79,6 +79,7 @@ _PROTO0_1_TRIVIAL_LEADING_OPCODES = frozenset(
     }
 )
 _MAX_PYTORCH_ZIP_ENTRIES = 10_000
+_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES = 4 * 1024 * 1024
 _MAX_PYTORCH_ZIP_PICKLE_MEMBERS = 256
 _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES = 512 * 1024 * 1024
 _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES = 512 * 1024 * 1024
@@ -108,6 +109,10 @@ class _StreamShortReadError(ValueError):
         self.expected_size = expected_size
         self.bytes_read = bytes_read
         self.partial_payload = partial_payload
+
+
+class _PickleDiscoveryProbeBudgetExceeded(ValueError):
+    """Raised when another hidden ZIP-member probe would exceed the byte budget."""
 
 
 class PickleScanner:
@@ -289,9 +294,27 @@ class PickleScanner:
                 return None
 
             pickle_entries, discovery_notices = _discover_pytorch_zip_pickle_entries(archive, entries, source=source)
-            if not _is_pytorch_zip_archive(entries, discovered_pickle_entries=pickle_entries):
+            probe_budget_exhausted = any(
+                notice.code == "pytorch_zip_pickle_discovery_probe_budget" for notice in discovery_notices
+            )
+            if (
+                not _is_pytorch_zip_archive(
+                    entries,
+                    discovered_pickle_entries=pickle_entries,
+                )
+                and not probe_budget_exhausted
+            ):
                 return None
             if not pickle_entries:
+                if probe_budget_exhausted:
+                    return _combine_pytorch_zip_reports(
+                        source=source,
+                        size=size,
+                        entry_count=len(entries),
+                        pickle_entries=[],
+                        member_reports=[],
+                        extra_notices=discovery_notices,
+                    )
                 return _pytorch_zip_notice_report(
                     source=source,
                     size=size,
@@ -530,6 +553,7 @@ def _discover_pytorch_zip_pickle_entries(
     pickle_entries: list[zipfile.ZipInfo] = []
     notices: list[Notice] = []
     seen_entries: set[int] = set()
+    candidates: list[zipfile.ZipInfo] = []
 
     def add_entry(entry: zipfile.ZipInfo) -> None:
         entry_id = id(entry)
@@ -549,24 +573,70 @@ def _discover_pytorch_zip_pickle_entries(
     for entry in entries:
         if entry.is_dir() or id(entry) in seen_entries:
             continue
+        candidates.append(entry)
+
+    probe_bytes_remaining = [_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES]
+    probed_member_count = 0
+    for candidate_index, entry in enumerate(candidates):
         try:
-            if _zip_entry_looks_like_pickle(archive, entry):
+            if _zip_entry_looks_like_pickle(archive, entry, probe_bytes_remaining):
                 add_entry(entry)
+            probed_member_count += 1
+        except _PickleDiscoveryProbeBudgetExceeded:
+            notices.append(
+                _pytorch_zip_pickle_discovery_probe_budget_notice(
+                    source=source,
+                    probe_bytes_read=(_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES - probe_bytes_remaining[0]),
+                    probed_member_count=probed_member_count,
+                    skipped_entries=candidates[candidate_index:],
+                )
+            )
+            break
         except Exception as error:
             notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
 
     return pickle_entries, tuple(notices)
 
 
-def _zip_entry_looks_like_pickle(archive: zipfile.ZipFile, entry: zipfile.ZipInfo) -> bool:
+def _read_zip_entry_probe(
+    archive: zipfile.ZipFile,
+    entry: zipfile.ZipInfo,
+    max_bytes: int,
+    probe_bytes_remaining: list[int],
+) -> bytes:
+    expected_bytes = min(max(entry.file_size, 0), max_bytes)
+    if expected_bytes == 0:
+        return b""
+    if expected_bytes > probe_bytes_remaining[0]:
+        raise _PickleDiscoveryProbeBudgetExceeded
+
     with archive.open(entry, "r") as member:
-        prefix = member.read(_PICKLE_DISCOVERY_SHORT_PROBE_BYTES)
+        sample = member.read(min(max_bytes, probe_bytes_remaining[0]))
+    probe_bytes_remaining[0] -= len(sample)
+    return sample
+
+
+def _zip_entry_looks_like_pickle(
+    archive: zipfile.ZipFile,
+    entry: zipfile.ZipInfo,
+    probe_bytes_remaining: list[int],
+) -> bool:
+    prefix = _read_zip_entry_probe(
+        archive,
+        entry,
+        _PICKLE_DISCOVERY_SHORT_PROBE_BYTES,
+        probe_bytes_remaining,
+    )
     if not prefix:
         return False
 
     if prefix.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES):
-        with archive.open(entry, "r") as member:
-            sample = member.read(_PICKLE_DISCOVERY_LONG_PROBE_BYTES)
+        sample = _read_zip_entry_probe(
+            archive,
+            entry,
+            _PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+            probe_bytes_remaining,
+        )
         return _looks_like_binary_pickle_prefix(sample, sample_is_prefix=entry.file_size > len(sample))
 
     if prefix[0] not in _PROTO0_1_START_BYTES:
@@ -574,8 +644,12 @@ def _zip_entry_looks_like_pickle(archive: zipfile.ZipFile, entry: zipfile.ZipInf
 
     sample = prefix
     if entry.file_size > len(prefix):
-        with archive.open(entry, "r") as member:
-            sample = member.read(_PICKLE_DISCOVERY_LONG_PROBE_BYTES)
+        sample = _read_zip_entry_probe(
+            archive,
+            entry,
+            _PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+            probe_bytes_remaining,
+        )
     return _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=entry.file_size > len(sample))
 
 
@@ -726,6 +800,32 @@ def _pytorch_zip_entry_limit_report(*, source: str, size: int, entry_count: int)
         details={
             "entry_count": entry_count,
             "max_entries": _MAX_PYTORCH_ZIP_ENTRIES,
+            "analysis_incomplete": True,
+        },
+    )
+
+
+def _pytorch_zip_pickle_discovery_probe_budget_notice(
+    *,
+    source: str,
+    probe_bytes_read: int,
+    probed_member_count: int,
+    skipped_entries: list[zipfile.ZipInfo],
+) -> Notice:
+    return Notice(
+        message=(
+            "PyTorch ZIP analysis stopped hidden pickle-member discovery because the archive exceeds the "
+            "standalone aggregate decompressed probe-byte budget"
+        ),
+        severity=Severity.INFO,
+        location=source,
+        code="pytorch_zip_pickle_discovery_probe_budget",
+        details={
+            "probe_bytes_read": probe_bytes_read,
+            "max_probe_bytes": _MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES,
+            "probed_member_count": probed_member_count,
+            "skipped_member_count": len(skipped_entries),
+            "skipped_members": [entry.filename for entry in skipped_entries[:10]],
             "analysis_incomplete": True,
         },
     )
