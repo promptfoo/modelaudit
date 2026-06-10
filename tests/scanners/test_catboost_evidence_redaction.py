@@ -225,10 +225,13 @@ def test_composed_quoted_sensitive_key_with_equals_is_redacted() -> None:
 
 
 @pytest.mark.parametrize("operator", ["==", "!=", ">=", "<="])
-def test_composed_quoted_sensitive_key_comparisons_are_not_redacted(operator: str) -> None:
+def test_composed_quoted_sensitive_key_comparisons_are_redacted(operator: str) -> None:
     text = f'"client" + "_secret" {operator} "public"'
 
-    assert redact_evidence_string(text, max_chars=500) == text
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "public" not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
 
 
 def test_redacts_long_delimited_values_before_report_truncation() -> None:
@@ -4180,6 +4183,26 @@ def test_sensitive_comparison_operators_redact_literals_and_preserve_command(ope
             'client_secret == <redacted> + "MARKER-TAIL-COMPARISON-SECRET-123456"; os.system("id")',
             ("MARKER-TAIL-COMPARISON-SECRET-123456",),
         ),
+        (
+            '"client_secret" == "QUOTED-KEY-COMPARISON-SECRET-123456"; os.system("id")',
+            ("QUOTED-KEY-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'config["client_secret"] == "SUBSCRIPT-KEY-COMPARISON-SECRET-123456"; os.system("id")',
+            ("SUBSCRIPT-KEY-COMPARISON-SECRET-123456",),
+        ),
+        (
+            '(client_secret) == "GROUPED-KEY-COMPARISON-SECRET-123456"; os.system("id")',
+            ("GROUPED-KEY-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'config[("client" + "_secret")] == "COMPOSED-SUBSCRIPT-COMPARISON-SECRET-123456"; os.system("id")',
+            ("COMPOSED-SUBSCRIPT-COMPARISON-SECRET-123456",),
+        ),
+        (
+            '"HUNTER2" == config["client_secret"]; os.system("id")',
+            ("HUNTER2",),
+        ),
     ],
 )
 def test_sensitive_comparison_statements_redact_compound_and_reversed_literals(
@@ -4227,3 +4250,13 @@ def test_excessive_comparison_candidates_fail_closed_for_sensitive_keys() -> Non
     text = f'{comparisons}; os.system("id")'
 
     assert redact_evidence_string(text, max_chars=10_000) == REDACTED_EVIDENCE_VALUE
+
+
+def test_quoted_comparison_decoys_do_not_consume_candidate_budget() -> None:
+    decoys = "; ".join('print("client_secret == inert")' for _ in range(65))
+    text = f'os.system("id"); {decoys}'
+
+    redacted = redact_evidence_string(text, max_chars=10_000)
+
+    assert redacted != REDACTED_EVIDENCE_VALUE
+    assert 'os.system("id")' in redacted

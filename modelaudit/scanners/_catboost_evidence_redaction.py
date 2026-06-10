@@ -201,13 +201,7 @@ COMPARISON_OPERATOR_PATTERN: Final[str] = (
     r"(?<![<>])(?<!<redacted)(?<!<credentials-redacted)>(?![=>])|"
     r"(?<!\w)is(?:\s+not)?(?!\w)|(?<!\w)(?:not\s+)?in(?!\w))"
 )
-SENSITIVE_COMPARISON_RE: Final[re.Pattern[str]] = re.compile(
-    rf"(?:(?P<left_key>(?<![-/A-Za-z0-9_.]){SENSITIVE_ASSIGNMENT_KEY}(?![-/A-Za-z0-9_.]))"
-    rf"\s*(?P<operator_after>{COMPARISON_OPERATOR_PATTERN})|"
-    rf"(?P<operator_before>{COMPARISON_OPERATOR_PATTERN})\s*"
-    rf"(?P<right_key>(?<![-/A-Za-z0-9_.]){SENSITIVE_ASSIGNMENT_KEY}(?![-/A-Za-z0-9_.])))",
-    re.IGNORECASE,
-)
+COMPARISON_OPERATOR_RE: Final[re.Pattern[str]] = re.compile(COMPARISON_OPERATOR_PATTERN, re.IGNORECASE)
 AUTHORIZATION_KEY_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)^{AUTHORIZATION_KEY_PATTERN}$")
 QUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(\\*)([\"'])({QUOTED_KEY_CONTENT_PATTERN})\1\2\s*{ASSIGNMENT_SEPARATOR}\s*"
@@ -2331,17 +2325,92 @@ def _find_value_expression_end(text: str, start: int, default_end: int) -> int:
     return default_end
 
 
+def _sensitive_comparison_key_from_expression(
+    expression: str,
+    *,
+    allow_literal: bool,
+) -> str | None:
+    expression = expression.strip()
+    if not expression or len(expression) > MAX_KEY_EXPRESSION_CHARS:
+        return None
+    folded = expression.casefold()
+    if not any(signal in folded for signal in SENSITIVE_KEYWORD_SIGNALS):
+        return None
+    try:
+        node = ast.parse(expression, mode="eval").body
+    except SyntaxError:
+        return None
+
+    value: str | None = None
+    if isinstance(node, ast.Name):
+        value = node.id
+    elif isinstance(node, ast.Attribute):
+        value = node.attr
+    elif isinstance(node, ast.Subscript):
+        subscript_value = _safe_eval_string_expr(node.slice)
+        value = subscript_value if isinstance(subscript_value, str) else None
+    elif allow_literal:
+        evaluated = _safe_eval_string_expr(node)
+        value = evaluated if isinstance(evaluated, str) else None
+    return _normalize_sensitive_key(value) if value is not None else None
+
+
+def _left_comparison_operand_has_sensitive_key(text: str, statement_start: int, operator_start: int) -> bool:
+    window_start = max(statement_start, operator_start - MAX_KEY_EXPRESSION_CHARS)
+    segment = text[window_start:operator_start].rstrip()
+    starts = {0}
+    for index, char in enumerate(segment):
+        if char.isspace() or char in ";,&|?:=<>!":
+            starts.add(index + 1)
+    attempts = 0
+    for start in sorted(starts, reverse=True):
+        candidate = segment[start:].strip()
+        if not candidate:
+            continue
+        attempts += 1
+        if _sensitive_comparison_key_from_expression(candidate, allow_literal=True) is not None:
+            return True
+        if attempts >= MAX_KEY_EXPRESSION_PARSE_ATTEMPTS:
+            break
+    return False
+
+
+def _right_comparison_operand_has_sensitive_key(text: str, operator_end: int, statement_end: int) -> bool:
+    segment = text[operator_end : min(statement_end, operator_end + MAX_KEY_EXPRESSION_CHARS)].lstrip()
+    ends = {len(segment)}
+    for index, char in enumerate(segment):
+        if char.isspace() or char in ";,&|?:=<>!":
+            ends.add(index)
+    attempts = 0
+    for end in sorted(ends):
+        candidate = segment[:end].strip()
+        if not candidate:
+            continue
+        attempts += 1
+        if _sensitive_comparison_key_from_expression(candidate, allow_literal=False) is not None:
+            return True
+        if attempts >= MAX_KEY_EXPRESSION_PARSE_ATTEMPTS:
+            break
+    return False
+
+
 def _redact_sensitive_comparison_statements(text: str) -> str:
     spans: list[tuple[int, int]] = []
-    for candidate_count, match in enumerate(SENSITIVE_COMPARISON_RE.finditer(text), start=1):
-        if candidate_count > MAX_COMPARISON_CANDIDATES:
-            return REDACTED_EVIDENCE_VALUE
+    candidate_count = 0
+    for match in COMPARISON_OPERATOR_RE.finditer(text):
         if _is_inside_quoted_literal(text, 0, match.start()):
             continue
         start = _last_unquoted_statement_boundary(text, 0, match.start())
         end = _find_value_expression_end(text, match.end(), len(text))
-        if start < end:
-            spans.append((start, end))
+        if start >= end or not (
+            _left_comparison_operand_has_sensitive_key(text, start, match.start())
+            or _right_comparison_operand_has_sensitive_key(text, match.end(), end)
+        ):
+            continue
+        candidate_count += 1
+        if candidate_count > MAX_COMPARISON_CANDIDATES:
+            return REDACTED_EVIDENCE_VALUE
+        spans.append((start, end))
 
     if not spans:
         return text

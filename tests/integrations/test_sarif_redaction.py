@@ -565,6 +565,22 @@ def test_catboost_sarif_revalidates_attacker_supplied_redaction_marker() -> None
             'client_secret == <redacted> + "MARKER-TAIL-COMPARISON-SECRET-123456"; os.system("id")',
             ("MARKER-TAIL-COMPARISON-SECRET-123456",),
         ),
+        (
+            '"client_secret" == "QUOTED-KEY-COMPARISON-SECRET-123456"; os.system("id")',
+            ("QUOTED-KEY-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'config["client_secret"] == "SUBSCRIPT-KEY-COMPARISON-SECRET-123456"; os.system("id")',
+            ("SUBSCRIPT-KEY-COMPARISON-SECRET-123456",),
+        ),
+        (
+            '(client_secret) == "GROUPED-KEY-COMPARISON-SECRET-123456"; os.system("id")',
+            ("GROUPED-KEY-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'config[("client" + "_secret")] == "COMPOSED-SUBSCRIPT-COMPARISON-SECRET-123456"; os.system("id")',
+            ("COMPOSED-SUBSCRIPT-COMPARISON-SECRET-123456",),
+        ),
     ],
 )
 def test_catboost_sarif_redacts_sensitive_comparison_statements(
