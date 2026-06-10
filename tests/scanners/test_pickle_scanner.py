@@ -2058,6 +2058,33 @@ def test_legacy_pytorch_container_scans_pickle_after_large_storage(tmp_path: Pat
     assert issue.details["global_position"] == reference["position"]
 
 
+def test_merge_standalone_pickle_segment_adds_scoped_opcode_counts() -> None:
+    scanner = PickleScanner()
+    result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+    result.metadata.update(
+        {
+            "opcode_counts": {"PROTO": 1},
+            "nested_opcode_counts": {"NEWOBJ": 1},
+            "follow_on_opcode_counts": {"REDUCE": 1},
+        }
+    )
+    segment_result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+    segment_result.metadata.update(
+        {
+            "opcode_counts": {"STOP": 1},
+            "nested_opcode_counts": {"NEWOBJ": 2},
+            "follow_on_opcode_counts": {"REDUCE": 2},
+        }
+    )
+
+    scanner._merge_standalone_pickle_segment(result, segment_result, segment_start=10)
+
+    assert result.metadata["opcode_counts"] == {"PROTO": 1, "STOP": 1}
+    assert result.metadata["nested_opcode_counts"] == {"NEWOBJ": 3}
+    assert result.metadata["follow_on_opcode_counts"] == {"REDUCE": 3}
+    assert result.metadata["opcode_count"] == 2
+
+
 def test_legacy_pytorch_complete_suffix_pickles_are_not_retreated_as_binary_tail(tmp_path: Path) -> None:
     payload, _pickle_end = _make_legacy_pytorch_container(b"A")
     storage_end = len(payload)

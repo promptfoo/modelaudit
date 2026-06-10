@@ -15,8 +15,8 @@ use crate::nested::{
     encoded_literal_may_contain_pickle, encoded_nested_literal_probe_coverage_incomplete,
     encoded_nested_literal_probe_windows_with_limit, encoded_nested_window_char_limit,
     encoded_pickle_consumes_literal, has_binary_pickle_prefix, has_execution_opcode,
-    has_pickle_prefix, looks_like_pickle_payload, nested_pickle_probe_offsets,
-    pickle_payload_extent_result, protocol0_global_or_inst_prefix_has_import_reference_lines,
+    has_pickle_prefix, nested_pickle_probe_offsets, pickle_payload_extent_result,
+    protocol0_global_or_inst_prefix_has_import_reference_lines,
     strict_base64_literal_has_encoded_pickle_candidate,
     strict_base64_literal_raw_execution_probe_offsets, DecodedNestedPayload, NestedProbeOffsets,
     MAX_NESTED_PAYLOAD_PROBES,
@@ -554,6 +554,8 @@ pub(crate) struct ScanState<'a> {
     non_allowlisted_global_imports: Vec<PendingGlobalImportFinding>,
     opcode_count: usize,
     opcode_counts: HashMap<&'static str, usize>,
+    nested_opcode_counts: HashMap<&'static str, usize>,
+    follow_on_opcode_counts: HashMap<&'static str, usize>,
     global_count: usize,
     bytes_scanned: usize,
     first_pickle_end_pos: Option<usize>,
@@ -622,6 +624,8 @@ impl<'a> ScanState<'a> {
             non_allowlisted_global_imports: Vec::new(),
             opcode_count: 0,
             opcode_counts: HashMap::new(),
+            nested_opcode_counts: HashMap::new(),
+            follow_on_opcode_counts: HashMap::new(),
             global_count: 0,
             bytes_scanned: 0,
             first_pickle_end_pos: None,
@@ -7441,9 +7445,22 @@ impl<'a> ScanState<'a> {
         }
         let nested_incomplete = !nested_scan.status.is_complete();
         let nested_import_references = std::mem::take(&mut nested_scan.import_references);
+        let nested_root_opcode_counts = std::mem::take(&mut nested_scan.opcode_counts);
+        let nested_descendant_opcode_counts = std::mem::take(&mut nested_scan.nested_opcode_counts);
+        let nested_follow_on_opcode_counts =
+            std::mem::take(&mut nested_scan.follow_on_opcode_counts);
         self.merge_follow_on_import_references(
             nested_import_references,
             nested_scan.import_references_truncated,
+        );
+        Self::merge_opcode_counts(&mut self.nested_opcode_counts, nested_root_opcode_counts);
+        Self::merge_opcode_counts(
+            &mut self.nested_opcode_counts,
+            nested_descendant_opcode_counts,
+        );
+        Self::merge_opcode_counts(
+            &mut self.nested_opcode_counts,
+            nested_follow_on_opcode_counts,
         );
 
         for nested_finding in nested_scan.findings {
@@ -7669,9 +7686,10 @@ impl<'a> ScanState<'a> {
             .min(start_index.saturating_add(self.options.post_budget_scan_bytes));
         let tail = &self.payload[start_index..scan_end];
         let probe_offsets = nested_pickle_probe_offsets(tail);
+        let mut skip_offsets_before = start_index;
         for relative_offset in probe_offsets.offsets {
             let absolute_offset = start_index.saturating_add(relative_offset);
-            if absolute_offset <= start_index {
+            if absolute_offset <= start_index || absolute_offset < skip_offsets_before {
                 continue;
             }
             let candidate = &self.payload[absolute_offset..scan_end];
@@ -7679,12 +7697,13 @@ impl<'a> ScanState<'a> {
                 return;
             }
             let candidate_probe_len = candidate.len().min(self.options.max_nested_pickle_bytes);
-            if !looks_like_pickle_payload(
+            let Ok(Some(candidate_len)) = pickle_payload_extent_result(
                 &candidate[..candidate_probe_len],
                 self.options.max_nested_pickle_bytes,
-            ) {
+            ) else {
                 continue;
-            }
+            };
+            let candidate = &candidate[..candidate_len];
             let nested_source = format!(
                 "{} (follow-on pickle stream at pos {})",
                 self.source,
@@ -7700,7 +7719,14 @@ impl<'a> ScanState<'a> {
                 Some(self.deadline),
             );
             follow_on_scan.run();
+            skip_offsets_before =
+                skip_offsets_before.max(absolute_offset.saturating_add(candidate_len));
             let had_findings = !follow_on_scan.findings.is_empty();
+            let follow_on_root_opcode_counts = std::mem::take(&mut follow_on_scan.opcode_counts);
+            let follow_on_nested_opcode_counts =
+                std::mem::take(&mut follow_on_scan.nested_opcode_counts);
+            let recursive_follow_on_opcode_counts =
+                std::mem::take(&mut follow_on_scan.follow_on_opcode_counts);
             for finding in follow_on_scan.findings {
                 self.add_finding(finding);
             }
@@ -7711,6 +7737,18 @@ impl<'a> ScanState<'a> {
             self.merge_follow_on_callable_invocations(
                 follow_on_scan.callable_invocations,
                 follow_on_scan.callable_invocations_truncated,
+            );
+            Self::merge_opcode_counts(
+                &mut self.follow_on_opcode_counts,
+                follow_on_root_opcode_counts,
+            );
+            Self::merge_opcode_counts(
+                &mut self.follow_on_opcode_counts,
+                follow_on_nested_opcode_counts,
+            );
+            Self::merge_opcode_counts(
+                &mut self.follow_on_opcode_counts,
+                recursive_follow_on_opcode_counts,
             );
             if had_findings {
                 self.add_notice(Notice {
@@ -7732,6 +7770,15 @@ impl<'a> ScanState<'a> {
                 });
                 return;
             }
+        }
+    }
+
+    fn merge_opcode_counts(
+        target: &mut HashMap<&'static str, usize>,
+        counts: HashMap<&'static str, usize>,
+    ) {
+        for (opcode, count) in counts {
+            *target.entry(opcode).or_insert(0) += count;
         }
     }
 
@@ -7924,6 +7971,16 @@ impl<'a> ScanState<'a> {
             opcode_counts.set_item(opcode, count)?;
         }
         metadata.set_item("opcode_counts", opcode_counts)?;
+        let nested_opcode_counts = PyDict::new(py);
+        for (opcode, count) in &self.nested_opcode_counts {
+            nested_opcode_counts.set_item(opcode, count)?;
+        }
+        metadata.set_item("nested_opcode_counts", nested_opcode_counts)?;
+        let follow_on_opcode_counts = PyDict::new(py);
+        for (opcode, count) in &self.follow_on_opcode_counts {
+            follow_on_opcode_counts.set_item(opcode, count)?;
+        }
+        metadata.set_item("follow_on_opcode_counts", follow_on_opcode_counts)?;
         metadata.set_item("globals_count", self.global_count)?;
         let import_references = PyList::empty(py);
         for reference in &self.import_references {
