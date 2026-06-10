@@ -2944,7 +2944,9 @@ def _remote_runtime_fragment_analysis(text: str) -> tuple[bool, bool]:
     for index, match in enumerate(re.finditer(r"%'18t\s+(?:connect|socket)", text, re.IGNORECASE)):
         if index >= 64:
             return False, True
-        if _runtime_fragment_has_remote_endpoint(text[match.end() : match.end() + 512]):
+        if _runtime_fragment_has_remote_endpoint(
+            text[match.end() : match.end() + LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES]
+        ):
             return True, False
     return False, False
 
