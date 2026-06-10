@@ -3645,6 +3645,15 @@ class PyTorchZipScanner(BaseScanner):
         """Return exact counts for dangerous opcode types backed by findings."""
         evidence_counts: dict[str, int] = {}
         supporting_evidence_counts: dict[str, int] = {}
+        raw_metadata_counts = pickle_result.metadata.get("opcode_counts")
+        has_metadata_build = isinstance(raw_metadata_counts, dict) and any(
+            isinstance(key, str)
+            and key.upper() == "BUILD"
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value > 0
+            for key, value in raw_metadata_counts.items()
+        )
         for issue in pickle_result.issues:
             issue_details = issue.details or {}
             target_counts = (
@@ -3655,28 +3664,33 @@ class PyTorchZipScanner(BaseScanner):
                 if count > 0:
                     target_counts[opcode] = target_counts.get(opcode, 0) + count
 
+            if issue.rule_code == "S207" and has_metadata_build:
+                target_counts.setdefault("BUILD", 1)
+
         for opcode, count in supporting_evidence_counts.items():
             evidence_counts.setdefault(opcode, count)
 
-        issue_import_references = {
-            import_reference
-            for issue in pickle_result.issues
-            if isinstance((import_reference := (issue.details or {}).get("import_reference")), str)
-        }
+        issue_import_references: set[str] = set()
+        for issue in pickle_result.issues:
+            issue_details = issue.details or {}
+            for reference_key in ("import_reference", "opener_import_reference", "writer_import_reference"):
+                import_reference = issue_details.get(reference_key)
+                if isinstance(import_reference, str) and import_reference:
+                    issue_import_references.add(import_reference)
+
         raw_callable_invocations = pickle_result.metadata.get("callable_invocations")
         if issue_import_references and isinstance(raw_callable_invocations, list):
             dangerous_opcodes = {opcode for opcode, _risk in _PICKLE_CODE_EXECUTION_OPCODE_RISKS}
             for invocation in raw_callable_invocations:
-                if (
-                    not isinstance(invocation, dict)
-                    or invocation.get("import_reference") not in issue_import_references
-                ):
+                if not isinstance(invocation, dict):
+                    continue
+                invocation_reference = invocation.get("import_reference")
+                if invocation_reference not in issue_import_references:
                     continue
                 invocation_opcode = invocation.get("opcode")
                 if isinstance(invocation_opcode, str) and invocation_opcode.upper() in dangerous_opcodes:
                     evidence_counts.setdefault(invocation_opcode.upper(), 1)
 
-        raw_metadata_counts = pickle_result.metadata.get("opcode_counts")
         if not isinstance(raw_metadata_counts, dict):
             return evidence_counts
 
