@@ -27,6 +27,15 @@ from tests.helpers import create_mock_pytorch_zip
 _ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
 
 
+class _NewObjExImportGadget:
+    def __new__(cls, *, module_name: str) -> "_NewObjExImportGadget":
+        __import__(module_name)
+        return super().__new__(cls)
+
+    def __getnewargs_ex__(self) -> tuple[tuple[object, ...], dict[str, object]]:
+        return (), {"module_name": "subprocess"}
+
+
 def _corrupt_zip_member_crc(zip_path: Path, member_name: str) -> None:
     """Patch ZIP headers so one member reports an incorrect CRC without changing data."""
     with zipfile.ZipFile(zip_path, "r") as zip_file:
@@ -59,6 +68,10 @@ def _malicious_eval_pickle_payload() -> bytes:
             return (eval, ("print('pwned')",))
 
     return pickle.dumps({"payload": MaliciousClass()})
+
+
+def _malicious_newobj_ex_pickle_payload() -> bytes:
+    return pickle.dumps(object.__new__(_NewObjExImportGadget), protocol=4)
 
 
 def _malicious_proto0_system_payload() -> bytes:
@@ -8023,7 +8036,7 @@ def test_pytorch_zip_cve_2025_32434_empty_imports_stay_suspicious(tmp_path: Path
     assert check.details["import_analysis"]["total_imports"] == 0
 
 
-def test_pytorch_zip_cve_2025_32434_ignores_opcode_name_substrings(tmp_path: Path) -> None:
+def test_pytorch_zip_cve_2025_32434_ignores_opcode_name_substrings_and_prose(tmp_path: Path) -> None:
     pickle_result = _pickle_result_with_reduce("numpy.core.multiarray._reconstruct")
     pickle_result.add_check(
         name="Dangerous Pickle Call Graph",
@@ -8048,7 +8061,8 @@ def test_pytorch_zip_cve_2025_32434_ignores_opcode_name_substrings(tmp_path: Pat
     )
 
     check = _weights_only_analysis_check(pytorch_result)
-    assert check.details["opcode_counts"] == {"REDUCE": 1, "GLOBAL": 1}
+    assert check.details["opcode_counts"] == {"REDUCE": 1}
+    assert "GLOBAL" not in check.details["unique_opcode_types"]
     assert "INST" not in check.details["unique_opcode_types"]
     assert "OBJ" not in check.details["unique_opcode_types"]
 
@@ -8073,6 +8087,74 @@ def test_pytorch_zip_cve_2025_32434_does_not_double_count_stack_global(tmp_path:
 
     check = _weights_only_analysis_check(pytorch_result)
     assert check.details["opcode_counts"] == {"STACK_GLOBAL": 1}
+
+
+def test_pytorch_zip_cve_2025_32434_reports_newobj_ex(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "newobj_ex.pt", with_pickle=False)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("data.pkl", _malicious_newobj_ex_pickle_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    check = _weights_only_analysis_check(result)
+    assert check.status == CheckStatus.FAILED
+    assert check.details["opcode_counts"] == {"STACK_GLOBAL": 1, "NEWOBJ_EX": 1}
+    assert check.details["total_dangerous_opcodes"] == 2
+    assert set(check.details["unique_opcode_types"]) == {"STACK_GLOBAL", "NEWOBJ_EX"}
+    assert "NEWOBJ" not in check.details["unique_opcode_types"]
+    assert "OBJ" not in check.details["unique_opcode_types"]
+
+
+def test_pytorch_zip_cve_2025_32434_retains_supporting_only_opcode_evidence(tmp_path: Path) -> None:
+    pickle_result = ScanResult(scanner_name="pickle")
+    pickle_result.metadata["opcode_counts"] = {"NEWOBJ_EX": 1}
+    pickle_result.add_check(
+        name="NEWOBJ_EX Opcode Safety Check",
+        passed=False,
+        message="Found NEWOBJ_EX opcode invoking dangerous global: builtins.compile",
+        severity=IssueSeverity.CRITICAL,
+        details={
+            "opcode": "NEWOBJ_EX",
+            "import_reference": "builtins.compile",
+            "supporting_rule_code": True,
+        },
+    )
+    pytorch_result = ScanResult(scanner_name="pytorch_zip")
+
+    PyTorchZipScanner()._add_weights_only_safety_warnings(
+        pickle_result,
+        pytorch_result,
+        str(tmp_path / "model.pt"),
+        "data.pkl",
+    )
+
+    check = _weights_only_analysis_check(pytorch_result)
+    assert check.status == CheckStatus.FAILED
+    assert check.severity == IssueSeverity.CRITICAL
+    assert check.details["opcode_counts"] == {"NEWOBJ_EX": 1}
+
+
+def test_pytorch_zip_cve_2025_32434_ignores_benign_opcode_near_matches(tmp_path: Path) -> None:
+    pickle_result = ScanResult(scanner_name="pickle")
+    pickle_result.add_check(
+        name="Pickle Metadata Diagnostic",
+        passed=False,
+        message=("Global build analysis reduced an installed object with newobject and stack_globalized metadata"),
+        severity=IssueSeverity.INFO,
+        details={"analysis": "metadata_diagnostic"},
+    )
+    pytorch_result = ScanResult(scanner_name="pytorch_zip")
+
+    PyTorchZipScanner()._add_weights_only_safety_warnings(
+        pickle_result,
+        pytorch_result,
+        str(tmp_path / "model.pt"),
+        "data.pkl",
+    )
+
+    check = _weights_only_analysis_check(pytorch_result)
+    assert check.status == CheckStatus.PASSED
+    assert check.details["dangerous_opcodes_found"] is False
 
 
 @pytest.mark.parametrize(

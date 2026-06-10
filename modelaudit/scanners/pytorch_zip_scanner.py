@@ -67,6 +67,7 @@ _PICKLE_CODE_EXECUTION_OPCODE_RISKS = (
     ("INST", "Class instantiation code execution"),
     ("OBJ", "Object creation code execution"),
     ("NEWOBJ", "New-style object creation"),
+    ("NEWOBJ_EX", "Extended new-style object creation"),
     ("STACK_GLOBAL", "Dynamic import and attribute access"),
     ("GLOBAL", "Module import and attribute access"),
     ("BUILD", "__setstate__ method exploitation"),
@@ -3525,20 +3526,13 @@ class PyTorchZipScanner(BaseScanner):
         import_analysis = self._analyze_pickle_imports(pickle_result)
 
         # Check if the pickle scan found any dangerous opcodes
-        dangerous_opcodes_found: list[str] = []
-        code_execution_risks: list[str] = []
-        opcode_counts: dict[str, int] = {}
+        opcode_counts = self._pickle_code_execution_opcode_counts(pickle_result)
+        dangerous_opcodes_found = list(opcode_counts)
+        code_execution_risks = [risk for opcode, risk in _PICKLE_CODE_EXECUTION_OPCODE_RISKS if opcode in opcode_counts]
 
         # Analyze the pickle scan results for dangerous patterns
         for issue in pickle_result.issues:
             issue_msg = issue.message.lower()
-            issue_details = issue.details or {}
-
-            for opcode, risk in _PICKLE_CODE_EXECUTION_OPCODE_RISKS:
-                if self._issue_reports_pickle_opcode(issue_msg, issue_details, opcode):
-                    dangerous_opcodes_found.append(opcode)
-                    opcode_counts[opcode] = opcode_counts.get(opcode, 0) + 1
-                    code_execution_risks.append(risk)
 
             # Look for any code execution patterns
             if any(pattern in issue_msg for pattern in ["exec", "eval", "import", "subprocess", "__import__"]):
@@ -3601,7 +3595,7 @@ class PyTorchZipScanner(BaseScanner):
                     "cve_id": self.CVE_2025_32434_ID,
                     "opcode_counts": opcode_counts,
                     "total_dangerous_opcodes": sum(opcode_counts.values()),
-                    "unique_opcode_types": list(set(dangerous_opcodes_found)),
+                    "unique_opcode_types": dangerous_opcodes_found,
                     "code_execution_risks": list(set(code_execution_risks)),
                     "import_analysis": import_analysis,
                     "safetensors_available": has_safetensors,
@@ -3646,27 +3640,100 @@ class PyTorchZipScanner(BaseScanner):
                 },
             )
 
-    @staticmethod
-    def _issue_reports_pickle_opcode(issue_message: str, issue_details: dict[str, Any], opcode: str) -> bool:
-        """Match exact opcode evidence without treating ordinary word fragments as opcodes."""
-        for key in ("opcode", "opcode_name"):
-            value = issue_details.get(key)
-            if isinstance(value, str) and value.upper() == opcode:
-                return True
+    @classmethod
+    def _pickle_code_execution_opcode_counts(cls, pickle_result: ScanResult) -> dict[str, int]:
+        """Return exact counts for dangerous opcode types backed by findings."""
+        evidence_counts: dict[str, int] = {}
+        supporting_evidence_counts: dict[str, int] = {}
+        for issue in pickle_result.issues:
+            issue_details = issue.details or {}
+            target_counts = (
+                supporting_evidence_counts if issue_details.get("supporting_rule_code") is True else evidence_counts
+            )
+            for opcode, _risk in _PICKLE_CODE_EXECUTION_OPCODE_RISKS:
+                count = cls._issue_pickle_opcode_count(issue.message, issue_details, opcode)
+                if count > 0:
+                    target_counts[opcode] = target_counts.get(opcode, 0) + count
 
-        raw_opcodes = issue_details.get("opcodes")
-        if isinstance(raw_opcodes, (list, tuple, set)) and any(
-            isinstance(value, str) and value.upper() == opcode for value in raw_opcodes
-        ):
-            return True
+        for opcode, count in supporting_evidence_counts.items():
+            evidence_counts.setdefault(opcode, count)
+
+        issue_import_references = {
+            import_reference
+            for issue in pickle_result.issues
+            if isinstance((import_reference := (issue.details or {}).get("import_reference")), str)
+        }
+        raw_callable_invocations = pickle_result.metadata.get("callable_invocations")
+        if issue_import_references and isinstance(raw_callable_invocations, list):
+            dangerous_opcodes = {opcode for opcode, _risk in _PICKLE_CODE_EXECUTION_OPCODE_RISKS}
+            for invocation in raw_callable_invocations:
+                if (
+                    not isinstance(invocation, dict)
+                    or invocation.get("import_reference") not in issue_import_references
+                ):
+                    continue
+                invocation_opcode = invocation.get("opcode")
+                if isinstance(invocation_opcode, str) and invocation_opcode.upper() in dangerous_opcodes:
+                    evidence_counts.setdefault(invocation_opcode.upper(), 1)
+
+        raw_metadata_counts = pickle_result.metadata.get("opcode_counts")
+        if not isinstance(raw_metadata_counts, dict):
+            return evidence_counts
+
+        opcode_counts: dict[str, int] = {}
+        for opcode, evidence_count in evidence_counts.items():
+            metadata_count = next(
+                (
+                    value
+                    for key, value in raw_metadata_counts.items()
+                    if isinstance(key, str)
+                    and key.upper() == opcode
+                    and isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value > 0
+                ),
+                None,
+            )
+            opcode_counts[opcode] = metadata_count if metadata_count is not None else evidence_count
+        return opcode_counts
+
+    @staticmethod
+    def _issue_pickle_opcode_count(issue_message: str, issue_details: dict[str, Any], opcode: str) -> int:
+        """Read structured opcode evidence, with a narrow legacy-message fallback."""
+        has_structured_evidence = False
 
         raw_opcode_counts = issue_details.get("opcode_counts")
         if isinstance(raw_opcode_counts, dict):
-            count = raw_opcode_counts.get(opcode)
-            if isinstance(count, int) and not isinstance(count, bool) and count > 0:
-                return True
+            for key, value in raw_opcode_counts.items():
+                if not isinstance(key, str) or not key:
+                    continue
+                has_structured_evidence = True
+                if key.upper() == opcode and isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                    return value
 
-        return re.search(rf"(?<![A-Z0-9_]){re.escape(opcode)}(?![A-Z0-9_])", issue_message.upper()) is not None
+        for key in ("opcode", "opcode_name"):
+            value = issue_details.get(key)
+            if isinstance(value, str) and value:
+                has_structured_evidence = True
+                if value.upper() == opcode:
+                    return 1
+
+        raw_opcodes = issue_details.get("opcodes")
+        if isinstance(raw_opcodes, (list, tuple, set)):
+            opcode_values = [value for value in raw_opcodes if isinstance(value, str) and value]
+            has_structured_evidence = has_structured_evidence or bool(opcode_values)
+            count = sum(value.upper() == opcode for value in opcode_values)
+            if count > 0:
+                return count
+
+        if has_structured_evidence:
+            return 0
+
+        escaped_opcode = re.escape(opcode)
+        explicit_opcode_pattern = (
+            rf"(?<![A-Z0-9_])(?:{escaped_opcode}\s+OPCODES?|OPCODES?\s*[:=]?\s*{escaped_opcode})(?![A-Z0-9_])"
+        )
+        return int(re.search(explicit_opcode_pattern, issue_message.upper()) is not None)
 
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         """Extract PyTorch ZIP (torch.save format) metadata."""
