@@ -1245,6 +1245,23 @@ def test_llamafile_scanner_marks_omitted_runtime_bytes_inconclusive(tmp_path: Pa
         reset_cache_manager()
 
 
+def test_llamafile_scanner_does_not_rescan_out_of_context_tail_heredoc_preview(tmp_path: Path) -> None:
+    binary = tmp_path / "bounded-literal-heredoc-tail.llamafile"
+    with binary.open("wb") as handle:
+        handle.write(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56)
+        handle.write(b'llamafile runtime\ncat <<"EOF"\n')
+        handle.seek(10 * 1024 * 1024)
+        handle.write(b"curl internal-host\nEOF\n")
+        handle.seek((12 * 1024 * 1024) - 1)
+        handle.write(b"\x00")
+
+    result = LlamafileScanner(config={"llamafile_payload_scan_bytes": 3 * 1024 * 1024}).scan(str(binary))
+
+    assert result.success is False
+    assert LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
+
+
 def test_llamafile_scanner_does_not_route_middle_near_match_in_exe(tmp_path: Path) -> None:
     binary = tmp_path / "middle-near-match.exe"
     binary.write_bytes(

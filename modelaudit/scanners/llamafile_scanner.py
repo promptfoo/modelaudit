@@ -4116,9 +4116,9 @@ class LlamafileScanner(BaseScanner):
             runtime_end = file_size
         runtime_scan_end = min(runtime_end, max(0, self.max_payload_scan_bytes))
         runtime_preview_blobs = [
-            blob[: runtime_end - start]
+            blob[: runtime_scan_end - start]
             for start, blob in runtime_blobs
-            if start < runtime_end and runtime_end - start > 0
+            if start < runtime_scan_end and runtime_scan_end - start > 0
         ]
         (
             runtime_stream_bytes,
