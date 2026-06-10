@@ -12,9 +12,12 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
+from modelaudit.utils.file import detection as detection_module
 from modelaudit.utils.file.detection import (
     JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES,
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
+    is_confirmed_jax_json_checkpoint_file,
+    is_jax_json_checkpoint_file,
 )
 
 
@@ -595,6 +598,66 @@ def test_orbax_prefixed_checkpoint_file_is_scanned(tmp_path: Path, checkpoint_fi
         and check.details["global"] == "posix.system"
         for check in result.checks
     )
+
+
+@pytest.mark.parametrize("checkpoint_entry", ["model_1", "step_0"])
+@pytest.mark.parametrize("entry_kind", ["directory", "file"])
+def test_bare_numbered_checkpoint_entry_does_not_route_directory(
+    tmp_path: Path,
+    checkpoint_entry: str,
+    entry_kind: str,
+) -> None:
+    checkpoint_dir = tmp_path / "ordinary-model-directory"
+    checkpoint_dir.mkdir()
+    entry_path = checkpoint_dir / checkpoint_entry
+    if entry_kind == "directory":
+        entry_path.mkdir()
+    else:
+        entry_path.write_text("ordinary model notes", encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is False
+
+
+def test_numbered_checkpoint_probe_handles_short_regular_file_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_dir = tmp_path / "short-read-checkpoint"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "model_1").write_text('{"framework":"jax"}', encoding="utf-8")
+    real_read = os.read
+
+    def short_read(descriptor: int, size: int) -> bytes:
+        return real_read(descriptor, min(size, 1))
+
+    monkeypatch.setattr("modelaudit.scanners.jax_checkpoint_scanner.os.read", short_read)
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is True
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+@pytest.mark.parametrize("checkpoint_entry", ["model_1", "step_0"])
+def test_linked_numbered_checkpoint_entry_selects_owner_without_content_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint_entry: str,
+) -> None:
+    checkpoint_dir = tmp_path / "linked-numbered-checkpoint"
+    checkpoint_dir.mkdir()
+    outside_checkpoint = tmp_path / "outside-checkpoint"
+    outside_checkpoint.write_bytes(b"cposix\nsystem\np0\n(Vid\np1\ntp2\nRp3\n.")
+    (checkpoint_dir / checkpoint_entry).symlink_to(outside_checkpoint)
+
+    def fail_content_probe(
+        _cls: type[JaxCheckpointScanner],
+        _path: Path,
+        _expected_stat: os.stat_result,
+    ) -> bool | None:
+        raise AssertionError("directory routing must not read linked checkpoint entries")
+
+    monkeypatch.setattr(JaxCheckpointScanner, "_probe_numbered_checkpoint_file", classmethod(fail_content_probe))
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is True
 
 
 def test_orbax_nested_checkpoint_directory_fails_closed(tmp_path: Path) -> None:
@@ -2430,6 +2493,28 @@ def test_malformed_orbax_metadata_is_inconclusive(tmp_path: Path) -> None:
     assert determine_exit_code(aggregate) == 2
 
 
+@pytest.mark.usefixtures("requires_symlinks")
+def test_metadata_symlink_selects_owner_without_content_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_dir = tmp_path / "linked-orbax-metadata"
+    checkpoint_dir.mkdir()
+    outside_metadata = tmp_path / "outside-metadata.json"
+    outside_metadata.write_text('{"format":"orbax","restore_fn":"os.system"}', encoding="utf-8")
+    (checkpoint_dir / "metadata.json").symlink_to(outside_metadata)
+
+    def fail_content_probe(_path: str | Path) -> bool:
+        raise AssertionError("directory routing must not read linked metadata")
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.jax_checkpoint_scanner.is_jax_json_checkpoint_file",
+        fail_content_probe,
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is True
+
+
 @pytest.mark.parametrize(
     "metadata",
     [
@@ -2465,7 +2550,7 @@ def test_generic_metadata_json_is_not_routed_as_jax(tmp_path: Path) -> None:
     assert determine_exit_code(result) == 0
 
 
-def test_large_ambiguous_generic_metadata_json_is_not_routed_as_jax(tmp_path: Path) -> None:
+def test_large_ambiguous_generic_metadata_json_routes_fail_closed(tmp_path: Path) -> None:
     ordinary_directory = tmp_path / "large-backup-package"
     ordinary_directory.mkdir()
     (ordinary_directory / "metadata.json").write_text(
@@ -2473,7 +2558,108 @@ def test_large_ambiguous_generic_metadata_json_is_not_routed_as_jax(tmp_path: Pa
         encoding="utf-8",
     )
 
-    assert JaxCheckpointScanner.can_handle(str(ordinary_directory)) is False
+    assert JaxCheckpointScanner.can_handle(str(ordinary_directory)) is True
+
+    result = JaxCheckpointScanner().scan(str(ordinary_directory))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_orbax_metadata_analysis_size_limit" in result.metadata["scan_outcome_reasons"]
+    assert not any(check.rule_code == "S302" for check in result.checks)
+
+
+def test_late_jax_identity_routes_visible_dangerous_restore_fn(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "late-jax-identity-visible-restore"
+    checkpoint_dir.mkdir()
+    metadata_path = checkpoint_dir / "metadata.json"
+    metadata_path.write_text(
+        '{"restore_fn":"os.system","padding":"'
+        + "A" * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1)
+        + '","framework":"jax"}',
+        encoding="utf-8",
+    )
+    assert metadata_path.stat().st_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is True
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success is False
+    assert "jax_orbax_metadata_analysis_size_limit" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Orbax Restore Function Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.rule_code == "S302"
+        for check in result.checks
+    )
+
+
+def test_late_jax_identity_and_restore_fn_route_inconclusively_without_unbounded_read(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "late-jax-identity-and-restore"
+    checkpoint_dir.mkdir()
+    metadata_path = checkpoint_dir / "metadata.json"
+    metadata_path.write_text(
+        '{"padding":"'
+        + "A" * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1)
+        + '","framework":"jax","restore_fn":"os.system"}',
+        encoding="utf-8",
+    )
+    assert metadata_path.stat().st_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is True
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_orbax_metadata_analysis_size_limit" in result.metadata["scan_outcome_reasons"]
+    assert not any(check.rule_code == "S302" for check in result.checks)
+
+
+def test_jax_identity_before_split_utf8_boundary_remains_confirmed(tmp_path: Path) -> None:
+    metadata_path = tmp_path / "metadata.json"
+    prefix = b'{"framework":"jax","padding":"'
+    padding_size = JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES - len(prefix)
+    metadata_path.write_bytes(prefix + b"A" * padding_size + "é".encode() + b'"}')
+
+    assert metadata_path.stat().st_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES
+    assert is_confirmed_jax_json_checkpoint_file(metadata_path) is True
+
+
+def test_json_parser_limit_remains_ambiguous_instead_of_raising(tmp_path: Path) -> None:
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text(
+        '{"padding":' + "9" * 5000 + ',"framework":"jax"}',
+        encoding="utf-8",
+    )
+
+    assert is_jax_json_checkpoint_file(metadata_path) is True
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_jax_json_routing_does_not_read_retargeted_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text('{"framework":"jax"}', encoding="utf-8")
+    outside_path = tmp_path / "outside.json"
+    outside_path.write_text('{"framework":"jax","restore_fn":"os.system"}', encoding="utf-8")
+    original_open = detection_module.os.open
+
+    def retarget_before_open(path: str | bytes | os.PathLike[str] | os.PathLike[bytes], flags: int) -> int:
+        metadata_path.unlink()
+        metadata_path.symlink_to(outside_path)
+        return original_open(path, flags)
+
+    def fail_read(_descriptor: int, _size: int) -> bytes:
+        raise AssertionError("routing must validate the opened identity before reading")
+
+    monkeypatch.setattr(detection_module.os, "open", retarget_before_open)
+    monkeypatch.setattr(detection_module.os, "read", fail_read)
+
+    assert is_jax_json_checkpoint_file(metadata_path) is True
 
 
 def test_huggingface_model_index_filename_is_not_an_orbax_directory_marker(tmp_path: Path) -> None:

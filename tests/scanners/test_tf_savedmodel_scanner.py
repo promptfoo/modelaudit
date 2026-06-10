@@ -1,5 +1,4 @@
 import base64
-import builtins
 import hashlib
 import io
 import logging
@@ -111,7 +110,7 @@ def test_tf_savedmodel_read_failure_is_inconclusive_not_security_finding(
     monkeypatch.setattr(
         tf_savedmodel_module.TensorFlowSavedModelScanner, "can_handle", classmethod(lambda _cls, _path: True)
     )
-    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner.open", raise_os_error, raising=False)
+    monkeypatch.setattr(tf_savedmodel_module, "_open_bound_regular_file", raise_os_error)
 
     direct = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(path)
     aggregate = scan_model_directory_or_file(path, cache_scan_results=False)
@@ -209,7 +208,7 @@ def test_tf_savedmodel_unreadable_keras_metadata_is_operational(
     def raise_os_error(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated Keras metadata read failure")
 
-    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner.open", raise_os_error, raising=False)
+    monkeypatch.setattr(tf_savedmodel_module, "_open_bound_regular_file", raise_os_error)
 
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(metadata_path))
     aggregate = scan_model_directory_or_file(str(metadata_path), cache_scan_results=False)
@@ -231,14 +230,14 @@ def test_tf_savedmodel_directory_keeps_keras_metadata_read_failure_operational(
     model_dir = Path(_create_test_savedmodel_with_op(tmp_path, "Const", "metadata_failure_model"))
     metadata_path = model_dir / "keras_metadata.pb"
     metadata_path.write_bytes(b"safe metadata")
-    real_open = builtins.open
+    real_bound_open = tf_savedmodel_module._open_bound_regular_file
 
-    def fail_metadata_read(file: str, *args: Any, **kwargs: Any) -> Any:
-        if file == str(metadata_path):
+    def fail_metadata_read(file: Path, *args: Any, **kwargs: Any) -> Any:
+        if file == metadata_path:
             raise OSError("simulated Keras metadata read failure")
-        return real_open(file, *args, **kwargs)
+        return real_bound_open(file, *args, **kwargs)
 
-    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner.open", fail_metadata_read, raising=False)
+    monkeypatch.setattr(tf_savedmodel_module, "_open_bound_regular_file", fail_metadata_read)
 
     result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
 
@@ -453,7 +452,12 @@ def test_tf_savedmodel_standalone_keras_metadata_swap_to_oversized_is_inconclusi
     metadata_path = tmp_path / "keras_metadata.pb"
     metadata_path.write_bytes(b"A")
     monkeypatch.setattr(tf_savedmodel_module, "_MAX_KERAS_METADATA_PARSE_BYTES", 32)
-    monkeypatch.setattr(tf_savedmodel_module, "open", lambda *_args, **_kwargs: io.BytesIO(b"A" * 33), raising=False)
+
+    @tf_savedmodel_module.contextlib.contextmanager
+    def oversized_metadata(*_args: Any, **_kwargs: Any) -> Any:
+        yield io.BytesIO(b"A" * 33)
+
+    monkeypatch.setattr(tf_savedmodel_module, "_open_bound_regular_file", oversized_metadata)
     monkeypatch.setattr(
         tf_savedmodel_module.TensorFlowSavedModelScanner,
         "calculate_file_hashes",
@@ -1833,6 +1837,26 @@ def test_tf_savedmodel_scanner_none_blacklist_config_stays_quiet(tmp_path: Path)
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_blacklist_scan_is_bounded_and_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    text_path = model_dir / "custom_file.txt"
+    text_path.write_text("A" * 32 + "blocked-token", encoding="utf-8")
+    monkeypatch.setattr(tf_savedmodel_module, "_MAX_SAVEDMODEL_TEXT_SCAN_BYTES", 16)
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner(
+        config={"blacklist_patterns": ["blocked-token"]},
+    ).scan(str(model_dir))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "savedmodel_blacklist_scan_size_limit" in result.metadata["scan_outcome_reasons"]
+    assert not any(check.name == "Blacklist Pattern Check" for check in result.checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_tf_savedmodel_pyfunc_reference_uses_token_boundaries(tmp_path: Path) -> None:
     """Benign function references containing suspicious substrings should not be mislabeled."""
     model_path = _create_test_savedmodel_with_scoped_nodes(
@@ -2832,6 +2856,38 @@ def test_scan_savedmodel_directory_detects_probe_boundary_padded_pickle_asset(tm
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_owner_detects_extended_probe_opcode_budget_pickle(tmp_path: Path) -> None:
+    """The extended byte probe must not retain the smaller opcode ceiling."""
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "extended-opcode-budget.dat"
+    asset_path.write_bytes(
+        b"I0\n0" * 16_384 + b"N0" * 16_384 + b'cos\nsystem\n(S"echo pwned"\ntR.',
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
+
+    assert any(
+        issue.location == str(asset_path) and "pickle_payload" in issue.details.get("detected_content_type", "")
+        for issue in result.issues
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_owner_detects_exact_opcode_boundary_pickle(tmp_path: Path) -> None:
+    """Exactly one opcode budget of balanced padding must trigger the extended probe."""
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "exact-opcode-boundary.dat"
+    asset_path.write_bytes(b"(0" * 32_768 + b'cos\nsystem\n(S"echo pwned"\ntR.')
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
+
+    assert any(
+        issue.location == str(asset_path) and "pickle_payload" in issue.details.get("detected_content_type", "")
+        for issue in result.issues
+    )
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_scan_savedmodel_directory_trivial_probe_boundary_padding_stays_clean(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2890,6 +2946,35 @@ def test_savedmodel_asset_growth_during_extended_probe_is_inconclusive(
     assert stability_checks[0].location == str(asset_path)
     assert stability_checks[0].details["analysis_incomplete"] is True
     assert stability_checks[0].details["final_size"] > stability_checks[0].details["initial_size"]
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_asset_open_failure_is_operationally_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "unreadable.dat"
+    asset_path.write_bytes(b"benign asset")
+    real_open = tf_savedmodel_module.os.open
+
+    def fail_asset_open(candidate: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if Path(candidate) == asset_path:
+            raise PermissionError("simulated asset open failure")
+        return real_open(candidate, flags, *args, **kwargs)
+
+    monkeypatch.setattr(tf_savedmodel_module.os, "open", fail_asset_open)
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_dir))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "savedmodel_asset_read_failed" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["operational_error"] is True
+    assert any(
+        check.location == str(asset_path) and check.details.get("scan_outcome_reason") == "savedmodel_asset_read_failed"
+        for check in result.checks
+    )
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")

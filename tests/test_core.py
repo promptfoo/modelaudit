@@ -37,6 +37,7 @@ from modelaudit.scanners import (
     jinja2_template_scanner,
     mxnet_scanner,
     safetensors_scanner,
+    tf_savedmodel_scanner,
 )
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
@@ -403,7 +404,8 @@ def test_directory_scan_invokes_orbax_owner_once_and_keeps_clean_result(
     original_scan = JaxCheckpointScanner.scan
 
     def record_owner_scan(scanner: JaxCheckpointScanner, path: str) -> ScanResult:
-        owner_calls.append(path)
+        if Path(path).is_dir():
+            owner_calls.append(path)
         return original_scan(scanner, path)
 
     monkeypatch.setattr(JaxCheckpointScanner, "scan", record_owner_scan)
@@ -447,8 +449,12 @@ def test_directory_scan_fails_closed_when_orbax_owner_raises(
     model_dir = tmp_path / "orbax-model"
     _write_orbax_metadata(model_dir)
 
-    def fail_owner_scan(_scanner: JaxCheckpointScanner, _path: str) -> ScanResult:
-        raise RuntimeError("simulated directory scanner failure")
+    original_scan = JaxCheckpointScanner.scan
+
+    def fail_owner_scan(scanner: JaxCheckpointScanner, owner_path: str) -> ScanResult:
+        if Path(owner_path).is_dir():
+            raise RuntimeError("simulated directory scanner failure")
+        return original_scan(scanner, owner_path)
 
     monkeypatch.setattr(JaxCheckpointScanner, "scan", fail_owner_scan)
 
@@ -506,9 +512,9 @@ def test_savedmodel_owner_snapshot_does_not_rehash_opaque_variable_shards(
     hashed_paths: list[str] = []
     original_hash = core_module._calculate_file_hash
 
-    def record_hash(path: str) -> str:
+    def record_hash(path: str, *, deadline: float | None = None) -> str:
         hashed_paths.append(path)
-        return original_hash(path)
+        return original_hash(path, deadline=deadline)
 
     monkeypatch.setattr(core_module, "_calculate_file_hash", record_hash)
 
@@ -541,12 +547,17 @@ def test_directory_scan_does_not_follow_external_orbax_marker_before_containment
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
 
     assert owner_calls == []
+    owner_metadata = result.file_metadata[str(model_dir)]
+    assert owner_metadata["directory_owner_scan"] is False
+    assert "directory_owner_source_not_regular" in owner_metadata["scan_outcome_reasons"]
     assert any(
-        issue.message == "Path traversal outside scanned directory"
+        issue.message == "Non-regular directory entry was not scanned"
         and issue.location == str(marker_path)
-        and issue.details["resolved_path"] == str(outside_metadata.resolve())
+        and issue.details["scan_outcome_reason"] == "directory_entry_non_regular"
         for issue in result.issues
     )
+    assert result.content_hash is None
+    assert determine_exit_code(result) == 2
 
 
 @pytest.mark.usefixtures("requires_symlinks")
@@ -574,12 +585,17 @@ def test_directory_scan_does_not_follow_external_savedmodel_marker_before_contai
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
 
     assert owner_calls == []
+    owner_metadata = result.file_metadata[str(model_dir)]
+    assert owner_metadata["directory_owner_scan"] is False
+    assert "directory_owner_source_not_regular" in owner_metadata["scan_outcome_reasons"]
     assert any(
-        issue.message == "Path traversal outside scanned directory"
+        issue.message == "Non-regular directory entry was not scanned"
         and issue.location == str(marker_path)
-        and issue.details["resolved_path"] == str(outside_model.resolve())
+        and issue.details["scan_outcome_reason"] == "directory_entry_non_regular"
         for issue in result.issues
     )
+    assert result.content_hash is None
+    assert determine_exit_code(result) == 2
 
 
 @pytest.mark.usefixtures("requires_symlinks")
@@ -674,9 +690,13 @@ def test_directory_scan_applies_file_budgets_before_orbax_owner(
     _write_orbax_metadata(model_dir, restore_fn="os.system")
     owner_calls: list[str] = []
 
-    def record_owner_scan(_scanner: JaxCheckpointScanner, owner_path: str) -> ScanResult:
-        owner_calls.append(owner_path)
-        raise AssertionError("owner scan must not bypass aggregate file budgets")
+    original_scan = JaxCheckpointScanner.scan
+
+    def record_owner_scan(scanner: JaxCheckpointScanner, owner_path: str) -> ScanResult:
+        if Path(owner_path).is_dir():
+            owner_calls.append(owner_path)
+            raise AssertionError("owner scan must not bypass aggregate file budgets")
+        return original_scan(scanner, owner_path)
 
     monkeypatch.setattr(JaxCheckpointScanner, "scan", record_owner_scan)
 
@@ -721,6 +741,507 @@ def test_directory_scan_fails_closed_when_orbax_source_changes_during_owner_scan
     assert "directory_owner_source_changed" in owner_metadata["scan_outcome_reasons"]
     assert owner_metadata["operational_error"] is True
     assert any(check.name == "Directory Owner Source Stability" for check in result.checks)
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_rejects_owner_source_retargeted_before_dispatch_without_external_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "orbax-model"
+    marker_path = _write_orbax_metadata(model_dir)
+    outside_metadata = tmp_path / "outside-metadata.json"
+    outside_metadata.write_text('{"format":"orbax","restore_fn":"os.system"}', encoding="utf-8")
+    original_snapshot = core_module._capture_directory_owner_namespace
+    snapshot_calls = 0
+
+    def retarget_before_second_snapshot(*args: Any, **kwargs: Any) -> Any:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        if snapshot_calls == 2:
+            marker_path.unlink()
+            marker_path.symlink_to(outside_metadata)
+        return original_snapshot(*args, **kwargs)
+
+    def fail_owner_scan(_scanner: JaxCheckpointScanner, _owner_path: str) -> ScanResult:
+        raise AssertionError("retargeted owner source must block owner dispatch")
+
+    original_hash = core_module._calculate_file_hash
+
+    def reject_symlink_hash(source_path: str, *, deadline: float | None = None) -> str:
+        if Path(source_path).is_symlink():
+            raise AssertionError("retargeted owner source must not be opened for hashing")
+        return original_hash(source_path, deadline=deadline)
+
+    original_scan_file = core_module.scan_file
+
+    def reject_retargeted_child_scan(source_path: str, config: dict[str, Any]) -> ScanResult:
+        if Path(source_path) == marker_path:
+            raise AssertionError("retargeted owner source must not reach child dispatch")
+        return original_scan_file(source_path, config)
+
+    monkeypatch.setattr(core_module, "_capture_directory_owner_namespace", retarget_before_second_snapshot)
+    monkeypatch.setattr(core_module, "_calculate_file_hash", reject_symlink_hash)
+    monkeypatch.setattr(core_module, "scan_file", reject_retargeted_child_scan)
+    monkeypatch.setattr(JaxCheckpointScanner, "scan", fail_owner_scan)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    owner_metadata = result.file_metadata[str(model_dir)]
+    assert owner_metadata["directory_owner_scan"] is False
+    assert "directory_owner_source_changed" in owner_metadata["scan_outcome_reasons"]
+    assert result.files_scanned == 0
+    assert result.content_hash is None
+    assert determine_exit_code(result) == 2
+
+
+@pytest.mark.parametrize("mutation", ["addition", "rename"])
+def test_directory_scan_rejects_owner_namespace_change_before_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    model_dir = tmp_path / "orbax-model"
+    metadata_path = _write_orbax_metadata(model_dir)
+    original_hash_files = core_module._hash_files_by_path
+    mutated = False
+    owner_calls: list[str] = []
+
+    def mutate_after_hash(file_paths: list[str], **kwargs: Any) -> dict[str, str]:
+        nonlocal mutated
+        hashes = original_hash_files(file_paths, **kwargs)
+        if not mutated and str(metadata_path) in file_paths:
+            mutated = True
+            if mutation == "addition":
+                (model_dir / "checkpoint_1").write_bytes(b"benign checkpoint data")
+            else:
+                metadata_path.rename(model_dir / "orbax_checkpoint_metadata.json")
+        return hashes
+
+    original_scan = JaxCheckpointScanner.scan
+
+    def record_owner_scan(scanner: JaxCheckpointScanner, owner_path: str) -> ScanResult:
+        if Path(owner_path).is_dir():
+            owner_calls.append(owner_path)
+            raise AssertionError("changed owner namespace must block owner dispatch")
+        return original_scan(scanner, owner_path)
+
+    monkeypatch.setattr(core_module, "_hash_files_by_path", mutate_after_hash)
+    monkeypatch.setattr(JaxCheckpointScanner, "scan", record_owner_scan)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    owner_metadata = result.file_metadata[str(model_dir)]
+    assert owner_calls == []
+    assert owner_metadata["directory_owner_scan"] is False
+    assert "directory_owner_source_changed" in owner_metadata["scan_outcome_reasons"]
+    assert owner_metadata["operational_error"] is True
+    assert result.content_hash is None
+    assert determine_exit_code(result) == 2
+
+
+def test_directory_scan_fails_closed_when_owner_adds_source_after_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "orbax-model"
+    _write_orbax_metadata(model_dir)
+    original_scan = JaxCheckpointScanner.scan
+
+    def add_source_after_owner_scan(scanner: JaxCheckpointScanner, owner_path: str) -> ScanResult:
+        owner_result = original_scan(scanner, owner_path)
+        (model_dir / "checkpoint_1").write_bytes(b"benign checkpoint data")
+        return owner_result
+
+    monkeypatch.setattr(JaxCheckpointScanner, "scan", add_source_after_owner_scan)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    owner_metadata = result.file_metadata[str(model_dir)]
+    assert owner_metadata["directory_owner_scan"] is True
+    assert "directory_owner_source_changed" in owner_metadata["scan_outcome_reasons"]
+    assert owner_metadata["operational_error"] is True
+    assert result.content_hash is None
+    assert determine_exit_code(result) == 2
+
+
+def test_directory_scan_fails_closed_when_owner_root_is_swapped_and_restored(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "orbax-model"
+    _write_orbax_metadata(model_dir)
+    replacement_dir = tmp_path / "replacement-model"
+    _write_orbax_metadata(replacement_dir, restore_fn="os.system")
+    parked_dir = tmp_path / "parked-model"
+    original_scan = JaxCheckpointScanner.scan
+
+    def swap_root_during_owner_scan(scanner: JaxCheckpointScanner, owner_path: str) -> ScanResult:
+        if not Path(owner_path).is_dir() or Path(owner_path) != model_dir:
+            return original_scan(scanner, owner_path)
+        model_dir.rename(parked_dir)
+        replacement_dir.rename(model_dir)
+        try:
+            return original_scan(scanner, owner_path)
+        finally:
+            model_dir.rename(replacement_dir)
+            parked_dir.rename(model_dir)
+
+    monkeypatch.setattr(JaxCheckpointScanner, "scan", swap_root_during_owner_scan)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    owner_metadata = result.file_metadata[str(model_dir)]
+    assert "directory_owner_source_changed" in owner_metadata["scan_outcome_reasons"]
+    assert owner_metadata["operational_error"] is True
+    assert result.content_hash is None
+    assert determine_exit_code(result) == 2
+
+
+def test_directory_scan_validates_owner_sources_after_scan_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "orbax-model"
+    metadata_path = _write_orbax_metadata(model_dir)
+    original_scan = JaxCheckpointScanner.scan
+    original_scan_file = core_module.scan_file
+
+    def mutate_then_raise(scanner: JaxCheckpointScanner, owner_path: str) -> ScanResult:
+        if Path(owner_path) != model_dir:
+            return original_scan(scanner, owner_path)
+        metadata_path.write_text('{"format":"orbax","restore_fn":"os.system"}', encoding="utf-8")
+        raise RuntimeError("simulated owner failure")
+
+    def reject_invalidated_child_scan(source_path: str, config: dict[str, Any]) -> ScanResult:
+        if Path(source_path) == metadata_path:
+            raise AssertionError("a mutated owner source must not reach child dispatch")
+        return original_scan_file(source_path, config)
+
+    monkeypatch.setattr(JaxCheckpointScanner, "scan", mutate_then_raise)
+    monkeypatch.setattr(core_module, "scan_file", reject_invalidated_child_scan)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    owner_metadata = result.file_metadata[str(model_dir)]
+    assert owner_metadata["directory_owner_scan"] is True
+    assert "directory_owner_scan_failed" in owner_metadata["scan_outcome_reasons"]
+    assert "directory_owner_source_changed" in owner_metadata["scan_outcome_reasons"]
+    assert owner_metadata["operational_error"] is True
+    assert all(issue.rule_code != "S302" for issue in result.issues)
+    assert result.content_hash is None
+    assert determine_exit_code(result) == 2
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+@pytest.mark.skipif(
+    os.scandir not in os.supports_fd or os.open not in os.supports_dir_fd,
+    reason="descriptor-relative directory traversal is unavailable",
+)
+def test_directory_owner_snapshot_rejects_directory_swapped_to_symlink_before_descent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "orbax-model"
+    nested_dir = model_dir / "checkpoint_1"
+    nested_dir.mkdir(parents=True)
+    (nested_dir / "state").write_bytes(b"benign")
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    (outside_dir / "secret").write_bytes(b"must not be enumerated")
+    parked_dir = tmp_path / "parked-checkpoint"
+    real_open = core_module.os.open
+    swapped = False
+
+    def swap_before_child_open(
+        candidate: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        *args: Any,
+        **kwargs: Any,
+    ) -> int:
+        nonlocal swapped
+        if os.fsdecode(candidate) == nested_dir.name and kwargs.get("dir_fd") is not None and not swapped:
+            swapped = True
+            nested_dir.rename(parked_dir)
+            nested_dir.symlink_to(outside_dir, target_is_directory=True)
+            assert flags & getattr(os, "O_NOFOLLOW", 0)
+        return real_open(candidate, flags, *args, **kwargs)
+
+    monkeypatch.setattr(core_module.os, "open", swap_before_child_open)
+
+    with pytest.raises(OSError):
+        core_module._capture_directory_owner_namespace_by_descriptor(
+            model_dir,
+            JaxCheckpointScanner,
+            deadline=core_module.time.time() + 10,
+            max_entries=10,
+        )
+
+    assert swapped is True
+
+
+def test_directory_scan_dispatches_structure_only_owner_without_child_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "orbax-model"
+    (model_dir / "checkpoint_1").mkdir(parents=True)
+    owner_calls: list[str] = []
+
+    def select_owner(*_args: Any, **_kwargs: Any) -> type[JaxCheckpointScanner]:
+        return JaxCheckpointScanner
+
+    def record_owner_scan(_scanner: JaxCheckpointScanner, owner_path: str) -> ScanResult:
+        owner_calls.append(owner_path)
+        owner_result = ScanResult(scanner_name=JaxCheckpointScanner.name)
+        owner_result.finish()
+        return owner_result
+
+    monkeypatch.setattr(core_module._registry, "get_scanner_for_path", select_owner)
+    monkeypatch.setattr(JaxCheckpointScanner, "scan", record_owner_scan)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    assert owner_calls == [str(model_dir)]
+    assert result.files_scanned == 0
+    assert result.file_metadata[str(model_dir)]["directory_owner_scan"] is True
+    assert result.has_errors is False
+
+
+def test_directory_owner_snapshot_entry_limit_allows_exact_boundary(tmp_path: Path) -> None:
+    model_dir = tmp_path / "orbax-model"
+    _write_orbax_metadata(model_dir)
+
+    result = scan_model_directory_or_file(
+        str(model_dir),
+        cache_scan_results=False,
+        max_directory_owner_snapshot_entries=1,
+    )
+
+    assert result.file_metadata[str(model_dir)]["directory_owner_scan"] is True
+    assert determine_exit_code(result) == 0
+
+
+def test_directory_owner_snapshot_entry_limit_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "orbax-model"
+    _write_orbax_metadata(model_dir)
+    (model_dir / "ordinary.txt").write_text("ordinary", encoding="utf-8")
+
+    def fail_unbounded_walk(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("an owner snapshot limit must stop the ordinary directory walk")
+
+    monkeypatch.setattr(core_module.os, "walk", fail_unbounded_walk)
+
+    result = scan_model_directory_or_file(
+        str(model_dir),
+        cache_scan_results=False,
+        max_directory_owner_snapshot_entries=1,
+    )
+
+    owner_metadata = result.file_metadata[str(model_dir)]
+    assert owner_metadata["directory_owner_scan"] is False
+    assert "directory_owner_entry_limit" in owner_metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Directory Owner Source Snapshot" and check.details["max_directory_owner_snapshot_entries"] == 1
+        for check in result.checks
+    )
+    assert result.content_hash is None
+    assert determine_exit_code(result) == 2
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation is unavailable")
+def test_calculate_file_hash_rejects_fifo_swap_without_blocking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "owner-asset.txt"
+    source_path.write_bytes(b"benign owner asset")
+    real_open = core_module.os.open
+    swapped = False
+
+    def replace_with_fifo_before_open(
+        candidate: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        *args: Any,
+        **kwargs: Any,
+    ) -> int:
+        nonlocal swapped
+        if Path(os.fsdecode(candidate)) == source_path and not swapped:
+            swapped = True
+            assert flags & getattr(os, "O_NONBLOCK", 0)
+            source_path.unlink()
+            os.mkfifo(source_path)
+        return real_open(candidate, flags, *args, **kwargs)
+
+    monkeypatch.setattr(core_module.os, "open", replace_with_fifo_before_open)
+
+    with pytest.raises(OSError, match="changed before hashing"):
+        core_module._calculate_file_hash(str(source_path))
+
+    assert swapped is True
+
+
+def test_filtered_savedmodel_owner_asset_updates_aggregate_hash_and_accounting(tmp_path: Path) -> None:
+    _require_tf_protos()
+    model_dir = tmp_path / "saved-model"
+    model_dir.mkdir()
+    saved_model_path = model_dir / "saved_model.pb"
+    _write_safe_savedmodel(saved_model_path)
+    assets_dir = model_dir / "assets"
+    assets_dir.mkdir()
+    asset_path = assets_dir / "notes.txt"
+    asset_path.write_bytes(b"benign asset")
+
+    first = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+    first_expected_bytes = saved_model_path.stat().st_size + asset_path.stat().st_size
+    asset_path.write_bytes(b"different benign asset contents")
+    second = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+    second_expected_bytes = saved_model_path.stat().st_size + asset_path.stat().st_size
+
+    assert first.content_hash is not None
+    assert second.content_hash is not None
+    assert first.content_hash != second.content_hash
+    assert first.files_scanned == second.files_scanned == 2
+    assert first.bytes_scanned == first_expected_bytes
+    assert second.bytes_scanned == second_expected_bytes
+    assert first.bytes_scanned != second.bytes_scanned
+    assert determine_exit_code(first) == 0
+    assert determine_exit_code(second) == 0
+
+
+def test_savedmodel_owner_and_child_sources_share_total_size_budget(tmp_path: Path) -> None:
+    _require_tf_protos()
+    model_dir = tmp_path / "saved-model"
+    model_dir.mkdir()
+    saved_model_path = model_dir / "saved_model.pb"
+    _write_safe_savedmodel(saved_model_path)
+    assets_dir = model_dir / "assets"
+    assets_dir.mkdir()
+    (assets_dir / "notes.txt").write_bytes(b"A" * 80)
+    variables_dir = model_dir / "variables"
+    variables_dir.mkdir()
+    (variables_dir / "variables.data-00000-of-00001").write_bytes(b"B" * 80)
+    max_total_size = saved_model_path.stat().st_size + 100
+
+    result = scan_model_directory_or_file(
+        str(model_dir),
+        cache_scan_results=False,
+        max_total_size=max_total_size,
+    )
+
+    owner_metadata = result.file_metadata[str(model_dir)]
+    assert owner_metadata["directory_owner_scan"] is False
+    assert "directory_owner_max_total_size" in owner_metadata["scan_outcome_reasons"]
+    assert result.files_scanned == 0
+    assert result.content_hash is None
+    assert determine_exit_code(result) == 2
+
+
+def test_mixed_savedmodel_and_orbax_root_preserves_both_security_scans(tmp_path: Path) -> None:
+    _require_tf_protos()
+    model_dir = tmp_path / "mixed-model"
+    model_dir.mkdir()
+    _write_safe_savedmodel(model_dir / "saved_model.pb")
+    metadata_path = model_dir / "metadata.json"
+    metadata_path.write_text(
+        '{"format":"orbax","restore_fn":"os.system"}',
+        encoding="utf-8",
+    )
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    assert "tf_savedmodel" in result.scanner_names
+    assert "jax_checkpoint" in result.scanner_names
+    assert any(issue.rule_code == "S302" and issue.location == str(metadata_path) for issue in result.issues)
+    assert determine_exit_code(result) == 1
+
+
+def test_nested_orbax_metadata_preserves_malicious_child_routing(tmp_path: Path) -> None:
+    nested_dir = tmp_path / "bundle" / "nested-orbax"
+    nested_dir.parent.mkdir()
+    metadata_path = _write_orbax_metadata(nested_dir, restore_fn="os.system")
+
+    result = scan_model_directory_or_file(str(tmp_path / "bundle"), cache_scan_results=False)
+
+    assert "jax_checkpoint" in result.scanner_names
+    assert any(issue.rule_code == "S302" and issue.location == str(metadata_path) for issue in result.issues)
+    assert determine_exit_code(result) == 1
+
+
+@pytest.mark.parametrize("layout", ["mixed_root", "nested"])
+def test_secondary_canonical_orbax_metadata_preserves_restore_fn_detection(
+    tmp_path: Path,
+    layout: str,
+) -> None:
+    scan_root = tmp_path / "bundle"
+    if layout == "mixed_root":
+        _require_tf_protos()
+        model_dir = scan_root
+        model_dir.mkdir()
+        _write_safe_savedmodel(model_dir / "saved_model.pb")
+    else:
+        model_dir = scan_root / "nested-orbax"
+        model_dir.mkdir(parents=True)
+    metadata_path = model_dir / "orbax_checkpoint_metadata.json"
+    metadata_path.write_text('{"restore_fn":"os.system"}', encoding="utf-8")
+
+    result = scan_model_directory_or_file(str(scan_root), cache_scan_results=False)
+
+    assert "jax_checkpoint" in result.scanner_names
+    assert any(issue.rule_code == "S302" and issue.location == str(metadata_path) for issue in result.issues)
+    assert determine_exit_code(result) == 1
+
+
+@pytest.mark.parametrize("layout", ["mixed_root", "nested"])
+@pytest.mark.parametrize("restore_location", ["checkpoint_marker", "sibling_metadata"])
+def test_secondary_orbax_marker_context_preserves_restore_fn_detection(
+    tmp_path: Path,
+    layout: str,
+    restore_location: str,
+) -> None:
+    scan_root = tmp_path / "bundle"
+    if layout == "mixed_root":
+        _require_tf_protos()
+        model_dir = scan_root
+        model_dir.mkdir()
+        _write_safe_savedmodel(model_dir / "saved_model.pb")
+    else:
+        model_dir = scan_root / "nested-orbax"
+        model_dir.mkdir(parents=True)
+
+    checkpoint_marker = model_dir / "_CHECKPOINT"
+    if restore_location == "checkpoint_marker":
+        malicious_path = checkpoint_marker
+        checkpoint_marker.write_text('{"restore_fn":"os.system"}', encoding="utf-8")
+    else:
+        checkpoint_marker.write_text("{}", encoding="utf-8")
+        malicious_path = model_dir / "metadata.json"
+        malicious_path.write_text('{"restore_fn":"os.system"}', encoding="utf-8")
+
+    result = scan_model_directory_or_file(str(scan_root), cache_scan_results=False)
+
+    assert "jax_checkpoint" in result.scanner_names
+    assert any(issue.rule_code == "S302" and issue.location == str(malicious_path) for issue in result.issues)
+    assert determine_exit_code(result) == 1
+
+
+def test_nested_generic_metadata_near_match_stays_clean(tmp_path: Path) -> None:
+    nested_dir = tmp_path / "bundle" / "ajax-package"
+    nested_dir.mkdir(parents=True)
+    metadata_path = nested_dir / "metadata.json"
+    metadata_path.write_text(
+        '{"framework":"ajax","restore_fn":"safe.restore"}',
+        encoding="utf-8",
+    )
+
+    result = scan_model_directory_or_file(str(tmp_path / "bundle"), cache_scan_results=False)
+
+    assert "jax_checkpoint" not in result.scanner_names
+    assert not any(issue.rule_code == "S302" for issue in result.issues)
+    assert determine_exit_code(result) == 0
 
 
 def test_directory_scan_without_logical_owner_keeps_file_walk_semantics(tmp_path: Path) -> None:
@@ -1409,6 +1930,7 @@ def test_directory_scan_fails_closed_when_hf_alias_retargets_after_discovery(
         config: dict[str, Any] | None = None,
         routing_paths: dict[str, str] | None = None,
         hashed_identities: dict[str, dict[str, int]] | None = None,
+        deadline: float | None = None,
     ) -> dict[str, str]:
         assert set(file_paths) == {str(blob_one), str(blob_two)}
         assert routing_paths == {str(blob_one): str(shard_one), str(blob_two): str(shard_two)}
@@ -1417,6 +1939,7 @@ def test_directory_scan_fails_closed_when_hf_alias_retargets_after_discovery(
             config=config,
             routing_paths=routing_paths,
             hashed_identities=hashed_identities,
+            deadline=deadline,
         )
         shard_one.unlink()
         shard_one.symlink_to(Path("../../blobs") / blob_two.name)
@@ -7064,7 +7587,14 @@ def test_scan_file_fails_closed_and_does_not_cache_bounded_jax_prefix_read_failu
     )
     cache_dir = tmp_path / "cache"
 
-    def fail_prefix_read(_scanner: JaxCheckpointScanner, _path: str, _result: ScanResult) -> None:
+    def fail_prefix_read(
+        _scanner: JaxCheckpointScanner,
+        _path: str,
+        _result: ScanResult,
+        *,
+        detect_orbax_restore_fn: bool = False,
+    ) -> None:
+        del detect_orbax_restore_fn
         raise OSError("forced bounded prefix read failure")
 
     monkeypatch.setattr(JaxCheckpointScanner, "_scan_bounded_json_prefix_patterns", fail_prefix_read)
@@ -10335,6 +10865,24 @@ def test_single_file_scan_bypasses_stale_cache_when_read_failure_aware_owner_rea
             return real_open(candidate, *args, **kwargs)
 
         monkeypatch.setattr("builtins.open", fail_cached_binary_read)
+        if filename == "saved_model.pb":
+            real_bound_open = tf_savedmodel_scanner._open_bound_regular_file
+
+            @contextmanager
+            def fail_cached_savedmodel_read(
+                candidate: Path,
+                expected_stat: os.stat_result,
+            ) -> Iterator[Any]:
+                if candidate == model_path:
+                    raise OSError(f"simulated transient {reason} read")
+                with real_bound_open(candidate, expected_stat) as stream:
+                    yield stream
+
+            monkeypatch.setattr(
+                tf_savedmodel_scanner,
+                "_open_bound_regular_file",
+                fail_cached_savedmodel_read,
+            )
         if filename.endswith(".npz"):
             real_zip_file = zipfile.ZipFile
 
@@ -10512,6 +11060,24 @@ def test_directory_scan_bypasses_stale_cache_when_read_failure_aware_owner_read_
             return real_open(candidate, *args, **kwargs)
 
         monkeypatch.setattr("builtins.open", fail_cached_binary_read)
+        if filename == "saved_model.pb":
+            real_bound_open = tf_savedmodel_scanner._open_bound_regular_file
+
+            @contextmanager
+            def fail_cached_savedmodel_read(
+                candidate: Path,
+                expected_stat: os.stat_result,
+            ) -> Iterator[Any]:
+                if candidate == cached_clean:
+                    raise OSError(f"simulated transient {reason} read")
+                with real_bound_open(candidate, expected_stat) as stream:
+                    yield stream
+
+            monkeypatch.setattr(
+                tf_savedmodel_scanner,
+                "_open_bound_regular_file",
+                fail_cached_savedmodel_read,
+            )
         if filename.endswith(".npz"):
             real_zip_file = zipfile.ZipFile
 
