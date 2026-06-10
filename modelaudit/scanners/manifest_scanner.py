@@ -765,13 +765,14 @@ class ManifestScanner(BaseScanner):
                 name="Manifest Scan Timeout",
                 passed=False,
                 message=f"Scan timed out: {e!s}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={
                     "timeout_seconds": self.timeout,
                     "analysis_incomplete": True,
                     "scan_outcome_reason": MANIFEST_SCAN_TIMEOUT_REASON,
                 },
+                why="Manifest scanning exceeded the configured timeout before all checks completed",
             )
             self._finish_manifest_result(result)
             return result
