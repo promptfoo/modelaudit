@@ -169,6 +169,11 @@ def generate_whitelist_module(org_models: dict[str, list[str]], output_path: Pat
         org_models: Dictionary mapping org name to model IDs
         output_path: Path where the module should be written
     """
+    if any(not isinstance(org, str) for org in org_models):
+        raise ValueError("Organization names must be strings")
+    if any(not isinstance(model_id, str) for models in org_models.values() for model_id in models):
+        raise ValueError("Model IDs must be strings")
+
     # Ensure parent directory exists
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -180,7 +185,10 @@ def generate_whitelist_module(org_models: dict[str, list[str]], output_path: Pat
     # Generate statistics
     total_orgs = len(org_models)
     total_models = len(all_model_ids)
-    org_summary = "\n".join(f"  - {org}: {len(models)} models" for org, models in sorted(org_models.items()))
+    org_summary = "\n".join(
+        f"#   - {json.dumps(org, ensure_ascii=False)}: {len(models)} models"
+        for org, models in sorted(org_models.items())
+    )
 
     # Generate the module content
     content = f'''"""
@@ -195,13 +203,13 @@ Source: HuggingFace Organizations API
 Total organizations: {total_orgs}
 Total unique models: {total_models}
 
-Organizations included:
-{org_summary}
-
 This whitelist is used by ModelAudit to reduce false positives when scanning
 models from trusted organizations. Users can disable this behavior via the
 'use_hf_whitelist' configuration option.
 """
+
+# Organizations included:
+{org_summary}
 
 # Set of model IDs from trusted organizations
 ORGANIZATION_MODELS: set[str] = {{
@@ -210,7 +218,7 @@ ORGANIZATION_MODELS: set[str] = {{
     # Add model IDs (sorted for readability and diff-friendliness)
     sorted_models = sorted(all_model_ids)
     for model_id in sorted_models:
-        content += f"    {model_id!r},\n"
+        content += f"    {json.dumps(model_id, ensure_ascii=False)},\n"
 
     content += '''}
 
@@ -236,7 +244,7 @@ def is_from_trusted_organization(model_id: str | None) -> bool:
 '''
 
     # Write the module
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         f.write(content)
 
     print(f"\nWhitelist module written to: {output_path}")

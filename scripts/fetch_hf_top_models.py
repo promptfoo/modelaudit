@@ -88,6 +88,9 @@ def generate_whitelist_module(model_ids: list[str], output_path: Path) -> None:
         model_ids: List of model IDs to whitelist
         output_path: Path where the module should be written
     """
+    if any(not isinstance(model_id, str) for model_id in model_ids):
+        raise ValueError("Model IDs must be strings")
+
     # Ensure parent directory exists
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -115,7 +118,7 @@ POPULAR_MODELS: set[str] = {{
     # Add model IDs (sorted for readability and diff-friendliness)
     sorted_models = sorted(model_ids)
     for model_id in sorted_models:
-        content += f"    {model_id!r},\n"
+        content += f"    {json.dumps(model_id, ensure_ascii=False)},\n"
 
     content += '''}
 
@@ -141,7 +144,7 @@ def is_popular_model(model_id: str | None) -> bool:
 '''
 
     # Write the module
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         f.write(content)
 
     print(f"\nWhitelist module written to: {output_path}")
