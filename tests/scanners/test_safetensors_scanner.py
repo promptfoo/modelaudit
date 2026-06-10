@@ -12,7 +12,7 @@ import pytest
 # Skip if safetensors is not available before importing it
 pytest.importorskip("safetensors")
 
-from safetensors.numpy import save_file
+from safetensors.numpy import load_file, save_file
 
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
@@ -74,6 +74,64 @@ def test_valid_safetensors_file(tmp_path: Path) -> None:
     header_limit_check = next((check for check in result.checks if check.name == "Header Size Limit"), None)
     assert header_limit_check is not None
     assert header_limit_check.status.value == "passed"
+
+
+def test_valid_empty_tensor_offsets(tmp_path: Path) -> None:
+    file_path = tmp_path / "empty_tensor.safetensors"
+    save_file(
+        {
+            "empty": np.empty((0,), dtype=np.float32),
+            "value": np.ones((1,), dtype=np.float32),
+        },
+        str(file_path),
+    )
+
+    with file_path.open("rb") as handle:
+        header_len = struct.unpack("<Q", handle.read(8))[0]
+        header = json.loads(handle.read(header_len))
+
+    assert header["empty"]["data_offsets"][0] == header["empty"]["data_offsets"][1]
+    assert load_file(str(file_path))["empty"].shape == (0,)
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is True
+    assert not result.has_errors
+    assert any(
+        check.name == "Tensor Offset Validation"
+        and check.details.get("tensor") == "empty"
+        and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Tensor Size Consistency Check"
+        and check.details.get("tensor") == "empty"
+        and check.details.get("size") == 0
+        and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+
+
+def test_zero_length_offsets_require_empty_shape(tmp_path: Path) -> None:
+    file_path = tmp_path / "invalid_zero_length_tensor.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {"not_empty": {"dtype": "F32", "shape": [1], "data_offsets": [0, 0]}},
+        b"",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Tensor Size Consistency Check"
+        and check.details.get("tensor") == "not_empty"
+        and check.details.get("expected_size") == 4
+        and check.details.get("actual_size") == 0
+        and check.severity == IssueSeverity.CRITICAL
+        and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
 
 
 def test_valid_empty_safetensors_custom_metadata(tmp_path: Path) -> None:

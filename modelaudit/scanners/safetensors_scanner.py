@@ -633,7 +633,7 @@ class SafeTensorsScanner(BaseScanner):
                         structural_validation_failed = True
                         continue
 
-                    if begin < 0 or end <= begin or end > data_size:
+                    if begin < 0 or end < begin or end > data_size:
                         result.add_check(
                             name="Tensor Offset Validation",
                             passed=False,
