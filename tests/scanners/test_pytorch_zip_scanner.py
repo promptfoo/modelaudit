@@ -7586,8 +7586,10 @@ def test_pytorch_zip_symlink_read_error_redacts_local_header_name(tmp_path: Path
         for check in result.checks
         if check.name == "Symlink Safety Validation" and check.details.get("entry") == central_name
     )
-    assert symlink_check.rule_code == "S902"
-    assert symlink_check.details["exception"] == "<redacted>"
+    assert symlink_check.status == CheckStatus.FAILED
+    assert symlink_check.severity == IssueSeverity.CRITICAL
+    assert symlink_check.rule_code == "S406"
+    assert symlink_check.details["target_class"] == "invalid"
     assert secret not in result.to_json()
 
 

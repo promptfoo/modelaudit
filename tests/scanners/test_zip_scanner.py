@@ -9041,12 +9041,49 @@ class TestZipScanner:
             member.write(b"safe")
 
         archive_path = tmp_path / "force_zip64_streamed.zip"
-        archive_path.write_bytes(archive_buffer.getvalue())
+        archive_bytes = bytearray(archive_buffer.getvalue())
+        local_header = archive_bytes.find(b"PK\x03\x04")
+        assert local_header >= 0
+        archive_bytes[local_header + 18 : local_header + 26] = b"\x00" * 8
+        archive_path.write_bytes(archive_bytes)
 
         result = ZipScanner().scan(str(archive_path))
 
         assert result.success is True
         assert not any(
+            check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+
+    def test_force_zip64_streamed_entry_rejects_invalid_64bit_descriptor(self, tmp_path: Path) -> None:
+        class NonSeekableBuffer(io.BytesIO):
+            def seek(self, *_args: Any, **_kwargs: Any) -> int:
+                raise io.UnsupportedOperation("not seekable")
+
+            def seekable(self) -> bool:
+                return False
+
+        archive_buffer = NonSeekableBuffer()
+        with (
+            zipfile.ZipFile(archive_buffer, "w") as archive,
+            archive.open("safe.txt", "w", force_zip64=True) as member,
+        ):
+            member.write(b"safe")
+
+        archive_bytes = bytearray(archive_buffer.getvalue())
+        local_header = archive_bytes.find(b"PK\x03\x04")
+        descriptor = archive_bytes.find(b"PK\x07\x08")
+        assert local_header >= 0
+        assert descriptor >= 0
+        archive_bytes[local_header + 18 : local_header + 26] = b"\x00" * 8
+        archive_bytes[descriptor + 12 : descriptor + 16] = (1).to_bytes(4, "little")
+        archive_path = tmp_path / "invalid-force-zip64-streamed.zip"
+        archive_path.write_bytes(archive_bytes)
+
+        result = ZipScanner().scan(str(archive_path))
+
+        assert result.success is False
+        assert any(
             check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
             for check in result.checks
         )

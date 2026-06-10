@@ -4310,6 +4310,38 @@ def test_scan_file_honors_zip_only_selection_for_hdf5_userblock(tmp_path: Path) 
     )
 
 
+def test_scan_file_honors_pytorch_zip_only_selection_for_hdf5_userblock(tmp_path: Path) -> None:
+    polyglot = tmp_path / "selected-pytorch-zip-userblock.h5"
+    _create_misnamed_zip(
+        polyglot,
+        {
+            "archive/data.pkl": pickle.dumps(
+                {"endpoint": "http://attacker.example/model"},
+                protocol=4,
+            ),
+            "archive/version": b"3\n",
+            "archive/byteorder": b"little",
+        },
+    )
+    _append_hdf5_userblock_candidate(polyglot, plausible=True)
+
+    result = scan_file(
+        str(polyglot),
+        config={"scanners": ["pytorch_zip"], "cache_scan_results": False},
+    )
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{polyglot}:archive/data.pkl"
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "pytorch_zip"
+        for check in result.checks
+    )
+
+
 def test_scan_file_honors_zip_only_selection_for_large_hdf5_userblock(tmp_path: Path) -> None:
     polyglot = tmp_path / "selected-large-zip-userblock.h5"
     _create_misnamed_zip(polyglot, {"payload.pkl": _build_malicious_pickle()})
@@ -4595,6 +4627,24 @@ def test_scan_file_does_not_use_suffix_only_supplemental_scanner_for_hdf5_userbl
     assert result.success is True
     assert "supplemental_scanners" not in result.metadata
     assert all(check.name != "Format Validation" for check in result.checks)
+
+
+def test_scan_file_does_not_run_extension_only_zip_analyzer_for_hdf5_userblock(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    model_path = tmp_path / "benign-userblock.h5"
+    with h5py.File(model_path, "w", userblock_size=512) as h5_file:
+        h5_file.attrs["model_config"] = json.dumps({"class_name": "Sequential", "config": {"layers": []}})
+    with model_path.open("r+b") as model_file:
+        model_file.write(b"PK\x03\x04corrupt-near-match")
+
+    result = scan_file(
+        str(model_path),
+        config={"scanners": ["weight_distribution"], "cache_scan_results": False},
+    )
+
+    assert result.success is True
+    assert "hdf5_userblock_zip_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
+    assert all(check.name != "HDF5 User Block ZIP Analysis" for check in result.checks)
 
 
 def test_scan_file_routes_runtime_h5py_failure_for_extensionless_userblock(
