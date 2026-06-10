@@ -2511,8 +2511,11 @@ def _validated_safetensors_routing_header(
 
     try:
         parsed_header = json.loads(header.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError, RecursionError):
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return None
+    except (RecursionError, ValueError):
+        # Parsing limits are inconclusive, so retain the fail-closed scanner route.
+        return (header_len, None)
 
     return (header_len, header) if isinstance(parsed_header, dict) else None
 
@@ -2889,7 +2892,6 @@ def _classify_initial_pickle_security_signal(
         if linear_state is None or frame_state is None:
             return None
         return False
-
     if _work_budget is None:
         _work_budget = _PickleProbeWorkBudget()
     stream = _PickleProbeStream(sample, _sample_start, frame_aware=_frame_aware)

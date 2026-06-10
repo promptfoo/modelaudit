@@ -658,6 +658,45 @@ def test_scan_bytes_detects_follow_on_malicious_pickle_streams(separator: bytes)
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert any(notice.code == "follow_on_stream_detected" for notice in report.notices)
     assert any(finding.details.get("import_reference") in SYSTEM_GLOBALS for finding in report.findings)
+    assert report.metadata["follow_on_opcode_counts"]["REDUCE"] == 1
+
+
+def test_scan_bytes_counts_each_follow_on_opcode_once() -> None:
+    follow_on = b"\x80\x04cclick\nopen_file\n)\x810cclick\nopen_file\n)\x810cclick\necho\n)R."
+    payload = pickle.dumps({"safe": True}, protocol=4) + (b"\x00" * 64) + follow_on
+
+    report = scan_bytes(payload, source="follow-on-exact-counts.pkl")
+
+    assert report.metadata["follow_on_opcode_counts"]["GLOBAL"] == 3
+    assert report.metadata["follow_on_opcode_counts"]["NEWOBJ"] == 2
+    assert report.metadata["follow_on_opcode_counts"]["REDUCE"] == 1
+
+
+def test_scan_bytes_counts_separate_follow_on_streams_once() -> None:
+    click_stream = b"\x80\x04cclick\nopen_file\n)\x810cclick\nopen_file\n)\x810cclick\necho\n)R."
+    help_stream = b"\x80\x04\x8c\x08builtins\x8c\x04help\x93)R."
+    padding = b"\x00" * 64
+    payload = pickle.dumps({"safe": True}, protocol=4) + padding + click_stream + padding + help_stream
+
+    report = scan_bytes(payload, source="separate-follow-on-exact-counts.pkl")
+
+    counts = report.metadata["follow_on_opcode_counts"]
+    assert counts["PROTO"] == 2
+    assert counts["STOP"] == 2
+    assert counts["GLOBAL"] == 3
+    assert counts["NEWOBJ"] == 2
+    assert counts["REDUCE"] == 2
+    assert counts["STACK_GLOBAL"] == 1
+
+
+def test_scan_bytes_follow_on_callable_alias_import_without_invocation_has_no_call_graph_finding() -> None:
+    import_only = b"\x80\x04\x8c\x08builtins\x8c\x04help\x93."
+    payload = pickle.dumps({"safe": True}, protocol=4) + (b"\x00" * 64) + import_only
+
+    report = scan_bytes(payload, source="follow-on-callable-alias-import.pkl")
+
+    assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+    assert report.metadata["follow_on_opcode_counts"]["STACK_GLOBAL"] == 1
 
 
 @pytest.mark.parametrize(
@@ -935,6 +974,19 @@ def test_scan_bytes_recurses_into_nested_persid_payload() -> None:
         finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "PERSID"
         for finding in report.findings
     )
+
+
+def test_scan_bytes_merges_nested_opcode_counts_without_flattening_invocations() -> None:
+    inner = b"\x80\x04cclick\nopen_file\n)\x810cclick\nopen_file\n)\x810cclick\necho\n)R."
+    outer = pickle.dumps({"inner": inner}, protocol=4)
+
+    report = scan_bytes(outer, source="nested-callable-invocations.pkl")
+
+    assert not report.metadata.get("callable_invocations")
+    assert "NEWOBJ" not in report.metadata["opcode_counts"]
+    assert "REDUCE" not in report.metadata["opcode_counts"]
+    assert report.metadata["nested_opcode_counts"]["NEWOBJ"] == 2
+    assert report.metadata["nested_opcode_counts"]["REDUCE"] == 1
 
 
 def test_scan_bytes_continues_raw_nested_scan_after_data_only_payload() -> None:
@@ -7847,6 +7899,302 @@ def test_scan_bytes_does_not_flag_stack_invalid_encoded_pickle_fragments(fragmen
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
     assert all(finding.rule_code != "S601" for finding in report.findings)
+
+
+def test_scan_bytes_ignores_short_base64_pickle_collision_in_plain_text() -> None:
+    assert base64.b64decode("grou") == b"\x82\xba."
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": "grouped convolution"}, protocol=4),
+        source="short-base64-collision.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert all(notice.code != "encoded_nested_payload_detected" for notice in report.notices)
+
+
+def test_scan_bytes_preserves_single_quartet_base64_execution_payload() -> None:
+    nested_payload = b"NQ."
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+    report = scan_bytes(
+        pickle.dumps({"metadata": encoded}, protocol=4),
+        source="single-quartet-base64-execution.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "PERSISTENT_ID" and finding.details.get("nested_details", {}).get("opcode") == "BINPERSID"
+        for finding in report.findings
+    )
+    assert any(
+        notice.code == "encoded_nested_payload_detected"
+        and notice.details.get("payload_size") == len(nested_payload)
+        and notice.details.get("nested_has_execution_opcode") is True
+        for notice in report.notices
+    )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "Analytics",
+        "Analyze",
+        "AnomalyDetector",
+        "AvgPool2D",
+        "CustomDense",
+        "CustomLoader",
+        "DynamicTypeCallableAttribute",
+        "BloomForCausalLM",
+        "PyTorchZipScanner",
+        "RandomForest",
+        "253DQUERYLEAKSECRET",
+        "00bc356079fe8ecc8f9c504bfa310c0a33958a8d",
+        "34341261800329426",
+        "fullyconnected",
+        "lyrics",
+        "lzma",
+        "org/domains/root/db/wanggou",
+        "ordinary ApiDef metadata",
+        "ordinary BloomModel metadata",
+        "ordinary VOCABULARY metadata",
+        "/long_grou",
+        "BIO_lookup_ex",
+        "UIBarAppearance",
+        "UIProgressView",
+        "UNIXConnectable",
+        "CATEGORY_LINEBREAK: CATEGORY_UNI_LINEBREAK,",
+        "if group and not (len(group)==1 and group[0][0] == 'equal'):",
+        "if group.title not in title_group_map:",
+        "#         next rollover is simply 6 - 2 - 1, or 3.",
+        "# compute product y*log(x) = yc*lxc*10**(-p-b-1+ye) = pc*10**(-p-1)",
+        "'HTTPPasswordMgrWithPriorAuth', 'AbstractBasicAuthHandler',",
+    ],
+)
+def test_scan_bytes_ignores_short_word_base64_near_matches(metadata: str) -> None:
+    report = scan_bytes(
+        pickle.dumps({"metadata": metadata}, protocol=4),
+        source="short-base64-word-near-match.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert all(
+        notice.code not in {"encoded_nested_payload_detected", "nested_pickle_incomplete"} for notice in report.notices
+    )
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        "ggEpUi4=",
+        "ggEpUi4==",
+        "ggEpUi4===",
+        "ggEp!Ui4=",
+        "g!gEpUi4=",
+        "ggEp Ui4=",
+        "ggEp\nUi4=",
+        "ggEp.Ui4=",
+        "g=gEpUi4=",
+        "gg=EpUi4=",
+        "ggEpU=i4=",
+        "ggEpUi=4=",
+        "=ggEpUi4=",
+    ],
+)
+def test_scan_bytes_preserves_compact_base64_execution_payload_detection(
+    encoded: str,
+) -> None:
+    nested_payload = b"\x82\x01)R."
+    assert base64.b64decode(encoded) == nested_payload
+    report = scan_bytes(
+        pickle.dumps({"metadata": encoded}, protocol=4),
+        source="compact-base64-execution.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S601"
+        and finding.details.get("payload_size") == len(nested_payload)
+        and finding.details.get("nested_has_execution_opcode") is True
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("nested_details", {}).get("opaque_extension") is True
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("encoded", "expected_rule"),
+    [
+        ("gA!Q=", "S601"),
+        ("ly!4=", "S601"),
+        ("l5!gu", "S601"),
+        ("UA!ou", "PERSISTENT_ID"),
+        ("Tl!Eu", "PERSISTENT_ID"),
+        ("l=y4=", "S601"),
+        ("ly=4=", "S601"),
+        ("l=5gu", "S601"),
+        ("l5=gu", "S601"),
+        ("l5gu============", "S601"),
+        ("ly4=============", "S601"),
+        ("U=Aou", "PERSISTENT_ID"),
+        ("UA=ou", "PERSISTENT_ID"),
+        ("T=lEu", "PERSISTENT_ID"),
+        ("Tl=Eu", "PERSISTENT_ID"),
+        ("=ly4=", "S601"),
+        ("=l5gu", "S601"),
+        ("=UAou", "PERSISTENT_ID"),
+        ("=TlEu", "PERSISTENT_ID"),
+        ("!ly4!=", "S601"),
+        ("!UAo!u", "PERSISTENT_ID"),
+        ("AAAA=ly4=", "S601"),
+        ("AAAA==ly4=", "S601"),
+        ("grou=ly4=", "S601"),
+        ("A" * 64 + "=ly4=", "S601"),
+    ],
+)
+def test_scan_bytes_preserves_lenient_compact_base64_security_evidence(
+    encoded: str,
+    expected_rule: str,
+) -> None:
+    report = scan_bytes(
+        pickle.dumps({"metadata": encoded}, protocol=4),
+        source="lenient-compact-base64.pkl",
+    )
+
+    assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
+    assert any(finding.rule_code == expected_rule for finding in report.findings)
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        "AAA=ly4=",
+        "AA==ly4=",
+        "A" * 63 + "=ly4=",
+        "A" * 63 + "==ly4=",
+        "A" * 66 + "==ly4=",
+    ],
+)
+def test_scan_bytes_ignores_compact_base64_tail_after_terminal_padding(encoded: str) -> None:
+    assert encoded.endswith("ly4=")
+    assert base64.b64decode(encoded[-4:]) == b"\x97."
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": encoded}, protocol=4),
+        source="terminal-padding-base64-tail.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert all(
+        notice.code not in {"encoded_nested_payload_detected", "nested_pickle_incomplete"} for notice in report.notices
+    )
+
+
+def test_scan_bytes_preserves_four_byte_data_only_base64_boundary() -> None:
+    nested_payload = b"\x80\x04N."
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+    report = scan_bytes(
+        pickle.dumps({"metadata": encoded}, protocol=4),
+        source="four-byte-base64-boundary.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert any(
+        notice.code == "encoded_nested_payload_detected"
+        and notice.details.get("payload_size") == len(nested_payload)
+        and notice.details.get("nested_has_execution_opcode") is False
+        for notice in report.notices
+    )
+
+
+@pytest.mark.parametrize(
+    "nested_payload",
+    [
+        b"\x80\x04",
+        b"\x97",
+        b"\x97.",
+        b"\x97\x98.",
+    ],
+)
+def test_scan_bytes_fails_closed_for_compact_base64_prefixes(
+    nested_payload: bytes,
+) -> None:
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+    report = scan_bytes(
+        pickle.dumps({"metadata": encoded}, protocol=4),
+        source="compact-base64-incomplete.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S601" and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+    assert any(
+        notice.code == "nested_pickle_incomplete"
+        and notice.details.get("nested_encoding") == "base64"
+        and notice.details.get("analysis_incomplete") is True
+        for notice in report.notices
+    )
+
+
+@pytest.mark.parametrize("nested_payload", [b"cos\nsystem\n", b"Xcos\nsystem\n"])
+def test_scan_bytes_fails_closed_for_encoded_dangerous_global_prefix(
+    nested_payload: bytes,
+) -> None:
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+    report = scan_bytes(
+        pickle.dumps({"metadata": encoded}, protocol=4),
+        source="dangerous-global-base64-incomplete.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_GLOBAL" and finding.details.get("import_reference") == "os.system"
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "S601" and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    ["gAQ==", "=gAQ=", "!gAQ!=", "lw==============", "lw=!=", "lw= ="],
+)
+def test_scan_bytes_fails_closed_for_lenient_compact_base64_prefix(encoded: str) -> None:
+    report = scan_bytes(
+        pickle.dumps({"metadata": encoded}, protocol=4),
+        source="lenient-compact-base64-incomplete.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S601" and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+    assert any(
+        notice.code == "nested_pickle_incomplete"
+        and notice.details.get("nested_encoding") == "base64"
+        and notice.details.get("analysis_incomplete") is True
+        for notice in report.notices
+    )
 
 
 def test_scan_bytes_records_data_only_base64_nested_pickle_payloads_as_notices() -> None:

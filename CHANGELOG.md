@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - prefer validated SafeTensors framing over invalid pickle and weak-magic collisions while retaining security-bearing pickle overlaps
+- scope both ONNX weight scanners to bounded semantic weight lineage across nested graphs, control flow, local functions, constants, Gather/Einsum, and static views; fail closed on ambiguous or sparse coverage; and evaluate extreme tails per conceptual output without suppressing repeated malicious patterns or flagging clean heavy tails
+- derive PyTorch ZIP pickle opcode summaries from exact opcode evidence instead of matching substrings in finding text
+- accept current SafeTensors FP8, sub-byte float, and complex tensors
+- reject corpus-QA lock identifiers and paths that escape download, member, or tool-output roots
+- assign ONNX custom operator domains to the dedicated S1111 framework rule instead of the HTTP-client S302 rule
+- emit Hugging Face whitelist model IDs and organization summaries as safe generated Python
+- preserve bounded and fail-closed SafeTensors routing when header lengths resemble compression magic
+- allow equal offsets for supported empty SafeTensors tensors while preserving deterministic range checks and rejecting native size overflow
 - attribute core file-type validation failures directly to S901 instead of message-matching unrelated rules
 - fail closed when manifest scanning exceeds its configured timeout
 - stop cloud directory analysis as soon as download size or object-count budgets are exhausted

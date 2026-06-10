@@ -111,14 +111,18 @@ RULE_CATALOG: tuple[RuleCatalogEntry, ...] = (
         name="Pickle OBJ opcode",
         severity="CRITICAL",
         description="Object construction via pickle OBJ",
-        patterns=(r"pickle.*OBJ", r"OBJ.*opcode", r"dangerous.*OBJ"),
+        patterns=(r"pickle.*\bOBJ\b", r"\bOBJ\b.*opcode", r"dangerous.*\bOBJ\b"),
     ),
     RuleCatalogEntry(
         code="S204",
         name="Pickle NEWOBJ opcode",
         severity="CRITICAL",
         description="New-style class construction via pickle NEWOBJ",
-        patterns=(r"pickle.*NEWOBJ", r"NEWOBJ.*opcode", r"dangerous.*NEWOBJ"),
+        patterns=(
+            r"pickle.*\bNEWOBJ(?:_EX)?\b",
+            r"\bNEWOBJ(?:_EX)?\b.*opcode",
+            r"dangerous.*\bNEWOBJ(?:_EX)?\b",
+        ),
     ),
     RuleCatalogEntry(
         code="S205",
@@ -805,5 +809,17 @@ RULE_CATALOG: tuple[RuleCatalogEntry, ...] = (
         severity="LOW",
         description="GGUF/GGML format security issues",
         patterns=(r"gguf", r"ggml", r"llama.*format"),
+    ),
+    RuleCatalogEntry(
+        code="S1111",
+        name="ONNX custom operator domains",
+        severity="INFO",
+        description="ONNX model may depend on an external custom operator implementation",
+        patterns=(
+            r"onnx.*custom.*operator",
+            r"custom onnx operator",
+            r"custom operator domain",
+            r"custom.*onnx.*domain",
+        ),
     ),
 )

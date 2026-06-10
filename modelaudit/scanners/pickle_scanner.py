@@ -2121,20 +2121,24 @@ class PickleScanner(BaseScanner):
                 *(segment_values if isinstance(segment_values, list) else []),
             ]
         combined_lists["protocols"] = list(dict.fromkeys(combined_lists["protocols"]))
-        combined_opcode_counts: dict[str, int] = {}
-        for metadata in (result.metadata, segment_result.metadata):
-            opcode_counts = metadata.get("opcode_counts")
-            if not isinstance(opcode_counts, dict):
-                continue
-            for opcode, count in opcode_counts.items():
-                if isinstance(opcode, str) and isinstance(count, int):
-                    combined_opcode_counts[opcode] = combined_opcode_counts.get(opcode, 0) + count
+        combined_opcode_count_maps: dict[str, dict[str, int]] = {}
+        for count_key in ("opcode_counts", "nested_opcode_counts", "follow_on_opcode_counts"):
+            combined_counts: dict[str, int] = {}
+            for metadata in (result.metadata, segment_result.metadata):
+                opcode_counts = metadata.get(count_key)
+                if not isinstance(opcode_counts, dict):
+                    continue
+                for opcode, count in opcode_counts.items():
+                    if isinstance(opcode, str) and isinstance(count, int):
+                        combined_counts[opcode] = combined_counts.get(opcode, 0) + count
+            combined_opcode_count_maps[count_key] = combined_counts
+        combined_opcode_counts = combined_opcode_count_maps["opcode_counts"]
         control_verdict = result.metadata.get("pickle_verdict")
         segment_verdict = segment_result.metadata.get("pickle_verdict")
 
         result.merge(segment_result)
         result.metadata.update(combined_lists)
-        result.metadata["opcode_counts"] = combined_opcode_counts
+        result.metadata.update(combined_opcode_count_maps)
         result.metadata["opcode_count"] = sum(combined_opcode_counts.values())
         result.metadata["globals_count"] = sum(
             value

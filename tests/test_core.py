@@ -8125,12 +8125,22 @@ def test_scan_file_routes_misnamed_keras_hdf5_by_header(tmp_path: Path) -> None:
     assert any("CVE-2025-9905" in issue.message for issue in result.issues)
 
 
+@pytest.mark.parametrize(
+    ("filename", "header_len"),
+    [
+        ("weights.jpg", SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1),
+        ("zlib-shaped.unknown", SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 0x9C78),
+    ],
+    ids=["generic", "zlib-shaped"],
+)
 def test_scan_file_routes_oversized_renamed_safetensors_to_inconclusive_scan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    header_len: int,
 ) -> None:
-    disguised_safetensors = tmp_path / "weights.jpg"
-    _write_sparse_oversized_safetensors_candidate(disguised_safetensors)
+    disguised_safetensors = tmp_path / filename
+    _write_sparse_oversized_safetensors_candidate(disguised_safetensors, header_len=header_len)
     monkeypatch.setattr(
         safetensors_scanner.SafeTensorsScanner,
         "calculate_file_hashes",
@@ -8148,12 +8158,22 @@ def test_scan_file_routes_oversized_renamed_safetensors_to_inconclusive_scan(
     assert limit_check.severity == IssueSeverity.INFO
 
 
+@pytest.mark.parametrize(
+    ("filename", "header_len"),
+    [
+        ("weights.jpg", SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1),
+        ("zlib-shaped.unknown", SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 0x9C78),
+    ],
+    ids=["generic", "zlib-shaped"],
+)
 def test_scan_top_level_oversized_renamed_safetensors_fails_before_hashing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    header_len: int,
 ) -> None:
-    disguised_safetensors = tmp_path / "weights.jpg"
-    _write_sparse_oversized_safetensors_candidate(disguised_safetensors)
+    disguised_safetensors = tmp_path / filename
+    _write_sparse_oversized_safetensors_candidate(disguised_safetensors, header_len=header_len)
     monkeypatch.setattr(
         safetensors_scanner.SafeTensorsScanner,
         "calculate_file_hashes",
@@ -11359,12 +11379,22 @@ def test_scan_file_incomplete_xml_routing_result_is_not_cached(tmp_path: Path) -
         reset_cache_manager()
 
 
+@pytest.mark.parametrize(
+    ("filename", "header_len"),
+    [
+        ("oversized.safetensors", (1024 * 1024) + 1),
+        ("zlib-shaped.unknown", SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 0x9C78),
+    ],
+    ids=["native-suffix", "zlib-shaped"],
+)
 def test_scan_file_inconclusive_safetensors_header_limit_result_is_not_cached(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    header_len: int,
 ) -> None:
-    payload = tmp_path / "oversized.safetensors"
-    _write_sparse_oversized_safetensors_candidate(payload, header_len=(1024 * 1024) + 1)
+    payload = tmp_path / filename
+    _write_sparse_oversized_safetensors_candidate(payload, header_len=header_len)
     cache_dir = tmp_path / "cache"
     config = {
         "cache_enabled": True,
