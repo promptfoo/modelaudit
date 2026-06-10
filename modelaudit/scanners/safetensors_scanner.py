@@ -733,7 +733,7 @@ class SafeTensorsScanner(BaseScanner):
                         )
 
                 # Check offset continuity
-                offsets.sort(key=lambda x: x[0])
+                offsets.sort()
                 last_end = 0
                 has_gap_or_overlap = False
                 for begin, end in offsets:

@@ -134,6 +134,25 @@ def test_zero_length_offsets_require_empty_shape(tmp_path: Path) -> None:
     )
 
 
+def test_empty_tensor_offset_order_does_not_create_false_overlap(tmp_path: Path) -> None:
+    file_path = tmp_path / "empty_tensor_before_nonempty_range.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {
+            "nonempty": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "empty": {"dtype": "U8", "shape": [0], "data_offsets": [0, 0]},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.metadata.get("scan_outcome") != "inconclusive"
+    assert not any(
+        check.status == CheckStatus.FAILED and check.name == "Offset Continuity Check" for check in result.checks
+    )
+
+
 def test_valid_empty_safetensors_custom_metadata(tmp_path: Path) -> None:
     """An empty string-to-string map is valid custom metadata."""
     file_path = tmp_path / "empty_metadata.safetensors"
