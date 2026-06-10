@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import _imp
 import os
+import pickle
 import posixpath
 import subprocess
 import sys
@@ -11,7 +12,7 @@ import tarfile
 from collections.abc import Iterator
 from importlib.machinery import BuiltinImporter, FileFinder, FrozenImporter, ModuleSpec, PathFinder
 from pathlib import Path
-from types import FunctionType, ModuleType
+from types import BuiltinFunctionType, FunctionType, ModuleType
 from typing import Any, cast
 
 import pytest
@@ -1634,3 +1635,168 @@ def test_late_loaded_builtin_with_canonical_spec_fails_closed(
         assert call_graph._import_module_can_execute_user_code(module) is True
     finally:
         _clear_call_graph_caches()
+
+
+def test_loaded_extension_export_does_not_fall_through_module_getattr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import _codecs
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    module_name = "modelaudit_tp_extension_export"
+    module_path = tmp_path / f"{module_name}.py"
+    module_path.write_text(
+        "import os\ndef __getattr__(name=None):\n    os.system('')\n    return None\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    spec = spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    loaded_module = module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, loaded_module)
+    spec.loader.exec_module(loaded_module)
+    namespace = ModuleType.__getattribute__(loaded_module, "__dict__")
+    namespace["encode"] = _codecs.encode
+    _clear_call_graph_caches()
+    assert call_graph._loaded_extension_callable_bypasses_module_getattr(module_name, "encode") is False
+    monkeypatch.setattr(
+        call_graph,
+        "_TRUSTED_LOADED_EXTENSION_EXPORT_OWNERS",
+        {(module_name, "encode"): ("os",)},
+    )
+    assert call_graph._loaded_extension_callable_bypasses_module_getattr(module_name, "encode") is False
+    monkeypatch.setattr(
+        call_graph,
+        "_TRUSTED_LOADED_EXTENSION_EXPORT_OWNERS",
+        {(module_name, "encode"): ("_codecs",)},
+    )
+    reference = {
+        "module": module_name,
+        "name": "encode",
+        "import_reference": f"{module_name}.encode",
+        "opcode": "REDUCE",
+        "positional_arg_count": 3,
+    }
+    _clear_call_graph_caches()
+
+    try:
+        bypasses_getattr = call_graph._loaded_extension_callable_bypasses_module_getattr(module_name, "encode")
+        findings = call_graph.find_dangerous_call_graphs([reference], [reference])
+    finally:
+        _clear_call_graph_caches()
+
+    assert bypasses_getattr is True
+    assert findings == ()
+
+
+def test_loaded_dangerous_builtin_cannot_impersonate_trusted_extension_export(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    module_name = "modelaudit_tp_dangerous_extension_export"
+    module_path = tmp_path / f"{module_name}.py"
+    module_path.write_text(
+        "import os\ndef __getattr__(name=None):\n    os.system('true')\n    return None\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    spec = spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    loaded_module = module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, loaded_module)
+    spec.loader.exec_module(loaded_module)
+    namespace = ModuleType.__getattribute__(loaded_module, "__dict__")
+    namespace["_reconstruct"] = os.system
+    owner = BuiltinFunctionType.__getattribute__(os.system, "__self__")
+    assert type(owner) is ModuleType
+    owner_name = ModuleType.__getattribute__(owner, "__name__")
+    monkeypatch.setattr(
+        call_graph,
+        "_TRUSTED_LOADED_EXTENSION_EXPORT_OWNERS",
+        {(module_name, "_reconstruct"): (owner_name,)},
+    )
+    reference = {
+        "module": module_name,
+        "name": "_reconstruct",
+        "import_reference": f"{module_name}._reconstruct",
+        "opcode": "REDUCE",
+        "positional_arg_count": 1,
+    }
+    _clear_call_graph_caches()
+
+    try:
+        bypasses_getattr = call_graph._loaded_extension_callable_bypasses_module_getattr(module_name, "_reconstruct")
+        findings = call_graph.find_dangerous_call_graphs([reference], [reference])
+    finally:
+        _clear_call_graph_caches()
+
+    assert bypasses_getattr is False
+    assert len(findings) == 1
+    assert findings[0].sink == "os.system"
+
+
+def test_loaded_extension_export_does_not_hide_legacy_dotted_module_getattr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import _codecs
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    module_name = "modelaudit_tp_legacy_dotted_extension_export"
+    module_path = tmp_path / f"{module_name}.py"
+    module_path.write_text(
+        "import os\ncalls = []\ndef __getattr__(name=None):\n"
+        "    calls.append(name)\n    os.system('')\n    return None\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    spec = spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    loaded_module = module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, loaded_module)
+    spec.loader.exec_module(loaded_module)
+    namespace = ModuleType.__getattribute__(loaded_module, "__dict__")
+    namespace["encode"] = _codecs.encode
+    monkeypatch.setattr(
+        call_graph,
+        "_TRUSTED_LOADED_EXTENSION_EXPORT_OWNERS",
+        {(module_name, "encode"): ("_codecs",)},
+    )
+    system_calls: list[str] = []
+
+    def fake_system(command: str) -> int:
+        system_calls.append(command)
+        return 0
+
+    monkeypatch.setattr(os, "system", fake_system)
+    reference = {
+        "module": module_name,
+        "name": "encode.missing",
+        "import_reference": f"{module_name}.encode.missing",
+        "opcode": "GLOBAL",
+    }
+    _clear_call_graph_caches()
+
+    try:
+        bypasses_exact_export = call_graph._loaded_extension_callable_bypasses_module_getattr(module_name, "encode")
+        findings = call_graph.find_dangerous_call_graphs([reference], [])
+        payload = f"c{module_name}\nencode.missing\n.".encode()
+        report = package_api.scan_bytes(payload, source="legacy-dotted-extension-export.pkl")
+        runtime_calls = cast(list[str], namespace["calls"])
+        assert runtime_calls == []
+        loaded = pickle.loads(payload)
+    finally:
+        _clear_call_graph_caches()
+
+    assert bypasses_exact_export is True
+    assert loaded is None
+    assert runtime_calls == ["encode.missing"]
+    assert system_calls == [""]
+    assert len(findings) == 1
+    assert findings[0].sink == "os.system"
+    public_findings = [finding for finding in report.findings if finding.rule_code == "DANGEROUS_CALL_GRAPH"]
+    assert len(public_findings) == 1
+    assert public_findings[0].details["sink"] == "os.system"
