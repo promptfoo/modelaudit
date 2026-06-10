@@ -5,6 +5,8 @@ import math
 import ntpath
 import os
 import re
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -81,6 +83,13 @@ _OP_TYPE_TOKEN_PATTERN = re.compile(
     r"[A-Z]+(?=[A-Z][a-z0-9]|[^A-Za-z0-9]|$)|[A-Z]?[a-z0-9]+",
 )
 _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT = 100
+_ONNX_WEIGHT_CONSUMER_SAMPLE_LIMIT = 20
+_ONNX_WEIGHT_ANALYSIS_GROUP_LIMIT = 100
+_ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT = 32
+_ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT = 32
+_ONNX_WEIGHT_RESHAPE_RANK_LIMIT = 64
+_ONNX_WEIGHT_METADATA_TEXT_LIMIT = 256
+_ONNX_WEIGHT_METADATA_SEQUENCE_LIMIT = 64
 _STANDARD_NEURAL_NETWORK_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
 
 
@@ -124,7 +133,7 @@ def _onnx_int_attribute(node: Any, name: str, default: int = 0) -> int:
     return default
 
 
-def _onnx_weight_output_axis(node: Any, input_index: int, rank: int) -> tuple[int | None, str]:
+def _onnx_weight_output_axes(node: Any, input_index: int, rank: int) -> tuple[tuple[int, ...] | None, str]:
     """Classify an initializer consumer for statistical weight analysis."""
     op_type = node.op_type
     domain = getattr(node, "domain", "")
@@ -137,31 +146,32 @@ def _onnx_weight_output_axis(node: Any, input_index: int, rank: int) -> tuple[in
         if rank != 2:
             return None, "unsupported_weight_rank"
         if input_index == 0:
-            return (1 if _onnx_int_attribute(node, "transA") else 0), "eligible_gemm_left_weight"
-        return (0 if _onnx_int_attribute(node, "transB") else 1), "eligible_gemm_weight"
+            return (1 if _onnx_int_attribute(node, "transA") else 0,), "eligible_gemm_left_weight"
+        return (0 if _onnx_int_attribute(node, "transB") else 1,), "eligible_gemm_weight"
 
     if op_type == "MatMul":
         if input_index not in {0, 1}:
             return None, "non_weight_input"
         if rank < 2:
             return None, "unsupported_weight_rank"
+        batch_axes = tuple(range(rank - 2))
         if input_index == 0:
-            return rank - 2, "eligible_matmul_left_weight"
-        return rank - 1, "eligible_matmul_weight"
+            return (*batch_axes, rank - 2), "eligible_matmul_left_weight"
+        return (*batch_axes, rank - 1), "eligible_matmul_weight"
 
     if op_type == "Conv":
         if input_index != 1:
             return None, "non_weight_input"
         if rank < 3:
             return None, "unsupported_weight_rank"
-        return 0, "eligible_conv_weight"
+        return (0,), "eligible_conv_weight"
 
     if op_type == "ConvTranspose":
         if input_index != 1:
             return None, "non_weight_input"
         if rank < 3:
             return None, "unsupported_weight_rank"
-        return 1, "eligible_conv_transpose_weight"
+        return (1,), "eligible_conv_transpose_weight"
 
     if op_type == "Gather" and input_index == 0:
         return None, "embedding_table"
@@ -201,28 +211,6 @@ def _graph_declared_value_names(graph: Any) -> set[str]:
     for node in getattr(graph, "node", []):
         declared.update(output_name for output_name in node.output if output_name)
     return declared
-
-
-def _iter_captured_initializer_consumers(
-    graph: Any,
-    initializer_names: set[str],
-    *,
-    root_graph: bool = False,
-) -> Any:
-    """Yield consumers of visible initializers across nested control-flow graphs."""
-    visible_names = initializer_names
-    if not root_graph:
-        visible_names = initializer_names - _graph_declared_value_names(graph)
-    if not visible_names:
-        return
-
-    for node in getattr(graph, "node", []):
-        for input_index, input_name in enumerate(node.input):
-            if input_name in visible_names:
-                yield node, input_index, input_name
-        for attribute in getattr(node, "attribute", []):
-            for subgraph in _iter_attribute_graphs(attribute):
-                yield from _iter_captured_initializer_consumers(subgraph, visible_names)
 
 
 def _iter_model_graphs(model: Any) -> Any:
@@ -395,6 +383,741 @@ def _tensor_data_type_to_np_dtype(data_type: int) -> Any:
         return np.dtype(mapping.TENSOR_TYPE_MAP[data_type].np_dtype)
 
     raise ValueError(f"Unsupported ONNX tensor dtype mapping API for data_type={data_type}")
+
+
+@dataclass(frozen=True)
+class _OnnxWeightTransform:
+    kind: str
+    parameters: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class _OnnxWeightLineage:
+    initializer_index: int
+    shape: tuple[int, ...] | None
+    transforms: tuple[_OnnxWeightTransform, ...] = ()
+    unresolved_reason: str | None = None
+
+
+@dataclass
+class _OnnxWeightConsumerGroup:
+    lineage: _OnnxWeightLineage
+    node: Any
+    node_index: int
+    input_index: int
+    output_axes: tuple[int, ...]
+    analysis_kind: str
+    group: int
+    consumer_count: int = 0
+    consumers: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _OnnxWeightAnalysisSpec:
+    analysis_id: int
+    weights: Any
+    output_axes: tuple[int, ...]
+    matrix_analysis: bool
+    context: dict[str, Any]
+
+
+@dataclass
+class _OnnxWeightAnalysisPlan:
+    specs: list[_OnnxWeightAnalysisSpec] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    coverage_gaps: dict[str, int] = field(default_factory=dict)
+    eligible_initializer_count: int = 0
+    analyzed_initializer_count: int = 0
+    external_initializers_skipped: int = 0
+    oversized_initializers_skipped: int = 0
+    extraction_failures: int = 0
+    string_truncation_count: int = 0
+    exclusion_counts: dict[str, int] = field(default_factory=dict)
+    exclusion_samples: list[dict[str, Any]] = field(default_factory=list)
+    unresolved_lineage_samples: list[dict[str, Any]] = field(default_factory=list)
+
+    def record_coverage_gap(self, reason: str, count: int = 1) -> None:
+        self.coverage_gaps[reason] = self.coverage_gaps.get(reason, 0) + count
+
+
+def _bounded_onnx_metadata_text(plan: _OnnxWeightAnalysisPlan, value: Any) -> tuple[str, int, bool]:
+    text = str(value)
+    original_length = len(text)
+    if original_length <= _ONNX_WEIGHT_METADATA_TEXT_LIMIT:
+        return text, original_length, False
+
+    marker = "...<truncated>"
+    plan.string_truncation_count += 1
+    return (
+        text[: _ONNX_WEIGHT_METADATA_TEXT_LIMIT - len(marker)] + marker,
+        original_length,
+        True,
+    )
+
+
+def _bounded_onnx_metadata_fields(
+    plan: _OnnxWeightAnalysisPlan,
+    field_name: str,
+    value: Any,
+) -> dict[str, Any]:
+    text, original_length, truncated = _bounded_onnx_metadata_text(plan, value)
+    return {
+        field_name: text,
+        f"{field_name}_length": original_length,
+        f"{field_name}_truncated": truncated,
+    }
+
+
+def _bounded_onnx_integer_sequence(field_name: str, values: Any) -> dict[str, Any]:
+    value_count = len(values)
+    sequence = [int(values[index]) for index in range(min(value_count, _ONNX_WEIGHT_METADATA_SEQUENCE_LIMIT))]
+    return {
+        field_name: sequence,
+        f"{field_name}_count": value_count,
+        f"{field_name}_truncated": value_count > _ONNX_WEIGHT_METADATA_SEQUENCE_LIMIT,
+    }
+
+
+def _onnx_inline_storage_nbytes(initializer: Any) -> int:
+    raw_bytes = len(getattr(initializer, "raw_data", b""))
+    typed_bytes = 0
+    for field_name, itemsize in (
+        ("float_data", 4),
+        ("int32_data", 4),
+        ("int64_data", 8),
+        ("double_data", 8),
+        ("uint64_data", 8),
+    ):
+        typed_bytes += len(getattr(initializer, field_name, ())) * itemsize
+    typed_bytes += sum(len(value) for value in getattr(initializer, "string_data", ()))
+    return raw_bytes + typed_bytes
+
+
+def _resolve_onnx_reshape_shape(
+    input_shape: tuple[int, ...],
+    shape_initializer: Any,
+    *,
+    allowzero: bool,
+    onnx: Any,
+) -> tuple[int, ...] | None:
+    dims = tuple(int(dimension) for dimension in getattr(shape_initializer, "dims", ()))
+    element_count = math.prod(dims) if dims else 0
+    if (
+        len(dims) != 1
+        or element_count < 0
+        or element_count > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
+        or int(getattr(shape_initializer, "data_type", -1)) != int(onnx.TensorProto.INT64)
+        or _onnx_inline_storage_nbytes(shape_initializer) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT * 8
+        or getattr(shape_initializer, "data_location", None) == getattr(onnx.TensorProto, "EXTERNAL", 1)
+        or bool(getattr(shape_initializer, "external_data", ()))
+    ):
+        return None
+
+    try:
+        target_values = onnx.numpy_helper.to_array(shape_initializer).reshape(-1).tolist()
+        target = [int(value) for value in target_values]
+    except Exception:
+        return None
+    if len(target) != element_count or any(value < -1 for value in target) or target.count(-1) > 1:
+        return None
+    if allowzero and -1 in target and 0 in target:
+        return None
+
+    normalized: list[int] = []
+    for index, value in enumerate(target):
+        if value == 0 and not allowzero:
+            if index >= len(input_shape):
+                return None
+            normalized.append(int(input_shape[index]))
+        else:
+            normalized.append(value)
+
+    input_size = math.prod(input_shape)
+    known_size = math.prod(value for value in normalized if value != -1)
+    if -1 in normalized:
+        if known_size <= 0 or input_size % known_size != 0:
+            return None
+        normalized[normalized.index(-1)] = input_size // known_size
+    elif math.prod(normalized) != input_size:
+        return None
+    return tuple(normalized)
+
+
+def _onnx_initializer_name_issues(
+    graph: Any,
+    plan: _OnnxWeightAnalysisPlan,
+) -> tuple[int, int, list[dict[str, Any]]]:
+    empty_count = 0
+    duplicate_count = 0
+    samples: list[dict[str, Any]] = []
+
+    def walk(current_graph: Any, graph_index: int) -> int:
+        nonlocal empty_count, duplicate_count
+        names = [str(initializer.name) for initializer in getattr(current_graph, "initializer", ())]
+        names.extend(
+            str(sparse_initializer.values.name)
+            for sparse_initializer in getattr(current_graph, "sparse_initializer", ())
+        )
+        seen: set[str] = set()
+        duplicated: set[str] = set()
+        for name in names:
+            if not name:
+                empty_count += 1
+                if len(samples) < _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT:
+                    samples.append({"graph_index": graph_index, "reason": "empty_initializer_name"})
+                continue
+            if name in seen:
+                duplicate_count += 1
+                if name not in duplicated and len(samples) < _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT:
+                    samples.append(
+                        {
+                            "graph_index": graph_index,
+                            "reason": "duplicate_initializer_name",
+                            **_bounded_onnx_metadata_fields(plan, "initializer", name),
+                        },
+                    )
+                duplicated.add(name)
+            seen.add(name)
+
+        next_graph_index = graph_index + 1
+        for node in getattr(current_graph, "node", ()):
+            for attribute in getattr(node, "attribute", ()):
+                for subgraph in _iter_attribute_graphs(attribute):
+                    next_graph_index = walk(subgraph, next_graph_index)
+        return next_graph_index
+
+    walk(graph, 0)
+    return empty_count, duplicate_count, samples
+
+
+def _onnx_potential_weight_input(node: Any, input_index: int) -> bool:
+    if getattr(node, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS:
+        return False
+    if node.op_type in {"Gemm", "MatMul"}:
+        return input_index in {0, 1}
+    if node.op_type in {"Conv", "ConvTranspose"}:
+        return input_index == 1
+    return False
+
+
+def _build_onnx_weight_analysis_plan(
+    model: Any,
+    *,
+    onnx: Any,
+    np: Any,
+    max_array_size: int | None,
+    pre_materialization_check: Callable[[Any, str, int], bool] | None = None,
+    retain_array_check: Callable[[str, int], bool] | None = None,
+) -> _OnnxWeightAnalysisPlan:
+    """Build a bounded, semantically oriented plan for ONNX weight analysis."""
+    plan = _OnnxWeightAnalysisPlan()
+    graph = model.graph
+    initializers = list(getattr(graph, "initializer", ()))
+    empty_names, duplicate_names, invalid_name_samples = _onnx_initializer_name_issues(graph, plan)
+    invalid_name_count = empty_names + duplicate_names
+    if invalid_name_count:
+        plan.record_coverage_gap("invalid_initializer_names", invalid_name_count)
+        plan.metadata = {
+            "eligible_initializer_count": 0,
+            "analyzed_layer_count": 0,
+            "eligible": [],
+            "eligible_metadata_truncated": False,
+            "exclusion_counts": {},
+            "exclusion_samples": [],
+            "exclusion_metadata_truncated": False,
+            "consumer_count": 0,
+            "consumer_metadata_sample_count": 0,
+            "consumer_metadata_truncated": False,
+            "unresolved_lineage_samples": [],
+            "unresolved_lineage_metadata_truncated": False,
+            "initializer_name_validation": {
+                "empty_name_count": empty_names,
+                "duplicate_name_count": duplicate_names,
+                "samples": invalid_name_samples,
+                "samples_truncated": invalid_name_count > len(invalid_name_samples),
+            },
+            "coverage_gaps": dict(plan.coverage_gaps),
+            "metadata_string_truncation_count": plan.string_truncation_count,
+            "metadata_strings_truncated": plan.string_truncation_count > 0,
+        }
+        return plan
+
+    initializer_indexes = {str(initializer.name): index for index, initializer in enumerate(initializers)}
+    floating_types = {
+        int(getattr(onnx.TensorProto, name))
+        for name in (
+            "FLOAT",
+            "FLOAT16",
+            "DOUBLE",
+            "BFLOAT16",
+            "FLOAT8E4M3FN",
+            "FLOAT8E4M3FNUZ",
+            "FLOAT8E5M2",
+            "FLOAT8E5M2FNUZ",
+            "FLOAT4E2M1",
+        )
+        if hasattr(onnx.TensorProto, name)
+    }
+    groups: list[dict[tuple[Any, ...], _OnnxWeightConsumerGroup]] = [{} for _ in initializers]
+    eligible_initializer_indexes: set[int] = set()
+    terminal_consumer_counts = [0] * len(initializers)
+    transform_counts = [0] * len(initializers)
+    total_consumer_count = 0
+    consumer_sample_count = 0
+    node_counter = 0
+
+    def record_exclusion(
+        initializer_index: int,
+        reason: str,
+        node: Any | None = None,
+        input_index: int | None = None,
+    ) -> None:
+        plan.exclusion_counts[reason] = plan.exclusion_counts.get(reason, 0) + 1
+        if len(plan.exclusion_samples) >= _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT:
+            return
+        initializer = initializers[initializer_index]
+        sample: dict[str, Any] = {
+            **_bounded_onnx_metadata_fields(plan, "initializer", initializer.name),
+            "reason": reason,
+            **_bounded_onnx_integer_sequence("stored_shape", initializer.dims),
+        }
+        if node is not None:
+            sample.update(_bounded_onnx_metadata_fields(plan, "consumer_op", node.op_type))
+            sample.update(_bounded_onnx_metadata_fields(plan, "consumer_node", node.name))
+            sample["consumer_input_index"] = input_index
+        plan.exclusion_samples.append(sample)
+
+    def consumer_metadata(node: Any, node_index: int, input_index: int) -> dict[str, Any]:
+        return {
+            **_bounded_onnx_metadata_fields(plan, "op", node.op_type),
+            **_bounded_onnx_metadata_fields(plan, "node", node.name),
+            "node_index": node_index,
+            "input_index": input_index,
+        }
+
+    def record_unresolved_lineage(
+        lineage: _OnnxWeightLineage,
+        node: Any,
+        node_index: int,
+        input_index: int,
+    ) -> None:
+        eligible_initializer_indexes.add(lineage.initializer_index)
+        plan.record_coverage_gap("unresolved_initializer_lineage")
+        if len(plan.unresolved_lineage_samples) >= _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT:
+            return
+        initializer = initializers[lineage.initializer_index]
+        plan.unresolved_lineage_samples.append(
+            {
+                **_bounded_onnx_metadata_fields(plan, "initializer", initializer.name),
+                **_bounded_onnx_metadata_fields(plan, "consumer_op", node.op_type),
+                **_bounded_onnx_metadata_fields(plan, "consumer_node", node.name),
+                "consumer_node_index": node_index,
+                "consumer_input_index": input_index,
+                "reason": lineage.unresolved_reason or "unknown_lineage",
+                "lineage_transform_count": len(lineage.transforms),
+            },
+        )
+
+    def add_consumer_group(
+        lineage: _OnnxWeightLineage,
+        node: Any,
+        node_index: int,
+        input_index: int,
+        output_axes: tuple[int, ...],
+    ) -> None:
+        nonlocal consumer_sample_count
+        initializer = initializers[lineage.initializer_index]
+        if int(initializer.data_type) not in floating_types:
+            record_exclusion(lineage.initializer_index, "non_floating_weight", node, input_index)
+            return
+
+        analysis_kind = (
+            "tensor" if node.op_type in {"Conv", "ConvTranspose"} or len(lineage.shape or ()) > 2 else "matrix"
+        )
+        group_value = _onnx_int_attribute(node, "group", 1) if node.op_type in {"Conv", "ConvTranspose"} else 1
+        signature = (
+            lineage.transforms,
+            node.op_type,
+            input_index,
+            output_axes,
+            analysis_kind,
+            group_value,
+        )
+        initializer_groups = groups[lineage.initializer_index]
+        consumer_group = initializer_groups.get(signature)
+        if consumer_group is None:
+            if len(initializer_groups) >= _ONNX_WEIGHT_ANALYSIS_GROUP_LIMIT:
+                plan.record_coverage_gap("initializer_analysis_group_limit")
+                return
+            consumer_group = _OnnxWeightConsumerGroup(
+                lineage=lineage,
+                node=node,
+                node_index=node_index,
+                input_index=input_index,
+                output_axes=output_axes,
+                analysis_kind=analysis_kind,
+                group=group_value,
+            )
+            initializer_groups[signature] = consumer_group
+        consumer_group.consumer_count += 1
+        if len(consumer_group.consumers) < _ONNX_WEIGHT_CONSUMER_SAMPLE_LIMIT:
+            consumer_group.consumers.append(consumer_metadata(node, node_index, input_index))
+            consumer_sample_count += 1
+        eligible_initializer_indexes.add(lineage.initializer_index)
+
+    def transformed_lineage(
+        lineage: _OnnxWeightLineage,
+        node: Any,
+        constants: dict[str, Any],
+    ) -> _OnnxWeightLineage:
+        if lineage.unresolved_reason is not None:
+            return lineage
+        if len(lineage.transforms) >= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT:
+            return _OnnxWeightLineage(
+                initializer_index=lineage.initializer_index,
+                shape=None,
+                transforms=lineage.transforms,
+                unresolved_reason="lineage_transform_depth_limit",
+            )
+        if lineage.shape is None:
+            return _OnnxWeightLineage(
+                initializer_index=lineage.initializer_index,
+                shape=None,
+                transforms=lineage.transforms,
+                unresolved_reason="lineage_shape_unavailable",
+            )
+
+        if node.op_type == "Identity":
+            transform = _OnnxWeightTransform("Identity")
+            output_shape = lineage.shape
+        elif node.op_type == "Transpose":
+            permutation = tuple(
+                int(value)
+                for value in next(
+                    (attribute.ints for attribute in node.attribute if attribute.name == "perm"),
+                    tuple(reversed(range(len(lineage.shape)))),
+                )
+            )
+            if sorted(permutation) != list(range(len(lineage.shape))):
+                return _OnnxWeightLineage(
+                    initializer_index=lineage.initializer_index,
+                    shape=None,
+                    transforms=lineage.transforms,
+                    unresolved_reason="invalid_transpose_lineage",
+                )
+            transform = _OnnxWeightTransform("Transpose", permutation)
+            output_shape = tuple(lineage.shape[index] for index in permutation)
+        else:
+            shape_name = str(node.input[1]) if len(node.input) > 1 else ""
+            shape_initializer = constants.get(shape_name)
+            resolved_shape = (
+                _resolve_onnx_reshape_shape(
+                    lineage.shape,
+                    shape_initializer,
+                    allowzero=bool(_onnx_int_attribute(node, "allowzero")),
+                    onnx=onnx,
+                )
+                if shape_initializer is not None
+                else None
+            )
+            if resolved_shape is None:
+                return _OnnxWeightLineage(
+                    initializer_index=lineage.initializer_index,
+                    shape=None,
+                    transforms=lineage.transforms,
+                    unresolved_reason="unresolved_reshape_lineage",
+                )
+            output_shape = resolved_shape
+            transform = _OnnxWeightTransform("Reshape", output_shape)
+
+        return _OnnxWeightLineage(
+            initializer_index=lineage.initializer_index,
+            shape=output_shape,
+            transforms=(*lineage.transforms, transform),
+        )
+
+    def bounded_lineages(lineages: dict[int, _OnnxWeightLineage]) -> dict[int, _OnnxWeightLineage]:
+        if len(lineages) <= _ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT:
+            return lineages
+        plan.record_coverage_gap(
+            "lineages_per_value_limit",
+            len(lineages) - _ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT,
+        )
+        return dict(sorted(lineages.items())[:_ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT])
+
+    def walk_graph(
+        current_graph: Any,
+        inherited_lineages: dict[str, dict[int, _OnnxWeightLineage]],
+        inherited_constants: dict[str, Any],
+        *,
+        root_graph: bool,
+    ) -> None:
+        nonlocal node_counter, total_consumer_count
+        if root_graph:
+            value_lineages = dict(inherited_lineages)
+            constants = dict(inherited_constants)
+        else:
+            declared_names = _graph_declared_value_names(current_graph)
+            value_lineages = {
+                name: lineages for name, lineages in inherited_lineages.items() if name not in declared_names
+            }
+            constants = {name: value for name, value in inherited_constants.items() if name not in declared_names}
+
+        for initializer in getattr(current_graph, "initializer", ()):
+            if initializer.name:
+                constants[str(initializer.name)] = initializer
+
+        for node in getattr(current_graph, "node", ()):
+            current_node_index = node_counter
+            node_counter += 1
+            supported_transform = getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and node.op_type in {
+                "Identity",
+                "Transpose",
+                "Reshape",
+            }
+            roots_consumed_as_weights: set[int] = set()
+            all_input_lineages: dict[int, _OnnxWeightLineage] = {}
+
+            for input_index, input_name in enumerate(node.input):
+                input_lineages = value_lineages.get(str(input_name), {})
+                for initializer_index, lineage in input_lineages.items():
+                    all_input_lineages.setdefault(initializer_index, lineage)
+                    if supported_transform and input_index == 0:
+                        continue
+                    terminal_consumer_counts[initializer_index] += 1
+                    total_consumer_count += 1
+                    if lineage.unresolved_reason is not None:
+                        if _onnx_potential_weight_input(node, input_index):
+                            record_unresolved_lineage(lineage, node, current_node_index, input_index)
+                        else:
+                            record_exclusion(initializer_index, "unresolved_lineage_consumer", node, input_index)
+                        continue
+                    output_axes, reason = _onnx_weight_output_axes(node, input_index, len(lineage.shape or ()))
+                    if output_axes is None:
+                        record_exclusion(initializer_index, reason, node, input_index)
+                        continue
+                    add_consumer_group(lineage, node, current_node_index, input_index, output_axes)
+                    roots_consumed_as_weights.add(initializer_index)
+
+            for attribute in getattr(node, "attribute", ()):
+                for subgraph in _iter_attribute_graphs(attribute):
+                    walk_graph(subgraph, value_lineages, constants, root_graph=False)
+
+            output_lineages: dict[int, _OnnxWeightLineage] = {}
+            if supported_transform:
+                data_lineages = value_lineages.get(str(node.input[0]), {}) if node.input else {}
+                for initializer_index, lineage in data_lineages.items():
+                    transform_counts[initializer_index] += 1
+                    output_lineages[initializer_index] = transformed_lineage(lineage, node, constants)
+            else:
+                for initializer_index, lineage in all_input_lineages.items():
+                    if initializer_index in roots_consumed_as_weights:
+                        continue
+                    output_lineages[initializer_index] = _OnnxWeightLineage(
+                        initializer_index=initializer_index,
+                        shape=None,
+                        transforms=lineage.transforms,
+                        unresolved_reason=lineage.unresolved_reason or "unsupported_lineage_operator",
+                    )
+
+            output_lineages = bounded_lineages(output_lineages)
+            for output_name in node.output:
+                if output_name and output_lineages:
+                    value_lineages[str(output_name)] = output_lineages
+
+            if getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and node.op_type == "Constant":
+                constant_tensor = None
+                for attribute in node.attribute:
+                    if attribute.name != "value":
+                        continue
+                    try:
+                        if attribute.HasField("t"):
+                            constant_tensor = attribute.t
+                    except (AttributeError, ValueError):
+                        constant_tensor = None
+                    break
+                if constant_tensor is not None:
+                    for output_name in node.output:
+                        if output_name:
+                            constants[str(output_name)] = constant_tensor
+
+    root_lineages = {
+        name: {
+            initializer_index: _OnnxWeightLineage(
+                initializer_index=initializer_index,
+                shape=tuple(int(dimension) for dimension in initializers[initializer_index].dims),
+            ),
+        }
+        for name, initializer_index in initializer_indexes.items()
+    }
+    root_constants = {str(initializer.name): initializer for initializer in initializers}
+    walk_graph(graph, root_lineages, root_constants, root_graph=True)
+
+    for initializer_index, _initializer in enumerate(initializers):
+        if terminal_consumer_counts[initializer_index] == 0 and not groups[initializer_index]:
+            reason = (
+                "unconsumed_transformed_initializer" if transform_counts[initializer_index] else "unused_initializer"
+            )
+            record_exclusion(initializer_index, reason)
+
+    analyzed_initializer_indexes: set[int] = set()
+    eligible_metadata: list[dict[str, Any]] = []
+    analysis_id = 0
+    for initializer_index in sorted(eligible_initializer_indexes):
+        initializer = initializers[initializer_index]
+        initializer_groups = groups[initializer_index]
+        if not initializer_groups:
+            continue
+        if initializer.data_location == onnx.TensorProto.EXTERNAL or bool(initializer.external_data):
+            plan.external_initializers_skipped += 1
+            continue
+
+        try:
+            numel = math.prod(int(dimension) for dimension in initializer.dims)
+            itemsize = int(_tensor_data_type_to_np_dtype(initializer.data_type).itemsize)
+            estimated_bytes = numel * itemsize
+            if estimated_bytes < 0 or (
+                max_array_size is not None and max_array_size > 0 and estimated_bytes > max_array_size
+            ):
+                plan.oversized_initializers_skipped += 1
+                continue
+            bounded_name, _, _ = _bounded_onnx_metadata_text(plan, initializer.name)
+            if pre_materialization_check is not None and not pre_materialization_check(
+                initializer,
+                bounded_name,
+                estimated_bytes,
+            ):
+                plan.oversized_initializers_skipped += 1
+                continue
+
+            array = onnx.numpy_helper.to_array(initializer)
+            if retain_array_check is not None and not retain_array_check(bounded_name, int(array.nbytes)):
+                plan.oversized_initializers_skipped += 1
+                continue
+
+            transformed_views: dict[tuple[_OnnxWeightTransform, ...], Any] = {(): array}
+            for consumer_group in initializer_groups.values():
+                transformed = transformed_views.get(consumer_group.lineage.transforms)
+                if transformed is None:
+                    transformed = array
+                    for transform in consumer_group.lineage.transforms:
+                        if transform.kind == "Identity":
+                            continue
+                        if transform.kind == "Transpose":
+                            transformed = np.transpose(transformed, axes=transform.parameters)
+                        elif transform.kind == "Reshape":
+                            transformed = np.reshape(transformed, transform.parameters)
+                        if transformed.size and not np.shares_memory(array, transformed):
+                            raise RuntimeError("ONNX weight lineage transform requires a full-tensor copy")
+                    transformed_views[consumer_group.lineage.transforms] = transformed
+
+                output_axes = consumer_group.output_axes
+                tensor_weights = transformed
+                conceptual_output_axes = output_axes
+                if consumer_group.node.op_type == "ConvTranspose":
+                    group_value = consumer_group.group
+                    if group_value <= 0 or int(transformed.shape[0]) % group_value != 0:
+                        raise ValueError("ConvTranspose initializer has an incompatible group")
+                    tensor_weights = transformed.reshape(
+                        group_value,
+                        int(transformed.shape[0]) // group_value,
+                        *transformed.shape[1:],
+                    )
+                    conceptual_output_axes = (0, 2)
+                if tensor_weights.size and not np.shares_memory(array, tensor_weights):
+                    raise RuntimeError("ONNX weight analysis requires a full-tensor copy")
+
+                matrix_analysis = consumer_group.analysis_kind == "matrix"
+                analysis_weights = tensor_weights
+                if matrix_analysis:
+                    if len(output_axes) != 1 or transformed.ndim != 2:
+                        raise ValueError("Matrix weight analysis requires exactly one output axis")
+                    analysis_weights = np.moveaxis(transformed, output_axes[0], -1)
+                    conceptual_output_axes = (analysis_weights.ndim - 1,)
+                input_axes = tuple(axis for axis in range(analysis_weights.ndim) if axis not in conceptual_output_axes)
+                analysis_shape = [
+                    math.prod(int(analysis_weights.shape[axis]) for axis in input_axes),
+                    math.prod(int(analysis_weights.shape[axis]) for axis in conceptual_output_axes),
+                ]
+                first_consumer = consumer_group.consumers[0]
+                context = {
+                    "analysis_id": analysis_id,
+                    **_bounded_onnx_metadata_fields(plan, "initializer", initializer.name),
+                    "consumer_op": first_consumer["op"],
+                    "consumer_op_length": first_consumer["op_length"],
+                    "consumer_op_truncated": first_consumer["op_truncated"],
+                    "consumer_node": first_consumer["node"],
+                    "consumer_node_length": first_consumer["node_length"],
+                    "consumer_node_truncated": first_consumer["node_truncated"],
+                    "consumer_node_index": consumer_group.node_index,
+                    "consumer_input_index": consumer_group.input_index,
+                    "output_axis": output_axes[-1],
+                    **_bounded_onnx_integer_sequence("output_axes", output_axes),
+                    "analysis_kind": consumer_group.analysis_kind,
+                    "group": consumer_group.group,
+                    **_bounded_onnx_integer_sequence("stored_shape", initializer.dims),
+                    **_bounded_onnx_integer_sequence("transformed_shape", transformed.shape),
+                    "analysis_shape": analysis_shape,
+                    **_bounded_onnx_integer_sequence("conceptual_output_axes", conceptual_output_axes),
+                    "analysis_storage_shares_memory": bool(
+                        array.size == 0 or np.shares_memory(array, analysis_weights)
+                    ),
+                    "analysis_materialization": "zero_copy_view_chunked_reduction",
+                    "lineage": [transform.kind for transform in consumer_group.lineage.transforms],
+                    "lineage_transform_count": len(consumer_group.lineage.transforms),
+                    "consumer_count": consumer_group.consumer_count,
+                    "consumers": consumer_group.consumers,
+                    "consumers_truncated": consumer_group.consumer_count > len(consumer_group.consumers),
+                }
+                plan.specs.append(
+                    _OnnxWeightAnalysisSpec(
+                        analysis_id=analysis_id,
+                        weights=analysis_weights,
+                        output_axes=conceptual_output_axes,
+                        matrix_analysis=matrix_analysis,
+                        context=context,
+                    ),
+                )
+                analysis_id += 1
+                analyzed_initializer_indexes.add(initializer_index)
+                if len(eligible_metadata) < _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT:
+                    eligible_metadata.append(context)
+        except Exception as exc:
+            plan.extraction_failures += 1
+            bounded_name, _, _ = _bounded_onnx_metadata_text(plan, initializer.name)
+            logger.warning(
+                "Failed to prepare ONNX initializer '%s' for distribution analysis (%s)",
+                bounded_name,
+                type(exc).__name__,
+            )
+
+    plan.eligible_initializer_count = len(eligible_initializer_indexes)
+    plan.analyzed_initializer_count = len(analyzed_initializer_indexes)
+    plan.metadata = {
+        "eligible_initializer_count": plan.eligible_initializer_count,
+        "analyzed_layer_count": len(plan.specs),
+        "eligible": eligible_metadata,
+        "eligible_metadata_truncated": len(plan.specs) > len(eligible_metadata),
+        "exclusion_counts": plan.exclusion_counts,
+        "exclusion_samples": plan.exclusion_samples,
+        "exclusion_metadata_truncated": sum(plan.exclusion_counts.values()) > len(plan.exclusion_samples),
+        "consumer_count": total_consumer_count,
+        "consumer_metadata_sample_count": consumer_sample_count,
+        "consumer_metadata_truncated": total_consumer_count > consumer_sample_count,
+        "unresolved_lineage_samples": plan.unresolved_lineage_samples,
+        "unresolved_lineage_metadata_truncated": plan.coverage_gaps.get("unresolved_initializer_lineage", 0)
+        > len(plan.unresolved_lineage_samples),
+        "coverage_gaps": dict(plan.coverage_gaps),
+        "metadata_string_truncation_count": plan.string_truncation_count,
+        "metadata_strings_truncated": plan.string_truncation_count > 0,
+        "initializer_name_validation": {
+            "empty_name_count": 0,
+            "duplicate_name_count": 0,
+            "samples": [],
+            "samples_truncated": False,
+        },
+    }
+    return plan
 
 
 def _parse_external_data_extent(info: dict[str, str], key: str) -> int | None:
@@ -1125,14 +1848,7 @@ class OnnxScanner(BaseScanner):
                     )
 
     def _check_weight_distribution(self, model: Any, path: str, result: ScanResult) -> None:
-        """Extract weights from ONNX initializers and run weight distribution analysis.
-
-        The model is already loaded with load_external_data=False, so external-data
-        tensors have no raw bytes and must be skipped. Only floating-point tensors
-        used as weights by supported neural-network operators are analyzed. This
-        avoids applying output-neuron statistics to embeddings, quantized codes,
-        biases, and shape/bookkeeping constants.
-        """
+        """Run bounded semantic weight analysis over eligible ONNX initializers."""
         try:
             import numpy as np
             import onnx
@@ -1146,238 +1862,53 @@ class OnnxScanner(BaseScanner):
             )
             return
 
-        # Max in-memory array size (default 100 MB)
-        max_array_size = self.config.get("max_array_size", 100 * 1024 * 1024)
+        configured_max_array_size = self.config.get("max_array_size", 100 * 1024 * 1024)
+        max_array_size = (
+            int(configured_max_array_size)
+            if isinstance(configured_max_array_size, (int, float))
+            and not isinstance(configured_max_array_size, bool)
+            and math.isfinite(float(configured_max_array_size))
+            and configured_max_array_size > 0
+            else None
+        )
+        plan = _build_onnx_weight_analysis_plan(
+            model,
+            onnx=onnx,
+            np=np,
+            max_array_size=max_array_size,
+        )
+        result.metadata["onnx_weight_distribution_semantics"] = plan.metadata
 
-        initializers = {initializer.name: initializer for initializer in model.graph.initializer}
-        consumers: dict[str, list[tuple[int, Any, int]]] = {name: [] for name in initializers}
-        for node_index, (node, input_index, input_name) in enumerate(
-            _iter_captured_initializer_consumers(model.graph, set(initializers), root_graph=True),
-        ):
-            consumers[input_name].append((node_index, node, input_index))
-
-        floating_types = {
-            int(getattr(onnx.TensorProto, name))
-            for name in (
-                "FLOAT",
-                "FLOAT16",
-                "DOUBLE",
-                "BFLOAT16",
-                "FLOAT8E4M3FN",
-                "FLOAT8E4M3FNUZ",
-                "FLOAT8E5M2",
-                "FLOAT8E5M2FNUZ",
-                "FLOAT4E2M1",
-            )
-            if hasattr(onnx.TensorProto, name)
-        }
-
-        eligible_initializers = 0
-        external_initializers_skipped = 0
-        oversized_initializers_skipped = 0
-        extraction_failures = 0
-        weights_info: dict[str, Any] = {}
-        tensor_weight_specs: dict[str, tuple[Any, tuple[int, ...]]] = {}
-        layer_contexts: dict[str, dict[str, Any]] = {}
-        analyzed_initializer_names: set[str] = set()
-        eligible_metadata: list[dict[str, Any]] = []
-        exclusion_counts: dict[str, int] = {}
-        exclusion_samples: list[dict[str, Any]] = []
-
-        def record_exclusion(
-            initializer: Any, reason: str, node: Any | None = None, input_index: int | None = None
-        ) -> None:
-            exclusion_counts[reason] = exclusion_counts.get(reason, 0) + 1
-            if len(exclusion_samples) >= _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT:
-                return
-            exclusion: dict[str, Any] = {
-                "initializer": initializer.name,
-                "reason": reason,
-                "stored_shape": [int(dim) for dim in initializer.dims],
-            }
-            if node is not None:
-                exclusion.update(
-                    {
-                        "consumer_op": node.op_type,
-                        "consumer_node": node.name,
-                        "consumer_input_index": input_index,
-                    },
-                )
-            exclusion_samples.append(exclusion)
-
-        for initializer_name, initializer in initializers.items():
-            try:
-                self.check_interrupted()
-
-                initializer_consumers = consumers[initializer_name]
-                if not initializer_consumers:
-                    record_exclusion(initializer, "unused_initializer")
-                    continue
-
-                semantic_contexts: list[dict[str, Any]] = []
-                for node_index, node, input_index in initializer_consumers:
-                    output_axis, reason = _onnx_weight_output_axis(node, input_index, len(initializer.dims))
-                    if output_axis is None:
-                        record_exclusion(initializer, reason, node, input_index)
-                        continue
-                    if int(initializer.data_type) not in floating_types:
-                        record_exclusion(initializer, "non_floating_weight", node, input_index)
-                        continue
-                    semantic_contexts.append(
-                        {
-                            "initializer": initializer.name,
-                            "consumer_op": node.op_type,
-                            "consumer_node": node.name,
-                            "consumer_node_index": node_index,
-                            "consumer_input_index": input_index,
-                            "output_axis": output_axis,
-                            "analysis_kind": (
-                                "tensor"
-                                if node.op_type in {"Conv", "ConvTranspose"}
-                                or (len(initializer.dims) > 2 and output_axis != len(initializer.dims) - 1)
-                                else "matrix"
-                            ),
-                            "group": (
-                                _onnx_int_attribute(node, "group", 1)
-                                if node.op_type in {"Conv", "ConvTranspose"}
-                                else 1
-                            ),
-                            "stored_shape": [int(dim) for dim in initializer.dims],
-                        },
-                    )
-
-                if not semantic_contexts:
-                    continue
-                eligible_initializers += 1
-
-                # Skip external-data tensors — their bytes were not loaded.
-                if initializer.data_location == onnx.TensorProto.EXTERNAL:
-                    external_initializers_skipped += 1
-                    continue
-
-                # Pre-check estimated size before materializing the array.
-                # Use math.prod for arbitrary-precision arithmetic (np.prod
-                # can silently overflow for very large dimension products).
-                numel = math.prod(int(dim) for dim in initializer.dims)
-                itemsize = int(_tensor_data_type_to_np_dtype(initializer.data_type).itemsize)
-                estimated_bytes = numel * itemsize
-                if max_array_size and max_array_size > 0 and estimated_bytes > max_array_size:
-                    oversized_initializers_skipped += 1
-                    continue
-
-                array = onnx.numpy_helper.to_array(initializer)
-                contexts_by_analysis: dict[tuple[str, int, int], list[dict[str, Any]]] = {}
-                for context in semantic_contexts:
-                    analysis_key = (
-                        str(context["analysis_kind"]),
-                        int(context["output_axis"]),
-                        int(context["group"]),
-                    )
-                    contexts_by_analysis.setdefault(analysis_key, []).append(context)
-
-                for (analysis_kind, output_axis, group), axis_contexts in contexts_by_analysis.items():
-                    layer_name = initializer.name
-                    if len(contexts_by_analysis) > 1:
-                        layer_name = f"{initializer.name}@output_axis={output_axis}"
-                    if layer_name in weights_info or layer_name in tensor_weight_specs:
-                        layer_name = f"{layer_name},kind={analysis_kind},group={group}"
-
-                    analysis_shape: list[int]
-                    conceptual_output_axes: tuple[int, ...]
-                    shares_storage = True
-                    if analysis_kind == "tensor":
-                        tensor_array = array
-                        conceptual_output_axes = (output_axis,)
-                        if axis_contexts[0]["consumer_op"] == "ConvTranspose":
-                            if group <= 0 or int(array.shape[0]) % group != 0:
-                                raise ValueError(
-                                    f"ConvTranspose initializer {initializer.name!r} has incompatible group {group}"
-                                )
-                            tensor_array = array.reshape(group, int(array.shape[0]) // group, *array.shape[1:])
-                            conceptual_output_axes = (0, 2)
-                        shares_storage = bool(array.size == 0 or np.shares_memory(array, tensor_array))
-                        if not shares_storage:
-                            raise RuntimeError(
-                                f"Weight analysis for initializer {initializer.name!r} would copy the full tensor"
-                            )
-                        input_axes = tuple(
-                            axis for axis in range(tensor_array.ndim) if axis not in conceptual_output_axes
-                        )
-                        analysis_shape = [
-                            math.prod(int(tensor_array.shape[axis]) for axis in input_axes),
-                            math.prod(int(tensor_array.shape[axis]) for axis in conceptual_output_axes),
-                        ]
-                        tensor_weight_specs[layer_name] = (tensor_array, conceptual_output_axes)
-                    else:
-                        analysis_array = np.moveaxis(array, output_axis, -1)
-                        if analysis_array.ndim > 2:
-                            analysis_array = analysis_array.reshape(-1, analysis_array.shape[-1])
-                        shares_storage = bool(array.size == 0 or np.shares_memory(array, analysis_array))
-                        if not shares_storage:
-                            raise RuntimeError(
-                                f"Weight analysis for initializer {initializer.name!r} would copy the full tensor"
-                            )
-                        conceptual_output_axes = (analysis_array.ndim - 1,)
-                        analysis_shape = [int(dim) for dim in analysis_array.shape]
-                        weights_info[layer_name] = analysis_array
-                    context = {
-                        **axis_contexts[0],
-                        "analysis_shape": analysis_shape,
-                        "conceptual_output_axes": list(conceptual_output_axes),
-                        "analysis_storage_shares_memory": shares_storage,
-                        "analysis_materialization": "zero_copy_view_chunked_reduction",
-                        "consumers": [
-                            {
-                                "op": item["consumer_op"],
-                                "node": item["consumer_node"],
-                                "node_index": item["consumer_node_index"],
-                                "input_index": item["consumer_input_index"],
-                            }
-                            for item in axis_contexts
-                        ],
-                    }
-                    layer_contexts[layer_name] = context
-                    analyzed_initializer_names.add(initializer_name)
-                    if len(eligible_metadata) < _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT:
-                        eligible_metadata.append(context)
-            except Exception as e:
-                extraction_failures += 1
-                logger.warning(
-                    "Failed to extract ONNX initializer '%s' for distribution analysis: %s",
-                    initializer.name,
-                    e,
-                )
-                continue
-
-        analyzed_layer_count = len(weights_info) + len(tensor_weight_specs)
-        result.metadata["onnx_weight_distribution_semantics"] = {
-            "eligible_initializer_count": eligible_initializers,
-            "analyzed_layer_count": analyzed_layer_count,
-            "eligible": eligible_metadata,
-            "eligible_metadata_truncated": analyzed_layer_count > len(eligible_metadata),
-            "exclusion_counts": exclusion_counts,
-            "exclusion_samples": exclusion_samples,
-            "exclusion_metadata_truncated": sum(exclusion_counts.values()) > len(exclusion_samples),
-        }
-
-        if external_initializers_skipped or oversized_initializers_skipped or extraction_failures:
+        coverage_incomplete = bool(
+            plan.coverage_gaps
+            or plan.external_initializers_skipped
+            or plan.oversized_initializers_skipped
+            or plan.extraction_failures
+        )
+        if coverage_incomplete:
+            reason = "partial_initializer_coverage"
+            if plan.coverage_gaps and not (
+                plan.external_initializers_skipped or plan.oversized_initializers_skipped or plan.extraction_failures
+            ):
+                reason = next(iter(plan.coverage_gaps)) if len(plan.coverage_gaps) == 1 else "multiple_coverage_gaps"
             self._mark_weight_distribution_incomplete(
                 result,
                 path,
-                reason="partial_initializer_coverage",
+                reason=reason,
                 message="Weight distribution analysis skipped one or more eligible ONNX initializers",
                 details={
-                    "eligible_initializers": eligible_initializers,
-                    "analyzed_initializers": len(analyzed_initializer_names),
-                    "external_initializers_skipped": external_initializers_skipped,
-                    "oversized_initializers_skipped": oversized_initializers_skipped,
-                    "extraction_failures": extraction_failures,
+                    "eligible_initializers": plan.eligible_initializer_count,
+                    "analyzed_initializers": plan.analyzed_initializer_count,
+                    "external_initializers_skipped": plan.external_initializers_skipped,
+                    "oversized_initializers_skipped": plan.oversized_initializers_skipped,
+                    "extraction_failures": plan.extraction_failures,
+                    "coverage_gaps": plan.coverage_gaps,
+                    "unresolved_lineage_samples": plan.unresolved_lineage_samples,
                     "max_array_size": max_array_size,
                 },
             )
 
-        if not weights_info and not tensor_weight_specs:
-            # Nothing to analyse (external-only model, or all tensors too small / too large).
+        if not plan.specs:
             return
 
         try:
@@ -1396,39 +1927,12 @@ class OnnxScanner(BaseScanner):
             )
             return
 
-        # Delegate the actual statistical analysis to WeightDistributionScanner.
         try:
             wd_scanner = WeightDistributionScanner(self.config)
-            anomalies = wd_scanner._analyze_weight_distributions(weights_info)
-            for layer_name, (tensor_weights, output_axes) in tensor_weight_specs.items():
-                anomalies.extend(
-                    wd_scanner._analyze_tensor_weight_extremes(
-                        layer_name,
-                        tensor_weights,
-                        output_axes=output_axes,
-                    ),
-                )
-
-            for anomaly in anomalies:
+            analyzed = wd_scanner._analyze_onnx_weight_specs(plan.specs)
+            for anomaly, spec in analyzed:
                 details = dict(anomaly["details"])
-                layer_name = str(details.get("layer", ""))
-                layer_context = layer_contexts.get(layer_name)
-                if layer_context is not None:
-                    details.update(
-                        {
-                            "initializer": layer_context["initializer"],
-                            "consumer_op": layer_context["consumer_op"],
-                            "consumer_node": layer_context["consumer_node"],
-                            "consumer_input_index": layer_context["consumer_input_index"],
-                            "output_axis": layer_context["output_axis"],
-                            "stored_shape": layer_context["stored_shape"],
-                            "analysis_shape": layer_context["analysis_shape"],
-                            "conceptual_output_axes": layer_context["conceptual_output_axes"],
-                            "group": layer_context["group"],
-                            "analysis_storage_shares_memory": layer_context["analysis_storage_shares_memory"],
-                            "analysis_materialization": layer_context["analysis_materialization"],
-                        },
-                    )
+                details.update(spec.context)
                 result.add_check(
                     name="Weight Distribution Anomaly Detection",
                     passed=False,
@@ -1439,26 +1943,26 @@ class OnnxScanner(BaseScanner):
                     why=anomaly.get("why"),
                 )
 
-            result.metadata["layers_analyzed"] = analyzed_layer_count
-            result.metadata["anomalies_found"] = len(anomalies)
-            if extraction_failures > 0:
-                result.metadata["weight_extraction_failures"] = extraction_failures
+            result.metadata["layers_analyzed"] = len(plan.specs)
+            result.metadata["anomalies_found"] = len(analyzed)
+            if plan.extraction_failures > 0:
+                result.metadata["weight_extraction_failures"] = plan.extraction_failures
         except Exception as e:
-            logger.warning(f"Weight distribution analysis failed: {e}")
+            logger.warning("Weight distribution analysis failed (%s)", type(e).__name__)
             result.add_check(
                 name="Weight Distribution Analysis",
                 passed=False,
-                message=f"Weight distribution analysis failed: {e!s}",
+                message=f"Weight distribution analysis failed ({type(e).__name__})",
                 severity=IssueSeverity.DEBUG,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={"exception_type": type(e).__name__},
             )
             self._mark_weight_distribution_incomplete(
                 result,
                 path,
                 reason="analysis_failed",
-                message=f"Weight distribution analysis failed: {e!s}",
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                message=f"Weight distribution analysis failed ({type(e).__name__})",
+                details={"exception_type": type(e).__name__},
             )
 
     def _mark_weight_distribution_incomplete(

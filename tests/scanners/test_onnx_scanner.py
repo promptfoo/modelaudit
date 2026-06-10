@@ -23,6 +23,7 @@ from modelaudit.scanners.onnx_scanner import (
     OnnxScanner,
     _confirmed_python_operator_findings,
 )
+from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
 from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
 
 
@@ -144,6 +145,189 @@ def create_onnx_weight_model(
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
     path = tmp_path / filename
+    onnx.save(model, str(path))
+    return path
+
+
+def create_transformed_onnx_weight_model(
+    tmp_path: Path,
+    analysis_weights: np.ndarray,
+    *,
+    transform: str,
+) -> Path:
+    """Create a MatMul whose weight reaches it through one intermediate operator."""
+    assert transform in {"Identity", "Transpose", "Reshape", "ReshapeDynamic", "Cast"}
+    initializers: list[Any] = []
+    if transform == "Transpose":
+        stored_weights = analysis_weights.T.copy()
+    elif transform == "Reshape":
+        stored_weights = analysis_weights.reshape(10, 10, analysis_weights.shape[1]).copy()
+    else:
+        stored_weights = analysis_weights.copy()
+    initializers.append(onnx.numpy_helper.from_array(stored_weights, name="W"))
+
+    if transform == "Identity":
+        transform_node = helper.make_node("Identity", ["W"], ["W_view"], name="weight_identity")
+    elif transform == "Transpose":
+        transform_node = helper.make_node(
+            "Transpose",
+            ["W"],
+            ["W_view"],
+            name="weight_transpose",
+            perm=[1, 0],
+        )
+    elif transform == "Reshape":
+        shape = np.asarray(analysis_weights.shape, dtype=np.int64)
+        initializers.append(onnx.numpy_helper.from_array(shape, name="weight_shape"))
+        transform_node = helper.make_node(
+            "Reshape",
+            ["W", "weight_shape"],
+            ["W_view"],
+            name="weight_reshape",
+        )
+    elif transform == "ReshapeDynamic":
+        transform_node = helper.make_node(
+            "Reshape",
+            ["W", "dynamic_shape"],
+            ["W_view"],
+            name="dynamic_weight_reshape",
+        )
+    else:
+        transform_node = helper.make_node(
+            "Cast",
+            ["W"],
+            ["W_view"],
+            name="unsupported_weight_cast",
+            to=TensorProto.FLOAT,
+        )
+
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, analysis_weights.shape[0]])
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, analysis_weights.shape[1]])
+    graph_inputs = [X]
+    if transform == "ReshapeDynamic":
+        graph_inputs.append(helper.make_tensor_value_info("dynamic_shape", TensorProto.INT64, [2]))
+    matmul = helper.make_node("MatMul", ["input", "W_view"], ["output"], name="linear")
+    graph = helper.make_graph(
+        [transform_node, matmul],
+        "transformed_weight_graph",
+        graph_inputs,
+        [Y],
+        initializer=initializers,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / f"{transform.lower()}-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_batched_matmul_weight_model(tmp_path: Path, weights: np.ndarray, *, left: bool) -> Path:
+    """Create a batched MatMul initializer on either operand."""
+    weight_tensor = onnx.numpy_helper.from_array(weights, name="W")
+    if left:
+        X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [weights.shape[0], weights.shape[2], 1])
+        Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [weights.shape[0], weights.shape[1], 1])
+        node_inputs = ["W", "input"]
+    else:
+        X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [weights.shape[0], 1, weights.shape[1]])
+        Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [weights.shape[0], 1, weights.shape[2]])
+        node_inputs = ["input", "W"]
+    node = helper.make_node("MatMul", node_inputs, ["output"], name="batched_linear")
+    graph = helper.make_graph([node], "batched_matmul_graph", [X], [Y], initializer=[weight_tensor])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / ("batched-left-matmul.onnx" if left else "batched-right-matmul.onnx")
+    onnx.save(model, str(path))
+    return path
+
+
+def create_collision_named_weight_model(tmp_path: Path) -> Path:
+    """Create initializer names that collide with the former synthesized keys."""
+    base_name = "W"
+    intermediate_name = "W@output_axis=1"
+    crafted_name = "W@output_axis=1,kind=matrix,group=1"
+    initializers = [
+        onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.float32), name=base_name),
+        onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.float32), name=crafted_name),
+        onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.float32), name=intermediate_name),
+    ]
+    right_input = helper.make_tensor_value_info("right_input", TensorProto.FLOAT, [1, 100])
+    left_input = helper.make_tensor_value_info("left_input", TensorProto.FLOAT, [10, 1])
+    outputs = [
+        helper.make_tensor_value_info("base_right", TensorProto.FLOAT, [1, 10]),
+        helper.make_tensor_value_info("base_left", TensorProto.FLOAT, [100, 1]),
+        helper.make_tensor_value_info("crafted_output", TensorProto.FLOAT, [1, 10]),
+        helper.make_tensor_value_info("intermediate_output", TensorProto.FLOAT, [1, 10]),
+    ]
+    nodes = [
+        helper.make_node("MatMul", ["right_input", base_name], ["base_right"], name="base_right_node"),
+        helper.make_node("MatMul", [base_name, "left_input"], ["base_left"], name="base_left_node"),
+        helper.make_node(
+            "MatMul",
+            ["right_input", crafted_name],
+            ["crafted_output"],
+            name="crafted_node",
+        ),
+        helper.make_node(
+            "MatMul",
+            ["right_input", intermediate_name],
+            ["intermediate_output"],
+            name="intermediate_node",
+        ),
+    ]
+    graph = helper.make_graph(nodes, "collision_graph", [right_input, left_input], outputs, initializer=initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "collision-named-weights.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_many_consumer_weight_model(tmp_path: Path, *, consumer_count: int) -> Path:
+    """Create bounded-metadata pressure with long attacker-controlled names."""
+    initializer_name = "initializer-" + "x" * 1000
+    weights = np.zeros((100, 10), dtype=np.float32)
+    weights[50:55, 3] = 10.0
+    initializer = onnx.numpy_helper.from_array(weights, name=initializer_name)
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 100])
+    output_names = [f"output_{index}" for index in range(consumer_count)]
+    Y = helper.make_tensor_value_info(output_names[-1], TensorProto.FLOAT, [1, 10])
+    nodes = [
+        helper.make_node(
+            "MatMul",
+            ["input", initializer_name],
+            [output_name],
+            name=f"consumer-{index}-" + "y" * 1000,
+        )
+        for index, output_name in enumerate(output_names)
+    ]
+    graph = helper.make_graph(nodes, "many_consumer_graph", [X], [Y], initializer=[initializer])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "many-consumer-weights.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_invalid_initializer_name_model(tmp_path: Path, *, duplicate: bool) -> Path:
+    """Serialize an invalid graph so the scanner must reject ambiguous names itself."""
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 2])
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 2])
+    node = helper.make_node("Identity", ["input"], ["output"], name="identity")
+    initializer_name = "W" if duplicate else ""
+    initializers = [
+        onnx.numpy_helper.from_array(np.zeros((2, 2), dtype=np.float32), name=initializer_name),
+    ]
+    if duplicate:
+        initializers.append(onnx.numpy_helper.from_array(np.ones((2, 2), dtype=np.float32), name="W"))
+    graph = helper.make_graph([node], "invalid_initializer_names", [X], [Y], initializer=initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / ("duplicate-initializers.onnx" if duplicate else "empty-initializer.onnx")
     onnx.save(model, str(path))
     return path
 
@@ -2335,6 +2519,148 @@ class TestWeightDistributionSemantics:
         assert semantics["eligible_initializer_count"] == 0
         assert semantics["analyzed_layer_count"] == 0
         assert semantics["exclusion_counts"]["unused_initializer"] == 1
+
+    @pytest.mark.parametrize("transform", ["Identity", "Transpose", "Reshape"])
+    def test_supported_initializer_lineage_reaches_matmul(self, tmp_path: Path, transform: str) -> None:
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+        model_path = create_transformed_onnx_weight_model(tmp_path, weights, transform=transform)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = self._extreme_checks(result)
+        assert len(checks) == 1
+        assert checks[0].details["affected_neurons"] == [3]
+        assert checks[0].details["lineage"] == [transform]
+        assert checks[0].details["lineage_transform_count"] == 1
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+
+    @pytest.mark.parametrize("transform", ["Cast", "ReshapeDynamic"])
+    def test_unsupported_initializer_lineage_fails_closed(self, tmp_path: Path, transform: str) -> None:
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+        model_path = create_transformed_onnx_weight_model(tmp_path, weights, transform=transform)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert self._extreme_checks(result) == []
+        assert result.success is False
+        assert len(coverage) == 1
+        assert coverage[0].details["coverage_gap"] == "unresolved_initializer_lineage"
+        assert coverage[0].details["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+
+    def test_internal_analysis_ids_cannot_collide_with_initializer_names(self, tmp_path: Path) -> None:
+        model_path = create_collision_named_weight_model(tmp_path)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        contexts = semantics["eligible"]
+        assert semantics["eligible_initializer_count"] == 3
+        assert semantics["analyzed_layer_count"] == 4
+        assert [context["analysis_id"] for context in contexts] == [0, 1, 2, 3]
+        assert len({context["analysis_id"] for context in contexts}) == 4
+        assert {context["initializer"] for context in contexts} == {
+            "W",
+            "W@output_axis=1",
+            "W@output_axis=1,kind=matrix,group=1",
+        }
+
+    @pytest.mark.parametrize("left", [False, True])
+    def test_batched_matmul_preserves_batch_outputs(self, tmp_path: Path, left: bool) -> None:
+        weights = np.zeros((2, 10, 100), dtype=np.float32) if left else np.zeros((2, 100, 10), dtype=np.float32)
+        if left:
+            weights[1, 3, 50:55] = 10.0
+        else:
+            weights[1, 50:55, 3] = 10.0
+        model_path = create_batched_matmul_weight_model(tmp_path, weights, left=left)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = self._extreme_checks(result)
+        assert len(checks) == 1
+        details = checks[0].details
+        expected_output_axes = [0, 1] if left else [0, 2]
+        assert details["output_axes"] == expected_output_axes
+        assert details["conceptual_output_axes"] == expected_output_axes
+        assert details["analysis_shape"] == [100, 20]
+        assert details["total_outputs"] == 20
+        assert details["affected_neurons"] == [13]
+
+    def test_consumer_and_string_metadata_are_bounded_with_counts(self, tmp_path: Path) -> None:
+        model_path = create_many_consumer_weight_model(tmp_path, consumer_count=30)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        context = semantics["eligible"][0]
+        assert semantics["consumer_count"] == 30
+        assert semantics["consumer_metadata_sample_count"] == 20
+        assert semantics["consumer_metadata_truncated"] is True
+        assert semantics["metadata_strings_truncated"] is True
+        assert context["consumer_count"] == 30
+        assert len(context["consumers"]) == 20
+        assert context["consumers_truncated"] is True
+        assert context["initializer_truncated"] is True
+        assert context["initializer_length"] > len(context["initializer"])
+        assert len(context["initializer"]) <= 256
+        assert all(len(consumer["node"]) <= 256 for consumer in context["consumers"])
+        checks = self._extreme_checks(result)
+        assert len(checks) == 1
+        assert len(checks[0].message) < 400
+
+    @pytest.mark.parametrize("duplicate", [False, True])
+    def test_invalid_initializer_names_fail_closed(self, tmp_path: Path, duplicate: bool) -> None:
+        model_path = create_invalid_initializer_name_model(tmp_path, duplicate=duplicate)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        validation = result.metadata["onnx_weight_distribution_semantics"]["initializer_name_validation"]
+        assert result.success is False
+        assert len(coverage) == 1
+        assert coverage[0].details["coverage_gap"] == "invalid_initializer_names"
+        assert validation["duplicate_name_count"] == int(duplicate)
+        assert validation["empty_name_count"] == int(not duplicate)
+
+    def test_standalone_onnx_scanner_matches_semantic_orientation(self, tmp_path: Path) -> None:
+        weights = np.zeros((10, 100), dtype=np.float32)
+        weights[3, 50:55] = 10.0
+        model_path = create_onnx_weight_model(tmp_path, weights, op_type="Gemm", trans_b=True)
+
+        integrated = OnnxScanner().scan(str(model_path))
+        standalone = WeightDistributionScanner().scan(str(model_path))
+
+        integrated_check = self._extreme_checks(integrated)[0]
+        standalone_checks = [
+            check
+            for check in standalone.checks
+            if check.name == "Weight Distribution Anomaly Detection"
+            and "extremely large weight values" in check.message
+        ]
+        assert len(standalone_checks) == 1
+        assert standalone_checks[0].details["output_axis"] == integrated_check.details["output_axis"] == 0
+        assert standalone_checks[0].details["analysis_shape"] == integrated_check.details["analysis_shape"] == [100, 10]
+        assert standalone_checks[0].details["affected_neurons"] == integrated_check.details["affected_neurons"] == [3]
+
+    def test_standalone_onnx_scanner_matches_semantic_exclusions(self, tmp_path: Path) -> None:
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+        model_path = create_onnx_weight_model(tmp_path, weights, op_type="Gather")
+
+        standalone = WeightDistributionScanner().scan(str(model_path))
+
+        assert not any(
+            check.name == "Weight Distribution Anomaly Detection" and "extremely large weight values" in check.message
+            for check in standalone.checks
+        )
+        semantics = standalone.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 0
+        assert semantics["exclusion_counts"] == {"embedding_table": 1}
 
 
 class TestRawDetectorCoverage:

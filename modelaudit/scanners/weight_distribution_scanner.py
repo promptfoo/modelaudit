@@ -197,6 +197,7 @@ class WeightDistributionScanner(BaseScanner):
         self.extraction_incomplete_reasons = []
         self.extraction_incomplete_details = {}
         self.retained_tensor_bytes = 0
+        onnx_plan: Any | None = None
 
         try:
             # Extract weights based on file format
@@ -212,7 +213,9 @@ class WeightDistributionScanner(BaseScanner):
                 elif ext == ".pb":
                     weights_info = self._extract_tensorflow_weights(path)
                 elif ext == ".onnx":
-                    weights_info = self._extract_onnx_weights(path)
+                    onnx_plan = self._extract_semantic_onnx_weight_plan(path)
+                    weights_info = {spec.analysis_id: spec.weights for spec in onnx_plan.specs}
+                    result.metadata["onnx_weight_distribution_semantics"] = onnx_plan.metadata
                 elif ext == ".safetensors":
                     weights_info = self._extract_safetensors_weights(path)
                 else:
@@ -262,23 +265,31 @@ class WeightDistributionScanner(BaseScanner):
                 return result
 
             # Analyze the weights
-            anomalies = self._analyze_weight_distributions(weights_info)
+            analyzed_onnx: list[tuple[dict[str, Any], Any]] | None = None
+            if onnx_plan is not None:
+                analyzed_onnx = self._analyze_onnx_weight_specs(onnx_plan.specs)
+                anomalies = [anomaly for anomaly, _spec in analyzed_onnx]
+            else:
+                anomalies = self._analyze_weight_distributions(weights_info)
 
             # Add issues for any anomalies found
-            for anomaly in anomalies:
+            for anomaly_index, anomaly in enumerate(anomalies):
+                details = dict(anomaly["details"])
+                if analyzed_onnx is not None:
+                    details.update(analyzed_onnx[anomaly_index][1].context)
                 result.add_check(
                     name="Weight Distribution Anomaly Detection",
                     passed=False,
                     message=anomaly["description"],
                     severity=anomaly["severity"],
                     location=path,
-                    details=anomaly["details"],
+                    details=details,
                     why=anomaly.get("why"),
                     rule_code="S801",
                 )
 
             # Add metadata
-            result.metadata["layers_analyzed"] = len(weights_info)
+            result.metadata["layers_analyzed"] = len(onnx_plan.specs) if onnx_plan is not None else len(weights_info)
             result.metadata["anomalies_found"] = len(anomalies)
 
             result.bytes_scanned = file_size
@@ -1500,6 +1511,95 @@ class WeightDistributionScanner(BaseScanner):
         typed_bytes += sum(len(value) for value in getattr(initializer, "string_data", ()))
         return raw_bytes * packed_multiplier + typed_bytes
 
+    def _extract_semantic_onnx_weight_plan(self, path: str) -> Any:
+        """Build the same bounded semantic ONNX plan used by ``OnnxScanner``."""
+        try:
+            import numpy as np
+            import onnx
+
+            from modelaudit.scanners.onnx_scanner import (
+                _build_onnx_weight_analysis_plan,
+                _OnnxWeightAnalysisPlan,
+            )
+        except ImportError as exc:
+            raise RuntimeError("ONNX semantic weight analysis dependencies are unavailable") from exc
+
+        max_total_bytes = self._max_total_tensor_bytes()
+        model_size = os.path.getsize(path)
+        if max_total_bytes is not None and model_size > max_total_bytes:
+            self._record_extraction_incomplete(
+                "onnx_model_size_limit",
+                failed_tensors=[path],
+                oversized_tensors=1,
+                tensor_nbytes=model_size,
+                max_total_tensor_bytes=max_total_bytes,
+            )
+            plan = _OnnxWeightAnalysisPlan()
+            plan.record_coverage_gap("onnx_model_size_limit")
+            plan.metadata = {
+                "eligible_initializer_count": 0,
+                "analyzed_layer_count": 0,
+                "eligible": [],
+                "eligible_metadata_truncated": False,
+                "exclusion_counts": {},
+                "exclusion_samples": [],
+                "exclusion_metadata_truncated": False,
+                "coverage_gaps": dict(plan.coverage_gaps),
+            }
+            return plan
+
+        try:
+            model = onnx.load(path, load_external_data=False)  # type: ignore[possibly-unresolved-reference]
+
+            def pre_materialization_check(initializer: Any, name: str, estimated_bytes: int) -> bool:
+                inline_storage_nbytes = self._onnx_inline_storage_nbytes(onnx, initializer)
+                if not self._tensor_fits_budget(
+                    "onnx_initializer_storage_size_limit",
+                    name,
+                    tensor_nbytes=inline_storage_nbytes,
+                ):
+                    return False
+                return self._tensor_fits_budget(
+                    "onnx_initializer_size_limit",
+                    name,
+                    tensor_nbytes=estimated_bytes,
+                )
+
+            plan = _build_onnx_weight_analysis_plan(
+                model,
+                onnx=onnx,
+                np=np,
+                max_array_size=None,
+                pre_materialization_check=pre_materialization_check,
+                retain_array_check=lambda name, nbytes: self._tensor_fits_budget(
+                    "onnx_initializer_size_limit",
+                    name,
+                    tensor_nbytes=nbytes,
+                    retain=True,
+                ),
+            )
+        except Exception as exc:
+            logger.warning("Failed to build semantic ONNX weight plan for %s (%s)", path, type(exc).__name__)
+            raise RuntimeError(f"Failed to extract ONNX weights from {path}") from exc
+
+        if plan.external_initializers_skipped:
+            self._record_extraction_incomplete(
+                "onnx_external_initializer_skipped",
+                external_reference_tensors=plan.external_initializers_skipped,
+            )
+        if plan.extraction_failures:
+            self._record_extraction_incomplete(
+                "onnx_initializer_read_failed",
+                tensor_read_failures=plan.extraction_failures,
+            )
+        for reason, count in plan.coverage_gaps.items():
+            self._record_extraction_incomplete(
+                f"onnx_{reason}",
+                coverage_gap_count=count,
+                unresolved_lineage_samples=plan.unresolved_lineage_samples,
+            )
+        return plan
+
     def _extract_onnx_weights(self, path: str) -> dict[str, Any]:
         """Extract weights from ONNX model files.
 
@@ -1665,7 +1765,25 @@ class WeightDistributionScanner(BaseScanner):
 
         return anomalies
 
-    def _analyze_architecture_properties(self, weights_info: dict[str, Any]) -> dict[str, Any]:
+    def _analyze_onnx_weight_specs(self, specs: list[Any]) -> list[tuple[dict[str, Any], Any]]:
+        """Analyze collision-proof ONNX specs using their semantic output axes."""
+        matrix_weights = {spec.analysis_id: spec.weights for spec in specs if spec.matrix_analysis}
+        architecture_analysis = self._analyze_architecture_properties(matrix_weights)
+        analyzed: list[tuple[dict[str, Any], Any]] = []
+        for spec in specs:
+            layer_name = str(spec.context["initializer"])
+            if spec.matrix_analysis:
+                anomalies = self._analyze_layer_weights(layer_name, spec.weights, architecture_analysis)
+            else:
+                anomalies = self._analyze_tensor_weight_extremes(
+                    layer_name,
+                    spec.weights,
+                    output_axes=spec.output_axes,
+                )
+            analyzed.extend((anomaly, spec) for anomaly in anomalies)
+        return analyzed
+
+    def _analyze_architecture_properties(self, weights_info: dict[Any, Any]) -> dict[str, Any]:
         """
         Analyze the mathematical and architectural properties to determine model characteristics.
         Uses structural analysis rather than name-based detection to avoid security bypasses.
