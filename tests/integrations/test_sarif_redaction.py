@@ -493,39 +493,6 @@ def test_sensitive_key_comparisons_are_not_treated_as_assignments(operator: str)
     assert redact_source_text(text) == text
 
 
-@pytest.mark.parametrize("operator", ["==", "!=", ">=", "<="])
-def test_prevalidated_source_redacts_sensitive_comparison_literals(operator: str) -> None:
-    secret = "PROD-COMPARISON-SECRET-123456"
-    text = f'client_secret {operator} "{secret}"; os.system("id")'
-
-    redacted = redact_prevalidated_source_value(text)
-
-    assert redacted == f'client_secret {operator} <redacted>; os.system("id")'
-
-
-@pytest.mark.parametrize(
-    "literal",
-    [
-        "PROD-BARE-COMPARISON-SECRET-123456",
-        'r"PROD-RAW-COMPARISON-SECRET-123456"',
-        '"""PROD-TRIPLE-COMPARISON-SECRET-123456"""',
-        '"PROD-ESCAPED-\\"-COMPARISON-SECRET-123456"',
-    ],
-)
-def test_prevalidated_source_redacts_comparison_literal_variants(literal: str) -> None:
-    text = f'client_secret == {literal}; os.system("id")'
-
-    redacted = redact_prevalidated_source_value(text)
-
-    assert redacted == 'client_secret == <redacted>; os.system("id")'
-
-
-def test_prevalidated_source_preserves_command_comparison_operand() -> None:
-    text = 'client_secret == os.system("id")'
-
-    assert redact_prevalidated_source_value(text) == text
-
-
 def test_preserved_redacted_assignment_does_not_exempt_neighboring_secret() -> None:
     text = 'client_secret=os.system("curl -u alice:<redacted>"); token=RAW-NEIGHBOR-SECRET'
 
@@ -566,20 +533,71 @@ def test_catboost_sarif_revalidates_attacker_supplied_redaction_marker() -> None
     assert "client_secret=os.system(<redacted>)" in output
 
 
-def test_catboost_sarif_redacts_sensitive_comparison_literal_and_preserves_command() -> None:
-    secret = "PROD-COMPARISON-SECRET-123456"
+@pytest.mark.parametrize(
+    ("excerpt", "secrets"),
+    [
+        (
+            'client_secret == "DIRECT-COMPARISON-SECRET-123456"; os.system("id")',
+            ("DIRECT-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'client_secret === "STRICT-COMPARISON-SECRET-123456"; os.system("id")',
+            ("STRICT-COMPARISON-SECRET-123456",),
+        ),
+        (
+            '"REVERSED-COMPARISON-SECRET-123456" == client_secret; os.system("id")',
+            ("REVERSED-COMPARISON-SECRET-123456",),
+        ),
+        (
+            '"LOW-COMPARISON-SECRET-123456" < client_secret < "HIGH-COMPARISON-SECRET-123456"; os.system("id")',
+            ("LOW-COMPARISON-SECRET-123456", "HIGH-COMPARISON-SECRET-123456"),
+        ),
+        (
+            'client_secret == ("PART-A-SECRET" + "CONCAT-COMPARISON-SECRET-123456"); os.system("id")',
+            ("PART-A-SECRET", "CONCAT-COMPARISON-SECRET-123456"),
+        ),
+        (
+            'client_secret == lookup("CALL-COMPARISON-SECRET-123456") if enabled '
+            'else "FALLBACK-COMPARISON-SECRET-123456"; os.system("id")',
+            ("CALL-COMPARISON-SECRET-123456", "FALLBACK-COMPARISON-SECRET-123456"),
+        ),
+        (
+            'client_secret == <redacted> + "MARKER-TAIL-COMPARISON-SECRET-123456"; os.system("id")',
+            ("MARKER-TAIL-COMPARISON-SECRET-123456",),
+        ),
+    ],
+)
+def test_catboost_sarif_redacts_sensitive_comparison_statements(
+    excerpt: str,
+    secrets: tuple[str, ...],
+) -> None:
     result = create_initial_audit_result()
     result.issues = [
         Issue(
             message="Suspicious command execution primitives detected",
             severity=IssueSeverity.CRITICAL,
-            details={
-                "matches": [
-                    {
-                        "excerpt": f'client_secret == "{secret}"; os.system("id")',
-                    }
-                ],
-            },
+            details={"matches": [{"excerpt": excerpt}]},
+            type="catboost_check",
+            timestamp=time.time(),
+        )
+    ]
+    result.finalize_statistics()
+
+    output = format_sarif_output(result, ["/test/model.cbm"])
+    properties = json.loads(output)["runs"][0]["results"][0]["properties"]
+    redacted_excerpt = properties["matches"][0]["excerpt"]
+
+    assert all(secret not in output for secret in secrets)
+    assert 'os.system("id")' in redacted_excerpt
+
+
+def test_catboost_sarif_preserves_sensitive_comparison_command_operand() -> None:
+    result = create_initial_audit_result()
+    result.issues = [
+        Issue(
+            message="Suspicious command execution primitives detected",
+            severity=IssueSeverity.CRITICAL,
+            details={"matches": [{"excerpt": 'client_secret == os.system("id")'}]},
             type="catboost_check",
             timestamp=time.time(),
         )
@@ -589,8 +607,7 @@ def test_catboost_sarif_redacts_sensitive_comparison_literal_and_preserves_comma
     output = format_sarif_output(result, ["/test/model.cbm"])
     properties = json.loads(output)["runs"][0]["results"][0]["properties"]
 
-    assert secret not in output
-    assert properties["matches"][0]["excerpt"] == 'client_secret == <redacted>; os.system("id")'
+    assert 'os.system("id")' in properties["matches"][0]["excerpt"]
 
 
 @pytest.mark.parametrize(

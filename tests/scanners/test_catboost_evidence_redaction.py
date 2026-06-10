@@ -4116,3 +4116,114 @@ def test_compact_aws_assignments_are_redacted(key: str) -> None:
 )
 def test_argv_and_compact_aws_near_matches_are_preserved(text: str) -> None:
     assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    "operator",
+    ["===", "!==", "==", "!=", ">=", "<=", "<>", ">", "<", "is", "is not", "in", "not in"],
+)
+def test_sensitive_comparison_operators_redact_literals_and_preserve_command(operator: str) -> None:
+    secret = f"OPERATOR-{operator.replace(' ', '-')}-SECRET-123456"
+    text = f'client_secret {operator} "{secret}"; os.system("id")'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert secret not in redacted
+    assert 'os.system("id")' in redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "secrets"),
+    [
+        (
+            '"REVERSED-COMPARISON-SECRET-123456" == client_secret; os.system("id")',
+            ("REVERSED-COMPARISON-SECRET-123456",),
+        ),
+        (
+            '"LOW-COMPARISON-SECRET-123456" < client_secret < "HIGH-COMPARISON-SECRET-123456"; os.system("id")',
+            ("LOW-COMPARISON-SECRET-123456", "HIGH-COMPARISON-SECRET-123456"),
+        ),
+        (
+            'client_secret == ("PAREN-COMPARISON-SECRET-123456"); os.system("id")',
+            ("PAREN-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'client_secret == ["LIST-COMPARISON-SECRET-123456"]; os.system("id")',
+            ("LIST-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'client_secret == {"name": "DICT-COMPARISON-SECRET-123456"}; os.system("id")',
+            ("DICT-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'client_secret == "PART-A-SECRET" + "CONCAT-COMPARISON-SECRET-123456"; os.system("id")',
+            ("PART-A-SECRET", "CONCAT-COMPARISON-SECRET-123456"),
+        ),
+        (
+            'client_secret == "PART-B-SECRET" "ADJACENT-COMPARISON-SECRET-123456"; os.system("id")',
+            ("PART-B-SECRET", "ADJACENT-COMPARISON-SECRET-123456"),
+        ),
+        (
+            'client_secret == "%s" % "PERCENT-COMPARISON-SECRET-123456"; os.system("id")',
+            ("PERCENT-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'client_secret == "YES-COMPARISON-SECRET-123456" if enabled else "NO-COMPARISON-SECRET-123456"; '
+            'os.system("id")',
+            ("YES-COMPARISON-SECRET-123456", "NO-COMPARISON-SECRET-123456"),
+        ),
+        (
+            'client_secret == lookup("CALL-COMPARISON-SECRET-123456"); os.system("id")',
+            ("CALL-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'client_secret == <redacted> + "MARKER-TAIL-COMPARISON-SECRET-123456"; os.system("id")',
+            ("MARKER-TAIL-COMPARISON-SECRET-123456",),
+        ),
+    ],
+)
+def test_sensitive_comparison_statements_redact_compound_and_reversed_literals(
+    text: str,
+    secrets: tuple[str, ...],
+) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert all(secret not in redacted for secret in secrets)
+    assert 'os.system("id")' in redacted
+
+
+def test_sensitive_comparison_preserves_command_operand() -> None:
+    redacted = redact_evidence_string('client_secret == os.system("id")', max_chars=1000)
+
+    assert 'os.system("id")' in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'tokenizer == "bert-base"; os.system("id")',
+        'label == "client_secret"; os.system("id")',
+    ],
+)
+def test_comparison_near_matches_are_preserved(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "password <redacted>",
+        "<redacted> password",
+        "password <credentials-redacted>",
+        "<credentials-redacted> password",
+    ],
+)
+def test_comparison_parser_ignores_redaction_marker_delimiters(text: str) -> None:
+    assert evidence_redaction._redact_sensitive_comparison_statements(text) == text
+
+
+def test_excessive_comparison_candidates_fail_closed_for_sensitive_keys() -> None:
+    comparisons = " or ".join(f'client_secret == "DENSE-COMPARISON-SECRET-{index}"' for index in range(65))
+    text = f'{comparisons}; os.system("id")'
+
+    assert redact_evidence_string(text, max_chars=10_000) == REDACTED_EVIDENCE_VALUE

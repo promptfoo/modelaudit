@@ -29,6 +29,7 @@ EVIDENCE_URL_LOOKAHEAD_CHARS: Final[int] = 64 * 1024
 CURL_COMMAND_SCAN_CHARS: Final[int] = EVIDENCE_URL_LOOKAHEAD_CHARS
 MAX_CURL_EXECUTABLE_CANDIDATES: Final[int] = 64
 MAX_SUBPROCESS_CALL_CANDIDATES: Final[int] = 64
+MAX_COMPARISON_CANDIDATES: Final[int] = 64
 MAX_URL_QUERY_DECODE_PASSES: Final[int] = 8
 MAX_NESTED_URL_QUERY_DEPTH: Final[int] = 8
 MAX_EVALUATED_KEY_CHARS: Final[int] = 256
@@ -194,6 +195,19 @@ KNOWN_AUTHORIZATION_SCHEME_PATTERN: Final[str] = (
 COMPOUND_AUTHORIZATION_SCHEME_PATTERN: Final[str] = r"(?:digest|aws4-hmac-sha256)"
 AUTHORIZATION_SCHEME_PATTERN: Final[str] = rf"(?:{KNOWN_AUTHORIZATION_SCHEME_PATTERN}\s+)?"
 SENSITIVE_ASSIGNMENT_KEY_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)^{SENSITIVE_ASSIGNMENT_KEY}$")
+COMPARISON_OPERATOR_PATTERN: Final[str] = (
+    r"(?:===|!==|==|!=|>=|<=|<>|"
+    r"(?<![<>])<(?![<=>]|redacted>|credentials-redacted>)|"
+    r"(?<![<>])(?<!<redacted)(?<!<credentials-redacted)>(?![=>])|"
+    r"(?<!\w)is(?:\s+not)?(?!\w)|(?<!\w)(?:not\s+)?in(?!\w))"
+)
+SENSITIVE_COMPARISON_RE: Final[re.Pattern[str]] = re.compile(
+    rf"(?:(?P<left_key>(?<![-/A-Za-z0-9_.]){SENSITIVE_ASSIGNMENT_KEY}(?![-/A-Za-z0-9_.]))"
+    rf"\s*(?P<operator_after>{COMPARISON_OPERATOR_PATTERN})|"
+    rf"(?P<operator_before>{COMPARISON_OPERATOR_PATTERN})\s*"
+    rf"(?P<right_key>(?<![-/A-Za-z0-9_.]){SENSITIVE_ASSIGNMENT_KEY}(?![-/A-Za-z0-9_.])))",
+    re.IGNORECASE,
+)
 AUTHORIZATION_KEY_RE: Final[re.Pattern[str]] = re.compile(rf"(?i)^{AUTHORIZATION_KEY_PATTERN}$")
 QUOTED_KEY_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(\\*)([\"'])({QUOTED_KEY_CONTENT_PATTERN})\1\2\s*{ASSIGNMENT_SEPARATOR}\s*"
@@ -2317,6 +2331,38 @@ def _find_value_expression_end(text: str, start: int, default_end: int) -> int:
     return default_end
 
 
+def _redact_sensitive_comparison_statements(text: str) -> str:
+    spans: list[tuple[int, int]] = []
+    for candidate_count, match in enumerate(SENSITIVE_COMPARISON_RE.finditer(text), start=1):
+        if candidate_count > MAX_COMPARISON_CANDIDATES:
+            return REDACTED_EVIDENCE_VALUE
+        if _is_inside_quoted_literal(text, 0, match.start()):
+            continue
+        start = _last_unquoted_statement_boundary(text, 0, match.start())
+        end = _find_value_expression_end(text, match.end(), len(text))
+        if start < end:
+            spans.append((start, end))
+
+    if not spans:
+        return text
+
+    merged_spans: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged_spans and start <= merged_spans[-1][1]:
+            merged_spans[-1] = (merged_spans[-1][0], max(merged_spans[-1][1], end))
+        else:
+            merged_spans.append((start, end))
+
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in merged_spans:
+        pieces.append(text[cursor:start])
+        pieces.append(_redact_sensitive_command_value(text[start:end]))
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
 def _count_preceding_backslashes(text: str, position: int) -> int:
     count = 0
     index = position - 1
@@ -4050,6 +4096,7 @@ def redact_evidence_string(text: str, max_chars: int = 180) -> str:
     redacted = _normalize_quoted_sensitive_keys(redacted)
     redacted = _normalize_subscript_sensitive_keys(redacted)
     redacted = _normalize_unquoted_sensitive_keys(redacted)
+    redacted = _redact_sensitive_comparison_statements(redacted)
     redacted = _redact_sensitive_literal_expressions(redacted)
     folded = redacted.casefold()
     has_quotes = '"' in redacted or "'" in redacted
