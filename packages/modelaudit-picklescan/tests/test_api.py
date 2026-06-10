@@ -8054,6 +8054,10 @@ def test_scan_bytes_preserves_compact_base64_execution_payload_detection(
         ("=TlEu", "PERSISTENT_ID"),
         ("!ly4!=", "S601"),
         ("!UAo!u", "PERSISTENT_ID"),
+        ("AAAA=ly4=", "S601"),
+        ("AAAA==ly4=", "S601"),
+        ("grou=ly4=", "S601"),
+        ("A" * 64 + "=ly4=", "S601"),
     ],
 )
 def test_scan_bytes_preserves_lenient_compact_base64_security_evidence(
@@ -8067,6 +8071,33 @@ def test_scan_bytes_preserves_lenient_compact_base64_security_evidence(
 
     assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
     assert any(finding.rule_code == expected_rule for finding in report.findings)
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        "AAA=ly4=",
+        "AA==ly4=",
+        "A" * 63 + "=ly4=",
+        "A" * 63 + "==ly4=",
+        "A" * 66 + "==ly4=",
+    ],
+)
+def test_scan_bytes_ignores_compact_base64_tail_after_terminal_padding(encoded: str) -> None:
+    assert encoded.endswith("ly4=")
+    assert base64.b64decode(encoded[-4:]) == b"\x97."
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": encoded}, protocol=4),
+        source="terminal-padding-base64-tail.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert all(
+        notice.code not in {"encoded_nested_payload_detected", "nested_pickle_incomplete"} for notice in report.notices
+    )
 
 
 def test_scan_bytes_preserves_four_byte_data_only_base64_boundary() -> None:
