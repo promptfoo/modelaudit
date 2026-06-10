@@ -6790,7 +6790,8 @@ def test_pytorch_zip_entry_validation_checks_timeout_between_members(
     with zipfile.ZipFile(zip_path, "w") as zipf:
         for index in range(3):
             symlink_info = zipfile.ZipInfo(f"link_{index}")
-            symlink_info.external_attr = 0o120777 << 16
+            symlink_info.create_system = 3
+            symlink_info.external_attr = (stat.S_IFLNK | 0o777) << 16
             symlink_info.compress_type = zipfile.ZIP_STORED
             zipf.writestr(symlink_info, str(tmp_path / f"target_{index}"))
 
