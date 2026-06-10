@@ -10485,6 +10485,56 @@ mod tests {
     }
 
     #[test]
+    fn raw_nested_byte_literal_scan_honors_string_literal_budget() {
+        for (label, max_string_literal_scan_chars) in [("zero", 0), ("small", 8)] {
+            let options = ScanOptions {
+                timeout_s: DEFAULT_TIMEOUT_S,
+                max_opcodes: DEFAULT_MAX_OPCODES,
+                post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+                max_string_literal_scan_chars,
+                max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+                max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+            };
+            let mut nested_bytes = vec![b'A'; 64];
+            nested_bytes.extend_from_slice(b"cos\nsystem\n)R.");
+            nested_bytes.extend_from_slice(&[b'B'; 64]);
+            let mut payload = b"\x80\x04B".to_vec();
+            payload.extend_from_slice(&(nested_bytes.len() as u32).to_le_bytes());
+            payload.extend_from_slice(&nested_bytes);
+            payload.push(b'.');
+            let mut scan = ScanState::new(
+                format!("raw-nested-{label}-literal-budget.pkl"),
+                &payload,
+                &options,
+                Some(payload.len()),
+                0,
+                0,
+                None,
+            );
+
+            scan.run();
+
+            assert_eq!(
+                scan.status, "inconclusive",
+                "literal budget was not surfaced for {label}"
+            );
+            assert!(
+                !scan.findings.iter().any(|finding| {
+                    finding.rule_code == Some("DANGEROUS_CALL")
+                        && detail_string(&finding.details, "import_reference").as_deref()
+                            == Some("os.system")
+                }),
+                "raw nested scan exceeded the {label} string literal budget"
+            );
+            assert!(scan.notices.iter().any(|notice| {
+                notice.code == Some("literal_scan_truncated")
+                    && detail_usize(&notice.details, "max_string_literal_scan_chars")
+                        == Some(max_string_literal_scan_chars)
+            }));
+        }
+    }
+
+    #[test]
     fn legacy_string_opcodes_scan_raw_nested_payloads() {
         let options = ScanOptions {
             timeout_s: DEFAULT_TIMEOUT_S,

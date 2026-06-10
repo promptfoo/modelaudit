@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import zipfile
+import zlib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -26,8 +27,10 @@ from modelaudit import core as core_module
 from modelaudit.analysis.unified_context import UnifiedMLContext
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import normalize_material_scan_config
+from modelaudit.config import ModelAuditConfig, set_config
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
+from modelaudit.rules import Severity
 from modelaudit.scanners import (
     archive_dispatch,
     flax_msgpack_scanner,
@@ -38,6 +41,7 @@ from modelaudit.scanners import (
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
 from modelaudit.scanners.tf_metagraph_scanner import _MAX_PARSE_BYTES
+from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
 from modelaudit.scanners.zip_scanner import ZipScanner
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
@@ -72,6 +76,22 @@ from tests.helpers import (
 )
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
+
+
+def _mock_weight_distribution_scanner_availability(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_loader = core_module._registry.load_scanner_by_id
+
+    def load_scanner_by_id(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "weight_distribution":
+            return WeightDistributionScanner
+        return original_loader(scanner_id)
+
+    monkeypatch.setattr(core_module._registry, "load_scanner_by_id", load_scanner_by_id)
+    monkeypatch.setattr(
+        WeightDistributionScanner,
+        "can_handle",
+        classmethod(lambda _cls, _path: True),
+    )
 
 
 def _valid_elf64_header() -> bytes:
@@ -468,6 +488,34 @@ def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         for name, data in entries.items():
             archive.writestr(name, data)
+
+
+def _promote_small_zip_to_zip64(path: Path) -> None:
+    """Rewrite a small fixture with ZIP64 EOCD metadata while preserving its entries."""
+    archive_bytes = bytearray(path.read_bytes())
+    eocd_offset = archive_bytes.rfind(b"PK\x05\x06")
+    assert eocd_offset >= 0
+    entry_count = struct.unpack_from("<H", archive_bytes, eocd_offset + 10)[0]
+    directory_size = struct.unpack_from("<I", archive_bytes, eocd_offset + 12)[0]
+    directory_offset = struct.unpack_from("<I", archive_bytes, eocd_offset + 16)[0]
+
+    zip64_eocd = struct.pack(
+        "<4sQ2H2I4Q",
+        b"PK\x06\x06",
+        44,
+        45,
+        45,
+        0,
+        0,
+        entry_count,
+        entry_count,
+        directory_size,
+        directory_offset,
+    )
+    zip64_locator = struct.pack("<4sIQI", b"PK\x06\x07", 0, eocd_offset, 1)
+    archive_bytes[eocd_offset + 8 : eocd_offset + 12] = b"\xff" * 4
+    archive_bytes[eocd_offset + 12 : eocd_offset + 20] = b"\xff" * 8
+    path.write_bytes(archive_bytes[:eocd_offset] + zip64_eocd + zip64_locator + archive_bytes[eocd_offset:])
 
 
 def _append_hdf5_userblock_candidate(
@@ -2080,6 +2128,78 @@ def test_scan_file_rejects_over_entry_zip_before_routing_opens_zipfile(
     )
 
 
+def test_scan_file_enforces_zip_entry_preflight_for_offset_zero_hdf5(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    model_path = tmp_path / "appended-over-entry.h5"
+    with h5py.File(model_path, "w") as h5_file:
+        h5_file.attrs["model_config"] = json.dumps({"class_name": "Sequential", "config": {"layers": []}})
+    with zipfile.ZipFile(model_path, "a") as archive:
+        archive.writestr("payload.pkl", _build_malicious_pickle())
+        archive.writestr("README.txt", "benign model notes")
+
+    assert find_hdf5_signature_offset(str(model_path)) == 0
+    assert zipfile.is_zipfile(model_path)
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+        "max_zip_entries": 1,
+    }
+
+    reset_cache_manager()
+    try:
+        for _ in range(2):
+            result = scan_file(str(model_path), config=config)
+
+            assert result.scanner_name == "zip"
+            assert result.success is False
+            assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+            assert any(
+                check.name == "Entry Count Limit Check"
+                and check.status == CheckStatus.FAILED
+                and check.rule_code == "S410"
+                and check.details["entries"] == 2
+                and check.details["entry_count_source"] == "central_directory_preflight"
+                for check in result.checks
+            )
+
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        aggregate = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            max_zip_entries=1,
+        )
+        assert determine_exit_code(aggregate) == 1
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_keeps_within_limit_appended_zip_on_offset_zero_hdf5_route(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    model_path = tmp_path / "appended-within-entry.h5"
+    with h5py.File(model_path, "w") as h5_file:
+        h5_file.attrs["model_config"] = json.dumps({"class_name": "Sequential", "config": {"layers": []}})
+    with zipfile.ZipFile(model_path, "a") as archive:
+        archive.writestr("README.txt", "benign model notes")
+
+    assert find_hdf5_signature_offset(str(model_path)) == 0
+    assert zipfile.is_zipfile(model_path)
+
+    result = scan_file(
+        str(model_path),
+        config={"max_zip_entries": 1, "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "keras_h5"
+    assert result.success is True
+    assert "zip_analysis_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.rule_code == "S410" for check in result.checks)
+
+
 def test_scan_file_selected_keras_still_enforces_zip_entry_preflight(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2204,6 +2324,7 @@ def test_scan_file_selected_weight_distribution_routes_within_entry_limit(
         "modelaudit.scanners.weight_distribution_scanner.WeightDistributionScanner.scan",
         fake_weight_scan,
     )
+    _mock_weight_distribution_scanner_availability(monkeypatch)
 
     result = scan_file(
         str(archive_path),
@@ -4310,6 +4431,68 @@ def test_scan_file_honors_zip_only_selection_for_hdf5_userblock(tmp_path: Path) 
     )
 
 
+def test_scan_file_honors_pytorch_zip_only_selection_for_hdf5_userblock(tmp_path: Path) -> None:
+    polyglot = tmp_path / "selected-pytorch-zip-userblock.h5"
+    _create_misnamed_zip(
+        polyglot,
+        {
+            "archive/data.pkl": pickle.dumps(
+                {"endpoint": "http://attacker.example/model"},
+                protocol=4,
+            ),
+            "archive/version": b"3\n",
+            "archive/byteorder": b"little",
+        },
+    )
+    _append_hdf5_userblock_candidate(polyglot, plausible=True)
+
+    result = scan_file(
+        str(polyglot),
+        config={"scanners": ["pytorch_zip"], "cache_scan_results": False},
+    )
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{polyglot}:archive/data.pkl"
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "pytorch_zip"
+        for check in result.checks
+    )
+
+
+def test_scan_file_selected_weight_distribution_ignores_hdf5_userblock_zip_near_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "selected-weight-distribution-userblock.h5"
+    model_path.write_bytes(b"PK\x03\x04 benign model notes")
+    _append_hdf5_userblock_candidate(model_path, plausible=True)
+
+    def fake_weight_scan(_self: Any, path: str) -> ScanResult:
+        assert path == str(model_path)
+        result = ScanResult(scanner_name="weight_distribution")
+        result.finish(success=True)
+        return result
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.weight_distribution_scanner.WeightDistributionScanner.scan",
+        fake_weight_scan,
+    )
+    _mock_weight_distribution_scanner_availability(monkeypatch)
+
+    result = scan_file(
+        str(model_path),
+        config={"scanners": ["weight_distribution"], "cache_scan_results": False},
+    )
+
+    assert result.scanner_name == "weight_distribution"
+    assert result.success is True
+    assert not any(check.name == "HDF5 User Block ZIP Analysis" for check in result.checks)
+
+
 def test_scan_file_honors_zip_only_selection_for_large_hdf5_userblock(tmp_path: Path) -> None:
     polyglot = tmp_path / "selected-large-zip-userblock.h5"
     _create_misnamed_zip(polyglot, {"payload.pkl": _build_malicious_pickle()})
@@ -4527,6 +4710,164 @@ def test_scan_file_preserves_earlier_concatenated_hdf5_userblock_zip(
 
     _assert_system_pickle_detected(result, "payload.pkl")
     assert any(item.get("path") == f"{polyglot}:README.txt" for item in result.metadata["contents"])
+
+
+@pytest.mark.parametrize("trailing_zip64", [False, True])
+def test_hdf5_userblock_allows_zero_padding_between_concatenated_zip_segments(
+    tmp_path: Path,
+    trailing_zip64: bool,
+) -> None:
+    malicious_zip = tmp_path / "malicious-first.zip"
+    benign_zip = tmp_path / "benign-last.zip"
+    _create_misnamed_zip(malicious_zip, {"payload.pkl": _build_malicious_pickle()})
+    _create_misnamed_zip(benign_zip, {"README.txt": b"benign trailing archive"})
+    if trailing_zip64:
+        _promote_small_zip_to_zip64(benign_zip)
+
+    polyglot = tmp_path / "padded-concatenated-zip-userblock.h5"
+    polyglot.write_bytes(malicious_zip.read_bytes() + bytes(64) + benign_zip.read_bytes())
+    signature_offset = _append_hdf5_userblock_candidate(polyglot, plausible=True)
+    result = ScanResult(scanner_name="keras_h5")
+    result.finish(success=True)
+
+    archive_dispatch.merge_hdf5_userblock_zip_findings(
+        str(polyglot),
+        result,
+        {"cache_scan_results": False},
+        signature_offset,
+        context="test HDF5 user block",
+    )
+
+    _assert_system_pickle_detected(result, "payload.pkl")
+    assert any(item.get("path") == f"{polyglot}:README.txt" for item in result.metadata["contents"])
+    assert "hdf5_userblock_zip_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "HDF5 User Block ZIP Analysis" for check in result.checks)
+
+
+@pytest.mark.parametrize("trailing_zip64", [False, True])
+def test_scan_file_fails_closed_for_non_padding_between_concatenated_hdf5_userblock_zips(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trailing_zip64: bool,
+) -> None:
+    first_zip = tmp_path / "benign-first.zip"
+    trailing_zip = tmp_path / "benign-last.zip"
+    _create_misnamed_zip(first_zip, {"README-first.txt": b"benign first archive"})
+    _create_misnamed_zip(trailing_zip, {"README-last.txt": b"benign trailing archive"})
+    if trailing_zip64:
+        _promote_small_zip_to_zip64(trailing_zip)
+
+    polyglot = tmp_path / "non-padding-concatenated-zip-userblock.h5"
+    polyglot.write_bytes(first_zip.read_bytes() + _build_malicious_pickle() + trailing_zip.read_bytes())
+    _append_hdf5_userblock_candidate(polyglot, plausible=True)
+    cache_dir = tmp_path / "non-padding-concatenated-cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir), "min_cache_file_size": 0}
+    monkeypatch.setattr("modelaudit.scanners.keras_h5_scanner.HAS_H5PY", False)
+
+    reset_cache_manager()
+    try:
+        for _ in range(2):
+            result = scan_file(str(polyglot), config=config)
+
+            assert result.success is False
+            assert "hdf5_userblock_zip_scan_failed" in result.metadata["scan_outcome_reasons"]
+            assert any(
+                check.name == "HDF5 User Block ZIP Analysis"
+                and check.status == CheckStatus.FAILED
+                and "non-padding content between ZIP segments" in check.message
+                for check in result.checks
+            )
+        cache_stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+        assert cache_stats["cache_hits"] == 0
+        assert cache_stats["total_entries"] == 0
+
+        aggregate = scan_model_directory_or_file(str(polyglot), config={"cache_scan_results": False})
+        metadata = aggregate.file_metadata[str(polyglot)]
+        assert "hdf5_userblock_zip_scan_failed" in metadata["scan_outcome_reasons"]
+        assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+@pytest.mark.parametrize("malicious", [False, True])
+@pytest.mark.parametrize("nested_zip64", [False, True])
+def test_hdf5_userblock_outer_zip_preserves_entries_before_nested_end_record(
+    tmp_path: Path,
+    malicious: bool,
+    nested_zip64: bool,
+) -> None:
+    nested_zip = tmp_path / "nested.zip"
+    _create_misnamed_zip(nested_zip, {"README-nested.txt": b"benign nested archive"})
+    if nested_zip64:
+        _promote_small_zip_to_zip64(nested_zip)
+        nested_bytes = nested_zip.read_bytes()
+        nested_eocd_offset = nested_bytes.rfind(b"PK\x05\x06")
+        assert nested_bytes[nested_eocd_offset + 12 : nested_eocd_offset + 20] == b"\xff" * 8
+    with zipfile.ZipFile(nested_zip) as archive:
+        assert archive.namelist() == ["README-nested.txt"]
+
+    polyglot = tmp_path / "outer-nested-zip-userblock.h5"
+    with zipfile.ZipFile(polyglot, "w", compression=zipfile.ZIP_STORED) as archive:
+        if malicious:
+            archive.writestr("payload.pkl", _build_malicious_pickle())
+        else:
+            archive.writestr("README-outer.txt", b"benign outer archive")
+        archive.writestr("nested.bin", nested_zip.read_bytes())
+    signature_offset = _append_hdf5_userblock_candidate(polyglot, plausible=True)
+    result = ScanResult(scanner_name="keras_h5")
+    result.finish(success=True)
+
+    archive_dispatch.merge_hdf5_userblock_zip_findings(
+        str(polyglot),
+        result,
+        {"cache_scan_results": False},
+        signature_offset,
+        context="test HDF5 user block",
+    )
+
+    pickle_findings = [
+        issue
+        for issue in result.issues
+        if issue.rule_code == "S201"
+        and issue.details.get("zip_entry") == "payload.pkl"
+        and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+    ]
+    assert bool(pickle_findings) is malicious
+    assert not any(check.name == "HDF5 User Block ZIP Analysis" for check in result.checks)
+    assert (
+        bool([issue for issue in result.issues if issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)])
+        is malicious
+    )
+
+
+def test_hdf5_userblock_concatenated_outer_zip_ignores_nested_zip64_boundary(tmp_path: Path) -> None:
+    first_zip = tmp_path / "first.zip"
+    _create_misnamed_zip(first_zip, {"README-first.txt": b"benign first archive"})
+    nested_zip = tmp_path / "nested.zip"
+    _create_misnamed_zip(nested_zip, {"README-nested.txt": b"benign nested archive"})
+    _promote_small_zip_to_zip64(nested_zip)
+    outer_zip = tmp_path / "outer.zip"
+    with zipfile.ZipFile(outer_zip, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("payload.pkl", _build_malicious_pickle())
+        archive.writestr("nested.bin", nested_zip.read_bytes())
+
+    polyglot = tmp_path / "concatenated-nested-zip64-userblock.h5"
+    polyglot.write_bytes(first_zip.read_bytes() + outer_zip.read_bytes())
+    signature_offset = _append_hdf5_userblock_candidate(polyglot, plausible=True, minimum_signature_offset=2048)
+    result = ScanResult(scanner_name="keras_h5")
+    result.finish(success=True)
+
+    archive_dispatch.merge_hdf5_userblock_zip_findings(
+        str(polyglot),
+        result,
+        {"cache_scan_results": False},
+        signature_offset,
+        context="test HDF5 user block",
+    )
+
+    _assert_system_pickle_detected(result, "payload.pkl")
+    assert not any(check.name == "HDF5 User Block ZIP Analysis" for check in result.checks)
 
 
 def test_large_hdf5_userblock_copies_only_validated_zip_prefix(
@@ -8540,6 +8881,64 @@ def test_scan_file_routes_onnx_pb_by_content(tmp_path: Path) -> None:
 
     assert result.scanner_name == "onnx"
     assert not any(check.name == "Format Validation" for check in result.checks)
+
+
+def test_scan_file_attributes_format_mismatch_to_s901(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.safetensors"
+    malicious_pickle = b"cbuiltins\neval\n(S'1+1'\ntR."
+    model_path.write_bytes(zlib.compress(malicious_pickle))
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+    format_check = next(
+        check for check in result.checks if check.name == "Format Validation" and check.location == str(model_path)
+    )
+    format_issue = next(
+        issue for issue in result.issues if issue.message == format_check.message and issue.location == str(model_path)
+    )
+
+    assert format_check.status == CheckStatus.FAILED
+    assert format_check.rule_code == "S901"
+    assert format_check.details == {
+        "extension_format": "safetensors",
+        "header_format": "zlib",
+        "file_type_validation_failed": True,
+    }
+    assert format_issue.rule_code == "S901"
+    assert any(issue.rule_code == "S104" and "builtins.eval" in issue.message for issue in result.issues)
+
+
+def test_scan_file_accepts_matching_zlib_format_without_mismatch(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.zlib"
+    model_path.write_bytes(zlib.compress(b"benign model metadata"))
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "compressed"
+    assert result.success is True
+    assert not any(check.name == "Format Validation" for check in result.checks)
+    assert not any(issue.rule_code == "S901" for issue in result.issues)
+
+
+def test_scan_file_does_not_attribute_compatible_container_discrepancy_to_s901(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
+    rule_config = ModelAuditConfig()
+    rule_config.severity = {"S901": Severity.CRITICAL}
+    set_config(rule_config)
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+    format_check = next(
+        check for check in result.checks if check.name == "Format Validation" and check.location == str(model_path)
+    )
+    format_issue = next(
+        issue for issue in result.issues if issue.message == format_check.message and issue.location == str(model_path)
+    )
+
+    assert result.success is True
+    assert format_check.details["file_type_validation_failed"] is False
+    assert format_check.rule_code is None
+    assert format_check.severity == IssueSeverity.DEBUG
+    assert format_issue.rule_code is None
+    assert format_issue.severity == IssueSeverity.DEBUG
 
 
 def test_scan_file_detects_malicious_onnx_pb_by_content(tmp_path: Path) -> None:

@@ -911,6 +911,13 @@ pub(crate) fn encoded_nested_literal_probe_windows_with_limit(
             push_unique_window(&mut windows, take_last_chars(value, max_window_chars));
         }
     }
+    if prefix_consumes_literal {
+        return EncodedNestedProbeWindows {
+            windows,
+            limit_exceeded,
+            limit_exceeded_encoding,
+        };
+    }
 
     let prefix_is_complete_long_protocol0 = encoded_base64_first_byte(value.as_bytes())
         .is_some_and(is_protocol0_long_line_probe_opcode)
@@ -967,14 +974,6 @@ pub(crate) fn encoded_nested_literal_probe_windows_with_limit(
         limit_exceeded = true;
         limit_exceeded_encoding = Some("base64");
     }
-    if prefix_consumes_literal {
-        return EncodedNestedProbeWindows {
-            windows,
-            limit_exceeded,
-            limit_exceeded_encoding,
-        };
-    }
-
     let mid_scan_len = value.len().min(MAX_ENCODED_LITERAL_MID_SCAN_BYTES);
     for index in padded_prefix_end..mid_scan_len {
         if !value.is_char_boundary(index) {
@@ -2478,6 +2477,31 @@ mod tests {
         assert!(base64_prefix_has_pickle_prefix("gAR9Lg=="));
         assert!(hex_prefix_has_pickle_prefix("80047d2e"));
         assert!(hex_prefix_has_pickle_prefix(r"\x80\x04\x7d\x2e"));
+    }
+
+    #[test]
+    fn complete_base64_constructor_pickle_has_no_truncated_candidates() {
+        let decoded = concat!(
+            "gASVNQAAAAAAAACMC2NvbGxlY3Rpb25zlIwHQ291bnRlcpSTlH2UKIwBYZRLA4wB",
+            "YpRLAowBY5RLAXWFlFKULg==",
+        );
+
+        let candidates = decode_possible_encoded_pickle(decoded, TEST_MAX_NESTED_PICKLE_BYTES);
+        assert_eq!(candidates.len(), 1);
+        assert!(!candidates[0].analysis_incomplete);
+        assert_eq!(candidates[0].payload.len(), 64);
+        let windows = encoded_nested_literal_probe_windows_with_limit(
+            decoded,
+            encoded_nested_window_char_limit(decoded, TEST_MAX_NESTED_PICKLE_BYTES),
+        );
+        assert_eq!(
+            windows
+                .windows
+                .iter()
+                .map(|window| window.value.as_str())
+                .collect::<Vec<_>>(),
+            vec![decoded],
+        );
     }
 
     #[test]

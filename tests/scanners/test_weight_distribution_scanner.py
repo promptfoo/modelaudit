@@ -1,3 +1,4 @@
+import builtins
 import os
 import pickle
 import sys
@@ -1053,6 +1054,9 @@ def test_pytorch_primary_load_reuses_budgeted_handle_after_path_replacement(
 
     fake_torch.Tensor = FakeTensor
     fake_torch.device = lambda value: value
+    budgeted_handle: Any = None
+    loaded_handle: Any = None
+    loaded_payload: bytes | None = None
 
     def fake_load(
         handle: Any,
@@ -1060,8 +1064,10 @@ def test_pytorch_primary_load_reuses_budgeted_handle_after_path_replacement(
         map_location: object,
         weights_only: bool = False,
     ) -> dict[str, object]:
+        nonlocal loaded_handle, loaded_payload
         del map_location, weights_only
-        assert handle.read() == original_payload
+        loaded_handle = handle
+        loaded_payload = handle.read()
         return {}
 
     fake_torch.load = fake_load
@@ -1069,16 +1075,32 @@ def test_pytorch_primary_load_reuses_budgeted_handle_after_path_replacement(
 
     scanner = WeightDistributionScanner({"enable_unsafe_torch_load": True})
     original_budget_check = scanner._pytorch_load_handle_within_budget
+    original_open = builtins.open
+    path_reopened = False
+
+    def redirect_path_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal path_reopened
+        if str(file) == str(path):
+            path_reopened = True
+            file = replacement_path
+        return original_open(file, *args, **kwargs)
 
     def replace_path_after_budget(path_text: str, handle: Any, *, is_zip: bool) -> bool:
+        nonlocal budgeted_handle
         within_budget = original_budget_check(path_text, handle, is_zip=is_zip)
-        os.replace(replacement_path, path)
+        budgeted_handle = handle
+        monkeypatch.setattr(builtins, "open", redirect_path_open)
         return within_budget
 
     monkeypatch.setattr(scanner, "_pytorch_load_handle_within_budget", replace_path_after_budget)
 
     assert scanner._extract_pytorch_weights(str(path)) == {}
-    assert path.read_bytes() == replacement_payload
+    assert loaded_handle is budgeted_handle
+    assert loaded_payload == original_payload
+    assert path_reopened is False
+    with builtins.open(path, "rb") as reopened:
+        assert reopened.read() == replacement_payload
+    assert path_reopened is True
 
 
 def test_pytorch_zip_small_shared_sequence_is_not_treated_as_cycle(

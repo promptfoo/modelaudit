@@ -17,6 +17,9 @@ from modelaudit.core_results import (
     results_have_operational_error,
 )
 from modelaudit.integrations.source_redaction import (
+    redact_prevalidated_source_value as _redact_prevalidated_value_for_sarif,
+)
+from modelaudit.integrations.source_redaction import (
     redact_source_identifier as _redact_path_for_sarif,
 )
 from modelaudit.integrations.source_redaction import (
@@ -27,6 +30,7 @@ from modelaudit.integrations.source_redaction import (
 )
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import IssueSeverity
+from modelaudit.scanners._catboost_evidence_redaction import redact_evidence_string as _redact_catboost_evidence
 
 
 def format_sarif_output(
@@ -260,7 +264,15 @@ def _create_results(
         result["partialFingerprints"]["primaryLocationLineHash"] = fingerprint  # type: ignore[index]
 
         # Add properties with additional details
-        properties = _redact_value_for_sarif(dict(issue.details or {}))
+        # Revalidate CatBoost evidence before trusting its redaction markers, then
+        # apply source URL protection without discarding sanitized command context.
+        catboost_issue = getattr(issue, "type", None) == "catboost_check"
+        details = dict(issue.details or {})
+        if catboost_issue:
+            details = _redact_catboost_details_for_sarif(details)
+        properties = (
+            _redact_prevalidated_value_for_sarif(details) if catboost_issue else _redact_value_for_sarif(details)
+        )
         properties.pop("rule_code", None)
         properties.pop("issue_type", None)
         rule_code = _get_issue_rule_code(issue)
@@ -278,6 +290,25 @@ def _create_results(
         results.append(result)
 
     return results
+
+
+def _redact_catboost_details_for_sarif(value: Any) -> Any:
+    """Revalidate scanner-redacted CatBoost evidence before export."""
+    if isinstance(value, str):
+        return _redact_catboost_evidence(value, max_chars=len(value))
+    if isinstance(value, dict):
+        return {key: _redact_catboost_details_for_sarif(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_catboost_details_for_sarif(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_catboost_details_for_sarif(item) for item in value)
+    if isinstance(value, set):
+        return {_redact_catboost_details_for_sarif(item) for item in value}
+    if isinstance(value, frozenset):
+        return frozenset(_redact_catboost_details_for_sarif(item) for item in value)
+    # Unknown structured values and binary evidence still take the conservative
+    # generic path before the prevalidated source pass sees them.
+    return _redact_value_for_sarif(value)
 
 
 def _create_artifacts(audit_result: ModelAuditResultModel) -> list[dict[str, Any]]:

@@ -10,6 +10,7 @@ import pytest
 from modelaudit.cli import _format_scan_output
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.integrations.source_redaction import (
+    redact_prevalidated_source_value,
     redact_source_identifier,
     redact_source_reference,
     redact_source_text,
@@ -483,6 +484,224 @@ def test_redact_source_text_handles_dense_credential_assignments() -> None:
 
     assert "EXPORT-SECRET-123" not in redacted
     assert redacted.count("<redacted>") == 5_000
+
+
+@pytest.mark.parametrize("operator", ["!=", ">=", "<="])
+def test_sensitive_key_ordering_comparisons_are_not_treated_as_assignments(operator: str) -> None:
+    text = f'config={{"client_secret" {operator} "public": "os.system(15)"}}'
+
+    assert redact_source_text(text) == text
+
+
+def test_sensitive_key_equality_comparisons_redact_value_and_preserve_context() -> None:
+    text = 'config={"client_secret" == "public": "os.system(15)"}'
+
+    redacted = redact_source_text(text)
+
+    assert redacted == 'config={"client_secret" == <redacted>: "os.system(15)"}'
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'client_secret == "RAW-COMPARISON-SECRET-123456"',
+        "token==RAW-COMPARISON-SECRET-123456; visible=yes",
+    ],
+)
+def test_sensitive_key_comparison_values_are_redacted_in_generic_exports(text: str) -> None:
+    for redacted in (redact_source_text(text), redact_source_value(text)):
+        assert "RAW-COMPARISON-SECRET-123456" not in redacted
+        assert "<redacted>" in redacted
+
+
+def test_benign_comparisons_are_preserved_in_generic_exports() -> None:
+    text = "status == 200 and count == 5"
+
+    assert redact_source_text(text) == text
+
+
+def test_comparison_marker_tail_is_redacted_in_generic_exports() -> None:
+    text = 'client_secret == <redacted> + "RAW-MARKER-TAIL-SECRET-123456"'
+
+    redacted = redact_source_text(text)
+
+    assert "RAW-MARKER-TAIL-SECRET-123456" not in redacted
+    assert redacted == "client_secret == <redacted>"
+
+
+def test_exactly_redacted_comparison_value_is_preserved() -> None:
+    text = "client_secret == <redacted>"
+
+    assert redact_source_text(text) == text
+
+
+def test_reversed_literal_key_comparison_redacts_value_in_generic_exports() -> None:
+    text = '"OPAQUE-VALUE-CRED-123456" == "client_secret"; os.system("id")'
+
+    redacted = redact_source_text(text)
+
+    assert "OPAQUE-VALUE-CRED-123456" not in redacted
+    assert '<redacted> == "client_secret"' in redacted
+    assert 'os.system("id")' in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'label == "client_secret"; os.system("id")',
+        '"OPAQUE-VALUE" == "tokenizer"',
+    ],
+)
+def test_reversed_comparison_near_matches_are_preserved_in_generic_exports(text: str) -> None:
+    assert redact_source_text(text) == text
+
+
+def test_prevalidated_comparison_command_operands_are_preserved() -> None:
+    text = 'client_secret == os.system("id")'
+
+    assert redact_prevalidated_source_value(text) == text
+
+
+def test_preserved_redacted_assignment_does_not_exempt_neighboring_secret() -> None:
+    text = 'client_secret=os.system("curl -u alice:<redacted>"); token=RAW-NEIGHBOR-SECRET'
+
+    redacted = redact_prevalidated_source_value(text)
+
+    assert 'client_secret=os.system("curl -u alice:<redacted>")' in redacted
+    assert "RAW-NEIGHBOR-SECRET" not in redacted
+
+
+def test_preserved_marker_for_later_assignment_does_not_exempt_earlier_secret() -> None:
+    text = "log session=RAW-SESSION-SECRET-123456 password=<redacted> done"
+
+    redacted = redact_prevalidated_source_value(text)
+
+    assert "RAW-SESSION-SECRET-123456" not in redacted
+    assert "password=<redacted>" in redacted
+
+
+def test_catboost_sarif_revalidates_attacker_supplied_redaction_marker() -> None:
+    attacker_tail = "ATTACKER-MARKER-RAW-SECRET-123456"
+    result = create_initial_audit_result()
+    result.issues = [
+        Issue(
+            message="Suspicious command execution primitives detected",
+            severity=IssueSeverity.CRITICAL,
+            details={
+                "matches": [
+                    {
+                        "excerpt": (
+                            f'client_secret=os.system("<redacted> {attacker_tail}"); token=NEIGHBOR-RAW-SECRET-123456'
+                        ),
+                    }
+                ],
+                "set_evidence": {f'client_secret=os.system("<redacted> {attacker_tail}-SET")'},
+                "binary_evidence": f"token={attacker_tail}-BYTES".encode(),
+            },
+            type="catboost_check",
+            timestamp=time.time(),
+        )
+    ]
+    result.finalize_statistics()
+
+    output = format_sarif_output(result, ["/test/model.cbm"])
+
+    assert attacker_tail not in output
+    assert "NEIGHBOR-RAW-SECRET-123456" not in output
+    assert "client_secret=os.system(<redacted>)" in output
+
+
+@pytest.mark.parametrize(
+    ("excerpt", "secrets"),
+    [
+        (
+            'client_secret == "DIRECT-COMPARISON-SECRET-123456"; os.system("id")',
+            ("DIRECT-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'client_secret === "STRICT-COMPARISON-SECRET-123456"; os.system("id")',
+            ("STRICT-COMPARISON-SECRET-123456",),
+        ),
+        (
+            '"REVERSED-COMPARISON-SECRET-123456" == client_secret; os.system("id")',
+            ("REVERSED-COMPARISON-SECRET-123456",),
+        ),
+        (
+            '"LOW-COMPARISON-SECRET-123456" < client_secret < "HIGH-COMPARISON-SECRET-123456"; os.system("id")',
+            ("LOW-COMPARISON-SECRET-123456", "HIGH-COMPARISON-SECRET-123456"),
+        ),
+        (
+            'client_secret == ("PART-A-SECRET" + "CONCAT-COMPARISON-SECRET-123456"); os.system("id")',
+            ("PART-A-SECRET", "CONCAT-COMPARISON-SECRET-123456"),
+        ),
+        (
+            'client_secret == lookup("CALL-COMPARISON-SECRET-123456") if enabled '
+            'else "FALLBACK-COMPARISON-SECRET-123456"; os.system("id")',
+            ("CALL-COMPARISON-SECRET-123456", "FALLBACK-COMPARISON-SECRET-123456"),
+        ),
+        (
+            'client_secret == <redacted> + "MARKER-TAIL-COMPARISON-SECRET-123456"; os.system("id")',
+            ("MARKER-TAIL-COMPARISON-SECRET-123456",),
+        ),
+        (
+            '"client_secret" == "QUOTED-KEY-COMPARISON-SECRET-123456"; os.system("id")',
+            ("QUOTED-KEY-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'config["client_secret"] == "SUBSCRIPT-KEY-COMPARISON-SECRET-123456"; os.system("id")',
+            ("SUBSCRIPT-KEY-COMPARISON-SECRET-123456",),
+        ),
+        (
+            '(client_secret) == "GROUPED-KEY-COMPARISON-SECRET-123456"; os.system("id")',
+            ("GROUPED-KEY-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'config[("client" + "_secret")] == "COMPOSED-SUBSCRIPT-COMPARISON-SECRET-123456"; os.system("id")',
+            ("COMPOSED-SUBSCRIPT-COMPARISON-SECRET-123456",),
+        ),
+    ],
+)
+def test_catboost_sarif_redacts_sensitive_comparison_statements(
+    excerpt: str,
+    secrets: tuple[str, ...],
+) -> None:
+    result = create_initial_audit_result()
+    result.issues = [
+        Issue(
+            message="Suspicious command execution primitives detected",
+            severity=IssueSeverity.CRITICAL,
+            details={"matches": [{"excerpt": excerpt}]},
+            type="catboost_check",
+            timestamp=time.time(),
+        )
+    ]
+    result.finalize_statistics()
+
+    output = format_sarif_output(result, ["/test/model.cbm"])
+    properties = json.loads(output)["runs"][0]["results"][0]["properties"]
+    redacted_excerpt = properties["matches"][0]["excerpt"]
+
+    assert all(secret not in output for secret in secrets)
+    assert 'os.system("id")' in redacted_excerpt
+
+
+def test_catboost_sarif_preserves_sensitive_comparison_command_operand() -> None:
+    result = create_initial_audit_result()
+    result.issues = [
+        Issue(
+            message="Suspicious command execution primitives detected",
+            severity=IssueSeverity.CRITICAL,
+            details={"matches": [{"excerpt": 'client_secret == os.system("id")'}]},
+            type="catboost_check",
+            timestamp=time.time(),
+        )
+    ]
+    result.finalize_statistics()
+
+    output = format_sarif_output(result, ["/test/model.cbm"])
+    properties = json.loads(output)["runs"][0]["results"][0]["properties"]
+
+    assert 'os.system("id")' in properties["matches"][0]["excerpt"]
 
 
 @pytest.mark.parametrize(
