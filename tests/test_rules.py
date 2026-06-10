@@ -87,7 +87,7 @@ class TestRuleRegistry:
         assert "S101" in rules
         assert "S1110" in rules
 
-    def test_get_rules_by_range(self):
+    def test_get_rules_by_range(self) -> None:
         """Test getting rules by numeric range."""
         # Get code execution rules (S100-S199)
         rules = RuleRegistry.get_rules_by_range(100, 199)
@@ -95,6 +95,9 @@ class TestRuleRegistry:
         assert "S101" in rules
         assert "S110" in rules
         assert "S201" not in rules  # Pickle rule, not in range
+
+        framework_rules = RuleRegistry.get_rules_by_range(1100, 1199)
+        assert "S1111" in framework_rules
 
         # Get pickle rules (S200-S299)
         rules = RuleRegistry.get_rules_by_range(200, 299)

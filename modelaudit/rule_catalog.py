@@ -810,4 +810,16 @@ RULE_CATALOG: tuple[RuleCatalogEntry, ...] = (
         description="GGUF/GGML format security issues",
         patterns=(r"gguf", r"ggml", r"llama.*format"),
     ),
+    RuleCatalogEntry(
+        code="S1111",
+        name="ONNX custom operator domains",
+        severity="INFO",
+        description="ONNX model may depend on an external custom operator implementation",
+        patterns=(
+            r"onnx.*custom.*operator",
+            r"custom onnx operator",
+            r"custom operator domain",
+            r"custom.*onnx.*domain",
+        ),
+    ),
 )

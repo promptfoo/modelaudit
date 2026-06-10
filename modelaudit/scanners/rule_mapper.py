@@ -129,6 +129,10 @@ def get_embedded_code_rule_code(code_type: str) -> str | None:
         return _rule("S109")
     elif "native library loading" in code_lower or "ctypes" in code_lower:
         return _rule("S110")
+    elif "onnx" in code_lower and (
+        "custom_operator" in code_lower or "custom operator" in code_lower or "custom onnx operator" in code_lower
+    ):
+        return _rule("S1111")
     elif "torchscript" in code_lower or "jit" in code_lower:
         return _rule("S510")
     elif (
