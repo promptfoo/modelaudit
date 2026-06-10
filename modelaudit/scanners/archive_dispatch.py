@@ -253,6 +253,7 @@ def detect_safetensors_overlap_scanner_ids(path: str) -> frozenset[str]:
         if zipfile.is_zipfile(path):
             scanner_ids.add("zip")
     except OSError:
+        # ZIP overlap probing is supplemental; preserve the independent checks below.
         pass
     if hdf5_signature_offset is not None:
         try:
