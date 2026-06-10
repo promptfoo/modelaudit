@@ -14,15 +14,23 @@ from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
 from ..core_results import mark_operational_scan_error
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
-# Map supported SafeTensors dtypes to bit sizes for integrity checking
+# Map SafeTensors dtypes to bit sizes for integrity checking. Sub-byte
+# dtypes are valid only when the complete tensor occupies whole bytes.
 _DTYPE_BITS = {
     "BOOL": 8,
     "BF16": 16,
+    "C64": 64,
+    "F4": 4,
+    "F6_E2M3": 6,
+    "F6_E3M2": 6,
     "F16": 16,
     "F32": 32,
     "F64": 64,
     "F8_E4M3": 8,
+    "F8_E4M3FNUZ": 8,
     "F8_E5M2": 8,
+    "F8_E5M2FNUZ": 8,
+    "F8_E8M0": 8,
     "I8": 8,
     "I16": 16,
     "I32": 32,
