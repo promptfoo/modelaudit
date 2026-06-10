@@ -4561,6 +4561,84 @@ def test_scan_file_preserves_earlier_concatenated_hdf5_userblock_zip(
     assert any(item.get("path") == f"{polyglot}:README.txt" for item in result.metadata["contents"])
 
 
+@pytest.mark.parametrize("zip64", [False, True], ids=["standard", "zip64"])
+@pytest.mark.parametrize("malicious_gap", [False, True], ids=["zero-padding", "malicious-gap"])
+def test_hdf5_userblock_concatenated_zip_gap_requires_padding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    zip64: bool,
+    malicious_gap: bool,
+) -> None:
+    first_zip = tmp_path / "first.zip"
+    second_zip = tmp_path / "second.zip"
+    _create_misnamed_zip(first_zip, {"README-first.txt": b"first archive"})
+    if zip64:
+        with monkeypatch.context() as zip64_patch:
+            zip64_patch.setattr(zipfile, "ZIP_FILECOUNT_LIMIT", 0)
+            _create_misnamed_zip(second_zip, {"README-second.txt": b"second archive"})
+    else:
+        _create_misnamed_zip(second_zip, {"README-second.txt": b"second archive"})
+    assert (b"PK\x06\x06" in second_zip.read_bytes()) is zip64
+
+    gap = bytes(32)
+    if malicious_gap:
+        gap = bytes(8) + _build_malicious_pickle() + bytes(8)
+    polyglot = tmp_path / "inter-segment-gap-userblock.h5"
+    polyglot.write_bytes(first_zip.read_bytes() + gap + second_zip.read_bytes())
+    signature_offset = _append_hdf5_userblock_candidate(polyglot, plausible=True)
+    result = ScanResult(scanner_name="keras_h5")
+    result.finish(success=True)
+
+    archive_dispatch.merge_hdf5_userblock_zip_findings(
+        str(polyglot),
+        result,
+        {"cache_scan_results": False},
+        signature_offset,
+        context="test HDF5 user block",
+    )
+
+    if malicious_gap:
+        assert result.success is False
+        assert "hdf5_userblock_zip_scan_failed" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "HDF5 User Block ZIP Analysis"
+            and check.status == CheckStatus.FAILED
+            and "non-padding content between ZIP segments" in check.message
+            for check in result.checks
+        )
+
+        cache_dir = tmp_path / "cache"
+        config = {
+            "cache_enabled": True,
+            "cache_dir": str(cache_dir),
+            "min_cache_file_size": 0,
+        }
+        monkeypatch.setattr("modelaudit.scanners.keras_h5_scanner.HAS_H5PY", False)
+        reset_cache_manager()
+        try:
+            for _ in range(2):
+                scanned = scan_file(str(polyglot), config=config)
+                assert scanned.success is False
+                assert "hdf5_userblock_zip_scan_failed" in scanned.metadata["scan_outcome_reasons"]
+                assert any(
+                    check.name == "HDF5 User Block ZIP Analysis"
+                    and check.status == CheckStatus.FAILED
+                    and "non-padding content between ZIP segments" in check.message
+                    for check in scanned.checks
+                )
+
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+            aggregate = scan_model_directory_or_file(str(polyglot), config=config)
+            assert determine_exit_code(aggregate) == 2
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+    else:
+        assert result.success is True
+        assert "hdf5_userblock_zip_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
+        assert any(item.get("path") == f"{polyglot}:README-second.txt" for item in result.metadata["contents"])
+
+
 @pytest.mark.parametrize("malicious", [False, True], ids=["benign", "malicious"])
 def test_scan_file_preserves_outer_members_before_nested_hdf5_userblock_zip(
     tmp_path: Path,

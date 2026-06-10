@@ -526,6 +526,7 @@ def merge_hdf5_userblock_zip_findings(
                     logical_start,
                     logical_end,
                     temp_suffix,
+                    required_zero_prefix_length=earliest_member_offset - logical_start,
                 )
             else:
                 temp_path = _copy_file_prefix_to_temp(path, logical_end, temp_suffix)
@@ -701,20 +702,35 @@ def _find_earliest_zip_member_offset(path: str, logical_end: int) -> int:
         return 0
 
 
-def _copy_file_range_to_temp(path: str, start: int, end: int, suffix: str) -> str:
+def _copy_file_range_to_temp(
+    path: str,
+    start: int,
+    end: int,
+    suffix: str,
+    *,
+    required_zero_prefix_length: int = 0,
+) -> str:
     """Copy exactly one validated archive range to a temporary file."""
+    range_length = end - start
+    if not 0 <= required_zero_prefix_length <= range_length:
+        raise OSError("HDF5 user-block ZIP has an invalid member offset")
     temp_path: str | None = None
     try:
         with open(path, "rb") as source, tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
             source.seek(start)
             temp_path = temp_file.name
-            remaining = end - start
+            remaining = range_length
+            zero_prefix_remaining = required_zero_prefix_length
             while remaining > 0:
                 chunk = source.read(min(1024 * 1024, remaining))
                 if not chunk:
                     raise OSError("HDF5 user-block ZIP ended before its validated logical EOF")
+                zero_prefix_chunk_length = min(len(chunk), zero_prefix_remaining)
+                if chunk[:zero_prefix_chunk_length].rstrip(b"\x00"):
+                    raise OSError("HDF5 user block contains non-padding content between ZIP segments")
                 temp_file.write(chunk)
                 remaining -= len(chunk)
+                zero_prefix_remaining -= zero_prefix_chunk_length
         return temp_path
     except BaseException:
         if temp_path is not None:
