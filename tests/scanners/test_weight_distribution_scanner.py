@@ -1810,6 +1810,63 @@ class TestWeightDistributionScanner:
         assert extreme["details"]["affected_neurons"] == [3]
         assert extreme["details"]["minimum_extreme_weights_per_output"] == 5
 
+    def test_extreme_value_check_ignores_nonzero_constant_matrix(self) -> None:
+        import numpy as np
+
+        weights = np.full((100, 10), 3.0, dtype=np.float32)
+
+        anomalies = WeightDistributionScanner()._analyze_layer_weights(
+            "constant_matrix",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        assert not any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
+
+    def test_extreme_value_check_does_not_count_constant_outputs_as_robust_tails(self) -> None:
+        import numpy as np
+
+        weights = np.ones((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+
+        anomalies = WeightDistributionScanner()._analyze_layer_weights(
+            "constant_outputs_with_target",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
+        assert extreme["details"]["affected_neurons"] == [3]
+        assert extreme["details"]["tail_affected_outputs"] == 1
+        evidence = extreme["details"]["per_output_evidence"][0]
+        assert evidence["robust_count"] == 5
+        assert evidence["robust_support_count"] == 5
+
+    def test_extreme_value_check_preserves_sampled_zero_mad_plateau(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import numpy as np
+
+        monkeypatch.setattr(
+            "modelaudit.scanners.weight_distribution_scanner._EXTREME_WEIGHT_ROBUST_SAMPLE_SIZE",
+            32,
+        )
+        weights = np.zeros((352, 1), dtype=np.float32)
+        weights[::11, 0] = 10_000.0
+
+        anomalies = WeightDistributionScanner()._analyze_tensor_weight_extremes(
+            "sampled_zero_mad_plateau",
+            weights,
+            output_axes=(1,),
+        )
+
+        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
+        evidence = extreme["details"]["per_output_evidence"][0]
+        assert evidence["robust_median_magnitude"] == 10_000.0
+        assert evidence["robust_mad_scale"] == 0.0
+        assert evidence["robust_count"] == 32
+
     def test_extreme_value_check_detects_single_output_with_contaminated_threshold(self) -> None:
         import numpy as np
 

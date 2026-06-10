@@ -20,6 +20,7 @@ from modelaudit.detectors.network_comm import NetworkCommDetector
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.onnx_scanner import (
     ONNX_STRUCTURE_INCONCLUSIVE_REASON,
+    ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON,
     OnnxScanner,
     _confirmed_onnx_operator_findings,
     _confirmed_python_operator_findings,
@@ -56,6 +57,7 @@ def create_onnx_model(
     include_initializer: bool = True,
     initializer_consumer: str | None = None,
     custom_opset_version: int | None = None,
+    custom_uses_initializer: bool = False,
 ) -> Path:
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, list(tensor_shape) or [1])
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, list(tensor_shape) or [1])
@@ -64,7 +66,7 @@ def create_onnx_model(
     elif custom:
         node = helper.make_node(
             custom_op_type,
-            ["input"],
+            ["input", "W"] if custom_uses_initializer else ["input"],
             ["output"],
             domain=custom_domain,
             name="custom",
@@ -249,6 +251,428 @@ def create_transformed_onnx_weight_model(
     model.ir_version = 8
     onnx.checker.check_model(model)
     path = tmp_path / f"{transform.lower()}-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_training_transformed_weight_model(tmp_path: Path, *, transform: str) -> Path:
+    analysis_weights = np.zeros((100, 10), dtype=np.float32)
+    analysis_weights[50:55, 3] = 10.0
+    if transform == "Reshape":
+        initializers = [
+            onnx.numpy_helper.from_array(analysis_weights.reshape(-1), name="W"),
+            onnx.numpy_helper.from_array(np.asarray(analysis_weights.shape, dtype=np.int64), name="shape"),
+        ]
+        transform_nodes = [helper.make_node("Reshape", ["W", "shape"], ["X"])]
+    elif transform == "Cast":
+        initializers = [onnx.numpy_helper.from_array(analysis_weights.astype(np.int64), name="W")]
+        transform_nodes = [helper.make_node("Cast", ["W"], ["X"], to=TensorProto.FLOAT)]
+    elif transform == "CastReshape":
+        initializers = [
+            onnx.numpy_helper.from_array(analysis_weights.astype(np.int64).reshape(-1), name="W"),
+            onnx.numpy_helper.from_array(np.asarray(analysis_weights.shape, dtype=np.int64), name="shape"),
+        ]
+        transform_nodes = [
+            helper.make_node("Cast", ["W"], ["W_float"], to=TensorProto.FLOAT),
+            helper.make_node("Reshape", ["W_float", "shape"], ["X"]),
+        ]
+    else:
+        raise ValueError(f"Unsupported transform: {transform}")
+
+    main_input = helper.make_tensor_value_info("main_input", TensorProto.FLOAT, [1])
+    main_output = helper.make_tensor_value_info("main_output", TensorProto.FLOAT, [1])
+    main_graph = helper.make_graph(
+        [helper.make_node("Identity", ["main_input"], ["main_output"])],
+        "main_graph",
+        [main_input],
+        [main_output],
+    )
+    adam = helper.make_node(
+        "Adam",
+        ["R", "T", "X", "G", "V", "H"],
+        ["X_new", "V_new", "H_new"],
+        domain="ai.onnx.preview.training",
+    )
+    algorithm = helper.make_graph(
+        [*transform_nodes, adam],
+        "transformed_training_weight",
+        [
+            helper.make_tensor_value_info("R", TensorProto.FLOAT, []),
+            helper.make_tensor_value_info("T", TensorProto.INT64, []),
+            helper.make_tensor_value_info("G", TensorProto.FLOAT, [100, 10]),
+            helper.make_tensor_value_info("V", TensorProto.FLOAT, [100, 10]),
+            helper.make_tensor_value_info("H", TensorProto.FLOAT, [100, 10]),
+        ],
+        [
+            helper.make_tensor_value_info("X_new", TensorProto.FLOAT, [100, 10]),
+            helper.make_tensor_value_info("V_new", TensorProto.FLOAT, [100, 10]),
+            helper.make_tensor_value_info("H_new", TensorProto.FLOAT, [100, 10]),
+        ],
+        initializer=initializers,
+    )
+    training_info = onnx.TrainingInfoProto()
+    training_info.algorithm.CopyFrom(algorithm)
+    model = helper.make_model(
+        main_graph,
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("ai.onnx.preview.training", 1)],
+    )
+    model.ir_version = 8
+    model.training_info.append(training_info)
+    onnx.checker.check_model(model)
+    path = tmp_path / f"training-{transform.lower()}-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_nonweight_transformed_matmul_model(tmp_path: Path, *, transform: str) -> Path:
+    weights = np.zeros((10, 10), dtype=np.float32)
+    weights[3:8, 4] = 10.0
+    if transform == "Reshape":
+        initializers = [
+            onnx.numpy_helper.from_array(weights, name="W"),
+            onnx.numpy_helper.from_array(np.asarray([100], dtype=np.int64), name="shape"),
+        ]
+        nodes = [
+            helper.make_node("Reshape", ["W", "shape"], ["W_view"]),
+            helper.make_node("MatMul", ["X", "W_view"], ["Y"]),
+        ]
+        graph_inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [100])]
+        graph_outputs = [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])]
+    elif transform == "Cast":
+        initializers = [onnx.numpy_helper.from_array(weights, name="W")]
+        nodes = [
+            helper.make_node("Cast", ["W"], ["W_view"], to=TensorProto.INT64),
+            helper.make_node("MatMul", ["X", "W_view"], ["Y"]),
+        ]
+        graph_inputs = [helper.make_tensor_value_info("X", TensorProto.INT64, [1, 10])]
+        graph_outputs = [helper.make_tensor_value_info("Y", TensorProto.INT64, [1, 10])]
+    else:
+        raise ValueError(f"Unsupported transform: {transform}")
+
+    graph = helper.make_graph(nodes, "nonweight_transform", graph_inputs, graph_outputs, initializer=initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / f"nonweight-{transform.lower()}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_zipmap_classifier_model(tmp_path: Path) -> Path:
+    weights = onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.float32), name="W")
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])
+    map_type = helper.make_map_type_proto(
+        TensorProto.INT64,
+        helper.make_tensor_type_proto(TensorProto.FLOAT, []),
+    )
+    probabilities = helper.make_value_info("probabilities", helper.make_sequence_type_proto(map_type))
+    nodes = [
+        helper.make_node("MatMul", ["X", "W"], ["logits"]),
+        helper.make_node(
+            "ZipMap",
+            ["logits"],
+            ["probabilities"],
+            domain="ai.onnx.ml",
+            classlabels_int64s=list(range(10)),
+        ),
+    ]
+    graph = helper.make_graph(nodes, "zipmap_classifier", [X], [probabilities], initializer=[weights])
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("ai.onnx.ml", 3)],
+    )
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "zipmap-classifier.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_training_info_weight_model(tmp_path: Path) -> Path:
+    main_input = helper.make_tensor_value_info("main_input", TensorProto.FLOAT, [1])
+    main_output = helper.make_tensor_value_info("main_output", TensorProto.FLOAT, [1])
+    main_graph = helper.make_graph(
+        [helper.make_node("Identity", ["main_input"], ["main_output"])],
+        "main_graph",
+        [main_input],
+        [main_output],
+    )
+
+    weights = np.zeros((100, 10), dtype=np.float32)
+    weights[50:55, 3] = 10.0
+    algorithm_inputs = [
+        helper.make_tensor_value_info("R", TensorProto.FLOAT, []),
+        helper.make_tensor_value_info("T", TensorProto.INT64, []),
+        helper.make_tensor_value_info("G", TensorProto.FLOAT, [100, 10]),
+        helper.make_tensor_value_info("V", TensorProto.FLOAT, [100, 10]),
+        helper.make_tensor_value_info("H", TensorProto.FLOAT, [100, 10]),
+    ]
+    algorithm_outputs = [
+        helper.make_tensor_value_info("X_new", TensorProto.FLOAT, [100, 10]),
+        helper.make_tensor_value_info("V_new", TensorProto.FLOAT, [100, 10]),
+        helper.make_tensor_value_info("H_new", TensorProto.FLOAT, [100, 10]),
+    ]
+    algorithm = helper.make_graph(
+        [
+            helper.make_node(
+                "Adam",
+                ["R", "T", "X", "G", "V", "H"],
+                ["X_new", "V_new", "H_new"],
+                domain="ai.onnx.preview.training",
+            )
+        ],
+        "training_algorithm",
+        algorithm_inputs,
+        algorithm_outputs,
+        initializer=[onnx.numpy_helper.from_array(weights, name="X")],
+    )
+    training_info = onnx.TrainingInfoProto()
+    training_info.algorithm.CopyFrom(algorithm)
+    model = helper.make_model(
+        main_graph,
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("ai.onnx.preview.training", 1)],
+    )
+    model.ir_version = 8
+    model.training_info.append(training_info)
+    onnx.checker.check_model(model)
+    path = tmp_path / "training-info-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_cross_training_info_weight_model(tmp_path: Path) -> Path:
+    main_input = helper.make_tensor_value_info("main_input", TensorProto.FLOAT, [1])
+    main_output = helper.make_tensor_value_info("main_output", TensorProto.FLOAT, [1])
+    main_graph = helper.make_graph(
+        [helper.make_node("Identity", ["main_input"], ["main_output"])],
+        "main_graph",
+        [main_input],
+        [main_output],
+    )
+
+    weights = np.zeros((100, 10), dtype=np.float32)
+    weights[50:55, 3] = 10.0
+    first_algorithm = helper.make_graph(
+        [helper.make_node("Identity", ["W"], ["W_seeded"])],
+        "first_training_algorithm",
+        [],
+        [helper.make_tensor_value_info("W_seeded", TensorProto.FLOAT, [100, 10])],
+        initializer=[onnx.numpy_helper.from_array(weights, name="W")],
+    )
+    first_training_info = onnx.TrainingInfoProto()
+    first_training_info.algorithm.CopyFrom(first_algorithm)
+    first_binding = first_training_info.update_binding.add()
+    first_binding.key = "W"
+    first_binding.value = "W_seeded"
+
+    second_algorithm = helper.make_graph(
+        [
+            helper.make_node(
+                "Adam",
+                ["R", "T", "W", "G", "V", "H"],
+                ["W_updated", "V_updated", "H_updated"],
+                domain="ai.onnx.preview.training",
+            )
+        ],
+        "second_training_algorithm",
+        [
+            helper.make_tensor_value_info("R", TensorProto.FLOAT, []),
+            helper.make_tensor_value_info("T", TensorProto.INT64, []),
+            helper.make_tensor_value_info("G", TensorProto.FLOAT, [100, 10]),
+            helper.make_tensor_value_info("V", TensorProto.FLOAT, [100, 10]),
+            helper.make_tensor_value_info("H", TensorProto.FLOAT, [100, 10]),
+        ],
+        [
+            helper.make_tensor_value_info("W_updated", TensorProto.FLOAT, [100, 10]),
+            helper.make_tensor_value_info("V_updated", TensorProto.FLOAT, [100, 10]),
+            helper.make_tensor_value_info("H_updated", TensorProto.FLOAT, [100, 10]),
+        ],
+    )
+    second_training_info = onnx.TrainingInfoProto()
+    second_training_info.algorithm.CopyFrom(second_algorithm)
+    second_binding = second_training_info.update_binding.add()
+    second_binding.key = "W"
+    second_binding.value = "W_updated"
+
+    model = helper.make_model(
+        main_graph,
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("ai.onnx.preview.training", 1)],
+    )
+    model.ir_version = 8
+    model.training_info.extend([first_training_info, second_training_info])
+    onnx.checker.check_model(model)
+    path = tmp_path / "cross-training-info-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_training_initialization_reset_model(tmp_path: Path) -> Path:
+    main_input = helper.make_tensor_value_info("main_input", TensorProto.FLOAT, [1])
+    main_output = helper.make_tensor_value_info("main_output", TensorProto.FLOAT, [1])
+    main_weights = onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.float32), name="W")
+    main_graph = helper.make_graph(
+        [helper.make_node("Identity", ["main_input"], ["main_output"])],
+        "main_graph",
+        [main_input],
+        [main_output],
+        initializer=[main_weights],
+    )
+
+    reset_weights = np.zeros((100, 10), dtype=np.float32)
+    reset_weights[50:55, 3] = 10.0
+    reset_tensor = onnx.numpy_helper.from_array(reset_weights, name="reset_value")
+    initialization = helper.make_graph(
+        [helper.make_node("Constant", [], ["W_reset"], value=reset_tensor)],
+        "training_initialization",
+        [],
+        [helper.make_tensor_value_info("W_reset", TensorProto.FLOAT, [100, 10])],
+    )
+    training_info = onnx.TrainingInfoProto()
+    training_info.initialization.CopyFrom(initialization)
+    binding = training_info.initialization_binding.add()
+    binding.key = "W"
+    binding.value = "W_reset"
+
+    model = helper.make_model(main_graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    model.training_info.append(training_info)
+    onnx.checker.check_model(model)
+    path = tmp_path / "training-initialization-reset.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_read_only_main_initializer_training_model(tmp_path: Path) -> Path:
+    main_input = helper.make_tensor_value_info("main_input", TensorProto.FLOAT, [1])
+    main_output = helper.make_tensor_value_info("main_output", TensorProto.FLOAT, [1])
+    weights = onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.float32), name="W")
+    main_graph = helper.make_graph(
+        [helper.make_node("Identity", ["main_input"], ["main_output"])],
+        "main_graph",
+        [main_input],
+        [main_output],
+        initializer=[weights],
+    )
+    algorithm = helper.make_graph(
+        [helper.make_node("Identity", ["W"], ["snapshot"])],
+        "read_only_training_algorithm",
+        [],
+        [helper.make_tensor_value_info("snapshot", TensorProto.FLOAT, [100, 10])],
+    )
+    training_info = onnx.TrainingInfoProto()
+    training_info.algorithm.CopyFrom(algorithm)
+    model = helper.make_model(main_graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    model.training_info.append(training_info)
+    onnx.checker.check_model(model)
+    path = tmp_path / "read-only-main-initializer-training.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_non_weight_training_update_model(
+    tmp_path: Path,
+    *,
+    data_type: int,
+    op_type: str,
+    shape: tuple[int, ...] = (),
+    opset_version: int = 13,
+) -> Path:
+    numpy_dtype = (
+        np.bool_ if data_type == TensorProto.BOOL else np.float32 if data_type == TensorProto.FLOAT else np.int64
+    )
+    state = onnx.numpy_helper.from_array(np.ones(shape, dtype=numpy_dtype), name="state")
+    algorithm_initializers = []
+    if op_type in {
+        "BitwiseNot",
+        "Celu",
+        "Gelu",
+        "Hardmax",
+        "LogSoftmax",
+        "LpNormalization",
+        "Neg",
+        "Not",
+        "Round",
+        "Shrink",
+        "Softmax",
+        "Swish",
+    }:
+        node_inputs = ["state"]
+    elif op_type == "Where":
+        condition = onnx.numpy_helper.from_array(np.ones(shape, dtype=np.bool_), name="condition")
+        alternative = onnx.numpy_helper.from_array(np.ones(shape, dtype=numpy_dtype), name="alternative")
+        algorithm_initializers.extend([condition, alternative])
+        node_inputs = ["condition", "state", "alternative"]
+    else:
+        delta = onnx.numpy_helper.from_array(np.ones(shape, dtype=numpy_dtype), name="delta")
+        algorithm_initializers.append(delta)
+        node_inputs = ["state", "delta"]
+    main_input = helper.make_tensor_value_info("main_input", TensorProto.FLOAT, [1])
+    main_output = helper.make_tensor_value_info("main_output", TensorProto.FLOAT, [1])
+    main_graph = helper.make_graph(
+        [helper.make_node("Identity", ["main_input"], ["main_output"])],
+        "main_graph",
+        [main_input],
+        [main_output],
+        initializer=[state],
+    )
+    algorithm = helper.make_graph(
+        [helper.make_node(op_type, node_inputs, ["state_new"])],
+        "non_weight_training_update",
+        [],
+        [helper.make_tensor_value_info("state_new", data_type, list(shape))],
+        initializer=algorithm_initializers,
+    )
+    training_info = onnx.TrainingInfoProto()
+    training_info.algorithm.CopyFrom(algorithm)
+    binding = training_info.update_binding.add()
+    binding.key = "state"
+    binding.value = "state_new"
+    model = helper.make_model(main_graph, opset_imports=[helper.make_opsetid("", opset_version)])
+    model.ir_version = 8
+    model.training_info.append(training_info)
+    onnx.checker.check_model(model)
+    path = tmp_path / f"non-weight-{op_type.lower()}-training-update.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_flat_training_initialization_reset_model(tmp_path: Path) -> Path:
+    stored_weights = np.zeros(1000, dtype=np.float32)
+    shape = onnx.numpy_helper.from_array(np.asarray([100, 10], dtype=np.int64), name="shape")
+    weights = onnx.numpy_helper.from_array(stored_weights, name="W")
+    main_input = helper.make_tensor_value_info("main_input", TensorProto.FLOAT, [1, 100])
+    main_output = helper.make_tensor_value_info("main_output", TensorProto.FLOAT, [1, 10])
+    main_graph = helper.make_graph(
+        [
+            helper.make_node("Reshape", ["W", "shape"], ["W_matrix"]),
+            helper.make_node("MatMul", ["main_input", "W_matrix"], ["main_output"]),
+        ],
+        "main_graph",
+        [main_input],
+        [main_output],
+        initializer=[weights, shape],
+    )
+
+    reset_weights = np.zeros(1000, dtype=np.float32)
+    reset_weights.reshape(100, 10)[50:55, 3] = 10.0
+    reset_tensor = onnx.numpy_helper.from_array(reset_weights, name="reset_value")
+    initialization = helper.make_graph(
+        [helper.make_node("Constant", [], ["reset"], value=reset_tensor)],
+        "flat_training_initialization",
+        [],
+        [helper.make_tensor_value_info("reset", TensorProto.FLOAT, [1000])],
+    )
+    training_info = onnx.TrainingInfoProto()
+    training_info.initialization.CopyFrom(initialization)
+    binding = training_info.initialization_binding.add()
+    binding.key = "W"
+    binding.value = "reset"
+    model = helper.make_model(main_graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    model.training_info.append(training_info)
+    onnx.checker.check_model(model)
+    path = tmp_path / "flat-training-initialization-reset.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -1841,6 +2265,8 @@ def test_onnx_scanner_standard_ai_onnx_ml_domain_not_flagged(tmp_path: Path) -> 
         f"Expected no custom-domain finding for ai.onnx.ml. Checks: {[c.message for c in result.checks]}"
     )
     assert "ai.onnx.ml" not in metadata_custom_domains
+    assert result.success is True
+    assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
 
 
 def test_onnx_scanner_standard_preview_training_domain_not_flagged(tmp_path: Path) -> None:
@@ -1855,6 +2281,8 @@ def test_onnx_scanner_standard_preview_training_domain_not_flagged(tmp_path: Pat
         f"Expected no custom-domain finding for ai.onnx.preview.training. Checks: {[c.message for c in result.checks]}"
     )
     assert "ai.onnx.preview.training" not in metadata_custom_domains
+    assert result.success is True
+    assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
 
 
 def test_onnx_scanner_registered_ai_onnx_preview_operator_not_flagged(
@@ -1877,6 +2305,671 @@ def test_onnx_scanner_registered_ai_onnx_preview_operator_not_flagged(
         f"Expected no custom-domain finding for ai.onnx.preview. Checks: {[c.message for c in result.checks]}"
     )
     assert "ai.onnx.preview" not in metadata_custom_domains
+    assert result.success is True
+    assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+
+
+def test_onnx_scanner_registered_onnx_ml_static_data_stays_clean(tmp_path: Path) -> None:
+    data = onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.float32), name="data")
+    output = helper.make_tensor_value_info("output", TensorProto.FLOAT, [100, 10])
+    normalizer = helper.make_node("Normalizer", ["data"], ["output"], domain="ai.onnx.ml")
+    graph = helper.make_graph([normalizer], "onnx_ml_static_data", [], [output], initializer=[data])
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("ai.onnx.ml", 3)],
+    )
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    model_path = tmp_path / "onnx-ml-static-data.onnx"
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+    semantics = result.metadata["onnx_weight_distribution_semantics"]
+    assert semantics["eligible_initializer_count"] == 0
+    assert semantics["coverage_gaps"] == {}
+
+
+def test_onnx_scanner_static_onnx_ml_output_used_as_weight_fails_closed(tmp_path: Path) -> None:
+    left_data = np.zeros((100, 100), dtype=np.float32)
+    left_data[0, 0] = 1e20
+    initializers = [
+        onnx.numpy_helper.from_array(left_data, name="left_data"),
+        onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.float32), name="right_weight"),
+    ]
+    output = helper.make_tensor_value_info("output", TensorProto.FLOAT, [100, 10])
+    nodes = [
+        helper.make_node("Normalizer", ["left_data"], ["left_normalized"], domain="ai.onnx.ml"),
+        helper.make_node("MatMul", ["left_normalized", "right_weight"], ["output"]),
+    ]
+    graph = helper.make_graph(nodes, "onnx_ml_static_weight_path", [], [output], initializer=initializers)
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("ai.onnx.ml", 3)],
+    )
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    model_path = tmp_path / "onnx-ml-static-weight-path.onnx"
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    coverage_checks = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+    semantics = result.metadata["onnx_weight_distribution_semantics"]
+    assert semantics["eligible_initializer_count"] == 2
+    assert semantics["analyzed_layer_count"] == 1
+
+
+def test_onnx_scanner_onnx_ml_bookkeeping_initializer_stays_clean(tmp_path: Path) -> None:
+    features = helper.make_tensor_value_info("features", TensorProto.FLOAT, [1, 2])
+    output = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 1])
+    indices = helper.make_tensor("indices", TensorProto.INT64, [1], [0])
+    node = helper.make_node(
+        "ArrayFeatureExtractor",
+        ["features", "indices"],
+        ["output"],
+        domain="ai.onnx.ml",
+    )
+    graph = helper.make_graph([node], "feature_extractor", [features], [output], initializer=[indices])
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("ai.onnx.ml", 3)],
+    )
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    model_path = tmp_path / "array-feature-extractor.onnx"
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+    semantics = result.metadata["onnx_weight_distribution_semantics"]
+    assert semantics["eligible_initializer_count"] == 0
+    assert semantics["coverage_gaps"] == {}
+
+
+@pytest.mark.parametrize("transform", ["Add", "Sub", "Abs"])
+def test_onnx_scanner_transformed_onnx_ml_bookkeeping_initializer_stays_clean(
+    tmp_path: Path,
+    transform: str,
+) -> None:
+    features = helper.make_tensor_value_info("features", TensorProto.FLOAT, [1, 2])
+    output = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 1])
+    indices = helper.make_tensor("indices", TensorProto.INT64, [1], [0])
+    graph_inputs = [features]
+    if transform == "Abs":
+        transform_node = helper.make_node(transform, ["indices"], ["dynamic_indices"])
+    else:
+        graph_inputs.append(helper.make_tensor_value_info("offset", TensorProto.INT64, [1]))
+        transform_node = helper.make_node(transform, ["indices", "offset"], ["dynamic_indices"])
+    nodes = [
+        transform_node,
+        helper.make_node(
+            "ArrayFeatureExtractor",
+            ["features", "dynamic_indices"],
+            ["output"],
+            domain="ai.onnx.ml",
+        ),
+    ]
+    graph = helper.make_graph(nodes, "transformed_feature_extractor", graph_inputs, [output], [indices])
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("ai.onnx.ml", 3)],
+    )
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    model_path = tmp_path / "transformed-array-feature-extractor.onnx"
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+    semantics = result.metadata["onnx_weight_distribution_semantics"]
+    assert semantics["eligible_initializer_count"] == 0
+    assert semantics["coverage_gaps"] == {}
+
+
+def test_onnx_scanner_onnx_ml_selector_does_not_taint_downstream_weights(tmp_path: Path) -> None:
+    features = helper.make_tensor_value_info("features", TensorProto.FLOAT, [1, 4])
+    output = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3])
+    indices = helper.make_tensor("indices", TensorProto.INT64, [2], [0, 1])
+    weights = onnx.numpy_helper.from_array(np.zeros((2, 3), dtype=np.float32), name="W")
+    nodes = [
+        helper.make_node(
+            "ArrayFeatureExtractor",
+            ["features", "indices"],
+            ["selected"],
+            domain="ai.onnx.ml",
+        ),
+        helper.make_node("MatMul", ["selected", "W"], ["output"]),
+    ]
+    graph = helper.make_graph(nodes, "feature_selection_matmul", [features], [output], [indices, weights])
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("ai.onnx.ml", 3)],
+    )
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    model_path = tmp_path / "feature-selection-matmul.onnx"
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+    semantics = result.metadata["onnx_weight_distribution_semantics"]
+    assert semantics["eligible_initializer_count"] == 1
+    assert semantics["analyzed_layer_count"] == 1
+    assert semantics["coverage_gaps"] == {}
+
+
+@pytest.mark.parametrize("transform", ["Reshape", "Cast", "CastReshape"])
+def test_onnx_scanner_training_consumer_uses_effective_lineage_shape_and_dtype(
+    tmp_path: Path,
+    transform: str,
+) -> None:
+    model_path = create_training_transformed_weight_model(tmp_path, transform=transform)
+
+    result = OnnxScanner().scan(str(model_path))
+
+    coverage_checks = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+    assert result.success is False
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+
+
+@pytest.mark.parametrize("transform", ["Reshape", "Cast"])
+def test_onnx_scanner_nonweight_effective_transform_stays_clean(tmp_path: Path, transform: str) -> None:
+    model_path = create_nonweight_transformed_matmul_model(tmp_path, transform=transform)
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+    semantics = result.metadata["onnx_weight_distribution_semantics"]
+    assert semantics["eligible_initializer_count"] == 0
+    assert semantics["coverage_gaps"] == {}
+
+
+def test_onnx_scanner_zipmap_activation_lineage_stays_clean(tmp_path: Path) -> None:
+    model_path = create_zipmap_classifier_model(tmp_path)
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+    semantics = result.metadata["onnx_weight_distribution_semantics"]
+    assert semantics["eligible_initializer_count"] == 1
+    assert semantics["analyzed_layer_count"] == 1
+    assert semantics["coverage_gaps"] == {}
+
+
+def test_onnx_scanner_training_graph_opaque_weight_consumer_fails_closed(tmp_path: Path) -> None:
+    model_path = create_training_info_weight_model(tmp_path)
+
+    result = OnnxScanner().scan(str(model_path))
+
+    coverage_checks = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+    assert result.success is False
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+    semantics = result.metadata["onnx_weight_distribution_semantics"]
+    assert semantics["eligible_initializer_count"] == 1
+    assert semantics["unresolved_lineage_samples"][0]["consumer_op"] == "Adam"
+
+
+def test_onnx_scanner_read_only_main_initializer_is_visible_to_training_graph(tmp_path: Path) -> None:
+    model_path = create_read_only_main_initializer_training_model(tmp_path)
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+    semantics = result.metadata["onnx_weight_distribution_semantics"]
+    assert semantics["eligible_initializer_count"] == 0
+    assert semantics["coverage_gaps"] == {}
+
+
+@pytest.mark.parametrize(
+    ("data_type", "op_type", "shape", "opset_version"),
+    [
+        pytest.param(TensorProto.INT64, "Sub", (), 13, id="integer-counter"),
+        pytest.param(TensorProto.FLOAT, "Add", (), 13, id="floating-learning-rate"),
+        pytest.param(TensorProto.FLOAT, "Neg", (), 13, id="unary-negation"),
+        pytest.param(TensorProto.FLOAT, "Round", (), 13, id="unary-rounding"),
+        pytest.param(TensorProto.FLOAT, "Clip", (), 13, id="clipped-scalar"),
+        pytest.param(TensorProto.FLOAT, "Celu", (), 13, id="celu-scalar"),
+        pytest.param(TensorProto.FLOAT, "Shrink", (), 13, id="shrunk-scalar"),
+        pytest.param(TensorProto.FLOAT, "PRelu", (), 13, id="prelu-scalar"),
+        pytest.param(TensorProto.FLOAT, "Sum", (), 13, id="summed-scalar"),
+        pytest.param(TensorProto.FLOAT, "Pow", (), 13, id="powered-scalar"),
+        pytest.param(TensorProto.FLOAT, "Where", (), 13, id="selected-scalar"),
+        pytest.param(TensorProto.FLOAT, "Softmax", (3,), 13, id="softmax-vector"),
+        pytest.param(TensorProto.FLOAT, "LogSoftmax", (3,), 13, id="log-softmax-vector"),
+        pytest.param(TensorProto.FLOAT, "Hardmax", (3,), 13, id="hardmax-vector"),
+        pytest.param(TensorProto.FLOAT, "LpNormalization", (3,), 13, id="normalized-vector"),
+        pytest.param(TensorProto.FLOAT, "Gelu", (), 20, id="gelu-scalar"),
+        pytest.param(TensorProto.FLOAT, "Swish", (), 24, id="swish-scalar"),
+        pytest.param(TensorProto.INT64, "BitwiseNot", (), 18, id="bitwise-not-scalar"),
+        pytest.param(TensorProto.BOOL, "Not", (), 13, id="not-scalar"),
+    ],
+)
+def test_onnx_scanner_non_weight_training_update_stays_clean(
+    tmp_path: Path,
+    data_type: int,
+    op_type: str,
+    shape: tuple[int, ...],
+    opset_version: int,
+) -> None:
+    model_path = create_non_weight_training_update_model(
+        tmp_path,
+        data_type=data_type,
+        op_type=op_type,
+        shape=shape,
+        opset_version=opset_version,
+    )
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+    semantics = result.metadata["onnx_weight_distribution_semantics"]
+    assert semantics["eligible_initializer_count"] == 0
+    assert semantics["coverage_gaps"] == {}
+
+
+@pytest.mark.parametrize(
+    "parameter_shape",
+    [
+        pytest.param((), id="scalar"),
+        pytest.param((100,), id="vector"),
+        pytest.param((1, 100), id="matrix"),
+    ],
+)
+def test_onnx_scanner_dynamic_prelu_slope_stays_clean(
+    tmp_path: Path,
+    parameter_shape: tuple[int, ...],
+) -> None:
+    activation = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])
+    output = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])
+    parameter = onnx.numpy_helper.from_array(np.ones(parameter_shape, dtype=np.float32), name="parameter")
+    weights = onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.float32), name="W")
+    graph = helper.make_graph(
+        [
+            helper.make_node("PRelu", ["X", "parameter"], ["activation"]),
+            helper.make_node("MatMul", ["activation", "W"], ["Y"]),
+        ],
+        "dynamic_prelu_slope",
+        [activation],
+        [output],
+        [parameter, weights],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    model_path = tmp_path / "dynamic-prelu-slope.onnx"
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+    semantics = result.metadata["onnx_weight_distribution_semantics"]
+    expected_eligible = 2 if len(parameter_shape) >= 2 else 1
+    expected_analyzed = 3 if len(parameter_shape) >= 2 else 1
+    assert semantics["eligible_initializer_count"] == expected_eligible
+    assert semantics["analyzed_layer_count"] == expected_analyzed
+    assert semantics["coverage_gaps"] == {}
+
+
+@pytest.mark.parametrize("transposed", [False, True])
+def test_onnx_scanner_malicious_matrix_prelu_slope_remains_detected(
+    tmp_path: Path,
+    transposed: bool,
+) -> None:
+    slope_values = np.zeros((100, 10), dtype=np.float32)
+    slope_values[50:55, 3] = 10.0
+    if transposed:
+        slope_values = slope_values.T
+    rows, columns = slope_values.shape
+    activation = helper.make_tensor_value_info("X", TensorProto.FLOAT, [rows, columns])
+    output = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [rows, 3])
+    slope = onnx.numpy_helper.from_array(slope_values, name="slope")
+    weights = onnx.numpy_helper.from_array(np.zeros((columns, 3), dtype=np.float32), name="W")
+    graph = helper.make_graph(
+        [
+            helper.make_node("PRelu", ["X", "slope"], ["activation"]),
+            helper.make_node("MatMul", ["activation", "W"], ["Y"]),
+        ],
+        "malicious_matrix_prelu_slope",
+        [activation],
+        [output],
+        [slope, weights],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    model_path = tmp_path / "malicious-matrix-prelu-slope.onnx"
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    extreme_checks = [
+        check
+        for check in result.checks
+        if check.name == "Weight Distribution Anomaly Detection" and "extremely large weight values" in check.message
+    ]
+    assert len(extreme_checks) == 1
+    assert extreme_checks[0].details["initializer"] == "slope"
+    assert extreme_checks[0].details["consumer_op"] == "PRelu"
+    assert extreme_checks[0].details["consumer_input_index"] == 1
+    assert extreme_checks[0].details["affected_neurons"] == [3]
+    assert extreme_checks[0].details["output_axis"] == (0 if transposed else 1)
+    semantics = result.metadata["onnx_weight_distribution_semantics"]
+    assert semantics["coverage_gaps"] == {}
+
+
+@pytest.mark.parametrize("slope_shape", [(100, 1, 1), (1, 100, 1, 1)])
+def test_onnx_scanner_prelu_singleton_axes_do_not_duplicate_findings(
+    tmp_path: Path,
+    slope_shape: tuple[int, ...],
+) -> None:
+    slope_values = np.zeros(slope_shape, dtype=np.float32)
+    non_singleton_axis = slope_shape.index(100)
+    outlier_slice: list[int | slice] = [0] * len(slope_shape)
+    outlier_slice[non_singleton_axis] = slice(50, 55)
+    slope_values[tuple(outlier_slice)] = 10.0
+    activation = helper.make_tensor_value_info("X", TensorProto.FLOAT, list(slope_shape))
+    output = helper.make_tensor_value_info("Y", TensorProto.FLOAT, list(slope_shape))
+    slope = onnx.numpy_helper.from_array(slope_values, name="slope")
+    graph = helper.make_graph(
+        [helper.make_node("PRelu", ["X", "slope"], ["Y"])],
+        "prelu_singleton_axes",
+        [activation],
+        [output],
+        [slope],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    model_path = tmp_path / "prelu-singleton-axes.onnx"
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    extreme_checks = [
+        check
+        for check in result.checks
+        if check.name == "Weight Distribution Anomaly Detection" and "extremely large weight values" in check.message
+    ]
+    assert len(extreme_checks) == 1
+    assert extreme_checks[0].details["initializer"] == "slope"
+    semantics = result.metadata["onnx_weight_distribution_semantics"]
+    assert semantics["eligible_initializer_count"] == 1
+    assert semantics["analyzed_layer_count"] == 2
+    assert semantics["coverage_gaps"] == {}
+
+
+def test_onnx_scanner_matrix_clip_bound_fails_closed(tmp_path: Path) -> None:
+    scalar = helper.make_tensor_value_info("X", TensorProto.FLOAT, [])
+    output = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])
+    matrix_bound = onnx.numpy_helper.from_array(np.zeros((2, 2), dtype=np.float32), name="minimum")
+    graph = helper.make_graph(
+        [helper.make_node("Clip", ["X", "minimum"], ["Y"])],
+        "invalid_matrix_clip_bound",
+        [scalar],
+        [output],
+        [matrix_bound],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    model_path = tmp_path / "matrix-clip-bound.onnx"
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    coverage_checks = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+    samples = result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
+    assert {sample["reason"] for sample in samples} == {"invalid_clip_bound_shape"}
+
+
+def test_onnx_scanner_transformed_non_scalar_clip_bound_fails_closed(tmp_path: Path) -> None:
+    scalar = helper.make_tensor_value_info("X", TensorProto.FLOAT, [])
+    output = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])
+    matrix_bound = onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.float32), name="minimum_matrix")
+    vector_shape = onnx.numpy_helper.from_array(np.asarray([1000], dtype=np.int64), name="vector_shape")
+    graph = helper.make_graph(
+        [
+            helper.make_node("Reshape", ["minimum_matrix", "vector_shape"], ["minimum"]),
+            helper.make_node("Clip", ["X", "minimum"], ["Y"]),
+        ],
+        "transformed_invalid_clip_bound",
+        [scalar],
+        [output],
+        [matrix_bound, vector_shape],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    model_path = tmp_path / "transformed-non-scalar-clip-bound.onnx"
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    coverage_checks = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+    samples = result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
+    assert {sample["reason"] for sample in samples} == {"invalid_clip_bound_shape"}
+
+
+@pytest.mark.parametrize(
+    ("op_type", "opset_version"),
+    [
+        pytest.param("Gelu", 20, id="gelu"),
+        pytest.param("Swish", 24, id="swish"),
+    ],
+)
+def test_onnx_scanner_static_matrix_unary_output_used_as_weight_fails_closed(
+    tmp_path: Path,
+    op_type: str,
+    opset_version: int,
+) -> None:
+    data = onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.float32), name="data")
+    weights = onnx.numpy_helper.from_array(np.zeros((10, 3), dtype=np.float32), name="W")
+    output = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [100, 3])
+    graph = helper.make_graph(
+        [
+            helper.make_node(op_type, ["data"], ["transformed"]),
+            helper.make_node("MatMul", ["transformed", "W"], ["Y"]),
+        ],
+        f"static_{op_type.lower()}_weight_path",
+        [],
+        [output],
+        [data, weights],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", opset_version)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    model_path = tmp_path / f"static-{op_type.lower()}-weight-path.onnx"
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    coverage_checks = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+
+
+@pytest.mark.parametrize("op_type", ["RandomNormalLike", "RandomUniformLike"])
+def test_onnx_scanner_random_like_dtype_override_used_as_weight_fails_closed(
+    tmp_path: Path,
+    op_type: str,
+) -> None:
+    shape_seed = onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.int64), name="shape_seed")
+    activation = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])
+    output = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])
+    graph = helper.make_graph(
+        [
+            helper.make_node(op_type, ["shape_seed"], ["generated_weight"], dtype=TensorProto.FLOAT),
+            helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+        ],
+        f"{op_type.lower()}_weight_path",
+        [activation],
+        [output],
+        [shape_seed],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 22)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    model_path = tmp_path / f"{op_type.lower()}-weight-path.onnx"
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    coverage_checks = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+
+
+def test_onnx_scanner_pow_exponent_dtype_override_used_as_weight_fails_closed(tmp_path: Path) -> None:
+    exponent = onnx.numpy_helper.from_array(np.ones((100, 10), dtype=np.int64), name="exponent")
+    base = helper.make_tensor_value_info("base", TensorProto.FLOAT, [100, 10])
+    activation = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])
+    output = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])
+    graph = helper.make_graph(
+        [
+            helper.make_node("Pow", ["base", "exponent"], ["generated_weight"]),
+            helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+        ],
+        "pow_exponent_weight_path",
+        [base, activation],
+        [output],
+        [exponent],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    model_path = tmp_path / "pow-exponent-weight-path.onnx"
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    coverage_checks = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+
+
+def test_onnx_scanner_cross_training_info_weight_state_fails_closed(tmp_path: Path) -> None:
+    model_path = create_cross_training_info_weight_model(tmp_path)
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    coverage_checks = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+    assert len(coverage_checks) == 1
+    semantics = result.metadata["onnx_weight_distribution_semantics"]
+    assert semantics["eligible_initializer_count"] == 1
+    assert semantics["coverage_gaps"]["unresolved_training_graph_input"] == 1
+    assert semantics["coverage_gaps"]["unresolved_training_binding"] == 1
+
+
+def test_onnx_scanner_training_initialization_binding_fails_closed(tmp_path: Path) -> None:
+    model_path = create_training_initialization_reset_model(tmp_path)
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    coverage_checks = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+    assert len(coverage_checks) == 1
+    semantics = result.metadata["onnx_weight_distribution_semantics"]
+    assert semantics["eligible_initializer_count"] == 1
+    assert any(
+        sample["reason"] == "unresolved_initialization_binding" for sample in semantics["unresolved_lineage_samples"]
+    )
+
+
+def test_onnx_scanner_flat_weight_initialization_binding_fails_closed(tmp_path: Path) -> None:
+    model_path = create_flat_training_initialization_reset_model(tmp_path)
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    coverage_checks = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+    assert len(coverage_checks) == 1
+    semantics = result.metadata["onnx_weight_distribution_semantics"]
+    assert semantics["eligible_initializer_count"] == 2
+    assert any(
+        sample["initializer"] == "reset" and sample["reason"] == "unresolved_initialization_binding"
+        for sample in semantics["unresolved_lineage_samples"]
+    )
+
+
+def test_onnx_scanner_combined_training_initializer_collision_fails_closed(tmp_path: Path) -> None:
+    model_path = create_flat_training_initialization_reset_model(tmp_path)
+    model = onnx.load(str(model_path))
+    colliding_algorithm = helper.make_graph(
+        [],
+        "colliding_training_algorithm",
+        [],
+        [],
+        initializer=[onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="W")],
+    )
+    model.training_info[0].algorithm.CopyFrom(colliding_algorithm)
+    onnx.checker.check_model(model)
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    coverage_checks = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["coverage_gaps"] == {"invalid_initializer_names": 1}
+    validation = result.metadata["onnx_weight_distribution_semantics"]["initializer_name_validation"]
+    assert validation["duplicate_name_count"] == 1
+    assert validation["samples"][0]["reason"] == "duplicate_combined_training_initializer_name"
+
+
+def test_onnx_scanner_unknown_default_domain_matrix_consumer_fails_closed(tmp_path: Path) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="",
+        custom_op_type="OpaqueKernel",
+        custom_uses_initializer=True,
+        tensor_shape=(100, 10),
+    )
+    model = onnx.load(str(model_path))
+    weights = np.zeros((100, 10), dtype=np.float32)
+    weights[50:55, 3] = 10.0
+    model.graph.initializer[0].CopyFrom(onnx.numpy_helper.from_array(weights, name="W"))
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    coverage_checks = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+    assert result.success is False
+    assert not [check for check in result.checks if check.rule_code == "S1111" and check.status == CheckStatus.FAILED]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+    sample = result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"][0]
+    assert sample["consumer_op"] == "OpaqueKernel"
+    assert sample["reason"] == "unsupported_weight_consumer"
 
 
 def test_onnx_scanner_unknown_ai_onnx_preview_operator_still_flagged(
@@ -3248,6 +4341,20 @@ class TestWeightDistributionCoverage:
         finally:
             reset_cache_manager()
 
+    def test_training_weight_coverage_gap_is_uncached_inconclusive(self, tmp_path: Path) -> None:
+        model_path = create_training_info_weight_model(tmp_path)
+
+        direct = OnnxScanner().scan(str(model_path))
+
+        coverage_checks = self._coverage_checks(direct)
+        assert len(coverage_checks) == 1
+        assert (
+            coverage_checks[0].message == "Weight distribution analysis skipped one or more eligible ONNX initializers"
+        )
+        assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+        self._assert_uncached_inconclusive_exit2(model_path, tmp_path / "cache")
+
     def test_missing_weight_distribution_dependency_ignores_model_without_initializers(
         self,
         tmp_path: Path,
@@ -3404,6 +4511,52 @@ class TestWeightDistributionCoverage:
         assert coverage_checks[0].details["oversized_initializers_skipped"] == 1
         assert coverage_checks[0].details["analyzed_initializers"] == 0
         self._assert_uncached_inconclusive_exit2(model_path, tmp_path / "cache", max_array_size=1)
+
+    def test_standalone_invalid_initializer_size_is_uncached_inconclusive(self, tmp_path: Path) -> None:
+        invalid_weight = onnx.TensorProto()
+        invalid_weight.name = "W"
+        invalid_weight.data_type = TensorProto.FLOAT
+        invalid_weight.dims.extend([-1, 4])
+        graph = helper.make_graph(
+            [helper.make_node("MatMul", ["X", "W"], ["Y"])],
+            "negative_initializer_dimension",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+            initializer=[invalid_weight],
+        )
+        model_path = tmp_path / "negative-initializer-dimension.onnx"
+        onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]), str(model_path))
+
+        direct = WeightDistributionScanner({"max_array_size": 1}).scan(str(model_path))
+
+        assert direct.success is False
+        assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "weight_distribution_analysis_incomplete" in direct.metadata["scan_outcome_reasons"]
+        analysis_check = next(check for check in direct.checks if check.name == "Weight Distribution Analysis")
+        assert analysis_check.details["oversized_initializers_skipped"] == 1
+
+        cache_dir = tmp_path / "standalone-cache"
+        reset_cache_manager()
+        try:
+            results = [
+                scan_model_directory_or_file(
+                    str(model_path),
+                    recursive=False,
+                    scanners=["weight_distribution"],
+                    max_array_size=1,
+                    cache_enabled=True,
+                    cache_dir=str(cache_dir),
+                    min_cache_file_size=0,
+                )
+                for _ in range(2)
+            ]
+            for result in results:
+                assert result.success is False
+                assert determine_exit_code(result) == 2
+                assert result.file_metadata[str(model_path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
 
     def test_inline_storage_is_bounded_before_materialization(
         self,

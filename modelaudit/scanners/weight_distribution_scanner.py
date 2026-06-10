@@ -1605,6 +1605,11 @@ class WeightDistributionScanner(BaseScanner):
             logger.warning("Failed to build semantic ONNX weight plan for %s (%s)", path, type(exc).__name__)
             raise RuntimeError(f"Failed to extract ONNX weights from {path}") from exc
 
+        if plan.oversized_initializers_skipped:
+            self._record_extraction_incomplete(
+                "onnx_initializer_size_limit",
+                oversized_initializers_skipped=plan.oversized_initializers_skipped,
+            )
         if plan.external_initializers_skipped:
             self._record_extraction_incomplete(
                 "onnx_external_initializer_skipped",
@@ -2338,10 +2343,18 @@ class WeightDistributionScanner(BaseScanner):
                 )
                 chunk_magnitudes[~np.isfinite(chunk_magnitudes)] = 0.0
                 robust_mask = chunk_magnitudes > robust_threshold_view
-                robust_mask |= (chunk_magnitudes >= robust_threshold_view) & inclusive_zero_mad_view
+                robust_mask |= (
+                    (chunk_magnitudes >= robust_threshold_view)
+                    & inclusive_zero_mad_view
+                    & (chunk_magnitudes > classical_threshold_view)
+                )
                 robust_counts += np.asarray(np.count_nonzero(robust_mask, axis=reduction_axes)).reshape(-1)
                 robust_support_mask = chunk_magnitudes > robust_support_threshold_view
-                robust_support_mask |= (chunk_magnitudes >= robust_support_threshold_view) & inclusive_zero_mad_view
+                robust_support_mask |= (
+                    (chunk_magnitudes >= robust_support_threshold_view)
+                    & inclusive_zero_mad_view
+                    & (chunk_magnitudes > classical_support_threshold_view)
+                )
                 robust_support_counts += np.asarray(
                     np.count_nonzero(robust_support_mask, axis=reduction_axes),
                 ).reshape(-1)
