@@ -4164,6 +4164,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 "header_format": detail_header_format,
                 "file_type_validation_failed": not file_type_valid,
             },
+            rule_code="S901" if not file_type_valid else None,
         )
 
     # Ensure bytes_scanned reflects the actual file size even when a scanner
