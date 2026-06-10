@@ -7734,6 +7734,43 @@ def test_scan_bytes_does_not_flag_stack_invalid_encoded_pickle_fragments(fragmen
     assert all(finding.rule_code != "S601" for finding in report.findings)
 
 
+def test_scan_bytes_ignores_short_base64_pickle_collision_in_plain_text() -> None:
+    assert base64.b64decode("grou") == b"\x82\xba."
+
+    report = scan_bytes(
+        pickle.dumps({"metadata": "grouped convolution"}, protocol=4),
+        source="short-base64-collision.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert all(notice.code != "encoded_nested_payload_detected" for notice in report.notices)
+
+
+def test_scan_bytes_preserves_compact_base64_execution_payload_detection() -> None:
+    nested_payload = b"\x82\x01)R."
+    encoded = base64.b64encode(nested_payload).decode("ascii")
+    report = scan_bytes(
+        pickle.dumps({"metadata": f"{encoded}!metadata-suffix"}, protocol=4),
+        source="compact-base64-execution.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S601"
+        and finding.details.get("payload_size") == len(nested_payload)
+        and finding.details.get("nested_has_execution_opcode") is True
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("nested_details", {}).get("opaque_extension") is True
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_records_data_only_base64_nested_pickle_payloads_as_notices() -> None:
     nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
     report = scan_bytes(

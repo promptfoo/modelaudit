@@ -6,6 +6,7 @@ const BASE64_LITERAL_CHARS: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
 const HEX_LITERAL_CHARS: &[u8] = b"0123456789abcdefABCDEF";
 const ENCODED_LITERAL_PROBE_CHARS: usize = 64;
+const MIN_NON_EXECUTING_BASE64_PICKLE_BYTES: usize = 4;
 const PROTOCOL0_SCALAR_PREFIX_PROBE_BYTES: usize = 256;
 const LONG_PROTOCOL0_LINE_PROBE_BYTES: usize = PROTOCOL0_SCALAR_PREFIX_PROBE_BYTES + 1;
 const LONG_PROTOCOL0_LINE_PROBE_CHARS: usize = LONG_PROTOCOL0_LINE_PROBE_BYTES.div_ceil(3) * 4;
@@ -78,6 +79,12 @@ pub(crate) fn decode_possible_encoded_pickle(
                     for (payload, analysis_incomplete) in
                         decoded_pickle_payloads(&decoded, max_nested_pickle_bytes)
                     {
+                        if !base64_nested_payload_has_sufficient_evidence(
+                            &payload,
+                            analysis_incomplete,
+                        ) {
+                            continue;
+                        }
                         if decoded_values.iter().any(|existing| {
                             existing.encoding == "base64"
                                 && existing.payload == payload
@@ -124,6 +131,17 @@ pub(crate) fn decode_possible_encoded_pickle(
     }
 
     decoded_values
+}
+
+fn base64_nested_payload_has_sufficient_evidence(
+    payload: &[u8],
+    analysis_incomplete: bool,
+) -> bool {
+    // A single Base64 quartet is common in ordinary words; keep short
+    // candidates only when they carry execution evidence or must fail closed.
+    analysis_incomplete
+        || payload.len() >= MIN_NON_EXECUTING_BASE64_PICKLE_BYTES
+        || has_execution_opcode(payload)
 }
 
 fn decoded_pickle_payloads(decoded: &[u8], max_nested_pickle_bytes: usize) -> Vec<(Vec<u8>, bool)> {
