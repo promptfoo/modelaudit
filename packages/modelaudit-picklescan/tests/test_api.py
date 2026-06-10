@@ -7649,7 +7649,7 @@ def test_scan_bytes_default_depth_surfaces_two_layer_encoded_nested_findings() -
     )
 
 
-def test_scan_bytes_marks_parent_inconclusive_when_nested_analysis_is_incomplete() -> None:
+def test_scan_bytes_respects_literal_cap_before_nested_analysis() -> None:
     nested_payload = pickle.dumps({"code": "A" * 128}, protocol=4)
 
     report = scan_bytes(
@@ -7659,14 +7659,17 @@ def test_scan_bytes_marks_parent_inconclusive_when_nested_analysis_is_incomplete
     )
 
     assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(finding.rule_code == "S213" for finding in report.findings)
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.is_clean is False
+    assert not any(finding.rule_code == "S213" for finding in report.findings)
     assert any(
-        notice.code == "nested_pickle_incomplete"
-        and notice.details.get("nested_status") == ScanStatus.INCONCLUSIVE.value
+        notice.code == "literal_scan_truncated"
+        and notice.details.get("literal_type") == "bytes"
+        and notice.details.get("max_string_literal_scan_chars") == 8
         and notice.details.get("analysis_incomplete") is True
         for notice in report.notices
     )
+    assert not any(notice.code == "nested_pickle_incomplete" for notice in report.notices)
 
 
 def test_scan_bytes_flags_oversized_nested_pickle_prefix_without_deep_parse() -> None:
