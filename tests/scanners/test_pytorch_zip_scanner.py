@@ -6760,7 +6760,8 @@ def test_pytorch_zip_scanner_entry_limit_skips_late_entries(tmp_path: Path) -> N
         zipf.writestr("entry_0.txt", "data")
         zipf.writestr("entry_1.txt", "data")
         symlink_info = zipfile.ZipInfo("late_symlink")
-        symlink_info.external_attr = 0o120777 << 16
+        symlink_info.create_system = 3
+        symlink_info.external_attr = (stat.S_IFLNK | 0o777) << 16
         symlink_info.compress_type = zipfile.ZIP_STORED
         zipf.writestr(symlink_info, str(symlink_target))
 
@@ -7640,7 +7641,8 @@ def test_pytorch_zip_scanner_symlink_detection(tmp_path: Path) -> None:
         # S_IFLNK = 0o120000 (symlink)
         symlink_info = zipfile.ZipInfo("malicious_link")
         # Set external attributes to indicate symlink (Unix mode in upper 16 bits)
-        symlink_info.external_attr = 0o120777 << 16  # symlink with full permissions
+        symlink_info.create_system = 3
+        symlink_info.external_attr = (stat.S_IFLNK | 0o777) << 16
         symlink_info.compress_type = zipfile.ZIP_STORED
         zipf.writestr(symlink_info, "/etc/passwd")
 
@@ -7682,7 +7684,8 @@ def test_pytorch_zip_scanner_combined_security_controls(tmp_path: Path) -> None:
         zipf.writestr("version", "3")
         # Add a symlink entry before the entry cap, then enough entries to exceed a low limit.
         symlink_info = zipfile.ZipInfo("evil_link")
-        symlink_info.external_attr = 0o120777 << 16
+        symlink_info.create_system = 3
+        symlink_info.external_attr = (stat.S_IFLNK | 0o777) << 16
         symlink_info.compress_type = zipfile.ZIP_STORED
         zipf.writestr(symlink_info, str(symlink_target))
         for i in range(12):

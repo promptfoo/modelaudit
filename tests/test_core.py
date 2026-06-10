@@ -2193,6 +2193,7 @@ def test_scan_file_selected_weight_distribution_routes_within_entry_limit(
     archive_path = tmp_path / "within-entry-limit.pt"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("archive/data.pkl", b"data")
+        archive.writestr("archive/version", b"1")
 
     def fake_weight_scan(_self: Any, path: str) -> ScanResult:
         assert path == str(archive_path)
@@ -2204,10 +2205,14 @@ def test_scan_file_selected_weight_distribution_routes_within_entry_limit(
         "modelaudit.scanners.weight_distribution_scanner.WeightDistributionScanner.scan",
         fake_weight_scan,
     )
+    monkeypatch.setattr(
+        "modelaudit.scanners.weight_distribution_scanner.WeightDistributionScanner.can_handle",
+        classmethod(lambda _cls, _path: True),
+    )
 
     result = scan_file(
         str(archive_path),
-        config={"scanners": ["weight_distribution"], "max_zip_entries": 1, "cache_enabled": False},
+        config={"scanners": ["weight_distribution"], "max_zip_entries": 2, "cache_enabled": False},
     )
 
     assert result.scanner_name == "weight_distribution"
