@@ -9,6 +9,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- avoid routing trusted NumPy extension reconstruction exports through module `__getattr__` fallbacks while preserving legacy dotted-`GLOBAL` hook detection
 - preserve nested and aliased callable opcode evidence for downstream scanners
 
 ## [0.1.6](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.5...modelaudit-picklescan-v0.1.6) (2026-06-05)
