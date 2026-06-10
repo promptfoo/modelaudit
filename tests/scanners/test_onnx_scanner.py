@@ -22,6 +22,7 @@ from modelaudit.scanners.onnx_scanner import (
     ONNX_STRUCTURE_INCONCLUSIVE_REASON,
     ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON,
     OnnxScanner,
+    _configured_onnx_weight_array_limit,
     _confirmed_onnx_operator_findings,
     _confirmed_python_operator_findings,
 )
@@ -4590,6 +4591,50 @@ class TestWeightDistributionCoverage:
         assert coverage[0].details["oversized_initializers_skipped"] == 1
         assert coverage[0].details["extraction_failures"] == 0
 
+    @pytest.mark.parametrize(
+        "invalid_limit",
+        ["unbounded", pytest.param(10**1000, id="oversized-integer")],
+    )
+    def test_invalid_array_limit_uses_default_before_materialization(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        invalid_limit: Any,
+    ) -> None:
+        tensor = onnx.TensorProto()
+        tensor.name = "W"
+        tensor.data_type = TensorProto.FLOAT
+        tensor.dims.extend([32768, 1024])
+        tensor.raw_data = b"\0\0\0\0"
+        X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 32768])
+        Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1024])
+        node = helper.make_node("MatMul", ["X", "W"], ["Y"])
+        model = helper.make_model(
+            helper.make_graph([node], "invalid_array_limit", [X], [Y], initializer=[tensor]),
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        model.ir_version = 8
+        model_path = tmp_path / "invalid-array-limit.onnx"
+        onnx.save(model, str(model_path))
+        original_to_array = onnx.numpy_helper.to_array
+
+        def guarded_to_array(initializer: Any, *args: Any, **kwargs: Any) -> Any:
+            if initializer.name == "W":
+                raise AssertionError("default-bounded tensor must not be materialized")
+            return original_to_array(initializer, *args, **kwargs)
+
+        monkeypatch.setattr(onnx.numpy_helper, "to_array", guarded_to_array)
+        result = OnnxScanner({"max_array_size": invalid_limit}).scan(str(model_path))
+
+        coverage = self._coverage_checks(result)
+        assert len(coverage) == 1
+        assert coverage[0].details["max_array_size"] == 100 * 1024 * 1024
+        assert coverage[0].details["oversized_initializers_skipped"] == 1
+        assert coverage[0].details["extraction_failures"] == 0
+
+    def test_zero_array_limit_remains_explicitly_unlimited(self) -> None:
+        assert _configured_onnx_weight_array_limit(0) is None
+
 
 class TestWeightDistributionSemantics:
     """Regression tests for ONNX initializer semantics and output axes."""
@@ -4780,6 +4825,34 @@ class TestWeightDistributionSemantics:
         assert details["num_extreme_weights"] == 5
         assert details["max_extreme_weights_per_output"] == 5
         assert details["max_to_threshold_ratio"] > 1.0
+
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_stale_external_metadata_does_not_hide_inline_weights(
+        self,
+        tmp_path: Path,
+        malicious: bool,
+    ) -> None:
+        weights = np.random.default_rng(20260610).normal(0.0, 0.02, size=(100, 10)).astype(np.float32)
+        if malicious:
+            weights.fill(0.0)
+            weights[50:55, 3] = 10.0
+        model_path = create_onnx_weight_model(tmp_path, weights, op_type="MatMul")
+        model = onnx.load(str(model_path), load_external_data=False)
+        initializer = model.graph.initializer[0]
+        initializer.external_data.append(StringStringEntryProto(key="location", value="stale.bin"))
+        initializer.data_location = TensorProto.DEFAULT
+        onnx.save(model, str(model_path))
+        (tmp_path / "stale.bin").write_bytes(weights.tobytes())
+
+        result = OnnxScanner().scan(str(model_path))
+
+        if not malicious:
+            assert result.success is True
+        assert len(self._extreme_checks(result)) == int(malicious)
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_layer_count"] == 1
 
     @pytest.mark.parametrize("op_type", ["Gemm", "MatMul"])
     def test_left_input_equivalent_graph_is_analyzed(self, tmp_path: Path, op_type: str) -> None:

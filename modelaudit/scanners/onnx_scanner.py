@@ -3,6 +3,7 @@
 import logging
 import math
 import ntpath
+import numbers
 import os
 import re
 from collections.abc import Callable, Iterable
@@ -92,6 +93,7 @@ _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT = 32
 _ONNX_WEIGHT_RESHAPE_RANK_LIMIT = 64
 _ONNX_WEIGHT_METADATA_TEXT_LIMIT = 256
 _ONNX_WEIGHT_METADATA_SEQUENCE_LIMIT = 64
+_ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE = 100 * 1024 * 1024
 _STANDARD_NEURAL_NETWORK_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
 _SAME_TYPE_ELEMENTWISE_OPERATORS: frozenset[str] = frozenset(
     {
@@ -744,6 +746,26 @@ def _onnx_inline_storage_nbytes(initializer: Any) -> int:
     return raw_bytes + typed_bytes
 
 
+def _onnx_tensor_uses_external_storage(initializer: Any, *, onnx: Any) -> bool:
+    if getattr(initializer, "data_location", None) == onnx.TensorProto.EXTERNAL:
+        return True
+    return bool(getattr(initializer, "external_data", ())) and _onnx_inline_storage_nbytes(initializer) == 0
+
+
+def _configured_onnx_weight_array_limit(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE
+    try:
+        numeric_value = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE
+    if not math.isfinite(numeric_value) or numeric_value < 0:
+        return _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE
+    if numeric_value == 0:
+        return None
+    return max(int(numeric_value), 1)
+
+
 def _resolve_onnx_reshape_shape(
     input_shape: tuple[int, ...],
     shape_initializer: Any,
@@ -759,8 +781,7 @@ def _resolve_onnx_reshape_shape(
         or element_count > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
         or int(getattr(shape_initializer, "data_type", -1)) != int(onnx.TensorProto.INT64)
         or _onnx_inline_storage_nbytes(shape_initializer) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT * 8
-        or getattr(shape_initializer, "data_location", None) == getattr(onnx.TensorProto, "EXTERNAL", 1)
-        or bool(getattr(shape_initializer, "external_data", ()))
+        or _onnx_tensor_uses_external_storage(shape_initializer, onnx=onnx)
     ):
         return None
 
@@ -812,8 +833,7 @@ def _resolve_onnx_axes(node: Any, constants: dict[str, Any], *, onnx: Any) -> tu
         or element_count > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
         or int(getattr(axes_initializer, "data_type", -1)) != int(onnx.TensorProto.INT64)
         or _onnx_inline_storage_nbytes(axes_initializer) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT * 8
-        or getattr(axes_initializer, "data_location", None) == getattr(onnx.TensorProto, "EXTERNAL", 1)
-        or bool(getattr(axes_initializer, "external_data", ()))
+        or _onnx_tensor_uses_external_storage(axes_initializer, onnx=onnx)
     ):
         return None
     try:
@@ -2331,7 +2351,7 @@ def _build_onnx_weight_analysis_plan(
         initializer_groups = groups[initializer_index]
         if not initializer_groups:
             continue
-        if initializer.data_location == onnx.TensorProto.EXTERNAL or bool(initializer.external_data):
+        if _onnx_tensor_uses_external_storage(initializer, onnx=onnx):
             plan.external_initializers_skipped += 1
             continue
 
@@ -3243,15 +3263,8 @@ class OnnxScanner(BaseScanner):
             )
             return
 
-        configured_max_array_size = self.config.get("max_array_size", 100 * 1024 * 1024)
-        max_array_size = (
-            int(configured_max_array_size)
-            if isinstance(configured_max_array_size, (int, float))
-            and not isinstance(configured_max_array_size, bool)
-            and math.isfinite(float(configured_max_array_size))
-            and configured_max_array_size > 0
-            else None
-        )
+        configured_max_array_size = self.config.get("max_array_size", _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE)
+        max_array_size = _configured_onnx_weight_array_limit(configured_max_array_size)
 
         def inline_storage_fits_budget(initializer: Any, _name: str, _estimated_bytes: int) -> bool:
             return max_array_size is None or _onnx_inline_storage_nbytes(initializer) <= max_array_size

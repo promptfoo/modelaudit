@@ -1294,6 +1294,14 @@ def test_onnx_external_and_unknown_initializers_fail_closed_before_materializati
             external_data=[],
         ),
         types.SimpleNamespace(
+            name="stale_external_metadata_weight",
+            dims=[2, 2],
+            data_type=1,
+            data_location=0,
+            external_data=[object()],
+            raw_data=b"x" * 16,
+        ),
+        types.SimpleNamespace(
             name="custom_numeric_weight",
             dims=[2, 2],
             data_type=16,
@@ -1326,8 +1334,8 @@ def test_onnx_external_and_unknown_initializers_fail_closed_before_materializati
     scanner = WeightDistributionScanner()
     weights = scanner._extract_onnx_weights(str(path))
 
-    assert list(weights) == ["valid_weight", "custom_numeric_weight"]
-    assert materialized == ["valid_weight", "custom_numeric_weight"]
+    assert list(weights) == ["valid_weight", "stale_external_metadata_weight", "custom_numeric_weight"]
+    assert materialized == ["valid_weight", "stale_external_metadata_weight", "custom_numeric_weight"]
     assert scanner.extraction_incomplete_reasons == [
         "onnx_external_initializer_skipped",
         "onnx_initializer_size_limit",
@@ -1487,7 +1495,10 @@ class TestWeightDistributionScanner:
         assert scanner._max_tensor_bytes() == 1
         assert scanner._max_total_tensor_bytes() == 32
 
-    @pytest.mark.parametrize("invalid_limit", [True, False, "unbounded", -1, float("inf"), float("nan")])
+    @pytest.mark.parametrize(
+        "invalid_limit",
+        [True, False, "unbounded", -1, float("inf"), float("nan"), pytest.param(10**1000, id="oversized-integer")],
+    )
     def test_invalid_tensor_byte_limit_uses_secure_default(self, invalid_limit: Any) -> None:
         scanner = WeightDistributionScanner({"max_array_size": invalid_limit})
 

@@ -396,7 +396,10 @@ class WeightDistributionScanner(BaseScanner):
     def _configured_byte_limit(value: Any, *, fallback: int | None = None) -> int | None:
         if isinstance(value, bool) or not isinstance(value, numbers.Real):
             return fallback
-        numeric_value = float(value)
+        try:
+            numeric_value = float(value)
+        except (OverflowError, TypeError, ValueError):
+            return fallback
         if not math.isfinite(numeric_value):
             return fallback
         if numeric_value == 0:
@@ -1673,8 +1676,9 @@ class WeightDistributionScanner(BaseScanner):
 
                 initializer_name = str(initializer.name)
                 external_location = getattr(getattr(onnx, "TensorProto", None), "EXTERNAL", 1)
-                if getattr(initializer, "data_location", None) == external_location or bool(
-                    getattr(initializer, "external_data", ())
+                if getattr(initializer, "data_location", None) == external_location or (
+                    bool(getattr(initializer, "external_data", ()))
+                    and self._onnx_inline_storage_nbytes(onnx, initializer) == 0
                 ):
                     self._record_extraction_incomplete(
                         "onnx_external_initializer_skipped",
