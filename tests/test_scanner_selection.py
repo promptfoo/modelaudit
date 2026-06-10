@@ -734,6 +734,29 @@ def test_pickle_routing_inconclusive_format_maps_to_pickle_scanner() -> None:
     assert scanner_ids_for_detected_format(PICKLE_ROUTING_INCONCLUSIVE_FORMAT) == frozenset({"pickle"})
 
 
+def test_remote_safetensors_route_preserves_possible_overlap_scanners() -> None:
+    scanner_ids = scanner_ids_for_detected_format("safetensors")
+
+    assert scanner_ids == frozenset(
+        {
+            "compressed",
+            "executorch",
+            "keras_h5",
+            "keras_zip",
+            "llamafile",
+            "numpy",
+            "pickle",
+            "pytorch_zip",
+            "safetensors",
+            "skops",
+            "torch7",
+            "torchserve_mar",
+            "weight_distribution",
+            "zip",
+        }
+    )
+
+
 def test_remote_prefilters_preserve_selected_extensionless_scanners() -> None:
     policy = resolve_scanner_selection_policy(scanners=["llamafile"])
     extensions = selected_scanner_extensions(policy, conservative=True)
