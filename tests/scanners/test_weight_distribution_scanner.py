@@ -1436,6 +1436,44 @@ class TestWeightDistributionScanner:
         assert scanner.weight_magnitude_threshold == 2.0
         assert scanner.max_array_size == 50 * 1024 * 1024
 
+    def test_onnx_semantic_views_count_physical_initializer_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import numpy as np
+
+        weights = np.broadcast_to(np.asarray(0.0, dtype=np.float32), (5120, 5120))
+        specs = [
+            types.SimpleNamespace(
+                initializer_index=7,
+                analysis_id=analysis_id,
+                weights=weights,
+                output_axes=(output_axis,),
+                matrix_analysis=True,
+                context={"initializer": "embedding"},
+            )
+            for analysis_id, output_axis in enumerate((0, 1))
+        ]
+        captured_architectures: list[dict[str, Any]] = []
+        scanner = WeightDistributionScanner()
+
+        def capture_architecture(
+            _layer_name: str,
+            _weights: Any,
+            architecture_analysis: dict[str, Any],
+        ) -> list[dict[str, Any]]:
+            captured_architectures.append(dict(architecture_analysis))
+            return []
+
+        monkeypatch.setattr(scanner, "_analyze_layer_weights", capture_architecture)
+
+        assert scanner._analyze_onnx_weight_specs(specs) == []
+        assert len(captured_architectures) == 2
+        for architecture in captured_architectures:
+            assert architecture["total_parameters"] == 5120 * 5120
+            assert architecture["layer_count"] == 1
+            assert architecture["is_likely_llm"] is False
+
     def test_numeric_byte_limit_config_is_coerced(self) -> None:
         import numpy as np
 

@@ -1790,7 +1790,10 @@ class WeightDistributionScanner(BaseScanner):
 
     def _analyze_onnx_weight_specs(self, specs: list[Any]) -> list[tuple[dict[str, Any], Any]]:
         """Analyze collision-proof ONNX specs using their semantic output axes."""
-        matrix_weights = {spec.analysis_id: spec.weights for spec in specs if spec.matrix_analysis}
+        matrix_weights: dict[int, Any] = {}
+        for spec in specs:
+            if spec.matrix_analysis:
+                matrix_weights.setdefault(spec.initializer_index, spec.weights)
         architecture_analysis = self._analyze_architecture_properties(matrix_weights)
         analyzed: list[tuple[dict[str, Any], Any]] = []
         for spec in specs:
