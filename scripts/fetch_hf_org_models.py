@@ -51,7 +51,10 @@ def fetch_organization_models_page(org: str, page: int) -> dict[str, Any]:
     try:
         req = Request(url, headers={"User-Agent": "ModelAudit/1.0"})
         with urlopen(req, timeout=30) as response:
-            return json.loads(response.read().decode("utf-8"))
+            data = json.loads(response.read().decode("utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("Hugging Face organization response must be a JSON object")
+            return data
     except HTTPError as e:
         if e.code == 404:
             # Organization doesn't exist or has no models
@@ -76,7 +79,7 @@ def fetch_organization_models(org: str, max_models: int | None = None) -> list[s
         List of model IDs
     """
     models_per_page = 30
-    model_ids = []
+    model_ids: list[str] = []
 
     print(f"\nFetching models from organization: {org}")
 
@@ -207,9 +210,7 @@ ORGANIZATION_MODELS: set[str] = {{
     # Add model IDs (sorted for readability and diff-friendliness)
     sorted_models = sorted(all_model_ids)
     for model_id in sorted_models:
-        # Escape quotes in model IDs if any
-        escaped_id = model_id.replace('"', '\\"')
-        content += f'    "{escaped_id}",\n'
+        content += f"    {model_id!r},\n"
 
     content += '''}
 
