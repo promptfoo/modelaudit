@@ -8016,6 +8016,58 @@ def test_pytorch_zip_cve_2025_32434_empty_imports_stay_suspicious(tmp_path: Path
     assert check.details["import_analysis"]["total_imports"] == 0
 
 
+def test_pytorch_zip_cve_2025_32434_ignores_opcode_name_substrings(tmp_path: Path) -> None:
+    pickle_result = _pickle_result_with_reduce("numpy.core.multiarray._reconstruct")
+    pickle_result.add_check(
+        name="Dangerous Pickle Call Graph",
+        passed=False,
+        message=(
+            "Pickle global 'numpy.core.multiarray._reconstruct' reaches dangerous Python "
+            "primitive 'builtins.__import__' through the installed call graph"
+        ),
+        severity=IssueSeverity.CRITICAL,
+        details={
+            "import_reference": "numpy.core.multiarray._reconstruct",
+            "analysis": "python_call_graph",
+        },
+    )
+    pytorch_result = ScanResult(scanner_name="pytorch_zip")
+
+    PyTorchZipScanner()._add_weights_only_safety_warnings(
+        pickle_result,
+        pytorch_result,
+        str(tmp_path / "model.pt"),
+        "data.pkl",
+    )
+
+    check = _weights_only_analysis_check(pytorch_result)
+    assert check.details["opcode_counts"] == {"REDUCE": 1, "GLOBAL": 1}
+    assert "INST" not in check.details["unique_opcode_types"]
+    assert "OBJ" not in check.details["unique_opcode_types"]
+
+
+def test_pytorch_zip_cve_2025_32434_does_not_double_count_stack_global(tmp_path: Path) -> None:
+    pickle_result = ScanResult(scanner_name="pickle")
+    pickle_result.add_check(
+        name="Dangerous Pickle Opcode",
+        passed=False,
+        message="STACK_GLOBAL opcode detected",
+        severity=IssueSeverity.WARNING,
+        details={"opcode": "STACK_GLOBAL"},
+    )
+    pytorch_result = ScanResult(scanner_name="pytorch_zip")
+
+    PyTorchZipScanner()._add_weights_only_safety_warnings(
+        pickle_result,
+        pytorch_result,
+        str(tmp_path / "model.pt"),
+        "data.pkl",
+    )
+
+    check = _weights_only_analysis_check(pytorch_result)
+    assert check.details["opcode_counts"] == {"STACK_GLOBAL": 1}
+
+
 @pytest.mark.parametrize(
     "import_reference",
     [

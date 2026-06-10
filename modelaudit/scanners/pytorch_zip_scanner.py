@@ -62,6 +62,15 @@ _EXECUTABLE_MEMBER_PROBE_BYTES = 1024
 _TORCHSCRIPT_FORBIDDEN_SOURCE_PATTERN = re.compile(
     r"(?im)(?:^\s*(?:import|from)\s+|\b(?:__import__|eval|exec|compile|open)\s*\(|\b(?:os|subprocess|socket|requests)\s*\.)"
 )
+_PICKLE_CODE_EXECUTION_OPCODE_RISKS = (
+    ("REDUCE", "__reduce__ method exploitation"),
+    ("INST", "Class instantiation code execution"),
+    ("OBJ", "Object creation code execution"),
+    ("NEWOBJ", "New-style object creation"),
+    ("STACK_GLOBAL", "Dynamic import and attribute access"),
+    ("GLOBAL", "Module import and attribute access"),
+    ("BUILD", "__setstate__ method exploitation"),
+)
 
 
 @dataclass(frozen=True)
@@ -3525,35 +3534,11 @@ class PyTorchZipScanner(BaseScanner):
             issue_msg = issue.message.lower()
             issue_details = issue.details or {}
 
-            # Look for specific dangerous opcodes
-            if "reduce" in issue_msg or "REDUCE" in str(issue_details):
-                dangerous_opcodes_found.append("REDUCE")
-                opcode_counts["REDUCE"] = opcode_counts.get("REDUCE", 0) + 1
-                code_execution_risks.append("__reduce__ method exploitation")
-            if "inst" in issue_msg or "INST" in str(issue_details):
-                dangerous_opcodes_found.append("INST")
-                opcode_counts["INST"] = opcode_counts.get("INST", 0) + 1
-                code_execution_risks.append("Class instantiation code execution")
-            if "obj" in issue_msg or "OBJ" in str(issue_details):
-                dangerous_opcodes_found.append("OBJ")
-                opcode_counts["OBJ"] = opcode_counts.get("OBJ", 0) + 1
-                code_execution_risks.append("Object creation code execution")
-            if "newobj" in issue_msg or "NEWOBJ" in str(issue_details):
-                dangerous_opcodes_found.append("NEWOBJ")
-                opcode_counts["NEWOBJ"] = opcode_counts.get("NEWOBJ", 0) + 1
-                code_execution_risks.append("New-style object creation")
-            if "stack_global" in issue_msg or "STACK_GLOBAL" in str(issue_details):
-                dangerous_opcodes_found.append("STACK_GLOBAL")
-                opcode_counts["STACK_GLOBAL"] = opcode_counts.get("STACK_GLOBAL", 0) + 1
-                code_execution_risks.append("Dynamic import and attribute access")
-            if "global" in issue_msg or "GLOBAL" in str(issue_details):
-                dangerous_opcodes_found.append("GLOBAL")
-                opcode_counts["GLOBAL"] = opcode_counts.get("GLOBAL", 0) + 1
-                code_execution_risks.append("Module import and attribute access")
-            if "build" in issue_msg or "BUILD" in str(issue_details):
-                dangerous_opcodes_found.append("BUILD")
-                opcode_counts["BUILD"] = opcode_counts.get("BUILD", 0) + 1
-                code_execution_risks.append("__setstate__ method exploitation")
+            for opcode, risk in _PICKLE_CODE_EXECUTION_OPCODE_RISKS:
+                if self._issue_reports_pickle_opcode(issue_msg, issue_details, opcode):
+                    dangerous_opcodes_found.append(opcode)
+                    opcode_counts[opcode] = opcode_counts.get(opcode, 0) + 1
+                    code_execution_risks.append(risk)
 
             # Look for any code execution patterns
             if any(pattern in issue_msg for pattern in ["exec", "eval", "import", "subprocess", "__import__"]):
@@ -3634,6 +3619,7 @@ class PyTorchZipScanner(BaseScanner):
                     "fixed_in": f"PyTorch {self.CVE_2025_32434_FIX_VERSION}",
                 },
             )
+
         else:
             # No dangerous opcodes found - add informational check
             pytorch_result.add_check(
@@ -3659,6 +3645,28 @@ class PyTorchZipScanner(BaseScanner):
                     ),
                 },
             )
+
+    @staticmethod
+    def _issue_reports_pickle_opcode(issue_message: str, issue_details: dict[str, Any], opcode: str) -> bool:
+        """Match exact opcode evidence without treating ordinary word fragments as opcodes."""
+        for key in ("opcode", "opcode_name"):
+            value = issue_details.get(key)
+            if isinstance(value, str) and value.upper() == opcode:
+                return True
+
+        raw_opcodes = issue_details.get("opcodes")
+        if isinstance(raw_opcodes, (list, tuple, set)) and any(
+            isinstance(value, str) and value.upper() == opcode for value in raw_opcodes
+        ):
+            return True
+
+        raw_opcode_counts = issue_details.get("opcode_counts")
+        if isinstance(raw_opcode_counts, dict):
+            count = raw_opcode_counts.get(opcode)
+            if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+                return True
+
+        return re.search(rf"(?<![A-Z0-9_]){re.escape(opcode)}(?![A-Z0-9_])", issue_message.upper()) is not None
 
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         """Extract PyTorch ZIP (torch.save format) metadata."""
