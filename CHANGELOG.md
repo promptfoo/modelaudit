@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- allow specification-valid empty SafeTensors tensors while preserving offset and size validation
+- allow specification-valid empty SafeTensors tensors while preserving deterministic range checks and rejecting size overflow
 - classify unsafe PyTorch ZIP symlink targets as critical archive-link findings while preserving safe relative links
 - restore pickle CVE scan throughput, reprobe malformed stream separators, and route four-byte protocol-0 Joblib operands correctly
 - bound manifest embedded-Jinja template collection while preserving findings across deep branches, cycles, and shared YAML aliases
