@@ -1,6 +1,7 @@
 """Tests for advanced file handler."""
 
 import os
+import sys
 import tempfile
 from collections import Counter
 from contextvars import ContextVar
@@ -676,6 +677,7 @@ class TestShardedModelDetector:
             for check in result.checks
         )
 
+    @pytest.mark.skipif(sys.platform == "darwin", reason="macOS lacks traversable descriptor-bound scan paths")
     def test_shard_target_swap_during_scan_discards_clean_result(
         self,
         tmp_path: Path,
@@ -698,6 +700,7 @@ class TestShardedModelDetector:
             def scan(self, shard_path: str) -> ScanResult:
                 path = Path(shard_path)
                 result = ScanResult(scanner_name=self.name)
+                scanned_payloads.append(path.read_bytes())
                 if path.name == original_target.name:
                     preserved_target = tmp_path / "preserved-malicious.pt"
                     original_target.rename(preserved_target)
@@ -708,7 +711,6 @@ class TestShardedModelDetector:
                         message=path.name,
                         severity=IssueSeverity.INFO,
                     )
-                scanned_payloads.append(path.read_bytes())
                 result.finish(success=True)
                 return result
 
@@ -721,6 +723,8 @@ class TestShardedModelDetector:
         assert any(check.name == "Shard Scan" and check.status == CheckStatus.FAILED for check in result.checks)
         assert not any(check.name == "Clean Replacement Accepted" for check in result.checks)
 
+    @pytest.mark.skipif(sys.platform == "darwin", reason="macOS lacks traversable descriptor-bound scan paths")
+    @pytest.mark.skipif(os.name == "nt", reason="Windows open-handle pinning prevents target replacement")
     def test_shard_target_swap_during_scan_preserves_security_findings(
         self,
         tmp_path: Path,
@@ -765,6 +769,8 @@ class TestShardedModelDetector:
         )
         assert any(issue.message == "Malicious shard payload detected" for issue in result.issues)
 
+    @pytest.mark.skipif(sys.platform == "darwin", reason="macOS lacks traversable descriptor-bound scan paths")
+    @pytest.mark.skipif(os.name == "nt", reason="Windows open-handle pinning prevents target replacement")
     def test_shard_target_aba_during_scan_cannot_hide_malicious_content(
         self,
         tmp_path: Path,
@@ -815,6 +821,35 @@ class TestShardedModelDetector:
         assert b"benign" not in scanned_payloads
         assert result.success is False
         assert any(check.name == "Malicious Shard Payload" for check in result.checks)
+
+    @pytest.mark.skipif(sys.platform == "darwin", reason="macOS lacks traversable descriptor-bound scan paths")
+    def test_shard_scanner_os_error_after_pinning_is_scan_error(self, tmp_path: Path) -> None:
+        """A scanner read failure after pinning is not a pin-setup failure."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        shard_one.write_bytes(b"first")
+        shard_two.write_bytes(b"second")
+        scanned_payloads: list[bytes] = []
+
+        class FailingScanner:
+            name = "failing_scanner"
+
+            def scan(self, shard_path: str) -> ScanResult:
+                scanned_payloads.append(Path(shard_path).read_bytes())
+                raise OSError("scanner read failed")
+
+        result = AdvancedFileHandler(str(shard_one), FailingScanner()).scan()
+
+        assert set(scanned_payloads) == {b"first", b"second"}
+        assert result.success is False
+        assert "shard_scan_error" in result.metadata["scan_outcome_reasons"]
+        assert "shard_pin_unavailable" not in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Shard Scan"
+            and check.status == CheckStatus.FAILED
+            and check.details["exception_type"] == "OSError"
+            for check in result.checks
+        )
 
     @pytest.mark.skipif(os.name == "nt", reason="Windows uses open-handle hard-link pinning")
     def test_shard_pin_unavailable_fails_explicitly(
