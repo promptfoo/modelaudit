@@ -8542,6 +8542,19 @@ def test_scan_file_routes_onnx_pb_by_content(tmp_path: Path) -> None:
     assert not any(check.name == "Format Validation" for check in result.checks)
 
 
+def test_scan_file_attributes_format_mismatch_to_s901(tmp_path: Path) -> None:
+    header_length = 0x9C78
+    metadata = b'{"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}'
+    metadata += b" " * (header_length - len(metadata))
+    model_path = tmp_path / "model.safetensors"
+    model_path.write_bytes(struct.pack("<Q", header_length) + metadata + b"\x00")
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+    format_check = next(check for check in result.checks if check.name == "Format Validation")
+
+    assert format_check.rule_code == "S901"
+
+
 def test_scan_file_detects_malicious_onnx_pb_by_content(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     onnx_pb = tmp_path / "malicious.pb"
