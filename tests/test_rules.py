@@ -96,6 +96,9 @@ class TestRuleRegistry:
         assert "S110" in rules
         assert "S201" not in rules  # Pickle rule, not in range
 
+        framework_rules = RuleRegistry.get_rules_by_range(1100, 1199)
+        assert "S1111" in framework_rules
+
         # Get pickle rules (S200-S299)
         rules = RuleRegistry.get_rules_by_range(200, 299)
         assert all(200 <= int(code[1:]) <= 299 for code in rules)

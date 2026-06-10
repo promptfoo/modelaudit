@@ -608,6 +608,7 @@ def test_onnx_scanner_custom_domain_still_flagged(tmp_path: Path) -> None:
     _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
     assert len(custom_domain_checks) > 0, "Expected custom domain finding for com.evil.ops"
     assert any(c.details.get("domain") == "com.evil.ops" for c in custom_domain_checks)
+    assert all(c.rule_code == "S1111" for c in custom_domain_checks)
     assert "com.evil.ops" in metadata_custom_domains
 
 

@@ -625,7 +625,7 @@ class OnnxScanner(BaseScanner):
                         ),
                         severity=IssueSeverity.INFO,
                         location=f"{path} (node: {node.name})",
-                        rule_code="S302",
+                        rule_code="S1111",
                         details={
                             "op_type": node.op_type,
                             "domain": node.domain,
