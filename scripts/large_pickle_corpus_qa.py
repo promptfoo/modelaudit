@@ -27,7 +27,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import quote
@@ -638,6 +638,40 @@ def _entry_local_path(corpus_root: Path, entry: CorpusEntry) -> Path:
     return corpus_root / "raw" / entry.id / entry.path
 
 
+def _validated_artifact_id(value: object) -> str:
+    artifact_id = str(value)
+    if (
+        not artifact_id
+        or artifact_id in {".", ".."}
+        or "/" in artifact_id
+        or "\\" in artifact_id
+        or Path(artifact_id).is_absolute()
+    ):
+        raise ValueError(f"unsafe corpus artifact id: {artifact_id!r}")
+    return artifact_id
+
+
+def _validated_remote_path(value: object) -> Path:
+    raw_path = str(value)
+    remote_path = PurePosixPath(raw_path)
+    if (
+        not raw_path
+        or "\\" in raw_path
+        or remote_path.is_absolute()
+        or any(part in {"", ".", ".."} for part in remote_path.parts)
+    ):
+        raise ValueError(f"unsafe corpus artifact path: {raw_path!r}")
+    return Path(*remote_path.parts)
+
+
+def _contained_output_path(root: Path, *parts: str | Path) -> Path:
+    resolved_root = root.resolve()
+    candidate = resolved_root.joinpath(*parts).resolve()
+    if candidate != resolved_root and resolved_root not in candidate.parents:
+        raise ValueError(f"corpus path escapes output root: {candidate}")
+    return candidate
+
+
 def _entry_to_lock(entry: CorpusEntry, *, corpus_root: Path) -> dict[str, Any]:
     return {
         **asdict(entry),
@@ -774,14 +808,18 @@ def _download_entry(
     direct_fallback: bool,
     direct_only: bool,
 ) -> dict[str, Any]:
+    artifact_id = _validated_artifact_id(entry["id"])
+    relative_path = _validated_remote_path(entry["path"])
+
     try:
         from huggingface_hub import hf_hub_download
     except Exception as error:  # pragma: no cover - depends on optional import state
         raise RuntimeError("huggingface_hub is required for downloads") from error
 
-    local_dir = corpus_root / "raw" / str(entry["id"])
+    raw_root = _contained_output_path(corpus_root, "raw")
+    local_dir = _contained_output_path(raw_root, artifact_id)
     local_dir.mkdir(parents=True, exist_ok=True)
-    expected_path = local_dir / str(entry["path"])
+    expected_path = _contained_output_path(local_dir, relative_path)
     expected_size = entry.get("remote_size_bytes")
     if expected_path.exists() and isinstance(expected_size, int) and expected_path.stat().st_size == expected_size:
         return _finalize_downloaded_entry(entry, expected_path)
@@ -794,12 +832,12 @@ def _download_entry(
     try:
         downloaded = hf_hub_download(
             repo_id=str(entry["repo_id"]),
-            filename=str(entry["path"]),
+            filename=relative_path.as_posix(),
             revision=str(entry.get("revision") or "main"),
             local_dir=local_dir,
             etag_timeout=etag_timeout_s,
         )
-        local_path = Path(downloaded)
+        local_path = _contained_output_path(local_dir, Path(downloaded).resolve().relative_to(local_dir.resolve()))
     except Exception:
         if not direct_fallback:
             raise
@@ -994,8 +1032,9 @@ def _scan_third_party(
     run_dir: Path,
     timeout_s: float,
 ) -> dict[str, Any]:
+    artifact_id = _validated_artifact_id(artifact_id)
     tool_path = _tool_path(spec, tools_root)
-    output_path = run_dir / "third-party-raw" / artifact_id / f"{spec.name}.json"
+    output_path = _contained_output_path(run_dir, "third-party-raw", artifact_id, f"{spec.name}.json")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     command = _tool_command(spec, tool_path=tool_path, artifact_path=path, output_path=output_path)
     try:
@@ -1065,8 +1104,9 @@ def _iter_pickle_zip_members(path: Path, *, run_dir: Path, artifact_id: str) -> 
 
 
 def _member_file_path(run_dir: Path, artifact_id: str, member_name: str) -> Path:
+    artifact_id = _validated_artifact_id(artifact_id)
     safe_member_name = member_name.replace("/", "__").replace("\\", "__")
-    return run_dir / "members" / artifact_id / safe_member_name
+    return _contained_output_path(run_dir, "members", artifact_id, safe_member_name)
 
 
 def _malicious_reduce_payload() -> bytes:
@@ -1355,7 +1395,21 @@ def _scan_records_for_entry(
     third_party_timeout_s: float,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     path = Path(str(entry["local_path"]))
-    artifact_id = str(entry["id"])
+    try:
+        artifact_id = _validated_artifact_id(entry["id"])
+    except ValueError as error:
+        return (
+            [
+                {
+                    "artifact_id": str(entry.get("id")),
+                    "scanner": "harness",
+                    "mode": "invalid-lock-entry",
+                    "status": "error",
+                    "error": f"{type(error).__name__}: {error}",
+                }
+            ],
+            [],
+        )
     scan_rows: list[dict[str, Any]] = []
     third_party_rows: list[dict[str, Any]] = []
     if not path.exists():

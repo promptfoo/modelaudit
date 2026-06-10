@@ -5,6 +5,8 @@ import zipfile
 from argparse import Namespace
 from pathlib import Path
 
+import pytest
+
 from scripts import large_pickle_corpus_qa
 
 
@@ -75,6 +77,61 @@ def test_iter_pickle_zip_members_extracts_data_pickle_and_skips_near_matches(tmp
 
     scan_row = large_pickle_corpus_qa._scan_package(member_path, engine="rust", artifact_id="A01:data.pkl")
     assert scan_row["result"]["critical_count"] >= 1
+
+
+@pytest.mark.parametrize(
+    ("artifact_id", "artifact_path"),
+    [
+        ("../escaped", "model.pkl"),
+        ("A01", "../../escaped.pkl"),
+        ("A01", "/tmp/escaped.pkl"),
+    ],
+)
+def test_download_entry_rejects_lock_paths_outside_corpus_root(
+    tmp_path: Path,
+    artifact_id: str,
+    artifact_path: str,
+) -> None:
+    entry = {
+        "id": artifact_id,
+        "repo_id": "trusted/model",
+        "path": artifact_path,
+        "revision": "main",
+    }
+
+    with pytest.raises(ValueError, match="unsafe corpus artifact"):
+        large_pickle_corpus_qa._download_entry(
+            entry,
+            corpus_root=tmp_path / "corpus",
+            etag_timeout_s=1,
+            direct_fallback=False,
+            direct_only=True,
+        )
+
+    assert not (tmp_path / "escaped.pkl").exists()
+
+
+def test_pickle_member_path_rejects_artifact_id_escape(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unsafe corpus artifact id"):
+        large_pickle_corpus_qa._member_file_path(tmp_path / "run", "../escaped", "data.pkl")
+
+    assert not (tmp_path / "escaped").exists()
+
+
+def test_third_party_output_rejects_artifact_id_escape(tmp_path: Path) -> None:
+    spec = next(iter(large_pickle_corpus_qa.TOOL_SPECS.values()))
+
+    with pytest.raises(ValueError, match="unsafe corpus artifact id"):
+        large_pickle_corpus_qa._scan_third_party(
+            tmp_path / "artifact.pkl",
+            artifact_id="../escaped",
+            spec=spec,
+            tools_root=tmp_path / "tools",
+            run_dir=tmp_path / "run",
+            timeout_s=1,
+        )
+
+    assert not (tmp_path / "third-party-raw").exists()
 
 
 def test_preflight_offline_writes_lockfile(tmp_path: Path) -> None:
