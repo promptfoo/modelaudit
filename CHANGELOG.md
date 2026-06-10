@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- prefer validated SafeTensors framing over protocol-less pickle header collisions
+- prefer validated SafeTensors framing over invalid pickle and weak-magic collisions while retaining security-bearing pickle overlaps
 - attribute core file-type validation failures directly to S901 instead of message-matching unrelated rules
 - fail closed when manifest scanning exceeds its configured timeout
 - stop cloud directory analysis as soon as download size or object-count budgets are exhausted

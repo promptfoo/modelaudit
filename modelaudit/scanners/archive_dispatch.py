@@ -20,8 +20,10 @@ from ..scanner_results import (
 )
 from ..scanner_selection import (
     SCANNER_SELECTION_PREFERRED_KIND,
+    ScannerSelectionPolicy,
     add_scanner_selection_skip_check,
     allows_protobuf_model_candidate_analysis,
+    allows_zip_content_analysis,
     allows_zip_structure_analysis,
     make_scanner_selection_skip_result,
     policy_from_config,
@@ -46,13 +48,16 @@ from ..utils.file.detection import (
     detect_pytorch_binary_supplemental_format,
     detect_xgboost_ubjson_content_route,
     has_inconclusive_renamed_flax_msgpack_routing,
+    has_safetensors_gzip_nonmember_trailing_overlap,
+    has_safetensors_routing_candidate,
+    has_structural_torch7_content_route,
     is_executorch_archive,
     is_keras_zip_archive,
     is_pytorch_zip_archive,
     is_skops_archive,
     is_torchserve_mar_archive,
 )
-from ..utils.file.hdf5 import HDF5_SIGNATURE_SCAN_MAX_BYTES
+from ..utils.file.hdf5 import HDF5_SIGNATURE_SCAN_MAX_BYTES, find_hdf5_signature_offset
 from .base import FORMAT_VALIDATION_CONFIG_KEY
 from .mxnet_scanner import MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY
 from .xgboost_scanner import (
@@ -89,7 +94,10 @@ _ONNX_ROUTING_INCOMPLETE_REASON = "onnx_routing_incomplete"
 _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_incomplete"
 SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY = "_skip_composed_archive_member_scan"
 KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY = "_known_unreadable_archive_entry_offsets"
+_ZIP_CONTAINER_DISPATCHED_PATHS_PRIVATE_METADATA_KEY = "_zip_container_dispatched_paths"
 _MAX_HDF5_USERBLOCK_ZIP_SEGMENTS = 16
+_MAX_HDF5_USERBLOCK_ZIP_CANDIDATE_VALIDATIONS = 64
+_MAX_HDF5_USERBLOCK_ZIP_VALIDATION_READ_BYTES = 32 * 1024 * 1024
 _ZIP_LEADING_SIGNATURES: tuple[bytes, ...] = (
     b"PK\x03\x04",
     b"PK\x01\x02",
@@ -235,6 +243,98 @@ def _merge_pytorch_binary_supplemental_analysis(
     result.metadata.setdefault("supplemental_scanners", []).append(supplemental_scanner_id)
 
 
+def detect_safetensors_overlap_scanner_ids(path: str) -> frozenset[str]:
+    """Return non-HDF5 scanners that own a validated SafeTensors overlap."""
+    if not has_safetensors_routing_candidate(path):
+        return frozenset()
+    scanner_ids = {"safetensors"}
+    hdf5_signature_offset = find_hdf5_signature_offset(path)
+    try:
+        if zipfile.is_zipfile(path):
+            scanner_ids.add("zip")
+    except OSError:
+        pass
+    if hdf5_signature_offset is not None:
+        try:
+            detected_format = detect_file_format(path)
+        except OSError:
+            detected_format = "unknown"
+        detected_scanner_id = _HEADER_FORMAT_TO_SCANNER_ID.get(detected_format)
+        if isinstance(detected_scanner_id, str) and detected_scanner_id != "keras_h5":
+            scanner_ids.add(detected_scanner_id)
+    if has_safetensors_gzip_nonmember_trailing_overlap(path):
+        scanner_ids.add("compressed")
+    if has_structural_torch7_content_route(path):
+        scanner_ids.add("torch7")
+    return frozenset(scanner_ids)
+
+
+def merge_safetensors_overlap_analysis(
+    path: str,
+    result: ScanResult,
+    config: dict[str, Any] | None,
+    scanner_selection: ScannerSelectionPolicy,
+    scanner_ids: frozenset[str],
+) -> None:
+    """Merge every trusted owner of a validated SafeTensors overlap for this path."""
+    from . import _registry
+
+    pending_scanner_ids = set(scanner_ids - {result.scanner_name})
+    dispatched_zip_paths = result._private_metadata.get(_ZIP_CONTAINER_DISPATCHED_PATHS_PRIVATE_METADATA_KEY, ())
+    zip_already_dispatched = (
+        isinstance(dispatched_zip_paths, list | tuple | set | frozenset)
+        and os.path.realpath(path) in dispatched_zip_paths
+    )
+    if result.scanner_name == "zip" and "zip" in scanner_ids and not zip_already_dispatched:
+        pending_scanner_ids.add("zip")
+
+    for scanner_id in sorted(pending_scanner_ids):
+        zip_analysis_allowed = scanner_id == "zip" and allows_zip_content_analysis(scanner_selection)
+        if not zip_analysis_allowed and not scanner_selection.allows(scanner_id):
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                scanner_id,
+                scanner_selection,
+                context="validated SafeTensors overlapping content analysis",
+            )
+            continue
+
+        if scanner_id == "zip":
+            supplemental_result = ScanResult(scanner_name="zip")
+            merge_executable_zip_container_findings(
+                path,
+                supplemental_result,
+                config,
+                context="validated SafeTensors overlapping ZIP analysis",
+            )
+            supplemental_result.finish(success=not supplemental_result.has_errors)
+        else:
+            scanner_class = _registry.load_scanner_by_id(scanner_id)
+            if scanner_class is None:
+                supplemental_result = _make_unavailable_recognized_format_result(path, scanner_id, scanner_id)
+            else:
+                supplemental_config = config
+                if scanner_id == "compressed":
+                    from .compressed_scanner import ALLOW_SAFETENSORS_NONMEMBER_TRAILING_CONFIG_KEY
+
+                    supplemental_config = dict(config or {})
+                    supplemental_config[ALLOW_SAFETENSORS_NONMEMBER_TRAILING_CONFIG_KEY] = True
+                supplemental_result = scanner_class(config=supplemental_config).scan(path)
+
+        primary_bytes_scanned = result.bytes_scanned
+        result.merge(supplemental_result)
+        result.bytes_scanned = max(primary_bytes_scanned, supplemental_result.bytes_scanned)
+        if scanner_id != result.scanner_name:
+            supplemental_scanners = result.metadata.setdefault("supplemental_scanners", [])
+            if isinstance(supplemental_scanners, list) and scanner_id not in supplemental_scanners:
+                supplemental_scanners.append(scanner_id)
+        supplemental_scanners = result.metadata.get("supplemental_scanners")
+        if isinstance(supplemental_scanners, list):
+            result.metadata["supplemental_scanners"] = list(dict.fromkeys(supplemental_scanners))
+        _deduplicate_exact_merged_findings(result)
+
+
 def _nested_scanner_can_handle(
     scanner_class: type[Any],
     scanner_id: str,
@@ -372,6 +472,17 @@ def _merge_composed_scan_result(result: ScanResult, other: ScanResult) -> None:
         result.metadata[SCAN_OUTCOME_REASONS_METADATA_KEY] = combined_reasons
 
 
+def _mark_zip_container_dispatched(result: ScanResult, path: str) -> None:
+    """Retain local ZIP dispatch ownership across nested result merges."""
+    dispatched_paths = result._private_metadata.setdefault(_ZIP_CONTAINER_DISPATCHED_PATHS_PRIVATE_METADATA_KEY, [])
+    if not isinstance(dispatched_paths, list):
+        dispatched_paths = []
+        result._private_metadata[_ZIP_CONTAINER_DISPATCHED_PATHS_PRIVATE_METADATA_KEY] = dispatched_paths
+    normalized_path = os.path.realpath(path)
+    if normalized_path not in dispatched_paths:
+        dispatched_paths.append(normalized_path)
+
+
 def merge_executable_zip_container_findings(
     path: str,
     result: ScanResult,
@@ -389,6 +500,8 @@ def merge_executable_zip_container_findings(
     except OSError:
         return
 
+    _mark_zip_container_dispatched(result, path)
+
     scanner_selection = policy_from_config(config)
     ext = os.path.splitext(path)[1].lower()
     subtype_ids: list[str] = []
@@ -405,6 +518,7 @@ def merge_executable_zip_container_findings(
             subtype_ids.append("skops")
     except ZipPreflightRejected as exc:
         result.merge(exc.result)
+        _mark_zip_container_dispatched(result, path)
         return
 
     subtype_config = dict(config or {})
@@ -447,6 +561,7 @@ def merge_executable_zip_container_findings(
         )
 
     _deduplicate_exact_merged_findings(result)
+    _mark_zip_container_dispatched(result, path)
 
 
 def merge_hdf5_userblock_zip_findings(
@@ -645,9 +760,10 @@ def _replace_nested_path(value: Any, old_path: str, new_path: str) -> Any:
 class _LogicalEOFReader:
     """Expose a bounded logical EOF for ZIP validation without copying again."""
 
-    def __init__(self, handle: BinaryIO, logical_size: int) -> None:
+    def __init__(self, handle: BinaryIO, logical_size: int, read_budget: list[int]) -> None:
         self._handle = handle
         self._logical_size = logical_size
+        self._read_budget = read_budget
 
     def tell(self) -> int:
         return self._handle.tell()
@@ -667,7 +783,12 @@ class _LogicalEOFReader:
 
     def read(self, size: int = -1) -> bytes:
         remaining = max(0, self._logical_size - self.tell())
-        return self._handle.read(remaining if size < 0 else min(size, remaining))
+        requested = remaining if size < 0 else min(size, remaining)
+        if requested > self._read_budget[0]:
+            raise OSError("HDF5 user-block ZIP validation read budget exhausted")
+        data = self._handle.read(requested)
+        self._read_budget[0] -= len(data)
+        return data
 
     def seekable(self) -> bool:
         return True
@@ -679,7 +800,10 @@ def _find_valid_zip_logical_segments(
     signature_offset: int,
 ) -> list[tuple[int, int]]:
     """Return archive starts and complete ZIP ends before the HDF5 signature."""
+    if len(eocd_offsets) > _MAX_HDF5_USERBLOCK_ZIP_CANDIDATE_VALIDATIONS:
+        raise OSError("HDF5 user block contains too many ZIP end-record candidates to validate safely")
     logical_segments: list[tuple[int, int]] = []
+    read_budget = [_MAX_HDF5_USERBLOCK_ZIP_VALIDATION_READ_BYTES]
     with open(temp_path, "rb") as handle:
         for eocd_offset in eocd_offsets:
             handle.seek(eocd_offset)
@@ -689,7 +813,7 @@ def _find_valid_zip_logical_segments(
             logical_end = eocd_offset + 22 + int.from_bytes(end_record[20:22], "little")
             if logical_end > signature_offset:
                 continue
-            bounded_reader = _LogicalEOFReader(handle, logical_end)
+            bounded_reader = _LogicalEOFReader(handle, logical_end, read_budget)
             bounded_reader.seek(0)
             try:
                 with zipfile.ZipFile(bounded_reader) as archive:
@@ -1039,21 +1163,56 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
     from .zip_scanner import ZipPreflightRejected, ZipScanner
 
     scanner_selection = policy_from_config(config)
+    hdf5_signature_offset = find_hdf5_signature_offset(path)
+    safetensors_overlap_scanner_ids = detect_safetensors_overlap_scanner_ids(path)
+    is_safetensors_hdf5_overlap = hdf5_signature_offset is not None and bool(safetensors_overlap_scanner_ids)
+    if is_safetensors_hdf5_overlap:
+        safetensors_overlap_scanner_ids |= {"safetensors"}
+
+    def with_safetensors_overlap(result: ScanResult) -> ScanResult:
+        if (
+            is_safetensors_hdf5_overlap
+            and hdf5_signature_offset not in (None, 0)
+            and allows_zip_content_analysis(scanner_selection)
+        ):
+            assert hdf5_signature_offset is not None
+            merge_hdf5_userblock_zip_findings(
+                path,
+                result,
+                config,
+                hdf5_signature_offset,
+                context="nested HDF5 user-block ZIP",
+            )
+        merge_safetensors_overlap_analysis(
+            path,
+            result,
+            config,
+            scanner_selection,
+            safetensors_overlap_scanner_ids,
+        )
+        return result
+
     raw_config = config or {}
     try:
         max_zip_entries = int(raw_config.get("max_zip_entries", ZipScanner.DEFAULT_MAX_ENTRIES))
     except (TypeError, ValueError):
         max_zip_entries = ZipScanner.DEFAULT_MAX_ENTRIES
     max_zip_directory_size = ZipScanner.central_directory_size_limit(raw_config)
-    if allows_zip_structure_analysis(scanner_selection, path) and ZipScanner.requires_preflight_result(
-        path,
-        max_zip_entries,
-        max_zip_directory_size,
+    if (
+        (not is_safetensors_hdf5_overlap or hdf5_signature_offset in (None, 0))
+        and allows_zip_structure_analysis(scanner_selection, path)
+        and ZipScanner.requires_preflight_result(
+            path,
+            max_zip_entries,
+            max_zip_directory_size,
+        )
     ):
-        return ZipScanner(config=config).scan(path)
+        return with_safetensors_overlap(ZipScanner(config=config).scan(path))
     scanner_class = None
     routed_content_format = detect_file_format(path)
     trusted_content_format = detect_file_format_from_magic(path)
+    if is_safetensors_hdf5_overlap:
+        trusted_content_format = "hdf5"
     skipped_overlap_scanner_id: str | None = None
     if (
         trusted_content_format == "xgboost"
@@ -1114,9 +1273,9 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
                 config = dict(config or {})
                 config[XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY] = True
     if trusted_content_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
-        return _make_incomplete_llamafile_routing_result(path, config)
+        return with_safetensors_overlap(_make_incomplete_llamafile_routing_result(path, config))
     if trusted_content_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
-        return _make_incomplete_nemo_routing_result(path)
+        return with_safetensors_overlap(_make_incomplete_nemo_routing_result(path))
     if trusted_content_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
         result = _make_incomplete_mxnet_symbol_routing_result(path, config)
         if skipped_overlap_scanner_id:
@@ -1128,15 +1287,15 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
                 context="overlapping JSON analysis",
                 kind=SCANNER_SELECTION_PREFERRED_KIND,
             )
-        return result
+        return with_safetensors_overlap(result)
     if trusted_content_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
-        return _make_incomplete_xgboost_ubjson_routing_result(path)
+        return with_safetensors_overlap(_make_incomplete_xgboost_ubjson_routing_result(path))
     if trusted_content_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT:
-        return _make_incomplete_onnx_routing_result(path)
+        return with_safetensors_overlap(_make_incomplete_onnx_routing_result(path))
     if trusted_content_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT:
-        return _make_incomplete_pickle_routing_result(path)
+        return with_safetensors_overlap(_make_incomplete_pickle_routing_result(path))
     if trusted_content_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
-        return _make_incomplete_tensorflow_protobuf_routing_result(path)
+        return with_safetensors_overlap(_make_incomplete_tensorflow_protobuf_routing_result(path))
     if trusted_content_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT:
         result = ScanResult(scanner_name="zip")
         merge_executable_zip_container_findings(
@@ -1146,13 +1305,13 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
             context="nested executable ZIP polyglot",
         )
         result.finish(success=not result.has_errors)
-        return result
+        return with_safetensors_overlap(result)
 
-    header_format_override = trusted_content_format if trusted_content_format in {"mxnet", "xgboost"} else None
+    header_format_override = trusted_content_format if trusted_content_format in {"hdf5", "mxnet", "xgboost"} else None
     try:
         scanner_id = _select_nested_scanner_id(path, header_format_override, config)
     except ZipPreflightRejected as exc:
-        return exc.result
+        return with_safetensors_overlap(exc.result)
     pytorch_binary_supplemental_scanner_id = (
         detect_pytorch_binary_supplemental_format(path)
         if os.path.splitext(path)[1].lower() == ".bin" and scanner_id == "pytorch_binary"
@@ -1229,20 +1388,26 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
                         or candidate_scanner_class.name
                     )
             if candidate_scanner_id and not scanner_selection.allows(candidate_scanner_id):
-                return make_scanner_selection_skip_result(path, candidate_scanner_id, scanner_selection)
+                return with_safetensors_overlap(
+                    make_scanner_selection_skip_result(path, candidate_scanner_id, scanner_selection)
+                )
 
         if trusted_content_format == XML_MODEL_INCONCLUSIVE_FORMAT:
-            return _make_incomplete_xml_model_result(path)
+            return with_safetensors_overlap(_make_incomplete_xml_model_result(path))
         if routed_content_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
-            return _make_incomplete_protobuf_model_result(path)
+            return with_safetensors_overlap(_make_incomplete_protobuf_model_result(path))
         if trusted_content_format == PROTOBUF_MODEL_CANDIDATE_FORMAT and routed_content_format != "unknown":
-            return _make_unavailable_recognized_format_result(path, routed_content_format, scanner_id)
+            return with_safetensors_overlap(
+                _make_unavailable_recognized_format_result(path, routed_content_format, scanner_id)
+            )
         if trusted_content_format != "unknown":
-            return _make_unavailable_recognized_format_result(path, trusted_content_format, scanner_id)
+            return with_safetensors_overlap(
+                _make_unavailable_recognized_format_result(path, trusted_content_format, scanner_id)
+            )
 
         result = ScanResult(scanner_name="unknown")
         result.finish(success=True)
-        return result
+        return with_safetensors_overlap(result)
 
     scanner_config = dict(config or {})
     if routed_content_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
@@ -1314,4 +1479,4 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
             config,
             pytorch_binary_supplemental_scanner_id,
         )
-    return result
+    return with_safetensors_overlap(result)

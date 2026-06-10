@@ -1,13 +1,21 @@
+import bz2
+import codecs
 import json
+import lzma
+import math
 import pickletools
 import posixpath
 import re
 import struct
+import sys
 import tarfile
 import zipfile
+import zlib
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 from io import BytesIO, StringIO
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Literal
+from typing import Any, BinaryIO, Literal, cast
 
 from ...scanner_registry_metadata import get_extension_format_map, get_registered_scanner_extensions
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
@@ -917,12 +925,281 @@ PROTO0_1_MAX_PROBE_BYTES: int = 64 * 1024
 # budget aligned with the byte budget so trivial padding cannot hide a later
 # dangerous opcode inside the sampled prefix.
 PROTO0_1_MAX_PROBE_OPCODES: int = PROTO0_1_MAX_PROBE_BYTES
+_PICKLE_FRAME_BRANCH_MAX: int = 32
+_PICKLE_MAX_STRUCTURAL_MEMO_INDEX: int = sys.maxsize // struct.calcsize("P") - 1
+_PICKLE_NUMERIC_OPERAND_MAX_BYTES: int = 4096
+_PICKLE_UNICODE_VALIDATE_MAX_BYTES: int = 16 * 1024 * 1024
 PROTO0_1_START_BYTES: bytes = b"()]}cilp0FGIJKLMNPSTUVX"
 PROTO0_1_IGNORABLE_TRAILING_BYTES: bytes = b" \t\r\n\x00"
 PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES: tuple[str, ...] = (
     "pickle exhausted before seeing STOP",
     "no newline found when trying to read ",
 )
+
+
+@dataclass
+class _PickleProbeWorkBudget:
+    """Bound total work shared by every alternate FRAME interpretation."""
+
+    remaining_opcodes: int = PROTO0_1_MAX_PROBE_OPCODES
+    remaining_frame_branches: int = _PICKLE_FRAME_BRANCH_MAX
+    hashability_cache: dict[int, tuple[Any, bool]] = field(default_factory=dict)
+    saw_frame: bool = False
+
+
+_INVALID_PICKLE_NUMERIC_LINE = b"!\n"
+_PICKLE_FLOAT_LINE_RE = re.compile(
+    rb"[+-]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|inf(?:inity)?|nan)",
+    re.IGNORECASE,
+)
+_PICKLE_LEGACY_OCTAL_INT_RE = re.compile(rb"[ \t\r\v\f]*[+-]?0[0-7]+")
+
+
+class _PickleNumericOperandLimitExceeded(ValueError):
+    """Raised when a numeric operand exceeds the bounded parser budget."""
+
+
+class _PickleStructuralArgumentInconclusive(ValueError):
+    """Raised when streamed argument validation reaches its bounded budget."""
+
+
+def _canonicalize_cpython_numeric_line(opcode_byte: int, line: bytes) -> bytes | None:
+    """Return a pickletools-readable line matching CPython's numeric parser."""
+    if opcode_byte not in b"IFLpg" or not line.endswith(b"\n"):
+        return None
+
+    raw_value = line[:-1]
+    had_nul = b"\x00" in raw_value
+    if opcode_byte == ord("L") and not had_nul and raw_value.endswith(b"L"):
+        raw_value = raw_value[:-1]
+    numeric_prefix = raw_value.split(b"\x00", 1)[0]
+    if len(numeric_prefix) > _PICKLE_NUMERIC_OPERAND_MAX_BYTES:
+        raise _PickleNumericOperandLimitExceeded("pickle numeric operand exceeded bounded parser limit")
+    try:
+        if opcode_byte == ord("I"):
+            if not numeric_prefix and had_nul:
+                value: int | float = 0
+            else:
+                try:
+                    value = int(numeric_prefix, 0)
+                except ValueError:
+                    if _PICKLE_LEGACY_OCTAL_INT_RE.fullmatch(numeric_prefix) is None:
+                        raise
+                    value = int(numeric_prefix, 8)
+            canonical = str(value).encode()
+        elif opcode_byte == ord("F"):
+            if _PICKLE_FLOAT_LINE_RE.fullmatch(numeric_prefix) is None:
+                return _INVALID_PICKLE_NUMERIC_LINE
+            value = float(numeric_prefix)
+            if math.isinf(value) and b"inf" not in numeric_prefix.lower():
+                return _INVALID_PICKLE_NUMERIC_LINE
+            canonical = repr(value).encode()
+        elif opcode_byte == ord("L"):
+            if not numeric_prefix:
+                return _INVALID_PICKLE_NUMERIC_LINE
+            canonical = str(int(numeric_prefix, 0)).encode()
+        else:
+            if not numeric_prefix:
+                return _INVALID_PICKLE_NUMERIC_LINE
+            value = int(numeric_prefix, 10)
+            max_value = _PICKLE_MAX_STRUCTURAL_MEMO_INDEX if opcode_byte == ord("p") else sys.maxsize
+            if not 0 <= value <= max_value:
+                return _INVALID_PICKLE_NUMERIC_LINE
+            canonical = str(value).encode()
+    except (OverflowError, ValueError):
+        return _INVALID_PICKLE_NUMERIC_LINE
+    return canonical + b"\n"
+
+
+class _PickleProbeStream:
+    """Bounded byte stream that mirrors CPython's FRAME read boundaries."""
+
+    def __init__(self, sample: bytes, start: int = 0, *, frame_aware: bool = False):
+        self._sample = sample
+        self._raw_position = start
+        self._frame_aware = frame_aware
+        self._frame_position: int | None = None
+        self._frame_end: int | None = None
+        self._linear_frame_ends: list[int] = []
+        self._current_opcode_byte: int | None = None
+        self.last_read_origin = start
+
+    def _drop_exhausted_frame(self) -> None:
+        if self._frame_position is not None and self._frame_end is not None and self._frame_position >= self._frame_end:
+            self._frame_position = None
+            self._frame_end = None
+
+    def tell(self) -> int:
+        self._drop_exhausted_frame()
+        return self._raw_position if self._frame_position is None else self._frame_position
+
+    def set_current_opcode(self, opcode_byte: int | None) -> None:
+        self._current_opcode_byte = opcode_byte
+
+    def read(self, size: int = -1, /) -> bytes:
+        if size == 0:
+            return b""
+        self._drop_exhausted_frame()
+        if size < 0:
+            if self._frame_position is not None and self._frame_end is not None:
+                size = self._frame_end - self._frame_position
+            else:
+                size = len(self._sample) - self._raw_position
+
+        if self._frame_position is not None and self._frame_end is not None:
+            if size <= self._frame_end - self._frame_position:
+                start = self._frame_position
+                self._frame_position += size
+                self.last_read_origin = start
+                return self._sample[start : start + size]
+            self._frame_position = None
+            self._frame_end = None
+
+        start = self._raw_position
+        self._raw_position = min(len(self._sample), start + size)
+        self.last_read_origin = start
+        return self._sample[start : start + size]
+
+    def readline(self, size: int = -1, /) -> bytes:
+        self._drop_exhausted_frame()
+        if self._frame_position is not None and self._frame_end is not None:
+            search_end = self._frame_end if size < 0 else min(self._frame_end, self._frame_position + size)
+            newline_index = self._sample.find(b"\n", self._frame_position, search_end)
+            if newline_index >= 0:
+                start = self._frame_position
+                self._frame_position = newline_index + 1
+                self.last_read_origin = start
+                line = self._sample[start : newline_index + 1]
+                return _canonicalize_cpython_numeric_line(self._current_opcode_byte or -1, line) or line
+            self._frame_position = None
+            self._frame_end = None
+
+        start = self._raw_position
+        search_end = len(self._sample) if size < 0 else min(len(self._sample), start + size)
+        newline_index = self._sample.find(b"\n", start, search_end)
+        end = search_end if newline_index < 0 else newline_index + 1
+        self._raw_position = end
+        self.last_read_origin = start
+        line = self._sample[start:end]
+        return _canonicalize_cpython_numeric_line(self._current_opcode_byte or -1, line) or line
+
+    def read_combining(self, size: int) -> bytes:
+        """Read payload bytes that CPython joins across a frame refill."""
+        self._drop_exhausted_frame()
+        if self._frame_position is None or self._frame_end is None or size <= self._frame_end - self._frame_position:
+            return self.read(size)
+        start = self._frame_position
+        prefix = self._sample[start : self._frame_end]
+        self._frame_position = None
+        self._frame_end = None
+        remaining = size - len(prefix)
+        raw_start = self._raw_position
+        self._raw_position = min(len(self._sample), raw_start + remaining)
+        self.last_read_origin = start
+        return prefix + self._sample[raw_start : raw_start + remaining]
+
+    def load_frame(self, frame_size: int) -> None:
+        """Load one frame payload, discarding a partial enclosing frame like CPython."""
+        if frame_size < 0:
+            raise ValueError("negative FRAME size")
+        if not self._frame_aware:
+            frame_end = self._raw_position + frame_size
+            if frame_end > len(self._sample):
+                raise ValueError("pickle exhausted while loading FRAME payload")
+            self._linear_frame_ends.append(frame_end)
+            return
+        self._drop_exhausted_frame()
+        if self._frame_position is not None and self._frame_end is not None:
+            if frame_size <= self._frame_end - self._frame_position:
+                start = self._frame_position
+                self._frame_position += frame_size
+                retained_frame_end = self._frame_end
+            else:
+                self._frame_position = None
+                self._frame_end = None
+                start = self._raw_position
+                self._raw_position = min(len(self._sample), start + frame_size)
+                retained_frame_end = start + frame_size
+        else:
+            start = self._raw_position
+            self._raw_position = min(len(self._sample), start + frame_size)
+            retained_frame_end = start + frame_size
+        if start + frame_size > len(self._sample):
+            raise ValueError("pickle exhausted while loading FRAME payload")
+        self._frame_position = start
+        self._frame_end = retained_frame_end
+
+    def frame_resume_positions(self) -> list[int]:
+        """Return where independent loads can resume after active frames."""
+        if not self._frame_aware:
+            current_position = self.tell()
+            self._linear_frame_ends = [end for end in self._linear_frame_ends if end > current_position]
+            return sorted(set(self._linear_frame_ends))
+        self._drop_exhausted_frame()
+        if self._frame_position is None or self._raw_position <= self._frame_position:
+            return []
+        return [self._raw_position]
+
+
+def _gen_pickle_probe_ops(stream: _PickleProbeStream) -> Iterator[tuple[Any, Any, int]]:
+    """Yield pickle opcodes while applying FRAME loading semantics to the probe stream."""
+    while True:
+        code = stream.read(1)
+        position = stream.last_read_origin
+        if not code:
+            raise ValueError("pickle exhausted before seeing STOP")
+        opcode = _PICKLE_OPCODE_BY_BYTE.get(code[0])
+        if opcode is None:
+            raise ValueError(f"at position {position}, opcode {code!r} unknown")
+        stream.set_current_opcode(code[0])
+        argument: Any
+        try:
+            if opcode.name in {"GLOBAL", "INST"}:
+                raw_module_name = stream.readline()
+                if not raw_module_name.endswith(b"\n"):
+                    raise ValueError(f"not enough data to read {opcode.name} argument")
+                argument_encoding = "ascii" if opcode.name == "INST" else "utf-8"
+                try:
+                    module_name = raw_module_name[:-1].decode(argument_encoding)
+                except UnicodeDecodeError as exc:
+                    raise ValueError(f"invalid module name in {opcode.name} argument") from exc
+                if not module_name:
+                    raise ValueError(f"empty module name in {opcode.name} argument")
+                raw_global_name = stream.readline()
+                if not raw_global_name.endswith(b"\n"):
+                    raise ValueError(f"not enough data to read {opcode.name} argument")
+                try:
+                    global_name = raw_global_name[:-1].decode(argument_encoding)
+                except UnicodeDecodeError as exc:
+                    raise ValueError(f"invalid global name in {opcode.name} argument") from exc
+                if not global_name:
+                    raise ValueError(f"empty global name in {opcode.name} argument")
+                argument = ("global_argument", module_name, global_name)
+            elif opcode.name in {"SHORT_BINBYTES", "BINBYTES", "BINBYTES8", "BYTEARRAY8"}:
+                length_size = {"SHORT_BINBYTES": 1, "BINBYTES": 4, "BINBYTES8": 8, "BYTEARRAY8": 8}[opcode.name]
+                length_bytes = stream.read(length_size)
+                if len(length_bytes) != length_size:
+                    raise ValueError(f"not enough data to read {opcode.name} length")
+                payload_size = int.from_bytes(length_bytes, "little")
+                if payload_size > sys.maxsize:
+                    raise ValueError(f"{opcode.name} byte count exceeds sys.maxsize")
+                payload = stream.read_combining(payload_size)
+                if len(payload) != payload_size:
+                    raise ValueError(f"not enough data to read {opcode.name} payload")
+                argument = bytearray(payload) if opcode.name == "BYTEARRAY8" else payload
+            else:
+                argument = None if opcode.arg is None else opcode.arg.reader(cast(BinaryIO, stream))
+        finally:
+            stream.set_current_opcode(None)
+        if opcode.name == "FRAME":
+            if not isinstance(argument, int):
+                raise ValueError("invalid FRAME size")
+            stream.load_frame(argument)
+        yield opcode, argument, position
+        if opcode.name == "STOP":
+            break
+
+
 PROTO0_1_TRIVIAL_LEADING_OPCODES: frozenset[str] = frozenset(
     {
         "MARK",
@@ -1792,6 +2069,171 @@ def _pickle_opcode_argument_end(
     return (end, False, 0) if end <= file_size else (None, False, 0)
 
 
+def _pickle_structural_argument(
+    handle: BinaryIO,
+    sample: bytes,
+    opcode: Any,
+    argument_offset: int,
+    argument_end: int,
+    file_size: int,
+    validation_budget: list[int],
+) -> tuple[bool, Any]:
+    """Decode only the small argument fields needed for abstract stack execution."""
+
+    def charge_validation_bytes(byte_count: int) -> None:
+        if byte_count > validation_budget[0]:
+            raise _PickleStructuralArgumentInconclusive("pickle structural validation budget exhausted")
+        validation_budget[0] -= byte_count
+
+    opcode_name = opcode.name
+    if opcode_name in {"BINPUT", "BINGET", "PROTO", "EXT1"}:
+        value = _read_pickle_structure_bytes(handle, sample, argument_offset, 1, file_size)
+        return (False, None) if value is None else (True, value[0])
+    if opcode_name in {"LONG_BINPUT", "LONG_BINGET", "EXT4"}:
+        value = _read_pickle_structure_bytes(handle, sample, argument_offset, 4, file_size)
+        return (False, None) if value is None else (True, int.from_bytes(value, "little"))
+    if opcode_name == "EXT2":
+        value = _read_pickle_structure_bytes(handle, sample, argument_offset, 2, file_size)
+        return (False, None) if value is None else (True, int.from_bytes(value, "little"))
+    if opcode_name in {"GLOBAL", "INST"}:
+        lines = _read_pickle_structure_bytes(
+            handle,
+            sample,
+            argument_offset,
+            argument_end - argument_offset,
+            file_size,
+        )
+        if lines is None:
+            return False, None
+        module_name, separator, remainder = lines.partition(b"\n")
+        global_name, second_separator, trailing = remainder.partition(b"\n")
+        if not module_name or not separator or not global_name or not second_separator or trailing:
+            return False, None
+        try:
+            argument_encoding = "ascii" if opcode_name == "INST" else "utf-8"
+            return True, (
+                "global_argument",
+                module_name.decode(argument_encoding),
+                global_name.decode(argument_encoding),
+            )
+        except UnicodeDecodeError:
+            return False, None
+    if opcode_name in {"PUT", "GET", "INT", "LONG", "FLOAT"}:
+        line = _read_pickle_structure_bytes(
+            handle,
+            sample,
+            argument_offset,
+            argument_end - argument_offset,
+            file_size,
+        )
+        if line is None:
+            return False, None
+        canonical = _canonicalize_cpython_numeric_line(opcode.code.encode("latin-1")[0], line)
+        if canonical is None or canonical == _INVALID_PICKLE_NUMERIC_LINE:
+            return False, None
+        if opcode_name in {"PUT", "GET", "INT", "LONG"}:
+            return True, int(canonical[:-1])
+        return True, float(canonical[:-1])
+    if opcode.arg is not None and opcode.arg.n == -1:
+        line_argument = _read_pickle_structure_bytes(
+            handle,
+            sample,
+            argument_offset,
+            argument_end - argument_offset,
+            file_size,
+        )
+        if line_argument is None:
+            return False, None
+        reader = BytesIO(line_argument)
+        try:
+            parsed_argument = opcode.arg.reader(reader)
+        except (UnicodeError, ValueError):
+            return False, None
+        return (reader.tell() == len(line_argument), parsed_argument)
+    if opcode_name in {"SHORT_BINUNICODE", "BINUNICODE", "BINUNICODE8"}:
+        length_width = {"SHORT_BINUNICODE": 1, "BINUNICODE": 4, "BINUNICODE8": 8}[opcode_name]
+        payload_length = argument_end - argument_offset - length_width
+        if payload_length < 0:
+            return False, None
+        if payload_length > _PICKLE_UNICODE_VALIDATE_MAX_BYTES:
+            raise _PickleStructuralArgumentInconclusive("pickle Unicode validation budget exhausted")
+        charge_validation_bytes(payload_length)
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        payload_offset = argument_offset + length_width
+        remaining = payload_length
+        try:
+            while remaining > 0:
+                chunk = _read_pickle_structure_bytes(
+                    handle,
+                    sample,
+                    payload_offset,
+                    min(4096, remaining),
+                    file_size,
+                )
+                if chunk is None:
+                    return False, None
+                decoder.decode(chunk, final=False)
+                payload_offset += len(chunk)
+                remaining -= len(chunk)
+            decoder.decode(b"", final=True)
+        except UnicodeDecodeError:
+            return False, None
+        return True, "" if payload_length == 0 else "validated"
+    if opcode_name == "BYTEARRAY8":
+        payload_length = argument_end - argument_offset - 8
+        return (payload_length >= 0, ("bytearray_length", max(payload_length, 0)))
+    if opcode_name in {"BININT", "BININT1", "BININT2"}:
+        width = {"BININT": 4, "BININT1": 1, "BININT2": 2}[opcode_name]
+        value = _read_pickle_structure_bytes(handle, sample, argument_offset, width, file_size)
+        if value is None:
+            return False, None
+        return True, int.from_bytes(value, "little", signed=opcode_name == "BININT")
+    if opcode_name in {"LONG1", "LONG4"}:
+        length_width = 1 if opcode_name == "LONG1" else 4
+        length_bytes = _read_pickle_structure_bytes(handle, sample, argument_offset, length_width, file_size)
+        if length_bytes is None:
+            return False, None
+        payload_length = int.from_bytes(length_bytes, "little", signed=opcode_name == "LONG4")
+        if payload_length < 0 or argument_offset + length_width + payload_length != argument_end:
+            return False, None
+        if payload_length > _PICKLE_UNICODE_VALIDATE_MAX_BYTES:
+            raise _PickleStructuralArgumentInconclusive("pickle integer validation budget exhausted")
+        charge_validation_bytes(payload_length)
+        leading_payload = _read_pickle_structure_bytes(
+            handle,
+            sample,
+            argument_offset + length_width,
+            min(payload_length, 8),
+            file_size,
+        )
+        if leading_payload is None:
+            return False, None
+        if payload_length <= 8:
+            return True, int.from_bytes(leading_payload, "little", signed=True)
+        extension_byte = b"\xff" if leading_payload[-1] & 0x80 else b"\x00"
+        remaining_offset = argument_offset + length_width + len(leading_payload)
+        remaining = payload_length - len(leading_payload)
+        while remaining > 0:
+            chunk = _read_pickle_structure_bytes(
+                handle,
+                sample,
+                remaining_offset,
+                min(4096, remaining),
+                file_size,
+            )
+            if chunk is None:
+                return False, None
+            if chunk.strip(extension_byte):
+                return True, "int_out_of_range"
+            remaining_offset += len(chunk)
+            remaining -= len(chunk)
+        return True, int.from_bytes(leading_payload, "little", signed=True)
+    if opcode_name == "FRAME":
+        value = _read_pickle_structure_bytes(handle, sample, argument_offset, 8, file_size)
+        return (False, None) if value is None else (True, int.from_bytes(value, "little"))
+    return True, None
+
+
 def _has_bounded_protocolless_binary_pickle_security_signal(
     file_path: Path,
     file_size: int,
@@ -1805,7 +2247,7 @@ def _has_bounded_protocolless_binary_pickle_security_signal(
     )
     if sample_state is True:
         return True
-    if not sample_is_prefix or len(sample) < 2 or _looks_like_binary_pickle_protocol(sample[:4]):
+    if not sample_is_prefix or len(sample) < 2:
         return False
 
     opcode_count = 0
@@ -1814,6 +2256,51 @@ def _has_bounded_protocolless_binary_pickle_security_signal(
     has_security_opcode = False
     has_pre_stop_security_opcode = False
     line_probe_bytes = 0
+    structural_validation_budget = [_PICKLE_UNICODE_VALIDATE_MAX_BYTES]
+    frame_probe_bytes_remaining = PROTO0_1_MAX_PROBE_BYTES
+    frame_branches_remaining = _PICKLE_FRAME_BRANCH_MAX
+    frame_work_budget = _PickleProbeWorkBudget()
+    frame_branch_started_for_load = False
+    saw_alternate_inconclusive = False
+    stack: list[Any] = []
+    memo: dict[Any, Any] = {}
+    hashability_cache: dict[int, tuple[Any, bool]] = {}
+
+    def negative_result() -> bool | None:
+        return None if saw_alternate_inconclusive else False
+
+    def classify_frame_branch(
+        handle: BinaryIO,
+        branch_offset: int,
+    ) -> bool | None:
+        nonlocal frame_branches_remaining, frame_probe_bytes_remaining, saw_alternate_inconclusive
+        remaining_size = file_size - branch_offset
+        if remaining_size <= 0:
+            return False
+        if frame_branches_remaining <= 0 or frame_probe_bytes_remaining <= 0:
+            saw_alternate_inconclusive = True
+            return None
+
+        frame_branches_remaining -= 1
+        probe_size = min(remaining_size, frame_probe_bytes_remaining)
+        handle.seek(branch_offset)
+        frame_sample = handle.read(probe_size)
+        frame_probe_bytes_remaining -= len(frame_sample)
+        if len(frame_sample) != probe_size:
+            saw_alternate_inconclusive = True
+            return None
+
+        alternate_state = _classify_initial_pickle_security_signal(
+            frame_sample,
+            sample_is_prefix=probe_size < remaining_size,
+            available_stream_length=remaining_size,
+            _work_budget=frame_work_budget,
+            _frame_aware=True,
+        )
+        if alternate_state is None:
+            saw_alternate_inconclusive = True
+        return alternate_state
+
     try:
         with file_path.open("rb") as handle:
             while offset < file_size:
@@ -1821,20 +2308,17 @@ def _has_bounded_protocolless_binary_pickle_security_signal(
                     return None
                 opcode_byte = _read_pickle_structure_bytes(handle, sample, offset, 1, file_size)
                 if opcode_byte is None:
-                    return has_binary_opcode and has_pre_stop_security_opcode
+                    return True if has_binary_opcode and has_pre_stop_security_opcode else negative_result()
                 opcode = _PICKLE_OPCODE_BY_BYTE.get(opcode_byte[0])
                 if opcode is None:
-                    return offset >= len(sample) and has_binary_opcode and has_pre_stop_security_opcode
+                    return (
+                        True
+                        if offset >= len(sample) and has_binary_opcode and has_pre_stop_security_opcode
+                        else negative_result()
+                    )
 
                 opcode_count += 1
                 opcode_name = opcode.name
-                if opcode_name in _PROTOCOLLESS_BINARY_PICKLE_OPCODES:
-                    has_binary_opcode = True
-                if opcode_name in _BINARY_PICKLE_SECURITY_OPCODES:
-                    has_security_opcode = True
-                if opcode_name in _PROTOCOLLESS_BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES:
-                    has_pre_stop_security_opcode = True
-
                 argument_end, budget_exceeded, consumed_line_bytes = _pickle_opcode_argument_end(
                     handle,
                     sample,
@@ -1847,13 +2331,70 @@ def _has_bounded_protocolless_binary_pickle_security_signal(
                 if budget_exceeded:
                     return None
                 if argument_end is None:
-                    return offset >= len(sample) and has_binary_opcode and has_pre_stop_security_opcode
+                    return (
+                        True
+                        if offset >= len(sample) and has_binary_opcode and has_pre_stop_security_opcode
+                        else negative_result()
+                    )
+                argument_valid, argument = _pickle_structural_argument(
+                    handle,
+                    sample,
+                    opcode,
+                    offset + 1,
+                    argument_end,
+                    file_size,
+                    structural_validation_budget,
+                )
+                if not argument_valid or not _apply_pickle_stack_effect(
+                    opcode,
+                    argument,
+                    stack,
+                    memo,
+                    hashability_cache,
+                ):
+                    return True if has_pre_stop_security_opcode else negative_result()
+                if opcode_name == "PROTO" and (
+                    not isinstance(argument, int) or argument > _MAX_FORWARD_COMPAT_BINARY_PICKLE_PROTOCOL
+                ):
+                    return True if has_pre_stop_security_opcode else negative_result()
+                if opcode_name in {"EXT1", "EXT2", "EXT4"} and (not isinstance(argument, int) or argument <= 0):
+                    return True if has_pre_stop_security_opcode else negative_result()
+                if opcode_name in {"PUT", "BINPUT", "LONG_BINPUT"} and (
+                    not isinstance(argument, int) or argument > _PICKLE_MAX_STRUCTURAL_MEMO_INDEX
+                ):
+                    return True if has_pre_stop_security_opcode else negative_result()
+                if opcode_name == "FRAME" and isinstance(argument, int) and argument_end + argument > file_size:
+                    return True if has_pre_stop_security_opcode else negative_result()
+                if opcode_name == "FRAME" and not frame_branch_started_for_load:
+                    frame_branch_started_for_load = True
+                    frame_state = classify_frame_branch(handle, offset)
+                    if frame_state is True:
+                        return True
+                    if frame_state is False and (stack or memo):
+                        saw_alternate_inconclusive = True
+                if opcode_name in _PROTOCOLLESS_BINARY_PICKLE_OPCODES:
+                    has_binary_opcode = True
+                if opcode_name in _BINARY_PICKLE_SECURITY_OPCODES:
+                    has_security_opcode = True
+                if opcode_name in _PROTOCOLLESS_BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES:
+                    has_pre_stop_security_opcode = True
                 if opcode_name == "STOP":
-                    return offset >= len(sample) and opcode_count >= 2 and has_binary_opcode and has_security_opcode
+                    if has_security_opcode:
+                        if offset >= len(sample) and opcode_count >= 2 and has_binary_opcode:
+                            return True
+                        return negative_result()
+                    stack.clear()
+                    has_security_opcode = False
+                    has_pre_stop_security_opcode = False
+                    frame_branch_started_for_load = False
                 offset = argument_end
+    except (_PickleNumericOperandLimitExceeded, _PickleStructuralArgumentInconclusive):
+        return None
     except OSError:
-        return False
-    return has_binary_opcode and has_pre_stop_security_opcode
+        return None
+    if has_binary_opcode and has_pre_stop_security_opcode:
+        return True
+    return negative_result()
 
 
 def _read_pickle_probe_sample(path: Path, size: int, header16: bytes) -> bytes:
@@ -1926,23 +2467,27 @@ def detect_pytorch_binary_supplemental_format(path: str) -> str | None:
     return None
 
 
-def _is_safetensors_routing_candidate(path: Path | None, magic8: bytes, file_size: int) -> bool:
-    """Recognize SafeTensors framing or retain oversized plausible headers."""
+def _validated_safetensors_routing_header(
+    path: Path | None,
+    magic8: bytes,
+    file_size: int,
+) -> tuple[int, bytes | None] | None:
+    """Return a bounded validated header, or retain an oversized plausible one."""
     if file_size <= 8 or len(magic8) < 8:
-        return False
+        return None
 
     try:
         header_len = struct.unpack("<Q", magic8)[0]
     except struct.error:
-        return False
+        return None
 
     if header_len <= 0:
-        return False
+        return None
     if header_len > file_size - 8:
-        return False
+        return None
 
     if path is None:
-        return False
+        return None
 
     # The scanner fails closed on headers above this bounded parse budget.
     # Retain plausible object headers without parsing attacker-sized metadata.
@@ -1950,26 +2495,690 @@ def _is_safetensors_routing_candidate(path: Path | None, magic8: bytes, file_siz
         try:
             with path.open("rb") as handle:
                 handle.seek(8)
-                return handle.read(1) == b"{"
+                return (header_len, None) if handle.read(1) == b"{" else None
         except OSError:
-            return False
+            return None
 
     try:
         with path.open("rb") as handle:
             handle.seek(8)
             header = handle.read(header_len)
     except OSError:
-        return False
+        return None
 
     if len(header) != header_len or not header.startswith(b"{"):
-        return False
+        return None
 
     try:
         parsed_header = json.loads(header.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
+
+    return (header_len, header) if isinstance(parsed_header, dict) else None
+
+
+def _is_safetensors_routing_candidate(path: Path | None, magic8: bytes, file_size: int) -> bool:
+    """Recognize SafeTensors framing or retain oversized plausible headers."""
+    return _validated_safetensors_routing_header(path, magic8, file_size) is not None
+
+
+def has_safetensors_routing_candidate(path: str) -> bool:
+    """Return whether a local file has bounded plausible SafeTensors framing."""
+    file_path = Path(path)
+    try:
+        file_size = file_path.stat().st_size
+        magic8 = read_magic_bytes(path, 8)
+    except OSError:
+        return False
+    return _is_safetensors_routing_candidate(file_path, magic8, file_size)
+
+
+def _apply_pickle_stack_effect(
+    opcode: Any,
+    argument: Any,
+    stack: list[Any],
+    memo: dict[Any, Any],
+    hashability_cache: dict[int, tuple[Any, bool]],
+) -> bool:
+    """Apply pickle stack semantics, returning False when execution cannot continue."""
+    before = opcode.stack_before
+    after = opcode.stack_after
+    num_to_pop = len(before)
+    preserved_value: Any | None = None
+    slice_size = 0
+    tuple_values: list[Any] = []
+
+    def value_kind(value: Any) -> str | None:
+        if isinstance(value, tuple | list) and value and isinstance(value[0], str):
+            return value[0]
+        if isinstance(value, str):
+            return value
+        return getattr(value, "name", None)
+
+    def is_known_hashable(value: Any) -> bool:
+        value_id = id(value)
+        cached = hashability_cache.get(value_id)
+        if cached is not None and cached[0] is value:
+            return cached[1]
+
+        pending: list[tuple[Any, bool]] = [(value, False)]
+        while pending:
+            current, expanded = pending.pop()
+            kind = value_kind(current)
+            if kind != "tuple" or not isinstance(current, tuple) or len(current) != 2:
+                continue
+            current_id = id(current)
+            cached = hashability_cache.get(current_id)
+            if cached is not None and cached[0] is current:
+                continue
+
+            if expanded:
+                is_hashable = True
+                for child in current[1]:
+                    child_kind = value_kind(child)
+                    if child_kind in {"bytearray", "dict", "list", "set", "unhashable_buffer"}:
+                        is_hashable = False
+                        break
+                    if child_kind == "tuple" and isinstance(child, tuple):
+                        child_cached = hashability_cache.get(id(child))
+                        if child_cached is not None and child_cached[0] is child and not child_cached[1]:
+                            is_hashable = False
+                            break
+                hashability_cache[current_id] = (current, is_hashable)
+                continue
+
+            pending.append((current, True))
+            pending.extend(
+                (child, False) for child in current[1] if value_kind(child) == "tuple" and isinstance(child, tuple)
+            )
+
+        cached = hashability_cache.get(value_id)
+        return (
+            cached[1]
+            if cached is not None and cached[0] is value
+            else value_kind(value)
+            not in {
+                "bytearray",
+                "dict",
+                "list",
+                "set",
+                "unhashable_buffer",
+            }
+        )
+
+    def is_known_invalid_callable_or_instance(value: Any) -> bool:
+        return value_kind(value) in {
+            "None",
+            "bool",
+            "buffer",
+            "bytearray",
+            "bytes",
+            "bytes_or_str",
+            "dict",
+            "empty_string",
+            "float",
+            "frozenset",
+            "int",
+            "int_out_of_range",
+            "int_or_bool",
+            "int_unknown",
+            "list",
+            "set",
+            "str",
+            "tuple",
+            "unhashable_buffer",
+        }
+
+    def is_known_invalid_tuple_operand(value: Any) -> bool:
+        return value_kind(value) not in {"any", "tuple"}
+
+    pops_mark = pickletools.markobject in before or (
+        opcode.name == "POP" and stack and stack[-1] is pickletools.markobject
+    )
+    if pops_mark:
+        if stack and stack[-1] is pickletools.markobject:
+            mark_index = len(stack) - 1
+        else:
+            mark_index = next(
+                (index for index in range(len(stack) - 1, -1, -1) if stack[index] is pickletools.markobject),
+                -1,
+            )
+        if mark_index < 0:
+            return False
+        slice_size = len(stack) - mark_index - 1
+        slice_values = stack[mark_index + 1 :]
+        if opcode.name in {"DICT", "SETITEMS"} and slice_size % 2:
+            return False
+        if opcode.name in {"DICT", "SETITEMS"} and not all(is_known_hashable(key) for key in slice_values[::2]):
+            return False
+        if opcode.name in {"ADDITEMS", "FROZENSET"} and not all(is_known_hashable(value) for value in slice_values):
+            return False
+        if opcode.name == "TUPLE":
+            tuple_values = slice_values
+        if opcode.name in {"APPENDS", "SETITEMS", "ADDITEMS"}:
+            if mark_index == 0 or stack[mark_index - 1] is pickletools.markobject:
+                return False
+            preserved_value = stack[mark_index - 1]
+            container_kind = value_kind(preserved_value)
+            if slice_size == 0:
+                pass
+            elif opcode.name == "APPENDS":
+                if container_kind == "any":
+                    pass
+                elif container_kind == "list" or (
+                    container_kind == "bytearray"
+                    and all(
+                        value_kind(value) in {"any", "int_unknown"}
+                        or (isinstance(value, tuple) and value[0] == "int" and 0 <= value[1] <= 255)
+                        for value in slice_values
+                    )
+                ):
+                    preserved_value[1] += slice_size
+                else:
+                    return False
+            elif opcode.name == "SETITEMS":
+                if container_kind in {"any", "dict"}:
+                    pass
+                elif container_kind in {"list", "bytearray"}:
+                    for key, value in zip(slice_values[::2], slice_values[1::2], strict=True):
+                        if value_kind(key) not in {"any", "int_unknown"} and (
+                            not isinstance(key, tuple)
+                            or key[0] != "int"
+                            or not -preserved_value[1] <= key[1] < preserved_value[1]
+                        ):
+                            return False
+                        if container_kind == "bytearray" and not (
+                            value_kind(value) in {"any", "int_unknown"}
+                            or (isinstance(value, tuple) and value[0] == "int" and 0 <= value[1] <= 255)
+                        ):
+                            return False
+                else:
+                    return False
+            elif container_kind not in {"any", "set"}:
+                return False
+        if opcode.name == "OBJ" and (slice_size < 1 or is_known_invalid_callable_or_instance(slice_values[0])):
+            return False
+        del stack[mark_index:]
+        num_to_pop = before.index(pickletools.markobject) if pickletools.markobject in before else 0
+
+    if len(stack) < num_to_pop:
+        return False
+    if not pops_mark and num_to_pop and any(value is pickletools.markobject for value in stack[-num_to_pop:]):
+        return False
+    if opcode.name == "REDUCE" and (
+        is_known_invalid_callable_or_instance(stack[-2]) or is_known_invalid_tuple_operand(stack[-1])
+    ):
+        return False
+    if opcode.name == "STACK_GLOBAL" and any(
+        value_kind(value) not in {"any", "bytes_or_str", "empty_string", "str"} for value in stack[-2:]
+    ):
+        return False
+    if opcode.name == "READONLY_BUFFER" and value_kind(stack[-1]) not in {
+        "any",
+        "buffer",
+        "bytearray",
+        "bytes",
+        "bytes_or_str",
+        "unhashable_buffer",
+    }:
+        return False
+    if opcode.name == "NEWOBJ" and (
+        is_known_invalid_callable_or_instance(stack[-2]) or is_known_invalid_tuple_operand(stack[-1])
+    ):
+        return False
+    if opcode.name == "NEWOBJ_EX" and (
+        is_known_invalid_callable_or_instance(stack[-3])
+        or is_known_invalid_tuple_operand(stack[-2])
+        or value_kind(stack[-1]) not in {"any", "dict"}
+    ):
+        return False
+    if opcode.name == "BUILD" and value_kind(stack[-1]) != "None" and is_known_invalid_callable_or_instance(stack[-2]):
+        return False
+    if opcode.name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
+        tuple_values = stack[-num_to_pop:]
+
+    if opcode.name == "APPEND":
+        preserved_value = stack[-2]
+        item = stack[-1]
+        container_kind = value_kind(preserved_value)
+        if container_kind == "any":
+            pass
+        elif container_kind == "bytearray":
+            if value_kind(item) not in {"any", "int_unknown"} and not (
+                isinstance(item, tuple) and item[0] == "int" and 0 <= item[1] <= 255
+            ):
+                return False
+            preserved_value[1] += 1
+        elif container_kind == "list":
+            preserved_value[1] += 1
+        else:
+            return False
+    elif opcode.name == "SETITEM":
+        preserved_value = stack[-3]
+        key = stack[-2]
+        value = stack[-1]
+        container_kind = value_kind(preserved_value)
+        if container_kind == "any":
+            pass
+        elif container_kind == "dict":
+            if not is_known_hashable(key):
+                return False
+        elif container_kind in {"list", "bytearray"}:
+            if value_kind(key) not in {"any", "int_unknown"} and (
+                not isinstance(key, tuple) or key[0] != "int" or not -preserved_value[1] <= key[1] < preserved_value[1]
+            ):
+                return False
+            if container_kind == "bytearray" and not (
+                value_kind(value) in {"any", "int_unknown"}
+                or (isinstance(value, tuple) and value[0] == "int" and 0 <= value[1] <= 255)
+            ):
+                return False
+        else:
+            return False
+
+    if opcode.name in {"PUT", "BINPUT", "LONG_BINPUT", "MEMOIZE"}:
+        if not stack or stack[-1] is pickletools.markobject:
+            return False
+        memo_index = len(memo) if opcode.name == "MEMOIZE" else argument
+        memo[memo_index] = stack[-1]
+        if opcode.name == "MEMOIZE":
+            after = [stack[-1]]
+    elif opcode.name in {"GET", "BINGET", "LONG_BINGET"}:
+        if argument not in memo:
+            return False
+        after = [memo[argument]]
+    elif opcode.name == "DUP":
+        after = [stack[-1], stack[-1]]
+
+    if preserved_value is not None:
+        after = [preserved_value]
+    elif len(after) == 1 and hasattr(after[0], "name") and after[0] is not pickletools.markobject:
+        output_kind = after[0].name
+        if opcode.name == "NEXT_BUFFER":
+            after = ["any"]
+        elif opcode.name == "READONLY_BUFFER":
+            input_kind = value_kind(stack[-1])
+            if input_kind in {"bytearray", "unhashable_buffer"}:
+                after = ["unhashable_buffer"]
+            elif input_kind == "any":
+                after = ["any"]
+            else:
+                after = ["buffer"]
+        elif output_kind in {"bytes_or_str", "str"} and argument in {b"", ""}:
+            after = ["empty_string"]
+        elif output_kind in {"int", "int_or_bool"}:
+            after = [
+                argument if argument == "int_unknown" else ("int", int(argument) if isinstance(argument, int) else 0)
+            ]
+        elif output_kind == "bool":
+            after = [("int", int(opcode.name == "NEWTRUE"))]
+        elif output_kind == "list":
+            after = [["list", slice_size if opcode.name == "LIST" else 0]]
+        elif output_kind == "bytearray":
+            if (
+                isinstance(argument, tuple)
+                and len(argument) == 2
+                and argument[0] == "bytearray_length"
+                and isinstance(argument[1], int)
+            ):
+                bytearray_length = argument[1]
+            else:
+                bytearray_length = len(argument) if isinstance(argument, bytearray | bytes) else 0
+            after = [["bytearray", bytearray_length]]
+        elif output_kind in {"dict", "set"}:
+            after = [[output_kind, None]]
+        elif output_kind == "tuple":
+            after = [("tuple", tuple(tuple_values))]
+        elif output_kind != "any":
+            after = [output_kind]
+
+    if num_to_pop:
+        del stack[-num_to_pop:]
+    stack.extend(after)
+    return True
+
+
+def _is_valid_pickle_global_argument(argument: Any) -> bool:
+    """Return whether a textual GLOBAL/INST operand has nonempty module and name lines."""
+    return (
+        isinstance(argument, tuple)
+        and len(argument) == 3
+        and argument[0] == "global_argument"
+        and isinstance(argument[1], str)
+        and isinstance(argument[2], str)
+        and bool(argument[1])
+        and bool(argument[2])
+    )
+
+
+def _classify_initial_pickle_security_signal(
+    sample: bytes,
+    *,
+    sample_is_prefix: bool,
+    available_stream_length: int | None = None,
+    _work_budget: _PickleProbeWorkBudget | None = None,
+    _sample_start: int = 0,
+    _frame_aware: bool | None = None,
+) -> bool | None:
+    """Classify bounded consecutive pickle streams without executing them."""
+    if _frame_aware is None:
+        if _work_budget is None:
+            _work_budget = _PickleProbeWorkBudget()
+        linear_state = _classify_initial_pickle_security_signal(
+            sample,
+            sample_is_prefix=sample_is_prefix,
+            available_stream_length=available_stream_length,
+            _work_budget=_work_budget,
+            _sample_start=_sample_start,
+            _frame_aware=False,
+        )
+        if linear_state is True:
+            return linear_state
+        if not _work_budget.saw_frame:
+            return linear_state
+        frame_state = _classify_initial_pickle_security_signal(
+            sample,
+            sample_is_prefix=sample_is_prefix,
+            available_stream_length=available_stream_length,
+            _work_budget=_work_budget,
+            _sample_start=_sample_start,
+            _frame_aware=True,
+        )
+        if frame_state is True:
+            return True
+        if linear_state is None or frame_state is None:
+            return None
         return False
 
-    return isinstance(parsed_header, dict)
+    if _work_budget is None:
+        _work_budget = _PickleProbeWorkBudget()
+    stream = _PickleProbeStream(sample, _sample_start, frame_aware=_frame_aware)
+    memo: dict[Any, Any] = {}
+    available_stream_end = None if available_stream_length is None else _sample_start + available_stream_length
+    saw_alternate_inconclusive = False
+    saw_opcode = False
+
+    def negative_result() -> bool | None:
+        return None if saw_alternate_inconclusive else False
+
+    def classify_frame_resumes() -> bool | None:
+        nonlocal saw_alternate_inconclusive
+        future_frame_ends = stream.frame_resume_positions()
+        if any(frame_end > len(sample) for frame_end in future_frame_ends):
+            return None if sample_is_prefix else False
+        for frame_end in future_frame_ends:
+            if frame_end < len(sample):
+                if _work_budget.remaining_frame_branches <= 0:
+                    saw_alternate_inconclusive = True
+                    continue
+                _work_budget.remaining_frame_branches -= 1
+                remaining_stream_length = (
+                    None if available_stream_end is None else max(0, available_stream_end - frame_end)
+                )
+                alternate_state = _classify_initial_pickle_security_signal(
+                    sample,
+                    sample_is_prefix=sample_is_prefix,
+                    available_stream_length=remaining_stream_length,
+                    _work_budget=_work_budget,
+                    _sample_start=frame_end,
+                    _frame_aware=_frame_aware,
+                )
+                if alternate_state is True:
+                    return True
+                if alternate_state is None:
+                    saw_alternate_inconclusive = True
+            elif sample_is_prefix:
+                saw_alternate_inconclusive = True
+        return None if saw_alternate_inconclusive else False
+
+    while stream.tell() < len(sample):
+        stream_start = stream.tell()
+        has_reachable_security_opcode = False
+        stack: list[Any] = []
+        try:
+            for opcode, argument, _position in _gen_pickle_probe_ops(stream):
+                if _work_budget.remaining_opcodes <= 0:
+                    return True if has_reachable_security_opcode else None
+                _work_budget.remaining_opcodes -= 1
+                saw_opcode = True
+                opcode_name = opcode.name
+                if opcode_name == "FRAME":
+                    _work_budget.saw_frame = True
+                invalid_opcode_argument = (
+                    opcode_name == "PROTO"
+                    and (not isinstance(argument, int) or argument > _MAX_FORWARD_COMPAT_BINARY_PICKLE_PROTOCOL)
+                ) or (
+                    opcode_name in {"PUT", "BINPUT", "LONG_BINPUT", "GET", "BINGET", "LONG_BINGET"}
+                    and (not isinstance(argument, int) or argument < 0)
+                )
+                invalid_opcode_argument = invalid_opcode_argument or (
+                    opcode_name in {"PUT", "BINPUT", "LONG_BINPUT"}
+                    and isinstance(argument, int)
+                    and argument > _PICKLE_MAX_STRUCTURAL_MEMO_INDEX
+                )
+                invalid_opcode_argument = invalid_opcode_argument or (
+                    opcode_name in {"EXT1", "EXT2", "EXT4"} and (not isinstance(argument, int) or argument <= 0)
+                )
+                invalid_opcode_argument = invalid_opcode_argument or (
+                    opcode_name in {"GLOBAL", "INST"} and not _is_valid_pickle_global_argument(argument)
+                )
+                if invalid_opcode_argument:
+                    return True if has_reachable_security_opcode else negative_result()
+                if not _apply_pickle_stack_effect(
+                    opcode,
+                    argument,
+                    stack,
+                    memo,
+                    _work_budget.hashability_cache,
+                ):
+                    if has_reachable_security_opcode:
+                        return True
+                    return negative_result()
+                if opcode_name in _BINARY_PICKLE_SECURITY_OPCODES:
+                    has_reachable_security_opcode = True
+                if opcode_name != "STOP":
+                    continue
+
+                if not _frame_aware:
+                    if has_reachable_security_opcode:
+                        return True
+                    break
+
+                if has_reachable_security_opcode:
+                    return True
+                if classify_frame_resumes() is True:
+                    return True
+                break
+        except _PickleNumericOperandLimitExceeded:
+            return True if has_reachable_security_opcode else None
+        except ValueError as exc:
+            exc_message = str(exc)
+            position_match = re.search(r"(?:at )?position (\d+)", exc_message)
+            if position_match is not None and "opcode" in exc_message:
+                return True if has_reachable_security_opcode else negative_result()
+            if has_reachable_security_opcode:
+                return True
+            if sample_is_prefix and sample[stream_start] in _PICKLE_OPCODE_BY_BYTE:
+                return None
+            return negative_result()
+        except (MemoryError, RecursionError):
+            return True if has_reachable_security_opcode else None
+        except Exception:
+            return True if has_reachable_security_opcode else None
+
+        if stream.tell() <= stream_start:
+            return True if has_reachable_security_opcode else None
+
+    if saw_alternate_inconclusive or (sample_is_prefix and saw_opcode):
+        return None
+    return False
+
+
+def _classify_extended_initial_line_pickle_security_signal(
+    path: Path,
+    file_size: int,
+    sample: bytes,
+) -> bool | None:
+    """Resolve an initial line operand without retaining attacker-sized data."""
+    opcode_offset = 0
+    protocol_prefix = b""
+    if _looks_like_binary_pickle_protocol(sample[:4]):
+        protocol_prefix = sample[:2]
+        opcode_offset = 2
+    if opcode_offset >= len(sample):
+        return None
+
+    opcode = _PICKLE_OPCODE_BY_BYTE.get(sample[opcode_offset])
+    if opcode is None or opcode.arg is None or opcode.arg.n != -1:
+        return None
+
+    canonical_opcode = {
+        "FLOAT": b"F0.0\n",
+        "GET": b"g0\n",
+        "GLOBAL": b"cbuiltins\nset\n",
+        "INST": b"i__builtin__\nset\n",
+        "INT": b"I0\n",
+        "LONG": b"L0\n",
+        "PERSID": b"Px\n",
+        "PUT": b"p0\n",
+        "STRING": b"S'x'\n",
+        "UNICODE": b"Vx\n",
+    }.get(opcode.name)
+    if canonical_opcode is None:
+        return None
+
+    try:
+        with path.open("rb") as handle:
+            argument_end, budget_exceeded, _ = _find_pickle_line_argument_end(
+                handle,
+                opcode_offset + 1,
+                file_size,
+                2 if opcode.name in _PICKLE_LINE_PAIR_OPCODES else 1,
+                min(file_size, SAFETENSORS_ROUTING_HEADER_PARSE_BYTES),
+            )
+            if budget_exceeded:
+                return None
+            if argument_end is None:
+                return False
+            cpython_numeric = False
+            if opcode.name in {"FLOAT", "GET", "INT", "LONG", "PUT"}:
+                handle.seek(opcode_offset + 1)
+                line = handle.read(argument_end - opcode_offset - 1)
+                canonical_line = _canonicalize_cpython_numeric_line(sample[opcode_offset], line)
+                if canonical_line is not None:
+                    canonical_opcode = sample[opcode_offset : opcode_offset + 1] + canonical_line
+                    cpython_numeric = True
+            if not cpython_numeric:
+                handle.seek(opcode_offset)
+                try:
+                    parsed_opcode, _, _ = next(pickletools.genops(handle))
+                except (StopIteration, UnicodeError, ValueError):
+                    return False
+                except (MemoryError, RecursionError):
+                    return None
+                if parsed_opcode.name != opcode.name or handle.tell() != argument_end:
+                    return False
+            handle.seek(argument_end)
+            suffix = handle.read(min(PROTO0_1_MAX_PROBE_BYTES, file_size - argument_end))
+    except _PickleNumericOperandLimitExceeded:
+        return None
+    except OSError:
+        return None
+
+    normalized_sample = protocol_prefix + canonical_opcode + suffix
+    return _classify_initial_pickle_security_signal(
+        normalized_sample,
+        sample_is_prefix=argument_end + len(suffix) < file_size,
+        available_stream_length=len(protocol_prefix) + len(canonical_opcode) + file_size - argument_end,
+    )
+
+
+def _detect_safetensors_content_route(path: Path | None, magic8: bytes, file_size: int) -> str | None:
+    """Resolve a validated SafeTensors frame that may also contain a pickle."""
+    validated_header = _validated_safetensors_routing_header(path, magic8, file_size)
+    if validated_header is None:
+        return None
+    if path is None:
+        return "safetensors"
+
+    header_len, header = validated_header
+    try:
+        if header is None:
+            with path.open("rb") as handle:
+                sample = handle.read(min(file_size, PROTO0_1_MAX_PROBE_BYTES))
+        else:
+            data_offset = 8 + header_len
+            tail_size = min(PROTO0_1_MAX_PROBE_BYTES, file_size - data_offset)
+            with path.open("rb") as handle:
+                handle.seek(data_offset)
+                sample = magic8 + header + handle.read(tail_size)
+    except OSError:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    sample_is_prefix = len(sample) < file_size
+    pickle_state = _classify_initial_pickle_security_signal(
+        sample,
+        sample_is_prefix=sample_is_prefix,
+        available_stream_length=file_size,
+    )
+    if pickle_state is None and header is not None:
+        pickle_state = _classify_extended_initial_line_pickle_security_signal(path, file_size, sample)
+    if (
+        pickle_state is None
+        and header is not None
+        and len(sample) < min(file_size, SAFETENSORS_ROUTING_HEADER_PARSE_BYTES)
+    ):
+        data_offset = 8 + header_len
+        extended_tail_size = max(0, SAFETENSORS_ROUTING_HEADER_PARSE_BYTES - data_offset)
+        try:
+            with path.open("rb") as handle:
+                handle.seek(data_offset)
+                extended_sample = magic8 + header + handle.read(min(extended_tail_size, file_size - data_offset))
+        except OSError:
+            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        if len(extended_sample) > len(sample):
+            pickle_state = _classify_initial_pickle_security_signal(
+                extended_sample,
+                sample_is_prefix=len(extended_sample) < file_size,
+                available_stream_length=file_size,
+            )
+    if pickle_state is True:
+        return "pickle"
+
+    if header is None or (sample_is_prefix and pickle_state is None):
+        structural_state = _has_bounded_protocolless_binary_pickle_security_signal(path, file_size, sample)
+        if structural_state is True:
+            return "pickle"
+        if structural_state is None:
+            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        return "safetensors"
+
+    if pickle_state is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    return "safetensors"
+
+
+def _resolve_safetensors_tensorflow_overlap(path: Path, file_size: int) -> str:
+    """Prefer fully validated SafeTensors framing over only ambiguous protobuf evidence."""
+    renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(
+        path,
+        file_size,
+        fail_closed_on_inconclusive=False,
+    )
+    if renamed_tensorflow_format == "oversized":
+        return "tf_metagraph"
+    if renamed_tensorflow_format in {"oversized_candidate", "inconclusive"}:
+        try:
+            magic8 = read_magic_bytes(str(path), 8)
+        except OSError:
+            return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+        validated_header = _validated_safetensors_routing_header(path, magic8, file_size)
+        if validated_header is not None and validated_header[1] is not None:
+            return "safetensors"
+        return TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
+    if renamed_tensorflow_format != "unknown":
+        return renamed_tensorflow_format
+    return "safetensors"
 
 
 def should_defer_safetensors_header_limit_hash(path: str, max_header_bytes: int) -> bool:
@@ -3346,6 +4555,40 @@ def find_structural_torch7_offset(payload: bytes) -> int | None:
     return min(offsets) if offsets else None
 
 
+def _has_structural_torch7_content_route(
+    file_path: Path | None,
+    file_size: int,
+    magic4: bytes,
+) -> bool:
+    """Return whether explicit Torch7 magic has supporting serialized structure."""
+    if magic4 != b"T7\x00\x00" or not _allows_renamed_binary_content_route(file_path):
+        return False
+    if file_path is None:
+        return True
+    try:
+        prefix = read_magic_bytes(str(file_path), min(file_size, _TORCH7_SIGNATURE_READ_BYTES))
+    except OSError:
+        return False
+    return find_structural_torch7_offset(prefix) is not None
+
+
+def has_structural_torch7_content_route(path: str) -> bool:
+    """Return whether a local overlap has explicit Torch7 structure near its magic."""
+    file_path = Path(path)
+    try:
+        file_size = file_path.stat().st_size
+        magic4 = read_magic_bytes(path, 4)
+    except OSError:
+        return False
+    if magic4 != b"T7\x00\x00":
+        return False
+    try:
+        prefix = read_magic_bytes(path, min(file_size, _TORCH7_SIGNATURE_READ_BYTES))
+    except OSError:
+        return False
+    return find_structural_torch7_offset(prefix) is not None
+
+
 def find_torch7_candidate_offset(payload: bytes) -> int | None:
     """Return the earliest Torch7 candidate with structure or nearby Lua risk signal."""
     binary_offset = _find_torch7_binary_candidate_offset(payload)
@@ -3492,6 +4735,193 @@ def _detect_compression_format(prefix: bytes) -> str | None:
     if is_zlib_header(prefix[:2]):
         return "zlib"
     return None
+
+
+def _has_structurally_valid_compression_header(prefix: bytes, compression_format: str) -> bool:
+    """Reject weak compression magic that cannot begin the claimed codec."""
+    if compression_format == "gzip":
+        return len(prefix) >= 4 and prefix[2] == 8 and prefix[3] & 0xE0 == 0
+    if compression_format == "bzip2":
+        return len(prefix) >= 4 and prefix[:3] == _BZIP2_MAGIC and prefix[3:4] in b"123456789"
+    if compression_format == "zlib":
+        return is_zlib_header(prefix[:2])
+    return compression_format in {"xz", "lz4"}
+
+
+def _could_start_structurally_valid_compression_header(prefix: bytes, compression_format: str) -> bool:
+    """Retain a partial same-codec header when a bounded probe ends mid-signature."""
+    if compression_format == "gzip":
+        required_prefix = b"\x1f\x8b\x08"
+        if len(prefix) < len(required_prefix):
+            return required_prefix.startswith(prefix)
+        return len(prefix) < 4 or _has_structurally_valid_compression_header(prefix, compression_format)
+    if compression_format == "bzip2":
+        required_prefix = _BZIP2_MAGIC
+        if len(prefix) < len(required_prefix):
+            return required_prefix.startswith(prefix)
+        return prefix.startswith(required_prefix) and (len(prefix) < 4 or prefix[3:4] in b"123456789")
+    if compression_format == "xz":
+        return _XZ_MAGIC.startswith(prefix) if len(prefix) < len(_XZ_MAGIC) else prefix.startswith(_XZ_MAGIC)
+    if compression_format == "lz4":
+        return (
+            _LZ4_FRAME_MAGIC.startswith(prefix)
+            if len(prefix) < len(_LZ4_FRAME_MAGIC)
+            else prefix.startswith(_LZ4_FRAME_MAGIC)
+        )
+    if compression_format == "zlib":
+        if len(prefix) >= 2:
+            return is_zlib_header(prefix[:2])
+        return bool(prefix) and any(is_zlib_header(prefix + bytes([second_byte])) for second_byte in range(256))
+    return False
+
+
+def _probe_compression_prefix(
+    path: Path,
+    file_size: int,
+    compression_format: str,
+    *,
+    probe_limit: int,
+) -> bool | Literal["complete_with_nonmember_trailing"] | None:
+    """Return False only when bounded decoding disproves a compression collision."""
+    if compression_format == "gzip":
+        decompressor: Any = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        error_types: tuple[type[BaseException], ...] = (zlib.error,)
+    elif compression_format == "zlib":
+        decompressor = zlib.decompressobj()
+        error_types = (zlib.error,)
+    elif compression_format == "bzip2":
+        decompressor = bz2.BZ2Decompressor()
+        error_types = (OSError, EOFError)
+    elif compression_format == "xz":
+        decompressor = lzma.LZMADecompressor(memlimit=64 * 1024 * 1024)
+        error_types = (lzma.LZMAError, EOFError)
+    else:
+        return None
+
+    total_input = 0
+    total_output = 0
+    successfully_decoded_input = 0
+    input_limit = min(file_size, probe_limit)
+    output_limit = probe_limit
+    try:
+        with path.open("rb") as handle:
+            while total_input < input_limit:
+                chunk = handle.read(min(4096, input_limit - total_input))
+                if not chunk:
+                    break
+                total_input += len(chunk)
+                try:
+                    output = decompressor.decompress(chunk, max_length=output_limit - total_output + 1)
+                except error_types:
+                    return None if total_output > 0 or successfully_decoded_input > 32 else False
+                successfully_decoded_input = total_input
+                total_output += len(output)
+                if total_output > output_limit:
+                    return None
+                if getattr(decompressor, "eof", False):
+                    trailing = bytes(getattr(decompressor, "unused_data", b""))
+                    if compression_format == "gzip":
+                        trailing = trailing.lstrip(b"\x00")
+                        while not trailing and total_input < min(file_size, input_limit):
+                            padding_probe = handle.read(min(4096, input_limit - total_input))
+                            if not padding_probe:
+                                break
+                            total_input += len(padding_probe)
+                            trailing = padding_probe.lstrip(b"\x00")
+                        if not trailing:
+                            return True if total_input >= file_size else None
+                        if len(trailing) < 16 and total_input < min(file_size, input_limit):
+                            suffix_probe = handle.read(min(16 - len(trailing), input_limit - total_input))
+                            total_input += len(suffix_probe)
+                            trailing += suffix_probe
+                    elif not trailing and total_input < file_size:
+                        trailing = handle.read(min(16, file_size - total_input))
+                    if not trailing:
+                        return True
+                    trailing_format = _detect_compression_format(trailing)
+                    if trailing_format == compression_format and _has_structurally_valid_compression_header(
+                        trailing,
+                        compression_format,
+                    ):
+                        return None
+                    if total_input < file_size and _could_start_structurally_valid_compression_header(
+                        trailing,
+                        compression_format,
+                    ):
+                        return None
+                    return "complete_with_nonmember_trailing" if compression_format == "gzip" else False
+                if getattr(decompressor, "unconsumed_tail", b""):
+                    return None
+    except OSError:
+        return None
+    return None
+
+
+def _compression_route_precedes_safetensors(
+    path: Path | None,
+    prefix: bytes,
+    file_size: int,
+    compression_format: str,
+) -> bool:
+    """Retain plausible compression while yielding decoder-invalid length collisions."""
+    if path is None:
+        return True
+    validated_header = _validated_safetensors_routing_header(path, prefix[:8], file_size)
+    if validated_header is None:
+        return True
+    if not _has_structurally_valid_compression_header(prefix, compression_format):
+        return False
+    if compression_format == "zlib" and len(prefix) >= 2 and prefix[1] & 0x20:
+        return True
+    header_len, header = validated_header
+    if header is None:
+        probe_limit = PROTO0_1_MAX_PROBE_BYTES
+    else:
+        probe_limit = min(
+            file_size,
+            8 + header_len + PROTO0_1_MAX_PROBE_BYTES,
+            SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + PROTO0_1_MAX_PROBE_BYTES,
+        )
+    probe_result = _probe_compression_prefix(
+        path,
+        file_size,
+        compression_format,
+        probe_limit=probe_limit,
+    )
+    return probe_result not in {False, "complete_with_nonmember_trailing"}
+
+
+def has_safetensors_gzip_nonmember_trailing_overlap(path: str) -> bool:
+    """Return whether bounded decoding proves a gzip member before SafeTensors-owned trailing data."""
+    file_path = Path(path)
+    try:
+        file_size = file_path.stat().st_size
+        prefix = read_magic_bytes(path, 16)
+    except OSError:
+        return False
+    if _detect_compression_format(prefix) != "gzip" or not _has_structurally_valid_compression_header(prefix, "gzip"):
+        return False
+    validated_header = _validated_safetensors_routing_header(file_path, prefix[:8], file_size)
+    if validated_header is None:
+        return False
+    header_len, header = validated_header
+    if header is None:
+        probe_limit = PROTO0_1_MAX_PROBE_BYTES
+    else:
+        probe_limit = min(
+            file_size,
+            8 + header_len + PROTO0_1_MAX_PROBE_BYTES,
+            SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + PROTO0_1_MAX_PROBE_BYTES,
+        )
+    return (
+        _probe_compression_prefix(
+            file_path,
+            file_size,
+            "gzip",
+            probe_limit=probe_limit,
+        )
+        == "complete_with_nonmember_trailing"
+    )
 
 
 def _looks_like_renamed_r_serialized_header(prefix: bytes) -> bool:
@@ -4054,8 +5484,14 @@ def detect_format_from_magic_bytes(
 ) -> FileFormat:
     """Detect file format using Python 3.10+ pattern matching on magic bytes."""
     compression_format = _detect_compression_format(magic16)
-    if compression_format:
+    if compression_format and _compression_route_precedes_safetensors(
+        file_path,
+        magic16,
+        file_size,
+        compression_format,
+    ):
         return compression_format
+    structural_torch7_route = _has_structural_torch7_content_route(file_path, file_size, magic4)
 
     # Use pattern matching for cleaner magic byte detection
     match magic4:
@@ -4063,8 +5499,6 @@ def detect_format_from_magic_bytes(
             return "catboost"
         case b"RKNN" if _allows_renamed_binary_content_route(file_path):
             return "rknn"
-        case b"T7\x00\x00" if _allows_renamed_binary_content_route(file_path):
-            return "torch7"
         case b"GGUF":
             return "gguf"
         case magic if magic in GGML_MAGIC_VARIANTS:
@@ -4108,8 +5542,13 @@ def detect_format_from_magic_bytes(
             if onnx_route_status is True:
                 return "onnx"
 
-    if _is_safetensors_routing_candidate(file_path, magic8, file_size):
-        return "safetensors"
+    safetensors_route = _detect_safetensors_content_route(file_path, magic8, file_size)
+    if safetensors_route is not None:
+        if safetensors_route == "safetensors" and file_path is not None:
+            return _resolve_safetensors_tensorflow_overlap(file_path, file_size)
+        return safetensors_route
+    if structural_torch7_route:
+        return "torch7"
     if _looks_like_binary_pickle_protocol(magic4) and (
         file_path is None or not _could_be_content_routed_flax_msgpack(file_path)
     ):
@@ -4585,15 +6024,27 @@ def detect_file_format(path: str) -> str:
         return llamafile_format
 
     compression_format = _detect_compression_format(header)
+    compression_precedes_safetensors = compression_format is not None and _compression_route_precedes_safetensors(
+        file_path,
+        header,
+        size,
+        compression_format,
+    )
+    structural_torch7_route = _has_structural_torch7_content_route(file_path, size, magic4)
     has_known_container_magic = (
         _has_zip_magic(magic4)
         or magic8.startswith(_SEVENZIP_MAGIC)
         or _has_rar_magic(magic8)
         or _looks_like_uncompressed_tar_header(header)
     )
-    if compression_format is None and not has_known_container_magic:
-        if _is_safetensors_routing_candidate(file_path, magic8, size):
-            return "safetensors"
+    if not compression_precedes_safetensors and not has_known_container_magic:
+        safetensors_route = _detect_safetensors_content_route(file_path, magic8, size)
+        if safetensors_route is not None:
+            if safetensors_route == "safetensors":
+                return _resolve_safetensors_tensorflow_overlap(file_path, size)
+            return safetensors_route
+        if structural_torch7_route:
+            return "torch7"
         could_be_flax = _could_be_content_routed_flax_msgpack(file_path)
         if _looks_like_binary_pickle_protocol(magic4) and not could_be_flax:
             return "pickle"
