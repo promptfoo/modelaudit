@@ -13,6 +13,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.core_results import merge_scan_result
 from modelaudit.models import create_initial_audit_result
+from modelaudit.scanners import pickle_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
     _BINARY_TAIL_SCAN_BYTES,
@@ -165,6 +166,30 @@ def _make_dup_heavy_pickle(iterations: int) -> bytes:
         payload += b"h\x002a0"
     payload += b"."
     return bytes(payload)
+
+
+def _make_legacy_pytorch_container(
+    storage_payload: bytes,
+    *,
+    object_stream: bytes | None = None,
+) -> tuple[bytes, int]:
+    control_streams = (
+        pickle.dumps(0x1950A86A20F9469CFC6C, protocol=2),
+        pickle.dumps(1001, protocol=2),
+        pickle.dumps(
+            {
+                "protocol_version": 1001,
+                "little_endian": True,
+                "type_sizes": {"short": 2, "int": 4, "long": 8},
+            },
+            protocol=2,
+        ),
+        object_stream or pickle.dumps({"weights": [1, 2, 3]}, protocol=2),
+        pickle.dumps(["storage-0"], protocol=2),
+    )
+    pickle_end = sum(len(stream) for stream in control_streams)
+    storage_record = len(storage_payload).to_bytes(8, "little") + storage_payload
+    return b"".join(control_streams) + storage_record, pickle_end
 
 
 def test_pickle_scanner_star_import_exports_scanner_class() -> None:
@@ -1579,6 +1604,110 @@ def test_extract_metadata_validates_pickle_read_limit(
     metadata = PickleScanner(config={"max_metadata_pickle_read_size": configured_limit}).extract_metadata(str(path))
 
     assert metadata["extraction_error"] == expected_error
+
+
+def test_legacy_pytorch_container_does_not_report_known_stream_truncated(tmp_path: Path) -> None:
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 512)
+    path = tmp_path / "legacy-known-size.bin"
+    path.write_bytes(payload)
+
+    result = PickleScanner(
+        config={
+            "max_known_stream_read_bytes": 256,
+            "pickle_root_raw_scan_limit_bytes": len(payload),
+        }
+    ).scan(str(path))
+
+    assert result.success is True
+    assert "known_stream_truncated" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.details.get("notice_code") == "known_stream_truncated" for check in result.checks)
+    assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
+
+
+def test_legacy_pytorch_seekable_stream_uses_control_stream_boundary() -> None:
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 512)
+    stream = io.BytesIO(payload)
+
+    result = PickleScanner(
+        config={
+            "max_known_stream_read_bytes": 256,
+            "pickle_root_raw_scan_limit_bytes": len(payload),
+        }
+    ).scan_stream(stream, len(payload), source="legacy-stream.bin")
+
+    assert result.success is True
+    assert "known_stream_truncated" not in result.metadata.get("scan_outcome_reasons", [])
+    assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
+    assert stream.tell() == 0
+
+
+def test_legacy_pytorch_storage_is_not_treated_as_binary_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 64)
+    path = tmp_path / "legacy-storage-tail.bin"
+    path.write_bytes(payload)
+    monkeypatch.setattr(pickle_scanner, "_BINARY_TAIL_SCAN_BYTES", 100)
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is True
+    assert not any(check.name == "Pickle Binary Tail Coverage" for check in result.checks)
+    assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
+
+
+def test_legacy_pytorch_storage_bytes_are_not_counted_as_pickle_cve_streams(tmp_path: Path) -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(b"N\xff" * 65)
+    path = tmp_path / "legacy-opcode-shaped-storage.bin"
+    path.write_bytes(payload)
+
+    result = PickleScanner(config={"pickle_root_raw_scan_limit_bytes": len(payload)}).scan(str(path))
+
+    assert result.success is True
+    assert result.metadata["pickle_cve_streams_analyzed"] == 5
+    assert not any(check.name == "Pickle CVE Stream Coverage" for check in result.checks)
+
+
+def test_legacy_pytorch_storage_bytes_do_not_report_extension_opcodes(tmp_path: Path) -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(b"\x82\x01\x83\x01\x00" * 32)
+    path = tmp_path / "legacy-extension-shaped-storage.bin"
+    path.write_bytes(payload)
+
+    result = PickleScanner(config={"pickle_root_raw_scan_limit_bytes": len(payload)}).scan(str(path))
+
+    assert result.success is True
+    assert not any(issue.details.get("opcode") in {"EXT1", "EXT2"} for issue in result.issues)
+
+
+def test_legacy_pytorch_container_scans_malicious_object_stream(tmp_path: Path) -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(
+        b"A" * 64,
+        object_stream=pickle.dumps(MaliciousPayload(), protocol=2),
+    )
+    path = tmp_path / "legacy-malicious-object.bin"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is True
+    assert result.metadata["legacy_pytorch_container"] is True
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any(issue.details.get("import_reference") == EXPECTED_SYSTEM_GLOBAL for issue in result.issues)
+
+
+def test_truncated_legacy_pytorch_control_stream_remains_inconclusive(tmp_path: Path) -> None:
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 64)
+    truncated_payload = payload[: pickle_end - 1] + payload[pickle_end:]
+    path = tmp_path / "legacy-truncated-control.bin"
+    path.write_bytes(truncated_payload)
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata.get("legacy_pytorch_container") is not True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pickle_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
 
 
 def test_scan_bin_file_detects_executable_tail_after_pickle_stream(tmp_path: Path) -> None:
