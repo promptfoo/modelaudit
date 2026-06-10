@@ -9,6 +9,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- avoid routing trusted NumPy extension reconstruction exports through module `__getattr__` fallbacks while preserving legacy dotted-`GLOBAL` hook detection
 - preserve nested and aliased callable opcode evidence for downstream scanners
 
 ## [0.1.6](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.5...modelaudit-picklescan-v0.1.6) (2026-06-05)
@@ -84,7 +85,6 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- avoid routing trusted NumPy extension reconstruction exports through module `__getattr__` fallbacks while preserving legacy dotted-`GLOBAL` hook detection
 - ignore single-quartet Base64 pickle prefixes in ordinary text while preserving explicit payloads and security evidence
 - honor the string-literal scan cap during bounded raw nested-pickle analysis and avoid duplicate probes inside complete encoded pickles
 - preserve raw persistent-ID probes and later encoded payloads when byte literals also contain complete or unterminated Base64 pickles
