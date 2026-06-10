@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import ast
+import io
 import ipaddress
 import os
 import re
+import shlex
 import struct
 import tempfile
+import tokenize
 import zipfile
+from bisect import bisect_left
+from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, BinaryIO, ClassVar
@@ -47,11 +53,14 @@ LLAMAFILE_RUNTIME_TRANSFER_TOKEN_LIMIT_REASON = "llamafile_runtime_transfer_toke
 LLAMAFILE_RUNTIME_STREAM_READ_REASON = "llamafile_runtime_stream_read_failed"
 LLAMAFILE_TORCH7_CARVE_FAILURE_REASON = "llamafile_torch7_payload_carve_failed"
 LLAMAFILE_TORCH7_ANALYSIS_INCOMPLETE_REASON = "llamafile_torch7_analysis_incomplete"
+LLAMAFILE_TORCH7_CANDIDATE_PROBE_LIMIT_REASON = "llamafile_torch7_candidate_probe_limited"
 LLAMAFILE_RUNTIME_MAX_EVIDENCE = 5
 LLAMAFILE_RUNTIME_EVIDENCE_INPUT_CHARS = 1024
 LLAMAFILE_RUNTIME_MAX_STRING_CANDIDATES = 100_000
+LLAMAFILE_RUNTIME_MAX_INTERPRETER_CANDIDATES = 64
 LLAMAFILE_RUNTIME_MAX_INTERPRETER_TOKENS = 32
 LLAMAFILE_RUNTIME_MAX_TRANSFER_TOKENS = 4096
+LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES = 64 * 1024
 LLAMAFILE_RUNTIME_STREAM_CHUNK_BYTES = 1024 * 1024
 LLAMAFILE_RUNTIME_STREAM_MAX_STRING_BYTES = 1024 * 1024
 LLAMAFILE_GGUF_MAX_HEADER_CANDIDATES = 1024
@@ -61,6 +70,7 @@ TORCH7_BINARY_MARKER = b"T7\x00\x00"
 TORCH7_ACTIONABLE_SIGNAL_CHUNK_BYTES = 64 * 1024
 TORCH7_ACTIONABLE_SIGNAL_CARRY_BYTES = 1024
 LLAMAFILE_TORCH7_MAX_CANDIDATE_SCANS = 16
+LLAMAFILE_TORCH7_MAX_MARKER_CANDIDATES = 1024
 
 ELF_MAGIC = b"\x7fELF"
 PE_MAGIC = b"MZ"
@@ -130,8 +140,10 @@ SAFE_JSON_SCHEMA_URL_RE = re.compile(
 )
 TRANSFER_TOKEN_RE = re.compile(r""""(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|&&|\|\||[;|&]|(?:\\.|[^\s;|&])+""")
 TRANSFER_COMMAND_WORD_RE = re.compile(
-    r"(?<![\w.-])(?P<tool>curl|wget)(?:\.exe)?"
-    r"""(?=(?:"(?=[\s;|&]|$)|'(?=[\s;|&]|$)|[\s;|&]|$))""",
+    r"(?<![\w.-])(?P<tool>\\?c(?:''|\"\")*\\?u(?:''|\"\")*\\?r(?:''|\"\")*\\?l|"
+    r"\\?w(?:''|\"\")*\\?g(?:''|\"\")*\\?e(?:''|\"\")*\\?t)(?:\.exe)?"
+    r"""(?=(?:\\(?:[nrt]|x[0-9a-f]{1,2}|0[0-7]{1,3}|[1-7][0-7]{0,2}|(?=\s))"""
+    r"""|"(?=[\s,;|&\]})]|$)|'(?=[\s,;|&\]})]|$)|[\s;|&]|$))""",
     re.IGNORECASE,
 )
 TRANSFER_DOMAIN_RE = re.compile(
@@ -139,6 +151,23 @@ TRANSFER_DOMAIN_RE = re.compile(
     r"(?:[a-z]{2,}|xn--[a-z0-9-]{2,})\.?(?::\d+)?$",
     re.IGNORECASE,
 )
+TRANSFER_SINGLE_LABEL_HOST_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?::\d+)?$",
+    re.IGNORECASE,
+)
+SHELL_CONTROL_PREFIXES = frozenset({"(", "{", "!", "coproc", "if", "then", "elif", "else", "while", "until", "do"})
+SHELL_RESERVED_CONTEXT_TOKENS = SHELL_CONTROL_PREFIXES | {"case", "in", "time"}
+SHELL_STDIN_INTERPRETERS = frozenset({"bash", "dash", "fish", "ksh", "sh", "zsh"})
+LITERAL_HEREDOC_DATA_CONSUMERS = frozenset(
+    {"cat", "cut", "grep", "head", "sed", "sort", "tail", "tee", "tr", "uniq", "wc"}
+)
+LLAMAFILE_RUNTIME_MAX_HEREDOC_LINE_BYTES = 64 * 1024
+LLAMAFILE_RUNTIME_MAX_HEREDOC_DECLARATIONS = 64
+TRANSFER_TERMINATING_LONG_OPTIONS = frozenset({"--help", "--manual", "--version"})
+TRANSFER_TERMINATING_SHORT_OPTIONS = {
+    "curl": frozenset({"h", "M", "V"}),
+    "wget": frozenset({"h", "V"}),
+}
 TRANSFER_VALUE_OPTIONS = frozenset(
     {
         "--connect-timeout",
@@ -151,6 +180,7 @@ TRANSFER_VALUE_OPTIONS = frozenset(
         "--directory-prefix",
         "--dns-servers",
         "--doh-url",
+        "--execute",
         "--form",
         "--ftp-password",
         "--ftp-user",
@@ -165,7 +195,9 @@ TRANSFER_VALUE_OPTIONS = frozenset(
         "--output",
         "--password",
         "--post-data",
+        "--preproxy",
         "--proxy",
+        "--proxy1.0",
         "--proxy-user",
         "--quota",
         "--referer",
@@ -279,7 +311,9 @@ TRANSFER_NETWORK_VALUE_OPTIONS = frozenset(
         "--connect-to",
         "--dns-servers",
         "--doh-url",
+        "--preproxy",
         "--proxy",
+        "--proxy1.0",
         "--resolve",
         "--socks4",
         "--socks4a",
@@ -287,6 +321,7 @@ TRANSFER_NETWORK_VALUE_OPTIONS = frozenset(
         "--socks5-hostname",
     }
 )
+WGET_PROXY_DIRECTIVES = frozenset({"ftp_proxy", "http_proxy", "https_proxy"})
 TRANSFER_USERINFO_RE = re.compile(
     r"(?P<userinfo_prefix>(?:(?:https?|ftp)://)?[^\s:/;|&@]{1,100}:)"
     r"(?P<userinfo_password>[^@\s;|&]{1,1024})"
@@ -396,6 +431,59 @@ def _unquote_transfer_token(token: str) -> str:
     return token
 
 
+def _normalize_static_shell_word(token: str) -> str:
+    """Resolve quote concatenation and escapes in a bounded literal shell word."""
+    if re.match(r"^[A-Za-z]:\\", token) is not None or not any(character in token for character in "'\"\\"):
+        return _unquote_transfer_token(token)
+    try:
+        values = shlex.split(token, posix=True)
+    except ValueError:
+        return _unquote_transfer_token(token)
+    return values[0] if len(values) == 1 else _unquote_transfer_token(token)
+
+
+def _transfer_match_tool(command_match: re.Match[str]) -> str:
+    """Return the semantic transfer executable name from static shell spelling."""
+    return _normalize_static_shell_word(command_match.group("tool")).lower()
+
+
+def _normalize_shell_line_continuations(text: str) -> str:
+    """Remove POSIX escaped newlines outside single quotes."""
+    if "\\\n" not in text:
+        return text
+    normalized: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character == "\\" and quote != "'":
+            if text.startswith("\\\n", index):
+                index += 2
+                continue
+            normalized.append(character)
+            if index + 1 < len(text):
+                normalized.append(text[index + 1])
+                index += 2
+                continue
+        elif character in {'"', "'"}:
+            if quote is None:
+                quote = character
+            elif quote == character:
+                quote = None
+        normalized.append(character)
+        index += 1
+    return "".join(normalized)
+
+
+def _transfer_token_is_executable(token: str) -> bool:
+    """Return whether a complete argv token names curl or wget."""
+    normalized = _normalize_static_shell_word(token)
+    if "=" in normalized or normalized.startswith("-"):
+        return False
+    name = re.split(r"[\\/]", normalized)[-1].lower()
+    return name in {"curl", "curl.exe", "wget", "wget.exe"}
+
+
 def _interpreter_command_analysis(text: str) -> tuple[int | None, bool]:
     """Return an executable command start and whether argv analysis hit its bound."""
     shell_names = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
@@ -423,7 +511,10 @@ def _interpreter_command_analysis(text: str) -> tuple[int | None, bool]:
     python_flag_letters = frozenset("bBdEiIOPqRsSuvx")
 
     token_scan_limited = False
-    for executable in INTERPRETER_WORD_RE.finditer(text):
+    for candidate_index, executable in enumerate(INTERPRETER_WORD_RE.finditer(text)):
+        if candidate_index >= LLAMAFILE_RUNTIME_MAX_INTERPRETER_CANDIDATES:
+            token_scan_limited = True
+            break
         name = executable.group("name").lower().removesuffix(".exe")
         args: list[str] = []
         for token_match in TRANSFER_TOKEN_RE.finditer(text, executable.end()):
@@ -532,9 +623,1564 @@ def _interpreter_command_start(text: str) -> int | None:
     return command_start
 
 
-def _classify_transfer_target(token: str) -> tuple[bool, bool]:
+def _transfer_wrapper_prefix_context(tokens: list[str]) -> tuple[bool, bool]:
+    """Return whether bounded wrapper argv executes the next token and whether parsing is ambiguous."""
+    assignment = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
+    index = 0
+    assignments_allowed = True
+    while index < len(tokens):
+        token = tokens[index]
+        if assignment.fullmatch(token):
+            if not assignments_allowed:
+                return False, False
+            index += 1
+            continue
+
+        quoted_time = token == "\\time"
+        wrapper_token = "time" if quoted_time else token
+        name = re.split(r"[\\/]", wrapper_token)[-1].lower().removesuffix(".exe")
+        if name not in {
+            "builtin",
+            "busybox",
+            "chroot",
+            "command",
+            "doas",
+            "env",
+            "eval",
+            "exec",
+            "ionice",
+            "nice",
+            "nohup",
+            "parallel",
+            "runuser",
+            "setsid",
+            "stdbuf",
+            "strace",
+            "sudo",
+            "taskset",
+            "time",
+            "timeout",
+            "watch",
+            "xargs",
+        }:
+            return False, False
+        index += 1
+
+        if name == "sudo":
+            flag_options = {
+                "-b",
+                "-E",
+                "-H",
+                "-k",
+                "-K",
+                "-n",
+                "-S",
+                "--background",
+                "--non-interactive",
+                "--preserve-env",
+                "--reset-timestamp",
+                "--set-home",
+                "--stdin",
+            }
+            value_options = {
+                "-C",
+                "-D",
+                "-g",
+                "-h",
+                "-p",
+                "-r",
+                "-T",
+                "-t",
+                "-u",
+                "--chdir",
+                "--close-from",
+                "--command-timeout",
+                "--group",
+                "--host",
+                "--prompt",
+                "--role",
+                "--type",
+                "--user",
+            }
+            terminating_options = {
+                "-e",
+                "-l",
+                "-L",
+                "-v",
+                "-V",
+                "--edit",
+                "--help",
+                "--list",
+                "--validate",
+                "--version",
+            }
+        elif name == "env":
+            flag_options = {"-0", "-i", "-v", "--debug", "--ignore-environment", "--null"}
+            value_options = {"-C", "-S", "-u", "--chdir", "--split-string", "--unset"}
+            terminating_options = {"--help", "--version"}
+        elif name == "command":
+            flag_options = {"-p"}
+            value_options = set()
+            terminating_options = {"-v", "-V"}
+        elif name == "exec":
+            flag_options = {"-c", "-l"}
+            value_options = {"-a"}
+            terminating_options = set()
+        elif name == "time":
+            flag_options = {
+                "-a",
+                "-p",
+                "-q",
+                "-v",
+                "--append",
+                "--portability",
+                "--quiet",
+                "--verbose",
+            }
+            value_options = {"-f", "-o", "--format", "--output"}
+            terminating_options = {"--help", "--version"}
+        elif name == "timeout":
+            flag_options = {"-v", "--foreground", "--preserve-status", "--verbose"}
+            value_options = {"-k", "-s", "--kill-after", "--signal"}
+            terminating_options = {"--help", "--version"}
+        elif name == "nice":
+            flag_options = set()
+            value_options = {"-n", "--adjustment"}
+            terminating_options = {"--help", "--version"}
+        elif name == "setsid":
+            flag_options = {"-c", "-f", "-w", "--ctty", "--fork", "--wait"}
+            value_options = set()
+            terminating_options = {"-h", "-V", "--help", "--version"}
+        elif name == "stdbuf":
+            flag_options = set()
+            value_options = {"-e", "-i", "-o", "--error", "--input", "--output"}
+            terminating_options = {"--help", "--version"}
+        elif name == "xargs":
+            flag_options = {
+                "-0",
+                "-p",
+                "-r",
+                "-t",
+                "-x",
+                "--interactive",
+                "--no-run-if-empty",
+                "--null",
+                "--show-limits",
+                "--verbose",
+                "--exit",
+            }
+            value_options = {
+                "-a",
+                "-d",
+                "-E",
+                "-I",
+                "-L",
+                "-n",
+                "-P",
+                "-s",
+                "--arg-file",
+                "--delimiter",
+                "--eof",
+                "--max-args",
+                "--max-chars",
+                "--max-lines",
+                "--max-procs",
+                "--process-slot-var",
+                "--replace",
+            }
+            terminating_options = {"--help", "--version"}
+        elif name == "watch":
+            flag_options = {
+                "-b",
+                "-e",
+                "-g",
+                "-p",
+                "-t",
+                "-x",
+                "--beep",
+                "--chgexit",
+                "--differences",
+                "--errexit",
+                "--exec",
+                "--no-title",
+                "--precise",
+            }
+            value_options = {"-n", "--interval"}
+            terminating_options = {"-h", "-v", "--help", "--version"}
+        elif name == "strace":
+            flag_options = {
+                "-c",
+                "-C",
+                "-d",
+                "-f",
+                "-F",
+                "-i",
+                "-k",
+                "-q",
+                "-qq",
+                "-r",
+                "-t",
+                "-tt",
+                "-ttt",
+                "-T",
+                "-x",
+                "-xx",
+                "-y",
+                "-yy",
+            }
+            value_options = {"-e", "-I", "-o", "-p", "-P", "-s", "-S", "-u", "-U"}
+            terminating_options = {"-h", "-V", "--help", "--version"}
+        elif name == "ionice":
+            flag_options = {"-t", "--ignore"}
+            value_options = {"-c", "-n", "-p", "-P", "-u", "--class", "--classdata", "--pid", "--pgid", "--uid"}
+            terminating_options = {"-h", "-V", "--help", "--version"}
+        elif name == "taskset":
+            flag_options = {"-a", "-c", "--all-tasks", "--cpu-list"}
+            value_options = set()
+            terminating_options = {"-h", "-V", "--help", "--version"}
+        elif name == "chroot":
+            flag_options = {"--skip-chdir"}
+            value_options = {"--groups", "--userspec"}
+            terminating_options = {"--help", "--version"}
+        elif name == "doas":
+            flag_options = {"-n", "-s"}
+            value_options = {"-a", "-C", "-u"}
+            terminating_options = {"-L"}
+        elif name == "runuser":
+            flag_options = {"-f", "-l", "-m", "-P", "-w", "--fast", "--login", "--preserve-environment", "--pty"}
+            value_options = {
+                "-c",
+                "-g",
+                "-G",
+                "-s",
+                "-u",
+                "--command",
+                "--group",
+                "--session-command",
+                "--shell",
+                "--supp-group",
+                "--user",
+            }
+            terminating_options = {"-h", "-V", "--help", "--version"}
+        elif name in {"builtin", "busybox", "eval", "parallel"}:
+            flag_options = set()
+            value_options = set()
+            terminating_options = {"--help", "--version"}
+        else:
+            flag_options = set()
+            value_options = set()
+            terminating_options = {"--help", "--version"}
+
+        while index < len(tokens) and tokens[index].startswith("-"):
+            option = tokens[index]
+            option_name = option.partition("=")[0]
+            if option == "--":
+                index += 1
+                break
+            if (name == "ionice" and option_name in {"-p", "-P", "-u", "--pid", "--pgid", "--uid"}) or (
+                name == "strace" and option_name == "-p"
+            ):
+                return False, False
+            if name == "doas" and option_name == "-C":
+                return False, False
+            if option_name in terminating_options:
+                return False, False
+            if option in flag_options or (name == "sudo" and re.fullmatch(r"-[bEHkKnS]+", option)):
+                index += 1
+                continue
+            if name == "nice" and re.fullmatch(r"-\d+", option):
+                index += 1
+                continue
+            if name == "nice" and re.fullmatch(r"-n-?\d+", option):
+                index += 1
+                continue
+            if name == "stdbuf" and re.fullmatch(r"-[eio].+", option):
+                index += 1
+                continue
+            if option_name in value_options:
+                if "=" in option:
+                    index += 1
+                    continue
+                if index + 1 >= len(tokens):
+                    return False, True
+                index += 2
+                continue
+            return False, True
+        if name in {"chroot", "taskset", "timeout"}:
+            if index >= len(tokens):
+                return False, True
+            index += 1
+        if name == "builtin":
+            if index >= len(tokens):
+                return False, False
+            builtin_name = re.split(r"[\\/]", tokens[index])[-1].lower()
+            if builtin_name not in {"command", "eval", "exec"}:
+                return False, False
+        assignments_allowed = name in {"env", "sudo"} or (name == "time" and token == "time")
+    return True, False
+
+
+def _active_shell_substitution(prefix: str) -> tuple[int, str, int, bool] | None:
+    """Return the start, closer, nesting, and legacy state of a command substitution."""
+    stack: list[tuple[str, str | None, int, int, bool]] = []
+    quote: str | None = None
+    escaped = False
+    word_started = False
+    index = 0
+    while index < len(prefix):
+        character = prefix[index]
+        if (
+            character == "\\"
+            and index + 1 < len(prefix)
+            and prefix[index + 1] == "`"
+            and stack
+            and stack[-1][0] == "`"
+            and quote is None
+        ):
+            if stack[-1][4]:
+                _, quote, _, _, _ = stack.pop()
+                word_started = True
+            else:
+                stack.append(("`", quote, index + 2, 0, True))
+                quote = None
+                word_started = False
+            index += 2
+            continue
+        if escaped:
+            word_started = True
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote == "'":
+            if character == "'":
+                quote = None
+            index += 1
+            continue
+        if character == '"':
+            word_started = True
+            quote = None if quote == '"' else '"'
+            index += 1
+            continue
+        if character == "'" and quote is None:
+            word_started = True
+            quote = "'"
+            index += 1
+            continue
+        if quote is None and character == "#" and not word_started:
+            return None
+        if quote is None and character.isspace():
+            word_started = False
+            index += 1
+            continue
+        if quote is None and character in ";|&":
+            word_started = False
+            index += 1
+            continue
+
+        command_substitution = (
+            (prefix.startswith("$(", index) and not prefix.startswith("$((", index))
+            or prefix.startswith("<(", index)
+            or prefix.startswith(">(", index)
+        )
+        if command_substitution:
+            stack.append((")", quote, index + 2, 0, False))
+            quote = None
+            word_started = False
+            index += 2
+            continue
+        if character == "`":
+            if stack and stack[-1][0] == "`" and quote is None:
+                _, quote, _, _, _ = stack.pop()
+                word_started = True
+            else:
+                stack.append(("`", quote, index + 1, 0, False))
+                quote = None
+                word_started = False
+            index += 1
+            continue
+        if character == "(" and quote is None and stack and stack[-1][0] == ")":
+            closing, outer_quote, start, depth, legacy = stack.pop()
+            stack.append((closing, outer_quote, start, depth + 1, legacy))
+            index += 1
+            continue
+        if character == ")" and quote is None and stack and stack[-1][0] == ")":
+            closing, outer_quote, start, depth, legacy = stack[-1]
+            if depth:
+                stack[-1] = (closing, outer_quote, start, depth - 1, legacy)
+            else:
+                stack.pop()
+                quote = outer_quote
+                word_started = True
+            index += 1
+            continue
+        word_started = True
+        index += 1
+    if not stack:
+        return None
+    closing, _, start, depth, legacy = stack[-1]
+    return start, closing, depth, legacy
+
+
+def _shell_substitution_end(
+    text: str,
+    start: int,
+    end: int,
+    closing: str,
+    depth: int,
+    legacy_escaped: bool,
+) -> int | None:
+    """Return the end boundary of a bounded active shell command substitution."""
+    quote: str | None = None
+    escaped = False
+    index = start
+    while index < end:
+        character = text[index]
+        if legacy_escaped and closing == "`" and text.startswith("\\`", index):
+            return index
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in {'"', "'"}:
+            quote = character
+            index += 1
+            continue
+        if closing == "`":
+            if character == "`":
+                return index
+            index += 1
+            continue
+        if character == "`":
+            quote = "`"
+            index += 1
+            continue
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            if depth == 0:
+                return index
+            depth -= 1
+        index += 1
+    return None
+
+
+def _shell_command_prefix_context(
+    prefix: str,
+    *,
+    hash_comments: bool = True,
+) -> tuple[list[str], bool, bool]:
+    """Return argv since the last separator, limit state, and blocked state."""
+    if len(prefix) > LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES:
+        return [], True, False
+
+    tokens: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    escaped = False
+    word_started = False
+    word_quoted_or_escaped = False
+
+    def flush() -> bool:
+        nonlocal word_quoted_or_escaped, word_started
+        if not word_started:
+            return False
+        token = "".join(current)
+        if word_quoted_or_escaped and token in SHELL_RESERVED_CONTEXT_TOKENS:
+            token = f"\\{token}"
+        tokens.append(token)
+        current.clear()
+        word_started = False
+        word_quoted_or_escaped = False
+        return len(tokens) > LLAMAFILE_RUNTIME_MAX_TRANSFER_TOKENS
+
+    for offset, character in enumerate(prefix):
+        if escaped:
+            current.append(character)
+            word_started = True
+            escaped = False
+            continue
+        if character == "\\" and quote != "'":
+            word_started = True
+            word_quoted_or_escaped = True
+            escaped = True
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            else:
+                current.append(character)
+            continue
+        if character in {'"', "'"}:
+            word_started = True
+            word_quoted_or_escaped = True
+            quote = character
+            continue
+        if hash_comments and character == "#" and not word_started:
+            return [], False, True
+        if character.isspace():
+            if flush():
+                return [], True, False
+            continue
+        if character == "&" and (
+            (current and current[-1] in "<>")
+            or (not word_started and offset + 1 < len(prefix) and prefix[offset + 1] == ">")
+        ):
+            current.append(character)
+            word_started = True
+            continue
+        if character == "|" and current and current[-1] == ">":
+            current.append(character)
+            continue
+        if (
+            character == "|"
+            and tokens
+            and tokens[0] == "case"
+            and "in" in tokens[1:]
+            and not any(token.endswith(")") for token in tokens[tokens.index("in") + 1 :])
+        ):
+            current.append(character)
+            word_started = True
+            continue
+        if character in ";|&":
+            if flush():
+                return [], True, False
+            tokens.clear()
+            continue
+        current.append(character)
+        word_started = True
+    if flush():
+        return [], True, False
+    return tokens, False, quote is not None
+
+
+def _shell_execution_prefix_context(tokens: list[str]) -> tuple[bool, bool]:
+    """Return whether shell control syntax and wrappers execute the next token."""
+    redirection_re = re.compile(r"^(?:\d*|&)(?:<<<|<<-?|<>|<&|<|>>?|>\||>&)(?P<target>.*)$")
+    command_tokens: list[str] = []
+    index = 0
+    while index < len(tokens):
+        redirection = redirection_re.fullmatch(tokens[index])
+        if redirection is None:
+            command_tokens.append(tokens[index])
+            index += 1
+            continue
+        if not redirection.group("target"):
+            if index + 1 >= len(tokens):
+                return False, True
+            index += 1
+        index += 1
+
+    if (
+        len(command_tokens) >= 3
+        and command_tokens[0] == "coproc"
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", command_tokens[1]) is not None
+        and command_tokens[2] == "{"
+    ):
+        command_tokens = command_tokens[3:]
+
+    case_index = 0 if command_tokens and command_tokens[0] == "case" else None
+    in_index = (
+        next(
+            (index for index in range(case_index + 1, len(command_tokens)) if command_tokens[index] == "in"),
+            None,
+        )
+        if case_index is not None
+        else None
+    )
+    case_command_start = (
+        next(
+            (index + 1 for index in range(in_index + 1, len(command_tokens)) if command_tokens[index].endswith(")")),
+            None,
+        )
+        if in_index is not None
+        else None
+    )
+    if case_command_start is not None:
+        command_tokens = command_tokens[case_command_start:]
+
+    index = 0
+    while index < len(command_tokens) and command_tokens[index] in SHELL_CONTROL_PREFIXES:
+        index += 1
+    return _transfer_wrapper_prefix_context(command_tokens[index:])
+
+
+def _cmd_prefix_executes_next_token(tokens: list[str]) -> bool:
+    """Return whether a cmd.exe prefix executes the immediately following token."""
+    if len(tokens) < 2:
+        return False
+    executable = re.split(r"[\\/]", tokens[0])[-1].lower()
+    if executable not in {"cmd", "cmd.exe"} or tokens[-1].lower() not in {"/c", "/k"}:
+        return False
+    option_re = re.compile(r"/(?:s|q|d|a|u|v(?::(?:on|off))?|e:(?:on|off)|f:(?:on|off))", re.IGNORECASE)
+    return all(option_re.fullmatch(token) is not None for token in tokens[1:-1])
+
+
+def _env_split_string_command_end(
+    text: str,
+    command_match: re.Match[str],
+    line_start: int,
+    line_end: int,
+) -> tuple[bool, int] | None:
+    """Return executable state and boundary for a quoted env split-string value."""
+    prefix = text[line_start : command_match.start()]
+    option_matches = list(re.finditer(r"(?<![\w=.-])(?:--split-string|-S)=", prefix))
+    if not option_matches:
+        return None
+    option_start = line_start + option_matches[-1].start()
+    value_start = text.find("=", option_start, command_match.start()) + 1
+    if value_start <= 0 or value_start >= command_match.start() or text[value_start] not in {'"', "'"}:
+        return None
+    quote = text[value_start]
+    value_start += 1
+
+    escaped = False
+    value_end: int | None = None
+    for index in range(command_match.end(), line_end):
+        character = text[index]
+        if escaped:
+            escaped = False
+        elif character == "\\" and quote == '"':
+            escaped = True
+        elif character == quote:
+            value_end = index
+            break
+    if value_end is None:
+        return None
+
+    try:
+        prefix_tokens = shlex.split(text[line_start:option_start], posix=True)
+    except ValueError:
+        return None
+    if not prefix_tokens or re.split(r"[\\/]", prefix_tokens[0])[-1].lower().removesuffix(".exe") != "env":
+        return None
+    if any(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token, re.DOTALL) for token in prefix_tokens[1:]):
+        return None
+    prefix_executable, prefix_ambiguous = _transfer_wrapper_prefix_context(prefix_tokens)
+    if not prefix_executable or prefix_ambiguous:
+        return None
+
+    try:
+        split_tokens = shlex.split(text[value_start:value_end], posix=True)
+    except ValueError:
+        return False, value_end
+    transfer_index = next(
+        (index for index, token in enumerate(split_tokens) if _transfer_token_is_executable(token)),
+        None,
+    )
+    if transfer_index is None:
+        return False, value_end
+    split_prefix_executable, split_prefix_ambiguous = _transfer_wrapper_prefix_context(split_tokens[:transfer_index])
+    if not split_prefix_executable or split_prefix_ambiguous:
+        return False, value_end
+    expected_tool = re.split(r"[\\/]", split_tokens[transfer_index])[-1].lower().removesuffix(".exe")
+    if expected_tool != _transfer_match_tool(command_match):
+        return False, value_end
+    return True, value_end
+
+
+def _unquoted_shell_operator_positions(
+    text: str,
+    operator: str,
+    *,
+    max_positions: int | None = None,
+) -> list[int]:
+    """Return bounded operator positions outside shell quotes and escapes."""
+    positions: list[int] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in {'"', "'"}:
+            quote = character
+            index += 1
+            continue
+        if text.startswith(operator, index):
+            if operator == "|" and text.startswith("||", index):
+                index += 2
+                continue
+            positions.append(index)
+            if max_positions is not None and len(positions) >= max_positions:
+                return positions
+            index += len(operator)
+            continue
+        index += 1
+    return positions
+
+
+def _shell_stdin_mode(tokens: list[str]) -> str | None:
+    """Return execute/noexec when argv makes a shell consume command stdin."""
+    shell_index = next(
+        (
+            index
+            for index, token in enumerate(tokens)
+            if re.split(r"[\\/]", token)[-1].lower().removesuffix(".exe") in SHELL_STDIN_INTERPRETERS
+        ),
+        None,
+    )
+    if shell_index is None:
+        return None
+    prefix_executable, prefix_ambiguous = _transfer_wrapper_prefix_context(tokens[:shell_index])
+    if not prefix_executable or prefix_ambiguous:
+        return None
+
+    noexec = False
+    stdin_forced = False
+    index = shell_index + 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"-o", "+o", "-O", "+O"}:
+            if index + 1 >= len(tokens):
+                return None
+            if tokens[index + 1] == "noexec":
+                noexec = token == "-o"
+            index += 2
+            continue
+        option, separator, _ = token.partition("=")
+        if option in {"--init-file", "--rcfile"}:
+            if separator:
+                index += 1
+            elif index + 1 < len(tokens):
+                index += 2
+            else:
+                return None
+            continue
+        if token in {"--noexec", "--help", "--version"}:
+            return "noexec"
+        if token in {
+            "--debug",
+            "--debugger",
+            "--login",
+            "--no-globalrcs",
+            "--no-rcs",
+            "--noediting",
+            "--noprofile",
+            "--norc",
+            "--posix",
+            "--privileged",
+            "--restricted",
+            "--shinstdin",
+            "--singlecommand",
+            "--verbose",
+        }:
+            index += 1
+            continue
+        if token == "--":
+            if index + 1 < len(tokens) and tokens[index + 1] in {
+                "-",
+                "/dev/fd/0",
+                "/dev/stdin",
+                "/proc/self/fd/0",
+            }:
+                return "noexec" if noexec else "execute"
+            if index + 1 < len(tokens) and not stdin_forced:
+                return None
+            return "noexec" if noexec else "execute"
+        if token in {"-", "/dev/fd/0", "/dev/stdin", "/proc/self/fd/0"}:
+            return "noexec" if noexec else "execute"
+        if token.startswith(("-", "+")) and len(token) > 1:
+            letters = token[1:]
+            if "c" in letters:
+                return None
+            if "D" in letters:
+                noexec = True
+            stdin_forced |= "s" in letters
+            if token.startswith("-") and "n" in letters:
+                noexec = True
+            elif token.startswith("+") and "n" in letters:
+                noexec = False
+            index += 1
+            continue
+        if not stdin_forced:
+            return None
+        break
+    return "noexec" if noexec else "execute"
+
+
+def _strip_shell_redirection_tokens(tokens: list[str]) -> list[str] | None:
+    """Remove complete shell redirections from argv-like tokens."""
+    redirection_re = re.compile(r"^(?:\d*|&)(?:<<-?|<>|<&|<|>>?|>\||>&)(?P<target>.*)$")
+    stripped: list[str] = []
+    index = 0
+    while index < len(tokens):
+        match = redirection_re.fullmatch(tokens[index])
+        if match is None:
+            stripped.append(tokens[index])
+            index += 1
+            continue
+        if not match.group("target"):
+            if index + 1 >= len(tokens):
+                return None
+            index += 1
+        index += 1
+    return stripped
+
+
+def _shell_stdout_is_redirected(segment: str) -> bool:
+    """Return whether an unquoted redirection diverts stdout from a pipe."""
+    for offset in _unquoted_shell_operator_positions(segment, ">"):
+        if offset > 0 and segment[offset - 1] == ">":
+            continue
+        operator_start = offset - 1 if offset > 0 and segment[offset - 1] == "<" else offset
+        prefix = segment[:operator_start]
+        descriptor_match = re.search(r"(?:^|[\s;|&(<])(?P<descriptor>\d+)$", prefix)
+        if descriptor_match is not None:
+            if descriptor_match.group("descriptor") == "1":
+                return True
+            continue
+        if re.search(r"(?:^|[\s;|&(<])\{[A-Za-z_][A-Za-z0-9_]*\}$", prefix) is not None:
+            continue
+        if operator_start == offset:
+            return True
+    return False
+
+
+def _shell_tokens_execute_stdin(tokens: list[str]) -> bool:
+    """Return whether argv invokes a shell that executes commands from stdin."""
+    return _shell_stdin_mode(tokens) == "execute"
+
+
+def _decode_shell_printf_escapes(value: str) -> str:
+    """Decode the bounded control escapes that affect shell command layout."""
+
+    def replace(match: re.Match[str]) -> str:
+        escape = match.group()[1:]
+        if escape.startswith("x"):
+            return chr(int(escape[1:], 16))
+        if escape[0].isdigit():
+            return chr(int(escape, 8))
+        return {"\\": "\\", "n": "\n", "r": "\r", "t": "\t"}[escape]
+
+    return re.sub(r"\\(?:\\|n|r|t|x[0-9A-Fa-f]{1,2}|0[0-7]{1,3}|[1-7][0-7]{0,2})", replace, value)
+
+
+def _shell_printf_output(format_string: str, arguments: list[str]) -> str:
+    """Reconstruct bounded printf output for %s/%b shell-script payloads."""
+    conversion_re = re.compile(r"%(?:%|[bs])")
+    conversions = [match.group() for match in conversion_re.finditer(format_string) if match.group() != "%%"]
+    if not conversions:
+        return _decode_shell_printf_escapes(format_string)[:LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES]
+
+    output: list[str] = []
+    output_length = 0
+
+    def append_bounded(value: str, *, decode_escapes: bool = False) -> bool:
+        nonlocal output_length
+        if decode_escapes:
+            value = _decode_shell_printf_escapes(value)
+        remaining = LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES - output_length
+        if remaining <= 0:
+            return False
+        piece = value[:remaining]
+        output.append(piece)
+        output_length += len(piece)
+        return len(value) <= remaining
+
+    argument_index = 0
+    first_pass = True
+    while (
+        first_pass or argument_index < len(arguments)
+    ) and output_length < LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES:
+        first_pass = False
+        cursor = 0
+        for match in conversion_re.finditer(format_string):
+            if not append_bounded(format_string[cursor : match.start()], decode_escapes=True):
+                break
+            conversion = match.group()
+            if conversion == "%%":
+                if not append_bounded("%"):
+                    break
+            else:
+                argument = arguments[argument_index] if argument_index < len(arguments) else ""
+                argument_index += 1
+                if not append_bounded(argument, decode_escapes=conversion == "%b"):
+                    break
+            cursor = match.end()
+        else:
+            append_bounded(format_string[cursor:], decode_escapes=True)
+        if not conversions:
+            break
+    return "".join(output)
+
+
+def _shell_stdin_payload(
+    text: str,
+    command_match: re.Match[str],
+    line_start: int,
+    line_end: int,
+) -> tuple[tuple[str, int] | None, bool]:
+    """Return a reconstructed shell-stdin payload and bounded-parser state."""
+    line = text[line_start:line_end]
+    command_offset = command_match.start() - line_start
+
+    here_string_offsets = _unquoted_shell_operator_positions(
+        line[:command_offset],
+        "<<<",
+        max_positions=LLAMAFILE_RUNTIME_MAX_TRANSFER_TOKENS + 1,
+    )
+    if len(here_string_offsets) > LLAMAFILE_RUNTIME_MAX_TRANSFER_TOKENS:
+        return None, True
+    for operator_offset in reversed(here_string_offsets):
+        value_start = operator_offset + 3
+        while value_start < len(line) and line[value_start].isspace():
+            value_start += 1
+        if value_start > command_offset:
+            continue
+        try:
+            prefix_tokens = shlex.split(line[:operator_offset], posix=True)
+            source = line[value_start:]
+            ansi_c_quoted = source.startswith("$'")
+            lexer = shlex.shlex(source[1:] if ansi_c_quoted else source, posix=True, punctuation_chars=";&|<>()")
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            value_tokens = list(lexer)
+        except ValueError:
+            return None, False
+        suffix_tokens: list[str] = []
+        for token in value_tokens[1:]:
+            if token and all(character in ";&|<>()" for character in token):
+                if "<" in token:
+                    return None, False
+                break
+            suffix_tokens.append(token)
+        shell_tokens = _strip_shell_redirection_tokens(prefix_tokens + suffix_tokens)
+        if value_tokens and shell_tokens is not None and _shell_tokens_execute_stdin(shell_tokens):
+            payload = value_tokens[0].removeprefix("$") if ansi_c_quoted else value_tokens[0]
+            if ansi_c_quoted:
+                payload = _decode_shell_printf_escapes(payload)
+            return (payload, line_end), False
+
+    operator_limit = LLAMAFILE_RUNTIME_MAX_TRANSFER_TOKENS + 1
+    pipe_offsets = _unquoted_shell_operator_positions(line, "|", max_positions=operator_limit)
+    semicolon_offsets = _unquoted_shell_operator_positions(line, ";", max_positions=operator_limit)
+    ampersand_offsets = _unquoted_shell_operator_positions(line, "&", max_positions=operator_limit)
+    if len(pipe_offsets) + len(semicolon_offsets) + len(ampersand_offsets) > LLAMAFILE_RUNTIME_MAX_TRANSFER_TOKENS:
+        return None, True
+    separator_offsets = sorted(
+        {
+            *pipe_offsets,
+            *semicolon_offsets,
+            *(offset for offset in ampersand_offsets if offset == 0 or line[offset - 1] != "|"),
+        }
+    )
+    previous_pipe_end = 0
+    for pipe_offset in pipe_offsets:
+        if pipe_offset <= command_offset:
+            previous_pipe_end = pipe_offset + (2 if line.startswith("|&", pipe_offset) else 1)
+            continue
+        producer_start = previous_pipe_end
+        previous_pipe_end = pipe_offset + (2 if line.startswith("|&", pipe_offset) else 1)
+        if command_offset < producer_start:
+            continue
+        producer_segment = line[producer_start:pipe_offset]
+        if _shell_stdout_is_redirected(producer_segment):
+            continue
+        consumer_start = pipe_offset + (2 if line.startswith("|&", pipe_offset) else 1)
+        separator_index = bisect_left(separator_offsets, consumer_start)
+        consumer_end = separator_offsets[separator_index] if separator_index < len(separator_offsets) else len(line)
+        try:
+            left_tokens = shlex.split(producer_segment, posix=True)
+            right_tokens = shlex.split(line[consumer_start:consumer_end], posix=True)
+        except ValueError:
+            return None, False
+        right_shell_tokens = _strip_shell_redirection_tokens(right_tokens)
+        if right_shell_tokens is None or not _shell_tokens_execute_stdin(right_shell_tokens):
+            continue
+        producer_index = next(
+            (
+                index
+                for index, token in enumerate(left_tokens)
+                if re.split(r"[\\/]", token)[-1].lower().removesuffix(".exe") in {"echo", "printf"}
+            ),
+            None,
+        )
+        if producer_index is None:
+            continue
+        producer_prefix, producer_ambiguous = _transfer_wrapper_prefix_context(left_tokens[:producer_index])
+        if not producer_prefix or producer_ambiguous:
+            continue
+        producer = re.split(r"[\\/]", left_tokens[producer_index])[-1].lower().removesuffix(".exe")
+        arguments = left_tokens[producer_index + 1 :]
+        payload = ""
+        if producer == "printf" and arguments:
+            format_string = arguments[0]
+            tool = _transfer_match_tool(command_match)
+            if tool in format_string.lower() or (
+                re.search(r"%[bs]", format_string) is not None
+                and any(tool in argument.lower() for argument in arguments[1:])
+            ):
+                payload = _shell_printf_output(format_string, arguments[1:])
+            else:
+                continue
+        elif producer == "echo":
+            decode_escapes = False
+            while arguments and arguments[0] in {"-e", "-E", "-n"}:
+                option = arguments.pop(0)
+                if option == "-e":
+                    decode_escapes = True
+                elif option == "-E":
+                    decode_escapes = False
+            payload = " ".join(arguments)
+            if decode_escapes:
+                payload = _decode_shell_printf_escapes(payload)
+        if not payload:
+            continue
+        quoted_payload = next(
+            (
+                token_match
+                for token_match in TRANSFER_TOKEN_RE.finditer(line, 0, pipe_offset)
+                if token_match.start() <= command_offset < token_match.end()
+                and len(token_match.group()) >= 2
+                and token_match.group()[0] == token_match.group()[-1]
+                and token_match.group()[0] in {'"', "'"}
+            ),
+            None,
+        )
+        boundary = line_start + (quoted_payload.end() - 1 if quoted_payload is not None else pipe_offset)
+        return (payload, boundary), False
+    return None, False
+
+
+def _shell_eval_payload(
+    text: str,
+    command_match: re.Match[str],
+    line_start: int,
+    line_end: int,
+) -> tuple[str, int] | None:
+    """Return bounded command text passed to the shell eval builtin."""
+    line = text[line_start:line_end]
+    if "eval" not in line[: command_match.start() - line_start].lower():
+        return None
+    try:
+        tokens = shlex.split(line, posix=True)
+    except ValueError:
+        return None
+    eval_index = next(
+        (index for index, token in enumerate(tokens) if re.split(r"[\\/]", token)[-1].lower() == "eval"),
+        None,
+    )
+    if eval_index is None or eval_index + 1 >= len(tokens):
+        return None
+    prefix_executable, prefix_ambiguous = _transfer_wrapper_prefix_context(tokens[:eval_index])
+    if not prefix_executable or prefix_ambiguous:
+        return None
+    payload = " ".join(tokens[eval_index + 1 :])[:LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES]
+    if _transfer_match_tool(command_match) not in payload.lower():
+        return None
+    return payload, line_end
+
+
+PythonLineAnalysis = tuple[int, tuple[tuple[int, int], ...], tuple[tuple[int, int, str], ...]]
+
+
+def _python_line_analysis(line: str) -> PythonLineAnalysis | None:
+    """Parse one Python line into inert spans and static execution payloads."""
+    leading_chars = len(line) - len(line.lstrip())
+    source = line[leading_chars:]
+    try:
+        tree = ast.parse(source)
+        tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+        inert_spans = tuple(
+            (token.start[1], token.end[1])
+            for token in tokens
+            if token.type in {tokenize.COMMENT, tokenize.STRING} and token.start[0] == 1
+        )
+    except (IndentationError, MemoryError, RecursionError, SyntaxError, tokenize.TokenError):
+        return None
+
+    shell_string_apis = {"os.system", "subprocess.getoutput", "subprocess.getstatusoutput"}
+    subprocess_apis = {"call", "check_call", "check_output", "popen", "run"}
+    payloads: list[tuple[int, int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or node.end_col_offset is None:
+            continue
+        end_col_offset = node.end_col_offset
+        if not node.args:
+            continue
+        api: str | None = None
+        if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+            owner = node.func.value.id.lower()
+            attribute = node.func.attr.lower()
+            if owner == "os" and attribute == "system":
+                api = "os.system"
+            elif owner == "subprocess" and (
+                attribute in subprocess_apis or attribute in {"getoutput", "getstatusoutput"}
+            ):
+                api = f"subprocess.{attribute}"
+        if api is None:
+            continue
+
+        argument = node.args[0]
+        payload: str | None = None
+        if isinstance(argument, (ast.List, ast.Tuple)):
+            values = [element.value for element in argument.elts if isinstance(element, ast.Constant)]
+            if len(values) != len(argument.elts) or not values or not all(isinstance(value, str) for value in values):
+                continue
+            payload = shlex.join(value for value in values if isinstance(value, str))
+        elif isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+            has_shell_true = any(
+                keyword.arg == "shell" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True
+                for keyword in node.keywords
+            )
+            if api not in shell_string_apis and not has_shell_true:
+                continue
+            payload = argument.value
+        if payload is None:
+            continue
+        payloads.append(
+            (
+                node.col_offset,
+                end_col_offset,
+                payload[:LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES],
+            )
+        )
+    return leading_chars, inert_spans, tuple(payloads)
+
+
+def _python_command_payload(
+    text: str,
+    command_match: re.Match[str],
+    line_start: int,
+    line_end: int,
+    analysis: PythonLineAnalysis | None = None,
+) -> tuple[str, int] | None:
+    """Return shell code or direct argv passed to a Python execution API."""
+    line = text[line_start:line_end]
+    if analysis is None:
+        analysis = _python_line_analysis(line)
+    if analysis is None:
+        return None
+    leading_chars, _, payloads = analysis
+    command_offset = command_match.start() - line_start - leading_chars
+    tool = _transfer_match_tool(command_match)
+    for start, end, payload in payloads:
+        if start <= command_offset < end and tool in payload.lower():
+            return payload, line_start + leading_chars + end
+    return None
+
+
+def _python_transfer_token_is_inert(
+    text: str,
+    command_match: re.Match[str],
+    analysis: PythonLineAnalysis | None = None,
+) -> bool:
+    """Return whether a transfer word is inside Python string/comment data."""
+    line_start = max(text.rfind("\n", 0, command_match.start()), text.rfind("\r", 0, command_match.start())) + 1
+    line_end_candidates = [
+        offset for offset in (text.find("\n", command_match.end()), text.find("\r", command_match.end())) if offset >= 0
+    ]
+    line_end = min(line_end_candidates, default=len(text))
+    line = text[line_start:line_end]
+    if analysis is None:
+        analysis = _python_line_analysis(line)
+    if analysis is None:
+        return False
+    leading_chars, inert_spans, _ = analysis
+    command_offset = command_match.start() - line_start - leading_chars
+    return any(start <= command_offset < end for start, end in inert_spans)
+
+
+def _shell_offset_is_inert(line: str, offset: int) -> bool:
+    """Return whether a shell offset is quoted or commented out."""
+    quote: str | None = None
+    escaped = False
+    word_started = False
+    for character in line[:offset]:
+        if escaped:
+            escaped = False
+            word_started = True
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            word_started = True
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            continue
+        if character in {'"', "'"}:
+            quote = character
+            word_started = True
+            continue
+        if character == "#" and not word_started:
+            return True
+        word_started = not (character.isspace() or character in ";|&")
+    return quote is not None
+
+
+def _invoked_shell_function_end(
+    text: str,
+    command_match: re.Match[str],
+    line_start: int,
+    line_end: int,
+) -> int | None:
+    """Return the body boundary when a same-line shell function is invoked."""
+    line = text[line_start:line_end]
+    command_offset = command_match.start() - line_start
+    if _shell_offset_is_inert(line, command_offset) and _active_shell_substitution(line[:command_offset]) is None:
+        return None
+    declaration = None
+    for candidate in re.finditer(
+        r"(?:^|[;|&]|\$\(|\()\s*(?:function\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?\s*\{",
+        line,
+    ):
+        if candidate.end() <= command_offset:
+            declaration = candidate
+    if declaration is None:
+        return None
+    body_end = line.find("}", command_match.end() - line_start)
+    if body_end < 0:
+        return None
+    function_name = re.escape(declaration.group("name"))
+    if re.search(rf"(?:^|[;|&])\s*{function_name}(?=\s|[;|&)]|$)", line[body_end + 1 :]) is None:
+        return None
+    return line_start + body_end
+
+
+def _transfer_command_context(
+    text: str,
+    command_match: re.Match[str],
+    *,
+    shell_stdin_depth: int = 0,
+) -> tuple[bool, int | None, bool, bool]:
+    """Return executable context, quote boundary, limit state, and ambiguity state."""
+    line_start = (
+        max(
+            text.rfind("\n", 0, command_match.start()),
+            text.rfind("\r", 0, command_match.start()),
+        )
+        + 1
+    )
+    if command_match.start() - line_start > LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES:
+        return False, None, True, False
+    line_end_candidates = [
+        offset for offset in (text.find("\n", command_match.end()), text.find("\r", command_match.end())) if offset >= 0
+    ]
+    line_end = min(line_end_candidates, default=len(text))
+    context_end = min(line_end, command_match.start() + LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES)
+    line_prefix = text[line_start : command_match.start()]
+    array_assignment = re.search(
+        r"(?<![A-Za-z0-9_])(?:(?:declare|local|readonly|typeset)\b(?:\s+-[A-Za-z]+)*\s+)?"
+        r"[A-Za-z_][A-Za-z0-9_]*=\([^)]*$",
+        line_prefix,
+    )
+    if array_assignment is not None and _active_shell_substitution(line_prefix[array_assignment.start() :]) is None:
+        return False, None, False, False
+
+    if (function_end := _invoked_shell_function_end(text, command_match, line_start, line_end)) is not None:
+        return True, function_end, False, False
+
+    segment_tokens: list[tuple[str, int, int]] = []
+    command_token_index: int | None = None
+    context_token_count = 0
+    for token_match in TRANSFER_TOKEN_RE.finditer(text, line_start, context_end):
+        context_token_count += 1
+        if context_token_count > LLAMAFILE_RUNTIME_MAX_TRANSFER_TOKENS:
+            return False, None, True, False
+        raw_token = token_match.group()
+        if raw_token.startswith("#"):
+            return False, None, False, False
+        if raw_token in {";", "|", "||", "&&"}:
+            segment_tokens.clear()
+            continue
+        segment_tokens.append((raw_token, token_match.start(), token_match.end()))
+        if token_match.start() <= command_match.start() < token_match.end():
+            command_token_index = len(segment_tokens) - 1
+            break
+
+    if command_token_index is None:
+        return False, None, context_end < line_end, context_end >= line_end
+
+    raw_command_token, token_start, token_end = segment_tokens[command_token_index]
+    command_token_is_executable = _transfer_token_is_executable(raw_command_token)
+    if command_token_index == 0 and command_token_is_executable:
+        return True, None, False, False
+
+    normalized_tokens = [_normalize_static_shell_word(raw) for raw, _, _ in segment_tokens]
+    find_index = next(
+        (
+            index
+            for index, token in enumerate(normalized_tokens[:command_token_index])
+            if re.split(r"[\\/]", token)[-1].lower().removesuffix(".exe") == "find"
+        ),
+        None,
+    )
+    find_exec_index = next(
+        (
+            index
+            for index in range(command_token_index - 1, -1, -1)
+            if normalized_tokens[index] in {"-exec", "-execdir", "-ok", "-okdir"}
+        ),
+        None,
+    )
+    if find_index is not None and find_exec_index is not None and find_index < find_exec_index:
+        find_suffix_tokens: list[str] = []
+        for suffix_match in TRANSFER_TOKEN_RE.finditer(text, command_match.end(), context_end):
+            raw_suffix_token = suffix_match.group()
+            if raw_suffix_token in {";", "|", "||", "&", "&&"}:
+                break
+            try:
+                semantic_tokens = shlex.split(raw_suffix_token, posix=True)
+            except ValueError:
+                semantic_tokens = []
+            if len(semantic_tokens) != 1:
+                break
+            find_suffix_tokens.append(semantic_tokens[0])
+            if len(find_suffix_tokens) >= LLAMAFILE_RUNTIME_MAX_TRANSFER_TOKENS:
+                break
+        find_has_terminator = any(
+            token == ";" or (token == "+" and index > 0 and find_suffix_tokens[index - 1] == "{}")
+            for index, token in enumerate(find_suffix_tokens)
+        )
+        find_prefix, find_prefix_ambiguous = _transfer_wrapper_prefix_context(normalized_tokens[:find_index])
+        exec_prefix, exec_prefix_ambiguous = _transfer_wrapper_prefix_context(
+            normalized_tokens[find_exec_index + 1 : command_token_index]
+        )
+        if find_prefix_ambiguous or exec_prefix_ambiguous:
+            return False, None, False, True
+        if find_has_terminator and find_prefix and exec_prefix and command_token_is_executable:
+            return True, None, False, False
+
+    env_split_string_context = _env_split_string_command_end(text, command_match, line_start, line_end)
+    if env_split_string_context is not None:
+        split_string_executable, split_string_end = env_split_string_context
+        return split_string_executable, split_string_end if split_string_executable else None, False, False
+
+    wrapper_executable, wrapper_ambiguous = _transfer_wrapper_prefix_context(normalized_tokens[:command_token_index])
+    if wrapper_executable and command_token_is_executable:
+        return True, None, False, False
+    if wrapper_ambiguous:
+        return False, None, False, True
+    if command_token_index == 0 and token_start == command_match.start() and not command_token_is_executable:
+        return False, None, False, False
+
+    quoted_command = (
+        len(raw_command_token) >= 2
+        and raw_command_token[0] == raw_command_token[-1]
+        and raw_command_token[0] in {'"', "'"}
+    )
+    ansi_c_quoted_command = raw_command_token.startswith(("$'", '$"'))
+    if ansi_c_quoted_command:
+        quote = raw_command_token[1]
+        quote_search_end = min(line_end, command_match.start() + LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES)
+        escaped = False
+        quote_end: int | None = None
+        for index in range(max(command_match.end(), token_end), quote_search_end):
+            character = text[index]
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote_end = index
+                break
+        if quote_end is None:
+            return False, None, quote_search_end < line_end, quote_search_end >= line_end
+        quoted_command = True
+        token_end = quote_end + 1
+
+    command_prefix_start = token_start + (2 if ansi_c_quoted_command else 1 if quoted_command else 0)
+    command_prefix = text[command_prefix_start : command_match.start()]
+    if command_prefix and not command_prefix[-1].isspace() and command_prefix[-1] not in ";|&(`/\\":
+        return False, None, False, False
+    path_prefix_length = 0
+    if command_prefix.endswith(("/", "\\")):
+        path_prefix_start = (
+            max(
+                (command_prefix.rfind(character) for character in " \t;|&(){}!"),
+                default=-1,
+            )
+            + 1
+        )
+        path_prefix = command_prefix[path_prefix_start:]
+        if "=" in path_prefix:
+            return False, None, False, False
+        path_prefix_length = len(path_prefix)
+        command_prefix = command_prefix[:path_prefix_start]
+
+    cmd_command_prefix_tokens, cmd_command_prefix_limited, cmd_command_prefix_blocked = _shell_command_prefix_context(
+        command_prefix, hash_comments=False
+    )
+    if cmd_command_prefix_limited:
+        return False, None, True, False
+
+    prefix_tokens = normalized_tokens[:command_token_index]
+    cmd_command_prefix_is_executable, cmd_command_prefix_ambiguous = _transfer_wrapper_prefix_context(
+        cmd_command_prefix_tokens
+    )
+    if cmd_command_prefix_ambiguous:
+        return False, None, False, True
+    if (
+        not cmd_command_prefix_blocked
+        and _cmd_prefix_executes_next_token(prefix_tokens)
+        and cmd_command_prefix_is_executable
+    ):
+        return True, token_end - 1 if quoted_command else None, False, False
+
+    if not quoted_command:
+        direct_prefix_end = command_match.start() - path_prefix_length
+        direct_command_prefix = text[line_start:direct_prefix_end]
+        direct_substitution = _active_shell_substitution(direct_command_prefix)
+        if direct_substitution is not None:
+            substitution_start, _, _, _ = direct_substitution
+            direct_command_prefix = direct_command_prefix[substitution_start:]
+        direct_prefix_tokens, direct_prefix_limited, direct_prefix_blocked = _shell_command_prefix_context(
+            direct_command_prefix
+        )
+        if direct_prefix_limited:
+            return False, None, True, False
+        if direct_prefix_blocked:
+            return False, None, False, False
+        direct_prefix_executable, direct_prefix_ambiguous = _shell_execution_prefix_context(direct_prefix_tokens)
+        if direct_prefix_ambiguous:
+            return False, None, False, True
+        if not direct_prefix_executable or direct_substitution is None:
+            return direct_prefix_executable, None, False, False
+        _, substitution_closing, substitution_depth, substitution_legacy = direct_substitution
+        substitution_end = _shell_substitution_end(
+            text,
+            command_match.end(),
+            context_end,
+            substitution_closing,
+            substitution_depth,
+            substitution_legacy,
+        )
+        if substitution_end is None:
+            return False, None, context_end < line_end, False
+        return True, substitution_end, False, False
+
+    direct_quoted_substitution = (
+        _active_shell_substitution(command_prefix) if raw_command_token.startswith(('"', '$"')) else None
+    )
+    if direct_quoted_substitution is not None:
+        substitution_start, substitution_closing, substitution_depth, substitution_legacy = direct_quoted_substitution
+        substitution_prefix_tokens, substitution_prefix_limited, substitution_prefix_blocked = (
+            _shell_command_prefix_context(command_prefix[substitution_start:])
+        )
+        if substitution_prefix_limited:
+            return False, None, True, False
+        if substitution_prefix_blocked:
+            return False, None, False, False
+        substitution_prefix_executable, substitution_prefix_ambiguous = _shell_execution_prefix_context(
+            substitution_prefix_tokens
+        )
+        if substitution_prefix_ambiguous:
+            return False, None, False, True
+        if not substitution_prefix_executable:
+            return False, None, False, False
+        substitution_end = _shell_substitution_end(
+            text,
+            command_match.end(),
+            token_end - 1,
+            substitution_closing,
+            substitution_depth,
+            substitution_legacy,
+        )
+        if substitution_end is None:
+            return False, None, False, False
+        return True, substitution_end, False, False
+
+    if command_token_index == 0:
+        return False, None, False, False
+    command_text = text[segment_tokens[0][1] : token_end]
+    interpreter_start = _interpreter_command_start(command_text)
+    if interpreter_start is None:
+        return False, None, False, False
+    interpreter_match = INTERPRETER_WORD_RE.search(command_text, interpreter_start)
+    if interpreter_match is None:
+        return False, None, False, False
+    interpreter_name = interpreter_match.group("name").lower().removesuffix(".exe")
+    if interpreter_name not in {"bash", "sh", "zsh", "dash", "ksh", "fish"}:
+        return False, None, False, False
+
+    absolute_interpreter_start = segment_tokens[0][1] + interpreter_match.start()
+    interpreter_token_index = next(
+        (
+            index
+            for index, (_, start, end) in enumerate(segment_tokens[:command_token_index])
+            if start <= absolute_interpreter_start < end
+        ),
+        None,
+    )
+    if interpreter_token_index is None:
+        return False, None, False, False
+    interpreter_prefix_executable, interpreter_prefix_ambiguous = _transfer_wrapper_prefix_context(
+        normalized_tokens[:interpreter_token_index]
+    )
+    if interpreter_prefix_ambiguous:
+        return False, None, False, True
+    if not interpreter_prefix_executable:
+        return False, None, False, False
+    command_option = normalized_tokens[command_token_index - 1]
+    shell_command_prefix = command_prefix
+    shell_substitution = _active_shell_substitution(shell_command_prefix)
+    if shell_substitution is not None:
+        substitution_start, _, _, _ = shell_substitution
+        shell_command_prefix = shell_command_prefix[substitution_start:]
+    shell_command_prefix_tokens, shell_command_prefix_limited, shell_command_prefix_blocked = (
+        _shell_command_prefix_context(shell_command_prefix)
+    )
+    if shell_command_prefix_limited:
+        return False, None, True, False
+    if shell_command_prefix_blocked:
+        return False, None, False, False
+    shell_command_prefix_is_executable, shell_command_prefix_ambiguous = _shell_execution_prefix_context(
+        shell_command_prefix_tokens
+    )
+    if shell_command_prefix_ambiguous:
+        return False, None, False, True
+    if (
+        not command_option.startswith("-")
+        or command_option.startswith("--")
+        or "c" not in command_option[1:]
+        or not shell_command_prefix_is_executable
+    ):
+        return False, None, False, False
+    if shell_substitution is not None:
+        _, substitution_closing, substitution_depth, substitution_legacy = shell_substitution
+        substitution_end = _shell_substitution_end(
+            text,
+            command_match.end(),
+            token_end - 1,
+            substitution_closing,
+            substitution_depth,
+            substitution_legacy,
+        )
+        if substitution_end is None:
+            return False, None, False, False
+        return True, substitution_end, False, False
+    return True, token_end - 1, False, False
+
+
+def _classify_transfer_target(token: str, *, allow_single_label: bool = False) -> tuple[bool, bool]:
     """Return whether a token is a transfer target and whether it is remote."""
-    target = _unquote_transfer_token(token).strip().strip("(){}<>,")
+    target = _normalize_static_shell_word(token).strip().strip("(){}<>,")
     for separator in ("&&", "||", ";", "|"):
         target = target.split(separator, 1)[0]
     if not target:
@@ -557,32 +2203,72 @@ def _classify_transfer_target(token: str) -> tuple[bool, bool]:
             return False, False
         return True, not _is_local_endpoint_token(parsed.hostname)
 
-    host_token = target.split("/", 1)[0]
+    host_token = re.split(r"[/?#]", target, maxsplit=1)[0]
+    has_url_suffix = len(host_token) < len(target)
     if "@" in host_token:
-        userinfo, _, host_token = host_token.rpartition("@")
-        if ":" not in userinfo and "/" not in target:
-            return False, False
+        _, _, host_token = host_token.rpartition("@")
     try:
         parsed_host = urlsplit(f"//{host_token}").hostname
     except ValueError:
         return True, True
-    if "/" in target:
+    if has_url_suffix:
         if parsed_host is None:
             return False, False
         return True, not _is_local_endpoint_token(parsed_host)
-    try:
-        ipaddress.ip_address(parsed_host or "")
-    except ValueError:
-        pass
-    else:
+    if _parse_legacy_ipv4(parsed_host or "") is not None:
         return True, not _is_local_endpoint_token(parsed_host or "")
     if parsed_host is not None and (
         TRANSFER_DOMAIN_RE.fullmatch(host_token) is not None
+        or (allow_single_label and TRANSFER_SINGLE_LABEL_HOST_RE.fullmatch(host_token) is not None)
         or _is_local_endpoint_token(parsed_host)
         or host_token.startswith("[")
     ):
         return True, not _is_local_endpoint_token(parsed_host)
     return False, False
+
+
+def _parse_legacy_ipv4(host: str) -> ipaddress.IPv4Address | None:
+    """Parse inet_aton-compatible one-to-four-part IPv4 spellings."""
+    components = host.lower().split(".")
+    if not 1 <= len(components) <= 4 or any(not component for component in components):
+        return None
+
+    values: list[int] = []
+    for component in components:
+        base = 16 if component.startswith("0x") else 8 if len(component) > 1 and component.startswith("0") else 10
+        digits = component[2:] if base == 16 else component
+        if not digits:
+            return None
+        try:
+            values.append(int(digits, base))
+        except ValueError:
+            return None
+
+    widths = {
+        1: (32,),
+        2: (8, 24),
+        3: (8, 8, 16),
+        4: (8, 8, 8, 8),
+    }[len(values)]
+    if any(value >= 1 << width for value, width in zip(values, widths, strict=True)):
+        return None
+
+    address = 0
+    for value, width in zip(values, widths, strict=True):
+        address = (address << width) | value
+    return ipaddress.IPv4Address(address)
+
+
+def _wget_execute_network_target(value: str) -> tuple[bool, bool, bool]:
+    """Return whether a wget execute value is a proxy directive with a recognized remote endpoint."""
+    directive, separator, endpoint = value.partition("=")
+    if not separator or directive.strip().lower() not in WGET_PROXY_DIRECTIVES:
+        return False, False, False
+    endpoint = endpoint.strip()
+    if not endpoint:
+        return True, True, False
+    recognized, remote = _classify_transfer_target(endpoint, allow_single_label=True)
+    return True, recognized, remote
 
 
 def _transfer_network_option_is_remote(option: str, value: str) -> bool:
@@ -611,35 +2297,393 @@ def _transfer_network_option_is_remote(option: str, value: str) -> bool:
         )
     if option == "--dns-servers":
         return any(not _is_local_endpoint_token(server) for server in value.split(",") if server)
-    recognized, remote = _classify_transfer_target(value)
+    recognized, remote = _classify_transfer_target(value, allow_single_label=True)
     return recognized and remote
 
 
-def _transfer_invocation_signals(text: str) -> tuple[bool, bool, bool, bool, str]:
+def _passive_heredoc_consumer_is_safe(name: str, arguments: list[str]) -> bool:
+    """Return whether a passive consumer cannot stage heredoc bytes to a file."""
+    if name == "sort":
+        return not arguments
+    if name == "sed":
+        return arguments == ["-n", "p"]
+    if name == "tee":
+        return not any(not argument.startswith("-") for argument in arguments)
+    if name == "uniq":
+        positional = [argument for argument in arguments if argument == "-" or not argument.startswith("-")]
+        return len(positional) < 2
+    return True
+
+
+def _heredoc_body_is_passive_data(line: str, operator_start: int) -> bool:
+    """Return whether a known passive command consumes this heredoc as data."""
+    suffix = line[operator_start + 2 :]
+    if (
+        _unquoted_shell_operator_positions(line, ">")
+        or _unquoted_shell_operator_positions(suffix, "|")
+        or _unquoted_shell_operator_positions(suffix, ">(")
+    ):
+        return False
+
+    tokens, limited, blocked = _shell_command_prefix_context(line[:operator_start])
+    if limited or blocked:
+        return False
+    if _shell_stdin_mode(tokens) == "noexec":
+        return True
+    for index, token in enumerate(tokens):
+        name = re.split(r"[\\/]", token)[-1].lower().removesuffix(".exe")
+        if name not in LITERAL_HEREDOC_DATA_CONSUMERS:
+            continue
+        prefix_executable, prefix_ambiguous = _transfer_wrapper_prefix_context(tokens[:index])
+        if not _passive_heredoc_consumer_is_safe(name, tokens[index + 1 :]):
+            return False
+        return prefix_executable and not prefix_ambiguous
+    return False
+
+
+def _shell_heredoc_declarations(line: str) -> list[tuple[str, bool, bool]]:
+    """Return delimiter, tab stripping, and safe suppression state for shell heredocs."""
+    if len(line) > LLAMAFILE_RUNTIME_MAX_HEREDOC_LINE_BYTES:
+        return []
+    declarations: list[tuple[str, bool, bool]] = []
+    quote: str | None = None
+    escaped = False
+    word_started = False
+    index = 0
+    while index < len(line):
+        character = line[index]
+        if not (character in "\t\r\n" or " " <= character <= "~"):
+            quote = None
+            escaped = False
+            word_started = False
+            index += 1
+            continue
+        if escaped:
+            escaped = False
+            word_started = True
+            index += 1
+            continue
+        if character == "\\" and quote != "'":
+            escaped = True
+            word_started = True
+            index += 1
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            index += 1
+            continue
+        if character in {'"', "'"}:
+            quote = character
+            word_started = True
+            index += 1
+            continue
+        if character == "#" and not word_started:
+            break
+        if character.isspace() or character in ";|&()":
+            word_started = False
+            index += 1
+            continue
+        if not line.startswith("<<", index) or line.startswith("<<<", index):
+            word_started = True
+            index += 1
+            continue
+
+        operator_start = index
+        index += 2
+        strip_tabs = index < len(line) and line[index] == "-"
+        index += int(strip_tabs)
+        while index < len(line) and line[index] in " \t":
+            index += 1
+
+        delimiter: list[str] = []
+        delimiter_quote: str | None = None
+        delimiter_quoted = False
+        while index < len(line):
+            character = line[index]
+            if delimiter_quote is not None:
+                if character == delimiter_quote:
+                    delimiter_quote = None
+                else:
+                    delimiter.append(character)
+                index += 1
+                continue
+            if character in {'"', "'"}:
+                delimiter_quote = character
+                delimiter_quoted = True
+                index += 1
+                continue
+            if character == "\\" and index + 1 < len(line):
+                delimiter_quoted = True
+                delimiter.append(line[index + 1])
+                index += 2
+                continue
+            if character.isspace() or character in ";|&()<>":
+                break
+            delimiter.append(character)
+            index += 1
+        if delimiter:
+            suppress_body = (
+                not declarations and delimiter_quoted and _heredoc_body_is_passive_data(line, operator_start)
+            )
+            if len(declarations) >= LLAMAFILE_RUNTIME_MAX_HEREDOC_DECLARATIONS:
+                continue
+            declarations.append(
+                (
+                    "".join(delimiter),
+                    strip_tabs,
+                    suppress_body,
+                )
+            )
+        word_started = True
+    return declarations
+
+
+def _quoted_heredoc_body_spans(text: str) -> list[tuple[int, int]]:
+    """Return passive literal-heredoc body spans in one bounded pass."""
+    if "<<" not in text:
+        return []
+    lines = text.splitlines(keepends=True)
+    offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line)
+
+    spans: list[tuple[int, int]] = []
+    pending: deque[tuple[str, bool, bool]] = deque()
+    body_start = 0
+    for line_index, line in enumerate(lines):
+        if not pending:
+            pending = deque(_shell_heredoc_declarations(line))
+            if pending:
+                body_start = offsets[line_index] + len(line)
+            continue
+
+        delimiter, strip_tabs, suppress_body = pending[0]
+        closing_line = line.rstrip("\r\n")
+        closing_line = re.split(r"[^\t -~]", closing_line, maxsplit=1)[0]
+        if strip_tabs:
+            closing_line = closing_line.lstrip("\t")
+        if closing_line != delimiter:
+            continue
+        if suppress_body:
+            spans.append((body_start, offsets[line_index]))
+        pending.popleft()
+        body_start = offsets[line_index] + len(line)
+
+    if pending and pending[0][2]:
+        spans.append((body_start, len(text)))
+    return spans
+
+
+class _LiteralHeredocStreamFilter:
+    """Suppress passive quoted-heredoc bodies while preserving streaming state."""
+
+    def __init__(self) -> None:
+        self._pending: deque[tuple[str, bool, bool]] = deque()
+        self._line = bytearray()
+        self._line_overflow = False
+
+    def _finish_line(self) -> None:
+        line = "" if self._line_overflow else self._line.decode("latin-1")
+        if self._pending:
+            delimiter, strip_tabs, _ = self._pending[0]
+            closing_line = line.rstrip("\r")
+            if strip_tabs:
+                closing_line = closing_line.lstrip("\t")
+            if closing_line == delimiter:
+                self._pending.popleft()
+        elif line:
+            self._pending = deque(_shell_heredoc_declarations(line))
+        self._line.clear()
+        self._line_overflow = False
+
+    def feed(self, blob: bytes) -> bytes:
+        """Return a length-preserving copy with passive literal body bytes hidden."""
+        filtered = bytearray(blob)
+        for offset, byte in enumerate(blob):
+            suppress_body = bool(self._pending and self._pending[0][2])
+            if byte == 0:
+                self._pending.clear()
+                self._line.clear()
+                self._line_overflow = False
+                continue
+            if byte == 10:
+                self._finish_line()
+                continue
+            if suppress_body:
+                filtered[offset] = 0
+            if len(self._line) < LLAMAFILE_RUNTIME_MAX_HEREDOC_LINE_BYTES:
+                self._line.append(byte)
+            else:
+                self._line_overflow = True
+        return bytes(filtered)
+
+
+def _transfer_invocation_signals(
+    text: str,
+    *,
+    shell_stdin_depth: int = 0,
+) -> tuple[bool, bool, bool, bool, str]:
     """Parse bounded curl/wget argument strings without an option-count bypass."""
+    text = _normalize_shell_line_continuations(text)
     if TRANSFER_COMMAND_WORD_RE.search(text) is None:
         return False, False, False, False, text
     invocation_seen = False
     remote_target_seen = False
     token_scan_limited = False
     option_arity_ambiguous = False
+    payload_command_starts: set[int] = set()
+    lowered_text = text.lower()
+    has_stdin_payload_marker = "<<<" in text or "|" in text
+    has_eval_payload_marker = "eval" in lowered_text
+    has_python_payload_marker = "os.system" in lowered_text or "subprocess." in lowered_text
+    python_line_analyses: dict[tuple[int, int], PythonLineAnalysis | None] = {}
+
+    def python_analysis(line_start: int, line_end: int) -> PythonLineAnalysis | None:
+        key = (line_start, line_end)
+        if key not in python_line_analyses:
+            python_line_analyses[key] = _python_line_analysis(text[line_start:line_end])
+        return python_line_analyses[key]
+
+    if shell_stdin_depth < 4 and (has_stdin_payload_marker or has_eval_payload_marker or has_python_payload_marker):
+        stdin_payloads: set[tuple[str, int]] = set()
+        for payload_index, payload_match in enumerate(TRANSFER_COMMAND_WORD_RE.finditer(text)):
+            if payload_index >= 64:
+                token_scan_limited = True
+                break
+            line_start = max(text.rfind("\n", 0, payload_match.start()), text.rfind("\r", 0, payload_match.start())) + 1
+            line_end_candidates = [
+                offset
+                for offset in (text.find("\n", payload_match.end()), text.find("\r", payload_match.end()))
+                if offset >= 0
+            ]
+            line_end = min(line_end_candidates, default=len(text))
+            stdin_payload: tuple[str, int] | None = None
+            if has_stdin_payload_marker:
+                stdin_payload, stdin_payload_limited = _shell_stdin_payload(
+                    text,
+                    payload_match,
+                    line_start,
+                    line_end,
+                )
+                token_scan_limited |= stdin_payload_limited
+            python_payload: tuple[str, int] | None = None
+            if has_python_payload_marker:
+                parsed_python_line = python_analysis(line_start, line_end)
+                if parsed_python_line is not None:
+                    python_payload = _python_command_payload(
+                        text,
+                        payload_match,
+                        line_start,
+                        line_end,
+                        parsed_python_line,
+                    )
+            payload_candidates = (
+                stdin_payload,
+                _shell_eval_payload(text, payload_match, line_start, line_end) if has_eval_payload_marker else None,
+                python_payload,
+            )
+            for payload_candidate in payload_candidates:
+                if payload_candidate is not None:
+                    stdin_payloads.add(payload_candidate)
+                    payload_command_starts.add(payload_match.start())
+        for payload_text, _ in stdin_payloads:
+            payload_invocation, payload_remote, payload_limited, payload_ambiguous, _ = _transfer_invocation_signals(
+                payload_text,
+                shell_stdin_depth=shell_stdin_depth + 1,
+            )
+            invocation_seen |= payload_invocation
+            remote_target_seen |= payload_remote
+            token_scan_limited |= payload_limited
+            option_arity_ambiguous |= payload_ambiguous
+    elif shell_stdin_depth >= 4:
+        token_scan_limited = True
     opaque_value_spans: list[tuple[int, int]] = []
-    for command_count, command_match in enumerate(TRANSFER_COMMAND_WORD_RE.finditer(text), start=1):
+    skip_non_executable_segment = False
+    skip_segment_start = 0
+    quoted_heredoc_spans = _quoted_heredoc_body_spans(text)
+    command_count = 0
+    for command_match in TRANSFER_COMMAND_WORD_RE.finditer(text):
+        command_count += 1
         if command_count > 64:
             token_scan_limited = True
             break
-        command_tool = command_match.group("tool").lower()
+        if any(start <= command_match.start() < end for start, end in quoted_heredoc_spans):
+            continue
+        if command_match.start() in payload_command_starts:
+            continue
+        if has_python_payload_marker:
+            python_line_start = (
+                max(
+                    text.rfind("\n", 0, command_match.start()),
+                    text.rfind("\r", 0, command_match.start()),
+                )
+                + 1
+            )
+            python_line_end_candidates = [
+                offset
+                for offset in (text.find("\n", command_match.end()), text.find("\r", command_match.end()))
+                if offset >= 0
+            ]
+            python_line_end = min(python_line_end_candidates, default=len(text))
+            parsed_python_line = python_analysis(python_line_start, python_line_end)
+            if parsed_python_line is not None and _python_transfer_token_is_inert(
+                text, command_match, parsed_python_line
+            ):
+                continue
+        if skip_non_executable_segment:
+            intervening = text[skip_segment_start : command_match.start()]
+            if re.search(r"[\r\n;|&`]|\$\(|[<>]\(", intervening) is None:
+                continue
+            skip_non_executable_segment = False
+        command_tool = _transfer_match_tool(command_match)
+        (
+            command_executable,
+            command_context_end,
+            command_context_limited,
+            command_context_ambiguous,
+        ) = _transfer_command_context(text, command_match, shell_stdin_depth=shell_stdin_depth)
+        token_scan_limited |= command_context_limited
+        option_arity_ambiguous |= command_context_ambiguous
+        if not command_executable:
+            token_start = (
+                max(
+                    (text.rfind(character, 0, command_match.start()) for character in " \t\r\n;|&"),
+                    default=-1,
+                )
+                + 1
+            )
+            if (
+                not command_context_limited
+                and not command_context_ambiguous
+                and _transfer_token_is_executable(text[token_start : command_match.end()])
+            ):
+                skip_non_executable_segment = True
+                skip_segment_start = command_match.end()
+            if not command_context_limited:
+                continue
+        allow_single_label_target = command_executable
         command_end = command_match.end()
         if command_end < len(text) and text[command_end] in {'"', "'"}:
             command_end += 1
 
         tokens: list[tuple[str, int, int]] = []
         tokens_truncated = False
-        for token_match in TRANSFER_TOKEN_RE.finditer(text, command_end):
+        line_end_candidates = [
+            offset for offset in (text.find("\n", command_end), text.find("\r", command_end)) if offset >= 0
+        ]
+        default_context_end = min(line_end_candidates, default=len(text))
+        for token_match in TRANSFER_TOKEN_RE.finditer(
+            text,
+            command_end,
+            command_context_end if command_context_end is not None else default_context_end,
+        ):
             if len(tokens) >= LLAMAFILE_RUNTIME_MAX_TRANSFER_TOKENS:
                 tokens_truncated = True
                 break
-            token = _unquote_transfer_token(token_match.group())
+            token = _normalize_static_shell_word(token_match.group())
             tokens.append((token, token_match.start(), token_match.end()))
             if token in {";", "|", "||", "&&"}:
                 break
@@ -649,6 +2693,7 @@ def _transfer_invocation_signals(text: str) -> tuple[bool, bool, bool, bool, str
         positional_targets: list[tuple[bool, bool]] = []
         tentative_option_targets: list[tuple[bool, bool, tuple[int, int]]] = []
         parse_terminated = False
+        invocation_terminated = False
         index = 0
         while index < len(tokens):
             token, token_start, token_end = tokens[index]
@@ -662,27 +2707,51 @@ def _transfer_invocation_signals(text: str) -> tuple[bool, bool, bool, bool, str
             if not positional_only and token.startswith("--"):
                 option, separator, attached_value = token.partition("=")
                 option = option.lower()
+                if not separator and option in TRANSFER_TERMINATING_LONG_OPTIONS:
+                    invocation_terminated = True
+                    parse_terminated = True
+                    break
                 if option in TRANSFER_URL_OPTIONS:
                     if not separator and index + 1 < len(tokens):
                         index += 1
                         attached_value = tokens[index][0]
-                    recognized, remote = _classify_transfer_target(attached_value)
+                    recognized, remote = _classify_transfer_target(attached_value, allow_single_label=True)
                     positional_targets.append((recognized, remote))
                 elif option in TRANSFER_FLAG_OPTIONS:
                     pass
                 elif separator:
-                    if option in TRANSFER_NETWORK_VALUE_OPTIONS:
+                    if command_tool == "wget" and option == "--execute":
+                        network_directive, endpoint_recognized, endpoint_remote = _wget_execute_network_target(
+                            attached_value
+                        )
+                        network_option_remote |= endpoint_remote
+                        option_arity_ambiguous |= network_directive and not endpoint_recognized
+                    elif option in TRANSFER_NETWORK_VALUE_OPTIONS:
                         network_option_remote |= _transfer_network_option_is_remote(option, attached_value)
                     opaque_value_spans.append((token_start, token_end))
                 elif index + 1 < len(tokens):
                     index += 1
                     value, value_start, value_end = tokens[index]
                     if option in TRANSFER_VALUE_OPTIONS:
-                        if option in TRANSFER_NETWORK_VALUE_OPTIONS:
+                        if command_tool == "wget" and option == "--execute":
+                            network_directive, endpoint_recognized, endpoint_remote = _wget_execute_network_target(
+                                value
+                            )
+                            network_option_remote |= endpoint_remote
+                            option_arity_ambiguous |= network_directive and not endpoint_recognized
+                        elif option in TRANSFER_NETWORK_VALUE_OPTIONS:
                             network_option_remote |= _transfer_network_option_is_remote(option, value)
                         opaque_value_spans.append((value_start, value_end))
                     else:
-                        tentative_option_targets.append((*_classify_transfer_target(value), (value_start, value_end)))
+                        tentative_option_targets.append(
+                            (
+                                *_classify_transfer_target(
+                                    value,
+                                    allow_single_label=allow_single_label_target,
+                                ),
+                                (value_start, value_end),
+                            )
+                        )
                 index += 1
                 continue
             if not positional_only and token.startswith("-") and len(token) >= 2:
@@ -693,6 +2762,20 @@ def _transfer_invocation_signals(text: str) -> tuple[bool, bool, bool, bool, str
                     (position for position, letter in enumerate(body) if f"-{letter}" in value_options),
                     None,
                 )
+                terminating_position = next(
+                    (
+                        position
+                        for position, letter in enumerate(body)
+                        if letter in TRANSFER_TERMINATING_SHORT_OPTIONS[command_tool]
+                    ),
+                    None,
+                )
+                if terminating_position is not None and (
+                    value_position is None or terminating_position < value_position
+                ):
+                    invocation_terminated = True
+                    parse_terminated = True
+                    break
                 if value_position is not None:
                     option = f"-{body[value_position]}"
                     if any(f"-{letter}" not in flag_options for letter in body[:value_position]):
@@ -706,18 +2789,35 @@ def _transfer_invocation_signals(text: str) -> tuple[bool, bool, bool, bool, str
                         opaque_value_spans.append((token_start, token_end))
                     if command_tool == "curl" and option == "-x":
                         network_option_remote |= _transfer_network_option_is_remote("--proxy", attached_value)
+                    elif command_tool == "wget" and option == "-e":
+                        network_directive, endpoint_recognized, endpoint_remote = _wget_execute_network_target(
+                            attached_value
+                        )
+                        network_option_remote |= endpoint_remote
+                        option_arity_ambiguous |= network_directive and not endpoint_recognized
                 elif all(f"-{letter}" in flag_options for letter in body):
                     pass
                 elif index + 1 < len(tokens):
                     index += 1
                     value, value_start, value_end = tokens[index]
-                    tentative_option_targets.append((*_classify_transfer_target(value), (value_start, value_end)))
+                    tentative_option_targets.append(
+                        (
+                            *_classify_transfer_target(
+                                value,
+                                allow_single_label=allow_single_label_target,
+                            ),
+                            (value_start, value_end),
+                        )
+                    )
                 else:
                     option_arity_ambiguous = True
                 index += 1
                 continue
 
-            recognized, remote = _classify_transfer_target(token)
+            recognized, remote = _classify_transfer_target(
+                token,
+                allow_single_label=allow_single_label_target,
+            )
             if not recognized:
                 parse_terminated = True
                 break
@@ -732,8 +2832,12 @@ def _transfer_invocation_signals(text: str) -> tuple[bool, bool, bool, bool, str
         ):
             option_arity_ambiguous = True
         opaque_value_spans.extend(span for _, _, span in tentative_option_targets)
-        invocation_seen |= bool(targets)
-        remote_target_seen |= network_option_remote or any(remote for _, remote in targets)
+        invocation_has_target = bool(targets) and not invocation_terminated
+        invocation_is_remote = invocation_has_target and (network_option_remote or any(remote for _, remote in targets))
+        invocation_seen |= invocation_has_target
+        remote_target_seen |= invocation_is_remote
+        if invocation_is_remote:
+            return True, True, token_scan_limited, option_arity_ambiguous, text
 
     if not opaque_value_spans:
         return invocation_seen, remote_target_seen, token_scan_limited, option_arity_ambiguous, text
@@ -835,11 +2939,19 @@ def _runtime_fragment_has_remote_endpoint(candidate: str) -> bool:
     return not _is_local_endpoint_token(token)
 
 
+def _remote_runtime_fragment_analysis(text: str) -> tuple[bool, bool]:
+    """Return remote-fragment and bounded-candidate states."""
+    for index, match in enumerate(re.finditer(r"%'18t\s+(?:connect|socket)", text, re.IGNORECASE)):
+        if index >= 64:
+            return False, True
+        if _runtime_fragment_has_remote_endpoint(text[match.end() : match.end() + 512]):
+            return True, False
+    return False, False
+
+
 def _has_remote_runtime_fragment(text: str) -> bool:
-    for match in re.finditer(r"%'18t\s+(?:connect|socket)", text, re.IGNORECASE):
-        if _runtime_fragment_has_remote_endpoint(text[match.end() :]):
-            return True
-    return False
+    remote, _ = _remote_runtime_fragment_analysis(text)
+    return remote
 
 
 def _has_network_indicator(text: str) -> bool:
@@ -848,6 +2960,7 @@ def _has_network_indicator(text: str) -> bool:
 
 
 def _runtime_text_signals(text: str) -> tuple[bool, bool, bool, bool, bool]:
+    text = _normalize_shell_line_continuations(text)
     (
         transfer_invocation,
         remote_transfer,
@@ -858,6 +2971,7 @@ def _runtime_text_signals(text: str) -> tuple[bool, bool, bool, bool, bool]:
     interpreter_start, interpreter_token_scan_limited = _interpreter_command_analysis(text)
     normalized = _strip_local_urls(transfer_sanitized)
     normalized_lower = normalized.lower()
+    remote_runtime_fragment, runtime_fragment_scan_limited = _remote_runtime_fragment_analysis(text)
     command_signal = (
         COMMAND_INDICATOR_RE.search(text) is not None
         or interpreter_start is not None
@@ -868,12 +2982,12 @@ def _runtime_text_signals(text: str) -> tuple[bool, bool, bool, bool, bool]:
         any(token in normalized_lower for token in NETWORK_TOKENS)
         or NETWORK_CODE_RE.search(normalized_lower) is not None
         or remote_transfer
-        or _has_remote_runtime_fragment(text)
+        or remote_runtime_fragment
     )
     return (
         command_signal,
         network_signal,
-        transfer_token_scan_limited,
+        transfer_token_scan_limited or runtime_fragment_scan_limited,
         transfer_option_ambiguous,
         interpreter_token_scan_limited,
     )
@@ -889,6 +3003,9 @@ def _is_local_endpoint_token(token: str) -> bool:
 
     if host in {"localhost", "::1", "0.0.0.0"}:
         return True
+
+    if (legacy_ipv4 := _parse_legacy_ipv4(host)) is not None:
+        return legacy_ipv4.is_loopback or legacy_ipv4.is_unspecified
 
     try:
         ip = ipaddress.ip_address(host)
@@ -1567,12 +3684,8 @@ class LlamafileScanner(BaseScanner):
                 self.max_payload_scan_bytes,
                 stop_at_gguf=False,
             )
-            raw_gguf_candidates = raw_payload_probe[0]
-            if is_ape_executable and raw_gguf_candidates:
-                mapping_scan_end = self.max_payload_scan_bytes
-                mapping_search_complete = True
-            else:
-                mapping_scan_end = self.max_payload_scan_bytes
+            mapping_scan_end = self.max_payload_scan_bytes
+            mapping_search_complete = max(0, mapping_scan_end) >= file_size
         mapped_executable_end = self._mapped_executable_file_end(
             path_obj,
             executable_format,
@@ -2042,8 +4155,11 @@ class LlamafileScanner(BaseScanner):
     ) -> tuple[set[str], set[str], bool, bool, bool, bool, bool, int, int, int, bool]:
         command_hits: set[str] = set()
         network_hits: set[str] = set()
+        runtime_text = _normalize_shell_line_continuations(blob.decode("latin-1"))
+        analysis_blob = runtime_text.encode("latin-1")
         string_scan_limited = bool(
-            max_string_bytes == LLAMAFILE_RUNTIME_STREAM_MAX_STRING_BYTES and OVERSIZED_PRINTABLE_TEXT_RE.search(blob)
+            max_string_bytes == LLAMAFILE_RUNTIME_STREAM_MAX_STRING_BYTES
+            and OVERSIZED_PRINTABLE_TEXT_RE.search(analysis_blob)
         )
         candidate_scan_limited = False
         transfer_token_scan_limited = False
@@ -2053,8 +4169,9 @@ class LlamafileScanner(BaseScanner):
         network_evidence_attempts = 0
         candidates_scanned = 0
         correlated_signal_seen = False
-        lowered_blob = blob.lower()
-        runtime_text = blob.decode("latin-1")
+        lowered_blob = analysis_blob.lower()
+        quoted_heredoc_spans = _quoted_heredoc_body_spans(runtime_text)
+        heredoc_span_index = 0
         has_transfer_hint = TRANSFER_COMMAND_WORD_RE.search(runtime_text) is not None
         interpreter_start, interpreter_hint_limited = _interpreter_command_analysis(runtime_text)
         has_command_signal = any(hint in lowered_blob for hint in COMMAND_HINTS) and (
@@ -2083,7 +4200,19 @@ class LlamafileScanner(BaseScanner):
         ):
             return set(), set(), string_scan_limited, candidate_scan_limited, False, False, False, 0, 0, 0, False
 
-        for match in PRINTABLE_TEXT_RE.finditer(blob):
+        for match in PRINTABLE_TEXT_RE.finditer(analysis_blob):
+            while (
+                heredoc_span_index < len(quoted_heredoc_spans)
+                and match.start() >= quoted_heredoc_spans[heredoc_span_index][1]
+            ):
+                heredoc_span_index += 1
+            if (
+                heredoc_span_index < len(quoted_heredoc_spans)
+                and quoted_heredoc_spans[heredoc_span_index][0]
+                <= match.start()
+                < quoted_heredoc_spans[heredoc_span_index][1]
+            ):
+                continue
             if candidates_scanned >= candidate_budget:
                 candidate_scan_limited = True
                 break
@@ -2273,16 +4402,54 @@ class LlamafileScanner(BaseScanner):
         network_evidence_budget: int = LLAMAFILE_RUNTIME_MAX_EVIDENCE,
     ) -> tuple[int, int, bool]:
         """Retain command evidence even when a printable run exceeds the bounded carry."""
-        lowered_blob = blob.lower()
+        runtime_text = _normalize_shell_line_continuations(blob.decode("latin-1"))
+        analysis_blob = runtime_text.encode("latin-1")
+        lowered_blob = analysis_blob.lower()
         if not any(hint in lowered_blob for hint in COMMAND_HINTS):
             return 0, 0, False
         command_evidence_attempts = 0
         network_evidence_attempts = 0
         correlated_signal_seen = False
-        for match in PRINTABLE_TEXT_RE.finditer(blob):
+        quoted_heredoc_spans = _quoted_heredoc_body_spans(runtime_text)
+        heredoc_span_index = 0
+        for match in PRINTABLE_TEXT_RE.finditer(analysis_blob):
+            while (
+                heredoc_span_index < len(quoted_heredoc_spans)
+                and match.start() >= quoted_heredoc_spans[heredoc_span_index][1]
+            ):
+                heredoc_span_index += 1
+            if (
+                heredoc_span_index < len(quoted_heredoc_spans)
+                and quoted_heredoc_spans[heredoc_span_index][0]
+                <= match.start()
+                < quoted_heredoc_spans[heredoc_span_index][1]
+            ):
+                continue
             text = match.group().decode("utf-8", errors="ignore").strip()
-            has_command_token, has_network_token, _, _, _ = _runtime_text_signals(text)
-            if self._is_known_runtime_string(text, command_signal=has_command_token):
+            analysis_text = text
+            (
+                has_command_token,
+                has_network_token,
+                transfer_tokens_limited,
+                transfer_option_ambiguous,
+                interpreter_tokens_limited,
+            ) = _runtime_text_signals(text)
+            if not has_command_token and (
+                transfer_tokens_limited or transfer_option_ambiguous or interpreter_tokens_limited
+            ):
+                for command_index, command_match in enumerate(TRANSFER_COMMAND_WORD_RE.finditer(text)):
+                    if command_index >= 64:
+                        break
+                    probe = text[
+                        command_match.start() : command_match.start() + LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES
+                    ]
+                    probe_command, probe_network, _, _, _ = _runtime_text_signals(probe)
+                    if probe_command:
+                        analysis_text = probe
+                        has_command_token = True
+                        has_network_token |= probe_network
+                        break
+            if self._is_known_runtime_string(analysis_text, command_signal=has_command_token):
                 continue
             if not has_command_token:
                 continue
@@ -2301,7 +4468,7 @@ class LlamafileScanner(BaseScanner):
                 continue
             command_evidence_attempts += int(retain_command)
             network_evidence_attempts += int(retain_network)
-            redacted_text = _redacted_runtime_evidence(text)
+            redacted_text = _redacted_runtime_evidence(analysis_text)
             if retain_command:
                 self._add_bounded_runtime_evidence(command_hits, redacted_text)
             if retain_network:
@@ -2394,6 +4561,7 @@ class LlamafileScanner(BaseScanner):
         network_evidence_attempts = 0
         runtime_string_candidates = 0
         correlated_signal_seen = False
+        heredoc_filter = _LiteralHeredocStreamFilter()
 
         def merge_blob(blob: bytes) -> bool:
             nonlocal candidate_scan_limited
@@ -2502,7 +4670,7 @@ class LlamafileScanner(BaseScanner):
                         break
 
                     scanned += len(chunk)
-                    combined = carry + chunk
+                    combined = carry + heredoc_filter.feed(chunk)
                     if scanned >= end_offset:
                         complete = combined
                         carry = b""
@@ -2768,6 +4936,7 @@ class LlamafileScanner(BaseScanner):
         actionable_scans = 0
         best_scanned_signal_rank = 0
         actionable_scan_limited = False
+        marker_candidate_probe_limited = False
 
         for next_offset in self._iter_embedded_torch7_offsets(
             path,
@@ -2775,6 +4944,9 @@ class LlamafileScanner(BaseScanner):
             start_offset=offset,
             signal_scan_bytes=scanner.max_scan_bytes,
         ):
+            if next_offset is None:
+                marker_candidate_probe_limited = True
+                break
             structurally_credible = self._embedded_torch7_candidate_is_structural(path, next_offset)
             has_binary_payload = self._embedded_torch7_candidate_has_binary_payload_bytes(path, next_offset)
             actionable_signal_rank = self._embedded_torch7_candidate_actionable_signal_rank(
@@ -2819,6 +4991,23 @@ class LlamafileScanner(BaseScanner):
                     and self._torch7_result_is_incomplete(embedded_result)
                 ):
                     deferred_incomplete = (embedded_result, next_offset, carve_size)
+
+        if marker_candidate_probe_limited:
+            result.metadata["embedded_torch7_marker_candidate_probe_limited"] = True
+            result.add_check(
+                name="Llamafile Embedded Torch7 Candidate Coverage",
+                passed=False,
+                message=(
+                    f"Stopped embedded Torch7 analysis after {LLAMAFILE_TORCH7_MAX_MARKER_CANDIDATES} candidate markers"
+                ),
+                severity=IssueSeverity.INFO,
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": LLAMAFILE_TORCH7_CANDIDATE_PROBE_LIMIT_REASON,
+                    "candidate_limit": LLAMAFILE_TORCH7_MAX_MARKER_CANDIDATES,
+                },
+            )
+            self._mark_inconclusive(result, LLAMAFILE_TORCH7_CANDIDATE_PROBE_LIMIT_REASON)
 
         if actionable_results:
             _, actionable_offset, carve_size, _ = actionable_results[0]
@@ -3232,7 +5421,7 @@ class LlamafileScanner(BaseScanner):
         *,
         start_offset: int = 0,
         signal_scan_bytes: int | None = None,
-    ) -> Iterator[int]:
+    ) -> Iterator[int | None]:
         """Yield Torch7 candidate offsets in one bounded pass."""
         file_size = path.stat().st_size
         search_limit = min(file_size, max_scan_bytes)
@@ -3243,6 +5432,7 @@ class LlamafileScanner(BaseScanner):
         scanned = start_offset
         carry = b""
         last_yielded = start_offset - 1
+        candidate_offsets_checked: set[int] = set()
 
         with path.open("rb") as handle:
             handle.seek(start_offset)
@@ -3262,6 +5452,13 @@ class LlamafileScanner(BaseScanner):
                     if marker_offset == -1:
                         break
                     absolute_offset = window_offset + marker_offset
+                    if absolute_offset in candidate_offsets_checked:
+                        marker_search_offset = marker_offset + 1
+                        continue
+                    if len(candidate_offsets_checked) >= LLAMAFILE_TORCH7_MAX_MARKER_CANDIDATES:
+                        yield None
+                        return
+                    candidate_offsets_checked.add(absolute_offset)
                     candidate_window = haystack[marker_offset : marker_offset + TORCH7_SIGNATURE_WINDOW_BYTES]
                     if (
                         absolute_offset > last_yielded
@@ -3282,6 +5479,12 @@ class LlamafileScanner(BaseScanner):
                     absolute_offset = window_offset + match.start()
                     if absolute_offset <= last_yielded:
                         continue
+                    if absolute_offset in candidate_offsets_checked:
+                        continue
+                    if len(candidate_offsets_checked) >= LLAMAFILE_TORCH7_MAX_MARKER_CANDIDATES:
+                        yield None
+                        return
+                    candidate_offsets_checked.add(absolute_offset)
                     candidate_window = haystack[match.start() : match.start() + TORCH7_SIGNATURE_WINDOW_BYTES]
                     if cls._torch7_ascii_candidate_is_structural(candidate_window):
                         relative_offsets.add(match.start())
@@ -3328,7 +5531,14 @@ class LlamafileScanner(BaseScanner):
     @classmethod
     def _find_embedded_torch7_offset(cls, path: Path, max_scan_bytes: int, *, start_offset: int = 0) -> int | None:
         """Find a Torch7 payload signature after a known payload boundary."""
-        return next(cls._iter_embedded_torch7_offsets(path, max_scan_bytes, start_offset=start_offset), None)
+        return next(
+            (
+                offset
+                for offset in cls._iter_embedded_torch7_offsets(path, max_scan_bytes, start_offset=start_offset)
+                if offset is not None
+            ),
+            None,
+        )
 
     @staticmethod
     def _find_casefolded_marker_offset(

