@@ -29,10 +29,16 @@ _EXTREME_WEIGHT_MIN_EFFECT_RATIO = 2.0
 _EXTREME_WEIGHT_MIN_PER_OUTPUT = 5
 _EXTREME_WEIGHT_LOCALIZATION_MIN_PER_OUTPUT = 2
 _EXTREME_WEIGHT_ROBUST_MAD_MULTIPLIER = 30.0
+_EXTREME_WEIGHT_ROBUST_SUPPORT_MAD_MULTIPLIER = 10.0
+_EXTREME_WEIGHT_MIN_ROBUST_TAIL_CONCENTRATION = 0.5
+_EXTREME_WEIGHT_CLASSICAL_SUPPORT_STD_MULTIPLIER = 0.5
+_EXTREME_WEIGHT_MIN_CLASSICAL_TAIL_CONCENTRATION = 0.5
 _EXTREME_WEIGHT_ROBUST_FALLBACK_MIN_PER_OUTPUT = 5
 _NORMAL_MAD_SCALE_FACTOR = 1.4826
 _EXTREME_WEIGHT_ANALYSIS_CHUNK_BYTES = 8 * 1024 * 1024
 _EXTREME_WEIGHT_ROBUST_SAMPLE_SIZE = 256 * 1024
+_EXTREME_WEIGHT_OUTPUT_SCRATCH_ARRAYS = 20
+_OUTPUT_NORM_ROBUST_Z_THRESHOLD = 10.0
 _PICKLE_OBJECT_OPCODES = frozenset(
     {
         "BINBYTES",
@@ -227,6 +233,23 @@ class WeightDistributionScanner(BaseScanner):
                         location=path,
                         details={"extension": ext},
                         rule_code="S801",
+                    )
+                    result.finish(success=False)
+                    return result
+
+            if onnx_plan is not None and any(spec.matrix_analysis for spec in onnx_plan.specs):
+                try:
+                    from scipy import stats as _stats  # noqa: F401
+                except Exception as exc:
+                    self._record_extraction_incomplete(
+                        "missing_weight_distribution_dependency",
+                        dependency="scipy",
+                        exception_type=type(exc).__name__,
+                    )
+                    self._mark_analysis_incomplete(
+                        result,
+                        path,
+                        message=f"Weight distribution analysis dependency unavailable: {exc!s}",
                     )
                     result.finish(success=False)
                     return result
@@ -1952,11 +1975,23 @@ class WeightDistributionScanner(BaseScanner):
         output_norms = np.linalg.norm(weights, axis=0)  # L2 norm of each output neuron
         if len(output_norms) > 1:
             z_scores = np.abs(stats.zscore(output_norms))
-            outlier_indices = np.where(z_scores > z_score_threshold)[0]
+            z_score_outliers = (z_scores > z_score_threshold) | np.isclose(
+                z_scores, z_score_threshold, rtol=1e-5, atol=0.0
+            )
+            norm_median = float(np.median(output_norms))
+            norm_mad_scale = _NORMAL_MAD_SCALE_FACTOR * float(np.median(np.abs(output_norms - norm_median)))
+            if norm_mad_scale > 0:
+                robust_norm_outliers = (
+                    np.abs(output_norms - norm_median) / norm_mad_scale
+                ) > _OUTPUT_NORM_ROBUST_Z_THRESHOLD
+            else:
+                robust_norm_outliers = output_norms > norm_median
+            outlier_indices = np.flatnonzero(z_score_outliers | robust_norm_outliers)
 
             # Only flag if the number of outliers is reasonable
             outlier_percentage = len(outlier_indices) / n_outputs
-            if len(outlier_indices) > 0 and outlier_percentage < outlier_percentage_threshold:
+            max_outlier_outputs = max(3, int(n_outputs * outlier_percentage_threshold))
+            if 0 < len(outlier_indices) <= max_outlier_outputs:
                 anomalies.append(
                     {
                         "description": f"Layer '{layer_name}' has {len(outlier_indices)} output neurons with "
@@ -2003,7 +2038,10 @@ class WeightDistributionScanner(BaseScanner):
                     dissimilar_neurons.append((i, max_similarity))
 
             # Only flag if we have a small number of dissimilar neurons (< 5% or max 3)
-            if 0 < len(dissimilar_neurons) <= max(3, int(0.05 * n_outputs)):
+            if 0 < len(dissimilar_neurons) < n_outputs and len(dissimilar_neurons) <= max(
+                3,
+                int(0.05 * n_outputs),
+            ):
                 for neuron_idx, max_sim in dissimilar_neurons:
                     anomalies.append(
                         {
@@ -2080,14 +2118,27 @@ class WeightDistributionScanner(BaseScanner):
         analysis_itemsize = 8
         max_work_values = max(1, _EXTREME_WEIGHT_ANALYSIS_CHUNK_BYTES // analysis_itemsize)
         input_values_per_output = math.prod(int(dimension) for dimension in input_shape)
-        outputs_per_chunk = max(
+        max_scratch_outputs = max(1, max_work_values // _EXTREME_WEIGHT_OUTPUT_SCRATCH_ARRAYS)
+        output_block_budget = max(
             1,
             min(
-                int(output_shape[-1]),
+                n_outputs,
                 max_work_values // max(1, input_values_per_output),
+                max_scratch_outputs,
             ),
         )
-        input_block_budget = max(1, max_work_values // outputs_per_chunk)
+        output_block_shape = [1] * len(output_shape)
+        remaining_output_values = output_block_budget
+        for axis in reversed(range(len(output_shape))):
+            block_length = min(int(output_shape[axis]), remaining_output_values)
+            output_block_shape[axis] = max(1, block_length)
+            remaining_output_values = max(1, remaining_output_values // output_block_shape[axis])
+        output_block_counts = tuple(
+            math.ceil(int(dimension) / block_length)
+            for dimension, block_length in zip(output_shape, output_block_shape, strict=True)
+        )
+
+        input_block_budget = max(1, max_work_values // output_block_budget)
         input_block_shape = [1] * len(input_shape)
         remaining_block_values = input_block_budget
         for axis in reversed(range(len(input_shape))):
@@ -2101,22 +2152,32 @@ class WeightDistributionScanner(BaseScanner):
 
         def magnitudes_as_float64(chunk: Any) -> Any:
             magnitudes = np.empty(chunk.shape, dtype=np.float64)
-            np.absolute(chunk, out=magnitudes, casting="unsafe")
+            if np.issubdtype(np.asarray(chunk).dtype, np.signedinteger):
+                # Integer absolute-value ufuncs overflow on the signed minimum.
+                np.copyto(magnitudes, chunk, casting="unsafe")
+                np.absolute(magnitudes, out=magnitudes)
+            else:
+                np.absolute(chunk, out=magnitudes, casting="unsafe")
             return magnitudes
 
         def iter_output_groups() -> Any:
-            prefix_shape = output_shape[:-1]
-            prefix_count = math.prod(int(dimension) for dimension in prefix_shape) if prefix_shape else 1
-            for prefix_index in range(prefix_count):
-                prefix = (
-                    tuple(int(value) for value in np.unravel_index(prefix_index, prefix_shape)) if prefix_shape else ()
+            for block_index in np.ndindex(*output_block_counts):
+                output_starts = tuple(
+                    index * block_length for index, block_length in zip(block_index, output_block_shape, strict=True)
                 )
-                for output_start in range(0, int(output_shape[-1]), outputs_per_chunk):
-                    output_end = min(int(output_shape[-1]), output_start + outputs_per_chunk)
-                    flat_output_start = prefix_index * int(output_shape[-1]) + output_start
-                    yield flat_output_start, prefix, output_start, output_end
+                output_ends = tuple(
+                    min(int(output_shape[axis]), start + output_block_shape[axis])
+                    for axis, start in enumerate(output_starts)
+                )
+                output_slices = tuple(slice(start, end) for start, end in zip(output_starts, output_ends, strict=True))
+                output_count = math.prod(end - start for start, end in zip(output_starts, output_ends, strict=True))
+                flat_output_start = 0
+                for axis, start in enumerate(output_starts):
+                    flat_output_start *= int(output_shape[axis])
+                    flat_output_start += start
+                yield flat_output_start, output_slices, output_count
 
-        def iter_group_chunks(prefix: tuple[int, ...], output_start: int, output_end: int) -> Any:
+        def iter_group_chunks(output_slices: tuple[slice, ...]) -> Any:
             for block_index in np.ndindex(*input_block_counts):
                 input_slices = tuple(
                     slice(
@@ -2127,35 +2188,7 @@ class WeightDistributionScanner(BaseScanner):
                         zip(block_index, input_block_shape, strict=True),
                     )
                 )
-                yield output_last_view[input_slices + prefix + (slice(output_start, output_end),)]
-
-        total_values = int(weights.size)
-        sample_step = max(1, math.ceil(total_values / _EXTREME_WEIGHT_ROBUST_SAMPLE_SIZE))
-        sample_parts: list[Any] = []
-        logical_offset = 0
-        magnitude_sum = 0.0
-        magnitude_square_sum = 0.0
-        for _flat_output_start, prefix, output_start, output_end in iter_output_groups():
-            for chunk in iter_group_chunks(prefix, output_start, output_end):
-                chunk_magnitudes = magnitudes_as_float64(chunk)
-                magnitude_sum += float(np.sum(chunk_magnitudes, dtype=np.float64))
-                first_sample = (-logical_offset) % sample_step
-                if first_sample < chunk_magnitudes.size:
-                    sample_parts.append(np.asarray(chunk_magnitudes.flat[first_sample::sample_step]))
-                logical_offset += int(chunk_magnitudes.size)
-                np.square(chunk_magnitudes, out=chunk_magnitudes)
-                magnitude_square_sum += float(np.sum(chunk_magnitudes, dtype=np.float64))
-
-        mean_magnitude = magnitude_sum / total_values
-        variance = max(0.0, magnitude_square_sum / total_values - mean_magnitude * mean_magnitude)
-        std_magnitude = math.sqrt(variance)
-        threshold = mean_magnitude + self.weight_magnitude_threshold * std_magnitude
-
-        robust_sample = np.concatenate(sample_parts)[:_EXTREME_WEIGHT_ROBUST_SAMPLE_SIZE]
-        robust_median = float(np.median(robust_sample))
-        robust_mad = float(np.median(np.abs(robust_sample - robust_median)))
-        robust_scale = _NORMAL_MAD_SCALE_FACTOR * robust_mad
-        robust_threshold = robust_median + _EXTREME_WEIGHT_ROBUST_MAD_MULTIPLIER * robust_scale
+                yield output_last_view[input_slices + output_slices]
 
         reduction_axes = tuple(range(len(input_shape)))
         max_affected_outputs = max(1, int(0.001 * n_outputs))
@@ -2164,89 +2197,298 @@ class WeightDistributionScanner(BaseScanner):
         total_affected = 0
         tail_affected_outputs = 0
         num_extreme_weights = 0
+        num_nonfinite_weights = 0
         max_extreme_weights_per_output = 0
         max_weight = 0.0
         max_effect_ratio = 0.0
-        for flat_output_start, prefix, output_start, output_end in iter_output_groups():
-            output_count = output_end - output_start
+        representative_threshold = 0.0
+        representative_robust_median = 0.0
+        representative_robust_scale = 0.0
+        representative_robust_threshold = 0.0
+        representative_set = False
+        for flat_output_start, output_slices, output_count in iter_output_groups():
+            sample_values_per_output = max(
+                1,
+                min(
+                    input_values_per_output,
+                    _EXTREME_WEIGHT_ROBUST_SAMPLE_SIZE // output_count,
+                ),
+            )
+            sample_step = max(1, math.ceil(input_values_per_output / sample_values_per_output))
+            sample_parts: list[Any] = []
+            input_logical_offset = 0
+            nonfinite_counts = np.zeros(output_count, dtype=np.int64)
+            per_output_max = np.zeros(output_count, dtype=np.float64)
+            normalized_sums = np.zeros(output_count, dtype=np.float64)
+            normalized_square_sums = np.zeros(output_count, dtype=np.float64)
+
+            for chunk in iter_group_chunks(output_slices):
+                chunk_magnitudes = magnitudes_as_float64(chunk).reshape(
+                    *chunk.shape[: len(input_shape)],
+                    output_count,
+                )
+                flat_magnitudes = chunk_magnitudes.reshape(-1, output_count)
+                first_sample = (-input_logical_offset) % sample_step
+                if first_sample < flat_magnitudes.shape[0]:
+                    sample_parts.append(np.array(flat_magnitudes[first_sample::sample_step], copy=True))
+                input_logical_offset += int(flat_magnitudes.shape[0])
+
+                finite_mask = np.isfinite(chunk_magnitudes)
+                nonfinite_counts += chunk_magnitudes.size // output_count - np.asarray(
+                    np.count_nonzero(finite_mask, axis=reduction_axes)
+                ).reshape(-1)
+                chunk_magnitudes[~finite_mask] = 0.0
+                chunk_max = np.asarray(np.max(chunk_magnitudes, axis=reduction_axes)).reshape(-1)
+                scale_increased = chunk_max > per_output_max
+                if np.any(scale_increased):
+                    scale_ratios = np.ones(output_count, dtype=np.float64)
+                    np.divide(
+                        per_output_max,
+                        chunk_max,
+                        out=scale_ratios,
+                        where=scale_increased,
+                    )
+                    normalized_sums[scale_increased] *= scale_ratios[scale_increased]
+                    normalized_square_sums[scale_increased] *= np.square(scale_ratios[scale_increased])
+                    per_output_max[scale_increased] = chunk_max[scale_increased]
+
+                scale_view = per_output_max.reshape((1,) * len(input_shape) + (output_count,))
+                np.divide(
+                    chunk_magnitudes,
+                    scale_view,
+                    out=chunk_magnitudes,
+                    where=scale_view > 0,
+                )
+                normalized_sums += np.asarray(
+                    np.sum(chunk_magnitudes, axis=reduction_axes, dtype=np.float64),
+                ).reshape(-1)
+                np.square(chunk_magnitudes, out=chunk_magnitudes)
+                normalized_square_sums += np.asarray(
+                    np.sum(chunk_magnitudes, axis=reduction_axes, dtype=np.float64),
+                ).reshape(-1)
+
+            finite_counts = input_values_per_output - nonfinite_counts
+            normalized_means = np.zeros(output_count, dtype=np.float64)
+            normalized_second_moments = np.zeros(output_count, dtype=np.float64)
+            np.divide(normalized_sums, finite_counts, out=normalized_means, where=finite_counts > 0)
+            np.divide(
+                normalized_square_sums,
+                finite_counts,
+                out=normalized_second_moments,
+                where=finite_counts > 0,
+            )
+            normalized_variances = normalized_second_moments - np.square(normalized_means)
+            np.maximum(normalized_variances, 0.0, out=normalized_variances)
+            normalized_stds = np.sqrt(normalized_variances)
+            normalized_thresholds = normalized_means + self.weight_magnitude_threshold * normalized_stds
+            normalized_classical_support_thresholds = (
+                normalized_means + _EXTREME_WEIGHT_CLASSICAL_SUPPORT_STD_MULTIPLIER * normalized_stds
+            )
+            with np.errstate(over="ignore", invalid="ignore"):
+                classical_thresholds = per_output_max * normalized_thresholds
+                classical_support_thresholds = per_output_max * normalized_classical_support_thresholds
+
+            robust_medians = np.zeros(output_count, dtype=np.float64)
+            robust_scales = np.zeros(output_count, dtype=np.float64)
+            if sample_parts:
+                robust_sample = np.concatenate(sample_parts, axis=0)
+                finite_sample_mask = np.isfinite(robust_sample)
+                valid_sample_outputs = np.any(finite_sample_mask, axis=0)
+                robust_sample[~finite_sample_mask] = np.nan
+                if np.any(valid_sample_outputs):
+                    valid_samples = robust_sample[:, valid_sample_outputs]
+                    valid_medians = np.nanmedian(valid_samples, axis=0)
+                    robust_medians[valid_sample_outputs] = valid_medians
+                    valid_deviations = np.abs(valid_samples - valid_medians)
+                    robust_scales[valid_sample_outputs] = _NORMAL_MAD_SCALE_FACTOR * np.nanmedian(
+                        valid_deviations,
+                        axis=0,
+                    )
+
+            with np.errstate(over="ignore", invalid="ignore"):
+                robust_thresholds = robust_medians + _EXTREME_WEIGHT_ROBUST_MAD_MULTIPLIER * robust_scales
+                robust_support_thresholds = (
+                    robust_medians + _EXTREME_WEIGHT_ROBUST_SUPPORT_MAD_MULTIPLIER * robust_scales
+                )
+
+            classical_counts = np.zeros(output_count, dtype=np.int64)
+            classical_support_counts = np.zeros(output_count, dtype=np.int64)
             classical_robust_counts = np.zeros(output_count, dtype=np.int64)
             robust_counts = np.zeros(output_count, dtype=np.int64)
-            per_output_max = np.zeros(output_count, dtype=np.float64)
-            for chunk in iter_group_chunks(prefix, output_start, output_end):
-                chunk_magnitudes = magnitudes_as_float64(chunk)
-                robust_mask = (
-                    chunk_magnitudes > robust_threshold if robust_scale > 0 else chunk_magnitudes > robust_median
+            robust_support_counts = np.zeros(output_count, dtype=np.int64)
+            inclusive_zero_mad = (robust_scales == 0) & (robust_medians > 0)
+            inclusive_zero_mad_view = inclusive_zero_mad.reshape((1,) * len(input_shape) + (output_count,))
+            robust_threshold_view = robust_thresholds.reshape((1,) * len(input_shape) + (output_count,))
+            robust_support_threshold_view = robust_support_thresholds.reshape(
+                (1,) * len(input_shape) + (output_count,),
+            )
+            classical_threshold_view = classical_thresholds.reshape(
+                (1,) * len(input_shape) + (output_count,),
+            )
+            classical_support_threshold_view = classical_support_thresholds.reshape(
+                (1,) * len(input_shape) + (output_count,),
+            )
+            for chunk in iter_group_chunks(output_slices):
+                chunk_magnitudes = magnitudes_as_float64(chunk).reshape(
+                    *chunk.shape[: len(input_shape)],
+                    output_count,
                 )
+                chunk_magnitudes[~np.isfinite(chunk_magnitudes)] = 0.0
+                robust_mask = chunk_magnitudes > robust_threshold_view
+                robust_mask |= (chunk_magnitudes >= robust_threshold_view) & inclusive_zero_mad_view
                 robust_counts += np.asarray(np.count_nonzero(robust_mask, axis=reduction_axes)).reshape(-1)
-                classical_mask = chunk_magnitudes > threshold
+                robust_support_mask = chunk_magnitudes > robust_support_threshold_view
+                robust_support_mask |= (chunk_magnitudes >= robust_support_threshold_view) & inclusive_zero_mad_view
+                robust_support_counts += np.asarray(
+                    np.count_nonzero(robust_support_mask, axis=reduction_axes),
+                ).reshape(-1)
+                classical_mask = chunk_magnitudes > classical_threshold_view
+                classical_counts += np.asarray(
+                    np.count_nonzero(classical_mask, axis=reduction_axes),
+                ).reshape(-1)
+                classical_support_mask = chunk_magnitudes > classical_support_threshold_view
+                classical_support_counts += np.asarray(
+                    np.count_nonzero(classical_support_mask, axis=reduction_axes),
+                ).reshape(-1)
                 classical_mask &= robust_mask
                 classical_robust_counts += np.asarray(
                     np.count_nonzero(classical_mask, axis=reduction_axes),
                 ).reshape(-1)
-                per_output_max = np.maximum(
-                    per_output_max,
-                    np.asarray(np.max(chunk_magnitudes, axis=reduction_axes)).reshape(-1),
-                )
 
             tail_affected_outputs += int(
-                np.count_nonzero(classical_robust_counts >= _EXTREME_WEIGHT_LOCALIZATION_MIN_PER_OUTPUT),
+                np.count_nonzero(
+                    (robust_counts >= _EXTREME_WEIGHT_LOCALIZATION_MIN_PER_OUTPUT)
+                    | (classical_counts >= _EXTREME_WEIGHT_LOCALIZATION_MIN_PER_OUTPUT)
+                    | (nonfinite_counts > 0),
+                ),
             )
 
-            if threshold > 0:
-                per_output_effect_ratios = per_output_max / threshold
-            else:
-                per_output_effect_ratios = np.where(per_output_max > 0, np.inf, 0.0)
-
-            classical_effect_qualified = (classical_robust_counts >= _EXTREME_WEIGHT_MIN_PER_OUTPUT) & (
-                per_output_effect_ratios >= _EXTREME_WEIGHT_MIN_EFFECT_RATIO
+            per_output_effect_ratios = np.zeros(output_count, dtype=np.float64)
+            np.divide(
+                per_output_max,
+                classical_thresholds,
+                out=per_output_effect_ratios,
+                where=classical_thresholds > 0,
             )
-            robust_fallback_qualified = classical_robust_counts >= _EXTREME_WEIGHT_ROBUST_FALLBACK_MIN_PER_OUTPUT
-            qualified_indices = np.flatnonzero(classical_effect_qualified | robust_fallback_qualified)
+            per_output_effect_ratios[(classical_thresholds == 0) & (per_output_max > 0)] = np.inf
+
+            robust_tail_concentrations = np.zeros(output_count, dtype=np.float64)
+            np.divide(
+                robust_counts,
+                robust_support_counts,
+                out=robust_tail_concentrations,
+                where=robust_support_counts > 0,
+            )
+            concentrated_robust_tails = robust_tail_concentrations >= _EXTREME_WEIGHT_MIN_ROBUST_TAIL_CONCENTRATION
+            classical_tail_concentrations = np.zeros(output_count, dtype=np.float64)
+            np.divide(
+                classical_counts,
+                classical_support_counts,
+                out=classical_tail_concentrations,
+                where=classical_support_counts > 0,
+            )
+            concentrated_classical_tails = (
+                classical_tail_concentrations >= _EXTREME_WEIGHT_MIN_CLASSICAL_TAIL_CONCENTRATION
+            )
+
+            classical_effect_qualified = (
+                (classical_counts >= _EXTREME_WEIGHT_MIN_PER_OUTPUT)
+                & (per_output_effect_ratios >= _EXTREME_WEIGHT_MIN_EFFECT_RATIO)
+                & concentrated_classical_tails
+            )
+            robust_fallback_counts = np.where(inclusive_zero_mad, classical_robust_counts, robust_counts)
+            robust_fallback_qualified = (
+                robust_fallback_counts >= _EXTREME_WEIGHT_ROBUST_FALLBACK_MIN_PER_OUTPUT
+            ) & concentrated_robust_tails
+            classical_fallback_qualified = (
+                classical_counts >= _EXTREME_WEIGHT_ROBUST_FALLBACK_MIN_PER_OUTPUT
+            ) & concentrated_classical_tails
+            nonfinite_qualified = nonfinite_counts > 0
+            qualified_indices = np.flatnonzero(
+                classical_effect_qualified
+                | robust_fallback_qualified
+                | classical_fallback_qualified
+                | nonfinite_qualified,
+            )
             if len(qualified_indices) == 0:
                 continue
 
-            qualified_counts = classical_robust_counts[qualified_indices]
+            finite_qualified_counts = np.maximum(
+                classical_counts[qualified_indices],
+                robust_fallback_counts[qualified_indices],
+            )
+            qualified_counts = finite_qualified_counts + nonfinite_counts[qualified_indices]
             total_affected += len(qualified_indices)
             num_extreme_weights += int(np.sum(qualified_counts))
+            num_nonfinite_weights += int(np.sum(nonfinite_counts[qualified_indices]))
             max_extreme_weights_per_output = max(max_extreme_weights_per_output, int(np.max(qualified_counts)))
             max_weight = max(max_weight, float(np.max(per_output_max[qualified_indices])))
-            max_effect_ratio = max(max_effect_ratio, float(np.max(per_output_effect_ratios[qualified_indices])))
 
             for local_output_index in qualified_indices:
                 output_index = flat_output_start + int(local_output_index)
                 if len(affected_neurons) < 10:
                     affected_neurons.append(output_index)
+                effect_ratio = float(per_output_effect_ratios[local_output_index])
+                if not representative_set or effect_ratio > max_effect_ratio:
+                    representative_set = True
+                    max_effect_ratio = effect_ratio
+                    representative_threshold = float(classical_thresholds[local_output_index])
+                    representative_robust_median = float(robust_medians[local_output_index])
+                    representative_robust_scale = float(robust_scales[local_output_index])
+                    representative_robust_threshold = float(robust_thresholds[local_output_index])
                 if len(evidence) >= 10:
                     continue
-                effect_ratio = float(per_output_effect_ratios[local_output_index])
                 robust_effect_ratio = (
-                    float((per_output_max[local_output_index] - robust_median) / robust_scale)
-                    if robust_scale > 0
+                    float(
+                        (per_output_max[local_output_index] - robust_medians[local_output_index])
+                        / robust_scales[local_output_index]
+                    )
+                    if robust_scales[local_output_index] > 0
                     else None
                 )
                 if classical_effect_qualified[local_output_index] and robust_fallback_qualified[local_output_index]:
                     detection_path = "classical_and_robust"
                 elif classical_effect_qualified[local_output_index]:
                     detection_path = "classical_effect"
-                else:
+                elif robust_fallback_qualified[local_output_index]:
                     detection_path = "robust_small_tensor_fallback"
+                elif classical_fallback_qualified[local_output_index]:
+                    detection_path = "concentrated_classical_fallback"
+                else:
+                    detection_path = "nonfinite_values"
+                if nonfinite_qualified[local_output_index] and detection_path != "nonfinite_values":
+                    detection_path = f"{detection_path}_and_nonfinite"
                 evidence.append(
                     {
                         "output_index": output_index,
+                        "classical_count": int(classical_counts[local_output_index]),
+                        "classical_support_count": int(classical_support_counts[local_output_index]),
+                        "classical_tail_concentration": float(classical_tail_concentrations[local_output_index]),
                         "classical_robust_count": int(classical_robust_counts[local_output_index]),
                         "robust_count": int(robust_counts[local_output_index]),
+                        "robust_support_count": int(robust_support_counts[local_output_index]),
+                        "robust_tail_concentration": float(robust_tail_concentrations[local_output_index]),
+                        "nonfinite_count": int(nonfinite_counts[local_output_index]),
+                        "threshold": float(classical_thresholds[local_output_index]),
+                        "robust_median_magnitude": float(robust_medians[local_output_index]),
+                        "robust_mad_scale": float(robust_scales[local_output_index]),
+                        "robust_threshold": float(robust_thresholds[local_output_index]),
                         "max_to_threshold_ratio": effect_ratio if np.isfinite(effect_ratio) else None,
                         "robust_effect_ratio": robust_effect_ratio,
                         "detection_path": detection_path,
                     },
                 )
 
-        if total_affected == 0 or tail_affected_outputs > max_affected_outputs:
+        if total_affected == 0:
             return []
+
+        description = f"Layer '{layer_name}' has neurons with extremely large weight values"
+        if num_nonfinite_weights:
+            description = f"Layer '{layer_name}' has neurons with non-finite or extremely large weight values"
 
         return [
             {
-                "description": f"Layer '{layer_name}' has neurons with extremely large weight values",
+                "description": description,
                 "severity": IssueSeverity.INFO,
                 "details": {
                     "layer": layer_name,
@@ -2254,19 +2496,25 @@ class WeightDistributionScanner(BaseScanner):
                     "total_affected": total_affected,
                     "tail_affected_outputs": tail_affected_outputs,
                     "num_extreme_weights": num_extreme_weights,
-                    "threshold": threshold,
+                    "num_nonfinite_weights": num_nonfinite_weights,
+                    "threshold": representative_threshold,
+                    "threshold_scope": "per_output",
                     "max_weight": max_weight,
                     "max_to_threshold_ratio": max_effect_ratio if np.isfinite(max_effect_ratio) else None,
                     "max_extreme_weights_per_output": max_extreme_weights_per_output,
                     "affected_output_limit": max_affected_outputs,
-                    "localized": tail_affected_outputs <= max_affected_outputs,
+                    "localized": total_affected <= max_affected_outputs,
                     "minimum_effect_ratio": _EXTREME_WEIGHT_MIN_EFFECT_RATIO,
                     "minimum_extreme_weights_per_output": _EXTREME_WEIGHT_MIN_PER_OUTPUT,
                     "localization_minimum_per_output": _EXTREME_WEIGHT_LOCALIZATION_MIN_PER_OUTPUT,
-                    "robust_median_magnitude": robust_median,
-                    "robust_mad_scale": robust_scale,
-                    "robust_threshold": robust_threshold,
+                    "robust_median_magnitude": representative_robust_median,
+                    "robust_mad_scale": representative_robust_scale,
+                    "robust_threshold": representative_robust_threshold,
                     "robust_mad_multiplier": _EXTREME_WEIGHT_ROBUST_MAD_MULTIPLIER,
+                    "robust_support_mad_multiplier": _EXTREME_WEIGHT_ROBUST_SUPPORT_MAD_MULTIPLIER,
+                    "minimum_robust_tail_concentration": _EXTREME_WEIGHT_MIN_ROBUST_TAIL_CONCENTRATION,
+                    "classical_support_std_multiplier": _EXTREME_WEIGHT_CLASSICAL_SUPPORT_STD_MULTIPLIER,
+                    "minimum_classical_tail_concentration": _EXTREME_WEIGHT_MIN_CLASSICAL_TAIL_CONCENTRATION,
                     "robust_fallback_minimum_per_output": _EXTREME_WEIGHT_ROBUST_FALLBACK_MIN_PER_OUTPUT,
                     "per_output_evidence": evidence,
                     "total_outputs": n_outputs,
@@ -2274,9 +2522,9 @@ class WeightDistributionScanner(BaseScanner):
                 },
                 "why": (
                     "Repeated weight values that are materially beyond both classical and robust distribution "
-                    "baselines can cause numerical instability, overflow attacks, or encode hidden data. Evidence "
-                    "is evaluated independently per output so unrelated coefficients cannot create or suppress an "
-                    "alert."
+                    "baselines, and non-finite weights, can cause numerical instability, overflow attacks, or encode "
+                    "hidden data. Evidence and thresholds are evaluated independently per output so unrelated "
+                    "coefficients cannot create or suppress an alert."
                 ),
             },
         ]

@@ -5,7 +5,7 @@ import math
 import ntpath
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
@@ -91,6 +91,17 @@ _ONNX_WEIGHT_RESHAPE_RANK_LIMIT = 64
 _ONNX_WEIGHT_METADATA_TEXT_LIMIT = 256
 _ONNX_WEIGHT_METADATA_SEQUENCE_LIMIT = 64
 _STANDARD_NEURAL_NETWORK_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
+_QUANTIZED_WEIGHT_OPERATORS: frozenset[str] = frozenset(
+    {
+        "ConvInteger",
+        "DequantizeLinear",
+        "DynamicQuantizeLinear",
+        "MatMulInteger",
+        "QLinearConv",
+        "QLinearMatMul",
+        "QuantizeLinear",
+    },
+)
 
 
 def _check_onnx() -> bool:
@@ -133,6 +144,18 @@ def _onnx_int_attribute(node: Any, name: str, default: int = 0) -> int:
     return default
 
 
+def _onnx_text_attribute(node: Any, name: str) -> str | None:
+    """Read a UTF-8 ONNX string attribute without importing ONNX eagerly."""
+    for attribute in getattr(node, "attribute", []):
+        if attribute.name != name:
+            continue
+        try:
+            return bytes(attribute.s).decode("utf-8")
+        except (AttributeError, UnicodeDecodeError):
+            return None
+    return None
+
+
 def _onnx_weight_output_axes(node: Any, input_index: int, rank: int) -> tuple[tuple[int, ...] | None, str]:
     """Classify an initializer consumer for statistical weight analysis."""
     op_type = node.op_type
@@ -173,11 +196,53 @@ def _onnx_weight_output_axes(node: Any, input_index: int, rank: int) -> tuple[tu
             return None, "unsupported_weight_rank"
         return (1,), "eligible_conv_transpose_weight"
 
-    if op_type == "Gather" and input_index == 0:
-        return None, "embedding_table"
-    if op_type in {"ConvInteger", "MatMulInteger", "QLinearConv", "QLinearMatMul"}:
+    if op_type == "Einsum":
+        equation = _onnx_text_attribute(node, "equation")
+        if equation is None or "..." in equation or equation.count("->") != 1:
+            return None, "unsupported_einsum_equation"
+        input_expression, output_expression = (part.strip() for part in equation.split("->", 1))
+        input_terms = [term.strip() for term in input_expression.split(",")]
+        if input_index >= len(input_terms):
+            return None, "unsupported_einsum_equation"
+        weight_term = input_terms[input_index]
+        if (
+            len(input_terms) != len(getattr(node, "input", ()))
+            or len(weight_term) != rank
+            or len(set(weight_term)) != len(weight_term)
+            or len(set(output_expression)) != len(output_expression)
+        ):
+            return None, "unsupported_einsum_equation"
+        output_axes = tuple(index for index, label in enumerate(weight_term) if label in output_expression)
+        if not output_axes or len(output_axes) == rank:
+            return None, "unsupported_einsum_orientation"
+        return output_axes, "eligible_einsum_weight"
+
+    if op_type == "Gather":
+        if input_index != 0:
+            return None, "non_weight_input"
+        if rank < 2:
+            return None, "unsupported_weight_rank"
+        axis = _onnx_int_attribute(node, "axis")
+        axis = axis if axis >= 0 else rank + axis
+        if axis < 0 or axis >= rank:
+            return None, "unsupported_weight_axis"
+        return (axis,), "eligible_gather_table"
+    if op_type in _QUANTIZED_WEIGHT_OPERATORS:
         return None, "quantized_operator"
-    if op_type in {"Add", "Mul", "Sub", "Div", "Reshape", "Shape", "Slice", "Transpose"}:
+    if op_type in {
+        "Add",
+        "Cast",
+        "Div",
+        "Flatten",
+        "Mul",
+        "Reshape",
+        "Shape",
+        "Slice",
+        "Squeeze",
+        "Sub",
+        "Transpose",
+        "Unsqueeze",
+    }:
         return None, "bookkeeping_constant"
     return None, "unsupported_consumer"
 
@@ -201,9 +266,13 @@ def _iter_graph_nodes(graph: Any) -> Any:
                 yield from _iter_graph_nodes(subgraph)
 
 
+def _onnx_value_name(value: Any) -> str:
+    return str(getattr(value, "name", value))
+
+
 def _graph_declared_value_names(graph: Any) -> set[str]:
     """Return names that shadow values captured from an enclosing ONNX graph."""
-    declared = {value.name for value in getattr(graph, "input", []) if value.name}
+    declared = {_onnx_value_name(value) for value in getattr(graph, "input", []) if _onnx_value_name(value)}
     declared.update(initializer.name for initializer in getattr(graph, "initializer", []) if initializer.name)
     for sparse_initializer in getattr(graph, "sparse_initializer", []):
         if sparse_initializer.values.name:
@@ -543,6 +612,35 @@ def _resolve_onnx_reshape_shape(
     return tuple(normalized)
 
 
+def _resolve_onnx_axes(node: Any, constants: dict[str, Any], *, onnx: Any) -> tuple[int, ...] | None:
+    for attribute in getattr(node, "attribute", ()):
+        if attribute.name == "axes":
+            return tuple(int(value) for value in attribute.ints)
+    if len(getattr(node, "input", ())) < 2:
+        return ()
+
+    axes_initializer = constants.get(str(node.input[1]))
+    if axes_initializer is None:
+        return None
+    dims = tuple(int(dimension) for dimension in getattr(axes_initializer, "dims", ()))
+    element_count = math.prod(dims) if dims else 0
+    if (
+        len(dims) != 1
+        or element_count < 0
+        or element_count > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
+        or int(getattr(axes_initializer, "data_type", -1)) != int(onnx.TensorProto.INT64)
+        or _onnx_inline_storage_nbytes(axes_initializer) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT * 8
+        or getattr(axes_initializer, "data_location", None) == getattr(onnx.TensorProto, "EXTERNAL", 1)
+        or bool(getattr(axes_initializer, "external_data", ()))
+    ):
+        return None
+    try:
+        axes = tuple(int(value) for value in onnx.numpy_helper.to_array(axes_initializer).reshape(-1).tolist())
+    except Exception:
+        return None
+    return axes if len(axes) == element_count else None
+
+
 def _onnx_initializer_name_issues(
     graph: Any,
     plan: _OnnxWeightAnalysisPlan,
@@ -597,7 +695,9 @@ def _onnx_potential_weight_input(node: Any, input_index: int) -> bool:
         return input_index in {0, 1}
     if node.op_type in {"Conv", "ConvTranspose"}:
         return input_index == 1
-    return False
+    if node.op_type == "Gather":
+        return input_index == 0
+    return node.op_type == "Einsum"
 
 
 def _build_onnx_weight_analysis_plan(
@@ -612,7 +712,16 @@ def _build_onnx_weight_analysis_plan(
     """Build a bounded, semantically oriented plan for ONNX weight analysis."""
     plan = _OnnxWeightAnalysisPlan()
     graph = model.graph
-    initializers = list(getattr(graph, "initializer", ()))
+    functions = {
+        (
+            str(getattr(function, "domain", "")),
+            str(getattr(function, "name", "")),
+            str(getattr(function, "overload", "")),
+        ): function
+        for function in getattr(model, "functions", ())
+    }
+    initializers: list[Any] = []
+    initializer_graph_indexes: list[int] = []
     empty_names, duplicate_names, invalid_name_samples = _onnx_initializer_name_issues(graph, plan)
     invalid_name_count = empty_names + duplicate_names
     if invalid_name_count:
@@ -642,7 +751,6 @@ def _build_onnx_weight_analysis_plan(
         }
         return plan
 
-    initializer_indexes = {str(initializer.name): index for index, initializer in enumerate(initializers)}
     floating_types = {
         int(getattr(onnx.TensorProto, name))
         for name in (
@@ -658,13 +766,33 @@ def _build_onnx_weight_analysis_plan(
         )
         if hasattr(onnx.TensorProto, name)
     }
-    groups: list[dict[tuple[Any, ...], _OnnxWeightConsumerGroup]] = [{} for _ in initializers]
+    groups: list[dict[tuple[Any, ...], _OnnxWeightConsumerGroup]] = []
     eligible_initializer_indexes: set[int] = set()
-    terminal_consumer_counts = [0] * len(initializers)
-    transform_counts = [0] * len(initializers)
+    terminal_consumer_counts: list[int] = []
+    transform_counts: list[int] = []
     total_consumer_count = 0
     consumer_sample_count = 0
     node_counter = 0
+    graph_counter = 0
+
+    def register_initializer(
+        initializer: Any,
+        graph_index: int,
+        *,
+        shape: tuple[int, ...] | None = None,
+        unresolved_reason: str | None = None,
+    ) -> _OnnxWeightLineage:
+        initializer_index = len(initializers)
+        initializers.append(initializer)
+        initializer_graph_indexes.append(graph_index)
+        groups.append({})
+        terminal_consumer_counts.append(0)
+        transform_counts.append(0)
+        return _OnnxWeightLineage(
+            initializer_index=initializer_index,
+            shape=shape if shape is not None else tuple(int(dimension) for dimension in initializer.dims),
+            unresolved_reason=unresolved_reason,
+        )
 
     def record_exclusion(
         initializer_index: int,
@@ -678,6 +806,7 @@ def _build_onnx_weight_analysis_plan(
         initializer = initializers[initializer_index]
         sample: dict[str, Any] = {
             **_bounded_onnx_metadata_fields(plan, "initializer", initializer.name),
+            "initializer_graph_index": initializer_graph_indexes[initializer_index],
             "reason": reason,
             **_bounded_onnx_integer_sequence("stored_shape", initializer.dims),
         }
@@ -709,6 +838,7 @@ def _build_onnx_weight_analysis_plan(
         plan.unresolved_lineage_samples.append(
             {
                 **_bounded_onnx_metadata_fields(plan, "initializer", initializer.name),
+                "initializer_graph_index": initializer_graph_indexes[lineage.initializer_index],
                 **_bounded_onnx_metadata_fields(plan, "consumer_op", node.op_type),
                 **_bounded_onnx_metadata_fields(plan, "consumer_node", node.name),
                 "consumer_node_index": node_index,
@@ -772,6 +902,25 @@ def _build_onnx_weight_analysis_plan(
     ) -> _OnnxWeightLineage:
         if lineage.unresolved_reason is not None:
             return lineage
+        if any(getattr(attribute, "ref_attr_name", "") for attribute in getattr(node, "attribute", ())):
+            return _OnnxWeightLineage(
+                initializer_index=lineage.initializer_index,
+                shape=None,
+                transforms=lineage.transforms,
+                unresolved_reason="referenced_function_attribute",
+            )
+        if node.op_type == "Identity":
+            return lineage
+        if node.op_type == "Cast":
+            initializer = initializers[lineage.initializer_index]
+            if _onnx_int_attribute(node, "to", -1) == int(initializer.data_type):
+                return lineage
+            return _OnnxWeightLineage(
+                initializer_index=lineage.initializer_index,
+                shape=None,
+                transforms=lineage.transforms,
+                unresolved_reason="dtype_changing_cast_lineage",
+            )
         if len(lineage.transforms) >= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT:
             return _OnnxWeightLineage(
                 initializer_index=lineage.initializer_index,
@@ -787,9 +936,66 @@ def _build_onnx_weight_analysis_plan(
                 unresolved_reason="lineage_shape_unavailable",
             )
 
-        if node.op_type == "Identity":
-            transform = _OnnxWeightTransform("Identity")
-            output_shape = lineage.shape
+        output_shape: tuple[int, ...]
+        transform: _OnnxWeightTransform
+        if node.op_type == "Flatten":
+            axis = _onnx_int_attribute(node, "axis", 1)
+            axis = axis if axis >= 0 else len(lineage.shape) + axis
+            if axis < 0 or axis > len(lineage.shape):
+                return _OnnxWeightLineage(
+                    initializer_index=lineage.initializer_index,
+                    shape=None,
+                    transforms=lineage.transforms,
+                    unresolved_reason="invalid_flatten_lineage",
+                )
+            output_shape = (math.prod(lineage.shape[:axis]), math.prod(lineage.shape[axis:]))
+            transform = _OnnxWeightTransform("Reshape", output_shape)
+        elif node.op_type in {"Squeeze", "Unsqueeze"}:
+            axes = _resolve_onnx_axes(node, constants, onnx=onnx)
+            if axes is None:
+                return _OnnxWeightLineage(
+                    initializer_index=lineage.initializer_index,
+                    shape=None,
+                    transforms=lineage.transforms,
+                    unresolved_reason=f"unresolved_{node.op_type.lower()}_lineage",
+                )
+            if node.op_type == "Squeeze":
+                normalized_axes = tuple(axis if axis >= 0 else len(lineage.shape) + axis for axis in axes)
+                if not normalized_axes:
+                    normalized_axes = tuple(index for index, dimension in enumerate(lineage.shape) if dimension == 1)
+                if (
+                    len(set(normalized_axes)) != len(normalized_axes)
+                    or any(axis < 0 or axis >= len(lineage.shape) for axis in normalized_axes)
+                    or any(lineage.shape[axis] != 1 for axis in normalized_axes)
+                ):
+                    return _OnnxWeightLineage(
+                        initializer_index=lineage.initializer_index,
+                        shape=None,
+                        transforms=lineage.transforms,
+                        unresolved_reason="invalid_squeeze_lineage",
+                    )
+                output_shape = tuple(
+                    dimension for index, dimension in enumerate(lineage.shape) if index not in normalized_axes
+                )
+            else:
+                output_rank = len(lineage.shape) + len(axes)
+                normalized_axes = tuple(axis if axis >= 0 else output_rank + axis for axis in axes)
+                if (
+                    not normalized_axes
+                    or len(set(normalized_axes)) != len(normalized_axes)
+                    or any(axis < 0 or axis >= output_rank for axis in normalized_axes)
+                ):
+                    return _OnnxWeightLineage(
+                        initializer_index=lineage.initializer_index,
+                        shape=None,
+                        transforms=lineage.transforms,
+                        unresolved_reason="invalid_unsqueeze_lineage",
+                    )
+                source_dimensions = iter(lineage.shape)
+                output_shape = tuple(
+                    1 if index in normalized_axes else next(source_dimensions) for index in range(output_rank)
+                )
+            transform = _OnnxWeightTransform("Reshape", output_shape)
         elif node.op_type == "Transpose":
             permutation = tuple(
                 int(value)
@@ -805,9 +1011,11 @@ def _build_onnx_weight_analysis_plan(
                     transforms=lineage.transforms,
                     unresolved_reason="invalid_transpose_lineage",
                 )
+            if permutation == tuple(range(len(lineage.shape))):
+                return lineage
             transform = _OnnxWeightTransform("Transpose", permutation)
             output_shape = tuple(lineage.shape[index] for index in permutation)
-        else:
+        else:  # Reshape
             shape_name = str(node.input[1]) if len(node.input) > 1 else ""
             shape_initializer = constants.get(shape_name)
             resolved_shape = (
@@ -830,6 +1038,9 @@ def _build_onnx_weight_analysis_plan(
             output_shape = resolved_shape
             transform = _OnnxWeightTransform("Reshape", output_shape)
 
+        if output_shape == lineage.shape:
+            return lineage
+
         return _OnnxWeightLineage(
             initializer_index=lineage.initializer_index,
             shape=output_shape,
@@ -845,38 +1056,108 @@ def _build_onnx_weight_analysis_plan(
         )
         return dict(sorted(lineages.items())[:_ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT])
 
+    def merge_lineages(
+        target: dict[int, _OnnxWeightLineage],
+        source: dict[int, _OnnxWeightLineage],
+        *,
+        ambiguous_reason: str,
+    ) -> None:
+        for initializer_index, lineage in source.items():
+            existing = target.get(initializer_index)
+            if existing is None:
+                target[initializer_index] = lineage
+                continue
+            if existing == lineage:
+                continue
+            target[initializer_index] = _OnnxWeightLineage(
+                initializer_index=initializer_index,
+                shape=None,
+                transforms=existing.transforms,
+                unresolved_reason=existing.unresolved_reason or lineage.unresolved_reason or ambiguous_reason,
+            )
+
     def walk_graph(
         current_graph: Any,
         inherited_lineages: dict[str, dict[int, _OnnxWeightLineage]],
         inherited_constants: dict[str, Any],
+        inherited_dynamic_values: set[str],
         *,
         root_graph: bool,
-    ) -> None:
-        nonlocal node_counter, total_consumer_count
+        bound_lineages: dict[str, dict[int, _OnnxWeightLineage]] | None = None,
+        bound_constants: dict[str, Any] | None = None,
+        bound_dynamic_values: set[str] | None = None,
+        bound_attributes: dict[str, Any] | None = None,
+        function_depth: int = 0,
+    ) -> tuple[list[dict[int, _OnnxWeightLineage]], list[bool]]:
+        nonlocal graph_counter, node_counter, total_consumer_count
+        current_graph_index = graph_counter
+        graph_counter += 1
         if root_graph:
             value_lineages = dict(inherited_lineages)
             constants = dict(inherited_constants)
+            dynamic_values = set(inherited_dynamic_values)
         else:
             declared_names = _graph_declared_value_names(current_graph)
             value_lineages = {
                 name: lineages for name, lineages in inherited_lineages.items() if name not in declared_names
             }
             constants = {name: value for name, value in inherited_constants.items() if name not in declared_names}
+            dynamic_values = {name for name in inherited_dynamic_values if name not in declared_names}
+
+        value_lineages.update(bound_lineages or {})
+        constants.update(bound_constants or {})
+        dynamic_values.update(bound_dynamic_values or set())
+        attribute_bindings = bound_attributes or {}
+
+        def resolve_attribute(attribute: Any) -> Any | None:
+            reference_name = str(getattr(attribute, "ref_attr_name", ""))
+            return attribute_bindings.get(reference_name) if reference_name else attribute
 
         for initializer in getattr(current_graph, "initializer", ()):
             if initializer.name:
-                constants[str(initializer.name)] = initializer
+                name = str(initializer.name)
+                lineage = register_initializer(initializer, current_graph_index)
+                value_lineages[name] = {lineage.initializer_index: lineage}
+                constants[name] = initializer
+                dynamic_values.discard(name)
+        for sparse_initializer in getattr(current_graph, "sparse_initializer", ()):
+            if sparse_initializer.values.name:
+                name = str(sparse_initializer.values.name)
+                lineage = register_initializer(
+                    sparse_initializer.values,
+                    current_graph_index,
+                    shape=tuple(int(dimension) for dimension in sparse_initializer.dims),
+                    unresolved_reason="sparse_initializer_unsupported",
+                )
+                value_lineages[name] = {lineage.initializer_index: lineage}
+                dynamic_values.discard(name)
+
+        for graph_input in getattr(current_graph, "input", ()):
+            name = _onnx_value_name(graph_input)
+            if name and name not in value_lineages and name not in constants:
+                dynamic_values.add(name)
 
         for node in getattr(current_graph, "node", ()):
             current_node_index = node_counter
             node_counter += 1
             supported_transform = getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and node.op_type in {
+                "Cast",
+                "Flatten",
                 "Identity",
-                "Transpose",
                 "Reshape",
+                "Squeeze",
+                "Transpose",
+                "Unsqueeze",
             }
-            roots_consumed_as_weights: set[int] = set()
             all_input_lineages: dict[int, _OnnxWeightLineage] = {}
+            input_names = [str(input_name) for input_name in node.input if input_name]
+            has_dynamic_input = any(
+                input_name in dynamic_values or (input_name not in value_lineages and input_name not in constants)
+                for input_name in input_names
+            )
+            has_referenced_attributes = any(
+                getattr(attribute, "ref_attr_name", "") for attribute in getattr(node, "attribute", ())
+            )
 
             for input_index, input_name in enumerate(node.input):
                 input_lineages = value_lineages.get(str(input_name), {})
@@ -892,16 +1173,144 @@ def _build_onnx_weight_analysis_plan(
                         else:
                             record_exclusion(initializer_index, "unresolved_lineage_consumer", node, input_index)
                         continue
+                    if has_referenced_attributes and not (supported_transform and input_index == 0):
+                        if _onnx_potential_weight_input(node, input_index):
+                            record_unresolved_lineage(
+                                _OnnxWeightLineage(
+                                    initializer_index=initializer_index,
+                                    shape=None,
+                                    transforms=lineage.transforms,
+                                    unresolved_reason="referenced_function_attribute",
+                                ),
+                                node,
+                                current_node_index,
+                                input_index,
+                            )
+                        else:
+                            record_exclusion(
+                                initializer_index,
+                                "referenced_function_attribute_consumer",
+                                node,
+                                input_index,
+                            )
+                        continue
                     output_axes, reason = _onnx_weight_output_axes(node, input_index, len(lineage.shape or ()))
                     if output_axes is None:
-                        record_exclusion(initializer_index, reason, node, input_index)
+                        if reason != "non_weight_input" and _onnx_potential_weight_input(node, input_index):
+                            record_unresolved_lineage(
+                                _OnnxWeightLineage(
+                                    initializer_index=initializer_index,
+                                    shape=None,
+                                    transforms=lineage.transforms,
+                                    unresolved_reason="unsupported_weight_consumer",
+                                ),
+                                node,
+                                current_node_index,
+                                input_index,
+                            )
+                        else:
+                            record_exclusion(initializer_index, reason, node, input_index)
                         continue
                     add_consumer_group(lineage, node, current_node_index, input_index, output_axes)
-                    roots_consumed_as_weights.add(initializer_index)
 
+            subgraph_results: list[tuple[list[dict[int, _OnnxWeightLineage]], list[bool]]] = []
             for attribute in getattr(node, "attribute", ()):
-                for subgraph in _iter_attribute_graphs(attribute):
-                    walk_graph(subgraph, value_lineages, constants, root_graph=False)
+                resolved_attribute = resolve_attribute(attribute)
+                if resolved_attribute is None:
+                    plan.record_coverage_gap("unresolved_function_attribute")
+                    continue
+                for subgraph in _iter_attribute_graphs(resolved_attribute):
+                    subgraph_bound_lineages: dict[str, dict[int, _OnnxWeightLineage]] = {}
+                    subgraph_bound_constants: dict[str, Any] = {}
+                    subgraph_bound_dynamic: set[str] = set()
+                    input_pairs: Iterable[tuple[Any, Any]]
+                    if node.op_type == "Loop":
+                        input_pairs = zip(node.input[2:], subgraph.input[2:], strict=False)
+                    elif node.op_type == "Scan":
+                        input_pairs = zip(node.input, subgraph.input, strict=False)
+                    else:
+                        input_pairs = ()
+                    for parent_input, graph_input in input_pairs:
+                        parent_name = str(parent_input)
+                        graph_input_name = _onnx_value_name(graph_input)
+                        if parent_name in value_lineages:
+                            subgraph_bound_lineages[graph_input_name] = value_lineages[parent_name]
+                        if parent_name in constants:
+                            subgraph_bound_constants[graph_input_name] = constants[parent_name]
+                        if parent_name in dynamic_values:
+                            subgraph_bound_dynamic.add(graph_input_name)
+                    subgraph_results.append(
+                        walk_graph(
+                            subgraph,
+                            value_lineages,
+                            constants,
+                            dynamic_values,
+                            root_graph=False,
+                            bound_lineages=subgraph_bound_lineages,
+                            bound_constants=subgraph_bound_constants,
+                            bound_dynamic_values=subgraph_bound_dynamic,
+                            bound_attributes=attribute_bindings,
+                            function_depth=function_depth,
+                        ),
+                    )
+
+            function = functions.get(
+                (
+                    str(getattr(node, "domain", "")),
+                    str(getattr(node, "op_type", "")),
+                    str(getattr(node, "overload", "")),
+                ),
+            )
+            if function is not None and function_depth >= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT:
+                plan.record_coverage_gap("function_call_depth_limit")
+                for input_index, input_name in enumerate(node.input):
+                    for initializer_index, lineage in value_lineages.get(str(input_name), {}).items():
+                        record_unresolved_lineage(
+                            _OnnxWeightLineage(
+                                initializer_index=initializer_index,
+                                shape=None,
+                                transforms=lineage.transforms,
+                                unresolved_reason="function_call_depth_limit",
+                            ),
+                            node,
+                            current_node_index,
+                            input_index,
+                        )
+                function = None
+            if function is not None:
+                function_bound_lineages: dict[str, dict[int, _OnnxWeightLineage]] = {}
+                function_bound_constants: dict[str, Any] = {}
+                function_bound_dynamic: set[str] = set()
+                function_bound_attributes = {
+                    str(attribute.name): attribute for attribute in getattr(function, "attribute_proto", ())
+                }
+                for attribute in getattr(node, "attribute", ()):
+                    resolved_attribute = resolve_attribute(attribute)
+                    if resolved_attribute is not None:
+                        function_bound_attributes[str(attribute.name)] = resolved_attribute
+                for parent_input, function_input in zip(node.input, function.input, strict=False):
+                    parent_name = str(parent_input)
+                    function_input_name = _onnx_value_name(function_input)
+                    if parent_name in value_lineages:
+                        function_bound_lineages[function_input_name] = value_lineages[parent_name]
+                    if parent_name in constants:
+                        function_bound_constants[function_input_name] = constants[parent_name]
+                    if parent_name in dynamic_values:
+                        function_bound_dynamic.add(function_input_name)
+                subgraph_results.append(
+                    walk_graph(
+                        function,
+                        value_lineages,
+                        constants,
+                        dynamic_values,
+                        root_graph=False,
+                        bound_lineages=function_bound_lineages,
+                        bound_constants=function_bound_constants,
+                        bound_dynamic_values=function_bound_dynamic,
+                        bound_attributes=function_bound_attributes,
+                        function_depth=function_depth + 1,
+                    ),
+                )
 
             output_lineages: dict[int, _OnnxWeightLineage] = {}
             if supported_transform:
@@ -909,10 +1318,13 @@ def _build_onnx_weight_analysis_plan(
                 for initializer_index, lineage in data_lineages.items():
                     transform_counts[initializer_index] += 1
                     output_lineages[initializer_index] = transformed_lineage(lineage, node, constants)
-            else:
+            elif (
+                all_input_lineages
+                and not has_dynamic_input
+                and node.op_type not in _QUANTIZED_WEIGHT_OPERATORS
+                and function is None
+            ):
                 for initializer_index, lineage in all_input_lineages.items():
-                    if initializer_index in roots_consumed_as_weights:
-                        continue
                     output_lineages[initializer_index] = _OnnxWeightLineage(
                         initializer_index=initializer_index,
                         shape=None,
@@ -921,37 +1333,155 @@ def _build_onnx_weight_analysis_plan(
                     )
 
             output_lineages = bounded_lineages(output_lineages)
-            for output_name in node.output:
-                if output_name and output_lineages:
-                    value_lineages[str(output_name)] = output_lineages
-
+            constant_output_names: set[str] = set()
+            constant_output_lineages: dict[str, dict[int, _OnnxWeightLineage]] = {}
             if getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and node.op_type == "Constant":
                 constant_tensor = None
+                sparse_constant = None
+                unresolved_constant_attribute = False
                 for attribute in node.attribute:
-                    if attribute.name != "value":
+                    resolved_attribute = resolve_attribute(attribute)
+                    if resolved_attribute is None:
+                        unresolved_constant_attribute = True
                         continue
-                    try:
-                        if attribute.HasField("t"):
-                            constant_tensor = attribute.t
-                    except (AttributeError, ValueError):
-                        constant_tensor = None
-                    break
-                if constant_tensor is not None:
-                    for output_name in node.output:
-                        if output_name:
-                            constants[str(output_name)] = constant_tensor
+                    if attribute.name == "value":
+                        try:
+                            if resolved_attribute.HasField("t"):
+                                constant_tensor = resolved_attribute.t
+                        except (AttributeError, ValueError):
+                            constant_tensor = None
+                    elif attribute.name == "value_ints":
+                        constant_tensor = onnx.helper.make_tensor(
+                            "",
+                            onnx.TensorProto.INT64,
+                            [len(resolved_attribute.ints)],
+                            list(resolved_attribute.ints),
+                        )
+                    elif attribute.name == "value_int":
+                        constant_tensor = onnx.helper.make_tensor(
+                            "",
+                            onnx.TensorProto.INT64,
+                            [],
+                            [resolved_attribute.i],
+                        )
+                    elif attribute.name == "value_floats":
+                        constant_tensor = onnx.helper.make_tensor(
+                            "",
+                            onnx.TensorProto.FLOAT,
+                            [len(resolved_attribute.floats)],
+                            list(resolved_attribute.floats),
+                        )
+                    elif attribute.name == "value_float":
+                        constant_tensor = onnx.helper.make_tensor(
+                            "",
+                            onnx.TensorProto.FLOAT,
+                            [],
+                            [resolved_attribute.f],
+                        )
+                    elif attribute.name == "sparse_value":
+                        try:
+                            if resolved_attribute.HasField("sparse_tensor"):
+                                sparse_constant = resolved_attribute.sparse_tensor
+                        except (AttributeError, ValueError):
+                            sparse_constant = None
+                    if constant_tensor is not None or sparse_constant is not None:
+                        break
+                output_names = [str(output_name) for output_name in node.output if output_name]
+                if len(output_names) != 1:
+                    plan.record_coverage_gap("invalid_constant_outputs")
+                elif constant_tensor is not None:
+                    name = output_names[0]
+                    constant_tensor.name = name
+                    lineage = register_initializer(constant_tensor, current_graph_index)
+                    constants[name] = constant_tensor
+                    constant_output_lineages[name] = {lineage.initializer_index: lineage}
+                    constant_output_names.add(name)
+                elif sparse_constant is not None:
+                    name = output_names[0]
+                    sparse_constant.values.name = name
+                    lineage = register_initializer(
+                        sparse_constant.values,
+                        current_graph_index,
+                        shape=tuple(int(dimension) for dimension in sparse_constant.dims),
+                        unresolved_reason="sparse_constant_unsupported",
+                    )
+                    constant_output_lineages[name] = {lineage.initializer_index: lineage}
+                    constant_output_names.add(name)
+                elif unresolved_constant_attribute:
+                    name = output_names[0]
+                    unresolved_tensor = onnx.TensorProto()
+                    unresolved_tensor.name = name
+                    lineage = register_initializer(
+                        unresolved_tensor,
+                        current_graph_index,
+                        unresolved_reason="unresolved_constant_attribute",
+                    )
+                    constant_output_lineages[name] = {lineage.initializer_index: lineage}
+                    constant_output_names.add(name)
 
-    root_lineages = {
-        name: {
-            initializer_index: _OnnxWeightLineage(
-                initializer_index=initializer_index,
-                shape=tuple(int(dimension) for dimension in initializers[initializer_index].dims),
-            ),
-        }
-        for name, initializer_index in initializer_indexes.items()
-    }
-    root_constants = {str(initializer.name): initializer for initializer in initializers}
-    walk_graph(graph, root_lineages, root_constants, root_graph=True)
+            subgraph_output_lineages: list[dict[int, _OnnxWeightLineage]] = [{} for _ in node.output]
+            subgraph_output_dynamic = [False for _ in node.output]
+            subgraph_output_offset = 1 if node.op_type == "Loop" else 0
+            for graph_output_lineages, graph_output_dynamic in subgraph_results:
+                for output_index in range(len(node.output)):
+                    graph_output_index = output_index + subgraph_output_offset
+                    if graph_output_index >= len(graph_output_lineages):
+                        continue
+                    merge_lineages(
+                        subgraph_output_lineages[output_index],
+                        graph_output_lineages[graph_output_index],
+                        ambiguous_reason="ambiguous_subgraph_output_lineage",
+                    )
+                    subgraph_output_dynamic[output_index] |= graph_output_dynamic[graph_output_index]
+
+            for output_index, output_name in enumerate(node.output):
+                if not output_name:
+                    continue
+                name = str(output_name)
+                per_output_lineages = dict(output_lineages)
+                merge_lineages(
+                    per_output_lineages,
+                    constant_output_lineages.get(name, {}),
+                    ambiguous_reason="ambiguous_constant_output_lineage",
+                )
+                merge_lineages(
+                    per_output_lineages,
+                    subgraph_output_lineages[output_index],
+                    ambiguous_reason="ambiguous_subgraph_output_lineage",
+                )
+                if subgraph_output_dynamic[output_index] and per_output_lineages:
+                    per_output_lineages = {
+                        initializer_index: _OnnxWeightLineage(
+                            initializer_index=initializer_index,
+                            shape=None,
+                            transforms=lineage.transforms,
+                            unresolved_reason=lineage.unresolved_reason or "dynamic_subgraph_output_lineage",
+                        )
+                        for initializer_index, lineage in per_output_lineages.items()
+                    }
+                per_output_lineages = bounded_lineages(per_output_lineages)
+                if per_output_lineages:
+                    value_lineages[name] = per_output_lineages
+                else:
+                    value_lineages.pop(name, None)
+
+                mapped_subgraph_output = bool(subgraph_results) and output_index < len(subgraph_output_dynamic)
+                output_is_dynamic = (
+                    subgraph_output_dynamic[output_index]
+                    if mapped_subgraph_output and per_output_lineages
+                    else has_dynamic_input or (not per_output_lineages and name not in constant_output_names)
+                )
+                if output_is_dynamic:
+                    dynamic_values.add(name)
+                else:
+                    dynamic_values.discard(name)
+
+        return (
+            [dict(value_lineages.get(_onnx_value_name(graph_output), {})) for graph_output in current_graph.output],
+            [_onnx_value_name(graph_output) in dynamic_values for graph_output in current_graph.output],
+        )
+
+    walk_graph(graph, {}, {}, set(), root_graph=True)
 
     for initializer_index, _initializer in enumerate(initializers):
         if terminal_consumer_counts[initializer_index] == 0 and not groups[initializer_index]:
@@ -1043,6 +1573,7 @@ def _build_onnx_weight_analysis_plan(
                 context = {
                     "analysis_id": analysis_id,
                     **_bounded_onnx_metadata_fields(plan, "initializer", initializer.name),
+                    "initializer_graph_index": initializer_graph_indexes[initializer_index],
                     "consumer_op": first_consumer["op"],
                     "consumer_op_length": first_consumer["op_length"],
                     "consumer_op_truncated": first_consumer["op_truncated"],
@@ -1871,11 +2402,16 @@ class OnnxScanner(BaseScanner):
             and configured_max_array_size > 0
             else None
         )
+
+        def inline_storage_fits_budget(initializer: Any, _name: str, _estimated_bytes: int) -> bool:
+            return max_array_size is None or _onnx_inline_storage_nbytes(initializer) <= max_array_size
+
         plan = _build_onnx_weight_analysis_plan(
             model,
             onnx=onnx,
             np=np,
             max_array_size=max_array_size,
+            pre_materialization_check=inline_storage_fits_budget,
         )
         result.metadata["onnx_weight_distribution_semantics"] = plan.metadata
 
@@ -1912,7 +2448,8 @@ class OnnxScanner(BaseScanner):
             return
 
         try:
-            from scipy import stats as _stats  # noqa: F401
+            if any(spec.matrix_analysis for spec in plan.specs):
+                from scipy import stats as _stats  # noqa: F401
 
             # Lazy-import the weight distribution scanner to avoid circular deps
             # and heavy library loads when the scanner is not needed.

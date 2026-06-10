@@ -477,16 +477,21 @@ def create_control_flow_captured_weight_model(
     return path
 
 
-def create_control_flow_shadowed_weight_model(tmp_path: Path, outer_weights: np.ndarray) -> Path:
+def create_control_flow_shadowed_weight_model(
+    tmp_path: Path,
+    outer_weights: np.ndarray,
+    *,
+    local_weights: np.ndarray | None = None,
+) -> Path:
     """Create an If graph where a local W shadows an unused outer W."""
     outer_weight_tensor = onnx.numpy_helper.from_array(outer_weights, name="W")
-    local_weights = np.zeros_like(outer_weights)
+    branch_weights = np.zeros_like(outer_weights) if local_weights is None else local_weights
     X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, outer_weights.shape[0]])
     Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, outer_weights.shape[1]])
     condition = helper.make_tensor_value_info("condition", TensorProto.BOOL, [])
 
     def make_branch(name: str) -> Any:
-        local_weight_tensor = onnx.numpy_helper.from_array(local_weights, name="W")
+        local_weight_tensor = onnx.numpy_helper.from_array(branch_weights, name="W")
         branch_output = helper.make_tensor_value_info(f"{name}_output", TensorProto.FLOAT, [1, outer_weights.shape[1]])
         node = helper.make_node("MatMul", ["X", "W"], [f"{name}_output"], name=f"{name}_linear")
         return helper.make_graph([node], name, [], [branch_output], initializer=[local_weight_tensor])
@@ -510,6 +515,309 @@ def create_control_flow_shadowed_weight_model(tmp_path: Path, outer_weights: np.
     model.ir_version = 8
     onnx.checker.check_model(model)
     path = tmp_path / "shadowed-captured-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_control_flow_returned_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
+    """Create an If that returns a captured weight to an outer MatMul."""
+    initializer = onnx.numpy_helper.from_array(weights, name="W")
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, weights.shape[0]])
+    condition = helper.make_tensor_value_info("condition", TensorProto.BOOL, [])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, weights.shape[1]])
+
+    def make_branch(name: str) -> Any:
+        output_name = f"{name}_weight"
+        output = helper.make_tensor_value_info(output_name, TensorProto.FLOAT, list(weights.shape))
+        return helper.make_graph(
+            [helper.make_node("Identity", ["W"], [output_name], name=f"{name}_identity")],
+            name,
+            [],
+            [output],
+        )
+
+    nodes = [
+        helper.make_node(
+            "If",
+            ["condition"],
+            ["selected_weight"],
+            name="select_weight",
+            then_branch=make_branch("then"),
+            else_branch=make_branch("else"),
+        ),
+        helper.make_node("MatMul", ["X", "selected_weight"], ["Y"], name="linear"),
+    ]
+    graph = helper.make_graph(nodes, "returned_weight_graph", [condition, X], [Y], initializer=[initializer])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "returned-control-flow-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_loop_carried_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
+    """Create a Loop whose body consumes a weight through a formal input."""
+    initializer = onnx.numpy_helper.from_array(weights, name="W")
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, weights.shape[0]])
+    trip_count = helper.make_tensor_value_info("trip_count", TensorProto.INT64, [])
+    condition = helper.make_tensor_value_info("condition", TensorProto.BOOL, [])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, weights.shape[1]])
+    iteration = helper.make_tensor_value_info("iteration", TensorProto.INT64, [])
+    body_condition = helper.make_tensor_value_info("body_condition", TensorProto.BOOL, [])
+    state_weight = helper.make_tensor_value_info("state_weight", TensorProto.FLOAT, list(weights.shape))
+    condition_output = helper.make_tensor_value_info("condition_output", TensorProto.BOOL, [])
+    weight_output = helper.make_tensor_value_info("weight_output", TensorProto.FLOAT, list(weights.shape))
+    body = helper.make_graph(
+        [
+            helper.make_node("Identity", ["body_condition"], ["condition_output"]),
+            helper.make_node("MatMul", ["X", "state_weight"], ["body_projection"], name="body_linear"),
+            helper.make_node("Identity", ["state_weight"], ["weight_output"]),
+        ],
+        "loop_body",
+        [iteration, body_condition, state_weight],
+        [condition_output, weight_output],
+    )
+    nodes = [
+        helper.make_node(
+            "Loop",
+            ["trip_count", "condition", "W"],
+            ["final_weight"],
+            name="carry_weight",
+            body=body,
+        ),
+        helper.make_node("MatMul", ["X", "final_weight"], ["Y"], name="outer_linear"),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "loop_carried_weight_graph",
+        [trip_count, condition, X],
+        [Y],
+        initializer=[initializer],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "loop-carried-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_activation_bookkeeping_model(tmp_path: Path, *, malicious: bool) -> Path:
+    """Create a linear stack whose activation path also consumes a bias."""
+    first_weight = np.zeros((100, 100), dtype=np.float32)
+    second_weight = np.zeros((100, 10), dtype=np.float32)
+    if malicious:
+        second_weight[50:55, 3] = 10.0
+    initializers = [
+        onnx.numpy_helper.from_array(first_weight, name="W1"),
+        onnx.numpy_helper.from_array(np.zeros(100, dtype=np.float32), name="bias"),
+        onnx.numpy_helper.from_array(second_weight, name="W2"),
+    ]
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])
+    nodes = [
+        helper.make_node("MatMul", ["X", "W1"], ["hidden"], name="first_linear"),
+        helper.make_node("Add", ["hidden", "bias"], ["biased"], name="bias_add"),
+        helper.make_node("Relu", ["biased"], ["activated"], name="activation"),
+        helper.make_node("MatMul", ["activated", "W2"], ["Y"], name="second_linear"),
+    ]
+    graph = helper.make_graph(nodes, "activation_bookkeeping_graph", [X], [Y], initializer=initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / ("malicious-activation-bookkeeping.onnx" if malicious else "benign-activation-bookkeeping.onnx")
+    onnx.save(model, str(path))
+    return path
+
+
+def create_einsum_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
+    initializer = onnx.numpy_helper.from_array(weights, name="W")
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, weights.shape[0]])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, weights.shape[1]])
+    node = helper.make_node("Einsum", ["X", "W"], ["Y"], name="linear", equation="bi,io->bo")
+    graph = helper.make_graph([node], "einsum_weight_graph", [X], [Y], initializer=[initializer])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "einsum-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_qdq_weight_model(tmp_path: Path) -> Path:
+    quantized_weight = onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.int8), name="W")
+    scale = onnx.numpy_helper.from_array(np.asarray(0.1, dtype=np.float32), name="scale")
+    zero_point = onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="zero_point")
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])
+    nodes = [
+        helper.make_node("DequantizeLinear", ["W", "scale", "zero_point"], ["dequantized_weight"]),
+        helper.make_node("MatMul", ["X", "dequantized_weight"], ["Y"]),
+    ]
+    graph = helper.make_graph(nodes, "qdq_weight_graph", [X], [Y], initializer=[quantized_weight, scale, zero_point])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "qdq-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_sparse_weight_model(tmp_path: Path) -> Path:
+    values = helper.make_tensor("W", TensorProto.FLOAT, [5], vals=[10.0] * 5)
+    indices = helper.make_tensor(
+        "W_indices",
+        TensorProto.INT64,
+        [5],
+        vals=[row * 10 + 3 for row in range(50, 55)],
+    )
+    sparse_weight = helper.make_sparse_tensor(values, indices, [100, 10])
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])
+    node = helper.make_node("MatMul", ["X", "W"], ["Y"], name="linear")
+    graph = helper.make_graph([node], "sparse_weight_graph", [X], [Y], sparse_initializer=[sparse_weight])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "sparse-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_constant_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, weights.shape[0]])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, weights.shape[1]])
+    weight_tensor = onnx.numpy_helper.from_array(weights)
+    nodes = [
+        helper.make_node("Constant", [], ["W"], name="weight_constant", value=weight_tensor),
+        helper.make_node("MatMul", ["X", "W"], ["Y"], name="linear"),
+    ]
+    graph = helper.make_graph(nodes, "constant_weight_graph", [X], [Y])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "constant-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_local_function_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
+    domain = "modelaudit.test"
+    initializer = onnx.numpy_helper.from_array(weights, name="W")
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, weights.shape[0]])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, weights.shape[1]])
+    function = helper.make_function(
+        domain,
+        "Linear",
+        ["function_input", "function_weight"],
+        ["function_output"],
+        [helper.make_node("MatMul", ["function_input", "function_weight"], ["function_output"])],
+        [helper.make_opsetid("", 13)],
+    )
+    call = helper.make_node("Linear", ["X", "W"], ["Y"], domain=domain, name="local_linear")
+    graph = helper.make_graph([call], "local_function_graph", [X], [Y], initializer=[initializer])
+    model = helper.make_model(
+        graph,
+        functions=[function],
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid(domain, 1)],
+    )
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "local-function-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_local_function_default_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
+    domain = "modelaudit.test"
+    attribute_name = "default_weight"
+    constant = helper.make_node("Constant", [], ["function_weight"])
+    constant.attribute.extend(
+        [
+            onnx.AttributeProto(
+                name="value",
+                ref_attr_name=attribute_name,
+                type=onnx.AttributeProto.TENSOR,
+            ),
+        ],
+    )
+    function = helper.make_function(
+        domain,
+        "DefaultWeight",
+        [],
+        ["function_weight"],
+        [constant],
+        [helper.make_opsetid("", 13)],
+        attribute_protos=[helper.make_attribute(attribute_name, onnx.numpy_helper.from_array(weights))],
+    )
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, weights.shape[0]])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, weights.shape[1]])
+    nodes = [
+        helper.make_node("DefaultWeight", [], ["W"], domain=domain),
+        helper.make_node("MatMul", ["X", "W"], ["Y"]),
+    ]
+    graph = helper.make_graph(nodes, "local_function_default_weight_graph", [X], [Y])
+    model = helper.make_model(
+        graph,
+        functions=[function],
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid(domain, 1)],
+    )
+    model.ir_version = 9
+    onnx.checker.check_model(model)
+    path = tmp_path / "local-function-default-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_static_shape_transform_weight_model(
+    tmp_path: Path,
+    analysis_weights: np.ndarray,
+    *,
+    transform: str,
+) -> Path:
+    assert transform in {"Flatten", "ReshapeValueInts", "Squeeze", "Unsqueeze"}
+    nodes: list[Any] = []
+    initializers: list[Any] = []
+    if transform in {"Flatten", "ReshapeValueInts"}:
+        stored_weights = analysis_weights.reshape(10, 10, analysis_weights.shape[1]).copy()
+    elif transform == "Squeeze":
+        stored_weights = analysis_weights.reshape(1, *analysis_weights.shape).copy()
+    else:
+        stored_weights = analysis_weights.copy()
+    initializers.append(onnx.numpy_helper.from_array(stored_weights, name="W"))
+
+    if transform == "Flatten":
+        nodes.append(helper.make_node("Flatten", ["W"], ["W_view"], axis=2))
+        input_shape = [1, analysis_weights.shape[0]]
+    elif transform == "ReshapeValueInts":
+        nodes.extend(
+            [
+                helper.make_node("Constant", [], ["shape"], value_ints=list(analysis_weights.shape)),
+                helper.make_node("Reshape", ["W", "shape"], ["W_view"]),
+            ],
+        )
+        input_shape = [1, analysis_weights.shape[0]]
+    elif transform == "Squeeze":
+        axes = onnx.numpy_helper.from_array(np.asarray([0], dtype=np.int64), name="axes")
+        initializers.append(axes)
+        nodes.append(helper.make_node("Squeeze", ["W", "axes"], ["W_view"]))
+        input_shape = [1, analysis_weights.shape[0]]
+    else:
+        axes = onnx.numpy_helper.from_array(np.asarray([0], dtype=np.int64), name="axes")
+        initializers.append(axes)
+        nodes.append(helper.make_node("Unsqueeze", ["W", "axes"], ["W_view"]))
+        input_shape = [1, 1, analysis_weights.shape[0]]
+
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, input_shape)
+    output_shape = [1, analysis_weights.shape[1]] if transform != "Unsqueeze" else [1, 1, analysis_weights.shape[1]]
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, output_shape)
+    nodes.append(helper.make_node("MatMul", ["X", "W_view"], ["Y"], name="linear"))
+    graph = helper.make_graph(nodes, "static_shape_transform_graph", [X], [Y], initializer=initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / f"{transform.lower()}-weight.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -2240,6 +2548,49 @@ class TestWeightDistributionCoverage:
         assert coverage_checks[0].details["coverage_gap"] == "missing_dependency"
         self._assert_uncached_inconclusive_exit2(model_path, tmp_path / "cache")
 
+    def test_standalone_missing_scipy_is_uncached_inconclusive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = create_onnx_model(tmp_path, tensor_shape=(2, 2), initializer_consumer="MatMul")
+        monkeypatch.setitem(sys.modules, "scipy", None)
+
+        direct = WeightDistributionScanner().scan(str(model_path))
+
+        assert direct.success is False
+        assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "weight_distribution_analysis_incomplete" in direct.metadata["scan_outcome_reasons"]
+        reset_cache_manager()
+        cache_dir = tmp_path / "standalone-cache"
+        try:
+            first = scan_model_directory_or_file(
+                str(model_path),
+                recursive=False,
+                scanners=["weight_distribution"],
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            second = scan_model_directory_or_file(
+                str(model_path),
+                recursive=False,
+                scanners=["weight_distribution"],
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            metadata = second.file_metadata[str(model_path)]
+            assert first.success is False
+            assert second.success is False
+            assert determine_exit_code(first) == 2
+            assert determine_exit_code(second) == 2
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
     def test_external_weight_distribution_tensors_are_inconclusive(self, tmp_path: Path) -> None:
         model_path = create_onnx_model(
             tmp_path,
@@ -2287,6 +2638,38 @@ class TestWeightDistributionCoverage:
         assert coverage_checks[0].details["analyzed_initializers"] == 0
         self._assert_uncached_inconclusive_exit2(model_path, tmp_path / "cache", max_array_size=1)
 
+    def test_inline_storage_is_bounded_before_materialization(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        tensor = onnx.TensorProto()
+        tensor.name = "W"
+        tensor.data_type = TensorProto.FLOAT
+        tensor.dims.extend([1, 1])
+        tensor.float_data.extend([1.0] * 100)
+        X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1])
+        Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])
+        node = helper.make_node("MatMul", ["X", "W"], ["Y"])
+        model = helper.make_model(helper.make_graph([node], "oversized_inline", [X], [Y], initializer=[tensor]))
+        model_path = tmp_path / "oversized-inline.onnx"
+        onnx.save(model, str(model_path))
+        original_to_array = onnx.numpy_helper.to_array
+
+        def guarded_to_array(initializer: Any, *args: Any, **kwargs: Any) -> Any:
+            if initializer.name == "W":
+                raise AssertionError("oversized inline tensor must not be materialized")
+            return original_to_array(initializer, *args, **kwargs)
+
+        monkeypatch.setattr(onnx.numpy_helper, "to_array", guarded_to_array)
+        result = OnnxScanner({"max_array_size": 8}).scan(str(model_path))
+
+        coverage = self._coverage_checks(result)
+        assert result.success is False
+        assert len(coverage) == 1
+        assert coverage[0].details["oversized_initializers_skipped"] == 1
+        assert coverage[0].details["extraction_failures"] == 0
+
 
 class TestWeightDistributionSemantics:
     """Regression tests for ONNX initializer semantics and output axes."""
@@ -2318,7 +2701,6 @@ class TestWeightDistributionSemantics:
     @pytest.mark.parametrize(
         ("op_type", "weights", "expected_reason"),
         [
-            ("Gather", np.zeros((2, 384), dtype=np.float32), "embedding_table"),
             ("MatMulInteger", np.full((128, 1), 127, dtype=np.int8), "quantized_operator"),
             ("Mul", np.zeros((288, 1), dtype=np.float32), "bookkeeping_constant"),
             ("Add", np.zeros((288, 1), dtype=np.float32), "bookkeeping_constant"),
@@ -2341,6 +2723,31 @@ class TestWeightDistributionSemantics:
         assert semantics["analyzed_layer_count"] == 0
         assert semantics["exclusion_counts"][expected_reason] == 1
         assert semantics["exclusion_samples"][0]["initializer"] == "W"
+
+    def test_gather_embedding_rows_use_the_token_axis(self, tmp_path: Path) -> None:
+        weights = np.zeros((100, 100), dtype=np.float32)
+        weights[3, 50:55] = 10.0
+        model_path = create_onnx_weight_model(tmp_path, weights, op_type="Gather")
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = self._extreme_checks(result)
+        assert len(checks) == 1
+        assert checks[0].details["output_axis"] == 0
+        assert checks[0].details["analysis_shape"] == [100, 100]
+        assert checks[0].details["affected_neurons"] == [3]
+
+    def test_clean_gather_embedding_table_stays_clean(self, tmp_path: Path) -> None:
+        weights = np.random.default_rng(20260610).normal(0.0, 0.02, size=(100, 100)).astype(np.float32)
+        model_path = create_onnx_weight_model(tmp_path, weights, op_type="Gather")
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_layer_count"] == 1
 
     @pytest.mark.parametrize(("op_type", "trans_b"), [("MatMul", False), ("Gemm", False), ("Gemm", True)])
     def test_malicious_repeated_extreme_weights_remain_detected(
@@ -2372,7 +2779,7 @@ class TestWeightDistributionSemantics:
         assert details["affected_neurons"] == [3]
         assert details["num_extreme_weights"] == 5
         assert details["max_extreme_weights_per_output"] == 5
-        assert details["max_to_threshold_ratio"] >= 2.0
+        assert details["max_to_threshold_ratio"] > 1.0
 
     @pytest.mark.parametrize("op_type", ["Gemm", "MatMul"])
     def test_left_input_equivalent_graph_is_analyzed(self, tmp_path: Path, op_type: str) -> None:
@@ -2516,12 +2923,167 @@ class TestWeightDistributionSemantics:
 
         assert self._extreme_checks(result) == []
         semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["eligible_initializer_count"] == 0
-        assert semantics["analyzed_layer_count"] == 0
+        assert semantics["eligible_initializer_count"] == 2
+        assert semantics["analyzed_layer_count"] == 2
+        assert {context["initializer_graph_index"] for context in semantics["eligible"]} == {1, 2}
         assert semantics["exclusion_counts"]["unused_initializer"] == 1
 
-    @pytest.mark.parametrize("transform", ["Identity", "Transpose", "Reshape"])
-    def test_supported_initializer_lineage_reaches_matmul(self, tmp_path: Path, transform: str) -> None:
+    def test_subgraph_local_malicious_weights_are_analyzed(self, tmp_path: Path) -> None:
+        outer_weights = np.zeros((100, 100), dtype=np.float32)
+        local_weights = np.zeros_like(outer_weights)
+        local_weights[50:55, 3] = 10.0
+        model_path = create_control_flow_shadowed_weight_model(
+            tmp_path,
+            outer_weights,
+            local_weights=local_weights,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = self._extreme_checks(result)
+        assert len(checks) == 2
+        assert {check.details["initializer_graph_index"] for check in checks} == {1, 2}
+        assert all(check.details["affected_neurons"] == [3] for check in checks)
+
+    @pytest.mark.parametrize(
+        "model_factory",
+        [create_control_flow_returned_weight_model, create_loop_carried_weight_model],
+    )
+    def test_weight_lineage_crosses_control_flow_boundaries(
+        self,
+        tmp_path: Path,
+        model_factory: Any,
+    ) -> None:
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+        model_path = model_factory(tmp_path, weights)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = self._extreme_checks(result)
+        assert len(checks) == 1
+        assert checks[0].details["affected_neurons"] == [3]
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_dynamic_activation_paths_do_not_propagate_bookkeeping_lineage(
+        self,
+        tmp_path: Path,
+        malicious: bool,
+    ) -> None:
+        model_path = create_activation_bookkeeping_model(tmp_path, malicious=malicious)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        assert len(self._extreme_checks(result)) == int(malicious)
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["exclusion_counts"]["bookkeeping_constant"] == 1
+
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_standard_einsum_weights_are_oriented_and_analyzed(self, tmp_path: Path, malicious: bool) -> None:
+        weights = np.zeros((100, 10), dtype=np.float32)
+        if malicious:
+            weights[50:55, 3] = 10.0
+        model_path = create_einsum_weight_model(tmp_path, weights)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        checks = self._extreme_checks(result)
+        assert len(checks) == int(malicious)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible"][0]["consumer_op"] == "Einsum"
+        assert semantics["eligible"][0]["output_axes"] == [1]
+
+    def test_qdq_weight_path_remains_a_clean_quantized_exclusion(self, tmp_path: Path) -> None:
+        model_path = create_qdq_weight_model(tmp_path)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 0
+        assert semantics["exclusion_counts"]["quantized_operator"] == 3
+
+    def test_sparse_weight_lineage_fails_closed(self, tmp_path: Path) -> None:
+        model_path = create_sparse_weight_model(tmp_path)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        assert coverage[0].details["coverage_gap"] == "unresolved_initializer_lineage"
+        assert coverage[0].details["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == "sparse_initializer_unsupported"
+
+    @pytest.mark.parametrize(
+        "model_factory",
+        [
+            create_constant_weight_model,
+            create_local_function_weight_model,
+            create_local_function_default_weight_model,
+        ],
+    )
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_static_and_function_weight_roots_are_analyzed(
+        self,
+        tmp_path: Path,
+        model_factory: Any,
+        malicious: bool,
+    ) -> None:
+        weights = np.zeros((100, 10), dtype=np.float32)
+        if malicious:
+            weights[50:55, 3] = 10.0
+        model_path = model_factory(tmp_path, weights)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        checks = self._extreme_checks(result)
+        assert len(checks) == int(malicious)
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        assert result.metadata["onnx_weight_distribution_semantics"]["analyzed_layer_count"] == 1
+
+    @pytest.mark.parametrize("transform", ["Flatten", "ReshapeValueInts", "Squeeze", "Unsqueeze"])
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_static_shape_weight_transforms_preserve_detection_without_clean_noise(
+        self,
+        tmp_path: Path,
+        transform: str,
+        malicious: bool,
+    ) -> None:
+        weights = np.zeros((100, 10), dtype=np.float32)
+        if malicious:
+            weights[50:55, 3] = 10.0
+        model_path = create_static_shape_transform_weight_model(tmp_path, weights, transform=transform)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        assert len(self._extreme_checks(result)) == int(malicious)
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+
+    @pytest.mark.parametrize(
+        ("transform", "expected_lineage"),
+        [
+            ("Identity", []),
+            ("Cast", []),
+            ("Transpose", ["Transpose"]),
+            ("Reshape", ["Reshape"]),
+        ],
+    )
+    def test_supported_initializer_lineage_reaches_matmul(
+        self,
+        tmp_path: Path,
+        transform: str,
+        expected_lineage: list[str],
+    ) -> None:
         weights = np.zeros((100, 10), dtype=np.float32)
         weights[50:55, 3] = 10.0
         model_path = create_transformed_onnx_weight_model(tmp_path, weights, transform=transform)
@@ -2531,11 +3093,11 @@ class TestWeightDistributionSemantics:
         checks = self._extreme_checks(result)
         assert len(checks) == 1
         assert checks[0].details["affected_neurons"] == [3]
-        assert checks[0].details["lineage"] == [transform]
-        assert checks[0].details["lineage_transform_count"] == 1
+        assert checks[0].details["lineage"] == expected_lineage
+        assert checks[0].details["lineage_transform_count"] == len(expected_lineage)
         assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
 
-    @pytest.mark.parametrize("transform", ["Cast", "ReshapeDynamic"])
+    @pytest.mark.parametrize("transform", ["ReshapeDynamic"])
     def test_unsupported_initializer_lineage_fails_closed(self, tmp_path: Path, transform: str) -> None:
         weights = np.zeros((100, 10), dtype=np.float32)
         weights[50:55, 3] = 10.0
@@ -2647,20 +3209,25 @@ class TestWeightDistributionSemantics:
         assert standalone_checks[0].details["analysis_shape"] == integrated_check.details["analysis_shape"] == [100, 10]
         assert standalone_checks[0].details["affected_neurons"] == integrated_check.details["affected_neurons"] == [3]
 
-    def test_standalone_onnx_scanner_matches_semantic_exclusions(self, tmp_path: Path) -> None:
-        weights = np.zeros((100, 10), dtype=np.float32)
-        weights[50:55, 3] = 10.0
+    def test_standalone_onnx_scanner_matches_gather_orientation(self, tmp_path: Path) -> None:
+        weights = np.zeros((100, 100), dtype=np.float32)
+        weights[3, 50:55] = 10.0
         model_path = create_onnx_weight_model(tmp_path, weights, op_type="Gather")
 
         standalone = WeightDistributionScanner().scan(str(model_path))
 
-        assert not any(
-            check.name == "Weight Distribution Anomaly Detection" and "extremely large weight values" in check.message
+        checks = [
+            check
             for check in standalone.checks
-        )
+            if check.name == "Weight Distribution Anomaly Detection"
+            and "extremely large weight values" in check.message
+        ]
+        assert len(checks) == 1
+        assert checks[0].details["output_axis"] == 0
+        assert checks[0].details["affected_neurons"] == [3]
         semantics = standalone.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["eligible_initializer_count"] == 0
-        assert semantics["exclusion_counts"] == {"embedding_table": 1}
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_layer_count"] == 1
 
 
 class TestRawDetectorCoverage:
