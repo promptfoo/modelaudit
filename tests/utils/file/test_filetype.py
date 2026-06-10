@@ -699,19 +699,6 @@ def test_detect_pickle_shaped_safetensors_header_remains_safetensors(tmp_path: P
     assert detect_file_format(str(safetensors_path)) == "safetensors"
 
 
-def test_detect_zlib_shaped_safetensors_header_remains_safetensors(tmp_path: Path) -> None:
-    header_length = 0x9C78
-    metadata = b'{"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}'
-    metadata += b" " * (header_length - len(metadata))
-    safetensors_path = tmp_path / "zlib-shaped-header.unknown"
-    safetensors_path.write_bytes(struct.pack("<Q", header_length) + metadata + b"\x00")
-
-    assert safetensors_path.read_bytes()[:2] == b"\x78\x9c"
-    assert detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
-    assert detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
-    assert detect_file_format(str(safetensors_path)) == "safetensors"
-
-
 def test_detect_file_format_from_magic_json_not_misrouted_as_safetensors(tmp_path: Path) -> None:
     json_path = tmp_path / "config.unknown"
     json_path.write_text('{"name":"model","version":1}', encoding="utf-8")

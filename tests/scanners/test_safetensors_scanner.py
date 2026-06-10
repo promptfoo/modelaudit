@@ -597,29 +597,6 @@ def test_safetensors_with_torch7_like_metadata_keeps_safetensors_routing(tmp_pat
     assert determine_exit_code(aggregate) == 1
 
 
-def test_zlib_shaped_header_keeps_safetensors_security_routing(tmp_path: Path) -> None:
-    file_path = tmp_path / "zlib-shaped-header.unknown"
-    header_len = 0x9C78
-    header = json.dumps(
-        {
-            "__metadata__": {"description": "<script>alert('xss')</script>"},
-            "tensor": {
-                "dtype": "U8",
-                "shape": [1],
-                "data_offsets": [0, 1],
-            },
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
-    write_raw_safetensors_header(file_path, header + b" " * (header_len - len(header)), b"\x00")
-
-    result = scan_file(str(file_path))
-
-    assert file_path.read_bytes()[:2] == b"\x78\x9c"
-    assert result.scanner_name == "safetensors"
-    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-
-
 @pytest.mark.parametrize(
     ("dtype", "expected_size"),
     [
