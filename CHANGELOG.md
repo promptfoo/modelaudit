@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - accept current SafeTensors FP8, sub-byte float, and complex tensors
+- reject corpus-QA lock identifiers and paths that escape download, member, or tool-output roots
 - assign ONNX custom operator domains to the dedicated S1111 framework rule instead of the HTTP-client S302 rule
 - emit Hugging Face whitelist model IDs and organization summaries as safe generated Python
 - preserve bounded and fail-closed SafeTensors routing when header lengths resemble compression magic
