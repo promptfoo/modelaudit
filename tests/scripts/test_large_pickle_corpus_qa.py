@@ -170,6 +170,95 @@ def test_download_entry_rejects_unsafe_lock_paths_before_writing(
     assert not corpus_root.exists()
 
 
+def test_download_validates_unsafe_entry_before_budget_skip(tmp_path: Path) -> None:
+    corpus_root = tmp_path / "corpus"
+    lock_path = tmp_path / "lock.json"
+    large_pickle_corpus_qa._write_lock(
+        lock_path,
+        [
+            {
+                "id": "../escaped",
+                "repo_id": "trusted/model",
+                "path": "model.pkl",
+                "revision": "main",
+                "remote_size_bytes": 1,
+            }
+        ],
+        tier="custom",
+    )
+
+    exit_code = large_pickle_corpus_qa.main(
+        [
+            "download",
+            "--lock",
+            str(lock_path),
+            "--corpus-root",
+            str(corpus_root),
+            "--budget-gb",
+            "0",
+            "--direct-only",
+        ]
+    )
+
+    entry = json.loads(lock_path.read_text(encoding="utf-8"))["entries"][0]
+    assert exit_code == 1
+    assert entry["download_status"] == "error"
+    assert entry["download_error"] == "ValueError: unsafe corpus artifact id: '../escaped'"
+    assert not corpus_root.exists()
+
+
+def test_download_keeps_safe_selected_over_budget_entry_skipped(tmp_path: Path) -> None:
+    corpus_root = tmp_path / "corpus"
+    lock_path = tmp_path / "lock.json"
+    large_pickle_corpus_qa._write_lock(
+        lock_path,
+        [
+            {
+                "id": "A01",
+                "repo_id": "trusted/model",
+                "path": "checkpoint-2148/pytorch_model.bin",
+                "revision": "main",
+                "remote_size_bytes": 1,
+                "download_status": "error",
+                "download_error": "stale selected error",
+            },
+            {
+                "id": "A02",
+                "repo_id": "trusted/other-model",
+                "path": "model.pkl",
+                "revision": "main",
+                "remote_size_bytes": 1,
+                "download_status": "error",
+                "download_error": "unselected prior error",
+            },
+        ],
+        tier="custom",
+    )
+
+    exit_code = large_pickle_corpus_qa.main(
+        [
+            "download",
+            "--lock",
+            str(lock_path),
+            "--corpus-root",
+            str(corpus_root),
+            "--budget-gb",
+            "0",
+            "--direct-only",
+            "--ids",
+            "A01",
+        ]
+    )
+
+    selected, unselected = json.loads(lock_path.read_text(encoding="utf-8"))["entries"]
+    assert exit_code == 0
+    assert selected["download_status"] == "skipped_budget"
+    assert "download_error" not in selected
+    assert unselected["download_status"] == "error"
+    assert unselected["download_error"] == "unselected prior error"
+    assert not corpus_root.exists()
+
+
 def test_download_entry_keeps_safe_nested_path_inside_artifact_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

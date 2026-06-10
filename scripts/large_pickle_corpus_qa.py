@@ -675,6 +675,10 @@ def _contained_output_path(root: Path, *parts: str | Path) -> Path:
     return candidate
 
 
+def _validated_lock_entry_path(entry: Mapping[str, Any]) -> tuple[str, Path]:
+    return _validated_artifact_id(entry["id"]), _validated_remote_path(entry["path"])
+
+
 def _entry_to_lock(entry: CorpusEntry, *, corpus_root: Path) -> dict[str, Any]:
     return {
         **asdict(entry),
@@ -811,8 +815,7 @@ def _download_entry(
     direct_fallback: bool,
     direct_only: bool,
 ) -> dict[str, Any]:
-    artifact_id = _validated_artifact_id(entry["id"])
-    relative_path = _validated_remote_path(entry["path"])
+    artifact_id, relative_path = _validated_lock_entry_path(entry)
 
     try:
         from huggingface_hub import hf_hub_download
@@ -1339,16 +1342,23 @@ def cmd_download(args: argparse.Namespace) -> int:
     downloaded_bytes = 0
     budget_bytes = int(float(args.budget_gb) * 1024 * 1024 * 1024) if args.budget_gb is not None else None
     updated = []
+    download_failed = False
     for entry in entries:
         if selected_ids is not None and str(entry.get("id")) not in selected_ids:
             updated.append(entry)
             continue
-        remote_size = entry.get("remote_size_bytes")
-        if budget_bytes is not None and isinstance(remote_size, int) and downloaded_bytes + remote_size > budget_bytes:
-            entry["download_status"] = "skipped_budget"
-            updated.append(entry)
-            continue
         try:
+            _validated_lock_entry_path(entry)
+            remote_size = entry.get("remote_size_bytes")
+            if (
+                budget_bytes is not None
+                and isinstance(remote_size, int)
+                and downloaded_bytes + remote_size > budget_bytes
+            ):
+                entry["download_status"] = "skipped_budget"
+                entry.pop("download_error", None)
+                updated.append(entry)
+                continue
             entry = _download_entry(
                 entry,
                 corpus_root=corpus_root,
@@ -1358,7 +1368,9 @@ def cmd_download(args: argparse.Namespace) -> int:
             )
             downloaded_bytes += int(entry.get("downloaded_size_bytes") or 0)
             entry["download_status"] = "ok"
+            entry.pop("download_error", None)
         except Exception as error:
+            download_failed = True
             entry["download_status"] = "error"
             entry["download_error"] = f"{type(error).__name__}: {error}"
         updated.append(entry)
@@ -1369,7 +1381,7 @@ def cmd_download(args: argparse.Namespace) -> int:
         extra=_lock_extra_metadata(lock_payload),
     )
     print(f"Updated {lock_path}; downloaded {downloaded_bytes} bytes")
-    return 1 if any(entry.get("download_status") == "error" for entry in updated) else 0
+    return 1 if download_failed else 0
 
 
 def cmd_classify(args: argparse.Namespace) -> int:
