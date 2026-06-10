@@ -76,6 +76,26 @@ def test_valid_safetensors_file(tmp_path: Path) -> None:
     assert header_limit_check.status.value == "passed"
 
 
+def test_valid_f8_e8m0_safetensors_file(tmp_path: Path) -> None:
+    file_path = tmp_path / "f8-e8m0.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {
+                "dtype": "F8_E8M0",
+                "shape": [4],
+                "data_offsets": [0, 4],
+            },
+        },
+        b"\x00" * 4,
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is True
+    assert not any("Invalid dtype" in issue.message for issue in result.issues)
+
+
 def test_valid_empty_safetensors_custom_metadata(tmp_path: Path) -> None:
     """An empty string-to-string map is valid custom metadata."""
     file_path = tmp_path / "empty_metadata.safetensors"
@@ -577,9 +597,41 @@ def test_safetensors_with_torch7_like_metadata_keeps_safetensors_routing(tmp_pat
     assert determine_exit_code(aggregate) == 1
 
 
+def test_zlib_shaped_header_keeps_safetensors_security_routing(tmp_path: Path) -> None:
+    file_path = tmp_path / "zlib-shaped-header.unknown"
+    header_len = 0x9C78
+    header = json.dumps(
+        {
+            "__metadata__": {"description": "<script>alert('xss')</script>"},
+            "tensor": {
+                "dtype": "U8",
+                "shape": [1],
+                "data_offsets": [0, 1],
+            },
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    write_raw_safetensors_header(file_path, header + b" " * (header_len - len(header)), b"\x00")
+
+    result = scan_file(str(file_path))
+
+    assert file_path.read_bytes()[:2] == b"\x78\x9c"
+    assert result.scanner_name == "safetensors"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
 @pytest.mark.parametrize(
     ("dtype", "expected_size"),
-    [("BOOL", 4), ("BF16", 8), ("F8_E4M3", 4), ("F8_E5M2", 4), ("F16", 8), ("F32", 16), ("F64", 32)],
+    [
+        ("BOOL", 4),
+        ("BF16", 8),
+        ("F8_E4M3", 4),
+        ("F8_E5M2", 4),
+        ("F8_E8M0", 4),
+        ("F16", 8),
+        ("F32", 16),
+        ("F64", 32),
+    ],
 )
 def test_tensor_size_check_runs_for_supported_dtypes(tmp_path: Path, dtype: str, expected_size: int) -> None:
     file_path = tmp_path / f"mismatch_{dtype}.safetensors"
