@@ -34,7 +34,10 @@ from tests.helpers.file_creators import (
     create_mock_mxnet_symbol,
     create_mock_onnx,
     create_v7_tar_archive,
+    malicious_pickle_bytes,
     prefix_mock_onnx_with_unknown_field,
+    valid_jpeg_bytes,
+    valid_png_bytes,
 )
 
 
@@ -185,6 +188,44 @@ class TestFileFilter:
 
         for file in skip_files:
             assert should_skip_file(file), f"Should skip {file}"
+
+    @pytest.mark.parametrize(
+        ("filename", "payload"),
+        [
+            ("preview.png", valid_png_bytes()),
+            ("preview.jpg", valid_jpeg_bytes()),
+            ("preview.jpeg", valid_jpeg_bytes()),
+        ],
+        ids=["png", "jpg", "jpeg"],
+    )
+    def test_valid_media_stays_skipped_by_default_prefilter(
+        self,
+        tmp_path: Path,
+        filename: str,
+        payload: bytes,
+    ) -> None:
+        media_path = tmp_path / filename
+        media_path.write_bytes(payload)
+
+        assert detect_file_format_for_skip_filter(str(media_path)) == "unknown"
+        assert should_skip_file(str(media_path)) is True
+
+    @pytest.mark.parametrize(
+        ("filename", "payload"),
+        [("polyglot.png", valid_png_bytes()), ("polyglot.jpg", valid_jpeg_bytes())],
+        ids=["png", "jpg"],
+    )
+    def test_media_pickle_polyglot_bypasses_default_prefilter(
+        self,
+        tmp_path: Path,
+        filename: str,
+        payload: bytes,
+    ) -> None:
+        media_path = tmp_path / filename
+        media_path.write_bytes(payload + malicious_pickle_bytes())
+
+        assert detect_file_format_for_skip_filter(str(media_path)) == "pickle"
+        assert should_skip_file(str(media_path)) is False
 
     def test_allow_model_extensions(self):
         """Test that model extensions are not skipped."""

@@ -284,6 +284,13 @@ _FLAX_MSGPACK_PROBE_LENGTH_SIZES = {
     0xDA: (2, 0),
     0xDB: (4, 0),
 }
+VALID_MEDIA_ROUTING_FORMAT = "valid_media"
+MEDIA_ROUTE_READ_BYTES = FLAX_MSGPACK_STRUCTURE_READ_BYTES
+_MEDIA_ROUTING_SUFFIXES = frozenset({".jpeg", ".jpg", ".png"})
+_MEDIA_TRAILING_PADDING = b"\x00\t\n\r "
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_IEND_CHUNK = b"IEND"
+_JPEG_STANDALONE_MARKERS = frozenset((0x01, 0xD8, 0xD9, *range(0xD0, 0xD8)))
 MXNET_SYMBOL_SIGNATURE_READ_BYTES = 10 * 1024 * 1024
 MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT = "mxnet_symbol_routing_inconclusive"
 _UTF8_BOM = b"\xef\xbb\xbf"
@@ -5362,6 +5369,146 @@ def _preserve_inconclusive_protobuf_model_routing(file_path: Path, file_size: in
     ) and not _is_complete_bounded_printable_text(file_path, file_size)
 
 
+def _detect_media_pickle_polyglot_route(trailing: bytes, *, sample_is_prefix: bool) -> str | None:
+    """Return a pickle route only for strong serialized bytes after valid media."""
+    candidate = trailing.lstrip(_MEDIA_TRAILING_PADDING)
+    if not candidate:
+        return None
+    if _looks_like_binary_pickle_protocol(candidate[:4]):
+        if _has_bounded_binary_pickle_security_signal(candidate):
+            return "pickle"
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT if sample_is_prefix else None
+    protocol_less_state = _classify_protocolless_binary_pickle_security_signal(
+        candidate,
+        sample_is_prefix=sample_is_prefix,
+    )
+    if protocol_less_state is True:
+        return "pickle"
+    if protocol_less_state is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    if _looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=sample_is_prefix):
+        return "pickle"
+    return None
+
+
+def _find_bounded_png_end(sample: bytes) -> int | None:
+    """Return the first byte after a complete bounded PNG stream."""
+    if not sample.startswith(_PNG_SIGNATURE):
+        return None
+
+    offset = len(_PNG_SIGNATURE)
+    saw_ihdr = False
+    while offset + 12 <= len(sample):
+        chunk_length = int.from_bytes(sample[offset : offset + 4], "big")
+        chunk_type = sample[offset + 4 : offset + 8]
+        chunk_end = offset + 12 + chunk_length
+        if chunk_end > len(sample):
+            return None
+        if not saw_ihdr:
+            if chunk_type != b"IHDR" or chunk_length != 13:
+                return None
+            saw_ihdr = True
+        elif chunk_type == b"IHDR":
+            return None
+        if chunk_type == _PNG_IEND_CHUNK:
+            return chunk_end if chunk_length == 0 else None
+        offset = chunk_end
+    return None
+
+
+def _find_bounded_jpeg_end(sample: bytes) -> int | None:
+    """Return the first byte after a complete bounded JPEG stream."""
+    if not sample.startswith(b"\xff\xd8"):
+        return None
+
+    offset = 2
+    while offset < len(sample):
+        if sample[offset] != 0xFF:
+            return None
+        while offset < len(sample) and sample[offset] == 0xFF:
+            offset += 1
+        if offset >= len(sample):
+            return None
+        marker = sample[offset]
+        offset += 1
+        if marker == 0x00:
+            return None
+        if marker == 0xD9:
+            return offset
+        if marker in _JPEG_STANDALONE_MARKERS:
+            continue
+        if offset + 2 > len(sample):
+            return None
+        segment_length = int.from_bytes(sample[offset : offset + 2], "big")
+        if segment_length < 2:
+            return None
+        segment_end = offset + segment_length
+        if segment_end > len(sample):
+            return None
+        if marker != 0xDA:
+            offset = segment_end
+            continue
+
+        offset = segment_end
+        while offset < len(sample):
+            marker_offset = sample.find(b"\xff", offset)
+            if marker_offset < 0 or marker_offset + 1 >= len(sample):
+                return None
+            marker = sample[marker_offset + 1]
+            if marker == 0x00 or 0xD0 <= marker <= 0xD7:
+                offset = marker_offset + 2
+                continue
+            if marker == 0xD9:
+                return marker_offset + 2
+            if marker == 0xFF:
+                offset = marker_offset + 1
+                continue
+            offset = marker_offset
+            break
+    return None
+
+
+def _detect_bounded_media_route_from_sample(
+    file_path: Path,
+    sample: bytes,
+    *,
+    sample_is_prefix: bool,
+) -> str | None:
+    """Return clean-media or strong media/pickle polyglot routing evidence."""
+    ext = file_path.suffix.lower()
+    if ext not in _MEDIA_ROUTING_SUFFIXES:
+        return None
+    if sample.startswith(_PNG_SIGNATURE):
+        media_end = _find_bounded_png_end(sample)
+    elif sample.startswith(b"\xff\xd8"):
+        media_end = _find_bounded_jpeg_end(sample)
+    else:
+        return None
+    if media_end is None:
+        return None
+    pickle_route = _detect_media_pickle_polyglot_route(sample[media_end:], sample_is_prefix=sample_is_prefix)
+    if pickle_route is not None:
+        return pickle_route
+    if sample_is_prefix:
+        return None
+    return VALID_MEDIA_ROUTING_FORMAT
+
+
+def _detect_bounded_media_route(file_path: Path, file_size: int) -> str | None:
+    """Inspect a bounded complete media sample before serialized fallback routing."""
+    if file_path.suffix.lower() not in _MEDIA_ROUTING_SUFFIXES:
+        return None
+    try:
+        sample = read_magic_bytes(str(file_path), min(file_size, MEDIA_ROUTE_READ_BYTES + 1))
+    except OSError:
+        return None
+    return _detect_bounded_media_route_from_sample(
+        file_path,
+        sample,
+        sample_is_prefix=file_size > len(sample),
+    )
+
+
 def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
     """Route declared Flax formats and renamed candidates without claiming overlaps."""
     ext = file_path.suffix.lower()
@@ -5370,6 +5517,8 @@ def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
     try:
         size = file_path.stat().st_size
     except OSError:
+        return False
+    if _detect_bounded_media_route(file_path, size) is not None:
         return False
     if ext not in _FLAX_MSGPACK_SCANNER_SUFFIXES:
         json_document_probe = _probe_complete_structured_json_document(file_path, size)
@@ -5551,6 +5700,12 @@ def detect_format_from_magic_bytes(
         return safetensors_route
     if structural_torch7_route:
         return "torch7"
+    if file_path is not None:
+        media_route = _detect_bounded_media_route(file_path, file_size)
+        if media_route == VALID_MEDIA_ROUTING_FORMAT:
+            return "unknown"
+        if media_route is not None:
+            return media_route
     if _looks_like_binary_pickle_protocol(magic4) and (
         file_path is None or not _could_be_content_routed_flax_msgpack(file_path)
     ):
@@ -5715,6 +5870,12 @@ def detect_file_format_from_magic(path: str) -> str:
                     return tar_route
             if format_result != "unknown":
                 return format_result
+
+            media_route = _detect_bounded_media_route(file_path, size)
+            if media_route == VALID_MEDIA_ROUTING_FORMAT:
+                return "unknown"
+            if media_route is not None:
+                return media_route
 
             # Protocol 0/1 pickle payloads can evade short magic-byte checks.
             # Probe a bounded prefix and require a valid opcode stream.
@@ -5890,6 +6051,12 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if format_result != "unknown":
             return format_result
 
+        media_route = _detect_bounded_media_route(file_path, size)
+        if media_route == VALID_MEDIA_ROUTING_FORMAT:
+            return "unknown"
+        if media_route is not None:
+            return media_route
+
         if _could_start_proto0_or_1_pickle(prefix):
             max_probe_size = min(size, PROTO0_1_MAX_PROBE_BYTES)
             if len(prefix) < max_probe_size:
@@ -6047,6 +6214,11 @@ def detect_file_format(path: str) -> str:
             return safetensors_route
         if structural_torch7_route:
             return "torch7"
+        media_route = _detect_bounded_media_route(file_path, size)
+        if media_route == VALID_MEDIA_ROUTING_FORMAT:
+            return "unknown"
+        if media_route is not None:
+            return media_route
         could_be_flax = _could_be_content_routed_flax_msgpack(file_path)
         if _looks_like_binary_pickle_protocol(magic4) and not could_be_flax:
             return "pickle"

@@ -74,6 +74,7 @@ from tests.helpers import (
     prefix_mock_onnx_with_unknown_field,
     prefix_mock_onnx_with_unknown_group,
 )
+from tests.helpers.file_creators import valid_jpeg_bytes, valid_png_bytes
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
 
@@ -336,6 +337,43 @@ def _write_gzip_safetensors_polyglot(
     assert json.loads(payload[8:header_end].decode("utf-8"))
     assert gzip.decompress(gzip_member) == uncompressed
     path.write_bytes(payload)
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [("preview.png", valid_png_bytes()), ("preview.jpg", valid_jpeg_bytes())],
+    ids=["png", "jpg"],
+)
+def test_scan_file_valid_media_is_unknown_not_serialized(tmp_path: Path, filename: str, payload: bytes) -> None:
+    media_path = tmp_path / filename
+    media_path.write_bytes(payload)
+
+    result = scan_file(str(media_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.issues == []
+
+
+def test_directory_scan_skips_valid_media_assets(tmp_path: Path) -> None:
+    (tmp_path / "preview.png").write_bytes(valid_png_bytes())
+    (tmp_path / "teaser.jpg").write_bytes(valid_jpeg_bytes())
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    assert result.files_scanned == 0
+    assert "pickle" not in result.scanner_names
+    assert "flax_msgpack" not in result.scanner_names
+    assert "jax_checkpoint" not in result.scanner_names
+
+
+def test_scan_file_media_pickle_polyglot_detects_system_global(tmp_path: Path) -> None:
+    media_path = tmp_path / "polyglot.png"
+    media_path.write_bytes(valid_png_bytes() + _build_malicious_pickle())
+
+    result = scan_file(str(media_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
 
 
 def _require_tf_protos() -> None:

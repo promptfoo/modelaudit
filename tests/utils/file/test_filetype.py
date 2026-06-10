@@ -47,7 +47,14 @@ from tests.helpers import (
     prefix_mock_onnx_with_unknown_field,
     prefix_mock_onnx_with_unknown_group,
 )
-from tests.helpers.file_creators import _coreml_field_bytes, _coreml_field_varint, create_v7_tar_archive
+from tests.helpers.file_creators import (
+    _coreml_field_bytes,
+    _coreml_field_varint,
+    create_v7_tar_archive,
+    malicious_pickle_bytes,
+    valid_jpeg_bytes,
+    valid_png_bytes,
+)
 
 
 def _ubjson_key(key: bytes) -> bytes:
@@ -216,6 +223,38 @@ def test_detect_file_format_large_directory(tmp_path):
         (tf_dir / f"file_{i}.txt").write_text("x")
 
     assert detect_file_format(str(tf_dir)) == "tensorflow_directory"
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [
+        ("preview.png", valid_png_bytes()),
+        ("preview.jpg", valid_jpeg_bytes()),
+        ("preview.jpeg", valid_jpeg_bytes()),
+    ],
+    ids=["png", "jpg", "jpeg"],
+)
+def test_valid_media_do_not_route_to_serialized_formats(tmp_path: Path, filename: str, payload: bytes) -> None:
+    media_path = tmp_path / filename
+    media_path.write_bytes(payload)
+
+    assert detect_file_format(str(media_path)) == "unknown"
+    assert detect_file_format_from_magic(str(media_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(media_path)) == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [("polyglot.png", valid_png_bytes()), ("polyglot.jpg", valid_jpeg_bytes())],
+    ids=["png", "jpg"],
+)
+def test_media_pickle_polyglot_keeps_pickle_route(tmp_path: Path, filename: str, payload: bytes) -> None:
+    media_path = tmp_path / filename
+    media_path.write_bytes(payload + malicious_pickle_bytes())
+
+    assert detect_file_format(str(media_path)) == "pickle"
+    assert detect_file_format_from_magic(str(media_path)) == "pickle"
+    assert detect_file_format_for_skip_filter(str(media_path)) == "pickle"
 
 
 def test_detect_file_format_zip(tmp_path):
