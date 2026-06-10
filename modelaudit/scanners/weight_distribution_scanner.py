@@ -25,6 +25,8 @@ _MAX_RESTRICTED_PICKLE_OPCODES = 500_000
 _MAX_RESTRICTED_PICKLE_MEMO_ENTRIES = 100_000
 _MAX_NUMERIC_SCALAR_BYTES = 16
 _MIN_NUMPY_ARRAY_BUDGET_BYTES = 256
+_EXTREME_WEIGHT_MIN_EFFECT_RATIO = 2.0
+_EXTREME_WEIGHT_MIN_PER_OUTPUT = 2
 _PICKLE_OBJECT_OPCODES = frozenset(
     {
         "BINBYTES",
@@ -1909,9 +1911,20 @@ class WeightDistributionScanner(BaseScanner):
         extreme_weights = np.where(weight_magnitudes > threshold)
         if len(extreme_weights[0]) > 0:
             # Group by output neuron
-            neurons_with_extreme_weights = np.unique(extreme_weights[1])
-            # Only flag if very few neurons affected (< 0.1% or max 5)
-            if len(neurons_with_extreme_weights) <= max(5, int(0.001 * n_outputs)):
+            neurons_with_extreme_weights, per_output_counts = np.unique(extreme_weights[1], return_counts=True)
+            max_affected_outputs = max(1, int(0.001 * n_outputs))
+            max_extreme_per_output = int(np.max(per_output_counts))
+            max_weight = float(np.max(weight_magnitudes[extreme_weights]))
+            effect_ratio = max_weight / float(threshold) if threshold > 0 else 0.0
+
+            # Ordinary distribution tails often produce one barely-over-threshold
+            # coefficient in several columns. Require a repeated, materially large
+            # effect localized to a genuinely small output subset.
+            if (
+                len(neurons_with_extreme_weights) <= max_affected_outputs
+                and max_extreme_per_output >= _EXTREME_WEIGHT_MIN_PER_OUTPUT
+                and effect_ratio >= _EXTREME_WEIGHT_MIN_EFFECT_RATIO
+            ):
                 anomalies.append(
                     {
                         "description": f"Layer '{layer_name}' has neurons with extremely large weight values",
@@ -1922,7 +1935,12 @@ class WeightDistributionScanner(BaseScanner):
                             "total_affected": len(neurons_with_extreme_weights),
                             "num_extreme_weights": len(extreme_weights[0]),
                             "threshold": float(threshold),
-                            "max_weight": float(np.max(weight_magnitudes)),
+                            "max_weight": max_weight,
+                            "max_to_threshold_ratio": effect_ratio,
+                            "max_extreme_weights_per_output": max_extreme_per_output,
+                            "affected_output_limit": max_affected_outputs,
+                            "minimum_effect_ratio": _EXTREME_WEIGHT_MIN_EFFECT_RATIO,
+                            "minimum_extreme_weights_per_output": _EXTREME_WEIGHT_MIN_PER_OUTPUT,
                             "total_outputs": n_outputs,
                             "analysis_method": "structural_analysis",
                         },

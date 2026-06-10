@@ -8,6 +8,7 @@ import pytest
 # Skip if onnx is not available before importing it
 pytest.importorskip("onnx")
 
+import numpy as np
 import onnx
 from onnx import TensorProto, helper
 from onnx.onnx_ml_pb2 import StringStringEntryProto
@@ -51,20 +52,22 @@ def create_onnx_model(
     missing_external: bool = False,
     tensor_shape: tuple[int, ...] = (1,),
     include_initializer: bool = True,
+    initializer_consumer: str | None = None,
 ) -> Path:
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, list(tensor_shape) or [1])
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, list(tensor_shape) or [1])
-    node = (
-        helper.make_node(
+    if initializer_consumer is not None:
+        node = helper.make_node(initializer_consumer, ["input", "W"], ["output"], name="weighted")
+    elif custom:
+        node = helper.make_node(
             custom_op_type,
             ["input"],
             ["output"],
             domain=custom_domain,
             name="custom",
         )
-        if custom
-        else helper.make_node("Relu", ["input"], ["output"], name="relu")
-    )
+    else:
+        node = helper.make_node("Relu", ["input"], ["output"], name="relu")
 
     initializers: list[Any] = []
     if include_initializer and external:
@@ -98,6 +101,49 @@ def create_onnx_model(
     graph = helper.make_graph([node], "graph", [X], [Y], initializer=initializers)
     model = helper.make_model(graph)
     path = tmp_path / "model.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_onnx_weight_model(
+    tmp_path: Path,
+    weights: np.ndarray,
+    *,
+    op_type: str,
+    trans_b: bool = False,
+    filename: str = "weighted.onnx",
+) -> Path:
+    """Create a small valid ONNX graph with the supplied initializer consumer."""
+    weight_tensor = onnx.numpy_helper.from_array(weights, name="W")
+    if op_type == "Gemm":
+        input_features = weights.shape[1] if trans_b else weights.shape[0]
+        output_features = weights.shape[0] if trans_b else weights.shape[1]
+        X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, input_features])
+        Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, output_features])
+        node = helper.make_node("Gemm", ["input", "W"], ["output"], name="linear", transB=int(trans_b))
+    elif op_type == "MatMul":
+        X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, weights.shape[0]])
+        Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, weights.shape[1]])
+        node = helper.make_node("MatMul", ["input", "W"], ["output"], name="linear")
+    elif op_type == "Gather":
+        X = helper.make_tensor_value_info("input", TensorProto.INT64, [1])
+        Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, weights.shape[1]])
+        node = helper.make_node("Gather", ["W", "input"], ["output"], name="embedding")
+    elif op_type == "MatMulInteger":
+        X = helper.make_tensor_value_info("input", TensorProto.INT8, [1, weights.shape[0]])
+        Y = helper.make_tensor_value_info("output", TensorProto.INT32, [1, weights.shape[1]])
+        node = helper.make_node("MatMulInteger", ["input", "W"], ["output"], name="quantized_linear")
+    elif op_type in {"Add", "Mul"}:
+        X = helper.make_tensor_value_info("input", TensorProto.FLOAT, list(weights.shape))
+        Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, list(weights.shape))
+        node = helper.make_node(op_type, ["input", "W"], ["output"], name="bookkeeping")
+    else:  # pragma: no cover - test helper guard
+        raise AssertionError(f"unsupported test operator: {op_type}")
+
+    graph = helper.make_graph([node], "weighted_graph", [X], [Y], initializer=[weight_tensor])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / filename
     onnx.save(model, str(path))
     return path
 
@@ -1789,12 +1835,29 @@ class TestWeightDistributionCoverage:
         assert "scan_outcome" not in result.metadata
         assert self._coverage_checks(result) == []
 
-    def test_missing_weight_distribution_dependency_is_inconclusive(
+    def test_missing_weight_distribution_dependency_ignores_unused_2d_initializers(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         model_path = create_onnx_model(tmp_path, tensor_shape=(2, 2))
+        monkeypatch.setitem(sys.modules, "scipy", None)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert result.metadata["onnx_weight_distribution_semantics"]["exclusion_counts"] == {
+            "unused_initializer": 1,
+        }
+        assert self._coverage_checks(result) == []
+
+    def test_missing_weight_distribution_dependency_is_inconclusive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = create_onnx_model(tmp_path, tensor_shape=(2, 2), initializer_consumer="MatMul")
         monkeypatch.setitem(sys.modules, "scipy", None)
 
         result = OnnxScanner().scan(str(model_path))
@@ -1818,6 +1881,7 @@ class TestWeightDistributionCoverage:
             external_path="weights.bin",
             external_file_bytes=struct.pack("ffff", 1.0, 2.0, 3.0, 4.0),
             tensor_shape=(2, 2),
+            initializer_consumer="MatMul",
         )
 
         result = OnnxScanner().scan(str(model_path))
@@ -1838,7 +1902,7 @@ class TestWeightDistributionCoverage:
         self._assert_uncached_inconclusive_exit2(model_path, tmp_path / "cache")
 
     def test_oversized_weight_distribution_tensors_are_inconclusive(self, tmp_path: Path) -> None:
-        model_path = create_onnx_model(tmp_path, tensor_shape=(2, 2))
+        model_path = create_onnx_model(tmp_path, tensor_shape=(2, 2), initializer_consumer="MatMul")
 
         result = OnnxScanner({"max_array_size": 1}).scan(str(model_path))
 
@@ -1856,6 +1920,93 @@ class TestWeightDistributionCoverage:
         assert coverage_checks[0].details["oversized_initializers_skipped"] == 1
         assert coverage_checks[0].details["analyzed_initializers"] == 0
         self._assert_uncached_inconclusive_exit2(model_path, tmp_path / "cache", max_array_size=1)
+
+
+class TestWeightDistributionSemantics:
+    """Regression tests for ONNX initializer semantics and output axes."""
+
+    @staticmethod
+    def _extreme_checks(result: Any) -> list[Any]:
+        return [
+            check
+            for check in result.checks
+            if check.name == "Weight Distribution Anomaly Detection"
+            and "extremely large weight values" in check.message
+        ]
+
+    def test_gemm_transposed_weight_uses_the_real_output_axis(self, tmp_path: Path) -> None:
+        weights = np.linspace(-0.1, 0.1, 384, dtype=np.float32).reshape(1, 384)
+        model_path = create_onnx_weight_model(tmp_path, weights, op_type="Gemm", trans_b=True)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert self._extreme_checks(result) == []
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_layer_count"] == 1
+        assert semantics["eligible"][0]["consumer_op"] == "Gemm"
+        assert semantics["eligible"][0]["output_axis"] == 0
+        assert semantics["eligible"][0]["stored_shape"] == [1, 384]
+        assert semantics["eligible"][0]["analysis_shape"] == [384, 1]
+
+    @pytest.mark.parametrize(
+        ("op_type", "weights", "expected_reason"),
+        [
+            ("Gather", np.zeros((2, 384), dtype=np.float32), "embedding_table"),
+            ("MatMulInteger", np.full((128, 1), 127, dtype=np.int8), "quantized_operator"),
+            ("Mul", np.zeros((288, 1), dtype=np.float32), "bookkeeping_constant"),
+            ("Add", np.zeros((288, 1), dtype=np.float32), "bookkeeping_constant"),
+        ],
+    )
+    def test_non_neuron_initializers_are_semantically_excluded(
+        self,
+        tmp_path: Path,
+        op_type: str,
+        weights: np.ndarray,
+        expected_reason: str,
+    ) -> None:
+        model_path = create_onnx_weight_model(tmp_path, weights, op_type=op_type)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert self._extreme_checks(result) == []
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 0
+        assert semantics["analyzed_layer_count"] == 0
+        assert semantics["exclusion_counts"][expected_reason] == 1
+        assert semantics["exclusion_samples"][0]["initializer"] == "W"
+
+    @pytest.mark.parametrize(("op_type", "trans_b"), [("MatMul", False), ("Gemm", False), ("Gemm", True)])
+    def test_malicious_repeated_extreme_weights_remain_detected(
+        self,
+        tmp_path: Path,
+        op_type: str,
+        trans_b: bool,
+    ) -> None:
+        analysis_weights = np.zeros((100, 10), dtype=np.float32)
+        analysis_weights[50:55, 3] = 10.0
+        stored_weights = analysis_weights.T if trans_b else analysis_weights
+        model_path = create_onnx_weight_model(
+            tmp_path,
+            stored_weights,
+            op_type=op_type,
+            trans_b=trans_b,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = self._extreme_checks(result)
+        assert len(checks) == 1
+        details = checks[0].details
+        assert details["initializer"] == "W"
+        assert details["consumer_op"] == op_type
+        assert details["consumer_input_index"] == 1
+        assert details["output_axis"] == (0 if trans_b else 1)
+        assert details["analysis_shape"] == [100, 10]
+        assert details["affected_neurons"] == [3]
+        assert details["num_extreme_weights"] == 5
+        assert details["max_extreme_weights_per_output"] == 5
+        assert details["max_to_threshold_ratio"] >= 2.0
 
 
 class TestRawDetectorCoverage:

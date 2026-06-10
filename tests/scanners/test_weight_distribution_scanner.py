@@ -404,8 +404,8 @@ def test_partial_hdf5_weight_extraction_preserves_analyzed_findings(tmp_path: Pa
     import numpy as np
 
     path = tmp_path / "partial_external_weights.h5"
-    anomalous_weights = np.zeros((2, 10), dtype=np.float32)
-    anomalous_weights[0, 0] = 1000.0
+    anomalous_weights = np.zeros((100, 10), dtype=np.float32)
+    anomalous_weights[50:55, 0] = 1000.0
 
     with h5py.File(path, "w") as hdf5_file:
         hdf5_file.create_dataset("model_weights/a_dense/weight:0", data=anomalous_weights)
@@ -1563,6 +1563,38 @@ class TestWeightDistributionScanner:
         )
         assert extreme_anomaly is not None
         assert 3 in extreme_anomaly["details"]["affected_neurons"]
+        assert extreme_anomaly["details"]["num_extreme_weights"] == 5
+        assert extreme_anomaly["details"]["max_extreme_weights_per_output"] == 5
+        assert extreme_anomaly["details"]["max_to_threshold_ratio"] >= 2.0
+
+    def test_extreme_value_check_ignores_ordinary_gaussian_tails(self) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.random.default_rng(20260609).normal(size=(2, 384))
+
+        anomalies = scanner._analyze_layer_weights(
+            "ordinary_projection",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        assert not any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
+
+    def test_extreme_value_check_requires_repeated_values_per_output(self) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50, 3] = 100.0
+
+        anomalies = scanner._analyze_layer_weights(
+            "single_scalar",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        assert not any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
 
     @pytest.mark.skipif(False, reason="Dynamic skip - see test method")
     def test_pytorch_model_scan(self, tmp_path: Path) -> None:
