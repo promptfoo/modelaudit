@@ -1,5 +1,6 @@
 """Tests for SkopsScanner covering CVE-2025-54412, CVE-2025-54413, CVE-2025-54886."""
 
+import builtins
 import os
 import stat
 import textwrap
@@ -1162,6 +1163,15 @@ class TestSkopsScannerEdgeCases:
             archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo replacement"\ntR.')
 
         original_scan_archive_members = zip_scanner_module.ZipScanner.scan_archive_members
+        original_open = builtins.open
+        path_reopened = False
+
+        def redirect_path_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+            nonlocal path_reopened
+            if str(file) == str(skops_path):
+                path_reopened = True
+                file = replacement_path
+            return original_open(file, *args, **kwargs)
 
         def replace_then_scan(
             scanner: zip_scanner_module.ZipScanner,
@@ -1169,13 +1179,15 @@ class TestSkopsScannerEdgeCases:
             archive: zipfile.ZipFile | None = None,
         ) -> ScanResult:
             assert archive is not None
-            replacement_path.replace(path)
-            return original_scan_archive_members(scanner, path, archive=archive)
+            with monkeypatch.context() as path_swap:
+                path_swap.setattr(builtins, "open", redirect_path_open)
+                return original_scan_archive_members(scanner, path, archive=archive)
 
         monkeypatch.setattr(zip_scanner_module.ZipScanner, "scan_archive_members", replace_then_scan)
 
         result = SkopsScanner().scan(str(skops_path))
 
+        assert path_reopened is False
         assert not any(issue.details.get("zip_entry") == "payload.pkl" for issue in result.issues)
         assert any(entry.get("path", "").endswith(":safe.txt") for entry in result.metadata["contents"])
         assert not any(entry.get("path", "").endswith(":payload.pkl") for entry in result.metadata["contents"])
