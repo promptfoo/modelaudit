@@ -2186,6 +2186,20 @@ def test_scan_file_selected_weight_distribution_enforces_zip_entry_preflight(
     )
 
 
+def _install_weight_distribution_test_scanner(monkeypatch: pytest.MonkeyPatch) -> None:
+    from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
+
+    original_loader = core_module._registry.load_scanner_by_id
+
+    def load_scanner_by_id(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "weight_distribution":
+            return WeightDistributionScanner
+        return original_loader(scanner_id)
+
+    monkeypatch.setattr(core_module._registry, "load_scanner_by_id", load_scanner_by_id)
+    monkeypatch.setattr(WeightDistributionScanner, "can_handle", classmethod(lambda _cls, _path: True))
+
+
 def test_scan_file_selected_weight_distribution_routes_within_entry_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2194,6 +2208,8 @@ def test_scan_file_selected_weight_distribution_routes_within_entry_limit(
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("archive/data.pkl", b"data")
         archive.writestr("archive/version", b"1")
+
+    _install_weight_distribution_test_scanner(monkeypatch)
 
     def fake_weight_scan(_self: Any, path: str) -> ScanResult:
         assert path == str(archive_path)
@@ -2205,11 +2221,6 @@ def test_scan_file_selected_weight_distribution_routes_within_entry_limit(
         "modelaudit.scanners.weight_distribution_scanner.WeightDistributionScanner.scan",
         fake_weight_scan,
     )
-    monkeypatch.setattr(
-        "modelaudit.scanners.weight_distribution_scanner.WeightDistributionScanner.can_handle",
-        classmethod(lambda _cls, _path: True),
-    )
-
     result = scan_file(
         str(archive_path),
         config={"scanners": ["weight_distribution"], "max_zip_entries": 2, "cache_enabled": False},
