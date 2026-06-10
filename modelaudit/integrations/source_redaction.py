@@ -895,12 +895,40 @@ def _redact_sensitive_comparison_values(value: str) -> str:
         if match.start() < previous_end:
             continue
         key = match.group("key") or match.group("quoted_key")
-        if not _is_sensitive_export_key(key) or _assignment_value_is_already_redacted(value, match.end()):
+        if _is_sensitive_export_key(key):
+            value_end = _assignment_value_end(value, match.end(), key=key)
+            # Skip only values that are exactly a marker; an embedded marker
+            # followed by raw content must not shield the tail.
+            if value[match.end() : value_end].strip() in ("<redacted>", "<credentials-redacted>"):
+                continue
+            redacted_parts.extend((value[previous_end : match.end()], "<redacted>"))
+            previous_end = value_end
             continue
-        redacted_parts.extend((value[previous_end : match.end()], "<redacted>"))
-        previous_end = _assignment_value_end(value, match.end(), key=key)
+        literal_end = _sensitive_reversed_comparison_literal_end(value, match)
+        if literal_end is not None:
+            redacted_parts.extend(
+                (value[previous_end : match.start()], "<redacted>", value[match.start("separator") : literal_end])
+            )
+            previous_end = literal_end
     redacted_parts.append(value[previous_end:])
     return "".join(redacted_parts)
+
+
+def _sensitive_reversed_comparison_literal_end(value: str, match: re.Match[str]) -> int | None:
+    """Return the right-literal end when a literal candidate value is compared to a key name."""
+    if match.group("quoted_key") is None:
+        return None
+    value_start = match.end()
+    while value_start < len(value) and value[value_start].isspace() and value[value_start] not in "\r\n":
+        value_start += 1
+    if value_start >= len(value) or value[value_start] not in {'"', "'"}:
+        return None
+    quote_end = _find_closing_quote(value, value_start, value[value_start])
+    if quote_end < 0:
+        return None
+    if not _is_sensitive_export_key(value[value_start + 1 : quote_end]):
+        return None
+    return quote_end + 1
 
 
 def _first_redaction_marker_start(value: str, start: int, end: int) -> int | None:

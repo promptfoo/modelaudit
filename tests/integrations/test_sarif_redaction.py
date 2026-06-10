@@ -520,6 +520,42 @@ def test_benign_comparisons_are_preserved_in_generic_exports() -> None:
     assert redact_source_text(text) == text
 
 
+def test_comparison_marker_tail_is_redacted_in_generic_exports() -> None:
+    text = 'client_secret == <redacted> + "RAW-MARKER-TAIL-SECRET-123456"'
+
+    redacted = redact_source_text(text)
+
+    assert "RAW-MARKER-TAIL-SECRET-123456" not in redacted
+    assert redacted == "client_secret == <redacted>"
+
+
+def test_exactly_redacted_comparison_value_is_preserved() -> None:
+    text = "client_secret == <redacted>"
+
+    assert redact_source_text(text) == text
+
+
+def test_reversed_literal_key_comparison_redacts_value_in_generic_exports() -> None:
+    text = '"OPAQUE-VALUE-CRED-123456" == "client_secret"; os.system("id")'
+
+    redacted = redact_source_text(text)
+
+    assert "OPAQUE-VALUE-CRED-123456" not in redacted
+    assert '<redacted> == "client_secret"' in redacted
+    assert 'os.system("id")' in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'label == "client_secret"; os.system("id")',
+        '"OPAQUE-VALUE" == "tokenizer"',
+    ],
+)
+def test_reversed_comparison_near_matches_are_preserved_in_generic_exports(text: str) -> None:
+    assert redact_source_text(text) == text
+
+
 def test_prevalidated_comparison_command_operands_are_preserved() -> None:
     text = 'client_secret == os.system("id")'
 
