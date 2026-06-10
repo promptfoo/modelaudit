@@ -5009,6 +5009,62 @@ def test_scan_file_routes_malicious_flax_checkpoint_under_skipped_suffix(tmp_pat
     assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
 
 
+@pytest.mark.parametrize(
+    ("filename", "payload", "expected_scanner"),
+    [
+        ("merges.txt", "#version: 0.2\nĠ t\n", "unknown"),
+        ("README.md", "# Higgs áudio\n\nModel card.\n", "text"),
+    ],
+    ids=["bpe-merges", "markdown-readme"],
+)
+def test_scan_file_keeps_bounded_utf8_tokenizer_text_out_of_flax_scanner(
+    tmp_path: Path,
+    filename: str,
+    payload: str,
+    expected_scanner: str,
+) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text(payload, encoding="utf-8")
+
+    assert file_detection.detect_file_format(str(text_path)) == "unknown"
+    assert file_detection.detect_file_format_from_magic(str(text_path)) == "unknown"
+    assert file_detection.detect_file_format_for_skip_filter(str(text_path)) == "unknown"
+
+    result = scan_file(str(text_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == expected_scanner
+    assert result.scanner_name != "flax_msgpack"
+    assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+
+
+def test_scan_file_keeps_real_msgpack_fixture_owned_by_flax_scanner(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "checkpoint.jpg"
+    checkpoint.write_bytes(flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True))
+
+    assert file_detection.detect_file_format(str(checkpoint)) == "flax_msgpack"
+    assert file_detection.detect_file_format_from_magic(str(checkpoint)) == "flax_msgpack"
+    assert file_detection.detect_file_format_for_skip_filter(str(checkpoint)) == "flax_msgpack"
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is True
+
+
+def test_scan_file_keeps_malformed_binary_control_owned_by_pytorch_binary_scanner(tmp_path: Path) -> None:
+    binary_path = tmp_path / "malformed.bin"
+    binary_path.write_bytes(b"\xff\x00\x01\x02broken binary")
+
+    assert file_detection.detect_file_format(str(binary_path)) == "pytorch_binary"
+
+    result = scan_file(str(binary_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pytorch_binary"
+
+
 def test_scan_file_routes_large_malicious_renamed_flax_msgpack_with_later_root_to_flax_scanner(tmp_path: Path) -> None:
     if not flax_msgpack_scanner.HAS_MSGPACK:
         pytest.skip("msgpack unavailable")
