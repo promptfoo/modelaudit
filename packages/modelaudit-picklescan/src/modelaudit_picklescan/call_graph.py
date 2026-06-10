@@ -35,7 +35,15 @@ from importlib.machinery import (
 from importlib.metadata import distribution, packages_distributions
 from importlib.util import MAGIC_NUMBER, cache_from_source, source_hash
 from pathlib import Path
-from types import CodeType, FunctionType, GetSetDescriptorType, MappingProxyType, MethodType, ModuleType
+from types import (
+    BuiltinFunctionType,
+    CodeType,
+    FunctionType,
+    GetSetDescriptorType,
+    MappingProxyType,
+    MethodType,
+    ModuleType,
+)
 from typing import Any, Protocol, TypeVar, cast
 from zipimport import zipimporter
 
@@ -4184,12 +4192,24 @@ def _resolve_module_getattr_target(
 
     module_getattr = f"{module_name}.__getattr__"
     if module_getattr in analysis.calls_by_function:
+        if _loaded_extension_callable_bypasses_module_getattr(module_name, qualified_name):
+            return None
         return module_getattr
 
     alias_target = analysis.aliases.get("__getattr__")
     if alias_target is not None and alias_target != module_getattr:
+        if _loaded_extension_callable_bypasses_module_getattr(module_name, qualified_name):
+            return None
         return _resolve_alias_function_target(alias_target)
     return None
+
+
+def _loaded_extension_callable_bypasses_module_getattr(module_name: str, name: str) -> bool:
+    # PEP 562 hooks run only after normal module lookup misses; compatibility
+    # wrappers can populate extension exports without a statically visible bind.
+    state = _current_loaded_interpreter_reference_state(module_name, name)
+    _track_loaded_interpreter_reference_state(module_name, name, state)
+    return state[0] and type(state[1]) is BuiltinFunctionType
 
 
 def _resolve_alias_function_target(alias_target: str) -> str | None:

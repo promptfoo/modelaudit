@@ -1633,3 +1633,24 @@ def test_late_loaded_builtin_with_canonical_spec_fails_closed(
         assert call_graph._import_module_can_execute_user_code(module) is True
     finally:
         _clear_call_graph_caches()
+
+
+def test_numpy_extension_export_does_not_fall_through_module_getattr() -> None:
+    from numpy.core import multiarray
+
+    assert multiarray._reconstruct is not None
+    reference = {
+        "module": "numpy.core.multiarray",
+        "name": "_reconstruct",
+        "import_reference": "numpy.core.multiarray._reconstruct",
+        "opcode": "REDUCE",
+        "positional_arg_count": 3,
+    }
+    _clear_call_graph_caches()
+
+    try:
+        findings = call_graph.find_dangerous_call_graphs([reference], [reference])
+    finally:
+        _clear_call_graph_caches()
+
+    assert findings == ()
