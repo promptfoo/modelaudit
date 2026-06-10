@@ -1407,8 +1407,6 @@ impl<'a> ScanState<'a> {
                                     raw_position.saturating_add(cursor),
                                 );
                             }
-                        } else if bytes.len() <= self.options.max_nested_pickle_bytes {
-                            self.scan_raw_nested_pickle_bytes(bytes, raw_position);
                         } else if scan_limit > 0 {
                             self.scan_raw_nested_pickle_bytes(&bytes[..scan_limit], raw_position);
                             let suffix_start =
@@ -10463,26 +10461,29 @@ mod tests {
     }
 
     #[test]
-    fn raw_nested_pickle_uses_nested_budget_beyond_literal_scan_cap() {
-        let mut options = default_test_options();
-        options.max_string_literal_scan_chars = 8;
-        let mut nested = b"\x80\x04}\x94\x8c\x04code\x94X\x80\x00\x00\x00".to_vec();
-        nested.extend(std::iter::repeat_n(b'A', 128));
-        nested.extend_from_slice(b"\x94s.");
-        let mut payload = b"\x80\x04C".to_vec();
-        payload.push(nested.len() as u8);
-        payload.extend_from_slice(&nested);
-        payload.push(b'.');
+    fn raw_nested_pickle_respects_literal_scan_cap() {
+        for literal_scan_cap in [0, 8] {
+            let mut options = default_test_options();
+            options.max_string_literal_scan_chars = literal_scan_cap;
+            let mut nested = b"\x80\x04}\x94\x8c\x04code\x94X\x80\x00\x00\x00".to_vec();
+            nested.extend(std::iter::repeat_n(b'A', 128));
+            nested.extend_from_slice(b"\x94s.");
+            let mut payload = b"\x80\x04C".to_vec();
+            payload.push(nested.len() as u8);
+            payload.extend_from_slice(&nested);
+            payload.push(b'.');
 
-        let scan = run_test_scan("bounded-raw-nested.pkl", &payload, &options);
+            let scan = run_test_scan("bounded-raw-nested.pkl", &payload, &options);
 
-        assert_eq!(scan.status, ScanStatus::Inconclusive);
-        assert_eq!(scan.verdict, "malicious");
-        assert!(scan
-            .findings
-            .iter()
-            .any(|finding| finding.rule_code == Some("S213")));
-        assert!(has_notice_code(&scan, "nested_pickle_incomplete"));
+            assert_eq!(scan.status, ScanStatus::Inconclusive);
+            assert_eq!(scan.verdict, "unknown");
+            assert!(!scan
+                .findings
+                .iter()
+                .any(|finding| finding.rule_code == Some("S213")));
+            assert!(has_notice_code(&scan, "literal_scan_truncated"));
+            assert!(!has_notice_code(&scan, "nested_pickle_incomplete"));
+        }
     }
 
     #[test]

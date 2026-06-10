@@ -7716,6 +7716,51 @@ class TestZipScanner:
         finally:
             os.unlink(tmp_path)
 
+    def test_mismatched_symlink_local_name_fails_closed_with_critical_finding(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "mismatched-symlink-name.zip"
+        secret = "SUPERSECRET_TOKEN_123"
+        local_name = f"password={secret}".encode()
+        central_name = "l" * len(local_name)
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            info = zipfile.ZipInfo(central_name)
+            info.create_system = 3
+            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(info, "/etc/passwd")
+
+        with zipfile.ZipFile(archive_path) as archive:
+            local_header_offset = archive.getinfo(central_name).header_offset
+        archive_bytes = bytearray(archive_path.read_bytes())
+        assert archive_bytes[local_header_offset : local_header_offset + 4] == b"PK\x03\x04"
+        filename_size = int.from_bytes(
+            archive_bytes[local_header_offset + 26 : local_header_offset + 28],
+            "little",
+        )
+        assert filename_size == len(local_name)
+        filename_start = local_header_offset + 30
+        archive_bytes[filename_start : filename_start + filename_size] = local_name
+        archive_path.write_bytes(archive_bytes)
+
+        result = self.scanner.scan(str(archive_path))
+
+        preflight_check = next(check for check in result.checks if check.name == "ZIP Central Directory Preflight")
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert preflight_check.status == CheckStatus.FAILED
+        assert preflight_check.severity == IssueSeverity.INFO
+        assert preflight_check.rule_code == "S902"
+        symlink_check = next(
+            check
+            for check in result.checks
+            if check.name == "Symlink Safety Validation" and check.details.get("entry") == central_name
+        )
+        assert symlink_check.status == CheckStatus.FAILED
+        assert symlink_check.severity == IssueSeverity.CRITICAL
+        assert symlink_check.rule_code == "S406"
+        assert symlink_check.details["target"] == "<inconsistent-zip-metadata>"
+        assert symlink_check.details["target_class"] == "invalid"
+        assert secret not in result.to_json()
+
     def test_dos_entry_with_unix_symlink_bits_is_scanned_as_regular_file(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "fake-symlink.zip"
         with zipfile.ZipFile(archive_path, "w") as archive:

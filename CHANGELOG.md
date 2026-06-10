@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- preserve PyTorch malformed-ZIP symlink findings, selected HDF5 user-block subtype scans, valid Python 3.10 streamed ZIP64 descriptors, and complete concatenated user-block ZIP scans without weakening preflight checks
+- preserve PyTorch malformed-ZIP symlink findings, selected HDF5 user-block subtype scans, valid Python 3.10 streamed ZIP64 descriptors, and complete nested and concatenated user-block ZIP scans without weakening preflight checks
 - prevent exported source redaction from treating comparisons as assignments or leaking suffixes appended to quoted redaction markers
 - classify unsafe PyTorch ZIP symlink targets as critical archive-link findings while preserving safe relative links
 - restore pickle CVE scan throughput, reprobe malformed stream separators, and route four-byte protocol-0 Joblib operands correctly

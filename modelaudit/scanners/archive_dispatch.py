@@ -519,19 +519,16 @@ def merge_hdf5_userblock_zip_findings(
 
         logical_start = 0
         for logical_end in logical_zip_ends:
-            if logical_start == 0:
-                temp_path = _copy_file_prefix_to_temp(path, logical_end, temp_suffix)
-            else:
+            earliest_member_offset = _find_earliest_zip_member_offset(path, logical_end)
+            if logical_start > 0 and earliest_member_offset >= logical_start:
                 temp_path = _copy_file_range_to_temp(
                     path,
                     logical_start,
                     logical_end,
                     temp_suffix,
                 )
-                if not zipfile.is_zipfile(temp_path):
-                    with suppress(OSError):
-                        os.unlink(temp_path)
-                    temp_path = _copy_file_prefix_to_temp(path, logical_end, temp_suffix)
+            else:
+                temp_path = _copy_file_prefix_to_temp(path, logical_end, temp_suffix)
             supplemental_result = ScanResult(scanner_name="zip")
             merge_executable_zip_container_findings(temp_path, supplemental_result, config, context=context)
             _replace_scan_result_path(supplemental_result, temp_path, path)
@@ -688,6 +685,20 @@ def _find_valid_zip_logical_ends(
             if zipfile.is_zipfile(bounded_reader) and logical_end not in logical_ends:
                 logical_ends.append(logical_end)
     return logical_ends
+
+
+def _find_earliest_zip_member_offset(path: str, logical_end: int) -> int:
+    """Return the earliest central-directory member offset for a logical ZIP."""
+    try:
+        with open(path, "rb") as handle:
+            bounded_reader = _LogicalEOFReader(handle, logical_end)
+            with zipfile.ZipFile(bounded_reader) as archive:
+                return min(
+                    (entry.header_offset for entry in archive.infolist()),
+                    default=archive.start_dir,
+                )
+    except (OSError, zipfile.BadZipFile):
+        return 0
 
 
 def _copy_file_range_to_temp(path: str, start: int, end: int, suffix: str) -> str:

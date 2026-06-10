@@ -4561,6 +4561,37 @@ def test_scan_file_preserves_earlier_concatenated_hdf5_userblock_zip(
     assert any(item.get("path") == f"{polyglot}:README.txt" for item in result.metadata["contents"])
 
 
+@pytest.mark.parametrize("malicious", [False, True], ids=["benign", "malicious"])
+def test_scan_file_preserves_outer_members_before_nested_hdf5_userblock_zip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    malicious: bool,
+) -> None:
+    nested_zip = io.BytesIO()
+    with zipfile.ZipFile(nested_zip, "w") as archive:
+        archive.writestr("README-inner.txt", b"benign nested archive")
+
+    polyglot = tmp_path / "nested-zip-userblock.h5"
+    _create_misnamed_zip(
+        polyglot,
+        {
+            "payload.pkl": _build_malicious_pickle() if malicious else pickle.dumps({"weights": [1, 2, 3]}),
+            "nested.zip": nested_zip.getvalue(),
+        },
+    )
+    _append_hdf5_userblock_candidate(polyglot, plausible=True)
+    monkeypatch.setattr("modelaudit.scanners.keras_h5_scanner.HAS_H5PY", False)
+
+    result = scan_file(str(polyglot), config={"cache_scan_results": False})
+
+    if malicious:
+        _assert_system_pickle_detected(result, "payload.pkl")
+    else:
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    nested_entry = next(item for item in result.metadata["contents"] if item.get("path") == f"{polyglot}:nested.zip")
+    assert any(item.get("path", "").endswith(":README-inner.txt") for item in nested_entry["contents"])
+
+
 def test_large_hdf5_userblock_copies_only_validated_zip_prefix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
