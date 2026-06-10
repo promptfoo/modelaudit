@@ -810,7 +810,12 @@ RULE_CATALOG: tuple[RuleCatalogEntry, ...] = (
         code="S1111",
         name="ONNX custom operator domains",
         severity="INFO",
-        description="ONNX model depends on an external custom operator implementation",
-        patterns=(r"onnx.*custom.*operator", r"custom operator domain", r"custom.*onnx.*domain"),
+        description="ONNX model may depend on an external custom operator implementation",
+        patterns=(
+            r"onnx.*custom.*operator",
+            r"custom onnx operator",
+            r"custom operator domain",
+            r"custom.*onnx.*domain",
+        ),
     ),
 )

@@ -87,7 +87,7 @@ class TestRuleRegistry:
         assert "S101" in rules
         assert "S1110" in rules
 
-    def test_get_rules_by_range(self):
+    def test_get_rules_by_range(self) -> None:
         """Test getting rules by numeric range."""
         # Get code execution rules (S100-S199)
         rules = RuleRegistry.get_rules_by_range(100, 199)
