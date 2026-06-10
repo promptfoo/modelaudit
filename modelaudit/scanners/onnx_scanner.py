@@ -132,17 +132,21 @@ def _onnx_weight_output_axis(node: Any, input_index: int, rank: int) -> tuple[in
         return None, "custom_domain_consumer"
 
     if op_type == "Gemm":
-        if input_index != 1:
+        if input_index not in {0, 1}:
             return None, "non_weight_input"
         if rank != 2:
             return None, "unsupported_weight_rank"
+        if input_index == 0:
+            return (1 if _onnx_int_attribute(node, "transA") else 0), "eligible_gemm_left_weight"
         return (0 if _onnx_int_attribute(node, "transB") else 1), "eligible_gemm_weight"
 
     if op_type == "MatMul":
-        if input_index != 1:
+        if input_index not in {0, 1}:
             return None, "non_weight_input"
         if rank < 2:
             return None, "unsupported_weight_rank"
+        if input_index == 0:
+            return rank - 2, "eligible_matmul_left_weight"
         return rank - 1, "eligible_matmul_weight"
 
     if op_type == "Conv":
@@ -185,6 +189,40 @@ def _iter_graph_nodes(graph: Any) -> Any:
         for attribute in node.attribute:
             for subgraph in _iter_attribute_graphs(attribute):
                 yield from _iter_graph_nodes(subgraph)
+
+
+def _graph_declared_value_names(graph: Any) -> set[str]:
+    """Return names that shadow values captured from an enclosing ONNX graph."""
+    declared = {value.name for value in getattr(graph, "input", []) if value.name}
+    declared.update(initializer.name for initializer in getattr(graph, "initializer", []) if initializer.name)
+    for sparse_initializer in getattr(graph, "sparse_initializer", []):
+        if sparse_initializer.values.name:
+            declared.add(sparse_initializer.values.name)
+    for node in getattr(graph, "node", []):
+        declared.update(output_name for output_name in node.output if output_name)
+    return declared
+
+
+def _iter_captured_initializer_consumers(
+    graph: Any,
+    initializer_names: set[str],
+    *,
+    root_graph: bool = False,
+) -> Any:
+    """Yield consumers of visible initializers across nested control-flow graphs."""
+    visible_names = initializer_names
+    if not root_graph:
+        visible_names = initializer_names - _graph_declared_value_names(graph)
+    if not visible_names:
+        return
+
+    for node in getattr(graph, "node", []):
+        for input_index, input_name in enumerate(node.input):
+            if input_name in visible_names:
+                yield node, input_index, input_name
+        for attribute in getattr(node, "attribute", []):
+            for subgraph in _iter_attribute_graphs(attribute):
+                yield from _iter_captured_initializer_consumers(subgraph, visible_names)
 
 
 def _iter_model_graphs(model: Any) -> Any:
@@ -1113,10 +1151,10 @@ class OnnxScanner(BaseScanner):
 
         initializers = {initializer.name: initializer for initializer in model.graph.initializer}
         consumers: dict[str, list[tuple[int, Any, int]]] = {name: [] for name in initializers}
-        for node_index, node in enumerate(model.graph.node):
-            for input_index, input_name in enumerate(node.input):
-                if input_name in consumers:
-                    consumers[input_name].append((node_index, node, input_index))
+        for node_index, (node, input_index, input_name) in enumerate(
+            _iter_captured_initializer_consumers(model.graph, set(initializers), root_graph=True),
+        ):
+            consumers[input_name].append((node_index, node, input_index))
 
         floating_types = {
             int(getattr(onnx.TensorProto, name))
@@ -1139,7 +1177,9 @@ class OnnxScanner(BaseScanner):
         oversized_initializers_skipped = 0
         extraction_failures = 0
         weights_info: dict[str, Any] = {}
+        tensor_weight_specs: dict[str, tuple[Any, tuple[int, ...]]] = {}
         layer_contexts: dict[str, dict[str, Any]] = {}
+        analyzed_initializer_names: set[str] = set()
         eligible_metadata: list[dict[str, Any]] = []
         exclusion_counts: dict[str, int] = {}
         exclusion_samples: list[dict[str, Any]] = []
@@ -1191,6 +1231,17 @@ class OnnxScanner(BaseScanner):
                             "consumer_node_index": node_index,
                             "consumer_input_index": input_index,
                             "output_axis": output_axis,
+                            "analysis_kind": (
+                                "tensor"
+                                if node.op_type in {"Conv", "ConvTranspose"}
+                                or (len(initializer.dims) > 2 and output_axis != len(initializer.dims) - 1)
+                                else "matrix"
+                            ),
+                            "group": (
+                                _onnx_int_attribute(node, "group", 1)
+                                if node.op_type in {"Conv", "ConvTranspose"}
+                                else 1
+                            ),
                             "stored_shape": [int(dim) for dim in initializer.dims],
                         },
                     )
@@ -1215,20 +1266,66 @@ class OnnxScanner(BaseScanner):
                     continue
 
                 array = onnx.numpy_helper.to_array(initializer)
-                contexts_by_axis: dict[int, list[dict[str, Any]]] = {}
+                contexts_by_analysis: dict[tuple[str, int, int], list[dict[str, Any]]] = {}
                 for context in semantic_contexts:
-                    contexts_by_axis.setdefault(int(context["output_axis"]), []).append(context)
+                    analysis_key = (
+                        str(context["analysis_kind"]),
+                        int(context["output_axis"]),
+                        int(context["group"]),
+                    )
+                    contexts_by_analysis.setdefault(analysis_key, []).append(context)
 
-                for output_axis, axis_contexts in contexts_by_axis.items():
+                for (analysis_kind, output_axis, group), axis_contexts in contexts_by_analysis.items():
                     layer_name = initializer.name
-                    if len(contexts_by_axis) > 1:
+                    if len(contexts_by_analysis) > 1:
                         layer_name = f"{initializer.name}@output_axis={output_axis}"
-                    analysis_array = np.moveaxis(array, output_axis, -1)
-                    if analysis_array.ndim > 2:
-                        analysis_array = analysis_array.reshape(-1, analysis_array.shape[-1])
+                    if layer_name in weights_info or layer_name in tensor_weight_specs:
+                        layer_name = f"{layer_name},kind={analysis_kind},group={group}"
+
+                    analysis_shape: list[int]
+                    conceptual_output_axes: tuple[int, ...]
+                    shares_storage = True
+                    if analysis_kind == "tensor":
+                        tensor_array = array
+                        conceptual_output_axes = (output_axis,)
+                        if axis_contexts[0]["consumer_op"] == "ConvTranspose":
+                            if group <= 0 or int(array.shape[0]) % group != 0:
+                                raise ValueError(
+                                    f"ConvTranspose initializer {initializer.name!r} has incompatible group {group}"
+                                )
+                            tensor_array = array.reshape(group, int(array.shape[0]) // group, *array.shape[1:])
+                            conceptual_output_axes = (0, 2)
+                        shares_storage = bool(array.size == 0 or np.shares_memory(array, tensor_array))
+                        if not shares_storage:
+                            raise RuntimeError(
+                                f"Weight analysis for initializer {initializer.name!r} would copy the full tensor"
+                            )
+                        input_axes = tuple(
+                            axis for axis in range(tensor_array.ndim) if axis not in conceptual_output_axes
+                        )
+                        analysis_shape = [
+                            math.prod(int(tensor_array.shape[axis]) for axis in input_axes),
+                            math.prod(int(tensor_array.shape[axis]) for axis in conceptual_output_axes),
+                        ]
+                        tensor_weight_specs[layer_name] = (tensor_array, conceptual_output_axes)
+                    else:
+                        analysis_array = np.moveaxis(array, output_axis, -1)
+                        if analysis_array.ndim > 2:
+                            analysis_array = analysis_array.reshape(-1, analysis_array.shape[-1])
+                        shares_storage = bool(array.size == 0 or np.shares_memory(array, analysis_array))
+                        if not shares_storage:
+                            raise RuntimeError(
+                                f"Weight analysis for initializer {initializer.name!r} would copy the full tensor"
+                            )
+                        conceptual_output_axes = (analysis_array.ndim - 1,)
+                        analysis_shape = [int(dim) for dim in analysis_array.shape]
+                        weights_info[layer_name] = analysis_array
                     context = {
                         **axis_contexts[0],
-                        "analysis_shape": [int(dim) for dim in analysis_array.shape],
+                        "analysis_shape": analysis_shape,
+                        "conceptual_output_axes": list(conceptual_output_axes),
+                        "analysis_storage_shares_memory": shares_storage,
+                        "analysis_materialization": "zero_copy_view_chunked_reduction",
                         "consumers": [
                             {
                                 "op": item["consumer_op"],
@@ -1239,8 +1336,8 @@ class OnnxScanner(BaseScanner):
                             for item in axis_contexts
                         ],
                     }
-                    weights_info[layer_name] = analysis_array
                     layer_contexts[layer_name] = context
+                    analyzed_initializer_names.add(initializer_name)
                     if len(eligible_metadata) < _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT:
                         eligible_metadata.append(context)
             except Exception as e:
@@ -1252,11 +1349,12 @@ class OnnxScanner(BaseScanner):
                 )
                 continue
 
+        analyzed_layer_count = len(weights_info) + len(tensor_weight_specs)
         result.metadata["onnx_weight_distribution_semantics"] = {
             "eligible_initializer_count": eligible_initializers,
-            "analyzed_layer_count": len(weights_info),
+            "analyzed_layer_count": analyzed_layer_count,
             "eligible": eligible_metadata,
-            "eligible_metadata_truncated": len(weights_info) > len(eligible_metadata),
+            "eligible_metadata_truncated": analyzed_layer_count > len(eligible_metadata),
             "exclusion_counts": exclusion_counts,
             "exclusion_samples": exclusion_samples,
             "exclusion_metadata_truncated": sum(exclusion_counts.values()) > len(exclusion_samples),
@@ -1270,7 +1368,7 @@ class OnnxScanner(BaseScanner):
                 message="Weight distribution analysis skipped one or more eligible ONNX initializers",
                 details={
                     "eligible_initializers": eligible_initializers,
-                    "analyzed_initializers": len(weights_info),
+                    "analyzed_initializers": len(analyzed_initializer_names),
                     "external_initializers_skipped": external_initializers_skipped,
                     "oversized_initializers_skipped": oversized_initializers_skipped,
                     "extraction_failures": extraction_failures,
@@ -1278,7 +1376,7 @@ class OnnxScanner(BaseScanner):
                 },
             )
 
-        if not weights_info:
+        if not weights_info and not tensor_weight_specs:
             # Nothing to analyse (external-only model, or all tensors too small / too large).
             return
 
@@ -1302,6 +1400,14 @@ class OnnxScanner(BaseScanner):
         try:
             wd_scanner = WeightDistributionScanner(self.config)
             anomalies = wd_scanner._analyze_weight_distributions(weights_info)
+            for layer_name, (tensor_weights, output_axes) in tensor_weight_specs.items():
+                anomalies.extend(
+                    wd_scanner._analyze_tensor_weight_extremes(
+                        layer_name,
+                        tensor_weights,
+                        output_axes=output_axes,
+                    ),
+                )
 
             for anomaly in anomalies:
                 details = dict(anomaly["details"])
@@ -1317,6 +1423,10 @@ class OnnxScanner(BaseScanner):
                             "output_axis": layer_context["output_axis"],
                             "stored_shape": layer_context["stored_shape"],
                             "analysis_shape": layer_context["analysis_shape"],
+                            "conceptual_output_axes": layer_context["conceptual_output_axes"],
+                            "group": layer_context["group"],
+                            "analysis_storage_shares_memory": layer_context["analysis_storage_shares_memory"],
+                            "analysis_materialization": layer_context["analysis_materialization"],
                         },
                     )
                 result.add_check(
@@ -1329,7 +1439,7 @@ class OnnxScanner(BaseScanner):
                     why=anomaly.get("why"),
                 )
 
-            result.metadata["layers_analyzed"] = len(weights_info)
+            result.metadata["layers_analyzed"] = analyzed_layer_count
             result.metadata["anomalies_found"] = len(anomalies)
             if extraction_failures > 0:
                 result.metadata["weight_extraction_failures"] = extraction_failures

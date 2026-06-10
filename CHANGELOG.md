@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- scope ONNX weight-distribution analysis to semantic neural-network weights and suppress isolated statistical-tail alerts while preserving repeated malicious patterns
+- scope ONNX weight analysis to semantic neural-network weights, preserve left-operand and grouped outputs without tensor copies, and use per-output robust evidence to suppress clean statistical tails without masking repeated malicious patterns
 - classify unsafe PyTorch ZIP symlink targets as critical archive-link findings while preserving safe relative links
 - restore pickle CVE scan throughput, reprobe malformed stream separators, and route four-byte protocol-0 Joblib operands correctly
 - bound manifest embedded-Jinja template collection while preserving findings across deep branches, cycles, and shared YAML aliases

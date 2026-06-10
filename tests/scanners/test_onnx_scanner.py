@@ -148,6 +148,188 @@ def create_onnx_weight_model(
     return path
 
 
+def create_left_equivalent_linear_model(
+    tmp_path: Path,
+    analysis_weights: np.ndarray,
+    *,
+    op_type: str,
+) -> Path:
+    """Encode X @ W as transpose(W.T @ transpose(X))."""
+    assert op_type in {"Gemm", "MatMul"}
+    stored_weights = analysis_weights.T.copy()
+    weight_tensor = onnx.numpy_helper.from_array(stored_weights, name="W")
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, analysis_weights.shape[0]])
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, analysis_weights.shape[1]])
+    nodes = [
+        helper.make_node("Transpose", ["input"], ["input_t"], name="transpose_input", perm=[1, 0]),
+        helper.make_node(op_type, ["W", "input_t"], ["output_t"], name="left_linear"),
+        helper.make_node("Transpose", ["output_t"], ["output"], name="transpose_output", perm=[1, 0]),
+    ]
+    graph = helper.make_graph(nodes, "left_equivalent_graph", [X], [Y], initializer=[weight_tensor])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / f"left-equivalent-{op_type.lower()}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_onnx_conv_weight_model(
+    tmp_path: Path,
+    weights: np.ndarray,
+    *,
+    transpose: bool,
+    group: int = 1,
+    filename: str = "conv-weighted.onnx",
+) -> Path:
+    """Create a valid Conv or ConvTranspose graph with inline weights."""
+    op_type = "ConvTranspose" if transpose else "Conv"
+    weight_tensor = onnx.numpy_helper.from_array(weights, name="W")
+    input_channels = weights.shape[0] if transpose else weights.shape[1] * group
+    output_channels = weights.shape[1] * group if transpose else weights.shape[0]
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, input_channels, 8, 8])
+    spatial_size = 8 + weights.shape[2] - 1 if transpose else 8 - weights.shape[2] + 1
+    Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, output_channels, spatial_size, spatial_size])
+    node = helper.make_node(op_type, ["input", "W"], ["output"], name="convolution", group=group)
+    graph = helper.make_graph([node], "conv_weight_graph", [X], [Y], initializer=[weight_tensor])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / filename
+    onnx.save(model, str(path))
+    return path
+
+
+def create_control_flow_captured_weight_model(
+    tmp_path: Path,
+    weights: np.ndarray,
+    *,
+    control_flow_op: str,
+) -> Path:
+    """Create a checker-valid control-flow graph whose body captures W."""
+    weight_tensor = onnx.numpy_helper.from_array(weights, name="W")
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, weights.shape[0]])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, weights.shape[1]])
+
+    if control_flow_op == "If":
+        condition = helper.make_tensor_value_info("condition", TensorProto.BOOL, [])
+
+        def make_branch(name: str) -> Any:
+            branch_output = helper.make_tensor_value_info(f"{name}_output", TensorProto.FLOAT, [1, weights.shape[1]])
+            node = helper.make_node("MatMul", ["X", "W"], [f"{name}_output"], name=f"{name}_linear")
+            return helper.make_graph([node], name, [], [branch_output])
+
+        control_node = helper.make_node(
+            "If",
+            ["condition"],
+            ["Y"],
+            name="control",
+            then_branch=make_branch("then"),
+            else_branch=make_branch("else"),
+        )
+        graph_inputs = [condition, X]
+        graph_outputs = [Y]
+    elif control_flow_op == "Loop":
+        trip_count = helper.make_tensor_value_info("trip_count", TensorProto.INT64, [])
+        condition = helper.make_tensor_value_info("condition", TensorProto.BOOL, [])
+        iteration = helper.make_tensor_value_info("iteration", TensorProto.INT64, [])
+        body_condition = helper.make_tensor_value_info("body_condition", TensorProto.BOOL, [])
+        state_input = helper.make_tensor_value_info("state_input", TensorProto.FLOAT, [1, weights.shape[0]])
+        condition_output = helper.make_tensor_value_info("condition_output", TensorProto.BOOL, [])
+        state_output = helper.make_tensor_value_info("state_output", TensorProto.FLOAT, [1, weights.shape[1]])
+        body = helper.make_graph(
+            [
+                helper.make_node("Identity", ["body_condition"], ["condition_output"]),
+                helper.make_node("MatMul", ["state_input", "W"], ["state_output"], name="loop_linear"),
+            ],
+            "loop_body",
+            [iteration, body_condition, state_input],
+            [condition_output, state_output],
+        )
+        control_node = helper.make_node(
+            "Loop",
+            ["trip_count", "condition", "X"],
+            ["Y"],
+            name="control",
+            body=body,
+        )
+        graph_inputs = [trip_count, condition, X]
+        graph_outputs = [Y]
+    elif control_flow_op == "Scan":
+        scan_values = helper.make_tensor_value_info("scan_values", TensorProto.FLOAT, [2, 1, weights.shape[0]])
+        scan_outputs = helper.make_tensor_value_info("scan_outputs", TensorProto.FLOAT, [2, 1, weights.shape[0]])
+        state_input = helper.make_tensor_value_info("state_input", TensorProto.FLOAT, [1, weights.shape[0]])
+        scan_input = helper.make_tensor_value_info("scan_input", TensorProto.FLOAT, [1, weights.shape[0]])
+        state_output = helper.make_tensor_value_info("state_output", TensorProto.FLOAT, [1, weights.shape[1]])
+        scan_output = helper.make_tensor_value_info("scan_output", TensorProto.FLOAT, [1, weights.shape[0]])
+        body = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["state_input", "W"], ["state_output"], name="scan_linear"),
+                helper.make_node("Identity", ["scan_input"], ["scan_output"]),
+            ],
+            "scan_body",
+            [state_input, scan_input],
+            [state_output, scan_output],
+        )
+        control_node = helper.make_node(
+            "Scan",
+            ["X", "scan_values"],
+            ["Y", "scan_outputs"],
+            name="control",
+            body=body,
+            num_scan_inputs=1,
+        )
+        graph_inputs = [X, scan_values]
+        graph_outputs = [Y, scan_outputs]
+    else:  # pragma: no cover - test helper guard
+        raise AssertionError(f"Unsupported control-flow operator: {control_flow_op}")
+
+    graph = helper.make_graph([control_node], "control_graph", graph_inputs, graph_outputs, initializer=[weight_tensor])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / f"captured-{control_flow_op.lower()}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_control_flow_shadowed_weight_model(tmp_path: Path, outer_weights: np.ndarray) -> Path:
+    """Create an If graph where a local W shadows an unused outer W."""
+    outer_weight_tensor = onnx.numpy_helper.from_array(outer_weights, name="W")
+    local_weights = np.zeros_like(outer_weights)
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, outer_weights.shape[0]])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, outer_weights.shape[1]])
+    condition = helper.make_tensor_value_info("condition", TensorProto.BOOL, [])
+
+    def make_branch(name: str) -> Any:
+        local_weight_tensor = onnx.numpy_helper.from_array(local_weights, name="W")
+        branch_output = helper.make_tensor_value_info(f"{name}_output", TensorProto.FLOAT, [1, outer_weights.shape[1]])
+        node = helper.make_node("MatMul", ["X", "W"], [f"{name}_output"], name=f"{name}_linear")
+        return helper.make_graph([node], name, [], [branch_output], initializer=[local_weight_tensor])
+
+    control_node = helper.make_node(
+        "If",
+        ["condition"],
+        ["Y"],
+        name="control",
+        then_branch=make_branch("then"),
+        else_branch=make_branch("else"),
+    )
+    graph = helper.make_graph(
+        [control_node],
+        "control_graph",
+        [condition, X],
+        [Y],
+        initializer=[outer_weight_tensor],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "shadowed-captured-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
 def create_python_onnx_model(tmp_path: Path) -> Path:
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
@@ -2007,6 +2189,152 @@ class TestWeightDistributionSemantics:
         assert details["num_extreme_weights"] == 5
         assert details["max_extreme_weights_per_output"] == 5
         assert details["max_to_threshold_ratio"] >= 2.0
+
+    @pytest.mark.parametrize("op_type", ["Gemm", "MatMul"])
+    def test_left_input_equivalent_graph_is_analyzed(self, tmp_path: Path, op_type: str) -> None:
+        analysis_weights = np.zeros((100, 10), dtype=np.float32)
+        analysis_weights[50:55, 3] = 10.0
+        model_path = create_left_equivalent_linear_model(tmp_path, analysis_weights, op_type=op_type)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = self._extreme_checks(result)
+        assert len(checks) == 1
+        details = checks[0].details
+        assert details["consumer_op"] == op_type
+        assert details["consumer_input_index"] == 0
+        assert details["output_axis"] == 0
+        assert details["stored_shape"] == [10, 100]
+        assert details["analysis_shape"] == [100, 10]
+        assert details["affected_neurons"] == [3]
+        assert details["analysis_storage_shares_memory"] is True
+
+    def test_small_binary_head_uses_robust_fallback(self, tmp_path: Path) -> None:
+        weights = np.zeros((50, 2), dtype=np.float32)
+        weights[:5, 0] = 1_000_000.0
+        model_path = create_onnx_weight_model(tmp_path, weights, op_type="MatMul")
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = self._extreme_checks(result)
+        assert len(checks) == 1
+        assert checks[0].details["affected_neurons"] == [0]
+        assert checks[0].details["max_to_threshold_ratio"] < 2.0
+
+    def test_nonqualifying_decoy_does_not_suppress_malicious_output(self, tmp_path: Path) -> None:
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+        weights[0, 4] = 3.0
+        model_path = create_onnx_weight_model(tmp_path, weights, op_type="MatMul")
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = self._extreme_checks(result)
+        assert len(checks) == 1
+        assert checks[0].details["affected_neurons"] == [3]
+        assert checks[0].details["num_extreme_weights"] == 5
+
+    def test_grouped_conv_transpose_uses_all_conceptual_outputs_without_clean_fp(self, tmp_path: Path) -> None:
+        weights = np.random.default_rng(42).normal(size=(4, 3, 3, 3)).astype(np.float32)
+        model_path = create_onnx_conv_weight_model(tmp_path, weights, transpose=True, group=2)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert [check for check in result.checks if check.name == "Weight Distribution Anomaly Detection"] == []
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["analyzed_layer_count"] == 1
+        context = semantics["eligible"][0]
+        assert context["stored_shape"] == [4, 3, 3, 3]
+        assert context["analysis_shape"] == [18, 6]
+        assert context["conceptual_output_axes"] == [0, 2]
+        assert context["group"] == 2
+        assert context["analysis_storage_shares_memory"] is True
+        assert context["analysis_materialization"] == "zero_copy_view_chunked_reduction"
+
+    def test_grouped_conv_transpose_retains_malicious_output_detection(self, tmp_path: Path) -> None:
+        weights = np.zeros((4, 3, 3, 3), dtype=np.float32)
+        weights[2:4, 1, 0:3, 0] = 10.0
+        model_path = create_onnx_conv_weight_model(tmp_path, weights, transpose=True, group=2)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = self._extreme_checks(result)
+        assert len(checks) == 1
+        details = checks[0].details
+        assert details["analysis_shape"] == [18, 6]
+        assert details["affected_neurons"] == [4]
+        assert details["num_extreme_weights"] == 6
+        assert details["group"] == 2
+        assert details["analysis_storage_shares_memory"] is True
+
+    def test_grouped_conv_transpose_analysis_only_uses_zero_copy_moveaxis(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        weights = np.random.default_rng(7).normal(size=(4, 3, 3, 3)).astype(np.float32)
+        model_path = create_onnx_conv_weight_model(tmp_path, weights, transpose=True, group=2)
+
+        original_moveaxis = np.moveaxis
+        moveaxis_calls = 0
+
+        def checked_moveaxis(*args: Any, **kwargs: Any) -> Any:
+            nonlocal moveaxis_calls
+            moveaxis_calls += 1
+            moved = original_moveaxis(*args, **kwargs)
+            assert np.shares_memory(args[0], moved)
+            return moved
+
+        monkeypatch.setattr(np, "moveaxis", checked_moveaxis)
+        result = OnnxScanner().scan(str(model_path))
+
+        assert moveaxis_calls == 1
+        assert (
+            result.metadata["onnx_weight_distribution_semantics"]["eligible"][0]["analysis_storage_shares_memory"]
+            is True
+        )
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+
+    @pytest.mark.parametrize("control_flow_op", ["If", "Loop", "Scan"])
+    def test_control_flow_subgraph_captures_outer_weight_initializer(
+        self,
+        tmp_path: Path,
+        control_flow_op: str,
+    ) -> None:
+        weights = np.zeros((100, 100), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+        model_path = create_control_flow_captured_weight_model(
+            tmp_path,
+            weights,
+            control_flow_op=control_flow_op,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = self._extreme_checks(result)
+        assert len(checks) == 1
+        details = checks[0].details
+        assert details["initializer"] == "W"
+        assert details["consumer_op"] == "MatMul"
+        assert details["consumer_input_index"] == 1
+        assert details["analysis_shape"] == [100, 100]
+        assert details["affected_neurons"] == [3]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_layer_count"] == 1
+
+    def test_subgraph_local_initializer_shadows_outer_weight(self, tmp_path: Path) -> None:
+        outer_weights = np.zeros((100, 100), dtype=np.float32)
+        outer_weights[50:55, 3] = 10.0
+        model_path = create_control_flow_shadowed_weight_model(tmp_path, outer_weights)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert self._extreme_checks(result) == []
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 0
+        assert semantics["analyzed_layer_count"] == 0
+        assert semantics["exclusion_counts"]["unused_initializer"] == 1
 
 
 class TestRawDetectorCoverage:

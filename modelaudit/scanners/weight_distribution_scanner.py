@@ -27,6 +27,11 @@ _MAX_NUMERIC_SCALAR_BYTES = 16
 _MIN_NUMPY_ARRAY_BUDGET_BYTES = 256
 _EXTREME_WEIGHT_MIN_EFFECT_RATIO = 2.0
 _EXTREME_WEIGHT_MIN_PER_OUTPUT = 2
+_EXTREME_WEIGHT_ROBUST_MAD_MULTIPLIER = 30.0
+_EXTREME_WEIGHT_ROBUST_FALLBACK_MIN_PER_OUTPUT = 3
+_NORMAL_MAD_SCALE_FACTOR = 1.4826
+_EXTREME_WEIGHT_ANALYSIS_CHUNK_BYTES = 8 * 1024 * 1024
+_EXTREME_WEIGHT_ROBUST_SAMPLE_SIZE = 256 * 1024
 _PICKLE_OBJECT_OPCODES = frozenset(
     {
         "BINBYTES",
@@ -1902,54 +1907,250 @@ class WeightDistributionScanner(BaseScanner):
                         },
                     )
 
-        # 3. Check for extreme weight values
-        weight_magnitudes = np.abs(weights)
-        mean_magnitude = np.mean(weight_magnitudes)
-        std_magnitude = np.std(weight_magnitudes)
+        # 3. Check for extreme weight values. Keep the decision per output so
+        # unrelated tails cannot supply or suppress another output's evidence.
+        anomalies.extend(self._analyze_tensor_weight_extremes(layer_name, weights, output_axes=(1,)))
+
+        return anomalies
+
+    def _analyze_tensor_weight_extremes(
+        self,
+        layer_name: str,
+        weights: Any,
+        *,
+        output_axes: tuple[int, ...],
+    ) -> list[dict[str, Any]]:
+        """Detect repeated extreme values without materializing a reordered tensor.
+
+        ``output_axes`` identifies the dimensions that form distinct output
+        neurons. Every other dimension is reduced as that output's weight vector.
+        This supports grouped convolution layouts while keeping the original
+        tensor storage order.
+        """
+        try:
+            import numpy as np
+        except ImportError:
+            return []
+
+        if len(weights.shape) < 2 or weights.size == 0:
+            return []
+
+        rank = len(weights.shape)
+        normalized_output_axes = tuple(axis if axis >= 0 else rank + axis for axis in output_axes)
+        if (
+            not normalized_output_axes
+            or len(set(normalized_output_axes)) != len(normalized_output_axes)
+            or any(axis < 0 or axis >= rank for axis in normalized_output_axes)
+        ):
+            raise ValueError(f"Invalid output axes {output_axes!r} for weight rank {rank}")
+
+        input_axes = tuple(axis for axis in range(rank) if axis not in normalized_output_axes)
+        if not input_axes or any(int(weights.shape[axis]) == 0 for axis in input_axes):
+            return []
+
+        n_outputs = math.prod(int(weights.shape[axis]) for axis in normalized_output_axes)
+        if n_outputs == 0:
+            return []
+
+        destination_axes = tuple(range(rank - len(normalized_output_axes), rank))
+        output_last_view = np.moveaxis(weights, normalized_output_axes, destination_axes)
+        input_shape = output_last_view.shape[: rank - len(normalized_output_axes)]
+        output_shape = output_last_view.shape[rank - len(normalized_output_axes) :]
+        # Magnitudes and squared magnitudes are accumulated in float64 so
+        # narrow source dtypes cannot overflow before the reduction.
+        analysis_itemsize = 8
+        max_work_values = max(1, _EXTREME_WEIGHT_ANALYSIS_CHUNK_BYTES // analysis_itemsize)
+        input_values_per_output = math.prod(int(dimension) for dimension in input_shape)
+        outputs_per_chunk = max(
+            1,
+            min(
+                int(output_shape[-1]),
+                max_work_values // max(1, input_values_per_output),
+            ),
+        )
+        input_block_budget = max(1, max_work_values // outputs_per_chunk)
+        input_block_shape = [1] * len(input_shape)
+        remaining_block_values = input_block_budget
+        for axis in reversed(range(len(input_shape))):
+            block_length = min(int(input_shape[axis]), remaining_block_values)
+            input_block_shape[axis] = max(1, block_length)
+            remaining_block_values = max(1, remaining_block_values // input_block_shape[axis])
+        input_block_counts = tuple(
+            math.ceil(int(dimension) / block_length)
+            for dimension, block_length in zip(input_shape, input_block_shape, strict=True)
+        )
+
+        def magnitudes_as_float64(chunk: Any) -> Any:
+            magnitudes = np.empty(chunk.shape, dtype=np.float64)
+            np.absolute(chunk, out=magnitudes, casting="unsafe")
+            return magnitudes
+
+        def iter_output_groups() -> Any:
+            prefix_shape = output_shape[:-1]
+            prefix_count = math.prod(int(dimension) for dimension in prefix_shape) if prefix_shape else 1
+            for prefix_index in range(prefix_count):
+                prefix = (
+                    tuple(int(value) for value in np.unravel_index(prefix_index, prefix_shape)) if prefix_shape else ()
+                )
+                for output_start in range(0, int(output_shape[-1]), outputs_per_chunk):
+                    output_end = min(int(output_shape[-1]), output_start + outputs_per_chunk)
+                    flat_output_start = prefix_index * int(output_shape[-1]) + output_start
+                    yield flat_output_start, prefix, output_start, output_end
+
+        def iter_group_chunks(prefix: tuple[int, ...], output_start: int, output_end: int) -> Any:
+            for block_index in np.ndindex(*input_block_counts):
+                input_slices = tuple(
+                    slice(
+                        index * block_length,
+                        min(int(input_shape[axis]), (index + 1) * block_length),
+                    )
+                    for axis, (index, block_length) in enumerate(
+                        zip(block_index, input_block_shape, strict=True),
+                    )
+                )
+                yield output_last_view[input_slices + prefix + (slice(output_start, output_end),)]
+
+        total_values = int(weights.size)
+        sample_step = max(1, math.ceil(total_values / _EXTREME_WEIGHT_ROBUST_SAMPLE_SIZE))
+        sample_parts: list[Any] = []
+        logical_offset = 0
+        magnitude_sum = 0.0
+        magnitude_square_sum = 0.0
+        for _flat_output_start, prefix, output_start, output_end in iter_output_groups():
+            for chunk in iter_group_chunks(prefix, output_start, output_end):
+                chunk_magnitudes = magnitudes_as_float64(chunk)
+                magnitude_sum += float(np.sum(chunk_magnitudes, dtype=np.float64))
+                first_sample = (-logical_offset) % sample_step
+                if first_sample < chunk_magnitudes.size:
+                    sample_parts.append(np.asarray(chunk_magnitudes.flat[first_sample::sample_step]))
+                logical_offset += int(chunk_magnitudes.size)
+                np.square(chunk_magnitudes, out=chunk_magnitudes)
+                magnitude_square_sum += float(np.sum(chunk_magnitudes, dtype=np.float64))
+
+        mean_magnitude = magnitude_sum / total_values
+        variance = max(0.0, magnitude_square_sum / total_values - mean_magnitude * mean_magnitude)
+        std_magnitude = math.sqrt(variance)
         threshold = mean_magnitude + self.weight_magnitude_threshold * std_magnitude
 
-        extreme_weights = np.where(weight_magnitudes > threshold)
-        if len(extreme_weights[0]) > 0:
-            # Group by output neuron
-            neurons_with_extreme_weights, per_output_counts = np.unique(extreme_weights[1], return_counts=True)
-            max_affected_outputs = max(1, int(0.001 * n_outputs))
-            max_extreme_per_output = int(np.max(per_output_counts))
-            max_weight = float(np.max(weight_magnitudes[extreme_weights]))
-            effect_ratio = max_weight / float(threshold) if threshold > 0 else 0.0
+        robust_sample = np.concatenate(sample_parts)[:_EXTREME_WEIGHT_ROBUST_SAMPLE_SIZE]
+        robust_median = float(np.median(robust_sample))
+        robust_mad = float(np.median(np.abs(robust_sample - robust_median)))
+        robust_scale = _NORMAL_MAD_SCALE_FACTOR * robust_mad
+        robust_threshold = robust_median + _EXTREME_WEIGHT_ROBUST_MAD_MULTIPLIER * robust_scale
 
-            # Ordinary distribution tails often produce one barely-over-threshold
-            # coefficient in several columns. Require a repeated, materially large
-            # effect localized to a genuinely small output subset.
-            if (
-                len(neurons_with_extreme_weights) <= max_affected_outputs
-                and max_extreme_per_output >= _EXTREME_WEIGHT_MIN_PER_OUTPUT
-                and effect_ratio >= _EXTREME_WEIGHT_MIN_EFFECT_RATIO
-            ):
-                anomalies.append(
+        reduction_axes = tuple(range(len(input_shape)))
+        max_affected_outputs = max(1, int(0.001 * n_outputs))
+        affected_neurons: list[int] = []
+        evidence: list[dict[str, Any]] = []
+        total_affected = 0
+        num_extreme_weights = 0
+        max_extreme_weights_per_output = 0
+        max_weight = 0.0
+        max_effect_ratio = 0.0
+        for flat_output_start, prefix, output_start, output_end in iter_output_groups():
+            output_count = output_end - output_start
+            classical_robust_counts = np.zeros(output_count, dtype=np.int64)
+            robust_counts = np.zeros(output_count, dtype=np.int64)
+            per_output_max = np.zeros(output_count, dtype=np.float64)
+            for chunk in iter_group_chunks(prefix, output_start, output_end):
+                chunk_magnitudes = magnitudes_as_float64(chunk)
+                robust_mask = (
+                    chunk_magnitudes > robust_threshold if robust_scale > 0 else chunk_magnitudes > robust_median
+                )
+                robust_counts += np.asarray(np.count_nonzero(robust_mask, axis=reduction_axes)).reshape(-1)
+                classical_mask = chunk_magnitudes > threshold
+                classical_mask &= robust_mask
+                classical_robust_counts += np.asarray(
+                    np.count_nonzero(classical_mask, axis=reduction_axes),
+                ).reshape(-1)
+                per_output_max = np.maximum(
+                    per_output_max,
+                    np.asarray(np.max(chunk_magnitudes, axis=reduction_axes)).reshape(-1),
+                )
+
+            if threshold > 0:
+                per_output_effect_ratios = per_output_max / threshold
+            else:
+                per_output_effect_ratios = np.where(per_output_max > 0, np.inf, 0.0)
+
+            classical_effect_qualified = (classical_robust_counts >= _EXTREME_WEIGHT_MIN_PER_OUTPUT) & (
+                per_output_effect_ratios >= _EXTREME_WEIGHT_MIN_EFFECT_RATIO
+            )
+            robust_fallback_qualified = classical_robust_counts >= _EXTREME_WEIGHT_ROBUST_FALLBACK_MIN_PER_OUTPUT
+            qualified_indices = np.flatnonzero(classical_effect_qualified | robust_fallback_qualified)
+            if len(qualified_indices) == 0:
+                continue
+
+            qualified_counts = classical_robust_counts[qualified_indices]
+            total_affected += len(qualified_indices)
+            num_extreme_weights += int(np.sum(qualified_counts))
+            max_extreme_weights_per_output = max(max_extreme_weights_per_output, int(np.max(qualified_counts)))
+            max_weight = max(max_weight, float(np.max(per_output_max[qualified_indices])))
+            max_effect_ratio = max(max_effect_ratio, float(np.max(per_output_effect_ratios[qualified_indices])))
+
+            for local_output_index in qualified_indices:
+                output_index = flat_output_start + int(local_output_index)
+                if len(affected_neurons) < 10:
+                    affected_neurons.append(output_index)
+                if len(evidence) >= 10:
+                    continue
+                effect_ratio = float(per_output_effect_ratios[local_output_index])
+                robust_effect_ratio = (
+                    float((per_output_max[local_output_index] - robust_median) / robust_scale)
+                    if robust_scale > 0
+                    else None
+                )
+                if classical_effect_qualified[local_output_index] and robust_fallback_qualified[local_output_index]:
+                    detection_path = "classical_and_robust"
+                elif classical_effect_qualified[local_output_index]:
+                    detection_path = "classical_effect"
+                else:
+                    detection_path = "robust_small_tensor_fallback"
+                evidence.append(
                     {
-                        "description": f"Layer '{layer_name}' has neurons with extremely large weight values",
-                        "severity": IssueSeverity.INFO,
-                        "details": {
-                            "layer": layer_name,
-                            "affected_neurons": neurons_with_extreme_weights.tolist()[:10],  # Limit list
-                            "total_affected": len(neurons_with_extreme_weights),
-                            "num_extreme_weights": len(extreme_weights[0]),
-                            "threshold": float(threshold),
-                            "max_weight": max_weight,
-                            "max_to_threshold_ratio": effect_ratio,
-                            "max_extreme_weights_per_output": max_extreme_per_output,
-                            "affected_output_limit": max_affected_outputs,
-                            "minimum_effect_ratio": _EXTREME_WEIGHT_MIN_EFFECT_RATIO,
-                            "minimum_extreme_weights_per_output": _EXTREME_WEIGHT_MIN_PER_OUTPUT,
-                            "total_outputs": n_outputs,
-                            "analysis_method": "structural_analysis",
-                        },
-                        "why": (
-                            "Weight values that are orders of magnitude larger than typical can cause numerical "
-                            "instability, overflow attacks, or may encode hidden data. Detection uses statistical "
-                            "analysis rather than name-based classification to avoid security bypasses."
-                        ),
+                        "output_index": output_index,
+                        "classical_robust_count": int(classical_robust_counts[local_output_index]),
+                        "robust_count": int(robust_counts[local_output_index]),
+                        "max_to_threshold_ratio": effect_ratio if np.isfinite(effect_ratio) else None,
+                        "robust_effect_ratio": robust_effect_ratio,
+                        "detection_path": detection_path,
                     },
                 )
 
-        return anomalies
+        if total_affected == 0:
+            return []
+
+        return [
+            {
+                "description": f"Layer '{layer_name}' has neurons with extremely large weight values",
+                "severity": IssueSeverity.INFO,
+                "details": {
+                    "layer": layer_name,
+                    "affected_neurons": affected_neurons,
+                    "total_affected": total_affected,
+                    "num_extreme_weights": num_extreme_weights,
+                    "threshold": threshold,
+                    "max_weight": max_weight,
+                    "max_to_threshold_ratio": max_effect_ratio if np.isfinite(max_effect_ratio) else None,
+                    "max_extreme_weights_per_output": max_extreme_weights_per_output,
+                    "affected_output_limit": max_affected_outputs,
+                    "localized": total_affected <= max_affected_outputs,
+                    "minimum_effect_ratio": _EXTREME_WEIGHT_MIN_EFFECT_RATIO,
+                    "minimum_extreme_weights_per_output": _EXTREME_WEIGHT_MIN_PER_OUTPUT,
+                    "robust_median_magnitude": robust_median,
+                    "robust_mad_scale": robust_scale,
+                    "robust_threshold": robust_threshold,
+                    "robust_mad_multiplier": _EXTREME_WEIGHT_ROBUST_MAD_MULTIPLIER,
+                    "robust_fallback_minimum_per_output": _EXTREME_WEIGHT_ROBUST_FALLBACK_MIN_PER_OUTPUT,
+                    "per_output_evidence": evidence,
+                    "total_outputs": n_outputs,
+                    "analysis_method": "per_output_robust_analysis",
+                },
+                "why": (
+                    "Repeated weight values that are materially beyond both classical and robust distribution "
+                    "baselines can cause numerical instability, overflow attacks, or encode hidden data. Evidence "
+                    "is evaluated independently per output so unrelated coefficients cannot create or suppress an "
+                    "alert."
+                ),
+            },
+        ]
