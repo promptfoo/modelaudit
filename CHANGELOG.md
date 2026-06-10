@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- preserve valid bounded SafeTensors routing when header lengths resemble compression magic
+- preserve bounded and fail-closed SafeTensors routing when header lengths resemble compression magic
 - preserve sanitized CatBoost command context in SARIF without exposing injected or neighboring credential values
 - redact values compared against sensitive keys in generic exports and literal credential comparisons in CatBoost evidence
 - preserve critical PyTorch malformed-ZIP symlink findings, valid Python 3.10 streamed ZIP64 descriptors, and selected subtype findings from complete nested and concatenated HDF5 user-block ZIPs while retaining bounded fail-closed preflight checks and avoiding structure-only ZIP route probes

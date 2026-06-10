@@ -1968,23 +1968,11 @@ def _is_safetensors_routing_candidate(path: Path | None, magic8: bytes, file_siz
         parsed_header = json.loads(header.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return False
+    except (RecursionError, ValueError):
+        # Parsing limits are inconclusive, so retain the fail-closed scanner route.
+        return True
 
     return isinstance(parsed_header, dict)
-
-
-def _has_bounded_safetensors_framing(path: Path | None, magic8: bytes, file_size: int) -> bool:
-    """Return whether a complete bounded SafeTensors JSON header owns the file."""
-    if len(magic8) < 8:
-        return False
-    try:
-        header_len = struct.unpack("<Q", magic8)[0]
-    except struct.error:
-        return False
-    return header_len <= SAFETENSORS_ROUTING_HEADER_PARSE_BYTES and _is_safetensors_routing_candidate(
-        path,
-        magic8,
-        file_size,
-    )
 
 
 def should_defer_safetensors_header_limit_hash(path: str, max_header_bytes: int) -> bool:
@@ -4070,7 +4058,7 @@ def detect_format_from_magic_bytes(
     """Detect file format using Python 3.10+ pattern matching on magic bytes."""
     compression_format = _detect_compression_format(magic16)
     if compression_format:
-        if _has_bounded_safetensors_framing(file_path, magic8, file_size):
+        if _is_safetensors_routing_candidate(file_path, magic8, file_size):
             return "safetensors"
         return compression_format
 
@@ -4602,6 +4590,8 @@ def detect_file_format(path: str) -> str:
         return llamafile_format
 
     compression_format = _detect_compression_format(header)
+    if compression_format and _is_safetensors_routing_candidate(file_path, magic8, size):
+        return "safetensors"
     has_known_container_magic = (
         _has_zip_magic(magic4)
         or magic8.startswith(_SEVENZIP_MAGIC)
@@ -4667,8 +4657,6 @@ def detect_file_format(path: str) -> str:
     if _looks_like_uncompressed_tar_header(header):
         return _detect_tar_route(path) or "tar"
     if compression_format:
-        if _has_bounded_safetensors_framing(file_path, magic8, size):
-            return "safetensors"
         tar_route = _detect_tar_route(path)
         if tar_route is not None:
             return tar_route
