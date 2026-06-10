@@ -256,11 +256,15 @@ def _create_results(
         # Add fingerprints for deduplication
         import hashlib
 
-        fingerprint_message = _redact_text_for_sarif(issue.message)
-        fingerprint_location = _redact_path_for_sarif(issue.location or "")
-        fingerprint = hashlib.sha256(
-            f"{fingerprint_message}{fingerprint_location}{issue.severity}".encode()
-        ).hexdigest()[:16]
+        fingerprint = ""
+        if issue.details:
+            fingerprint = _redact_text_for_sarif(str(issue.details.get("evidence_fingerprint", "")))
+        if not fingerprint:
+            fingerprint_message = _redact_text_for_sarif(issue.message)
+            fingerprint_location = _redact_path_for_sarif(issue.location or "")
+            fingerprint = hashlib.sha256(
+                f"{fingerprint_message}{fingerprint_location}{issue.severity}".encode()
+            ).hexdigest()[:16]
         result["partialFingerprints"]["primaryLocationLineHash"] = fingerprint  # type: ignore[index]
 
         # Add properties with additional details

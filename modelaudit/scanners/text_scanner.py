@@ -1,6 +1,7 @@
 """Scanner for text-based ML files like README.md and vocab.txt."""
 
 import ast
+import hashlib
 import io
 import keyword
 import os
@@ -8,9 +9,10 @@ import re
 import token
 import tokenize
 from typing import Any, ClassVar
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from modelaudit.core_results import mark_operational_scan_error
+from modelaudit.detectors.network_comm import redact_url_for_finding
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from modelaudit.scanners._evidence_redaction import redact_untrusted_error_message
 from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
@@ -50,6 +52,28 @@ PASSIVE_NETWORK_FINDING_TYPES = frozenset(
         "url_detected",
     }
 )
+CORRELATABLE_DOCUMENTATION_NETWORK_FINDING_TYPES = PASSIVE_NETWORK_FINDING_TYPES | frozenset({"network_command"})
+DOCUMENTATION_NETWORK_EVIDENCE_TRAILING_DELIMITERS = ".,;:)]}'\"`>"
+DOCUMENTATION_NETWORK_EVIDENCE_LEADING_DELIMITERS = "<([{'\"`"
+DOCUMENTATION_NETWORK_DESTINATION_TOKEN_PATTERN = re.compile(rb"[^\s;&|#]+")
+DOCUMENTATION_NETWORK_FINDING_SEVERITY_RANK = {
+    "DEBUG": 0,
+    "INFO": 1,
+    "LOW": 1,
+    "MEDIUM": 2,
+    "WARNING": 2,
+    "HIGH": 3,
+    "CRITICAL": 3,
+}
+DOCUMENTATION_NETWORK_FINDING_PRIORITY = {
+    "network_command": 40,
+    "cloud_storage_url": 30,
+    "url_detected": 20,
+    "ipv4_address": 10,
+    "ipv6_address": 10,
+    "domain_name": 0,
+    "domain": 0,
+}
 PASSIVE_DATA_TEXT_FILENAMES = frozenset({"classes.txt"})
 PASSIVE_DATA_TEXT_PREFIXES = ("label", "token", "vocab")
 BARE_NETWORK_URL_TOKEN_PATTERN = re.compile(rb"[A-Za-z][A-Za-z0-9+.-]*://\S+")
@@ -1540,6 +1564,348 @@ class TextScanner(BaseScanner):
             finding,
         )
 
+    @staticmethod
+    def _documentation_line_bounds(payload: bytes, position: int) -> tuple[int, int, int]:
+        position = min(max(position, 0), len(payload))
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        line_end = payload.find(b"\n", position)
+        if line_end < 0:
+            line_end = len(payload)
+        return line_start, line_end, payload.count(b"\n", 0, line_start) + 1
+
+    @staticmethod
+    def _normalize_documentation_network_evidence_value(value: str) -> str:
+        normalized = value.strip().lstrip(DOCUMENTATION_NETWORK_EVIDENCE_LEADING_DELIMITERS)
+        normalized = normalized.rstrip(DOCUMENTATION_NETWORK_EVIDENCE_TRAILING_DELIMITERS)
+        if "://" in normalized:
+            normalized = redact_url_for_finding(normalized)
+        try:
+            parsed = urlsplit(normalized)
+        except ValueError:
+            return normalized.casefold()
+        if parsed.scheme and parsed.netloc:
+            return urlunsplit(
+                (
+                    parsed.scheme.casefold(),
+                    parsed.netloc.casefold(),
+                    parsed.path,
+                    parsed.query,
+                    parsed.fragment,
+                )
+            )
+        return normalized.casefold()
+
+    @classmethod
+    def _documentation_network_evidence_from_span(
+        cls,
+        payload: bytes,
+        span_start: int,
+        span_end: int,
+        *,
+        kind: str,
+        value: str,
+    ) -> dict[str, Any]:
+        line_start, _line_end, line_number = cls._documentation_line_bounds(payload, span_start)
+        return {
+            "kind": kind,
+            "value": cls._normalize_documentation_network_evidence_value(value),
+            "line": line_number,
+            "column": span_start - line_start + 1,
+            "span_start": span_start,
+            "span_end": span_end,
+        }
+
+    @classmethod
+    def _documentation_url_evidence_at_position(
+        cls,
+        payload: bytes,
+        position: int,
+    ) -> dict[str, Any] | None:
+        line_start, line_end, _line_number = cls._documentation_line_bounds(payload, position)
+        line = payload[line_start:line_end]
+        line_position = position - line_start
+        for match in BARE_NETWORK_URL_TOKEN_PATTERN.finditer(line):
+            if not (match.start() <= line_position < match.end()):
+                continue
+            raw_value = match.group().decode("utf-8", errors="ignore")
+            return cls._documentation_network_evidence_from_span(
+                payload,
+                line_start + match.start(),
+                line_start + match.end(),
+                kind="url",
+                value=redact_url_for_finding(raw_value),
+            )
+        return None
+
+    @classmethod
+    def _documentation_network_command_evidence(
+        cls,
+        payload: bytes,
+        finding: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        position = finding.get("position")
+        destination = finding.get("destination")
+        if not isinstance(position, int) or not isinstance(destination, str) or not destination:
+            return None
+
+        url_evidence = cls._documentation_url_evidence_at_position(payload, position)
+        if url_evidence is not None:
+            return url_evidence
+
+        line_start, line_end, _line_number = cls._documentation_line_bounds(payload, position)
+        line_position = position - line_start
+        destination_match = DOCUMENTATION_NETWORK_DESTINATION_TOKEN_PATTERN.match(
+            payload[line_start:line_end], line_position
+        )
+        if destination_match is None:
+            return None
+        return cls._documentation_network_evidence_from_span(
+            payload,
+            line_start + destination_match.start(),
+            line_start + destination_match.end(),
+            kind="destination",
+            value=destination,
+        )
+
+    @staticmethod
+    def _documentation_network_command_is_correlatable(finding: dict[str, Any]) -> bool:
+        return finding.get("type") == "network_command" and finding.get("command_type") == "git_clone"
+
+    @classmethod
+    def _documentation_network_command_evidences(
+        cls,
+        payload: bytes,
+        findings: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        return [
+            evidence
+            for finding in findings
+            if cls._documentation_network_command_is_correlatable(finding)
+            if (evidence := cls._documentation_network_command_evidence(payload, finding)) is not None
+        ]
+
+    @staticmethod
+    def _documentation_network_evidence_at_position(
+        evidences: list[dict[str, Any]],
+        position: int,
+    ) -> dict[str, Any] | None:
+        matching_evidences = [
+            evidence for evidence in evidences if int(evidence["span_start"]) <= position < int(evidence["span_end"])
+        ]
+        if not matching_evidences:
+            return None
+        return min(matching_evidences, key=lambda evidence: int(evidence["span_end"]) - int(evidence["span_start"]))
+
+    @classmethod
+    def _documentation_network_finding_evidence(
+        cls,
+        payload: bytes,
+        finding: dict[str, Any],
+        command_evidences: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        finding_type = finding.get("type")
+        position = finding.get("position")
+        if finding_type not in CORRELATABLE_DOCUMENTATION_NETWORK_FINDING_TYPES or not isinstance(position, int):
+            return None
+        if finding_type == "network_command" and not cls._documentation_network_command_is_correlatable(finding):
+            return None
+
+        url_evidence = cls._documentation_url_evidence_at_position(payload, position)
+        if url_evidence is not None:
+            return url_evidence
+
+        command_evidence = cls._documentation_network_evidence_at_position(command_evidences, position)
+        if command_evidence is not None:
+            return command_evidence
+
+        if finding_type == "network_command":
+            return cls._documentation_network_command_evidence(payload, finding)
+
+        if finding_type in {"domain", "domain_name"}:
+            value = finding.get("domain")
+            kind = "host"
+        elif finding_type in {"ipv4_address", "ipv6_address"}:
+            value = finding.get("ip")
+            kind = "ip"
+        elif finding_type in {"cloud_storage_url", "url_detected"}:
+            value = finding.get("url")
+            kind = "url"
+        else:
+            return None
+
+        if not isinstance(value, str) or not value:
+            return None
+        return cls._documentation_network_evidence_from_span(
+            payload,
+            position,
+            position + len(value.encode("utf-8", errors="ignore")),
+            kind=kind,
+            value=value,
+        )
+
+    @staticmethod
+    def _documentation_network_finding_sort_key(finding: dict[str, Any], original_index: int) -> tuple[int, int, int]:
+        severity = str(finding.get("severity", "WARNING")).upper()
+        finding_type = str(finding.get("type", ""))
+        return (
+            DOCUMENTATION_NETWORK_FINDING_PRIORITY.get(finding_type, 0),
+            DOCUMENTATION_NETWORK_FINDING_SEVERITY_RANK.get(
+                severity,
+                DOCUMENTATION_NETWORK_FINDING_SEVERITY_RANK["WARNING"],
+            ),
+            -original_index,
+        )
+
+    @staticmethod
+    def _highest_documentation_network_severity(findings: list[dict[str, Any]]) -> str:
+        return max(
+            (str(finding.get("severity", "WARNING")).upper() for finding in findings),
+            key=lambda severity: DOCUMENTATION_NETWORK_FINDING_SEVERITY_RANK.get(
+                severity,
+                DOCUMENTATION_NETWORK_FINDING_SEVERITY_RANK["WARNING"],
+            ),
+        )
+
+    @classmethod
+    def _calibrated_documentation_network_severity(
+        cls,
+        representative: dict[str, Any],
+        findings: list[dict[str, Any]],
+    ) -> str:
+        representative_severity = str(representative.get("severity", "WARNING")).upper()
+        if representative.get("type") in {"cloud_storage_url", "network_command"}:
+            return representative_severity
+        return cls._highest_documentation_network_severity(findings)
+
+    @staticmethod
+    def _documentation_network_evidence_fingerprint(evidence: dict[str, Any]) -> str:
+        material = "|".join(
+            (
+                "text-documentation-network-v1",
+                str(evidence["line"]),
+                str(evidence["column"]),
+                str(evidence["kind"]),
+                str(evidence["value"]),
+            )
+        )
+        digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+        return f"text-doc-network:{digest}"
+
+    @staticmethod
+    def _documentation_network_related_finding(finding: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: finding[key]
+            for key in (
+                "type",
+                "severity",
+                "message",
+                "position",
+                "url",
+                "domain",
+                "ip",
+                "destination",
+                "command_type",
+                "provider",
+            )
+            if key in finding
+        }
+
+    @classmethod
+    def _annotate_documentation_network_finding(
+        cls,
+        finding: dict[str, Any],
+        evidence: dict[str, Any],
+        related_findings: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        fingerprint = cls._documentation_network_evidence_fingerprint(evidence)
+        annotated = {
+            **finding,
+            "line": evidence["line"],
+            "column": evidence["column"],
+            "evidence_fingerprint": fingerprint,
+            "evidence_location": {
+                "line": evidence["line"],
+                "column": evidence["column"],
+                "span_start": evidence["span_start"],
+                "span_end": evidence["span_end"],
+            },
+            "normalized_evidence": {
+                "kind": evidence["kind"],
+                "value": evidence["value"],
+            },
+        }
+        if related_findings:
+            annotated["deduplicated_related_findings"] = related_findings
+            annotated["deduplicated_related_count"] = len(related_findings)
+        return annotated
+
+    @classmethod
+    def _deduplicate_documentation_network_findings(
+        cls,
+        path: str,
+        payload: bytes,
+        findings: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not cls._is_documentation_sidecar(path):
+            return findings
+
+        command_evidences = cls._documentation_network_command_evidences(payload, findings)
+        grouped: dict[tuple[int, int, str, str], list[tuple[int, dict[str, Any], dict[str, Any]]]] = {}
+        ordered_items: list[tuple[str, int | tuple[int, int, str, str]]] = []
+        standalone: dict[int, dict[str, Any]] = {}
+        for index, finding in enumerate(findings):
+            evidence = cls._documentation_network_finding_evidence(payload, finding, command_evidences)
+            if evidence is None:
+                ordered_items.append(("standalone", index))
+                standalone[index] = finding
+                continue
+            key = (
+                int(evidence["line"]),
+                int(evidence["column"]),
+                str(evidence["kind"]),
+                str(evidence["value"]),
+            )
+            if key not in grouped:
+                ordered_items.append(("group", key))
+            grouped.setdefault(key, []).append((index, finding, evidence))
+
+        deduplicated: list[dict[str, Any]] = []
+        emitted_keys: set[tuple[int, int, str, str]] = set()
+        for item_type, item_value in ordered_items:
+            if item_type == "standalone":
+                assert isinstance(item_value, int)
+                deduplicated.append(standalone[item_value])
+                continue
+            assert not isinstance(item_value, int)
+            key = item_value
+            if key in emitted_keys:
+                continue
+            emitted_keys.add(key)
+            entries = grouped[key]
+            representative_index, representative, representative_evidence = max(
+                entries,
+                key=lambda entry: cls._documentation_network_finding_sort_key(entry[1], entry[0]),
+            )
+            severity = cls._calibrated_documentation_network_severity(
+                representative,
+                [entry[1] for entry in entries],
+            )
+            if str(representative.get("severity", "WARNING")).upper() != severity:
+                representative = {**representative, "severity": severity}
+            related_findings = [
+                cls._documentation_network_related_finding(related)
+                for related_index, related, _evidence in entries
+                if related_index != representative_index
+            ]
+            deduplicated.append(
+                cls._annotate_documentation_network_finding(
+                    representative,
+                    representative_evidence,
+                    related_findings,
+                )
+            )
+        return deduplicated
+
     @classmethod
     def _downgrade_sidecar_network_findings(
         cls,
@@ -1700,6 +2066,11 @@ class TextScanner(BaseScanner):
                 )
                 network_findings, finding_limit = self._split_detector_finding_limit(network_findings)
                 network_findings, classification_incomplete = self._downgrade_sidecar_network_findings(
+                    path,
+                    inspected_payload,
+                    network_findings,
+                )
+                network_findings = self._deduplicate_documentation_network_findings(
                     path,
                     inspected_payload,
                     network_findings,

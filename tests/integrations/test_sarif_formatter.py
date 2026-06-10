@@ -665,6 +665,18 @@ class TestCreateResults:
         assert "partialFingerprints" in results[0]
         assert "primaryLocationLineHash" in results[0]["partialFingerprints"]
 
+    def test_result_uses_evidence_fingerprint_when_present(self):
+        issue = Issue(
+            message="Duplicate documentation indicators",
+            severity=IssueSeverity.WARNING,
+            details={"evidence_fingerprint": "text-doc-network:stable"},
+            timestamp=time.time(),
+        )
+
+        results = _create_results([issue])
+
+        assert results[0]["partialFingerprints"]["primaryLocationLineHash"] == "text-doc-network:stable"
+
     def test_result_kind_by_severity(self):
         """Test result kind based on severity."""
         critical = Issue(message="Critical", severity=IssueSeverity.CRITICAL, timestamp=time.time())

