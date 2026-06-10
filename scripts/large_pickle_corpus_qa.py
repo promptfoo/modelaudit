@@ -1573,7 +1573,21 @@ def cmd_scan(args: argparse.Namespace) -> int:
     _write_benchmark_csv(run_dir / "benchmark-summary.csv", all_scan_rows, all_third_party_rows)
     _write_report(run_dir, all_scan_rows, all_third_party_rows)
     print(f"Wrote QA run to {run_dir}")
+    scan_error_count = sum(1 for row in all_scan_rows if _scan_row_has_error(row))
+    if scan_error_count:
+        print(
+            f"QA scan failed with {scan_error_count} scan error(s); see {scan_results_path}",
+            file=sys.stderr,
+        )
+        return 2
     return 1 if _has_blocking_drift(all_scan_rows) and args.fail_on_drift else 0
+
+
+def _scan_row_has_error(row: Mapping[str, Any]) -> bool:
+    if row.get("status") == "error":
+        return True
+    result = row.get("result")
+    return isinstance(result, Mapping) and result.get("status") == "error"
 
 
 def _rows_by_artifact_and_scanner(rows: Iterable[Mapping[str, Any]]) -> dict[tuple[str, str], dict[str, Any]]:

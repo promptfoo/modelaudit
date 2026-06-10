@@ -346,6 +346,98 @@ def test_classify_preserves_lock_selection_metadata(tmp_path: Path) -> None:
     assert payload["entries"][0]["classification"]["exists"] is True
 
 
+def test_scan_fails_closed_for_unsafe_lock_id(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    artifact_path = tmp_path / "artifact.pkl"
+    artifact_path.write_bytes(b"\x80\x04N.")
+    lock_path = tmp_path / "lock.json"
+    run_dir = tmp_path / "run"
+    large_pickle_corpus_qa._write_lock(
+        lock_path,
+        [{"id": "../escaped", "local_path": str(artifact_path)}],
+        tier="custom",
+    )
+
+    exit_code = large_pickle_corpus_qa.main(
+        [
+            "scan",
+            "--lock",
+            str(lock_path),
+            "--out",
+            str(run_dir),
+            "--no-synthetic",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    scan_rows = large_pickle_corpus_qa._read_jsonl(run_dir / "scan-results.jsonl")
+    assert exit_code == 2
+    assert "QA scan failed with 1 scan error(s)" in captured.err
+    assert len(scan_rows) == 1
+    assert scan_rows[0]["scanner"] == "harness"
+    assert scan_rows[0]["mode"] == "invalid-lock-entry"
+    assert scan_rows[0]["status"] == "error"
+    assert scan_rows[0]["error"] == "ValueError: unsafe corpus artifact id: '../escaped'"
+
+
+def test_scan_error_exit_takes_precedence_over_blocking_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    artifact_path = tmp_path / "artifact.pkl"
+    artifact_path.write_bytes(b"\x80\x04N.")
+    lock_path = tmp_path / "lock.json"
+    run_dir = tmp_path / "run"
+    large_pickle_corpus_qa._write_lock(
+        lock_path,
+        [{"id": "A01", "local_path": str(artifact_path)}],
+        tier="custom",
+    )
+    scan_rows = [
+        {
+            "artifact_id": "A01",
+            "scanner": "modelaudit-picklescan",
+            "mode": "rust",
+            "result": {"status": "error", "verdict": "unknown", "success": False, "rule_codes": []},
+        },
+        {
+            "artifact_id": "A01",
+            "scanner": "modelaudit-root",
+            "mode": "default:rust",
+            "result": {"status": "complete", "verdict": "clean", "success": True, "rule_codes": []},
+        },
+    ]
+
+    def fake_scan_records_for_entry(
+        *_args: object, **_kwargs: object
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        return scan_rows, []
+
+    monkeypatch.setattr(large_pickle_corpus_qa, "_scan_records_for_entry", fake_scan_records_for_entry)
+
+    exit_code = large_pickle_corpus_qa.main(
+        [
+            "scan",
+            "--lock",
+            str(lock_path),
+            "--out",
+            str(run_dir),
+            "--no-synthetic",
+            "--fail-on-drift",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    drift = json.loads((run_dir / "parity-drift.json").read_text(encoding="utf-8"))
+    assert exit_code == 2
+    assert "QA scan failed with 1 scan error(s)" in captured.err
+    assert drift["drift_count"] == 1
+    assert drift["drifts"][0]["delta"] == "status_drift"
+
+
 def test_parity_drift_detects_root_false_negative() -> None:
     rows = [
         {
