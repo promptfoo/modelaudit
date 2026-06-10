@@ -1627,22 +1627,36 @@ class LlamafileScanner(BaseScanner):
 
         payload_bytes_scanned = 0
         recognized_offsets: set[int] = set()
-        candidates_to_scan = gguf_candidates[:LLAMAFILE_GGUF_MAX_PAYLOAD_CANDIDATE_SCANS]
+        if gguf_offset is not None:
+            prioritized_candidates = [gguf_offset]
+            prioritized_candidates.extend(offset for offset in gguf_candidates if offset != gguf_offset)
+        else:
+            prioritized_candidates = gguf_candidates
+        candidates_to_scan = prioritized_candidates[:LLAMAFILE_GGUF_MAX_PAYLOAD_CANDIDATE_SCANS]
         if len(gguf_candidates) > len(candidates_to_scan):
             gguf_candidate_scan_limited = True
 
-        remaining_carve_bytes = self.max_payload_carve_bytes
-        for index, candidate_offset in enumerate(candidates_to_scan):
-            if remaining_carve_bytes < 24:
-                gguf_candidate_scan_limited = True
-                break
-            next_offset = gguf_candidates[index + 1] if index + 1 < len(gguf_candidates) else file_size
+        max_candidate_scans_by_budget = max(0, self.max_payload_carve_bytes) // 24
+        if len(candidates_to_scan) > max_candidate_scans_by_budget:
+            candidates_to_scan = candidates_to_scan[:max_candidate_scans_by_budget]
+            gguf_candidate_scan_limited = True
+
+        next_candidate_offsets = {
+            candidate_offset: (gguf_candidates[index + 1] if index + 1 < len(gguf_candidates) else file_size)
+            for index, candidate_offset in enumerate(gguf_candidates)
+        }
+        remaining_carve_bytes = max(0, self.max_payload_carve_bytes)
+        selected_payload_metadata: dict[str, Any] | None = None
+        for candidate_index, candidate_offset in enumerate(candidates_to_scan):
+            remaining_candidates = len(candidates_to_scan) - candidate_index
+            candidate_budget = remaining_carve_bytes // remaining_candidates
+            next_offset = next_candidate_offsets[candidate_offset]
             candidate_size = (
                 payload_size
                 if zip_payload is not None and candidate_offset == gguf_offset and payload_size is not None
                 else max(0, next_offset - candidate_offset)
             )
-            candidate_size = min(candidate_size, remaining_carve_bytes)
+            candidate_size = min(candidate_size, candidate_budget)
             scanned_bytes, recognized_candidate = self._scan_embedded_payload(
                 path_obj,
                 result,
@@ -1653,6 +1667,19 @@ class LlamafileScanner(BaseScanner):
             remaining_carve_bytes = max(0, remaining_carve_bytes - scanned_bytes)
             if recognized_candidate:
                 recognized_offsets.add(candidate_offset)
+            if candidate_offset == gguf_offset:
+                selected_payload_metadata = {
+                    "embedded_payload_offset": result.metadata.get("embedded_payload_offset"),
+                    "embedded_payload_size": result.metadata.get("embedded_payload_size"),
+                    "embedded_gguf_metadata": result.metadata.get("embedded_gguf_metadata"),
+                }
+
+        if selected_payload_metadata is not None:
+            for key, value in selected_payload_metadata.items():
+                if value is None:
+                    result.metadata.pop(key, None)
+                else:
+                    result.metadata[key] = value
 
         if not gguf_candidates and zip_payload is None:
             payload_bytes_scanned, _ = self._scan_embedded_payload(

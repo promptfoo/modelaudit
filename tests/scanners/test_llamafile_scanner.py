@@ -19,6 +19,7 @@ from modelaudit.scanners.llamafile_scanner import (
     LLAMAFILE_GGUF_HEADER_INCOMPLETE_REASON,
     LLAMAFILE_GGUF_HEADER_LIMIT_REASON,
     LLAMAFILE_GGUF_MAX_HEADER_CANDIDATES,
+    LLAMAFILE_GGUF_MAX_PAYLOAD_CANDIDATE_SCANS,
     LLAMAFILE_GGUF_ZIP_MEMBER_INCOMPLETE_REASON,
     LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON,
     LLAMAFILE_ROUTE_SCAN_BYTES,
@@ -524,6 +525,84 @@ def test_llamafile_scanner_scans_gguf_candidates_inside_mapped_executable_ranges
     result = LlamafileScanner().scan(str(binary))
 
     assert result.metadata["mapped_executable_end"] == mapped_size
+    assert result.metadata["embedded_payload_boundary_trusted"] is True
+    assert any(
+        check.name == "Llamafile Embedded Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_llamafile_scanner_prioritizes_selected_gguf_boundary_after_many_mapped_decoys(tmp_path: Path) -> None:
+    binary = tmp_path / "many-mapped-gguf-decoys.llamafile"
+    malicious_payload = _build_gguf_string_metadata(
+        [("tokenizer.chat_template", "{{ ''.__class__.__mro__[1].__subclasses__() }}")]
+    )
+    payload_offset = _write_sparse_mapped_llamafile(binary, "elf", embedded_payload=malicious_payload)
+    decoy = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
+    with binary.open("r+b") as handle:
+        for index in range(LLAMAFILE_GGUF_MAX_PAYLOAD_CANDIDATE_SCANS + 1):
+            handle.seek((1024 * 1024) + (index * 64))
+            handle.write(decoy)
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata["embedded_payload_offset"] == payload_offset
+    assert result.metadata["embedded_payload_boundary_trusted"] is True
+    assert LLAMAFILE_GGUF_CANDIDATE_SCAN_LIMIT_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Llamafile Embedded Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_llamafile_scanner_keeps_benign_selected_gguf_boundary_clean_after_many_mapped_decoys(
+    tmp_path: Path,
+) -> None:
+    binary = tmp_path / "many-mapped-gguf-decoys-benign.llamafile"
+    benign_payload = _build_gguf_string_metadata(
+        [("general.description", "INFO llama server listening on http://127.0.0.1:8080")]
+    )
+    payload_offset = _write_sparse_mapped_llamafile(binary, "elf", embedded_payload=benign_payload)
+    decoy = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
+    with binary.open("r+b") as handle:
+        for index in range(LLAMAFILE_GGUF_MAX_PAYLOAD_CANDIDATE_SCANS + 1):
+            handle.seek((1024 * 1024) + (index * 64))
+            handle.write(decoy)
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata["embedded_payload_offset"] == payload_offset
+    assert result.metadata["embedded_payload_boundary_trusted"] is True
+    assert not any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
+    assert not any(
+        check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+
+
+def test_llamafile_scanner_reserves_carve_budget_for_mapped_gguf_candidates(tmp_path: Path) -> None:
+    binary = tmp_path / "mapped-malicious-gguf-before-large-selected-payload.llamafile"
+    mapped_size = 8 * 1024 * 1024
+    malicious_offset = 1024 * 1024
+    selected_offset = 10 * 1024 * 1024
+    malicious_payload = _build_gguf_string_metadata(
+        [("tokenizer.chat_template", "{{ ''.__class__.__mro__[1].__subclasses__() }}")]
+    )
+    benign_payload = _build_gguf_string_metadata([("general.description", "benign model")])
+    with binary.open("wb") as handle:
+        handle.write(_build_mapped_executable_header("elf", mapped_size))
+        handle.seek(malicious_offset)
+        handle.write(malicious_payload)
+        handle.seek(6 * 1024 * 1024)
+        handle.write(b"llamafile runtime\n")
+        handle.seek(selected_offset)
+        handle.write(benign_payload)
+        handle.seek(selected_offset + 1024)
+        handle.write(b"\x00")
+
+    result = LlamafileScanner(config={"llamafile_payload_carve_bytes": 512}).scan(str(binary))
+
+    assert result.metadata["embedded_payload_offset"] == selected_offset
     assert result.metadata["embedded_payload_boundary_trusted"] is True
     assert any(
         check.name == "Llamafile Embedded Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
