@@ -2127,6 +2127,10 @@ class TestAdvancedFileHandler:
         assert scanned_names.count(shard_two.name) == 2
         assert cache_entries == 0
 
+    @pytest.mark.skipif(
+        os.name == "nt" or sys.platform == "darwin",
+        reason="requires descriptor-bound sharded caching with reliable sibling identity",
+    )
     def test_cached_sharded_scan_revalidates_retargeted_sibling(
         self,
         tmp_path: Path,
