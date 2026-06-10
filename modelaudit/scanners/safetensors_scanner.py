@@ -33,6 +33,7 @@ _DTYPE_SIZES = {
     "U64": 8,
 }
 MAX_HEADER_BYTES = 16 * 1024 * 1024
+_MAX_PLATFORM_USIZE = (1 << (8 * struct.calcsize("P"))) - 1
 SAFETENSORS_HEADER_INCONCLUSIVE_REASON = "safetensors_header_validation_failed"
 SAFETENSORS_STRUCTURE_INCONCLUSIVE_REASON = "safetensors_structure_validation_failed"
 SAFETENSORS_HEADER_LIMIT_INCONCLUSIVE_REASON = "safetensors_header_size_limit_exceeded"
@@ -862,7 +863,11 @@ class SafeTensorsScanner(BaseScanner):
         for dim in shape:
             if not isinstance(dim, int) or isinstance(dim, bool) or dim < 0:
                 return None
+            if dim > _MAX_PLATFORM_USIZE or (dim and total > _MAX_PLATFORM_USIZE // dim):
+                return None
             total *= dim
+        if total > _MAX_PLATFORM_USIZE // size:
+            return None
         return total * size
 
     def _detect_metadata_injection_attacks(

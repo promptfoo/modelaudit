@@ -12,6 +12,7 @@ import pytest
 # Skip if safetensors is not available before importing it
 pytest.importorskip("safetensors")
 
+from safetensors import SafetensorError, safe_open
 from safetensors.numpy import load_file, save_file
 
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
@@ -151,6 +152,65 @@ def test_empty_tensor_offset_order_does_not_create_false_overlap(tmp_path: Path)
     assert not any(
         check.status == CheckStatus.FAILED and check.name == "Offset Continuity Check" for check in result.checks
     )
+
+
+@pytest.mark.parametrize(
+    ("dtype", "shape"),
+    [
+        ("U8", [1 << (8 * struct.calcsize("P") - 1), 2, 0]),
+        ("U16", [1 << (8 * struct.calcsize("P") - 1)]),
+        ("U8", [1 << (8 * struct.calcsize("P")), 0]),
+    ],
+)
+def test_shape_size_overflow_cannot_be_masked_by_zero_dimension(
+    tmp_path: Path,
+    dtype: str,
+    shape: list[int],
+) -> None:
+    file_path = tmp_path / "overflow_masked_empty_tensor.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {"tensor": {"dtype": dtype, "shape": shape, "data_offsets": [0, 0]}},
+        b"",
+    )
+
+    with pytest.raises(SafetensorError, match=r"overflow|invalid JSON"):
+        safe_open(str(file_path), framework="np")
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(
+        check.name == "Tensor Size Computation Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("shape") == shape
+        for check in result.checks
+    )
+
+
+def test_zero_before_large_dimensions_remains_valid_empty_shape(tmp_path: Path) -> None:
+    file_path = tmp_path / "zero_first_large_empty_tensor.safetensors"
+    shape = [0, 1 << (8 * struct.calcsize("P") - 1), 2]
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {
+                "dtype": "U8",
+                "shape": shape,
+                "data_offsets": [0, 0],
+            }
+        },
+        b"",
+    )
+
+    with safe_open(str(file_path), framework="np") as handle:
+        assert handle.get_slice("tensor").get_shape() == shape
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
 
 
 def test_valid_empty_safetensors_custom_metadata(tmp_path: Path) -> None:
