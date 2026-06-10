@@ -17,7 +17,7 @@ WORKDIR /build
 COPY . .
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 libcap2 libsystemd0 libudev1 \
+    && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 libcap2 libssl3t64 libsystemd0 libudev1 \
     && apt-get install --yes --no-install-recommends build-essential ca-certificates curl \
     && case "${TARGETARCH}" in \
         amd64) rustup_target="x86_64-unknown-linux-gnu"; rustup_sha256="${RUSTUP_INIT_X86_64_UNKNOWN_LINUX_GNU_SHA256}" ;; \
@@ -41,7 +41,7 @@ FROM ${PYTHON_IMAGE} AS runtime
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 libcap2 libsystemd0 libudev1 \
+    && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 libcap2 libssl3t64 libsystemd0 libudev1 \
     && apt-get install --yes --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

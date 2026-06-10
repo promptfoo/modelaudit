@@ -213,7 +213,7 @@ def test_format_scan_json_preserves_pydantic_json_serialization() -> None:
     payload = json.loads(_format_scan_output(result, [], output_format="json", verbose=True))
 
     assert payload["issues"][0]["details"] == {
-        "path": "models/model.pkl",
+        "path": str(Path("models") / "model.pkl"),
         "timestamp": "2026-06-08T12:30:00Z",
     }
 
