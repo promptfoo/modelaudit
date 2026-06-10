@@ -1317,6 +1317,20 @@ _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES = frozenset(
         ("torch.serialization", "_get_layout"),
     }
 )
+_TRUSTED_LOADED_EXTENSION_EXPORT_OWNERS = MappingProxyType(
+    {
+        ("numpy._core.multiarray", "_reconstruct"): ("numpy._core._multiarray_umath",),
+        ("numpy._core.multiarray", "scalar"): ("numpy._core._multiarray_umath",),
+        ("numpy.core.multiarray", "_reconstruct"): (
+            "numpy.core._multiarray_umath",
+            "numpy._core._multiarray_umath",
+        ),
+        ("numpy.core.multiarray", "scalar"): (
+            "numpy.core._multiarray_umath",
+            "numpy._core._multiarray_umath",
+        ),
+    }
+)
 _TRUSTED_IMPORT_ONLY_REFERENCES |= _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES
 _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES = (
     frozenset(
@@ -4179,26 +4193,37 @@ def _resolve_dotted_module_getattr_target(
         return None
     if _resolve_wildcard_reexport_alias(module_name, first_component) is not None:
         return None
-    return _resolve_module_getattr_target(module_name, first_component, analysis)
+    return _resolve_module_getattr_target(
+        module_name,
+        first_component,
+        analysis,
+        allow_loaded_extension_bypass=False,
+    )
 
 
 def _resolve_module_getattr_target(
     module_name: str,
     qualified_name: str,
     analysis: _ModuleAnalysis,
+    *,
+    allow_loaded_extension_bypass: bool = True,
 ) -> str | None:
     if qualified_name in analysis.direct_names:
         return None
 
     module_getattr = f"{module_name}.__getattr__"
     if module_getattr in analysis.calls_by_function:
-        if _loaded_extension_callable_bypasses_module_getattr(module_name, qualified_name):
+        if allow_loaded_extension_bypass and _loaded_extension_callable_bypasses_module_getattr(
+            module_name, qualified_name
+        ):
             return None
         return module_getattr
 
     alias_target = analysis.aliases.get("__getattr__")
     if alias_target is not None and alias_target != module_getattr:
-        if _loaded_extension_callable_bypasses_module_getattr(module_name, qualified_name):
+        if allow_loaded_extension_bypass and _loaded_extension_callable_bypasses_module_getattr(
+            module_name, qualified_name
+        ):
             return None
         return _resolve_alias_function_target(alias_target)
     return None
@@ -4207,9 +4232,26 @@ def _resolve_module_getattr_target(
 def _loaded_extension_callable_bypasses_module_getattr(module_name: str, name: str) -> bool:
     # PEP 562 hooks run only after normal module lookup misses; compatibility
     # wrappers can populate extension exports without a statically visible bind.
+    expected_owner_names = _TRUSTED_LOADED_EXTENSION_EXPORT_OWNERS.get((module_name, name))
+    if expected_owner_names is None:
+        return False
     state = _current_loaded_interpreter_reference_state(module_name, name)
     _track_loaded_interpreter_reference_state(module_name, name, state)
-    return state[0] and type(state[1]) is BuiltinFunctionType
+    value = state[1]
+    if not state[0] or type(value) is not BuiltinFunctionType:
+        return False
+    callable_name = BuiltinFunctionType.__getattribute__(value, "__name__")
+    callable_owner = BuiltinFunctionType.__getattribute__(value, "__self__")
+    if callable_name != name or type(callable_owner) is not ModuleType:
+        return False
+    for owner_name in expected_owner_names:
+        owner_loaded, owner_module, _ = _loaded_module_state_without_hooks(owner_name)
+        if not owner_loaded or owner_module is not callable_owner:
+            continue
+        owner_state = _loaded_reference_state_without_hooks(callable_owner, name)
+        _track_loaded_interpreter_reference_state(owner_name, name, owner_state)
+        return owner_state[0] and owner_state[1] is value
+    return False
 
 
 def _resolve_alias_function_target(alias_target: str) -> str | None:
