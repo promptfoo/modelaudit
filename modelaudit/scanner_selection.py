@@ -461,12 +461,18 @@ def scanner_ids_for_detected_format(detected_format: str) -> frozenset[str]:
             scanner_ids.add(scanner_id)
     if detected_format in {"zip", EXECUTABLE_ZIP_POLYGLOT_FORMAT}:
         scanner_ids.update(_ZIP_STRUCTURE_ROUTED_SCANNER_IDS)
+    if detected_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT:
+        scanner_ids.add("safetensors")
     if detected_format in {"tar", "gzip", "bzip2", "xz"}:
         scanner_ids.add("nemo")
     if detected_format in {"gzip", "bzip2", "xz"}:
         scanner_ids.add("tar")
-    if detected_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
+    if detected_format == "safetensors":
+        scanner_ids.update({"compressed", "keras_h5", "llamafile", "pickle", "torch7"})
+        scanner_ids.update(_ZIP_STRUCTURE_ROUTED_SCANNER_IDS)
+    if detected_format in {"llamafile", LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT}:
         scanner_ids.add("llamafile")
+        scanner_ids.add("safetensors")
         scanner_ids.update(_ZIP_STRUCTURE_ROUTED_SCANNER_IDS)
     if detected_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
         scanner_ids.update({"coreml", "onnx", "tf_metagraph", "tf_savedmodel"})

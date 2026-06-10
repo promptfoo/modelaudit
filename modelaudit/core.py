@@ -48,10 +48,12 @@ from modelaudit.scanner_selection import (
 from modelaudit.scanners import _registry
 from modelaudit.scanners.archive_dispatch import (
     NESTED_SCAN_CALLBACK_CONFIG_KEY,
+    detect_safetensors_overlap_scanner_ids,
     merge_executable_zip_container_findings,
     merge_flax_msgpack_overlap_findings,
     merge_hdf5_userblock_zip_findings,
     merge_inconclusive_flax_msgpack_outcome,
+    merge_safetensors_overlap_analysis,
 )
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
 from modelaudit.scanners.mxnet_scanner import MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY
@@ -3581,6 +3583,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         return sr
 
     hdf5_signature_offset = find_hdf5_signature_offset(path)
+    safetensors_overlap_scanner_ids = detect_safetensors_overlap_scanner_ids(path)
     try:
         max_zip_entries = int(config.get("max_zip_entries", ZipScanner.DEFAULT_MAX_ENTRIES))
     except (TypeError, ValueError):
@@ -3595,7 +3598,15 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             max_zip_directory_size,
         )
     ):
-        return ZipScanner(config=config).scan(path)
+        preflight_result = ZipScanner(config=config).scan(path)
+        merge_safetensors_overlap_analysis(
+            path,
+            preflight_result,
+            config,
+            scanner_selection,
+            safetensors_overlap_scanner_ids,
+        )
+        return preflight_result
 
     logger.debug(f"Processing: {path}")
 
@@ -3742,6 +3753,13 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         return sr
     if header_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT or magic_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT:
         sr = _make_incomplete_pickle_routing_result(path)
+        merge_safetensors_overlap_analysis(
+            path,
+            sr,
+            config,
+            scanner_selection,
+            safetensors_overlap_scanner_ids,
+        )
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
@@ -3750,6 +3768,13 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         or magic_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT
     ):
         sr = _make_incomplete_tensorflow_protobuf_routing_result(path)
+        merge_safetensors_overlap_analysis(
+            path,
+            sr,
+            config,
+            scanner_selection,
+            safetensors_overlap_scanner_ids,
+        )
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
@@ -3757,6 +3782,13 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         header_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT or magic_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT
     ) and hdf5_signature_offset is None:
         sr = _scan_executable_zip_polyglot(path, config)
+        merge_safetensors_overlap_analysis(
+            path,
+            sr,
+            config,
+            scanner_selection,
+            safetensors_overlap_scanner_ids,
+        )
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
@@ -3811,6 +3843,13 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             else None
         )
     except ZipPreflightRejected as exc:
+        merge_safetensors_overlap_analysis(
+            path,
+            exc.result,
+            config,
+            scanner_selection,
+            safetensors_overlap_scanner_ids,
+        )
         return exc.result
     skipped_preferred_scanner_id: str | None = None
     unavailable_preferred_scanner_id: str | None = None
@@ -4019,6 +4058,13 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                             hdf5_signature_offset,
                             context="HDF5 user-block ZIP",
                         )
+                    merge_safetensors_overlap_analysis(
+                        path,
+                        result,
+                        config,
+                        scanner_selection,
+                        safetensors_overlap_scanner_ids,
+                    )
                     return result
 
             if unavailable_preferred_scanner_id is not None:
@@ -4066,6 +4112,14 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             context="overlapping JSON analysis",
             kind=SCANNER_SELECTION_PREFERRED_KIND,
         )
+
+    merge_safetensors_overlap_analysis(
+        path,
+        result,
+        config,
+        scanner_selection,
+        safetensors_overlap_scanner_ids,
+    )
 
     if is_xgboost_pickle_spoof:
         _mark_xgboost_pickle_extension_spoof(result, path, ext)
@@ -4129,6 +4183,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     if (
         hdf5_userblock_supplemental_scanner_id not in (None, "zip")
         and result.scanner_name != hdf5_userblock_supplemental_scanner_id
+        and hdf5_userblock_supplemental_scanner_id not in safetensors_overlap_scanner_ids
     ):
         _merge_supplemental_scanner_analysis(
             path,
