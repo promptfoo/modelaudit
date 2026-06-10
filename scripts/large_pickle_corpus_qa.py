@@ -27,7 +27,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import quote
@@ -645,6 +645,7 @@ def _validated_artifact_id(value: object) -> str:
         or artifact_id in {".", ".."}
         or "/" in artifact_id
         or "\\" in artifact_id
+        or PureWindowsPath(artifact_id).drive
         or Path(artifact_id).is_absolute()
     ):
         raise ValueError(f"unsafe corpus artifact id: {artifact_id!r}")
@@ -653,15 +654,17 @@ def _validated_artifact_id(value: object) -> str:
 
 def _validated_remote_path(value: object) -> Path:
     raw_path = str(value)
+    raw_parts = raw_path.split("/")
     remote_path = PurePosixPath(raw_path)
     if (
         not raw_path
         or "\\" in raw_path
         or remote_path.is_absolute()
-        or any(part in {"", ".", ".."} for part in remote_path.parts)
+        or PureWindowsPath(raw_path).drive
+        or any(part in {"", ".", ".."} for part in raw_parts)
     ):
         raise ValueError(f"unsafe corpus artifact path: {raw_path!r}")
-    return Path(*remote_path.parts)
+    return Path(*raw_parts)
 
 
 def _contained_output_path(root: Path, *parts: str | Path) -> Path:
@@ -768,7 +771,7 @@ def _direct_download_entry(entry: Mapping[str, Any], local_path: Path) -> Path:
     repo_id = str(entry["repo_id"])
     filename = str(entry["path"])
     url = f"https://huggingface.co/{repo_id}/resolve/{revision}/{quote(filename, safe='/')}"
-    part_path = local_path.with_name(f"{local_path.name}.part")
+    part_path = _contained_output_path(local_path.parent, f"{local_path.name}.part")
     local_path.parent.mkdir(parents=True, exist_ok=True)
 
     expected_size = entry.get("remote_size_bytes")
@@ -1081,7 +1084,7 @@ def _is_package_scannable_path(path: Path, classification: Mapping[str, Any]) ->
 def _iter_pickle_zip_members(path: Path, *, run_dir: Path, artifact_id: str) -> Iterator[tuple[str, Path]]:
     try:
         with zipfile.ZipFile(path) as archive:
-            for member in archive.infolist():
+            for member_index, member in enumerate(archive.infolist()):
                 if member.is_dir():
                     continue
                 member_name = member.filename
@@ -1090,7 +1093,7 @@ def _iter_pickle_zip_members(path: Path, *, run_dir: Path, artifact_id: str) -> 
                     lowered.endswith((".pkl", ".pickle")) or lowered.endswith("/data.pkl") or lowered == "data.pkl"
                 ):
                     continue
-                member_path = _member_file_path(run_dir, artifact_id, member_name)
+                member_path = _member_file_path(run_dir, artifact_id, member_name, member_index=member_index)
                 member_path.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     with archive.open(member) as source, member_path.open("wb") as target:
@@ -1103,9 +1106,10 @@ def _iter_pickle_zip_members(path: Path, *, run_dir: Path, artifact_id: str) -> 
         return
 
 
-def _member_file_path(run_dir: Path, artifact_id: str, member_name: str) -> Path:
+def _member_file_path(run_dir: Path, artifact_id: str, member_name: str, *, member_index: int) -> Path:
     artifact_id = _validated_artifact_id(artifact_id)
-    safe_member_name = member_name.replace("/", "__").replace("\\", "__")
+    member_digest = hashlib.sha256(member_name.encode("utf-8")).hexdigest()
+    safe_member_name = f"{member_index:08d}-{member_digest}.pkl"
     return _contained_output_path(run_dir, "members", artifact_id, safe_member_name)
 
 

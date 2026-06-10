@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import zipfile
 from argparse import Namespace
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -79,19 +81,76 @@ def test_iter_pickle_zip_members_extracts_data_pickle_and_skips_near_matches(tmp
     assert scan_row["result"]["critical_count"] >= 1
 
 
+def test_pickle_zip_member_paths_are_unique_portable_and_contained(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.zip"
+    malicious_payload = large_pickle_corpus_qa.raw_os_system_reduce_payload()
+    benign_payload = b"\x80\x04N."
+    member_names = ["../../data.pkl", "..__..__data.pkl", "evil?.pkl", "duplicate.pkl", "duplicate.pkl"]
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(member_names[0], malicious_payload)
+        archive.writestr(member_names[1], benign_payload)
+        archive.writestr(member_names[2], benign_payload)
+        archive.writestr(member_names[3], malicious_payload)
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            archive.writestr(member_names[4], benign_payload)
+
+    members = list(
+        large_pickle_corpus_qa._iter_pickle_zip_members(
+            archive_path,
+            run_dir=tmp_path,
+            artifact_id="A01",
+        )
+    )
+
+    assert [member_name for member_name, _member_path in members] == member_names
+    member_paths = [member_path for _member_name, member_path in members]
+    member_root = (tmp_path / "members" / "A01").resolve()
+    assert len(set(member_paths)) == len(member_names)
+    assert all(member_path.parent == member_root for member_path in member_paths)
+    assert all(member_path.name.endswith(".pkl") for member_path in member_paths)
+    assert member_paths[0].read_bytes() == malicious_payload
+    assert member_paths[1].read_bytes() == benign_payload
+    assert member_paths[3].read_bytes() == malicious_payload
+    assert member_paths[4].read_bytes() == benign_payload
+
+    for member_index in (0, 3):
+        malicious_scan = large_pickle_corpus_qa._scan_package(
+            member_paths[member_index],
+            engine="rust",
+            artifact_id=f"A01:{member_names[member_index]}",
+        )
+        assert malicious_scan["result"]["critical_count"] >= 1
+    for member_index in (1, 4):
+        benign_scan = large_pickle_corpus_qa._scan_package(
+            member_paths[member_index],
+            engine="rust",
+            artifact_id=f"A01:{member_names[member_index]}",
+        )
+        assert benign_scan["result"]["critical_count"] == 0
+
+
 @pytest.mark.parametrize(
     ("artifact_id", "artifact_path"),
     [
         ("../escaped", "model.pkl"),
+        ("C:escaped", "model.pkl"),
         ("A01", "../../escaped.pkl"),
         ("A01", "/tmp/escaped.pkl"),
+        ("A01", "C:/escaped.pkl"),
+        ("A01", "C:escaped.pkl"),
+        ("A01", "."),
+        ("A01", "nested/./model.pkl"),
+        ("A01", "nested//model.pkl"),
+        ("A01", r"..\..\escaped.pkl"),
+        ("A01", r"\\server\share\escaped.pkl"),
     ],
 )
-def test_download_entry_rejects_lock_paths_outside_corpus_root(
+def test_download_entry_rejects_unsafe_lock_paths_before_writing(
     tmp_path: Path,
     artifact_id: str,
     artifact_path: str,
 ) -> None:
+    corpus_root = tmp_path / "corpus"
     entry = {
         "id": artifact_id,
         "repo_id": "trusted/model",
@@ -102,18 +161,107 @@ def test_download_entry_rejects_lock_paths_outside_corpus_root(
     with pytest.raises(ValueError, match="unsafe corpus artifact"):
         large_pickle_corpus_qa._download_entry(
             entry,
-            corpus_root=tmp_path / "corpus",
+            corpus_root=corpus_root,
             etag_timeout_s=1,
             direct_fallback=False,
             direct_only=True,
         )
 
-    assert not (tmp_path / "escaped.pkl").exists()
+    assert not corpus_root.exists()
+
+
+def test_download_entry_keeps_safe_nested_path_inside_artifact_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    corpus_root = tmp_path / "corpus"
+    entry = {
+        "id": "A01",
+        "repo_id": "trusted/model",
+        "path": "checkpoint-2148/pytorch_model.bin",
+        "revision": "main",
+    }
+
+    def fake_direct_download(_entry: Mapping[str, Any], local_path: Path) -> Path:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(b"benign model")
+        return local_path
+
+    monkeypatch.setattr(large_pickle_corpus_qa, "_direct_download_entry", fake_direct_download)
+
+    result = large_pickle_corpus_qa._download_entry(
+        entry,
+        corpus_root=corpus_root,
+        etag_timeout_s=1,
+        direct_fallback=False,
+        direct_only=True,
+    )
+
+    artifact_root = (corpus_root / "raw" / "A01").resolve()
+    expected_path = artifact_root / "checkpoint-2148" / "pytorch_model.bin"
+    assert Path(result["local_path"]) == expected_path
+    assert expected_path.is_relative_to(artifact_root)
+    assert expected_path.read_bytes() == b"benign model"
+
+
+def test_download_entry_rejects_symlink_escape(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    corpus_root = tmp_path / "corpus"
+    artifact_root = corpus_root / "raw" / "A01"
+    artifact_root.mkdir(parents=True)
+    outside_root = tmp_path / "outside"
+    outside_root.mkdir()
+    (artifact_root / "checkpoint-2148").symlink_to(outside_root, target_is_directory=True)
+    entry = {
+        "id": "A01",
+        "repo_id": "trusted/model",
+        "path": "checkpoint-2148/pytorch_model.bin",
+        "revision": "main",
+    }
+
+    with pytest.raises(ValueError, match="escapes output root"):
+        large_pickle_corpus_qa._download_entry(
+            entry,
+            corpus_root=corpus_root,
+            etag_timeout_s=1,
+            direct_fallback=False,
+            direct_only=True,
+        )
+
+    assert not (outside_root / "pytorch_model.bin").exists()
+
+
+def test_direct_download_rejects_symlinked_partial_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    output_dir = tmp_path / "corpus" / "raw" / "A01"
+    output_dir.mkdir(parents=True)
+    local_path = output_dir / "model.pkl"
+    outside_path = tmp_path / "outside.pkl"
+    outside_path.write_bytes(b"unchanged")
+    local_path.with_name("model.pkl.part").symlink_to(outside_path)
+
+    def fail_urlopen(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("download must not start for an escaping partial path")
+
+    monkeypatch.setattr(large_pickle_corpus_qa, "urlopen", fail_urlopen)
+
+    with pytest.raises(ValueError, match="escapes output root"):
+        large_pickle_corpus_qa._direct_download_entry(
+            {"repo_id": "trusted/model", "path": "model.pkl", "revision": "main"},
+            local_path,
+        )
+
+    assert outside_path.read_bytes() == b"unchanged"
 
 
 def test_pickle_member_path_rejects_artifact_id_escape(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unsafe corpus artifact id"):
-        large_pickle_corpus_qa._member_file_path(tmp_path / "run", "../escaped", "data.pkl")
+        large_pickle_corpus_qa._member_file_path(tmp_path / "run", "../escaped", "data.pkl", member_index=0)
 
     assert not (tmp_path / "escaped").exists()
 
