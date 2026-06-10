@@ -2140,14 +2140,84 @@ def scan_model_directory_or_file(
 
         # Check if path is a directory
         if os.path.isdir(path):
-            # Directory scans require root traversal before scanner dispatch.
-            # Single files must reach their owning scanner so unreadable model
-            # inputs can produce a format-specific operational outcome.
             if not os.access(path, os.R_OK):
                 raise PermissionError(f"Path is not readable: {path}")
 
             if progress_callback:
                 progress_callback(f"Scanning directory: {path}", 0.0)
+
+            # Some model formats are logical directory packages rather than a
+            # collection of independently routable files. Run their owning
+            # scanner once, then retain the ordinary child walk as supplemental
+            # coverage. The child walk owns aggregate physical byte accounting,
+            # so the logical package pass records its inspected-byte count only
+            # in metadata instead of counting the same files twice.
+            directory_owner_result: ScanResult | None = None
+            directory_owner_class: type[BaseScanner] | None = None
+            directory_owner_dispatched = False
+            try:
+                directory_owner_class = _registry.get_scanner_for_path(
+                    path,
+                    scanner_selection=scanner_selection if scanner_selection.active else None,
+                )
+                if directory_owner_class is not None:
+                    directory_owner_dispatched = True
+                    directory_scan_started_at = time.time()
+                    directory_owner_result = directory_owner_class(config=config).scan(path)
+                    record_scanner_used(
+                        directory_owner_class.name,
+                        "directory",
+                        time.time() - directory_scan_started_at,
+                    )
+                elif scanner_selection.active:
+                    candidate_owner_class = _registry.get_scanner_for_path(path)
+                    if candidate_owner_class is not None:
+                        candidate_owner_id = (
+                            _registry.get_scanner_id_for_class(candidate_owner_class.__name__)
+                            or candidate_owner_class.name
+                        )
+                        if not scanner_selection.allows(candidate_owner_id):
+                            directory_owner_result = make_scanner_selection_skip_result(
+                                path,
+                                candidate_owner_id,
+                                scanner_selection,
+                            )
+            except Exception as error:
+                scanner_name = directory_owner_class.name if directory_owner_class is not None else "directory"
+                directory_owner_result = ScanResult(scanner_name=scanner_name)
+                directory_owner_result.add_check(
+                    name="Directory Owner Scan",
+                    passed=False,
+                    message=(
+                        "Unable to complete logical model-directory analysis: "
+                        f"{_redacted_scan_error_for_reporting(error, path)}"
+                    ),
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={
+                        "exception_type": type(error).__name__,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "directory_owner_scan_failed",
+                    },
+                )
+                _mark_inconclusive_scan_outcome(directory_owner_result, "directory_owner_scan_failed")
+                _mark_operational_scan_error(directory_owner_result, "directory_owner_scan_failed")
+                directory_owner_result.finish(success=False)
+
+            if directory_owner_result is not None:
+                owner_bytes_scanned = directory_owner_result.bytes_scanned if directory_owner_dispatched else 0
+                if not directory_owner_dispatched:
+                    directory_owner_result.metadata.pop("file_size", None)
+                directory_owner_result.metadata.update(
+                    {
+                        "directory_owner_scan": directory_owner_dispatched,
+                        "directory_owner_bytes_scanned": owner_bytes_scanned,
+                        "aggregate_bytes_accounted_by": "child_file_walk",
+                    }
+                )
+                directory_owner_result.bytes_scanned = 0
+                _add_scan_result_to_model(results, scan_metadata, directory_owner_result, path)
+                _add_asset_to_results(results, path, directory_owner_result)
 
             # Scan all files in the directory. File counts are only needed for
             # progress percentages, so avoid the extra tree walk when callers do

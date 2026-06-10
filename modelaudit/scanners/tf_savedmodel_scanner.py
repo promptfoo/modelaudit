@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import logging
 import os
+import pickletools
 import re
 import stat
 from collections.abc import Iterator
@@ -17,7 +18,12 @@ from google.protobuf.message import DecodeError, Message
 
 from modelaudit.config.explanations import get_tf_op_explanation
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
-from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, _looks_like_proto0_or_1_pickle
+from modelaudit.utils.file.detection import (
+    PROTO0_1_MAX_PROBE_BYTES,
+    PROTO0_1_MAX_PROBE_OPCODES,
+    PROTO0_1_TRIVIAL_LEADING_OPCODES,
+    _looks_like_proto0_or_1_pickle,
+)
 from modelaudit.utils.helpers.code_validation import (
     is_code_potentially_dangerous,
     validate_python_syntax,
@@ -151,6 +157,7 @@ _ASSET_MACHO_HEADERS = (
 _ASSET_PE_HEADER = b"MZ"  # Windows PE executables
 _ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 6))
 _ASSET_PROBE_BYTES = max(8192, PROTO0_1_MAX_PROBE_BYTES)
+_ASSET_TRIVIAL_PADDING_COMPLETE_BYTES = 2 * _ASSET_PROBE_BYTES
 _MAX_PROTOBUF_PARSE_BYTES = 20 * 1024 * 1024
 _MAX_SAVEDMODEL_META_GRAPHS = 64
 _MAX_SAVEDMODEL_GRAPH_NODES = 200_000
@@ -177,6 +184,25 @@ _ASSET_PYTHON_PATTERN = re.compile(
     r"|class\s+[A-Za-z_]\w*\s*[:(]"
     r"))"
 )
+
+
+def _is_trivial_proto0_padding_prefix(sample: bytes) -> bool:
+    """Return whether a bounded prefix is entirely harmless protocol-0 padding."""
+    opcode_count = 0
+    try:
+        for opcode, _argument, _position in pickletools.genops(sample):
+            opcode_count += 1
+            if opcode.name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
+                return False
+            if opcode_count >= PROTO0_1_MAX_PROBE_OPCODES:
+                return False
+    except ValueError as error:
+        return opcode_count >= 2 and str(error).startswith("pickle exhausted before seeing STOP")
+    except Exception:
+        return False
+    return False
+
+
 _PYFUNC_DANGEROUS_REFERENCE_TOKENS = frozenset(
     {
         "__builtin__",
@@ -1274,6 +1300,17 @@ class TensorFlowSavedModelScanner(BaseScanner):
         try:
             with file_path.open("rb") as file_obj:
                 content_head = file_obj.read(_ASSET_PROBE_BYTES)
+                if (
+                    file_stat.st_size > len(content_head)
+                    and file_stat.st_size <= _ASSET_TRIVIAL_PADDING_COMPLETE_BYTES
+                    and _is_trivial_proto0_padding_prefix(content_head)
+                ):
+                    # Resolve the narrow boundary case where a harmless opcode
+                    # prefix crosses the normal probe limit. This read remains
+                    # bounded and also exposes a payload immediately after the
+                    # otherwise-trivial padding.
+                    file_obj.seek(0)
+                    content_head = file_obj.read(_ASSET_TRIVIAL_PADDING_COMPLETE_BYTES)
         except OSError as exc:
             redacted_error = redact_untrusted_error_message(exc)
             result.add_check(
@@ -1339,7 +1376,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 details={
                     "file_name": redacted_file_name,
                     "asset_size": file_stat.st_size,
-                    "probe_bytes": _ASSET_PROBE_BYTES,
+                    "probe_bytes": len(content_head),
                     "analysis_incomplete": True,
                 },
             )

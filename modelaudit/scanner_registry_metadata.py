@@ -344,7 +344,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "module": "modelaudit.scanners.jax_checkpoint_scanner",
         "class": "JaxCheckpointScanner",
         "description": "Scans JAX checkpoint files in various serialization formats",
-        "extensions": [".ckpt", ".checkpoint", ".orbax-checkpoint", ".pickle"],
+        "extensions": [".ckpt", ".checkpoint", ".orbax-checkpoint", ".pickle", ""],
         "header_formats": ["jax_checkpoint"],
         "priority": 15,
         "dependencies": [],

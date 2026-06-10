@@ -69,6 +69,7 @@ class JaxCheckpointScanner(BaseScanner):
         ".checkpoint",  # Explicit checkpoint files
         ".orbax-checkpoint",  # Orbax checkpoint directories
         ".pickle",  # JAX models saved as pickle (when context suggests JAX)
+        "",  # Directory-based Orbax/JAX checkpoints
     ]
     _JAX_INDICATORS: ClassVar[tuple[str, ...]] = (
         "jax",
