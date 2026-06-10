@@ -80,12 +80,19 @@ class _ZipDirectoryMetadata:
 class _ZipCentralDirectoryEntry:
     filename: bytes
     flags: int
+    creator_system: int
+    external_attr: int
     compression_method: int
     crc32: int
     compressed_size: int
     uncompressed_size: int
     relative_local_offset: int
     uses_zip64_sizes: bool
+
+    @property
+    def is_symlink(self) -> bool:
+        """Return whether Unix mode metadata declares this entry as a symlink."""
+        return self.creator_system in _UNIX_MODE_ZIP_CREATOR_SYSTEMS and stat.S_ISLNK(self.external_attr >> 16)
 
 
 @dataclass(frozen=True)
@@ -98,6 +105,14 @@ class _InvalidZipDirectory(ValueError):
     def __init__(self, message: str, *, routing_evidence: bool = False):
         super().__init__(message)
         self.routing_evidence = routing_evidence
+
+
+class _ZipLocalEntryMismatch(_InvalidZipDirectory):
+    """Raised when a central-directory entry does not match its local record."""
+
+    def __init__(self, message: str, entry: _ZipCentralDirectoryEntry):
+        super().__init__(message, routing_evidence=True)
+        self.entry = entry
 
 
 class _ZipCentralDirectorySizeExceeded(_InvalidZipDirectory):
@@ -540,6 +555,8 @@ class ZipScanner(BaseScanner):
         return _ZipCentralDirectoryEntry(
             filename=filename,
             flags=int.from_bytes(header[8:10], "little"),
+            creator_system=header[5],
+            external_attr=int.from_bytes(header[38:42], "little"),
             compression_method=int.from_bytes(header[10:12], "little"),
             crc32=int.from_bytes(header[16:20], "little"),
             compressed_size=compressed_size,
@@ -670,22 +687,31 @@ class ZipScanner(BaseScanner):
         if not uses_data_descriptor:
             return _ZipLocalEntryLayout(offset=local_header_offset, end_candidates=frozenset({data_end}))
 
-        uses_zip64_descriptor = entry.uses_zip64_sizes or local_uses_zip64_sizes
-        descriptor_size = 24 if uses_zip64_descriptor else 16
+        descriptor_widths = {entry.uses_zip64_sizes or local_uses_zip64_sizes}
+        local_zip64_data = cls._zip64_extra_field(extra)
+        if local_zip64_data is not None and len(local_zip64_data) >= 16:
+            # Python 3.10 can write zero local sizes with a ZIP64 extra field and
+            # still emit the 64-bit descriptor selected by force_zip64=True.
+            descriptor_widths.add(True)
+        descriptor_size = 24 if True in descriptor_widths else 16
         try:
             handle.seek(data_end)
             descriptor = handle.read(descriptor_size)
         except OSError as exc:
             raise _InvalidZipDirectory(f"ZIP data descriptor could not be read: {exc}") from exc
-        end_candidates = cls._data_descriptor_end_candidates(
-            descriptor,
-            data_end,
-            entry,
-            uses_zip64_sizes=uses_zip64_descriptor,
-        )
+        end_candidates: set[int] = set()
+        for uses_zip64_sizes in descriptor_widths:
+            end_candidates.update(
+                cls._data_descriptor_end_candidates(
+                    descriptor,
+                    data_end,
+                    entry,
+                    uses_zip64_sizes=uses_zip64_sizes,
+                )
+            )
         if not end_candidates:
             return None
-        return _ZipLocalEntryLayout(offset=local_header_offset, end_candidates=end_candidates)
+        return _ZipLocalEntryLayout(offset=local_header_offset, end_candidates=frozenset(end_candidates))
 
     @classmethod
     def _validate_declared_local_entry_layout(
@@ -714,6 +740,11 @@ class ZipScanner(BaseScanner):
                 for candidate in candidates
                 if (layout := cls._local_entry_layout(handle, metadata, entry, candidate)) is not None
             ]
+            if not matching_layouts:
+                raise _ZipLocalEntryMismatch(
+                    "ZIP central directory does not uniquely identify its local entry",
+                    entry,
+                )
             if len(matching_layouts) != 1:
                 raise _InvalidZipDirectory(
                     "ZIP central directory does not uniquely identify its local entry",
@@ -1273,23 +1304,54 @@ class ZipScanner(BaseScanner):
             self._add_central_directory_size_limit_check(result, path, error)
         else:
             assert error is not None
-            result.add_check(
-                name="ZIP Central Directory Preflight",
-                passed=False,
-                message=f"ZIP central-directory validation failed: {error}",
-                severity=IssueSeverity.INFO,
-                rule_code="S902",
-                location=path,
-                details={
-                    "exception": str(error),
-                    "exception_type": type(error).__name__,
-                    "analysis_incomplete": True,
-                    "scan_outcome_reason": "zip_analysis_incomplete",
-                },
-            )
+            self._add_invalid_directory_checks(result, path, error)
         mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
         result.finish(success=False)
         return result
+
+    @staticmethod
+    def _add_invalid_directory_checks(
+        result: ScanResult,
+        path: str,
+        error: _InvalidZipDirectory,
+    ) -> None:
+        result.add_check(
+            name="ZIP Central Directory Preflight",
+            passed=False,
+            message=f"ZIP central-directory validation failed: {error}",
+            severity=IssueSeverity.INFO,
+            rule_code="S902",
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "zip_analysis_incomplete",
+            },
+        )
+        if not isinstance(error, _ZipLocalEntryMismatch) or not error.entry.is_symlink:
+            return
+
+        encoding = "utf-8" if error.entry.flags & 0x0800 else "cp437"
+        entry_name = error.entry.filename.decode(encoding, errors="replace")
+        if len(entry_name) > 1024:
+            entry_name = f"{entry_name[:1021]}..."
+        result.add_check(
+            name="Symlink Safety Validation",
+            passed=False,
+            message=f"Symlink {entry_name} has inconsistent ZIP local metadata",
+            severity=IssueSeverity.CRITICAL,
+            rule_code="S406",
+            location=f"{path}:{entry_name}",
+            details={
+                "entry": entry_name,
+                "target": "<inconsistent-zip-metadata>",
+                "target_class": "invalid",
+                "compressed_size": error.entry.compressed_size,
+                "uncompressed_size": error.entry.uncompressed_size,
+                "analysis_incomplete": True,
+            },
+        )
 
     @staticmethod
     def _add_central_directory_size_limit_check(
@@ -1670,20 +1732,7 @@ class ZipScanner(BaseScanner):
                 result.finish(success=False)
                 return result
             except _InvalidZipDirectory as exc:
-                result.add_check(
-                    name="ZIP Central Directory Preflight",
-                    passed=False,
-                    message=f"ZIP central-directory validation failed: {exc}",
-                    severity=IssueSeverity.INFO,
-                    rule_code="S902",
-                    location=path,
-                    details={
-                        "exception": str(exc),
-                        "exception_type": type(exc).__name__,
-                        "analysis_incomplete": True,
-                        "scan_outcome_reason": "zip_analysis_incomplete",
-                    },
-                )
+                self._add_invalid_directory_checks(result, path, exc)
                 mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
                 result.finish(success=False)
                 return result

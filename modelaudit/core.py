@@ -38,6 +38,7 @@ from modelaudit.scanner_selection import (
     ScannerSelectionPolicy,
     add_scanner_selection_skip_check,
     allows_protobuf_model_candidate_analysis,
+    allows_zip_content_analysis,
     allows_zip_structure_analysis,
     make_scanner_selection_skip_result,
     normalize_scanner_selection_config,
@@ -1242,6 +1243,11 @@ def _select_hdf5_userblock_supplemental_scanner_id(
     config: dict[str, Any] | None = None,
 ) -> str | None:
     """Preserve the non-HDF5 scanner that owns a user-block prefix or path."""
+    if header_format in {"zip", EXECUTABLE_ZIP_POLYGLOT_FORMAT}:
+        # The HDF5 user-block dispatcher validates and scans each complete ZIP
+        # segment independently; probing the concatenated prefix here would
+        # reject valid earlier segments as undeclared local records.
+        return "zip"
     scanner_id = _select_non_hdf5_preferred_scanner_id(path, header_format, ext, config)
     if scanner_id is not None:
         return scanner_id
@@ -2177,6 +2183,8 @@ def scan_model_directory_or_file(
             directory_owner_result: ScanResult | None = None
             directory_owner_class: type[BaseScanner] | None = None
             directory_owner_source_paths: set[str] = set()
+            directory_owner_traversal_sources: set[str] = set()
+            directory_owner_unavailable_sources: set[str] = set()
 
             def merge_directory_owner_result(owner_result: ScanResult, *, dispatched: bool) -> None:
                 owner_bytes_scanned = owner_result.bytes_scanned if dispatched else 0
@@ -2353,6 +2361,24 @@ def scan_model_directory_or_file(
                     recorded = True
                 return recorded
 
+            def record_non_regular_directory_entry(file_path: Path) -> None:
+                nonlocal aggregate_hash_complete
+                aggregate_hash_complete = False
+                scan_metadata["success"] = False
+                scan_metadata["has_operational_errors"] = True
+                _add_issue_to_model(
+                    results,
+                    "Non-regular directory entry was not scanned",
+                    severity=IssueSeverity.INFO.value,
+                    location=str(file_path),
+                    details={
+                        "entry_type": "non_regular",
+                        "analysis_incomplete": True,
+                        "scan_outcome": "inconclusive",
+                        "scan_outcome_reason": "directory_entry_non_regular",
+                    },
+                )
+
             directory_discovery_started_at = _start_phase_timing(phase_timings)
             for root, dirs, files in os.walk(
                 path,
@@ -2376,11 +2402,17 @@ def scan_model_directory_or_file(
                         continue
 
                     file_path_obj = Path(file_path)
-                    if (
-                        not file_path_obj.is_file()
-                        and not file_path_obj.is_symlink()
-                        and record_dvc_directory_special_file(file_path_obj)
-                    ):
+                    relative_parts = Path(os.path.relpath(file_path_obj, path)).parts
+                    is_directory_owner_source = bool(
+                        directory_owner_class is not None
+                        and ".." not in relative_parts
+                        and directory_owner_class.directory_owner_source_in_scope(relative_parts)
+                    )
+                    if not file_path_obj.is_file() and not file_path_obj.is_symlink():
+                        if is_directory_owner_source:
+                            directory_owner_unavailable_sources.add(str(file_path_obj))
+                        if not record_dvc_directory_special_file(file_path_obj):
+                            record_non_regular_directory_entry(file_path_obj)
                         continue
                     resolved_file = resolve_covered_dvc_file_symlink(file_path_obj)
                     is_dvc_covered_file_symlink = resolved_file is not None
@@ -2399,15 +2431,20 @@ def scan_model_directory_or_file(
                             scan_metadata["has_operational_errors"] = True
                     record_uncovered_dvc_file_symlink(file_path_obj, resolved_file)
                     if resolved_file is None:
+                        if is_directory_owner_source:
+                            if entry_unavailable:
+                                directory_owner_unavailable_sources.add(str(file_path_obj))
+                            else:
+                                directory_owner_traversal_sources.add(str(file_path_obj))
                         continue
-                    if not resolved_file.is_file() and record_dvc_directory_special_file(file_path_obj):
+                    if not resolved_file.is_file():
+                        if is_directory_owner_source:
+                            directory_owner_unavailable_sources.add(str(file_path_obj))
+                        if not record_dvc_directory_special_file(file_path_obj):
+                            record_non_regular_directory_entry(file_path_obj)
                         continue
-                    if resolved_file.is_file() and directory_owner_class is not None:
-                        relative_parts = Path(os.path.relpath(file_path_obj, path)).parts
-                        if ".." not in relative_parts and directory_owner_class.directory_owner_source_in_scope(
-                            relative_parts
-                        ):
-                            directory_owner_source_paths.add(str(resolved_file))
+                    if is_directory_owner_source:
+                        directory_owner_source_paths.add(str(resolved_file))
                     snapshot_path = Path(file_path).absolute()
                     snapshot_shard_family_key = _shard_family_key_for_path(str(snapshot_path))
                     route_hf_shard_alias = (
@@ -2694,9 +2731,16 @@ def scan_model_directory_or_file(
             owner_sizes: dict[str, int] = {}
             owner_total_size = 0
             if directory_owner_class is not None and directory_owner_result is None:
-                if reported_traversal_targets:
+                if directory_owner_traversal_sources:
                     owner_block_reason = "directory_owner_path_traversal"
-                    owner_block_details = {"traversal_target_count": len(reported_traversal_targets)}
+                    owner_block_details = {
+                        "traversal_source_count": len(directory_owner_traversal_sources),
+                    }
+                elif directory_owner_unavailable_sources:
+                    owner_block_reason = "directory_owner_source_unavailable"
+                    owner_block_details = {
+                        "unavailable_source_count": len(directory_owner_unavailable_sources),
+                    }
                 else:
                     try:
                         for source in owner_sources:
@@ -3826,15 +3870,20 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         sr.finish(success=False)
         return sr
 
+    hdf5_signature_offset = find_hdf5_signature_offset(path)
     try:
         max_zip_entries = int(config.get("max_zip_entries", ZipScanner.DEFAULT_MAX_ENTRIES))
     except (TypeError, ValueError):
         max_zip_entries = ZipScanner.DEFAULT_MAX_ENTRIES
     max_zip_directory_size = ZipScanner.central_directory_size_limit(config)
-    if allows_zip_structure_analysis(scanner_selection, path) and ZipScanner.requires_preflight_result(
-        path,
-        max_zip_entries,
-        max_zip_directory_size,
+    if (
+        hdf5_signature_offset in (None, 0)
+        and allows_zip_structure_analysis(scanner_selection, path)
+        and ZipScanner.requires_preflight_result(
+            path,
+            max_zip_entries,
+            max_zip_directory_size,
+        )
     ):
         return ZipScanner(config=config).scan(path)
 
@@ -3936,8 +3985,6 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             if nested_xgboost_route == "xgboost":
                 config[XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY] = True
     is_xgboost_pickle_spoof = ext in _XGBOOST_BINARY_EXTENSIONS and header_format == "pickle"
-    hdf5_signature_offset = find_hdf5_signature_offset(path)
-
     # Record telemetry for file type detection
     detected_format = header_format if header_format != "unknown" else ext_format
     record_file_type_detected(path, detected_format)
@@ -4248,10 +4295,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     result = make_scanner_selection_skip_result(path, candidate_scanner_id, scanner_selection)
                     if result.bytes_scanned == 0 and file_size > 0:
                         result.bytes_scanned = file_size
-                    userblock_zip_allowed = hdf5_signature_offset not in (None, 0) and (
-                        scanner_selection.allows("zip")
-                        or scanner_selection.allows(hdf5_userblock_supplemental_scanner_id)
-                    )
+                    userblock_zip_allowed = hdf5_signature_offset not in (
+                        None,
+                        0,
+                    ) and allows_zip_content_analysis(scanner_selection)
                     if userblock_zip_allowed:
                         assert hdf5_signature_offset is not None
                         result.scanner_name = "zip"
@@ -4352,11 +4399,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     if hdf5_signature_offset not in (None, 0):
         assert hdf5_signature_offset is not None
-        userblock_zip_allowed = (
-            not scanner_selection.active
-            or scanner_selection.allows("zip")
-            or scanner_selection.allows(hdf5_userblock_supplemental_scanner_id)
-        )
+        userblock_zip_allowed = allows_zip_content_analysis(scanner_selection)
         if userblock_zip_allowed:
             merge_hdf5_userblock_zip_findings(
                 path,
@@ -4411,6 +4454,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 "header_format": detail_header_format,
                 "file_type_validation_failed": not file_type_valid,
             },
+            rule_code="S901" if not file_type_valid else None,
         )
 
     # Ensure bytes_scanned reflects the actual file size even when a scanner

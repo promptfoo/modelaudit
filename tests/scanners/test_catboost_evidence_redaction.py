@@ -225,10 +225,13 @@ def test_composed_quoted_sensitive_key_with_equals_is_redacted() -> None:
 
 
 @pytest.mark.parametrize("operator", ["==", "!=", ">=", "<="])
-def test_composed_quoted_sensitive_key_comparisons_are_not_redacted(operator: str) -> None:
+def test_composed_quoted_sensitive_key_comparisons_are_redacted(operator: str) -> None:
     text = f'"client" + "_secret" {operator} "public"'
 
-    assert redact_evidence_string(text, max_chars=500) == text
+    redacted = redact_evidence_string(text, max_chars=500)
+
+    assert "public" not in redacted
+    assert REDACTED_EVIDENCE_VALUE in redacted
 
 
 def test_redacts_long_delimited_values_before_report_truncation() -> None:
@@ -1762,6 +1765,22 @@ def test_curl_user_complex_password_is_fully_redacted(credential: str, secret: s
             '"pass\u200bword' + (r"\(" * 26),
         ),
     ],
+    ids=[
+        "quoted-cert-unterminated",
+        "quoted-user-unterminated",
+        "substitution-user-unterminated",
+        "config-user-unterminated",
+        "quoted-cert-long-colons",
+        "quoted-user-long-colons",
+        "config-user-long-colons",
+        "cert-long-colons",
+        "cert-option-near-match",
+        "curl-executable-near-match",
+        "sensitive-argv-unterminated",
+        "cookie-header-unterminated",
+        "structured-value-unterminated",
+        "zero-width-key-unterminated",
+    ],
 )
 def test_command_credential_redaction_has_bounded_runtime(pattern_name: str, payload: str) -> None:
     code = (
@@ -1779,6 +1798,7 @@ def test_command_credential_redaction_has_bounded_runtime(pattern_name: str, pay
         cwd=repo_root,
         env={**os.environ, "PYTHONPATH": python_path},
         input=payload,
+        encoding="utf-8",
         text=True,
         timeout=5,
     )
@@ -1793,6 +1813,14 @@ def test_command_credential_redaction_has_bounded_runtime(pattern_name: str, pay
         "subprocess.run(" * 8_000,
         "a-" * 8_000,
         ("a-" * 8_000) + ':"',
+    ],
+    ids=[
+        "repeated-slash-curl",
+        "repeated-curl-prefix",
+        "split-curl",
+        "repeated-subprocess",
+        "repeated-option",
+        "repeated-option-quote",
     ],
 )
 def test_redaction_adversarial_inputs_have_bounded_runtime(payload: str) -> None:
@@ -1811,6 +1839,7 @@ def test_redaction_adversarial_inputs_have_bounded_runtime(payload: str) -> None
         cwd=repo_root,
         env={**os.environ, "PYTHONPATH": python_path},
         input=payload,
+        encoding="utf-8",
         text=True,
         timeout=5,
     )
@@ -4090,3 +4119,148 @@ def test_compact_aws_assignments_are_redacted(key: str) -> None:
 )
 def test_argv_and_compact_aws_near_matches_are_preserved(text: str) -> None:
     assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    "operator",
+    ["===", "!==", "==", "!=", ">=", "<=", "<>", ">", "<", "is", "is not", "in", "not in"],
+)
+def test_sensitive_comparison_operators_redact_literals_and_preserve_command(operator: str) -> None:
+    secret = f"OPERATOR-{operator.replace(' ', '-')}-SECRET-123456"
+    text = f'client_secret {operator} "{secret}"; os.system("id")'
+
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert secret not in redacted
+    assert 'os.system("id")' in redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "secrets"),
+    [
+        (
+            '"REVERSED-COMPARISON-SECRET-123456" == client_secret; os.system("id")',
+            ("REVERSED-COMPARISON-SECRET-123456",),
+        ),
+        (
+            '"LOW-COMPARISON-SECRET-123456" < client_secret < "HIGH-COMPARISON-SECRET-123456"; os.system("id")',
+            ("LOW-COMPARISON-SECRET-123456", "HIGH-COMPARISON-SECRET-123456"),
+        ),
+        (
+            'client_secret == ("PAREN-COMPARISON-SECRET-123456"); os.system("id")',
+            ("PAREN-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'client_secret == ["LIST-COMPARISON-SECRET-123456"]; os.system("id")',
+            ("LIST-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'client_secret == {"name": "DICT-COMPARISON-SECRET-123456"}; os.system("id")',
+            ("DICT-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'client_secret == "PART-A-SECRET" + "CONCAT-COMPARISON-SECRET-123456"; os.system("id")',
+            ("PART-A-SECRET", "CONCAT-COMPARISON-SECRET-123456"),
+        ),
+        (
+            'client_secret == "PART-B-SECRET" "ADJACENT-COMPARISON-SECRET-123456"; os.system("id")',
+            ("PART-B-SECRET", "ADJACENT-COMPARISON-SECRET-123456"),
+        ),
+        (
+            'client_secret == "%s" % "PERCENT-COMPARISON-SECRET-123456"; os.system("id")',
+            ("PERCENT-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'client_secret == "YES-COMPARISON-SECRET-123456" if enabled else "NO-COMPARISON-SECRET-123456"; '
+            'os.system("id")',
+            ("YES-COMPARISON-SECRET-123456", "NO-COMPARISON-SECRET-123456"),
+        ),
+        (
+            'client_secret == lookup("CALL-COMPARISON-SECRET-123456"); os.system("id")',
+            ("CALL-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'client_secret == <redacted> + "MARKER-TAIL-COMPARISON-SECRET-123456"; os.system("id")',
+            ("MARKER-TAIL-COMPARISON-SECRET-123456",),
+        ),
+        (
+            '"client_secret" == "QUOTED-KEY-COMPARISON-SECRET-123456"; os.system("id")',
+            ("QUOTED-KEY-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'config["client_secret"] == "SUBSCRIPT-KEY-COMPARISON-SECRET-123456"; os.system("id")',
+            ("SUBSCRIPT-KEY-COMPARISON-SECRET-123456",),
+        ),
+        (
+            '(client_secret) == "GROUPED-KEY-COMPARISON-SECRET-123456"; os.system("id")',
+            ("GROUPED-KEY-COMPARISON-SECRET-123456",),
+        ),
+        (
+            'config[("client" + "_secret")] == "COMPOSED-SUBSCRIPT-COMPARISON-SECRET-123456"; os.system("id")',
+            ("COMPOSED-SUBSCRIPT-COMPARISON-SECRET-123456",),
+        ),
+        (
+            '"HUNTER2" == config["client_secret"]; os.system("id")',
+            ("HUNTER2",),
+        ),
+        (
+            '"OPAQUE-VALUE-CRED-123456" == "client_secret"; os.system("id")',
+            ("OPAQUE-VALUE-CRED-123456",),
+        ),
+    ],
+)
+def test_sensitive_comparison_statements_redact_compound_and_reversed_literals(
+    text: str,
+    secrets: tuple[str, ...],
+) -> None:
+    redacted = redact_evidence_string(text, max_chars=1000)
+
+    assert all(secret not in redacted for secret in secrets)
+    assert 'os.system("id")' in redacted
+
+
+def test_sensitive_comparison_preserves_command_operand() -> None:
+    redacted = redact_evidence_string('client_secret == os.system("id")', max_chars=1000)
+
+    assert 'os.system("id")' in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'tokenizer == "bert-base"; os.system("id")',
+        'label == "client_secret"; os.system("id")',
+    ],
+)
+def test_comparison_near_matches_are_preserved(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=1000) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "password <redacted>",
+        "<redacted> password",
+        "password <credentials-redacted>",
+        "<credentials-redacted> password",
+    ],
+)
+def test_comparison_parser_ignores_redaction_marker_delimiters(text: str) -> None:
+    assert evidence_redaction._redact_sensitive_comparison_statements(text) == text
+
+
+def test_excessive_comparison_candidates_fail_closed_for_sensitive_keys() -> None:
+    comparisons = " or ".join(f'client_secret == "DENSE-COMPARISON-SECRET-{index}"' for index in range(65))
+    text = f'{comparisons}; os.system("id")'
+
+    assert redact_evidence_string(text, max_chars=10_000) == REDACTED_EVIDENCE_VALUE
+
+
+def test_quoted_comparison_decoys_do_not_consume_candidate_budget() -> None:
+    decoys = "; ".join('print("client_secret == inert")' for _ in range(65))
+    text = f'os.system("id"); {decoys}'
+
+    redacted = redact_evidence_string(text, max_chars=10_000)
+
+    assert redacted != REDACTED_EVIDENCE_VALUE
+    assert 'os.system("id")' in redacted

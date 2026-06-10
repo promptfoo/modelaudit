@@ -78,6 +78,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- ignore single-quartet Base64 pickle prefixes in ordinary text while preserving explicit payloads and security evidence
+- honor the string-literal scan cap during bounded raw nested-pickle analysis and avoid duplicate probes inside complete encoded pickles
 - preserve raw persistent-ID probes and later encoded payloads when byte literals also contain complete or unterminated Base64 pickles
 - scan encoded nested pickles in bounded byte and bytearray literals without treating benign execution-like text or complete encoded payloads as raw pickle fragments
 - continue probing encoded protocol 0 payloads after long line operands, lenient base64 separators, and wrapper alignment shifts while failing closed beyond bounded mid-scan coverage
@@ -91,6 +93,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect nested pickles accepted by permissive base64 and hex decoders, and fail
   closed when decoded prefixes leave over-budget encoded tails
 - Invalidate cached call-graph analysis when Python sources, import hooks, loaded module origins, or parent package markers change.
+- bound aggregate decompressed bytes used to probe PyTorch ZIP members for hidden pickles
 - fail closed when PyTorch ZIP archives exceed the standalone pickle-member scan budget
 - detect dangerous call-like strings split across newline-separated statements
 - scan raw nested pickle payloads carried inside Unicode string literals

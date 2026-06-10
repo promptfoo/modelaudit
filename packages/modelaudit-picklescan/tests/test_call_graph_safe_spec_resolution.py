@@ -31,6 +31,7 @@ def _posixpath_text_regex_cache_name() -> str:
         if name in posixpath.expandvars.__code__.co_names:
             return name
     pytest.skip("posixpath.expandvars has no recognized text regex cache")
+    raise AssertionError("pytest.skip returned unexpectedly")
 
 
 def _has_source_unavailable_notice(report: PickleReport, module: str, name: str) -> bool:

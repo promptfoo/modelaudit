@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Pull in current Debian security fixes from the configured apt sources.
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 \
+    && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 libssl3t64 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

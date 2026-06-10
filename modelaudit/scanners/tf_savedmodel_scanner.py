@@ -1314,7 +1314,6 @@ class TensorFlowSavedModelScanner(BaseScanner):
             return []
 
         source_changed = False
-        final_file_size = file_stat.st_size
         try:
             with file_path.open("rb") as file_obj:
                 opened_stat = os.fstat(file_obj.fileno())

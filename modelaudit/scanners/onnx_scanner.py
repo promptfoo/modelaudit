@@ -59,6 +59,7 @@ STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset(
         "ai.onnx.preview.training",
     }
 )
+SCHEMA_VALIDATED_ONNX_DOMAINS: frozenset[str] = frozenset({"ai.onnx.preview"})
 ONNX_STRUCTURE_INCONCLUSIVE_REASON = "onnx_structure_validation_failed"
 ONNX_RAW_DETECTION_INCONCLUSIVE_REASON = "onnx_raw_detection_analysis_incomplete"
 ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON = "onnx_weight_distribution_analysis_incomplete"
@@ -135,14 +136,90 @@ def _iter_graph_nodes(graph: Any) -> Any:
 
 def _iter_model_graphs(model: Any) -> Any:
     """Yield graph-bearing ONNX model fields that may declare operators."""
-    yield model.graph
+    for graph, _opset_versions in _iter_model_graphs_with_opsets(model):
+        yield graph
+
+
+def _iter_model_graphs_with_opsets(model: Any) -> Any:
+    """Yield model graphs with the operator-set versions governing each graph."""
+    model_opset_versions = {opset.domain or "": int(opset.version) for opset in getattr(model, "opset_import", [])}
+    yield model.graph, model_opset_versions
     for function in getattr(model, "functions", []):
-        yield function
+        function_opset_versions = {
+            opset.domain or "": int(opset.version) for opset in getattr(function, "opset_import", [])
+        }
+        yield function, function_opset_versions
         for attribute in getattr(function, "attribute_proto", []):
-            yield from _iter_attribute_graphs(attribute)
+            for graph in _iter_attribute_graphs(attribute):
+                yield graph, function_opset_versions
     for training_info in getattr(model, "training_info", []):
-        yield training_info.initialization
-        yield training_info.algorithm
+        yield training_info.initialization, model_opset_versions
+        yield training_info.algorithm, model_opset_versions
+
+
+def _model_local_function_identifiers(model: Any) -> frozenset[tuple[str, str, str]]:
+    """Return identifiers for functions implemented inside the ONNX model."""
+    return frozenset(
+        (
+            function.domain or "",
+            function.name or "",
+            getattr(function, "overload", "") or "",
+        )
+        for function in getattr(model, "functions", [])
+    )
+
+
+def _operator_identifier(node: Any) -> tuple[str, str, str]:
+    """Return an ONNX operator's domain, name, and overload identity."""
+    return (node.domain or "", node.op_type or "", getattr(node, "overload", "") or "")
+
+
+def _has_operator_schema(op_type: str, version: int, domain: str) -> bool:
+    """Return whether the installed ONNX release registers an operator schema."""
+    try:
+        import onnx
+
+        return bool(onnx.defs.has(op_type, version, domain))
+    except Exception as exc:  # pragma: no cover - fail closed on optional API errors
+        logger.debug("Unable to validate ONNX operator schema %s::%s at version %s: %s", domain, op_type, version, exc)
+        return False
+
+
+def _is_schema_validated_operator(node: Any, opset_versions: dict[str, int]) -> bool:
+    """Return whether this graph's imports register the preview operator."""
+    domain = node.domain or ""
+    version = opset_versions.get(domain)
+    return bool(
+        domain in SCHEMA_VALIDATED_ONNX_DOMAINS
+        and not (getattr(node, "overload", "") or "")
+        and version is not None
+        and _has_operator_schema(node.op_type or "", version, domain)
+    )
+
+
+def _is_external_custom_operator(
+    node: Any,
+    local_function_identifiers: frozenset[tuple[str, str, str]],
+    opset_versions: dict[str, int],
+) -> bool:
+    """Return True for non-standard operators without a model-local implementation."""
+    domain = node.domain or ""
+    return bool(
+        domain
+        and domain not in STANDARD_ONNX_DOMAINS
+        and _operator_identifier(node) not in local_function_identifiers
+        and not _is_schema_validated_operator(node, opset_versions)
+    )
+
+
+def _is_explicit_custom_operator(
+    node: Any,
+    local_function_identifiers: frozenset[tuple[str, str, str]],
+) -> bool:
+    """Return whether an actual graph node carries the raw custom-op marker."""
+    return bool(
+        "custom_op" in (node.op_type or "").casefold() and _operator_identifier(node) not in local_function_identifiers
+    )
 
 
 def _iter_graph_and_subgraphs(graph: Any) -> Any:
@@ -247,6 +324,26 @@ def _confirmed_python_operator_findings(findings: list[Any], model: Any) -> list
             continue
         confirmed.append(finding)
     return confirmed
+
+
+def _confirmed_onnx_operator_findings(findings: list[Any], model: Any) -> list[Any]:
+    """Let parsed graph checks own custom-op findings when inventory is readable."""
+    confirmed = _confirmed_python_operator_findings(findings, model)
+    if not any(_jit_finding_type(finding) == "custom_operator" for finding in confirmed):
+        return confirmed
+
+    try:
+        if hasattr(model, "HasField") and not model.HasField("graph"):
+            return confirmed
+        for graph in _iter_model_graphs(model):
+            for node in _iter_graph_nodes(graph):
+                _operator_identifier(node)
+    except Exception as exc:  # pragma: no cover - defensive: keep finding if unsure
+        logger.debug("Unable to validate ONNX custom operator finding against graph: %s", exc)
+        return confirmed
+
+    logger.debug("Suppressing raw-byte ONNX custom_operator finding in favor of parsed graph checks")
+    return [finding for finding in confirmed if _jit_finding_type(finding) != "custom_operator"]
 
 
 def _is_windows_absolute_path(path: str) -> bool:
@@ -528,7 +625,7 @@ class OnnxScanner(BaseScanner):
                     )
                 else:
                     self.add_jit_script_findings(
-                        _confirmed_python_operator_findings(jit_findings, model),
+                        _confirmed_onnx_operator_findings(jit_findings, model),
                         result,
                         model_type="onnx",
                         context=path,
@@ -600,37 +697,53 @@ class OnnxScanner(BaseScanner):
 
     def _check_custom_ops(self, model: Any, path: str, result: ScanResult) -> None:
         custom_domains = set()
+        local_function_identifiers = _model_local_function_identifiers(model)
+        custom_operators_found = 0
         python_ops_found = False
         safe_nodes = 0
         nodes_checked = 0
 
-        for graph in _iter_model_graphs(model):
+        for graph, opset_versions in _iter_model_graphs_with_opsets(model):
             for node in _iter_graph_nodes(graph):
                 nodes_checked += 1
                 # Check for interrupts periodically during node processing.
                 self.check_interrupted()
                 is_python_operator = _is_python_operator(node.op_type or "")
-                if node.domain and node.domain not in STANDARD_ONNX_DOMAINS:
-                    custom_domains.add(node.domain)
+                is_external_custom_operator = _is_external_custom_operator(
+                    node,
+                    local_function_identifiers,
+                    opset_versions,
+                )
+                is_explicit_custom_operator = _is_explicit_custom_operator(node, local_function_identifiers)
+                if is_external_custom_operator or is_explicit_custom_operator:
+                    custom_operators_found += 1
+                    if is_external_custom_operator:
+                        custom_domains.add(node.domain)
+                        message = (
+                            f"Model references custom operator domain '{node.domain}'. "
+                            "This is metadata only - ensure operators are from trusted sources before installation."
+                        )
+                    else:
+                        message = (
+                            f"Model references custom operator '{node.op_type}' in the standard ONNX domain. "
+                            "Ensure its implementation is from a trusted source before installation."
+                        )
 
-                    # All custom domains are INFO - they're metadata, not executable code
+                    # All custom operators are INFO - they're metadata, not executable code
                     # Security risk is in runtime environment (installing malicious operators)
                     # not in the ONNX file itself
                     result.add_check(
                         name="Custom Operator Domain Check",
                         passed=False,
-                        message=(
-                            f"Model references custom operator domain '{node.domain}'. "
-                            f"This is metadata only - ensure operators are from trusted sources before installation."
-                        ),
+                        message=message,
                         severity=IssueSeverity.INFO,
                         location=f"{path} (node: {node.name})",
-                        rule_code="S302",
+                        rule_code="S1111",
                         details={
                             "op_type": node.op_type,
                             "domain": node.domain,
                             "security_note": (
-                                "Custom domains indicate dependencies on external operator implementations. "
+                                "Custom operators may depend on external operator implementations. "
                                 "ONNX files cannot execute code - risk is in runtime environment if malicious "
                                 "operators are installed. Verify operator packages before installation."
                             ),
@@ -648,15 +761,15 @@ class OnnxScanner(BaseScanner):
                         rule_code="S902",
                         details={"op_type": node.op_type, "domain": node.domain},
                     )
-                elif not node.domain or node.domain in STANDARD_ONNX_DOMAINS:
+                elif not is_external_custom_operator and not is_explicit_custom_operator:
                     safe_nodes += 1
 
         # Record successful checks for safe operators
-        if safe_nodes > 0 and not custom_domains:
+        if safe_nodes > 0 and custom_operators_found == 0:
             result.add_check(
                 name="Custom Operator Domain Check",
                 passed=True,
-                message="All operators use standard ONNX domains",
+                message="All operators use standard ONNX domains or model-local function implementations",
                 location=path,
                 details={"safe_nodes": safe_nodes},
                 rule_code=None,  # Passing check
@@ -1237,8 +1350,18 @@ class OnnxScanner(BaseScanner):
             metadata["operators"] = operators
 
             # Custom domains
+            local_function_identifiers = _model_local_function_identifiers(model)
             custom_domains = sorted(
-                {node.domain for node in model.graph.node if node.domain and node.domain not in STANDARD_ONNX_DOMAINS}
+                {
+                    node.domain
+                    for graph, opset_versions in _iter_model_graphs_with_opsets(model)
+                    for node in _iter_graph_nodes(graph)
+                    if _is_external_custom_operator(
+                        node,
+                        local_function_identifiers,
+                        opset_versions,
+                    )
+                }
             )
             if custom_domains:
                 metadata["custom_domains"] = custom_domains

@@ -2406,9 +2406,15 @@ def test_numpy_dependency_unavailable_is_inconclusive(
 def test_malformed_orbax_metadata_is_inconclusive(tmp_path: Path) -> None:
     checkpoint_dir = tmp_path / "malformed_orbax"
     checkpoint_dir.mkdir()
-    (checkpoint_dir / "metadata.json").write_text('{"type": "orbax_checkpoint"', encoding="utf-8")
+    (checkpoint_dir / "metadata.json").write_text(
+        '{"version": 1, "type": "orbax_checkpoint"',
+        encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir))
 
     result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+    aggregate = scan_model_directory_or_file(str(checkpoint_dir), cache_scan_results=False)
 
     assert result.success is False
     assert result.metadata["scan_outcome"] == "inconclusive"
@@ -2419,6 +2425,27 @@ def test_malformed_orbax_metadata_is_inconclusive(tmp_path: Path) -> None:
         and check.severity == IssueSeverity.INFO
         for check in result.checks
     )
+    assert aggregate.file_metadata[str(checkpoint_dir)]["directory_owner_scan"] is True
+    assert aggregate.file_metadata[str(checkpoint_dir)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        '{"package":"backup-tool"',
+        '{"description":"format orbax"',
+        '{"nested":{"format":"orbax"}',
+        '{"format":"jaxonomy"',
+        '{"format":"borbax"',
+    ],
+)
+def test_malformed_generic_metadata_json_is_not_routed_as_jax(tmp_path: Path, metadata: str) -> None:
+    ordinary_directory = tmp_path / "malformed-backup-package"
+    ordinary_directory.mkdir()
+    (ordinary_directory / "metadata.json").write_text(metadata, encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(ordinary_directory)) is False
 
 
 def test_generic_metadata_json_is_not_routed_as_jax(tmp_path: Path) -> None:

@@ -1968,6 +1968,9 @@ def _is_safetensors_routing_candidate(path: Path | None, magic8: bytes, file_siz
         parsed_header = json.loads(header.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return False
+    except (RecursionError, ValueError):
+        # Parsing limits are inconclusive, so retain the fail-closed scanner route.
+        return True
 
     return isinstance(parsed_header, dict)
 
@@ -3526,6 +3529,63 @@ def has_jax_json_checkpoint_structure(payload: object) -> bool:
     return False
 
 
+def _has_jax_json_checkpoint_prefix_identity(prefix: bytes) -> bool:
+    """Recognize explicit top-level JAX identity in a truncated JSON object."""
+    try:
+        prefix_text = prefix.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False
+
+    def skip_json_whitespace(offset: int) -> int:
+        while offset < len(prefix_text) and prefix_text[offset] in " \t\r\n":
+            offset += 1
+        return offset
+
+    decoder = json.JSONDecoder()
+    offset = skip_json_whitespace(0)
+    if offset >= len(prefix_text) or prefix_text[offset] != "{":
+        return False
+    offset += 1
+
+    while True:
+        offset = skip_json_whitespace(offset)
+        if offset >= len(prefix_text) or prefix_text[offset] == "}":
+            return False
+
+        try:
+            key, key_end = decoder.raw_decode(prefix_text, offset)
+        except (json.JSONDecodeError, RecursionError):
+            return False
+        if not isinstance(key, str):
+            return False
+
+        offset = skip_json_whitespace(key_end)
+        if offset >= len(prefix_text) or prefix_text[offset] != ":":
+            return False
+        offset = skip_json_whitespace(offset + 1)
+
+        if key in _JAX_JSON_CHECKPOINT_MARKER_KEYS:
+            return True
+
+        try:
+            value, value_end = decoder.raw_decode(prefix_text, offset)
+        except (json.JSONDecodeError, RecursionError):
+            return False
+        if (
+            key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS
+            and isinstance(value, str)
+            and _JAX_JSON_CHECKPOINT_IDENTITY_RE.search(value)
+        ):
+            return True
+
+        offset = skip_json_whitespace(value_end)
+        if offset >= len(prefix_text) or prefix_text[offset] == "}":
+            return False
+        if prefix_text[offset] != ",":
+            return False
+        offset += 1
+
+
 def _probe_jax_json_checkpoint_file(file_path: Path) -> bool | None:
     """Return True for JAX JSON, None for bounded ambiguity, else False."""
     try:
@@ -3548,6 +3608,8 @@ def _probe_jax_json_checkpoint_file(file_path: Path) -> bool | None:
     try:
         payload = json.loads(prefix.decode("utf-8-sig"))
     except (UnicodeDecodeError, ValueError, RecursionError):
+        if _has_jax_json_checkpoint_prefix_identity(prefix):
+            return True
         if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES:
             # A visible non-JAX value cannot prove the unseen tail has no later
             # JAX identity field; preserve bounded ambiguity instead of skipping.
@@ -4060,6 +4122,8 @@ def detect_format_from_magic_bytes(
     """Detect file format using Python 3.10+ pattern matching on magic bytes."""
     compression_format = _detect_compression_format(magic16)
     if compression_format:
+        if _is_safetensors_routing_candidate(file_path, magic8, file_size):
+            return "safetensors"
         return compression_format
 
     # Use pattern matching for cleaner magic byte detection
@@ -4590,6 +4654,8 @@ def detect_file_format(path: str) -> str:
         return llamafile_format
 
     compression_format = _detect_compression_format(header)
+    if compression_format and _is_safetensors_routing_candidate(file_path, magic8, size):
+        return "safetensors"
     has_known_container_magic = (
         _has_zip_magic(magic4)
         or magic8.startswith(_SEVENZIP_MAGIC)
