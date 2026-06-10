@@ -6910,6 +6910,7 @@ def test_pytorch_zip_entry_limit_reads_selected_symlink_duplicate(tmp_path: Path
     symlink_target = tmp_path / "selected-target"
     with zipfile.ZipFile(zip_path, "w") as zipf:
         symlink_info = zipfile.ZipInfo("duplicate-entry")
+        symlink_info.create_system = 3
         symlink_info.external_attr = 0o120777 << 16
         symlink_info.compress_type = zipfile.ZIP_STORED
         zipf.writestr(symlink_info, str(symlink_target))
