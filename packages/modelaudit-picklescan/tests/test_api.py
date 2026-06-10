@@ -88,6 +88,14 @@ EXPECTED_SYSTEM_GLOBAL = _expected_system_global()
 SYSTEM_GLOBALS = frozenset({"os.system", EXPECTED_SYSTEM_GLOBAL, "nt.system", "posix.system"})
 
 
+def _isolate_reusable_meta_path_finders(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "meta_path",
+        [finder for finder in sys.meta_path if ":unreusable:" not in _meta_path_finder_resolution_identity(finder)],
+    )
+
+
 @pytest.fixture(autouse=True)
 def _restore_copyreg_dispatch_table() -> collections.abc.Iterator[None]:
     original_dispatch_table = dict(copyreg.dispatch_table)
@@ -1568,6 +1576,7 @@ def test_scan_file_combines_pytorch_zip_private_source_fingerprints(
     other_path = source_root / f"{other_module}.py"
     other_path.write_text("def entrypoint():\n    return 2\n")
     monkeypatch.syspath_prepend(str(source_root))
+    _isolate_reusable_meta_path_finders(monkeypatch)
 
     archive_path = tmp_path / "model.pt"
     with zipfile.ZipFile(archive_path, "w") as archive:
@@ -5732,6 +5741,7 @@ def test_scan_bytes_preserves_origin_review_when_call_graph_enrichment_is_disabl
         encoding="utf-8",
     )
     monkeypatch.syspath_prepend(str(tmp_path))
+    _isolate_reusable_meta_path_finders(monkeypatch)
     payload = b"cnumpy\nGadget\n."
 
     report = scan_bytes(
@@ -5755,7 +5765,10 @@ def test_scan_bytes_preserves_origin_review_when_call_graph_enrichment_is_disabl
     assert marker.read_text(encoding="utf-8") == "owned"
 
 
-def test_scan_bytes_allows_trusted_origin_when_call_graph_enrichment_is_disabled() -> None:
+def test_scan_bytes_allows_trusted_origin_when_call_graph_enrichment_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_reusable_meta_path_finders(monkeypatch)
     report = scan_bytes(
         b"ccollections\nOrderedDict\n.",
         source="disabled-enrichment-ordered-dict.pkl",
@@ -5898,6 +5911,8 @@ def test_scan_bytes_warns_when_framework_reconstruction_reference_resolves_to_sh
         encoding="utf-8",
     )
     monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "torch._utils", raising=False)
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
     _clear_source_sensitive_caches()
     payload = b"ctorch._utils\n_rebuild_tensor_v2\n."
 
@@ -6130,11 +6145,7 @@ def test_with_call_graph_findings_records_source_fingerprint_metadata(
     module_path = tmp_path / "safe_module.py"
     module_path.write_text("def safe():\n    return 1\n")
     monkeypatch.syspath_prepend(str(tmp_path))
-    monkeypatch.setattr(
-        sys,
-        "meta_path",
-        [finder for finder in sys.meta_path if ":unreusable:" not in _meta_path_finder_resolution_identity(finder)],
-    )
+    _isolate_reusable_meta_path_finders(monkeypatch)
 
     report = PickleReport(
         source="safe-module.pkl",
@@ -6169,6 +6180,7 @@ def test_with_call_graph_findings_fails_closed_for_loaded_source_outside_search_
     module = ModuleType("loaded_safe_module")
     module.__spec__ = ModuleSpec("loaded_safe_module", loader=None, origin=str(module_path))
     monkeypatch.setitem(sys.modules, "loaded_safe_module", module)
+    _isolate_reusable_meta_path_finders(monkeypatch)
 
     report = PickleReport(
         source="loaded-safe-module.pkl",
@@ -6207,6 +6219,7 @@ def test_with_call_graph_findings_fingerprints_parent_package_markers(
     (second_package / "child.py").write_text("def entrypoint():\n    return 1\n")
     monkeypatch.syspath_prepend(str(second_root))
     monkeypatch.syspath_prepend(str(first_root))
+    _isolate_reusable_meta_path_finders(monkeypatch)
 
     report = PickleReport(
         source="parent-package-marker.pkl",
@@ -6245,6 +6258,7 @@ def test_with_call_graph_findings_fingerprints_higher_priority_namespace_candida
     safe_module.write_text("def entrypoint():\n    return 1\n")
     monkeypatch.syspath_prepend(str(second_root))
     monkeypatch.syspath_prepend(str(first_root))
+    _isolate_reusable_meta_path_finders(monkeypatch)
 
     report = PickleReport(
         source="namespace-candidate.pkl",
@@ -6289,6 +6303,7 @@ def test_with_call_graph_findings_fingerprints_sourceless_parent_package_markers
     py_compile.compile(str(package_source), cfile=str(package_marker), doraise=True)
     monkeypatch.syspath_prepend(str(second_root))
     monkeypatch.syspath_prepend(str(first_root))
+    _isolate_reusable_meta_path_finders(monkeypatch)
 
     report = PickleReport(
         source="sourceless-parent-package-marker.pkl",
@@ -6388,6 +6403,7 @@ def test_zipimport_archive_changes_invalidate_source_snapshot(
         archive.writestr("zip_pkg/__init__.py", "")
         archive.writestr("zip_pkg/helper.py", "def entrypoint():\n    return 1\n")
     monkeypatch.syspath_prepend(str(archive_path))
+    _isolate_reusable_meta_path_finders(monkeypatch)
 
     with shared_source_sensitive_caches():
         report_generation = _begin_shared_source_report()
@@ -6494,6 +6510,7 @@ def test_loaded_parent_package_path_controls_child_source_resolution(
     (runtime_package / "__init__.py").write_text("")
     (runtime_package / "child.py").write_text("import os\n\ndef entrypoint():\n    return os.system('id')\n")
     monkeypatch.syspath_prepend(str(safe_root))
+    _isolate_reusable_meta_path_finders(monkeypatch)
 
     loaded_package = ModuleType("loaded_parent_pkg")
     loaded_spec = ModuleSpec(
@@ -6630,6 +6647,7 @@ def test_matching_source_bytecode_remains_analyzable(
     module_path.write_text("def entrypoint():\n    return 1\n")
     py_compile.compile(str(module_path), doraise=True)
     monkeypatch.syspath_prepend(str(tmp_path))
+    _isolate_reusable_meta_path_finders(monkeypatch)
 
     report = PickleReport(
         source="matching-cached-bytecode.pkl",
