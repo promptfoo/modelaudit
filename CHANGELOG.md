@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - preserve sanitized CatBoost command context in SARIF without exposing injected or neighboring credential values
-- preserve critical PyTorch malformed-ZIP symlink findings, valid Python 3.10 streamed ZIP64 descriptors, and selected subtype findings from each complete ZIP segment in concatenated HDF5 user blocks while retaining bounded fail-closed preflight checks and avoiding structure-only ZIP route probes
+- preserve critical PyTorch malformed-ZIP symlink findings, valid Python 3.10 streamed ZIP64 descriptors, and selected subtype findings from complete nested and concatenated HDF5 user-block ZIPs while retaining bounded fail-closed preflight checks and avoiding structure-only ZIP route probes
 - classify unsafe PyTorch ZIP symlink targets as critical archive-link findings while preserving safe relative links
 - restore pickle CVE scan throughput, reprobe malformed stream separators, and route four-byte protocol-0 Joblib operands correctly
 - bound manifest embedded-Jinja template collection while preserving findings across deep branches, cycles, and shared YAML aliases

@@ -10025,6 +10025,37 @@ class TestZipScanner:
             for check in result.checks
         )
 
+    def test_symlink_local_metadata_mismatch_reports_critical_finding(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "mismatched-symlink-name.zip"
+        link_name = "link.txt"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            info = zipfile.ZipInfo(link_name)
+            info.create_system = 3
+            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(info, "safe-target")
+
+        with zipfile.ZipFile(archive_path) as archive:
+            header_offset = archive.getinfo(link_name).header_offset
+        archive_bytes = bytearray(archive_path.read_bytes())
+        filename_length = struct.unpack_from("<H", archive_bytes, header_offset + 26)[0]
+        filename_start = header_offset + 30
+        archive_bytes[filename_start : filename_start + filename_length] = b"x" * filename_length
+        archive_path.write_bytes(archive_bytes)
+
+        result = ZipScanner().scan(str(archive_path))
+
+        assert result.success is False
+        assert any(check.rule_code == "S902" for check in result.checks)
+        symlink_check = next(
+            check
+            for check in result.checks
+            if check.name == "Symlink Safety Validation" and check.details.get("entry") == link_name
+        )
+        assert symlink_check.status == CheckStatus.FAILED
+        assert symlink_check.severity == IssueSeverity.CRITICAL
+        assert symlink_check.rule_code == "S406"
+        assert symlink_check.details["target_class"] == "invalid"
+
     def test_many_eocd_signatures_in_stored_member_are_not_treated_as_candidates(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "many_eocd_signatures.zip"
         payload = (b"PK\x05\x06" + (b"A" * 16) + b"\x00\x00") * 16

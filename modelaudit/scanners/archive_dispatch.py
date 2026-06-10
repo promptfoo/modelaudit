@@ -494,16 +494,16 @@ def merge_hdf5_userblock_zip_findings(
                 bytes_read += len(chunk)
                 remaining -= len(chunk)
 
-        logical_zip_ends = _find_valid_zip_logical_ends(path, eocd_offsets, scan_limit)
-        if not logical_zip_ends:
+        logical_zip_segments = _find_valid_zip_logical_segments(path, eocd_offsets, scan_limit)
+        if not logical_zip_segments:
             if saw_zip_record:
                 raise OSError("HDF5 user block has ZIP-like content without a valid ZIP end record")
             if scan_limit < signature_offset:
                 _mark_hdf5_userblock_zip_probe_incomplete(result, path, signature_offset, scan_limit)
             return
-        if len(logical_zip_ends) > _MAX_HDF5_USERBLOCK_ZIP_SEGMENTS:
+        if len(logical_zip_segments) > _MAX_HDF5_USERBLOCK_ZIP_SEGMENTS:
             raise OSError("HDF5 user block contains too many complete ZIP segments")
-        logical_zip_end = logical_zip_ends[-1]
+        logical_zip_end = logical_zip_segments[-1][1]
 
         has_trailing_content = False
         with open(path, "rb") as source:
@@ -517,12 +517,17 @@ def merge_hdf5_userblock_zip_findings(
                     has_trailing_content = True
                 trailing_bytes -= len(chunk)
 
-        previous_logical_end = 0
-        for logical_end in logical_zip_ends:
-            if previous_logical_end == 0:
+        previous_top_level_end = 0
+        for index, (archive_start, logical_end) in enumerate(logical_zip_segments):
+            # Analyze nested candidates, but do not let their EOCDs advance the
+            # boundary used to isolate independent concatenated archives.
+            is_contained = any(
+                containing_start <= archive_start for containing_start, _ in logical_zip_segments[index + 1 :]
+            )
+            if previous_top_level_end == 0:
                 temp_path = _copy_file_prefix_to_temp(path, logical_end, temp_suffix)
             else:
-                temp_path = _copy_file_range_to_temp(path, previous_logical_end, logical_end, temp_suffix)
+                temp_path = _copy_file_range_to_temp(path, previous_top_level_end, logical_end, temp_suffix)
             supplemental_result = ScanResult(scanner_name="zip")
             merge_executable_zip_container_findings(temp_path, supplemental_result, config, context=context)
             _replace_scan_result_path(supplemental_result, temp_path, path)
@@ -530,7 +535,8 @@ def merge_hdf5_userblock_zip_findings(
             with suppress(OSError):
                 os.unlink(temp_path)
             temp_path = None
-            previous_logical_end = logical_end
+            if not is_contained:
+                previous_top_level_end = logical_end
         if has_trailing_content:
             reason = "hdf5_userblock_zip_trailing_content_unanalyzed"
             mark_inconclusive_scan_result(result, reason)
@@ -658,13 +664,13 @@ class _LogicalEOFReader:
         return True
 
 
-def _find_valid_zip_logical_ends(
+def _find_valid_zip_logical_segments(
     temp_path: str,
     eocd_offsets: list[int],
     signature_offset: int,
-) -> list[int]:
-    """Return complete ZIP end records before the HDF5 signature."""
-    logical_ends: list[int] = []
+) -> list[tuple[int, int]]:
+    """Return archive starts and complete ZIP ends before the HDF5 signature."""
+    logical_segments: list[tuple[int, int]] = []
     with open(temp_path, "rb") as handle:
         for eocd_offset in eocd_offsets:
             handle.seek(eocd_offset)
@@ -676,9 +682,21 @@ def _find_valid_zip_logical_ends(
                 continue
             bounded_reader = _LogicalEOFReader(handle, logical_end)
             bounded_reader.seek(0)
-            if zipfile.is_zipfile(bounded_reader) and logical_end not in logical_ends:
-                logical_ends.append(logical_end)
-    return logical_ends
+            try:
+                with zipfile.ZipFile(bounded_reader) as archive:
+                    entries = archive.infolist()
+                    archive_start = min(
+                        (entry.header_offset for entry in entries),
+                        default=archive.start_dir,
+                    )
+            except (OSError, zipfile.BadZipFile):
+                continue
+            if archive_start < 0 or archive_start > eocd_offset:
+                continue
+            segment = (archive_start, logical_end)
+            if segment not in logical_segments:
+                logical_segments.append(segment)
+    return logical_segments
 
 
 def _copy_file_prefix_to_temp(path: str, length: int, suffix: str) -> str:

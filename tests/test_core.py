@@ -470,6 +470,34 @@ def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
             archive.writestr(name, data)
 
 
+def _promote_small_zip_to_zip64(path: Path) -> None:
+    """Rewrite a small fixture with ZIP64 EOCD metadata while preserving its entries."""
+    archive_bytes = bytearray(path.read_bytes())
+    eocd_offset = archive_bytes.rfind(b"PK\x05\x06")
+    assert eocd_offset >= 0
+    entry_count = struct.unpack_from("<H", archive_bytes, eocd_offset + 10)[0]
+    directory_size = struct.unpack_from("<I", archive_bytes, eocd_offset + 12)[0]
+    directory_offset = struct.unpack_from("<I", archive_bytes, eocd_offset + 16)[0]
+
+    zip64_eocd = struct.pack(
+        "<4sQ2H2I4Q",
+        b"PK\x06\x06",
+        44,
+        45,
+        45,
+        0,
+        0,
+        entry_count,
+        entry_count,
+        directory_size,
+        directory_offset,
+    )
+    zip64_locator = struct.pack("<4sIQI", b"PK\x06\x07", 0, eocd_offset, 1)
+    archive_bytes[eocd_offset + 8 : eocd_offset + 12] = b"\xff" * 4
+    archive_bytes[eocd_offset + 12 : eocd_offset + 20] = b"\xff" * 8
+    path.write_bytes(archive_bytes[:eocd_offset] + zip64_eocd + zip64_locator + archive_bytes[eocd_offset:])
+
+
 def _append_hdf5_userblock_candidate(
     path: Path,
     *,
@@ -4588,6 +4616,86 @@ def test_scan_file_preserves_earlier_concatenated_hdf5_userblock_zip(
 
     _assert_system_pickle_detected(result, "payload.pkl")
     assert any(item.get("path") == f"{polyglot}:README.txt" for item in result.metadata["contents"])
+
+
+@pytest.mark.parametrize("malicious", [False, True])
+@pytest.mark.parametrize("nested_zip64", [False, True])
+def test_hdf5_userblock_outer_zip_preserves_entries_before_nested_end_record(
+    tmp_path: Path,
+    malicious: bool,
+    nested_zip64: bool,
+) -> None:
+    nested_zip = tmp_path / "nested.zip"
+    _create_misnamed_zip(nested_zip, {"README-nested.txt": b"benign nested archive"})
+    if nested_zip64:
+        _promote_small_zip_to_zip64(nested_zip)
+        nested_bytes = nested_zip.read_bytes()
+        nested_eocd_offset = nested_bytes.rfind(b"PK\x05\x06")
+        assert nested_bytes[nested_eocd_offset + 12 : nested_eocd_offset + 20] == b"\xff" * 8
+    with zipfile.ZipFile(nested_zip) as archive:
+        assert archive.namelist() == ["README-nested.txt"]
+
+    polyglot = tmp_path / "outer-nested-zip-userblock.h5"
+    with zipfile.ZipFile(polyglot, "w", compression=zipfile.ZIP_STORED) as archive:
+        if malicious:
+            archive.writestr("payload.pkl", _build_malicious_pickle())
+        else:
+            archive.writestr("README-outer.txt", b"benign outer archive")
+        archive.writestr("nested.bin", nested_zip.read_bytes())
+    signature_offset = _append_hdf5_userblock_candidate(polyglot, plausible=True)
+    result = ScanResult(scanner_name="keras_h5")
+    result.finish(success=True)
+
+    archive_dispatch.merge_hdf5_userblock_zip_findings(
+        str(polyglot),
+        result,
+        {"cache_scan_results": False},
+        signature_offset,
+        context="test HDF5 user block",
+    )
+
+    pickle_findings = [
+        issue
+        for issue in result.issues
+        if issue.rule_code == "S201"
+        and issue.details.get("zip_entry") == "payload.pkl"
+        and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+    ]
+    assert bool(pickle_findings) is malicious
+    assert not any(check.name == "HDF5 User Block ZIP Analysis" for check in result.checks)
+    assert (
+        bool([issue for issue in result.issues if issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)])
+        is malicious
+    )
+
+
+def test_hdf5_userblock_concatenated_outer_zip_ignores_nested_zip64_boundary(tmp_path: Path) -> None:
+    first_zip = tmp_path / "first.zip"
+    _create_misnamed_zip(first_zip, {"README-first.txt": b"benign first archive"})
+    nested_zip = tmp_path / "nested.zip"
+    _create_misnamed_zip(nested_zip, {"README-nested.txt": b"benign nested archive"})
+    _promote_small_zip_to_zip64(nested_zip)
+    outer_zip = tmp_path / "outer.zip"
+    with zipfile.ZipFile(outer_zip, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("payload.pkl", _build_malicious_pickle())
+        archive.writestr("nested.bin", nested_zip.read_bytes())
+
+    polyglot = tmp_path / "concatenated-nested-zip64-userblock.h5"
+    polyglot.write_bytes(first_zip.read_bytes() + outer_zip.read_bytes())
+    signature_offset = _append_hdf5_userblock_candidate(polyglot, plausible=True, minimum_signature_offset=2048)
+    result = ScanResult(scanner_name="keras_h5")
+    result.finish(success=True)
+
+    archive_dispatch.merge_hdf5_userblock_zip_findings(
+        str(polyglot),
+        result,
+        {"cache_scan_results": False},
+        signature_offset,
+        context="test HDF5 user block",
+    )
+
+    _assert_system_pickle_detected(result, "payload.pkl")
+    assert not any(check.name == "HDF5 User Block ZIP Analysis" for check in result.checks)
 
 
 def test_large_hdf5_userblock_copies_only_validated_zip_prefix(

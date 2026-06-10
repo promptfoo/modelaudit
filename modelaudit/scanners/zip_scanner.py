@@ -1304,44 +1304,54 @@ class ZipScanner(BaseScanner):
             self._add_central_directory_size_limit_check(result, path, error)
         else:
             assert error is not None
-            result.add_check(
-                name="ZIP Central Directory Preflight",
-                passed=False,
-                message=f"ZIP central-directory validation failed: {error}",
-                severity=IssueSeverity.INFO,
-                rule_code="S902",
-                location=path,
-                details={
-                    "exception": str(error),
-                    "exception_type": type(error).__name__,
-                    "analysis_incomplete": True,
-                    "scan_outcome_reason": "zip_analysis_incomplete",
-                },
-            )
-            if isinstance(error, _ZipLocalEntryMismatch) and error.entry.is_symlink:
-                encoding = "utf-8" if error.entry.flags & 0x0800 else "cp437"
-                entry_name = error.entry.filename.decode(encoding, errors="replace")
-                if len(entry_name) > 1024:
-                    entry_name = f"{entry_name[:1021]}..."
-                result.add_check(
-                    name="Symlink Safety Validation",
-                    passed=False,
-                    message=f"Symlink {entry_name} has inconsistent ZIP local metadata",
-                    severity=IssueSeverity.CRITICAL,
-                    rule_code="S406",
-                    location=f"{path}:{entry_name}",
-                    details={
-                        "entry": entry_name,
-                        "target": "<inconsistent-zip-metadata>",
-                        "target_class": "invalid",
-                        "compressed_size": error.entry.compressed_size,
-                        "uncompressed_size": error.entry.uncompressed_size,
-                        "analysis_incomplete": True,
-                    },
-                )
+            self._add_invalid_directory_checks(result, path, error)
         mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
         result.finish(success=False)
         return result
+
+    @staticmethod
+    def _add_invalid_directory_checks(
+        result: ScanResult,
+        path: str,
+        error: _InvalidZipDirectory,
+    ) -> None:
+        result.add_check(
+            name="ZIP Central Directory Preflight",
+            passed=False,
+            message=f"ZIP central-directory validation failed: {error}",
+            severity=IssueSeverity.INFO,
+            rule_code="S902",
+            location=path,
+            details={
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "zip_analysis_incomplete",
+            },
+        )
+        if not isinstance(error, _ZipLocalEntryMismatch) or not error.entry.is_symlink:
+            return
+
+        encoding = "utf-8" if error.entry.flags & 0x0800 else "cp437"
+        entry_name = error.entry.filename.decode(encoding, errors="replace")
+        if len(entry_name) > 1024:
+            entry_name = f"{entry_name[:1021]}..."
+        result.add_check(
+            name="Symlink Safety Validation",
+            passed=False,
+            message=f"Symlink {entry_name} has inconsistent ZIP local metadata",
+            severity=IssueSeverity.CRITICAL,
+            rule_code="S406",
+            location=f"{path}:{entry_name}",
+            details={
+                "entry": entry_name,
+                "target": "<inconsistent-zip-metadata>",
+                "target_class": "invalid",
+                "compressed_size": error.entry.compressed_size,
+                "uncompressed_size": error.entry.uncompressed_size,
+                "analysis_incomplete": True,
+            },
+        )
 
     @staticmethod
     def _add_central_directory_size_limit_check(
@@ -1722,20 +1732,7 @@ class ZipScanner(BaseScanner):
                 result.finish(success=False)
                 return result
             except _InvalidZipDirectory as exc:
-                result.add_check(
-                    name="ZIP Central Directory Preflight",
-                    passed=False,
-                    message=f"ZIP central-directory validation failed: {exc}",
-                    severity=IssueSeverity.INFO,
-                    rule_code="S902",
-                    location=path,
-                    details={
-                        "exception": str(exc),
-                        "exception_type": type(exc).__name__,
-                        "analysis_incomplete": True,
-                        "scan_outcome_reason": "zip_analysis_incomplete",
-                    },
-                )
+                self._add_invalid_directory_checks(result, path, exc)
                 mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
                 result.finish(success=False)
                 return result
