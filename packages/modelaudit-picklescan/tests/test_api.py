@@ -8032,7 +8032,8 @@ def test_scan_bytes_preserves_lenient_compact_base64_security_evidence(
     ],
 )
 def test_scan_bytes_ignores_compact_base64_tail_after_terminal_padding(encoded: str) -> None:
-    assert b"\x97." not in base64.b64decode(encoded)
+    assert encoded.endswith("ly4=")
+    assert base64.b64decode(encoded[-4:]) == b"\x97."
 
     report = scan_bytes(
         pickle.dumps({"metadata": encoded}, protocol=4),
