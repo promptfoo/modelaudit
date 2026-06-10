@@ -1963,11 +1963,19 @@ def test_manifest_scanner_enforces_timeout(
 
     result = scanner.scan(str(test_file))
 
-    assert result.success is True
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "manifest_scan_timeout"
+    assert result.metadata["analysis_incomplete"] is True
     timeout_checks = [check for check in result.checks if check.name == "Manifest Scan Timeout"]
     assert len(timeout_checks) == 1
     assert timeout_checks[0].status == CheckStatus.FAILED
-    assert timeout_checks[0].severity == IssueSeverity.WARNING
+    assert timeout_checks[0].severity == IssueSeverity.INFO
+    assert timeout_checks[0].details == {
+        "timeout_seconds": 1,
+        "analysis_incomplete": True,
+        "scan_outcome_reason": "manifest_scan_timeout",
+    }
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_manifest_scanner_blacklist_timeout_reports_only_timeout(
@@ -1992,7 +2000,8 @@ def test_manifest_scanner_blacklist_timeout_reports_only_timeout(
 
     result = scanner.scan(str(test_file))
 
-    assert result.success is True
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "manifest_scan_timeout"
     assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
 
 
@@ -2015,7 +2024,8 @@ def test_manifest_scanner_parse_timeout_reports_only_timeout(
 
     result = scanner.scan(str(test_file))
 
-    assert result.success is True
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "manifest_scan_timeout"
     assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
     assert not any(check.name == "File Parse Error" for check in result.checks)
     assert not any(check.name == "Manifest Parse Attempt" for check in result.checks)
@@ -2044,35 +2054,95 @@ def test_manifest_scanner_cloud_url_timeout_reports_only_timeout(
 
     result = scanner.scan(str(test_file))
 
-    assert result.success is True
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "manifest_scan_timeout"
     assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
     assert not any(check.name == "Manifest File Scan" for check in result.checks)
 
 
-def test_manifest_scanner_weak_hash_timeout_reports_only_timeout(
+def test_manifest_scanner_timeout_preserves_weak_hash_finding_and_is_not_cached(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Timeout overruns after weak-hash analysis should still report a manifest timeout."""
+    """Timeouts must preserve prior findings while remaining operational failures."""
     test_file = tmp_path / "config.json"
     test_file.write_text(json.dumps({"model_type": "bert", "checksum": "e3b0c44298fc1c149afbf4c8996fb924"}))
+    cache_dir = tmp_path / "cache"
 
+    original_check_weak_hashes = ManifestScanner._check_weak_hashes
+
+    def detect_then_expire(self: ManifestScanner, content: object, result: ScanResult) -> None:
+        original_check_weak_hashes(self, content, result)
+        self.scan_start_time = 0
+
+    monkeypatch.setattr(ManifestScanner, "_check_weak_hashes", detect_then_expire)
     scanner = ManifestScanner(config={"timeout": 1})
-    monkeypatch.setattr(scanner, "_check_file_for_blacklist", lambda _path, _result: None)
-    monkeypatch.setattr(scanner, "_check_cloud_storage_urls", lambda _path, _result: None)
-    monkeypatch.setattr(scanner, "_check_model_name_policies", lambda _content, _result: None)
-    monkeypatch.setattr(scanner, "_check_suspicious_urls", lambda _content, _result: None)
-
-    def expire_timeout(_content: object, _result: ScanResult) -> None:
-        scanner.scan_start_time = 0
-
-    monkeypatch.setattr(scanner, "_check_weak_hashes", expire_timeout)
 
     result = scanner.scan(str(test_file))
 
-    assert result.success is True
-    assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "manifest_scan_timeout"
+    failed_checks = [check for check in result.checks if check.status == CheckStatus.FAILED]
+    assert [check.name for check in failed_checks] == ["Weak Hash Detection", "Manifest Scan Timeout"]
+    assert failed_checks[0].severity == IssueSeverity.WARNING
+    assert failed_checks[0].details["algorithm"] == "MD5"
+    assert failed_checks[1].severity == IssueSeverity.INFO
     assert not any(check.name == "Manifest File Scan" for check in result.checks)
+
+    monkeypatch.setattr(
+        cache_decorator,
+        "should_bypass_cache_for_read_failure_aware_file",
+        lambda _path: False,
+    )
+    reset_cache_manager()
+    try:
+        aggregates = [
+            scan_model_directory_or_file(
+                str(test_file),
+                timeout=1,
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            for _ in range(2)
+        ]
+
+        for aggregate in aggregates:
+            assert aggregate.success is False
+            assert aggregate.file_metadata[str(test_file)]["operational_error_reason"] == "manifest_scan_timeout"
+            assert any(
+                issue.severity == IssueSeverity.WARNING and issue.details.get("algorithm") == "MD5"
+                for issue in aggregate.issues
+            )
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_manifest_scanner_timeout_keeps_strong_hash_near_match_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert", "checksum": "0" * 64}))
+    original_check_weak_hashes = ManifestScanner._check_weak_hashes
+
+    def detect_then_expire(self: ManifestScanner, content: object, result: ScanResult) -> None:
+        original_check_weak_hashes(self, content, result)
+        self.scan_start_time = 0
+
+    monkeypatch.setattr(ManifestScanner, "_check_weak_hashes", detect_then_expire)
+
+    result = ManifestScanner(config={"timeout": 1}).scan(str(test_file))
+
+    assert result.success is False
+    strong_hash_checks = [check for check in result.checks if check.name == "Weak Hash Detection"]
+    assert len(strong_hash_checks) == 1
+    assert strong_hash_checks[0].status == CheckStatus.PASSED
+    assert strong_hash_checks[0].details["algorithm"] == "SHA256"
+    assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 # ---------------------------------------------------------------------------
