@@ -7639,6 +7639,7 @@ def test_pytorch_zip_scanner_symlink_detection(tmp_path: Path) -> None:
         # The external_attr field encodes the Unix file mode
         # S_IFLNK = 0o120000 (symlink)
         symlink_info = zipfile.ZipInfo("malicious_link")
+        symlink_info.create_system = 3
         # Set external attributes to indicate symlink (Unix mode in upper 16 bits)
         symlink_info.external_attr = 0o120777 << 16  # symlink with full permissions
         symlink_info.compress_type = zipfile.ZIP_STORED

@@ -38,6 +38,7 @@ from modelaudit.scanners import (
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
 from modelaudit.scanners.tf_metagraph_scanner import _MAX_PARSE_BYTES
+from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
 from modelaudit.scanners.zip_scanner import ZipScanner
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
@@ -72,6 +73,22 @@ from tests.helpers import (
 )
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
+
+
+def _mock_weight_distribution_scanner_availability(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_loader = core_module._registry.load_scanner_by_id
+
+    def load_scanner_by_id(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "weight_distribution":
+            return WeightDistributionScanner
+        return original_loader(scanner_id)
+
+    monkeypatch.setattr(core_module._registry, "load_scanner_by_id", load_scanner_by_id)
+    monkeypatch.setattr(
+        WeightDistributionScanner,
+        "can_handle",
+        classmethod(lambda _cls, _path: True),
+    )
 
 
 def _valid_elf64_header() -> bytes:
@@ -2232,6 +2249,7 @@ def test_scan_file_selected_weight_distribution_routes_within_entry_limit(
         "modelaudit.scanners.weight_distribution_scanner.WeightDistributionScanner.scan",
         fake_weight_scan,
     )
+    _mock_weight_distribution_scanner_availability(monkeypatch)
 
     result = scan_file(
         str(archive_path),
@@ -4388,6 +4406,7 @@ def test_scan_file_selected_weight_distribution_ignores_hdf5_userblock_zip_near_
         "modelaudit.scanners.weight_distribution_scanner.WeightDistributionScanner.scan",
         fake_weight_scan,
     )
+    _mock_weight_distribution_scanner_availability(monkeypatch)
 
     result = scan_file(
         str(model_path),
