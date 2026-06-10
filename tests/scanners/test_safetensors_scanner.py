@@ -174,7 +174,7 @@ def test_shape_size_overflow_cannot_be_masked_by_zero_dimension(
         b"",
     )
 
-    with pytest.raises(SafetensorError, match=r"overflow|invalid JSON"):
+    with pytest.raises(SafetensorError, match=r"(?i)(overflow|invalid.*(?:header|json))"):
         safe_open(str(file_path), framework="np")
 
     result = SafeTensorsScanner().scan(str(file_path))
@@ -211,6 +211,34 @@ def test_zero_before_large_dimensions_remains_valid_empty_shape(tmp_path: Path) 
 
     assert result.success is True
     assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+
+
+def test_tensor_size_overflow_uses_native_bit_width(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("modelaudit.scanners.safetensors_scanner._MAX_PLATFORM_USIZE", 15)
+
+    assert SafeTensorsScanner._expected_size("U8", [1]) == 1
+    assert SafeTensorsScanner._expected_size("U8", [2]) is None
+
+
+def test_offsets_must_fit_native_usize(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    file_path = tmp_path / "native_offset_overflow.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {"empty": {"dtype": "U8", "shape": [0], "data_offsets": [4, 4]}},
+        b"\x00" * 4,
+    )
+    monkeypatch.setattr("modelaudit.scanners.safetensors_scanner._MAX_PLATFORM_USIZE", 3)
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Tensor Offset Validation"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("max_platform_offset") == 3
+        for check in result.checks
+    )
 
 
 def test_valid_empty_safetensors_custom_metadata(tmp_path: Path) -> None:
