@@ -1648,7 +1648,7 @@ class TestWeightDistributionScanner:
 
         assert not any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
 
-    def test_extreme_value_alert_is_monotonic_across_qualifying_outputs(self) -> None:
+    def test_extreme_value_check_ignores_widespread_tail_outputs(self) -> None:
         import numpy as np
 
         scanner = WeightDistributionScanner()
@@ -1662,11 +1662,9 @@ class TestWeightDistributionScanner:
             self._create_mock_architecture_analysis(is_llm=False),
         )
 
-        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
-        assert extreme["details"]["affected_neurons"] == [3, 4]
-        assert extreme["details"]["localized"] is False
+        assert not any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
 
-    def test_extreme_value_check_preserves_two_value_material_effect(self) -> None:
+    def test_extreme_value_check_ignores_two_value_material_tail(self) -> None:
         import numpy as np
 
         scanner = WeightDistributionScanner()
@@ -1679,23 +1677,71 @@ class TestWeightDistributionScanner:
             self._create_mock_architecture_analysis(is_llm=False),
         )
 
+        assert not any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
+
+    def test_extreme_value_check_preserves_five_value_material_effect(self) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+
+        anomalies = scanner._analyze_layer_weights(
+            "five_repeated_values",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
         extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
         assert extreme["details"]["affected_neurons"] == [3]
-        assert extreme["details"]["per_output_evidence"][0]["detection_path"] == "classical_effect"
+        assert extreme["details"]["minimum_extreme_weights_per_output"] == 5
 
-    @pytest.mark.parametrize(("degrees_of_freedom", "seed"), [(3, 94), (5, 26), (7, 785)])
+    @pytest.mark.parametrize(
+        ("degrees_of_freedom", "seed", "shape"),
+        [
+            (3, 94, (50, 2)),
+            (5, 26, (50, 2)),
+            (7, 785, (50, 2)),
+            (3, 3, (256, 64)),
+            (3, 22, (512, 64)),
+            (3, 1, (1024, 64)),
+        ],
+    )
     def test_extreme_value_check_ignores_deterministic_clean_heavy_tails(
         self,
         degrees_of_freedom: int,
         seed: int,
+        shape: tuple[int, int],
     ) -> None:
         import numpy as np
 
         scanner = WeightDistributionScanner()
-        weights = np.random.default_rng(seed).standard_t(degrees_of_freedom, size=(50, 2))
+        weights = np.random.default_rng(seed).standard_t(degrees_of_freedom, size=shape)
 
         anomalies = scanner._analyze_layer_weights(
             f"clean_student_t_df{degrees_of_freedom}",
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        assert not any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
+
+    @pytest.mark.parametrize(
+        ("seed", "shape"),
+        [(1, (256, 64)), (2, (256, 64)), (25, (512, 64)), (48, (128, 512))],
+    )
+    def test_extreme_value_check_ignores_deterministic_clean_lognormal_tails(
+        self,
+        seed: int,
+        shape: tuple[int, int],
+    ) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.random.default_rng(seed).lognormal(size=shape)
+
+        anomalies = scanner._analyze_layer_weights(
+            "clean_lognormal",
             weights,
             self._create_mock_architecture_analysis(is_llm=False),
         )

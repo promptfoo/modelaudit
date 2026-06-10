@@ -26,9 +26,10 @@ _MAX_RESTRICTED_PICKLE_MEMO_ENTRIES = 100_000
 _MAX_NUMERIC_SCALAR_BYTES = 16
 _MIN_NUMPY_ARRAY_BUDGET_BYTES = 256
 _EXTREME_WEIGHT_MIN_EFFECT_RATIO = 2.0
-_EXTREME_WEIGHT_MIN_PER_OUTPUT = 2
+_EXTREME_WEIGHT_MIN_PER_OUTPUT = 5
+_EXTREME_WEIGHT_LOCALIZATION_MIN_PER_OUTPUT = 2
 _EXTREME_WEIGHT_ROBUST_MAD_MULTIPLIER = 30.0
-_EXTREME_WEIGHT_ROBUST_FALLBACK_MIN_PER_OUTPUT = 3
+_EXTREME_WEIGHT_ROBUST_FALLBACK_MIN_PER_OUTPUT = 5
 _NORMAL_MAD_SCALE_FACTOR = 1.4826
 _EXTREME_WEIGHT_ANALYSIS_CHUNK_BYTES = 8 * 1024 * 1024
 _EXTREME_WEIGHT_ROBUST_SAMPLE_SIZE = 256 * 1024
@@ -2043,6 +2044,7 @@ class WeightDistributionScanner(BaseScanner):
         affected_neurons: list[int] = []
         evidence: list[dict[str, Any]] = []
         total_affected = 0
+        tail_affected_outputs = 0
         num_extreme_weights = 0
         max_extreme_weights_per_output = 0
         max_weight = 0.0
@@ -2067,6 +2069,10 @@ class WeightDistributionScanner(BaseScanner):
                     per_output_max,
                     np.asarray(np.max(chunk_magnitudes, axis=reduction_axes)).reshape(-1),
                 )
+
+            tail_affected_outputs += int(
+                np.count_nonzero(classical_robust_counts >= _EXTREME_WEIGHT_LOCALIZATION_MIN_PER_OUTPUT),
+            )
 
             if threshold > 0:
                 per_output_effect_ratios = per_output_max / threshold
@@ -2117,7 +2123,7 @@ class WeightDistributionScanner(BaseScanner):
                     },
                 )
 
-        if total_affected == 0:
+        if total_affected == 0 or tail_affected_outputs > max_affected_outputs:
             return []
 
         return [
@@ -2128,15 +2134,17 @@ class WeightDistributionScanner(BaseScanner):
                     "layer": layer_name,
                     "affected_neurons": affected_neurons,
                     "total_affected": total_affected,
+                    "tail_affected_outputs": tail_affected_outputs,
                     "num_extreme_weights": num_extreme_weights,
                     "threshold": threshold,
                     "max_weight": max_weight,
                     "max_to_threshold_ratio": max_effect_ratio if np.isfinite(max_effect_ratio) else None,
                     "max_extreme_weights_per_output": max_extreme_weights_per_output,
                     "affected_output_limit": max_affected_outputs,
-                    "localized": total_affected <= max_affected_outputs,
+                    "localized": tail_affected_outputs <= max_affected_outputs,
                     "minimum_effect_ratio": _EXTREME_WEIGHT_MIN_EFFECT_RATIO,
                     "minimum_extreme_weights_per_output": _EXTREME_WEIGHT_MIN_PER_OUTPUT,
+                    "localization_minimum_per_output": _EXTREME_WEIGHT_LOCALIZATION_MIN_PER_OUTPUT,
                     "robust_median_magnitude": robust_median,
                     "robust_mad_scale": robust_scale,
                     "robust_threshold": robust_threshold,
