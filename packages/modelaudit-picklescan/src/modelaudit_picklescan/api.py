@@ -2114,6 +2114,12 @@ def _call_graph_finding_to_report_finding(report: PickleReport, finding: CallGra
             "sink": finding.sink,
             "call_path": list(finding.call_path),
             "analysis": "python_call_graph",
+            **(
+                {"invocation_import_reference": finding.invocation_import_reference}
+                if finding.invocation_import_reference is not None
+                else {}
+            ),
+            **({"opcode": finding.invocation_opcode} if finding.invocation_opcode is not None else {}),
         },
         why=(
             "The pickle imports a Python wrapper whose source code reaches a known RCE-capable primitive when invoked."

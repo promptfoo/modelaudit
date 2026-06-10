@@ -1602,6 +1602,8 @@ class CallGraphFinding:
     import_reference: str
     sink: str
     call_path: tuple[str, ...]
+    invocation_import_reference: str | None = None
+    invocation_opcode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1762,6 +1764,12 @@ def find_dangerous_call_graphs(
                 import_reference=f"{module}.{name}",
                 sink=sink,
                 call_path=sink_path,
+                invocation_import_reference=(
+                    str(reference["invocation_import_reference"])
+                    if reference.get("invocation_import_reference")
+                    else None
+                ),
+                invocation_opcode=str(reference["opcode"]) if reference.get("opcode") else None,
             )
         )
         if len(findings) >= _MAX_IMPORT_REFERENCES:
@@ -2479,6 +2487,7 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
             continue
         opcode = str(item.get("opcode", ""))
         positional_arg_count = item.get("positional_arg_count")
+        invocation_import_reference = f"{module}.{name}"
         for reference_module, reference_name in (
             (module, name),
             *_callable_singleton_aliases(module, name),
@@ -2498,6 +2507,7 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
             reference["module"] = reference_module
             reference["name"] = reference_name
             reference["import_reference"] = f"{reference_module}.{reference_name}"
+            reference["invocation_import_reference"] = invocation_import_reference
             normalized.append(reference)
     return tuple(normalized)
 

@@ -111,14 +111,18 @@ RULE_CATALOG: tuple[RuleCatalogEntry, ...] = (
         name="Pickle OBJ opcode",
         severity="CRITICAL",
         description="Object construction via pickle OBJ",
-        patterns=(r"pickle.*OBJ", r"OBJ.*opcode", r"dangerous.*OBJ"),
+        patterns=(r"pickle.*\bOBJ\b", r"\bOBJ\b.*opcode", r"dangerous.*\bOBJ\b"),
     ),
     RuleCatalogEntry(
         code="S204",
         name="Pickle NEWOBJ opcode",
         severity="CRITICAL",
         description="New-style class construction via pickle NEWOBJ",
-        patterns=(r"pickle.*NEWOBJ", r"NEWOBJ.*opcode", r"dangerous.*NEWOBJ"),
+        patterns=(
+            r"pickle.*\bNEWOBJ(?:_EX)?\b",
+            r"\bNEWOBJ(?:_EX)?\b.*opcode",
+            r"dangerous.*\bNEWOBJ(?:_EX)?\b",
+        ),
     ),
     RuleCatalogEntry(
         code="S205",
