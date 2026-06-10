@@ -1647,6 +1647,10 @@ class TestAdvancedFileHandler:
             }
 
         monkeypatch.setattr(ShardedModelDetector, "detect_shards", classmethod(stable_detect_shards))
+        monkeypatch.setattr(
+            "modelaudit.utils.file.handlers._supports_reliable_shard_cache_identity",
+            lambda: True,
+        )
         scanner = RecordingShardScanner({"cache_enabled": True, "cache_dir": str(cache_dir)})
 
         reset_cache_manager()
@@ -1672,6 +1676,10 @@ class TestAdvancedFileHandler:
             check.name == "Malicious Shard Payload" and check.status == CheckStatus.FAILED for check in second.checks
         )
 
+    @pytest.mark.skipif(
+        os.name == "nt" or sys.platform == "darwin",
+        reason="requires descriptor-bound sharded caching with reliable sibling identity",
+    )
     def test_cached_advanced_scan_keys_selected_model_config(
         self,
         tmp_path: Path,
