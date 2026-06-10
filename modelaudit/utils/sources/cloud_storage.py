@@ -121,6 +121,7 @@ _TFLITE_MAGIC_BYTES = b"TFL3"
 _MSGPACK_CONTAINER_MARKERS = frozenset((*range(0x80, 0x90), 0xDE, 0xDF))
 _MAX_CLOUD_METADATA_ERROR_SAMPLES = 3
 _MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS = 512
+_MAX_CLOUD_DIRECTORY_ANALYSIS_OBJECTS = 10_000
 _CLOUD_PROBE_SUFFIX_RE = re.compile(r"\.[0-9A-Za-z][0-9A-Za-z_-]{0,31}\Z")
 _CLOUD_LOCAL_PATH_ESCAPE_CHARS = frozenset('<>:"/\\|?*%#')
 _WINDOWS_RESERVED_LOCAL_PATH_NAMES = frozenset(
@@ -1148,7 +1149,34 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
     return None
 
 
-async def analyze_cloud_target(url: str) -> dict[str, Any]:
+def _iter_cloud_directory_items(fs: Any, url: str) -> Iterator[object]:
+    """Yield directory entries incrementally when the filesystem supports it."""
+    walk_observed = False
+    try:
+        for root, _, files in fs.walk(url):
+            walk_observed = True
+            entries = files.keys() if isinstance(files, Mapping) else files
+            for item in entries:
+                listed_path = str(item)
+                if "://" not in listed_path and "/" not in listed_path.strip("/"):
+                    listed_path = f"{str(root).rstrip('/')}/{listed_path}"
+                yield listed_path
+    except (AttributeError, NotImplementedError, TypeError):
+        if walk_observed:
+            raise
+    if walk_observed:
+        return
+
+    glob_pattern = f"{url.rstrip('/')}/**"
+    yield from fs.glob(glob_pattern)
+
+
+async def analyze_cloud_target(
+    url: str,
+    *,
+    max_size: int | None = None,
+    max_objects: int = _MAX_CLOUD_DIRECTORY_ANALYSIS_OBJECTS,
+) -> dict[str, Any]:
     """Analyze cloud target before downloading."""
     try:
         import fsspec
@@ -1192,13 +1220,17 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
         # It's a directory, list contents
         files = []
         total_size = 0
+        listed_object_count = 0
         metadata_error_count = 0
         metadata_errors: list[dict[str, str]] = []
 
-        # List all files recursively
-        # Ensure URL ends with / for proper globbing
-        glob_pattern = f"{fs_url.rstrip('/')}/**"
-        for item in fs.glob(glob_pattern):
+        for item in _iter_cloud_directory_items(fs, fs_url):
+            listed_object_count += 1
+            if listed_object_count > max_objects:
+                raise ValueError(
+                    "Cloud directory analysis exceeds the maximum object count "
+                    f"({max_objects}) for {redact_url_for_display(url)}"
+                )
             item_url = _normalize_cloud_listing_path(fs_url, item)
             try:
                 item_info = fs.info(item_url)
@@ -1206,7 +1238,7 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
                 if item_type == "directory":
                     continue
                 if item_type == "file" or "size" in item_info:
-                    size = item_info.get("size", 0)
+                    size = _parse_size_value(item_info.get("size", 0))
                     file_metadata = {
                         "path": item_url,
                         "name": _cloud_url_basename(item_url),
@@ -1224,6 +1256,11 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
                 metadata_error_count += 1
                 if len(metadata_errors) < _MAX_CLOUD_METADATA_ERROR_SAMPLES:
                     metadata_errors.append(_cloud_metadata_error_sample(item, exc))
+            if max_size is not None and total_size > max_size:
+                raise ValueError(
+                    f"Cloud directory size ({format_size(total_size)}) exceeds maximum allowed size "
+                    f"({format_size(max_size)})"
+                )
 
         if metadata_error_count:
             sample_errors = "; ".join(f"{entry['path']}: {entry['error']}" for entry in metadata_errors)
@@ -2677,7 +2714,11 @@ def download_from_cloud(
     cache = GCSCache(cache_dir) if use_cache else None
 
     # Analyze target
-    metadata = _run_coroutine_sync(lambda: analyze_cloud_target(url))
+    analysis_max_size = max_size if not selective else None
+    if analysis_max_size is None:
+        metadata = _run_coroutine_sync(lambda: analyze_cloud_target(url))
+    else:
+        metadata = _run_coroutine_sync(lambda: analyze_cloud_target(url, max_size=analysis_max_size))
 
     # Ensure target was analyzed successfully
     if "error" in metadata or metadata.get("type") == "unknown":
@@ -2968,7 +3009,11 @@ def download_from_cloud_streaming(
         ) from e
 
     # Analyze target to get file list
-    metadata = _run_coroutine_sync(lambda: analyze_cloud_target(url))
+    analysis_max_size = max_size if not selective else None
+    if analysis_max_size is None:
+        metadata = _run_coroutine_sync(lambda: analyze_cloud_target(url))
+    else:
+        metadata = _run_coroutine_sync(lambda: analyze_cloud_target(url, max_size=analysis_max_size))
 
     if "error" in metadata or metadata.get("type") == "unknown":
         error_msg = metadata.get("error", "Unknown cloud target type")
