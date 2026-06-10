@@ -28,8 +28,12 @@ __all__ = ["LLAMAFILE_MARKER", "LLAMAFILE_ROUTE_SCAN_BYTES", "LLAMAFILE_ROUTE_TA
 GGUF_MARKER = b"GGUF"
 LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON = "llamafile_payload_scan_limited"
 LLAMAFILE_RUNTIME_PREVIEW_READ_REASON = "llamafile_runtime_preview_read_failed"
+LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON = "llamafile_runtime_scan_limited"
+LLAMAFILE_RUNTIME_STREAM_READ_REASON = "llamafile_runtime_stream_read_failed"
 LLAMAFILE_TORCH7_CARVE_FAILURE_REASON = "llamafile_torch7_payload_carve_failed"
 LLAMAFILE_TORCH7_ANALYSIS_INCOMPLETE_REASON = "llamafile_torch7_analysis_incomplete"
+LLAMAFILE_RUNTIME_STREAM_CHUNK_BYTES = 1024 * 1024
+LLAMAFILE_RUNTIME_STREAM_OVERLAP_BYTES = 512
 TORCH7_SIGNATURE_WINDOW_BYTES = 4096
 TORCH7_BINARY_MARKER = b"T7\x00\x00"
 TORCH7_ACTIONABLE_SIGNAL_CHUNK_BYTES = 64 * 1024
@@ -288,18 +292,68 @@ class LlamafileScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.bytes_scanned = runtime_preview_bytes
-        self._scan_runtime_strings(path, b"\n".join(runtime_blobs), result)
-
         gguf_offset, torch7_offset = self._find_embedded_payload_offsets(path_obj, self.max_payload_scan_bytes)
-        payload_bytes_scanned, _valid_gguf_payload = self._scan_embedded_payload(path_obj, result, gguf_offset)
+        payload_bytes_scanned, valid_gguf_payload = self._scan_embedded_payload(path_obj, result, gguf_offset)
         if gguf_offset is not None and torch7_offset is None:
             torch7_offset = self._find_embedded_torch7_offset(
                 path_obj,
                 self.max_payload_scan_bytes,
                 start_offset=gguf_offset + len(GGUF_MARKER),
             )
-        result.bytes_scanned += payload_bytes_scanned
+
+        file_size = path_obj.stat().st_size
+        runtime_end = gguf_offset if gguf_offset is not None and valid_gguf_payload else file_size
+        runtime_scan_end = min(runtime_end, max(0, self.max_payload_scan_bytes))
+        runtime_stream_bytes, runtime_stream_error = self._scan_runtime_strings_streaming(
+            path_obj,
+            runtime_scan_end,
+            runtime_blobs,
+            result,
+        )
+
+        result.bytes_scanned = min(file_size, runtime_preview_bytes + runtime_stream_bytes + payload_bytes_scanned)
+        if runtime_stream_error is not None or runtime_stream_bytes < runtime_scan_end:
+            self._mark_inconclusive(result, LLAMAFILE_RUNTIME_STREAM_READ_REASON)
+            details: dict[str, Any] = {
+                "analysis_incomplete": True,
+                "scan_outcome_reason": LLAMAFILE_RUNTIME_STREAM_READ_REASON,
+                "expected_runtime_bytes": runtime_scan_end,
+                "runtime_bytes_scanned": runtime_stream_bytes,
+            }
+            if runtime_stream_error is not None:
+                details["exception"] = str(runtime_stream_error)
+                details["exception_type"] = type(runtime_stream_error).__name__
+            result.add_check(
+                name="Llamafile Runtime Stream Read",
+                passed=False,
+                message=(
+                    f"Failed reading runtime stream bytes: {runtime_stream_error!s}"
+                    if runtime_stream_error is not None
+                    else "Runtime stream ended before the expected executable boundary"
+                ),
+                severity=IssueSeverity.INFO,
+                location=path,
+                details=details,
+            )
+
+        if runtime_scan_end < runtime_end:
+            self._mark_inconclusive(result, LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON)
+            result.add_check(
+                name="Llamafile Runtime Coverage",
+                passed=False,
+                message="Executable runtime extends beyond the bounded streaming scan window",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON,
+                    "max_scan_bytes": self.max_payload_scan_bytes,
+                    "runtime_bytes_scanned": runtime_stream_bytes,
+                    "runtime_bytes_total": runtime_end,
+                    "runtime_bytes_omitted": runtime_end - runtime_scan_end,
+                },
+            )
+
         self._merge_polyglot_findings(path_obj, result, torch7_offset)
 
         result.finish(
@@ -331,7 +385,7 @@ class LlamafileScanner(BaseScanner):
                 return True
         return False
 
-    def _scan_runtime_strings(self, path: str, blob: bytes, result: ScanResult) -> None:
+    def _runtime_string_hits(self, blob: bytes) -> tuple[set[str], set[str]]:
         command_hits: set[str] = set()
         network_hits: set[str] = set()
 
@@ -351,6 +405,15 @@ class LlamafileScanner(BaseScanner):
             if has_network_token:
                 network_hits.add(redacted_text)
 
+        return command_hits, network_hits
+
+    @staticmethod
+    def _add_runtime_string_analysis(
+        path: str,
+        result: ScanResult,
+        command_hits: set[str],
+        network_hits: set[str],
+    ) -> None:
         if not command_hits and not network_hits:
             return
 
@@ -375,6 +438,45 @@ class LlamafileScanner(BaseScanner):
                 "network_evidence": sorted(network_hits)[:5],
             },
         )
+
+    def _scan_runtime_strings(self, path: str, blob: bytes, result: ScanResult) -> None:
+        command_hits, network_hits = self._runtime_string_hits(blob)
+        self._add_runtime_string_analysis(path, result, command_hits, network_hits)
+
+    def _scan_runtime_strings_streaming(
+        self,
+        path: Path,
+        end_offset: int,
+        preview_blobs: list[bytes],
+        result: ScanResult,
+    ) -> tuple[int, OSError | None]:
+        command_hits: set[str] = set()
+        network_hits: set[str] = set()
+        for blob in preview_blobs:
+            preview_command_hits, preview_network_hits = self._runtime_string_hits(blob)
+            command_hits.update(preview_command_hits)
+            network_hits.update(preview_network_hits)
+
+        scanned = 0
+        carry = b""
+        read_error: OSError | None = None
+        try:
+            with path.open("rb") as handle:
+                while scanned < end_offset:
+                    chunk = handle.read(min(LLAMAFILE_RUNTIME_STREAM_CHUNK_BYTES, end_offset - scanned))
+                    if not chunk:
+                        break
+
+                    stream_command_hits, stream_network_hits = self._runtime_string_hits(carry + chunk)
+                    command_hits.update(stream_command_hits)
+                    network_hits.update(stream_network_hits)
+                    carry = (carry + chunk)[-LLAMAFILE_RUNTIME_STREAM_OVERLAP_BYTES:]
+                    scanned += len(chunk)
+        except OSError as exc:
+            read_error = exc
+
+        self._add_runtime_string_analysis(str(path), result, command_hits, network_hits)
+        return scanned, read_error
 
     def _scan_embedded_payload(self, path: Path, result: ScanResult, gguf_offset: int | None) -> tuple[int, bool]:
         if gguf_offset is None:

