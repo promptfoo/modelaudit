@@ -28,20 +28,11 @@ def create_safetensors_file(path: Path) -> None:
 
 
 def create_safetensors_with_dtype_size_mismatch(path: Path, dtype: str) -> None:
-    create_safetensors_file(path)
-
-    with open(path, "rb") as f:
-        header_len = struct.unpack("<Q", f.read(8))[0]
-        header_bytes = f.read(header_len)
-        data_bytes = f.read()
-
-    header = json.loads(header_bytes.decode("utf-8"))
-    header["t2"]["dtype"] = dtype
-    header["t2"]["shape"] = [4]
-    header["t2"]["data_offsets"] = [0, 3]
-
-    new_header_bytes = json.dumps(header).encode("utf-8")
-    path.write_bytes(struct.pack("<Q", len(new_header_bytes)) + new_header_bytes + data_bytes)
+    write_raw_safetensors(
+        path,
+        {"tensor": {"dtype": dtype, "shape": [4], "data_offsets": [0, 1]}},
+        b"\x00",
+    )
 
 
 def write_raw_safetensors(path: Path, header: dict[str, Any], data: bytes) -> None:
@@ -76,24 +67,115 @@ def test_valid_safetensors_file(tmp_path: Path) -> None:
     assert header_limit_check.status.value == "passed"
 
 
-def test_valid_f8_e8m0_safetensors_file(tmp_path: Path) -> None:
-    file_path = tmp_path / "f8-e8m0.safetensors"
+@pytest.mark.parametrize(
+    ("dtype", "shape", "data_size"),
+    [
+        ("C64", [2], 16),
+        ("F4", [2], 1),
+        ("F6_E2M3", [4], 3),
+        ("F6_E3M2", [4], 3),
+        ("F8_E4M3FNUZ", [4], 4),
+        ("F8_E5M2FNUZ", [4], 4),
+        ("F8_E8M0", [4], 4),
+    ],
+)
+def test_valid_current_safetensors_dtype(
+    tmp_path: Path,
+    dtype: str,
+    shape: list[int],
+    data_size: int,
+) -> None:
+    file_path = tmp_path / f"valid-{dtype}.safetensors"
     write_raw_safetensors(
         file_path,
         {
             "tensor": {
-                "dtype": "F8_E8M0",
-                "shape": [4],
-                "data_offsets": [0, 4],
+                "dtype": dtype,
+                "shape": shape,
+                "data_offsets": [0, data_size],
             },
+        },
+        b"\x00" * data_size,
+    )
+
+    direct = scan_file(str(file_path))
+    aggregate = scan_model_directory_or_file(str(file_path))
+
+    assert direct.scanner_name == "safetensors"
+    assert direct.success is True
+    assert direct.issues == []
+    assert any(
+        check.name == "Tensor Size Consistency Check"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("size") == data_size
+        for check in direct.checks
+    )
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_valid_zero_element_safetensors_tensor(tmp_path: Path) -> None:
+    file_path = tmp_path / "zero-element.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {"tensor": {"dtype": "F32", "shape": [0], "data_offsets": [0, 0]}},
+        b"",
+    )
+
+    direct = scan_file(str(file_path))
+    aggregate = scan_model_directory_or_file(str(file_path))
+
+    assert direct.scanner_name == "safetensors"
+    assert direct.success is True
+    assert direct.issues == []
+    assert any(
+        check.name == "Tensor Size Consistency Check"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("size") == 0
+        for check in direct.checks
+    )
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_valid_zero_element_tensor_after_nonempty_header_entry(tmp_path: Path) -> None:
+    file_path = tmp_path / "mixed-zero-element.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {
+            "nonempty": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+            "empty": {"dtype": "F32", "shape": [0], "data_offsets": [0, 0]},
         },
         b"\x00" * 4,
     )
 
-    result = SafeTensorsScanner().scan(str(file_path))
+    direct = scan_file(str(file_path))
+    aggregate = scan_model_directory_or_file(str(file_path))
 
-    assert result.success is True
-    assert not any("Invalid dtype" in issue.message for issue in result.issues)
+    assert direct.scanner_name == "safetensors"
+    assert direct.success is True
+    assert direct.issues == []
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_zero_length_range_for_nonempty_tensor_is_critical(tmp_path: Path) -> None:
+    file_path = tmp_path / "invalid-zero-length.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {"tensor": {"dtype": "F32", "shape": [1], "data_offsets": [0, 0]}},
+        b"",
+    )
+
+    direct = scan_file(str(file_path))
+    aggregate = scan_model_directory_or_file(str(file_path))
+
+    assert direct.scanner_name == "safetensors"
+    assert direct.has_errors is True
+    assert any(
+        check.name == "Tensor Size Consistency Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in direct.checks
+    )
+    assert determine_exit_code(aggregate) == 1
 
 
 def test_valid_empty_safetensors_custom_metadata(tmp_path: Path) -> None:
@@ -602,8 +684,14 @@ def test_safetensors_with_torch7_like_metadata_keeps_safetensors_routing(tmp_pat
     [
         ("BOOL", 4),
         ("BF16", 8),
+        ("C64", 32),
+        ("F4", 2),
+        ("F6_E2M3", 3),
+        ("F6_E3M2", 3),
         ("F8_E4M3", 4),
+        ("F8_E4M3FNUZ", 4),
         ("F8_E5M2", 4),
+        ("F8_E5M2FNUZ", 4),
         ("F8_E8M0", 4),
         ("F16", 8),
         ("F32", 16),
@@ -614,19 +702,44 @@ def test_tensor_size_check_runs_for_supported_dtypes(tmp_path: Path, dtype: str,
     file_path = tmp_path / f"mismatch_{dtype}.safetensors"
     create_safetensors_with_dtype_size_mismatch(file_path, dtype)
 
-    scanner = SafeTensorsScanner()
-    result = scanner.scan(str(file_path))
+    direct = scan_file(str(file_path))
+    aggregate = scan_model_directory_or_file(str(file_path))
 
     size_checks = [
         check
-        for check in result.checks
-        if check.name == "Tensor Size Consistency Check" and check.details.get("tensor") == "t2"
+        for check in direct.checks
+        if check.name == "Tensor Size Consistency Check" and check.details.get("tensor") == "tensor"
     ]
+    assert direct.scanner_name == "safetensors"
+    assert direct.has_errors is True
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in direct.issues)
     assert size_checks, f"Expected Tensor Size Consistency Check for dtype {dtype}"
     assert any(
         check.status == CheckStatus.FAILED and check.details.get("expected_size") == expected_size
         for check in size_checks
     ), f"Expected failing size consistency check for dtype {dtype}"
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize("dtype", ["F4", "F6_E2M3", "F6_E3M2"])
+def test_subbyte_dtype_requires_byte_aligned_tensor(tmp_path: Path, dtype: str) -> None:
+    file_path = tmp_path / f"misaligned-{dtype}.safetensors"
+    write_raw_safetensors(
+        file_path,
+        {"tensor": {"dtype": dtype, "shape": [1], "data_offsets": [0, 1]}},
+        b"\x00",
+    )
+
+    direct = scan_file(str(file_path))
+    aggregate = scan_model_directory_or_file(str(file_path))
+
+    assert direct.scanner_name == "safetensors"
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(
+        check.name == "Tensor Size Computation Check" and check.status == CheckStatus.FAILED for check in direct.checks
+    )
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_deeply_nested_header(tmp_path: Path) -> None:
