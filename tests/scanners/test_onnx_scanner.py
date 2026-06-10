@@ -21,6 +21,7 @@ from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, INCONCLUSIVE_
 from modelaudit.scanners.onnx_scanner import (
     ONNX_STRUCTURE_INCONCLUSIVE_REASON,
     OnnxScanner,
+    _confirmed_onnx_operator_findings,
     _confirmed_python_operator_findings,
 )
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
@@ -54,6 +55,7 @@ def create_onnx_model(
     tensor_shape: tuple[int, ...] = (1,),
     include_initializer: bool = True,
     initializer_consumer: str | None = None,
+    custom_opset_version: int | None = None,
 ) -> Path:
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, list(tensor_shape) or [1])
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, list(tensor_shape) or [1])
@@ -100,7 +102,16 @@ def create_onnx_model(
         initializers.append(tensor)
 
     graph = helper.make_graph([node], "graph", [X], [Y], initializer=initializers)
-    model = helper.make_model(graph)
+    if custom and custom_opset_version is not None:
+        model = helper.make_model(
+            graph,
+            opset_imports=[
+                helper.make_opsetid("", 13),
+                helper.make_opsetid(custom_domain, custom_opset_version),
+            ],
+        )
+    else:
+        model = helper.make_model(graph)
     path = tmp_path / "model.onnx"
     onnx.save(model, str(path))
     return path
@@ -1467,6 +1478,8 @@ def create_onnx_model_with_function_default_external_tensor_attribute(
     attribute_kind: str,
     external_tensor: str = "values",
     missing_external: bool = False,
+    function_domain: str = "local",
+    function_name: str = "ExternalDefault",
 ) -> Path:
     assert attribute_kind in {"dense", "sparse"}
     assert external_tensor in {"values", "indices"}
@@ -1499,8 +1512,8 @@ def create_onnx_model_with_function_default_external_tensor_attribute(
         ]
     )
     function = helper.make_function(
-        "local",
-        "ExternalDefault",
+        function_domain,
+        function_name,
         [],
         ["Y"],
         [node],
@@ -1508,7 +1521,7 @@ def create_onnx_model_with_function_default_external_tensor_attribute(
         attribute_protos=[helper.make_attribute(attr_name, attr_value)],
     )
     graph = helper.make_graph(
-        [helper.make_node("ExternalDefault", [], ["Y"], domain="local")],
+        [helper.make_node(function_name, [], ["Y"], domain=function_domain)],
         "graph",
         [],
         [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
@@ -1516,7 +1529,7 @@ def create_onnx_model_with_function_default_external_tensor_attribute(
     model = helper.make_model(
         graph,
         functions=[function],
-        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid(function_domain, 1)],
     )
     model.ir_version = 9
     path = tmp_path / f"function_default_{attribute_kind}_external.onnx"
@@ -1529,6 +1542,73 @@ def create_onnx_model_with_function_default_external_tensor_attribute(
             struct.pack("f" if external_tensor == "values" else "q", 1 if external_tensor == "values" else 0)
         )
 
+    return path
+
+
+def create_onnx_model_with_function_overload(
+    tmp_path: Path,
+    *,
+    function_overload: str,
+    call_overload: str,
+) -> Path:
+    function = helper.make_function(
+        "local",
+        "Transform",
+        ["X"],
+        ["Y"],
+        [helper.make_node("Identity", ["X"], ["Y"])],
+        [helper.make_opsetid("", 13)],
+        overload=function_overload,
+    )
+    graph = helper.make_graph(
+        [helper.make_node("Transform", ["X"], ["Y"], domain="local", overload=call_overload)],
+        "graph",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+    )
+    model = helper.make_model(
+        graph,
+        functions=[function],
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+    )
+    model.ir_version = 10
+    path = tmp_path / f"function_overload_{function_overload}_{call_overload}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_onnx_model_with_function_preview_operator(
+    tmp_path: Path,
+    *,
+    include_unimported_model_preview: bool = False,
+) -> Path:
+    function = helper.make_function(
+        "local",
+        "PreviewWrapper",
+        ["X"],
+        ["Y"],
+        [helper.make_node("FlexAttention", ["X"], ["Y"], domain="ai.onnx.preview")],
+        [helper.make_opsetid("", 13), helper.make_opsetid("ai.onnx.preview", 1)],
+    )
+    graph_nodes = [helper.make_node("PreviewWrapper", ["X"], ["Y"], domain="local")]
+    output_name = "Y"
+    if include_unimported_model_preview:
+        graph_nodes.append(helper.make_node("FlexAttention", ["Y"], ["Z"], domain="ai.onnx.preview"))
+        output_name = "Z"
+    graph = helper.make_graph(
+        graph_nodes,
+        "graph",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1])],
+        [helper.make_tensor_value_info(output_name, TensorProto.FLOAT, [1])],
+    )
+    model = helper.make_model(
+        graph,
+        functions=[function],
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+    )
+    model.ir_version = 10
+    path = tmp_path / "function_preview_operator.onnx"
+    onnx.save(model, str(path))
     return path
 
 
@@ -1777,6 +1857,159 @@ def test_onnx_scanner_standard_preview_training_domain_not_flagged(tmp_path: Pat
     assert "ai.onnx.preview.training" not in metadata_custom_domains
 
 
+def test_onnx_scanner_registered_ai_onnx_preview_operator_not_flagged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def registered_schema(op_type: str, version: int, domain: str) -> bool:
+        return (domain, op_type, version) == ("ai.onnx.preview", "FlexAttention", 1)
+
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._has_operator_schema", registered_schema)
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="ai.onnx.preview",
+        custom_op_type="FlexAttention",
+        custom_opset_version=1,
+    )
+    result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+    assert len(custom_domain_checks) == 0, (
+        f"Expected no custom-domain finding for ai.onnx.preview. Checks: {[c.message for c in result.checks]}"
+    )
+    assert "ai.onnx.preview" not in metadata_custom_domains
+
+
+def test_onnx_scanner_unknown_ai_onnx_preview_operator_still_flagged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._has_operator_schema", lambda *_args: False)
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="ai.onnx.preview",
+        custom_op_type="UnknownKernel",
+        custom_opset_version=1,
+    )
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].rule_code == "S1111"
+    assert custom_domain_checks[0].details["op_type"] == "UnknownKernel"
+    assert "ai.onnx.preview" in metadata_custom_domains
+
+
+def test_onnx_scanner_preview_schema_rejects_nonempty_overload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def registered_schema(op_type: str, version: int, domain: str) -> bool:
+        return (domain, op_type, version) == ("ai.onnx.preview", "FlexAttention", 1)
+
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._has_operator_schema", registered_schema)
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="ai.onnx.preview",
+        custom_op_type="FlexAttention",
+        custom_opset_version=1,
+    )
+    model = onnx.load(str(model_path))
+    model.graph.node[0].overload = "unregistered"
+    onnx.save(model, str(model_path))
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].rule_code == "S1111"
+    assert "ai.onnx.preview" in metadata_custom_domains
+
+
+def test_onnx_scanner_function_body_uses_function_opset_imports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def registered_schema(op_type: str, version: int, domain: str) -> bool:
+        return (domain, op_type, version) == ("ai.onnx.preview", "FlexAttention", 1)
+
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._has_operator_schema", registered_schema)
+    model_path = create_onnx_model_with_function_preview_operator(tmp_path)
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert custom_domain_checks == []
+    assert "ai.onnx.preview" not in metadata_custom_domains
+
+
+def test_onnx_scanner_function_opset_does_not_authorize_model_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def registered_schema(op_type: str, version: int, domain: str) -> bool:
+        return (domain, op_type, version) == ("ai.onnx.preview", "FlexAttention", 1)
+
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._has_operator_schema", registered_schema)
+    model_path = create_onnx_model_with_function_preview_operator(
+        tmp_path,
+        include_unimported_model_preview=True,
+    )
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].rule_code == "S1111"
+    assert custom_domain_checks[0].details["op_type"] == "FlexAttention"
+    assert "ai.onnx.preview" in metadata_custom_domains
+
+
+def test_onnx_scanner_model_local_function_not_flagged_as_external(tmp_path: Path) -> None:
+    model_path = create_onnx_model_with_function_default_external_tensor_attribute(
+        tmp_path,
+        external_path="weights.bin",
+        attribute_kind="dense",
+        function_domain="ai.onnx.contrib",
+        function_name="custom_op",
+    )
+
+    result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert custom_domain_checks == []
+    assert result.metadata.get("custom_domains", []) == []
+    assert "ai.onnx.contrib" not in metadata_custom_domains
+    assert not [issue for issue in result.issues if issue.details.get("type") == "custom_operator"]
+
+
+def test_onnx_scanner_matching_model_local_function_overload_not_flagged(tmp_path: Path) -> None:
+    model_path = create_onnx_model_with_function_overload(
+        tmp_path,
+        function_overload="float",
+        call_overload="float",
+    )
+
+    result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert result.success is True
+    assert custom_domain_checks == []
+    assert "local" not in metadata_custom_domains
+
+
+def test_onnx_scanner_mismatched_model_local_function_overload_still_flagged(tmp_path: Path) -> None:
+    model_path = create_onnx_model_with_function_overload(
+        tmp_path,
+        function_overload="float",
+        call_overload="integer",
+    )
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].rule_code == "S1111"
+    assert custom_domain_checks[0].details["op_type"] == "Transform"
+    assert custom_domain_checks[0].details["domain"] == "local"
+    assert "local" in metadata_custom_domains
+
+
 def test_onnx_scanner_custom_domain_still_flagged(tmp_path: Path) -> None:
     model_path = create_onnx_model(
         tmp_path,
@@ -1784,10 +2017,31 @@ def test_onnx_scanner_custom_domain_still_flagged(tmp_path: Path) -> None:
         custom_domain="com.evil.ops",
         custom_op_type="BackdoorOp",
     )
-    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+    result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
     assert len(custom_domain_checks) > 0, "Expected custom domain finding for com.evil.ops"
     assert any(c.details.get("domain") == "com.evil.ops" for c in custom_domain_checks)
+    assert all(c.rule_code == "S1111" for c in custom_domain_checks)
+    assert all(c.severity == IssueSeverity.INFO for c in custom_domain_checks)
+    assert "com.evil.ops" in result.metadata["custom_domains"]
     assert "com.evil.ops" in metadata_custom_domains
+
+
+def test_onnx_scanner_custom_operator_emits_one_domain_rule(tmp_path: Path) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="ai.onnx.contrib",
+        custom_op_type="custom_op",
+    )
+
+    result = OnnxScanner().scan(str(model_path))
+    custom_operator_issues = [issue for issue in result.issues if issue.rule_code == "S1111"]
+
+    assert len(custom_operator_issues) == 1
+    assert custom_operator_issues[0].severity == IssueSeverity.INFO
+    assert custom_operator_issues[0].details["domain"] == "ai.onnx.contrib"
+    assert not [issue for issue in result.issues if issue.details.get("type") == "custom_operator"]
+    assert not any(issue.rule_code == "S510" for issue in result.issues)
 
 
 def test_onnx_scanner_ai_onnx_ml_subdomain_still_flagged(tmp_path: Path) -> None:
@@ -2006,6 +2260,23 @@ def test_onnx_scanner_skips_graph_confirmation_without_python_operator_candidate
     assert accessed == []
 
 
+def test_onnx_scanner_custom_operator_confirmation_fails_closed() -> None:
+    class UnreadableModel:
+        @property
+        def graph(self) -> Any:
+            raise RuntimeError("operator inventory unavailable")
+
+    findings = [{"type": "custom_operator", "message": "Custom ONNX operator detected"}]
+
+    assert _confirmed_onnx_operator_findings(findings, UnreadableModel()) == findings
+
+
+def test_onnx_scanner_custom_operator_confirmation_keeps_finding_without_graph() -> None:
+    findings = [{"type": "custom_operator", "message": "Custom ONNX operator detected"}]
+
+    assert _confirmed_onnx_operator_findings(findings, onnx.ModelProto()) == findings
+
+
 def test_onnx_scanner_pyop_bytes_in_weight_data_not_flagged(tmp_path: Path) -> None:
     """A clean ai.onnx-only model is not flagged when weight bytes spell 'PyOp'."""
     model_path = _save_model_with_int8_weight(tmp_path, _PYOP_WEIGHT_BYTES)
@@ -2014,6 +2285,38 @@ def test_onnx_scanner_pyop_bytes_in_weight_data_not_flagged(tmp_path: Path) -> N
 
     assert result.success is True
     assert _python_operator_issues(result) == []
+
+
+@pytest.mark.parametrize(
+    "weight_bytes",
+    [b"\x00custom_op\x00", b"\x00ai.onnx.contrib\x00"],
+    ids=["custom-op-marker", "contrib-domain-marker"],
+)
+def test_onnx_scanner_custom_op_marker_in_weight_data_not_flagged(tmp_path: Path, weight_bytes: bytes) -> None:
+    """Raw custom-op marker bytes in weights do not imply a graph operator."""
+    model_path = _save_model_with_int8_weight(tmp_path, weight_bytes)
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not [issue for issue in result.issues if issue.details.get("type") == "custom_operator"]
+    assert not [check for check in result.checks if check.rule_code == "S1111" and check.status == CheckStatus.FAILED]
+
+
+def test_onnx_scanner_explicit_custom_op_in_standard_domain_still_flagged(tmp_path: Path) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="",
+        custom_op_type="custom_op",
+    )
+
+    result = OnnxScanner().scan(str(model_path))
+    custom_operator_issues = [issue for issue in result.issues if issue.rule_code == "S1111"]
+
+    assert len(custom_operator_issues) == 1
+    assert custom_operator_issues[0].severity == IssueSeverity.INFO
+    assert custom_operator_issues[0].details["op_type"] == "custom_op"
 
 
 def test_onnx_scanner_real_pyop_node_still_flagged_despite_weight_bytes(tmp_path: Path) -> None:
@@ -2061,12 +2364,17 @@ def test_onnx_scanner_subgraph_pyop_still_flagged(tmp_path: Path) -> None:
     model_path = tmp_path / "subgraph.onnx"
     onnx.save(model, str(model_path))
 
-    result = OnnxScanner().scan(str(model_path))
+    scanner = OnnxScanner()
+    result = scanner.scan(str(model_path))
+    metadata = scanner.extract_metadata(str(model_path))
 
     assert result.success is False
     python_operator_issues = _python_operator_issues(result)
     assert python_operator_issues
     assert all(issue.severity == IssueSeverity.CRITICAL for issue in python_operator_issues)
+    assert result.metadata["custom_domains"] == ["com.attacker"]
+    assert metadata["custom_domains"] == ["com.attacker"]
+    assert all(check.rule_code == "S1111" for check in _failed_custom_domain_checks(result))
 
 
 def test_onnx_scanner_subgraph_snake_python_op_still_flagged(tmp_path: Path) -> None:
