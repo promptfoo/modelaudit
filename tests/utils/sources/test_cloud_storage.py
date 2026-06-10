@@ -991,6 +991,86 @@ def test_analyze_cloud_target_directory_success(mock_fs: MagicMock) -> None:
     fs.glob.assert_called_once_with("s3://bucket/path/**")
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+@patch("fsspec.filesystem")
+def test_bounded_cloud_download_stops_directory_analysis_over_max_size(
+    mock_fs: MagicMock,
+    tmp_path: Path,
+    streaming: bool,
+) -> None:
+    url = "s3://bucket/path/"
+    file_urls = [f"s3://bucket/path/model-{index}.bin" for index in range(3)]
+    fs = make_fs_mock()
+
+    def info_side_effect(path: str) -> dict[str, object]:
+        if path == url:
+            return {"type": "directory"}
+        if path in file_urls:
+            return {"type": "file", "size": 10}
+        raise FileNotFoundError(path)
+
+    fs.info.side_effect = info_side_effect
+    fs.glob.return_value = file_urls
+    mock_fs.return_value = fs
+
+    with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+        if streaming:
+            list(
+                download_from_cloud_streaming(
+                    url,
+                    max_size=1,
+                    show_progress=False,
+                    selective=False,
+                )
+            )
+        else:
+            download_from_cloud(
+                url,
+                cache_dir=tmp_path,
+                max_size=1,
+                use_cache=False,
+                show_progress=False,
+                selective=False,
+            )
+
+    assert [entry.args[0] for entry in fs.info.call_args_list] == [url, file_urls[0]]
+    fs.get.assert_not_called()
+    fs.open.assert_not_called()
+
+
+@patch("fsspec.filesystem")
+def test_analyze_cloud_target_bounds_zero_size_directory_object_count(mock_fs: MagicMock) -> None:
+    url = "s3://bucket/path/"
+    file_urls = [f"s3://bucket/path/model-{index}.bin" for index in range(3)]
+    fs = make_fs_mock()
+    fs.info.side_effect = lambda path: {"type": "directory"} if path == url else {"type": "file", "size": 0}
+    fs.glob.return_value = file_urls
+    mock_fs.return_value = fs
+
+    result = asyncio.run(analyze_cloud_target(url, max_objects=2))
+
+    assert result["type"] == "unknown"
+    assert "maximum object count (2)" in result["error"]
+    assert [entry.args[0] for entry in fs.info.call_args_list] == [url, *file_urls[:2]]
+
+
+@patch("fsspec.filesystem")
+def test_analyze_cloud_target_consumes_directory_walk_incrementally(mock_fs: MagicMock) -> None:
+    url = "s3://bucket/path/"
+    file_urls = [f"s3://bucket/path/model-{index}.bin" for index in range(3)]
+    fs = make_fs_mock()
+    fs.info.side_effect = lambda path: {"type": "directory"} if path == url else {"type": "file", "size": 10}
+    fs.walk.return_value = iter([(url, [], [Path(file_url).name for file_url in file_urls])])
+    mock_fs.return_value = fs
+
+    result = asyncio.run(analyze_cloud_target(url, max_size=1))
+
+    assert result["type"] == "unknown"
+    assert "exceeds maximum allowed size" in result["error"]
+    assert [entry.args[0] for entry in fs.info.call_args_list] == [url, file_urls[0]]
+    fs.glob.assert_not_called()
+
+
 @pytest.mark.parametrize(
     ("listed_path", "expected_path", "expected_name"),
     [
