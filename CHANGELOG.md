@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - preserve bounded and fail-closed SafeTensors routing when header lengths resemble compression magic
+- attribute core file-type validation failures directly to S901 instead of message-matching unrelated rules
 - fail closed when manifest scanning exceeds its configured timeout
 - stop cloud directory analysis as soon as download size or object-count budgets are exhausted
 - preserve sanitized CatBoost command context in SARIF without exposing injected or neighboring credential values
