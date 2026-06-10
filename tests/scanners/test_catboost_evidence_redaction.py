@@ -4203,6 +4203,10 @@ def test_sensitive_comparison_operators_redact_literals_and_preserve_command(ope
             '"HUNTER2" == config["client_secret"]; os.system("id")',
             ("HUNTER2",),
         ),
+        (
+            '"OPAQUE-VALUE-CRED-123456" == "client_secret"; os.system("id")',
+            ("OPAQUE-VALUE-CRED-123456",),
+        ),
     ],
 )
 def test_sensitive_comparison_statements_redact_compound_and_reversed_literals(

@@ -2375,7 +2375,13 @@ def _left_comparison_operand_has_sensitive_key(text: str, statement_start: int, 
     return False
 
 
-def _right_comparison_operand_has_sensitive_key(text: str, operator_end: int, statement_end: int) -> bool:
+def _right_comparison_operand_has_sensitive_key(
+    text: str,
+    operator_end: int,
+    statement_end: int,
+    *,
+    allow_literal: bool = False,
+) -> bool:
     segment = text[operator_end : min(statement_end, operator_end + MAX_KEY_EXPRESSION_CHARS)].lstrip()
     ends = {len(segment)}
     for index, char in enumerate(segment):
@@ -2387,11 +2393,15 @@ def _right_comparison_operand_has_sensitive_key(text: str, operator_end: int, st
         if not candidate:
             continue
         attempts += 1
-        if _sensitive_comparison_key_from_expression(candidate, allow_literal=False) is not None:
+        if _sensitive_comparison_key_from_expression(candidate, allow_literal=allow_literal) is not None:
             return True
         if attempts >= MAX_KEY_EXPRESSION_PARSE_ATTEMPTS:
             break
     return False
+
+
+def _comparison_left_operand_is_string_literal(text: str, statement_start: int, operator_start: int) -> bool:
+    return text[statement_start:operator_start].rstrip().endswith(('"', "'"))
 
 
 def _redact_sensitive_comparison_statements(text: str) -> str:
@@ -2404,7 +2414,15 @@ def _redact_sensitive_comparison_statements(text: str) -> str:
         end = _find_value_expression_end(text, match.end(), len(text))
         if start >= end or not (
             _left_comparison_operand_has_sensitive_key(text, start, match.start())
-            or _right_comparison_operand_has_sensitive_key(text, match.end(), end)
+            or _right_comparison_operand_has_sensitive_key(
+                text,
+                match.end(),
+                end,
+                # A literal sensitive key on the right only marks the statement
+                # when the left operand is itself a literal candidate value;
+                # identifier-vs-key-name dispatches stay untouched.
+                allow_literal=_comparison_left_operand_is_string_literal(text, start, match.start()),
+            )
         ):
             continue
         candidate_count += 1
