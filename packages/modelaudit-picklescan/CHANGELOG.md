@@ -93,6 +93,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect nested pickles accepted by permissive base64 and hex decoders, and fail
   closed when decoded prefixes leave over-budget encoded tails
 - Invalidate cached call-graph analysis when Python sources, import hooks, loaded module origins, or parent package markers change.
+- bound aggregate decompressed bytes used to probe PyTorch ZIP members for hidden pickles
 - fail closed when PyTorch ZIP archives exceed the standalone pickle-member scan budget
 - detect dangerous call-like strings split across newline-separated statements
 - scan raw nested pickle payloads carried inside Unicode string literals

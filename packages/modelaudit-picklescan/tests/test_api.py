@@ -1736,6 +1736,112 @@ def test_scan_file_does_not_route_large_trivial_proto0_text_as_hidden_pickle(tmp
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
 
 
+def test_scan_file_stops_hidden_pickle_discovery_at_aggregate_probe_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    probe_budget = package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES + package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    monkeypatch.setattr(
+        package_api,
+        "_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES",
+        probe_budget,
+        raising=False,
+    )
+    archive_path = tmp_path / "hidden-probe-budget.pt"
+    decoy = b"I0\n0" * 20_000
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("archive/decoy-0", decoy)
+        archive.writestr("archive/decoy-1", decoy)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+
+    decompressed_probe_bytes = 0
+    original_read = zipfile.ZipExtFile.read
+
+    def count_probe_bytes(member: zipfile.ZipExtFile, size: int = -1) -> bytes:
+        nonlocal decompressed_probe_bytes
+        data = original_read(member, size)
+        if str(member.name).startswith("archive/decoy-"):
+            decompressed_probe_bytes += len(data)
+        return data
+
+    monkeypatch.setattr(zipfile.ZipExtFile, "read", count_probe_bytes)
+
+    report = scan_file(archive_path)
+
+    assert decompressed_probe_bytes == probe_budget
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.metadata["analysis_incomplete"] is True
+    assert report.coverage.raw_scan_complete is False
+    assert report.coverage.opcode_scan_complete is False
+    budget_notices = [notice for notice in report.notices if notice.code == "pytorch_zip_pickle_discovery_probe_budget"]
+    assert len(budget_notices) == 1
+    assert budget_notices[0].details["analysis_incomplete"] is True
+    assert budget_notices[0].details["probe_bytes_read"] == probe_budget
+    assert budget_notices[0].details["max_probe_bytes"] == probe_budget
+    assert budget_notices[0].details["probed_member_count"] == 1
+    assert budget_notices[0].details["skipped_member_count"] == 3
+    assert next(iter(budget_notices[0].details["skipped_members"])) == "archive/decoy-1"
+
+
+def test_scan_file_detects_hidden_pickle_at_aggregate_probe_budget_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    hidden_payload = b"cposix\nsystem\n(S'echo hidden'\ntR."
+    probe_budget = len("3\n") + len("little") + package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES + len(hidden_payload)
+    monkeypatch.setattr(
+        package_api,
+        "_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES",
+        probe_budget,
+        raising=False,
+    )
+    archive_path = tmp_path / "hidden-probe-boundary.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/payload", hidden_payload)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/payload"]
+    assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
+    assert all(notice.code != "pytorch_zip_pickle_discovery_probe_budget" for notice in report.notices)
+
+
+def test_scan_file_keeps_small_benign_archive_complete_at_aggregate_probe_budget_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    version = b"3\n"
+    byteorder = b"little"
+    notes = b"weights"
+    probe_budget = len(version) + len(byteorder) + len(notes)
+    monkeypatch.setattr(
+        package_api,
+        "_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES",
+        probe_budget,
+        raising=False,
+    )
+    archive_path = tmp_path / "benign-probe-boundary.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/version", version)
+        archive.writestr("archive/byteorder", byteorder)
+        archive.writestr("archive/notes", notes)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.is_clean
+    assert "analysis_incomplete" not in report.metadata
+    assert all(notice.code != "pytorch_zip_pickle_discovery_probe_budget" for notice in report.notices)
+
+
 def test_scan_file_marks_hidden_pytorch_zip_probe_failure_inconclusive(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
