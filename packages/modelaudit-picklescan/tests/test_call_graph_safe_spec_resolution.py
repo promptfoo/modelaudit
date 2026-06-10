@@ -1635,14 +1635,32 @@ def test_late_loaded_builtin_with_canonical_spec_fails_closed(
         _clear_call_graph_caches()
 
 
-def test_numpy_extension_export_does_not_fall_through_module_getattr() -> None:
-    from numpy.core import multiarray
+def test_loaded_extension_export_does_not_fall_through_module_getattr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import _codecs
+    from importlib.util import module_from_spec, spec_from_file_location
 
-    assert multiarray._reconstruct is not None
+    module_name = "modelaudit_tp_extension_export"
+    module_path = tmp_path / f"{module_name}.py"
+    module_path.write_text(
+        "def __getattr__(name=None):\n"
+        "    import modelaudit_tp_extension_dependency\n"
+        "    return modelaudit_tp_extension_dependency.resolve(name)\n",
+        encoding="utf-8",
+    )
+    spec = spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    loaded_module = module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, loaded_module)
+    spec.loader.exec_module(loaded_module)
+    namespace = ModuleType.__getattribute__(loaded_module, "__dict__")
+    namespace["_reconstruct"] = _codecs.encode
     reference = {
-        "module": "numpy.core.multiarray",
+        "module": module_name,
         "name": "_reconstruct",
-        "import_reference": "numpy.core.multiarray._reconstruct",
+        "import_reference": f"{module_name}._reconstruct",
         "opcode": "REDUCE",
         "positional_arg_count": 3,
     }
