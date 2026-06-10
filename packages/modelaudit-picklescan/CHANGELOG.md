@@ -78,6 +78,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- ignore single-quartet Base64 pickle prefixes in ordinary text while preserving explicit payloads and security evidence
 - honor the string-literal scan cap during bounded raw nested-pickle analysis and avoid duplicate probes inside complete encoded pickles
 - preserve raw persistent-ID probes and later encoded payloads when byte literals also contain complete or unterminated Base64 pickles
 - scan encoded nested pickles in bounded byte and bytearray literals without treating benign execution-like text or complete encoded payloads as raw pickle fragments
