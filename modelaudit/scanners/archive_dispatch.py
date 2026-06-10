@@ -527,7 +527,16 @@ def merge_hdf5_userblock_zip_findings(
             if previous_top_level_end == 0:
                 temp_path = _copy_file_prefix_to_temp(path, logical_end, temp_suffix)
             else:
-                temp_path = _copy_file_range_to_temp(path, previous_top_level_end, logical_end, temp_suffix)
+                required_zero_prefix_length = 0
+                if not is_contained:
+                    required_zero_prefix_length = archive_start - previous_top_level_end
+                temp_path = _copy_file_range_to_temp(
+                    path,
+                    previous_top_level_end,
+                    logical_end,
+                    temp_suffix,
+                    required_zero_prefix_length=required_zero_prefix_length,
+                )
             supplemental_result = ScanResult(scanner_name="zip")
             merge_executable_zip_container_findings(temp_path, supplemental_result, config, context=context)
             _replace_scan_result_path(supplemental_result, temp_path, path)
@@ -720,20 +729,36 @@ def _copy_file_prefix_to_temp(path: str, length: int, suffix: str) -> str:
         raise
 
 
-def _copy_file_range_to_temp(path: str, start: int, end: int, suffix: str) -> str:
+def _copy_file_range_to_temp(
+    path: str,
+    start: int,
+    end: int,
+    suffix: str,
+    *,
+    required_zero_prefix_length: int = 0,
+) -> str:
     """Copy one validated concatenated ZIP segment to a temporary file."""
+    range_length = end - start
+    if not 0 <= required_zero_prefix_length <= range_length:
+        raise OSError("HDF5 user-block ZIP padding exceeds the validated segment range")
+
     temp_path: str | None = None
     try:
         with open(path, "rb") as source, tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
             source.seek(start)
             temp_path = temp_file.name
-            remaining = end - start
+            remaining = range_length
+            zero_prefix_remaining = required_zero_prefix_length
             while remaining > 0:
                 chunk = source.read(min(1024 * 1024, remaining))
                 if not chunk:
                     raise OSError("HDF5 user-block ZIP segment ended before its validated logical EOF")
+                checked_length = min(len(chunk), zero_prefix_remaining)
+                if chunk[:checked_length].rstrip(b"\x00"):
+                    raise OSError("HDF5 user block contains non-padding content between ZIP segments")
                 temp_file.write(chunk)
                 remaining -= len(chunk)
+                zero_prefix_remaining -= checked_length
         return temp_path
     except BaseException:
         if temp_path is not None:
