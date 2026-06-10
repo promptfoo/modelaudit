@@ -1,3 +1,4 @@
+import builtins
 import bz2
 import gzip
 import importlib
@@ -9509,7 +9510,11 @@ class TestZipScanner:
             for check in exc_info.value.result.checks
         )
 
-    def test_archive_member_scan_reuses_open_archive_after_path_replacement(self, tmp_path: Path) -> None:
+    def test_archive_member_scan_reuses_open_archive_after_path_replacement(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         archive_path = tmp_path / "original.zip"
         replacement_path = tmp_path / "replacement.zip"
         with zipfile.ZipFile(archive_path, "w") as archive:
@@ -9517,10 +9522,21 @@ class TestZipScanner:
         with zipfile.ZipFile(replacement_path, "w") as archive:
             archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo replacement"\ntR.')
 
+        original_open = builtins.open
+        path_reopened = False
+
+        def redirect_path_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+            nonlocal path_reopened
+            if str(file) == str(archive_path):
+                path_reopened = True
+                file = replacement_path
+            return original_open(file, *args, **kwargs)
+
         with zipfile.ZipFile(archive_path) as archive:
-            os.replace(replacement_path, archive_path)
+            monkeypatch.setattr(builtins, "open", redirect_path_open)
             result = ZipScanner().scan_archive_members(str(archive_path), archive=archive)
 
+        assert path_reopened is False
         assert result.success is True
         assert not result.issues
         assert any(entry.get("path", "").endswith(":safe.txt") for entry in result.metadata["contents"])

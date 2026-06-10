@@ -197,13 +197,14 @@ def test_format_scan_json_redacts_sources_without_corrupting_result_metadata() -
 
 
 def test_format_scan_json_preserves_pydantic_json_serialization() -> None:
+    model_path = Path("models") / "model.pkl"
     result = create_mock_scan_result(
         issues=[
             {
                 "message": "Serializable details",
                 "severity": "warning",
                 "details": {
-                    "path": Path("models/model.pkl"),
+                    "path": model_path,
                     "timestamp": datetime(2026, 6, 8, 12, 30, tzinfo=timezone.utc),
                 },
             }
@@ -213,7 +214,7 @@ def test_format_scan_json_preserves_pydantic_json_serialization() -> None:
     payload = json.loads(_format_scan_output(result, [], output_format="json", verbose=True))
 
     assert payload["issues"][0]["details"] == {
-        "path": "models/model.pkl",
+        "path": str(model_path),
         "timestamp": "2026-06-08T12:30:00Z",
     }
 
