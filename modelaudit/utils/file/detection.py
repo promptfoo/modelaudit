@@ -4592,12 +4592,10 @@ def detect_file_format(path: str) -> str:
         or _looks_like_uncompressed_tar_header(header)
     )
     if compression_format is None and not has_known_container_magic:
+        if _is_safetensors_routing_candidate(file_path, magic8, size):
+            return "safetensors"
         could_be_flax = _could_be_content_routed_flax_msgpack(file_path)
-        if (
-            _looks_like_binary_pickle_protocol(magic4)
-            and not could_be_flax
-            and not _is_safetensors_routing_candidate(file_path, magic8, size)
-        ):
+        if _looks_like_binary_pickle_protocol(magic4) and not could_be_flax:
             return "pickle"
         pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
         protocol_less_state = _has_bounded_protocolless_binary_pickle_security_signal(
