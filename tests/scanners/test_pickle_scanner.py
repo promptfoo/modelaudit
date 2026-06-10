@@ -4,6 +4,7 @@ import hashlib
 import io
 import os
 import pickle
+import pickletools
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.core_results import merge_scan_result
 from modelaudit.models import create_initial_audit_result
+from modelaudit.scanners import pickle_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
     _BINARY_TAIL_SCAN_BYTES,
@@ -112,6 +114,10 @@ def _short_binunicode(data: bytes) -> bytes:
     return b"\x8c" + bytes([len(data)]) + data
 
 
+def _binunicode(data: bytes) -> bytes:
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
 def _binary_opcode_os_system_reduce_payload() -> bytes:
     # The command text is inert here; the scanner only needs a realistic GLOBAL/REDUCE payload shape.
     return _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93" + _short_binunicode(b"echo") + b"\x85R."
@@ -165,6 +171,134 @@ def _make_dup_heavy_pickle(iterations: int) -> bytes:
         payload += b"h\x002a0"
     payload += b"."
     return bytes(payload)
+
+
+def _legacy_pytorch_object_stream(
+    storage_keys: tuple[str, ...],
+    storage_size: int,
+    *,
+    malicious_object: bool = False,
+) -> bytes:
+    object_stream = bytearray(b"\x80\x02]")
+    for key in storage_keys:
+        encoded_key = key.encode("ascii")
+        object_stream += b"(" + _binunicode(b"storage")
+        object_stream += b"ctorch\nByteStorage\n"
+        object_stream += _binunicode(encoded_key) + _binunicode(b"cpu")
+        object_stream += pickle.dumps(storage_size, protocol=2)[2:-1]
+        object_stream += b"NtQa"
+    if malicious_object:
+        malicious_pickle = pickle.dumps(MaliciousPayload(), protocol=2)
+        object_stream += malicious_pickle[2:-1] + b"a"
+    object_stream += b"."
+    return bytes(object_stream)
+
+
+def _memoized_legacy_pytorch_object_stream(protocol: int) -> bytes:
+    payload = bytearray(b"\x80" + bytes([protocol]) + b"]\x94")
+    payload += b"(" + _short_binunicode(b"storage") + b"\x94"
+    payload += _short_binunicode(b"torch") + b"\x94"
+    payload += _short_binunicode(b"ByteStorage") + b"\x94\x93\x94"
+    payload += _short_binunicode(b"0") + b"\x94"
+    payload += _short_binunicode(b"cpu") + b"\x94K\x04Nt\x94Qa"
+    payload += b"(h\x01h\x04h\x05h\x06K\x04NtQa."
+    return bytes(payload)
+
+
+def _make_legacy_pytorch_container(
+    storage_payload: bytes,
+    *,
+    declared_storage_size: int | None = None,
+    malicious_object: bool = False,
+    storage_keys: tuple[str, ...] = ("0",),
+) -> tuple[bytes, int]:
+    storage_size = len(storage_payload) if declared_storage_size is None else declared_storage_size
+    control_streams = (
+        pickle.dumps(0x1950A86A20F9469CFC6C, protocol=2),
+        pickle.dumps(1001, protocol=2),
+        pickle.dumps(
+            {
+                "protocol_version": 1001,
+                "little_endian": True,
+                "type_sizes": {"short": 2, "int": 4, "long": 8},
+            },
+            protocol=2,
+        ),
+        _legacy_pytorch_object_stream(storage_keys, storage_size, malicious_object=malicious_object),
+        pickle.dumps(list(storage_keys), protocol=2),
+    )
+    pickle_end = sum(len(stream) for stream in control_streams)
+    storage_record = b"".join(storage_size.to_bytes(8, "little") + storage_payload for _key in storage_keys)
+    return b"".join(control_streams) + storage_record, pickle_end
+
+
+@pytest.mark.parametrize("protocol", [4, 5])
+def test_legacy_pytorch_storage_records_accept_memoized_protocols(protocol: int) -> None:
+    records = pickle_scanner._legacy_pytorch_storage_records(
+        _memoized_legacy_pytorch_object_stream(protocol),
+        ("0",),
+    )
+
+    assert records is not None
+    assert len(records) == 1
+    assert records[0].key == "0"
+    assert records[0].element_count == 4
+    assert records[0].element_size == 1
+
+
+def test_legacy_pytorch_storage_records_reject_missing_memo_reference() -> None:
+    payload = b"\x80\x02(" + _binunicode(b"storage") + b"ctorch\nByteStorage\n"
+    payload += _binunicode(b"0") + _binunicode(b"cpu") + b"K\x01h\xfa" + b"tQ."
+
+    assert pickle_scanner._legacy_pytorch_storage_records(payload, ("0",)) is None
+
+
+def test_legacy_pytorch_storage_records_reject_stack_underflow() -> None:
+    payload = _legacy_pytorch_object_stream(("0",), 1)
+    malformed_payload = payload[:-1] + b"00."
+
+    assert pickle_scanner._legacy_pytorch_storage_records(malformed_payload, ("0",)) is None
+
+
+def test_legacy_pytorch_storage_records_reject_out_of_bounds_view() -> None:
+    payload = b"\x80\x02(" + _binunicode(b"storage") + b"ctorch\nByteStorage\n"
+    payload += _binunicode(b"0") + _binunicode(b"cpu") + b"K\x04"
+    payload += b"(" + _binunicode(b"1") + b"K\x03K\x02t" + b"tQ."
+
+    assert pickle_scanner._legacy_pytorch_storage_records(payload, ("0",)) is None
+
+
+def test_legacy_pytorch_storage_records_reject_zip_style_five_field_id() -> None:
+    payload = b"\x80\x02(" + _binunicode(b"storage") + b"ctorch\nByteStorage\n"
+    payload += _binunicode(b"0") + _binunicode(b"cpu") + b"K\x04tQ."
+
+    assert pickle_scanner._legacy_pytorch_storage_records(payload, ("0",)) is None
+
+
+def test_legacy_pytorch_storage_key_parser_stops_at_opcode_budget() -> None:
+    append_count = pickle_scanner._PYTORCH_LEGACY_MAX_CONTROL_OPCODES // 2
+    payload = b"\x80\x02]" + ((_binunicode(b"0") + b"a") * append_count) + b"."
+
+    assert pickle_scanner._legacy_pytorch_storage_keys(payload) is None
+
+
+def test_legacy_pytorch_stream_layout_stops_at_control_opcode_budget() -> None:
+    control_streams = (
+        pickle.dumps(0x1950A86A20F9469CFC6C, protocol=2),
+        pickle.dumps(1001, protocol=2),
+        pickle.dumps(
+            {
+                "protocol_version": 1001,
+                "little_endian": True,
+                "type_sizes": {"short": 2, "int": 4, "long": 8},
+            },
+            protocol=2,
+        ),
+        _make_opcode_padding_stream((pickle_scanner._PYTORCH_LEGACY_MAX_CONTROL_OPCODES // 2) + 1),
+        pickle.dumps([], protocol=2),
+    )
+
+    assert pickle_scanner._legacy_pytorch_stream_layout(b"".join(control_streams)) is None
 
 
 def test_pickle_scanner_star_import_exports_scanner_class() -> None:
@@ -1581,6 +1715,424 @@ def test_extract_metadata_validates_pickle_read_limit(
     assert metadata["extraction_error"] == expected_error
 
 
+def test_legacy_pytorch_container_does_not_report_known_stream_truncated(tmp_path: Path) -> None:
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 512)
+    path = tmp_path / "legacy-known-size.bin"
+    path.write_bytes(payload)
+
+    result = PickleScanner(
+        config={
+            "max_known_stream_read_bytes": 256,
+            "pickle_root_raw_scan_limit_bytes": len(payload),
+        }
+    ).scan(str(path))
+
+    assert result.success is True
+    assert "known_stream_truncated" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.details.get("notice_code") == "known_stream_truncated" for check in result.checks)
+    assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
+
+
+def test_legacy_pytorch_container_accepts_historical_big_endian_storage_header(tmp_path: Path) -> None:
+    storage_payload = b"A" * 64
+    payload, pickle_end = _make_legacy_pytorch_container(storage_payload)
+    big_endian_payload = payload[:pickle_end] + len(storage_payload).to_bytes(8, "big") + storage_payload
+    path = tmp_path / "legacy-big-endian-header.pt"
+    path.write_bytes(big_endian_payload)
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is True
+    assert result.metadata["legacy_pytorch_container"] is True
+    assert result.metadata["legacy_pytorch_storage_end"] == len(big_endian_payload)
+
+
+def test_legacy_pytorch_seekable_stream_uses_control_stream_boundary() -> None:
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 512)
+    stream = io.BytesIO(payload)
+
+    result = PickleScanner(
+        config={
+            "max_known_stream_read_bytes": 256,
+            "pickle_root_raw_scan_limit_bytes": len(payload),
+        }
+    ).scan_stream(stream, len(payload), source="legacy-stream.bin")
+
+    assert result.success is True
+    assert "known_stream_truncated" not in result.metadata.get("scan_outcome_reasons", [])
+    assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
+    assert stream.tell() == 0
+
+
+def test_unknown_size_seekable_legacy_pytorch_stream_rejects_oversized_storage_span() -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(
+        b"",
+        declared_storage_size=(1 << 63) - 1,
+    )
+    stream = io.BytesIO(payload)
+
+    result = PickleScanner().scan_stream(stream, None, source="legacy-oversized-storage.pt")
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "legacy_pytorch_storage_layout_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "Legacy PyTorch Storage Layout" for check in result.checks)
+    assert stream.tell() == 0
+
+
+def test_legacy_pytorch_storage_is_not_treated_as_binary_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 64)
+    path = tmp_path / "legacy-storage-tail.bin"
+    path.write_bytes(payload)
+    monkeypatch.setattr(pickle_scanner, "_BINARY_TAIL_SCAN_BYTES", 100)
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is True
+    assert not any(check.name == "Pickle Binary Tail Coverage" for check in result.checks)
+    assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
+
+
+def test_storageless_legacy_pytorch_container_scans_appended_binary_tail(tmp_path: Path) -> None:
+    payload, pickle_end = _make_legacy_pytorch_container(b"", storage_keys=())
+    path = tmp_path / "storageless-legacy-tail.pt"
+    path.write_bytes(payload + b"\x7fELF/bin/sh\x00")
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is True
+    assert result.metadata["legacy_pytorch_storage_key_count"] == 0
+    assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
+    assert result.metadata["legacy_pytorch_storage_end"] == pickle_end
+    assert "legacy_pytorch_storage_payload_skipped" not in result.metadata
+    failed_check = next(check for check in result.checks if check.rule_code == "S502")
+    issue = next(issue for issue in result.issues if issue.rule_code == "S502")
+    assert failed_check.status == CheckStatus.FAILED
+    assert failed_check.location == f"{path} (pos {pickle_end})"
+    assert failed_check.details["offset"] == pickle_end
+    assert issue.location == failed_check.location
+    assert issue.details["offset"] == pickle_end
+
+
+def test_non_seekable_legacy_pytorch_stream_omits_only_raw_storage() -> None:
+    payload, pickle_end = _make_legacy_pytorch_container(b"\x7fELF" + (b"A" * 512))
+
+    result = PickleScanner(config={"max_known_stream_read_bytes": 256}).scan_stream(
+        NonSeekableBytesIO(payload),
+        len(payload),
+        source="legacy-storage.pt",
+    )
+
+    assert result.success is True
+    assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
+    assert result.metadata["legacy_pytorch_storage_end"] == len(payload)
+    assert result.metadata["legacy_pytorch_storage_scan_bounded"] is True
+    assert result.metadata["legacy_pytorch_storage_bytes_buffered"] == 256 - pickle_end
+    assert "non_seekable_stream_truncated" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "Pickle Stream Read Limit" for check in result.checks)
+    assert not any(check.name == "Legacy PyTorch Storage Layout" for check in result.checks)
+    integrity_check = next(check for check in result.checks if check.name == "File Integrity Check")
+    assert integrity_check.details["hash_complete"] is False
+    assert not any(issue.rule_code == "S502" for issue in result.issues)
+
+
+def test_non_seekable_legacy_pytorch_stream_keeps_unread_suffix_inconclusive() -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(b"A" * 512)
+    storage_end = len(payload)
+    appended_pickle = pickle.dumps(MaliciousPayload(), protocol=4)
+    combined_payload = payload + appended_pickle
+
+    result = PickleScanner(config={"max_known_stream_read_bytes": 256}).scan_stream(
+        NonSeekableBytesIO(combined_payload),
+        len(combined_payload),
+        source="legacy-unread-suffix.pt",
+    )
+
+    assert result.success is False
+    assert result.metadata["legacy_pytorch_storage_end"] == storage_end
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "non_seekable_stream_truncated" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "Pickle Stream Read Limit" for check in result.checks)
+    assert not any(issue.details.get("import_reference") == EXPECTED_SYSTEM_GLOBAL for issue in result.issues)
+
+
+def test_non_seekable_legacy_pytorch_stream_scans_malicious_control_pickle() -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(
+        b"A" * 512,
+        malicious_object=True,
+    )
+
+    result = PickleScanner(config={"max_known_stream_read_bytes": 256}).scan_stream(
+        NonSeekableBytesIO(payload),
+        len(payload),
+        source="legacy-malicious-storage.pt",
+    )
+
+    assert result.success is True
+    assert result.metadata["legacy_pytorch_storage_scan_bounded"] is True
+    assert "non_seekable_stream_truncated" not in result.metadata.get("scan_outcome_reasons", [])
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any(issue.details.get("import_reference") == EXPECTED_SYSTEM_GLOBAL for issue in result.issues)
+
+
+def test_seekable_legacy_pytorch_stream_preserves_wrapped_positions() -> None:
+    prefix = b"WRAPPED:"
+    payload, _pickle_end = _make_legacy_pytorch_container(
+        b"A" * 64,
+        malicious_object=True,
+    )
+    bare_result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="bare.pt")
+    wrapped_stream = io.BytesIO(prefix + payload)
+    wrapped_stream.seek(len(prefix))
+
+    wrapped_result = PickleScanner().scan_stream(wrapped_stream, len(payload), source="wrapped.pt")
+
+    assert wrapped_result.metadata["first_pickle_end_pos"] == (
+        bare_result.metadata["first_pickle_end_pos"] + len(prefix)
+    )
+    assert wrapped_result.metadata["legacy_pytorch_storage_start"] == (
+        bare_result.metadata["legacy_pytorch_storage_start"] + len(prefix)
+    )
+    assert wrapped_result.metadata["legacy_pytorch_storage_end"] == (
+        bare_result.metadata["legacy_pytorch_storage_end"] + len(prefix)
+    )
+    for bare_boundary, wrapped_boundary in zip(
+        bare_result.metadata["legacy_pytorch_pickle_stream_boundaries"],
+        wrapped_result.metadata["legacy_pytorch_pickle_stream_boundaries"],
+        strict=True,
+    ):
+        assert wrapped_boundary["start"] == bare_boundary["start"] + len(prefix)
+        assert wrapped_boundary["end"] == bare_boundary["end"] + len(prefix)
+    assert "known_stream_truncated" not in wrapped_result.metadata.get("scan_outcome_reasons", [])
+    bare_reference = next(
+        reference
+        for reference in bare_result.metadata["import_references"]
+        if reference["import_reference"] == EXPECTED_SYSTEM_GLOBAL
+    )
+    wrapped_reference = next(
+        reference
+        for reference in wrapped_result.metadata["import_references"]
+        if reference["import_reference"] == EXPECTED_SYSTEM_GLOBAL
+    )
+    assert wrapped_reference["position"] == bare_reference["position"] + len(prefix)
+    bare_invocation = next(
+        invocation
+        for invocation in bare_result.metadata["callable_invocations"]
+        if invocation["import_reference"] == EXPECTED_SYSTEM_GLOBAL
+    )
+    wrapped_invocation = next(
+        invocation
+        for invocation in wrapped_result.metadata["callable_invocations"]
+        if invocation["import_reference"] == EXPECTED_SYSTEM_GLOBAL
+    )
+    assert wrapped_invocation["global_position"] == bare_invocation["global_position"] + len(prefix)
+    assert wrapped_invocation["opcode_position"] == bare_invocation["opcode_position"] + len(prefix)
+    wrapped_issue = next(
+        issue for issue in wrapped_result.issues if issue.details.get("import_reference") == EXPECTED_SYSTEM_GLOBAL
+    )
+    assert wrapped_issue.details["global_position"] == wrapped_invocation["global_position"]
+    wrapped_check = next(
+        check for check in wrapped_result.checks if check.details.get("import_reference") == EXPECTED_SYSTEM_GLOBAL
+    )
+    assert wrapped_check.status == CheckStatus.FAILED
+    assert wrapped_check.location == wrapped_issue.location
+    assert wrapped_check.details["global_position"] == wrapped_reference["position"]
+    assert wrapped_stream.tell() == len(prefix)
+
+
+def test_seekable_legacy_pytorch_stream_scans_suffix_beyond_storage_window() -> None:
+    prefix = b"WRAPPED:"
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 4096)
+    storage_end = len(payload)
+    appended_pickle = pickle.dumps(MaliciousPayload(), protocol=4)
+    global_position = next(
+        position
+        for opcode, _arg, position in pickletools.genops(appended_pickle)
+        if opcode.name in {"GLOBAL", "STACK_GLOBAL"} and position is not None
+    )
+    wrapped_stream = io.BytesIO(prefix + payload + appended_pickle)
+    wrapped_stream.seek(len(prefix))
+
+    result = PickleScanner(config={"pickle_root_raw_scan_limit_bytes": pickle_end}).scan_stream(
+        wrapped_stream,
+        len(payload) + len(appended_pickle),
+        source="wrapped-suffix.pt",
+    )
+
+    reference = next(
+        reference
+        for reference in result.metadata["import_references"]
+        if reference["import_reference"] == EXPECTED_SYSTEM_GLOBAL
+    )
+    assert result.success is True
+    assert result.metadata["legacy_pytorch_storage_start"] == len(prefix) + pickle_end
+    assert result.metadata["legacy_pytorch_storage_end"] == len(prefix) + storage_end
+    assert reference["position"] == len(prefix) + storage_end + global_position
+    assert result.metadata["pickle_verdict"] == "malicious"
+    assert result.metadata["protocols"] == [2, 4]
+    assert wrapped_stream.tell() == len(prefix)
+
+
+def test_legacy_pytorch_storage_bytes_are_not_counted_as_pickle_cve_streams(tmp_path: Path) -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(b"N\xff" * 65)
+    path = tmp_path / "legacy-opcode-shaped-storage.bin"
+    path.write_bytes(payload)
+
+    result = PickleScanner(config={"pickle_root_raw_scan_limit_bytes": len(payload)}).scan(str(path))
+
+    assert result.success is True
+    assert result.metadata["pickle_cve_streams_analyzed"] == 5
+    assert not any(check.name == "Pickle CVE Stream Coverage" for check in result.checks)
+
+
+def test_legacy_pytorch_storage_bytes_do_not_report_extension_opcodes(tmp_path: Path) -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(b"\x82\x01\x83\x01\x00" * 32)
+    path = tmp_path / "legacy-extension-shaped-storage.bin"
+    path.write_bytes(payload)
+
+    result = PickleScanner(config={"pickle_root_raw_scan_limit_bytes": len(payload)}).scan(str(path))
+
+    assert result.success is True
+    assert not any(issue.details.get("opcode") in {"EXT1", "EXT2"} for issue in result.issues)
+
+
+def test_legacy_pytorch_storage_bytes_do_not_trigger_pickle_cve_patterns(tmp_path: Path) -> None:
+    storage_payload = b"torch.distributed.rpc rpc_sync eval" + (b"A" * 512)
+    payload, _pickle_end = _make_legacy_pytorch_container(storage_payload)
+    path = tmp_path / "legacy-cve-shaped-storage.pt"
+    path.write_bytes(payload)
+
+    result = PickleScanner(config={"pickle_root_raw_scan_limit_bytes": len(payload)}).scan(str(path))
+
+    assert result.success is True
+    assert result.metadata["legacy_pytorch_storage_end"] == len(payload)
+    assert not any(issue.details.get("cve_id") == "CVE-2024-5480" for issue in result.issues)
+
+
+def test_legacy_pytorch_container_scans_pickle_after_large_storage(tmp_path: Path) -> None:
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 4096)
+    storage_end = len(payload)
+    appended_pickle = pickle.dumps(MaliciousPayload(), protocol=4)
+    global_position = next(
+        position
+        for opcode, _arg, position in pickletools.genops(appended_pickle)
+        if opcode.name in {"GLOBAL", "STACK_GLOBAL"} and position is not None
+    )
+    reduce_position = next(
+        position
+        for opcode, _arg, position in pickletools.genops(appended_pickle)
+        if opcode.name == "REDUCE" and position is not None
+    )
+    path = tmp_path / "legacy-storage-appended-pickle.pt"
+    path.write_bytes(payload + appended_pickle)
+
+    result = PickleScanner(config={"pickle_root_raw_scan_limit_bytes": pickle_end + 16}).scan(str(path))
+
+    reference = next(
+        reference
+        for reference in result.metadata["import_references"]
+        if reference["import_reference"] == EXPECTED_SYSTEM_GLOBAL
+    )
+    invocation = next(
+        invocation
+        for invocation in result.metadata["callable_invocations"]
+        if invocation["import_reference"] == EXPECTED_SYSTEM_GLOBAL
+    )
+    issue = next(issue for issue in result.issues if issue.details.get("import_reference") == EXPECTED_SYSTEM_GLOBAL)
+    assert result.success is True
+    assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
+    assert result.metadata["legacy_pytorch_storage_end"] == storage_end
+    assert (
+        result.metadata["first_pickle_end_pos"] == result.metadata["legacy_pytorch_pickle_stream_boundaries"][0]["end"]
+    )
+    assert result.metadata["protocols"] == [2, 4]
+    assert result.metadata["globals_count"] == 2
+    assert result.metadata["pickle_verdict"] == "malicious"
+    assert result.metadata["pickle_coverage"]["bytes_scanned"] == pickle_end + len(appended_pickle)
+    assert reference["position"] == storage_end + global_position
+    assert invocation["global_position"] == reference["position"]
+    assert invocation["opcode_position"] == storage_end + reduce_position
+    assert issue.details["global_position"] == reference["position"]
+
+
+def test_legacy_pytorch_complete_suffix_pickles_are_not_retreated_as_binary_tail(tmp_path: Path) -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(b"A")
+    storage_end = len(payload)
+    appended_pickle = pickle.dumps({"safe": True}, protocol=4) + pickle.dumps(
+        {"blob": b"B" * (_BINARY_TAIL_SCAN_BYTES + 100)},
+        protocol=4,
+    )
+    path = tmp_path / "legacy-benign-large-suffix.pt"
+    path.write_bytes(payload + appended_pickle)
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is True
+    assert result.metadata["legacy_pytorch_storage_end"] == storage_end
+    assert result.metadata["last_pickle_end_pos"] == len(payload) + len(appended_pickle)
+    assert "pickle_binary_tail_scan_window_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "Pickle Binary Tail Coverage" for check in result.checks)
+
+
+def test_legacy_pytorch_container_scans_malicious_object_stream(tmp_path: Path) -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(
+        b"A" * 64,
+        malicious_object=True,
+    )
+    path = tmp_path / "legacy-malicious-object.bin"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is True
+    assert result.metadata["legacy_pytorch_container"] is True
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any(issue.details.get("import_reference") == EXPECTED_SYSTEM_GLOBAL for issue in result.issues)
+
+
+def test_truncated_legacy_pytorch_control_stream_remains_inconclusive(tmp_path: Path) -> None:
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 64)
+    truncated_payload = payload[: pickle_end - 1] + payload[pickle_end:]
+    path = tmp_path / "legacy-truncated-control.bin"
+    path.write_bytes(truncated_payload)
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata.get("legacy_pytorch_container") is not True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pickle_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+
+
+def test_legacy_pytorch_invalid_storage_header_fails_closed(tmp_path: Path) -> None:
+    payload, pickle_end = _make_legacy_pytorch_container(b"\x7fELF" + (b"A" * 64))
+    malformed_payload = payload[:pickle_end] + (1).to_bytes(8, "little") + payload[pickle_end + 8 :]
+    path = tmp_path / "legacy-invalid-storage-header.pt"
+    path.write_bytes(malformed_payload)
+
+    result = PickleScanner().scan(str(path))
+    result.metadata["file_path"] = str(path)
+    aggregate_result = create_initial_audit_result()
+    merge_scan_result(aggregate_result, result)
+
+    assert result.success is False
+    assert result.metadata.get("legacy_pytorch_container") is not True
+    assert result.metadata["legacy_pytorch_control_streams"] is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "legacy_pytorch_storage_layout_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Legacy PyTorch Storage Layout"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S902"
+        for check in result.checks
+    )
+    assert not any(issue.rule_code == "S502" for issue in result.issues)
+    assert determine_exit_code(aggregate_result) == 1
+
+
 def test_scan_bin_file_detects_executable_tail_after_pickle_stream(tmp_path: Path) -> None:
     path = tmp_path / "model.bin"
     path.write_bytes(pickle.dumps({"safe": True}, protocol=4) + b"\x7fELF/bin/sh\x00")
@@ -1635,6 +2187,19 @@ def test_scan_pytorch_extension_keeps_security_exit_for_detected_binary_tail_gap
     assert result.metadata.get("operational_error") is not True
     assert any(issue.rule_code == "S502" for issue in result.issues)
     assert determine_exit_code(aggregate_result) == 1
+
+
+def test_legacy_pytorch_control_probe_is_independent_of_raw_detector_limit(tmp_path: Path) -> None:
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 64)
+    path = tmp_path / "legacy-missing-storage.pt"
+    path.write_bytes(payload[:pickle_end])
+
+    result = PickleScanner(config={"pickle_root_raw_scan_limit_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["legacy_pytorch_control_streams"] is True
+    assert "legacy_pytorch_storage_layout_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "Legacy PyTorch Storage Layout" for check in result.checks)
 
 
 def test_scan_stream_unknown_size_seekable_marks_out_of_window_binary_tail_incomplete() -> None:
