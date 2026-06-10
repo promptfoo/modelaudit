@@ -88,6 +88,14 @@ MACHO_MAGICS = {
 PRINTABLE_TEXT_RE = re.compile(rb"[ -~]{8,}")
 PRINTABLE_BYTES = bytes(range(32, 127))
 OVERSIZED_PRINTABLE_TEXT_RE = re.compile(rb"[ -~]{1048577}")
+UTF8_SCALAR_BYTES_PATTERN = (
+    rb"(?:[ -~]|[\xc2-\xdf][\x80-\xbf]|\xe0[\xa0-\xbf][\x80-\xbf]|"
+    rb"[\xe1-\xec\xee-\xef][\x80-\xbf]{2}|\xed[\x80-\x9f][\x80-\xbf]|"
+    rb"\xf0[\x90-\xbf][\x80-\xbf]{2}|[\xf1-\xf3][\x80-\xbf]{3}|"
+    rb"\xf4[\x80-\x8f][\x80-\xbf]{2})"
+)
+UTF8_RUNTIME_CANDIDATE_RE = re.compile(rb"[ -~\x80-\xff]{8,}")
+UTF8_RUNTIME_TEXT_SUFFIX_RE = re.compile(rb"(?:" + UTF8_SCALAR_BYTES_PATTERN + rb")+$")
 UTF16LE_PRINTABLE_TEXT_RE = re.compile(rb"(?:[ -~]\x00){8,}")
 UTF16BE_PRINTABLE_TEXT_RE = re.compile(rb"(?:\x00[ -~]){8,}")
 COMMAND_HINTS = (
@@ -138,10 +146,11 @@ SAFE_JSON_SCHEMA_URL_RE = re.compile(
     r"https?://(?:www\.)?json-schema\.org(?::\d+)?(?=[/?#\s]|$)(?:[/?#][^\s]*)?",
     re.IGNORECASE,
 )
-TRANSFER_TOKEN_RE = re.compile(r""""(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|&&|\|\||[;|&]|(?:\\.|[^\s;|&])+""")
+TRANSFER_TOKEN_RE = re.compile(r"""&&|\|\||[;|&]|(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|\\.|[^\s;|&'"\\])+""")
 TRANSFER_COMMAND_WORD_RE = re.compile(
-    r"(?<![\w.-])(?P<tool>\\?c(?:''|\"\")*\\?u(?:''|\"\")*\\?r(?:''|\"\")*\\?l|"
-    r"\\?w(?:''|\"\")*\\?g(?:''|\"\")*\\?e(?:''|\"\")*\\?t)(?:\.exe)?"
+    r"(?<![\w.-])(?P<tool>\\?c['\"]*\\?u['\"]*\\?r['\"]*\\?l|"
+    r"\\?w['\"]*\\?g['\"]*\\?e['\"]*\\?t)"
+    r"(?:['\"]*\\?\.['\"]*\\?e['\"]*\\?x['\"]*\\?e['\"]*)?"
     r"""(?=(?:\\(?:[nrt]|x[0-9a-f]{1,2}|0[0-7]{1,3}|[1-7][0-7]{0,2}|(?=\s))"""
     r"""|"(?=[\s,;|&\]})]|$)|'(?=[\s,;|&\]})]|$)|[\s;|&]|$))""",
     re.IGNORECASE,
@@ -433,6 +442,10 @@ def _unquote_transfer_token(token: str) -> str:
 
 def _normalize_static_shell_word(token: str) -> str:
     """Resolve quote concatenation and escapes in a bounded literal shell word."""
+    if len(token) >= 3 and token.startswith("$'") and token.endswith("'"):
+        return _decode_shell_printf_escapes(token[2:-1])
+    if len(token) >= 3 and token.startswith('$"') and token.endswith('"'):
+        token = token[1:]
     if re.match(r"^[A-Za-z]:\\", token) is not None or not any(character in token for character in "'\"\\"):
         return _unquote_transfer_token(token)
     try:
@@ -444,7 +457,11 @@ def _normalize_static_shell_word(token: str) -> str:
 
 def _transfer_match_tool(command_match: re.Match[str]) -> str:
     """Return the semantic transfer executable name from static shell spelling."""
-    return _normalize_static_shell_word(command_match.group("tool")).lower()
+    raw_tool = command_match.group("tool")
+    normalized = _normalize_static_shell_word(raw_tool).lower()
+    if normalized in {"curl", "wget"}:
+        return normalized
+    return re.sub(r"[\\'\"]", "", raw_tool).lower()
 
 
 def _normalize_shell_line_continuations(text: str) -> str:
@@ -1480,26 +1497,32 @@ def _decode_shell_printf_escapes(value: str) -> str:
     return re.sub(r"\\(?:\\|n|r|t|x[0-9A-Fa-f]{1,2}|0[0-7]{1,3}|[1-7][0-7]{0,2})", replace, value)
 
 
-def _shell_printf_output(format_string: str, arguments: list[str]) -> str:
-    """Reconstruct bounded printf output for %s/%b shell-script payloads."""
+def _shell_printf_output(format_string: str, arguments: list[str]) -> tuple[str, bool]:
+    """Reconstruct bounded printf output and report omitted output."""
     conversion_re = re.compile(r"%(?:%|[bs])")
     conversions = [match.group() for match in conversion_re.finditer(format_string) if match.group() != "%%"]
     if not conversions:
-        return _decode_shell_printf_escapes(format_string)[:LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES]
+        decoded = _decode_shell_printf_escapes(format_string)
+        return decoded[:LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES], (
+            len(decoded) > LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES
+        )
 
     output: list[str] = []
     output_length = 0
+    output_truncated = False
 
     def append_bounded(value: str, *, decode_escapes: bool = False) -> bool:
-        nonlocal output_length
+        nonlocal output_length, output_truncated
         if decode_escapes:
             value = _decode_shell_printf_escapes(value)
         remaining = LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES - output_length
         if remaining <= 0:
+            output_truncated |= bool(value)
             return False
         piece = value[:remaining]
         output.append(piece)
         output_length += len(piece)
+        output_truncated |= len(value) > remaining
         return len(value) <= remaining
 
     argument_index = 0
@@ -1526,7 +1549,8 @@ def _shell_printf_output(format_string: str, arguments: list[str]) -> str:
             append_bounded(format_string[cursor:], decode_escapes=True)
         if not conversions:
             break
-    return "".join(output)
+    output_truncated |= argument_index < len(arguments)
+    return "".join(output), output_truncated
 
 
 def _shell_stdin_payload(
@@ -1628,6 +1652,7 @@ def _shell_stdin_payload(
         producer = re.split(r"[\\/]", left_tokens[producer_index])[-1].lower().removesuffix(".exe")
         arguments = left_tokens[producer_index + 1 :]
         payload = ""
+        payload_limited = False
         if producer == "printf" and arguments:
             format_string = arguments[0]
             tool = _transfer_match_tool(command_match)
@@ -1635,7 +1660,7 @@ def _shell_stdin_payload(
                 re.search(r"%[bs]", format_string) is not None
                 and any(tool in argument.lower() for argument in arguments[1:])
             ):
-                payload = _shell_printf_output(format_string, arguments[1:])
+                payload, payload_limited = _shell_printf_output(format_string, arguments[1:])
             else:
                 continue
         elif producer == "echo":
@@ -1650,6 +1675,8 @@ def _shell_stdin_payload(
             if decode_escapes:
                 payload = _decode_shell_printf_escapes(payload)
         if not payload:
+            if payload_limited:
+                return None, True
             continue
         quoted_payload = next(
             (
@@ -1663,7 +1690,7 @@ def _shell_stdin_payload(
             None,
         )
         boundary = line_start + (quoted_payload.end() - 1 if quoted_payload is not None else pipe_offset)
-        return (payload, boundary), False
+        return (payload, boundary), payload_limited
     return None, False
 
 
@@ -1714,6 +1741,19 @@ def _python_line_analysis(line: str) -> PythonLineAnalysis | None:
     except (IndentationError, MemoryError, RecursionError, SyntaxError, tokenize.TokenError):
         return None
 
+    source_is_ascii = source.isascii()
+    utf8_column_boundaries: list[int] | None = None
+
+    def character_column(byte_column: int) -> int:
+        nonlocal utf8_column_boundaries
+        if source_is_ascii:
+            return byte_column
+        if utf8_column_boundaries is None:
+            utf8_column_boundaries = [0]
+            for character in source:
+                utf8_column_boundaries.append(utf8_column_boundaries[-1] + len(character.encode("utf-8")))
+        return bisect_left(utf8_column_boundaries, byte_column)
+
     shell_string_apis = {"os.system", "subprocess.getoutput", "subprocess.getstatusoutput"}
     subprocess_apis = {"call", "check_call", "check_output", "popen", "run"}
     payloads: list[tuple[int, int, str]] = []
@@ -1755,8 +1795,8 @@ def _python_line_analysis(line: str) -> PythonLineAnalysis | None:
             continue
         payloads.append(
             (
-                node.col_offset,
-                end_col_offset,
+                character_column(node.col_offset),
+                character_column(end_col_offset),
                 payload[:LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES],
             )
         )
@@ -1972,34 +2012,35 @@ def _transfer_command_context(
         split_string_executable, split_string_end = env_split_string_context
         return split_string_executable, split_string_end if split_string_executable else None, False, False
 
-    wrapper_executable, wrapper_ambiguous = _transfer_wrapper_prefix_context(normalized_tokens[:command_token_index])
-    if wrapper_executable and command_token_is_executable:
-        return True, None, False, False
-    if wrapper_ambiguous:
-        return False, None, False, True
-    if command_token_index == 0 and token_start == command_match.start() and not command_token_is_executable:
-        return False, None, False, False
-
     quoted_command = (
         len(raw_command_token) >= 2
         and raw_command_token[0] == raw_command_token[-1]
         and raw_command_token[0] in {'"', "'"}
     )
     ansi_c_quoted_command = raw_command_token.startswith(("$'", '$"'))
+    wrapper_executable, wrapper_ambiguous = _transfer_wrapper_prefix_context(normalized_tokens[:command_token_index])
+    if wrapper_executable and command_token_is_executable:
+        return True, None, False, False
+    if wrapper_ambiguous and not (quoted_command or ansi_c_quoted_command):
+        return False, None, False, True
+    if command_token_index == 0 and token_start == command_match.start() and not command_token_is_executable:
+        return False, None, False, False
+
     if ansi_c_quoted_command:
         quote = raw_command_token[1]
         quote_search_end = min(line_end, command_match.start() + LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES)
         escaped = False
-        quote_end: int | None = None
-        for index in range(max(command_match.end(), token_end), quote_search_end):
-            character = text[index]
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == quote:
-                quote_end = index
-                break
+        quote_end: int | None = token_end - 1 if raw_command_token.endswith(quote) else None
+        if quote_end is None:
+            for index in range(max(command_match.end(), token_end), quote_search_end):
+                character = text[index]
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote_end = index
+                    break
         if quote_end is None:
             return False, None, quote_search_end < line_end, quote_search_end >= line_end
         quoted_command = True
@@ -2315,7 +2356,31 @@ def _passive_heredoc_consumer_is_safe(name: str, arguments: list[str]) -> bool:
     return True
 
 
-def _heredoc_body_is_passive_data(line: str, operator_start: int) -> bool:
+def _shell_command_overrides(line: str) -> set[str]:
+    """Return passive-consumer names overridden in executable shell text."""
+    overrides: set[str] = set()
+    for match in re.finditer(
+        r"(?:^|[;|&])\s*(?:function\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?\s*\{",
+        line,
+    ):
+        name = match.group("name").lower()
+        if name in LITERAL_HEREDOC_DATA_CONSUMERS and not _shell_offset_is_inert(line, match.start("name")):
+            overrides.add(name)
+    for match in re.finditer(
+        r"(?:^|[;|&])\s*alias\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)=",
+        line,
+    ):
+        name = match.group("name").lower()
+        if name in LITERAL_HEREDOC_DATA_CONSUMERS and not _shell_offset_is_inert(line, match.start("name")):
+            overrides.add(name)
+    return overrides
+
+
+def _heredoc_body_is_passive_data(
+    line: str,
+    operator_start: int,
+    overridden_consumers: set[str] | frozenset[str] = frozenset(),
+) -> bool:
     """Return whether a known passive command consumes this heredoc as data."""
     suffix = line[operator_start + 2 :]
     if (
@@ -2334,6 +2399,8 @@ def _heredoc_body_is_passive_data(line: str, operator_start: int) -> bool:
         name = re.split(r"[\\/]", token)[-1].lower().removesuffix(".exe")
         if name not in LITERAL_HEREDOC_DATA_CONSUMERS:
             continue
+        if name in overridden_consumers:
+            return False
         prefix_executable, prefix_ambiguous = _transfer_wrapper_prefix_context(tokens[:index])
         if not _passive_heredoc_consumer_is_safe(name, tokens[index + 1 :]):
             return False
@@ -2341,7 +2408,10 @@ def _heredoc_body_is_passive_data(line: str, operator_start: int) -> bool:
     return False
 
 
-def _shell_heredoc_declarations(line: str) -> list[tuple[str, bool, bool]]:
+def _shell_heredoc_declarations(
+    line: str,
+    overridden_consumers: set[str] | frozenset[str] = frozenset(),
+) -> list[tuple[str, bool, bool]]:
     """Return delimiter, tab stripping, and safe suppression state for shell heredocs."""
     if len(line) > LLAMAFILE_RUNTIME_MAX_HEREDOC_LINE_BYTES:
         return []
@@ -2423,8 +2493,11 @@ def _shell_heredoc_declarations(line: str) -> list[tuple[str, bool, bool]]:
             delimiter.append(character)
             index += 1
         if delimiter:
+            effective_overrides = overridden_consumers | _shell_command_overrides(line[:operator_start])
             suppress_body = (
-                not declarations and delimiter_quoted and _heredoc_body_is_passive_data(line, operator_start)
+                not declarations
+                and delimiter_quoted
+                and _heredoc_body_is_passive_data(line, operator_start, effective_overrides)
             )
             if len(declarations) >= LLAMAFILE_RUNTIME_MAX_HEREDOC_DECLARATIONS:
                 continue
@@ -2452,10 +2525,12 @@ def _quoted_heredoc_body_spans(text: str) -> list[tuple[int, int]]:
 
     spans: list[tuple[int, int]] = []
     pending: deque[tuple[str, bool, bool]] = deque()
+    overridden_consumers: set[str] = set()
     body_start = 0
     for line_index, line in enumerate(lines):
         if not pending:
-            pending = deque(_shell_heredoc_declarations(line))
+            pending = deque(_shell_heredoc_declarations(line, overridden_consumers))
+            overridden_consumers.update(_shell_command_overrides(line))
             if pending:
                 body_start = offsets[line_index] + len(line)
             continue
@@ -2484,6 +2559,7 @@ class _LiteralHeredocStreamFilter:
         self._pending: deque[tuple[str, bool, bool]] = deque()
         self._line = bytearray()
         self._line_overflow = False
+        self._overridden_consumers: set[str] = set()
 
     def _finish_line(self) -> None:
         line = "" if self._line_overflow else self._line.decode("latin-1")
@@ -2495,7 +2571,8 @@ class _LiteralHeredocStreamFilter:
             if closing_line == delimiter:
                 self._pending.popleft()
         elif line:
-            self._pending = deque(_shell_heredoc_declarations(line))
+            self._pending = deque(_shell_heredoc_declarations(line, self._overridden_consumers))
+            self._overridden_consumers.update(_shell_command_overrides(line))
         self._line.clear()
         self._line_overflow = False
 
@@ -2508,6 +2585,7 @@ class _LiteralHeredocStreamFilter:
                 self._pending.clear()
                 self._line.clear()
                 self._line_overflow = False
+                self._overridden_consumers.clear()
                 continue
             if byte == 10:
                 self._finish_line()
@@ -2707,7 +2785,7 @@ def _transfer_invocation_signals(
             if not positional_only and token.startswith("--"):
                 option, separator, attached_value = token.partition("=")
                 option = option.lower()
-                if not separator and option in TRANSFER_TERMINATING_LONG_OPTIONS:
+                if option in TRANSFER_TERMINATING_LONG_OPTIONS:
                     invocation_terminated = True
                     parse_terminated = True
                     break
@@ -2771,7 +2849,7 @@ def _transfer_invocation_signals(
                     None,
                 )
                 if terminating_position is not None and (
-                    value_position is None or terminating_position < value_position
+                    value_position is None or terminating_position <= value_position
                 ):
                     invocation_terminated = True
                     parse_terminated = True
@@ -3016,6 +3094,94 @@ def _is_local_endpoint_token(token: str) -> bool:
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         return ip.ipv4_mapped.is_loopback or ip.ipv4_mapped.is_unspecified
     return ip.is_loopback or ip.is_unspecified
+
+
+def _iter_utf8_runtime_strings(blob: bytes) -> Iterator[tuple[int, bytes]]:
+    """Yield non-ASCII Python runtime strings that need Unicode-aware parsing."""
+    for match in UTF8_RUNTIME_CANDIDATE_RE.finditer(blob):
+        raw_text = match.group()
+        if raw_text.isascii() or not any(hint in raw_text.lower() for hint in (b"os.system", b"subprocess.")):
+            continue
+
+        text = raw_text.decode("utf-8", errors="surrogateescape")
+        segment_byte_start = 0
+        byte_offset = 0
+        for character in text:
+            character_bytes = len(character.encode("utf-8", errors="surrogateescape"))
+            is_surrogate = 0xD800 <= ord(character) <= 0xDFFF
+            if is_surrogate or not character.isprintable():
+                segment = raw_text[segment_byte_start:byte_offset]
+                if (
+                    len(segment) >= 8
+                    and not segment.isascii()
+                    and any(hint in segment.lower() for hint in (b"os.system", b"subprocess."))
+                ):
+                    yield (
+                        match.start() + segment_byte_start,
+                        segment,
+                    )
+                segment_byte_start = byte_offset + character_bytes
+            byte_offset += character_bytes
+        segment = raw_text[segment_byte_start:byte_offset]
+        if (
+            len(segment) >= 8
+            and not segment.isascii()
+            and any(hint in segment.lower() for hint in (b"os.system", b"subprocess."))
+        ):
+            yield match.start() + segment_byte_start, segment
+
+
+def _iter_runtime_strings(blob: bytes) -> Iterator[tuple[int, bytes]]:
+    """Yield bounded Unicode-aware candidates before ordinary ASCII strings."""
+    yield from _iter_utf8_runtime_strings(blob)
+    for match in PRINTABLE_TEXT_RE.finditer(blob):
+        yield match.start(), match.group()
+
+
+def _incomplete_utf8_suffix_start(blob: bytes) -> int:
+    """Return the start of an incomplete, otherwise valid UTF-8 tail."""
+    for start in range(max(0, len(blob) - 3), len(blob)):
+        first = blob[start]
+        expected = 2 if 0xC2 <= first <= 0xDF else 3 if 0xE0 <= first <= 0xEF else 4 if 0xF0 <= first <= 0xF4 else 0
+        actual = len(blob) - start
+        if not expected or actual >= expected or any(byte < 0x80 or byte > 0xBF for byte in blob[start + 1 :]):
+            continue
+        if actual >= 2:
+            second = blob[start + 1]
+            if (first == 0xE0 and second < 0xA0) or (first == 0xED and second > 0x9F):
+                continue
+            if (first == 0xF0 and second < 0x90) or (first == 0xF4 and second > 0x8F):
+                continue
+        return start
+    return len(blob)
+
+
+def _utf8_printable_suffix_start(blob: bytes) -> int:
+    """Return the start of a trailing printable UTF-8 run, including a partial code point."""
+    partial_start = _incomplete_utf8_suffix_start(blob)
+    complete = blob[:partial_start]
+    ascii_start = len(complete.rstrip(PRINTABLE_BYTES))
+    if ascii_start == 0:
+        return 0
+
+    codepoint_end = ascii_start if ascii_start < len(complete) else len(complete)
+    has_valid_utf8_prefix = False
+    if codepoint_end and complete[codepoint_end - 1] >= 0x80:
+        for width in range(2, 5):
+            if codepoint_end < width:
+                continue
+            try:
+                decoded = complete[codepoint_end - width : codepoint_end].decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            if len(decoded) == 1 and not decoded.isascii():
+                has_valid_utf8_prefix = True
+                break
+    if not has_valid_utf8_prefix:
+        return ascii_start if ascii_start < len(complete) else partial_start
+
+    match = UTF8_RUNTIME_TEXT_SUFFIX_RE.search(complete)
+    return match.start() if match is not None else partial_start
 
 
 def _utf16_printable_suffix_start(blob: bytes, *, little_endian: bool) -> int:
@@ -4202,16 +4368,16 @@ class LlamafileScanner(BaseScanner):
         ):
             return set(), set(), string_scan_limited, candidate_scan_limited, False, False, False, 0, 0, 0, False
 
-        for match in PRINTABLE_TEXT_RE.finditer(analysis_blob):
+        for match_start, raw_text in _iter_runtime_strings(analysis_blob):
             while (
                 heredoc_span_index < len(quoted_heredoc_spans)
-                and match.start() >= quoted_heredoc_spans[heredoc_span_index][1]
+                and match_start >= quoted_heredoc_spans[heredoc_span_index][1]
             ):
                 heredoc_span_index += 1
             if (
                 heredoc_span_index < len(quoted_heredoc_spans)
                 and quoted_heredoc_spans[heredoc_span_index][0]
-                <= match.start()
+                <= match_start
                 < quoted_heredoc_spans[heredoc_span_index][1]
             ):
                 continue
@@ -4219,7 +4385,6 @@ class LlamafileScanner(BaseScanner):
                 candidate_scan_limited = True
                 break
             candidates_scanned += 1
-            raw_text = match.group()
             if max_string_bytes is not None and len(raw_text) > max_string_bytes:
                 string_scan_limited = True
                 raw_text = raw_text[:max_string_bytes]
@@ -4414,20 +4579,20 @@ class LlamafileScanner(BaseScanner):
         correlated_signal_seen = False
         quoted_heredoc_spans = _quoted_heredoc_body_spans(runtime_text)
         heredoc_span_index = 0
-        for match in PRINTABLE_TEXT_RE.finditer(analysis_blob):
+        for match_start, raw_text in _iter_runtime_strings(analysis_blob):
             while (
                 heredoc_span_index < len(quoted_heredoc_spans)
-                and match.start() >= quoted_heredoc_spans[heredoc_span_index][1]
+                and match_start >= quoted_heredoc_spans[heredoc_span_index][1]
             ):
                 heredoc_span_index += 1
             if (
                 heredoc_span_index < len(quoted_heredoc_spans)
                 and quoted_heredoc_spans[heredoc_span_index][0]
-                <= match.start()
+                <= match_start
                 < quoted_heredoc_spans[heredoc_span_index][1]
             ):
                 continue
-            text = match.group().decode("utf-8", errors="ignore").strip()
+            text = raw_text.decode("utf-8", errors="ignore").strip()
             analysis_text = text
             (
                 has_command_token,
@@ -4677,7 +4842,7 @@ class LlamafileScanner(BaseScanner):
                         complete = combined
                         carry = b""
                     else:
-                        trailing_start = len(combined.rstrip(PRINTABLE_BYTES))
+                        trailing_start = _utf8_printable_suffix_start(combined)
                         complete = combined[:trailing_start]
                         carry = combined[trailing_start:]
 

