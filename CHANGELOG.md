@@ -10,11 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - preserve bounded and fail-closed SafeTensors routing when header lengths resemble compression magic
+- fail closed when manifest scanning exceeds its configured timeout
 - stop cloud directory analysis as soon as download size or object-count budgets are exhausted
 - preserve sanitized CatBoost command context in SARIF without exposing injected or neighboring credential values
 - redact values compared against sensitive keys in generic exports and literal credential comparisons in CatBoost evidence
 - preserve critical PyTorch malformed-ZIP symlink findings, valid Python 3.10 streamed ZIP64 descriptors, and selected subtype findings from complete nested and concatenated HDF5 user-block ZIPs while retaining bounded fail-closed preflight checks and avoiding structure-only ZIP route probes
 - classify unsafe PyTorch ZIP symlink targets as critical archive-link findings while preserving safe relative links
+- recognize canonical legacy PyTorch pickle-stream boundaries without treating raw tensor storage as incomplete pickle, binary-tail, or CVE coverage
 - restore pickle CVE scan throughput, reprobe malformed stream separators, and route four-byte protocol-0 Joblib operands correctly
 - bound manifest embedded-Jinja template collection while preserving findings across deep branches, cycles, and shared YAML aliases
 - bound Jinja static render analysis and fail closed on CPU-heavy aliased, recursive, container-wrapped, and arithmetic range probes when sandbox workers are unavailable
