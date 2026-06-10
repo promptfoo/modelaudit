@@ -486,11 +486,44 @@ def test_redact_source_text_handles_dense_credential_assignments() -> None:
     assert redacted.count("<redacted>") == 5_000
 
 
-@pytest.mark.parametrize("operator", ["==", "!=", ">=", "<="])
-def test_sensitive_key_comparisons_are_not_treated_as_assignments(operator: str) -> None:
+@pytest.mark.parametrize("operator", ["!=", ">=", "<="])
+def test_sensitive_key_ordering_comparisons_are_not_treated_as_assignments(operator: str) -> None:
     text = f'config={{"client_secret" {operator} "public": "os.system(15)"}}'
 
     assert redact_source_text(text) == text
+
+
+def test_sensitive_key_equality_comparisons_redact_value_and_preserve_context() -> None:
+    text = 'config={"client_secret" == "public": "os.system(15)"}'
+
+    redacted = redact_source_text(text)
+
+    assert redacted == 'config={"client_secret" == <redacted>: "os.system(15)"}'
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'client_secret == "RAW-COMPARISON-SECRET-123456"',
+        "token==RAW-COMPARISON-SECRET-123456; visible=yes",
+    ],
+)
+def test_sensitive_key_comparison_values_are_redacted_in_generic_exports(text: str) -> None:
+    for redacted in (redact_source_text(text), redact_source_value(text)):
+        assert "RAW-COMPARISON-SECRET-123456" not in redacted
+        assert "<redacted>" in redacted
+
+
+def test_benign_comparisons_are_preserved_in_generic_exports() -> None:
+    text = "status == 200 and count == 5"
+
+    assert redact_source_text(text) == text
+
+
+def test_prevalidated_comparison_command_operands_are_preserved() -> None:
+    text = 'client_secret == os.system("id")'
+
+    assert redact_prevalidated_source_value(text) == text
 
 
 def test_preserved_redacted_assignment_does_not_exempt_neighboring_secret() -> None:
@@ -500,6 +533,15 @@ def test_preserved_redacted_assignment_does_not_exempt_neighboring_secret() -> N
 
     assert 'client_secret=os.system("curl -u alice:<redacted>")' in redacted
     assert "RAW-NEIGHBOR-SECRET" not in redacted
+
+
+def test_preserved_marker_for_later_assignment_does_not_exempt_earlier_secret() -> None:
+    text = "log session=RAW-SESSION-SECRET-123456 password=<redacted> done"
+
+    redacted = redact_prevalidated_source_value(text)
+
+    assert "RAW-SESSION-SECRET-123456" not in redacted
+    assert "password=<redacted>" in redacted
 
 
 def test_catboost_sarif_revalidates_attacker_supplied_redaction_marker() -> None:

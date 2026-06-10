@@ -103,6 +103,14 @@ _EXPORT_ASSIGNMENT_RE = re.compile(
     r"(?P<separator>\s*(?::|(?<![!<=>])=(?!=)|<<?-)\s*)",
     re.IGNORECASE,
 )
+_EXPORT_COMPARISON_RE = re.compile(
+    r"(?<![0-9A-Za-z_%.-])(?:"
+    rf"(?P<key_escape>\\?)(?P<quote>[\"'])"
+    rf"(?P<quoted_key>{_EXPORT_KEY_TOKEN}(?:{_EXPORT_BRACKET_KEY})*)(?P=key_escape)(?P=quote)"
+    rf"|(?P<key>{_EXPORT_KEY_TOKEN}(?:{_EXPORT_BRACKET_KEY})*))"
+    r"(?P<separator>\s*={2,}\s*)",
+    re.IGNORECASE,
+)
 _EXPORT_EQUALS_KEY_RE = re.compile(
     r"(?<![0-9A-Za-z_%.-])(?P<key>[0-9A-Za-z_%.-]+)(?P<separator>\s*=\s*)",
     re.IGNORECASE,
@@ -841,6 +849,11 @@ def _redact_export_alias_assignments(
     preserve_redacted_assignments: bool = False,
 ) -> str:
     value = _normalize_encoded_sensitive_assignment_separators(value)
+    if not preserve_redacted_assignments:
+        # Prevalidated text already had sensitive comparisons redacted by a
+        # domain sanitizer that preserves command operands; generic exports
+        # need this backstop so `key == value` cannot smuggle a credential.
+        value = _redact_sensitive_comparison_values(value)
     redacted_parts: list[str] = []
     previous_end = 0
     for match in _EXPORT_ASSIGNMENT_RE.finditer(value):
@@ -850,10 +863,16 @@ def _redact_export_alias_assignments(
         if not _is_sensitive_export_key(key) or _assignment_value_is_already_redacted(value, match.end()):
             continue
         value_end = _assignment_value_end(value, match.end(), key=key)
-        if preserve_redacted_assignments and any(
-            marker in value[match.end() : value_end] for marker in ("<redacted>", "<credentials-redacted>")
-        ):
-            continue
+        if preserve_redacted_assignments:
+            marker_start = _first_redaction_marker_start(value, match.end(), value_end)
+            if marker_start is not None:
+                next_sensitive_start = _next_sensitive_assignment_start(value, match.end(), value_end)
+                if next_sensitive_start is None or marker_start < next_sensitive_start:
+                    # The upstream sanitizer already redacted within this value.
+                    continue
+                # The marker belongs to a later assignment; stop short of it so
+                # this raw value is redacted without erasing validated context.
+                value_end = next_sensitive_start
         redacted_parts.extend((value[previous_end : match.end()], "<redacted>"))
         previous_end = value_end
     redacted_parts.append(value[previous_end:])
@@ -866,6 +885,39 @@ def _redact_export_alias_assignments(
 
     redacted = _EXPORT_OPTION_RE.sub(redact_whitespace_value, redacted)
     return _EXPORT_AUTHORIZATION_RE.sub(redact_whitespace_value, redacted)
+
+
+def _redact_sensitive_comparison_values(value: str) -> str:
+    """Redact values compared against sensitive keys in generic export text."""
+    redacted_parts: list[str] = []
+    previous_end = 0
+    for match in _EXPORT_COMPARISON_RE.finditer(value):
+        if match.start() < previous_end:
+            continue
+        key = match.group("key") or match.group("quoted_key")
+        if not _is_sensitive_export_key(key) or _assignment_value_is_already_redacted(value, match.end()):
+            continue
+        redacted_parts.extend((value[previous_end : match.end()], "<redacted>"))
+        previous_end = _assignment_value_end(value, match.end(), key=key)
+    redacted_parts.append(value[previous_end:])
+    return "".join(redacted_parts)
+
+
+def _first_redaction_marker_start(value: str, start: int, end: int) -> int | None:
+    marker_starts = [
+        marker_start
+        for marker_start in (value.find(marker, start, end) for marker in ("<redacted>", "<credentials-redacted>"))
+        if marker_start != -1
+    ]
+    return min(marker_starts) if marker_starts else None
+
+
+def _next_sensitive_assignment_start(value: str, start: int, end: int) -> int | None:
+    for match in _EXPORT_ASSIGNMENT_RE.finditer(value, start, end):
+        key = match.group("key") or match.group("quoted_key")
+        if _is_sensitive_export_key(key):
+            return match.start()
+    return None
 
 
 def _normalize_encoded_sensitive_assignment_separators(value: str) -> str:
