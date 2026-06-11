@@ -112,10 +112,13 @@ def _write_sparse_large_flax_ndarray_ext(
     tensor_size: int,
     *,
     dtype: str = "float32",
+    shape_values: list[int] | None = None,
     body_prefix: bytes = b"",
     trailing_body: bytes = b"",
 ) -> None:
-    metadata_size = 1 + 1 + _msgpack_uint_size(tensor_size // 4) + _msgpack_str_size(dtype) + 5
+    shape_values = [tensor_size // 4] if shape_values is None else shape_values
+    metadata_size = 1 + 1 + sum(_msgpack_uint_size(dimension) for dimension in shape_values)
+    metadata_size += _msgpack_str_size(dtype) + 5
     ext_size = metadata_size + tensor_size + len(trailing_body)
     with path.open("wb") as output:
         output.write(b"\x81")
@@ -124,8 +127,11 @@ def _write_sparse_large_flax_ndarray_ext(
         _write_msgpack_str(output, "embedding")
         output.write(b"\xc9" + struct.pack(">I", ext_size) + b"\x01")
         output.write(b"\x93")
-        output.write(b"\x91")
-        _write_msgpack_uint(output, tensor_size // 4)
+        if len(shape_values) > 15:
+            raise ValueError("test helper only supports fixarray shape metadata")
+        output.write(bytes([0x90 | len(shape_values)]))
+        for dimension in shape_values:
+            _write_msgpack_uint(output, dimension)
         _write_msgpack_str(output, dtype)
         output.write(b"\xc6" + struct.pack(">I", tensor_size))
         if len(body_prefix) > tensor_size:
@@ -1481,6 +1487,41 @@ def test_flax_msgpack_large_flax_ndarray_ext_above_decode_budget_streams_tensor_
     assert result.metadata["jax_metadata"]["tensor_count"] == 1
     assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
     assert all(check.name != "Binary Blob Size Check" for check in result.checks)
+
+
+def test_flax_msgpack_flax_ndarray_ext_above_reduced_decode_budget_uses_ndarray_parser(tmp_path: Path) -> None:
+    path = tmp_path / "small_ndarray_ext_above_reduced_budget.msgpack"
+    _write_sparse_large_flax_ndarray_ext(path, 32)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["jax_metadata"]["tensor_count"] == 1
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
+
+
+def test_flax_msgpack_flax_ndarray_ext_accepts_float8_dtype_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "float8_ndarray_ext.msgpack"
+    _write_sparse_large_flax_ndarray_ext(path, 64, dtype="float8_e4m3fn", shape_values=[64])
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["jax_metadata"]["tensor_count"] == 1
+    assert all(check.name != "Msgpack Parse Check" for check in result.checks)
+
+
+def test_flax_msgpack_flax_ndarray_ext_accepts_zero_dimension_after_nonzero(tmp_path: Path) -> None:
+    path = tmp_path / "zero_dimension_ndarray_ext.msgpack"
+    _write_sparse_large_flax_ndarray_ext(path, 0, shape_values=[5, 0])
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert all(check.name != "Msgpack Parse Check" for check in result.checks)
 
 
 def test_flax_msgpack_large_flax_ndarray_ext_detects_hidden_text_body(tmp_path: Path) -> None:

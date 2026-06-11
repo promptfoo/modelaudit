@@ -45,6 +45,14 @@ _FLAX_NDARRAY_DTYPE_ITEM_SIZES = {
     "bool": 1,
     "bool_": 1,
     "byte": 1,
+    "float8_e3m4": 1,
+    "float8_e4m3": 1,
+    "float8_e4m3b11fnuz": 1,
+    "float8_e4m3fn": 1,
+    "float8_e4m3fnuz": 1,
+    "float8_e5m2": 1,
+    "float8_e5m2fnuz": 1,
+    "float8_e8m0fnu": 1,
     "int8": 1,
     "uint8": 1,
     "i1": 1,
@@ -2619,14 +2627,20 @@ class FlaxMsgpackScanner(BaseScanner):
         if data_length % item_size != 0:
             raise _MsgpackStreamFormatError("Flax ndarray tensor byte length is not aligned to dtype item size")
 
-        max_elements = data_length // item_size
-        element_count = 1
+        has_zero_dimension = False
         for index, dimension in enumerate(shape_values):
             if dimension < 0:
                 raise _MsgpackStreamFormatError(f"Flax ndarray shape dimension {index} is negative")
             if dimension == 0:
-                element_count = 0
-                break
+                has_zero_dimension = True
+        if has_zero_dimension:
+            if data_length != 0:
+                raise _MsgpackStreamFormatError("Flax ndarray shape and dtype do not match declared tensor byte length")
+            return
+
+        max_elements = data_length // item_size
+        element_count = 1
+        for dimension in shape_values:
             if element_count > max_elements // dimension:
                 raise _MsgpackStreamFormatError("Flax ndarray shape and dtype exceed declared tensor byte length")
             element_count *= dimension
@@ -2801,7 +2815,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 return _StreamValue("ExtType", value=msgpack.ExtType(code, data))
             return _StreamValue("ExtType", value=data)
 
-        if code == 1 and length > _STREAM_TEXT_CHUNK_BYTES:
+        if code == 1 and length > self.max_msgpack_decode_bytes:
             return self._consume_flax_ndarray_ext_scalar(cursor, length, location, result, summary, path=path)
 
         if length > self.max_msgpack_decode_bytes:
