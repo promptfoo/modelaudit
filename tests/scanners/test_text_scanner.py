@@ -341,6 +341,34 @@ return urllib.request.urlopen(req).read()
     assert determine_exit_code(aggregate) == 0
 
 
+def test_text_scanner_fenced_documentation_imported_urlopen_loopback_api_is_informational(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+from urllib.request import urlopen
+
+urlopen("http://localhost:8080/v1/models")
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == "http://localhost:8080/v1/models"
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
 @pytest.mark.parametrize(
     "api_url",
     [
@@ -1209,6 +1237,60 @@ pip3 install .
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_fenced_documentation_github_clone_cd_then_popd_before_pip_remains_actionable(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+git clone https://github.com/example-org/model.git
+cd model
+popd
+pip install .
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_command"
+        and check.details.get("command_type") == "git_clone"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_github_clone_cd_same_line_pip3_remains_actionable(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+git clone https://github.com/example-org/model.git
+cd model && pip3 install .
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_command"
+        and check.details.get("command_type") == "git_clone"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_fenced_documentation_github_clone_pushd_then_python_m_pip_remains_actionable(
     tmp_path: Path,
 ) -> None:
@@ -1274,6 +1356,33 @@ git clone https://github.com/example-org/model.git
 pushd model
 popd
 pip3 install .
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_command"
+        and check.details.get("command_type") == "git_clone"
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_fenced_documentation_github_clone_cd_same_line_listing_is_informational(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+git clone https://github.com/example-org/model.git
+cd model && ls
 ```
 """,
         encoding="utf-8",

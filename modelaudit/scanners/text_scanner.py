@@ -1599,29 +1599,23 @@ class TextScanner(BaseScanner):
         return rb"^\s*(?:sudo\s+)?"
 
     @classmethod
-    def _documentation_fenced_line_enters_clone_checkout(cls, line: bytes, checkout_path: bytes) -> bool:
-        cd_target = cls._documentation_fenced_line_cd_target(line)
-        if cd_target is None or checkout_path == b".":
-            return False
-        return cd_target == checkout_path
-
-    @classmethod
-    def _documentation_fenced_line_cd_target(cls, line: bytes) -> bytes | None:
+    def _documentation_fenced_line_directory_change(cls, line: bytes) -> tuple[bytes, bytes] | None:
         stripped = line.strip()
         if not stripped or stripped.startswith(b"#"):
             return None
         match = re.match(
             cls._documentation_fenced_shell_command_prefix_pattern()
-            + rb"(?:cd|pushd)\s+(?P<target>[^\s;&|]+)\s*(?:$|[;&|])",
+            + rb"(?P<command>cd|pushd)\s+(?P<target>[^\s;&|]+)\s*(?:$|[;&|])",
             stripped,
             flags=re.IGNORECASE,
         )
         if match is None:
             return None
+        command = match.group("command").lower()
         target = match.group("target").strip().strip(b"'\"").rstrip(b"/")
         while target.startswith(b"./"):
             target = target[2:]
-        return target or b"."
+        return command, target or b"."
 
     @classmethod
     def _documentation_fenced_line_pops_directory_stack(cls, line: bytes) -> bool:
@@ -1673,12 +1667,30 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
+    def _documentation_fenced_line_enters_then_executes_clone_checkout(cls, line: bytes, checkout_path: bytes) -> bool:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(b"#") or checkout_path == b".":
+            return False
+        path_reference = rb"(?:\./)?" + re.escape(checkout_path)
+        match = re.match(
+            cls._documentation_fenced_shell_command_prefix_pattern()
+            + rb"(?:cd|pushd)\s+"
+            + path_reference
+            + rb"\s*(?:&&|;)\s*(?P<tail>.+)$",
+            stripped,
+            flags=re.IGNORECASE,
+        )
+        return match is not None and cls._documentation_fenced_line_executes_inside_clone_checkout(match.group("tail"))
+
+    @classmethod
     def _documentation_fenced_line_executes_clone_checkout(cls, line: bytes, checkout_path: bytes) -> bool:
         stripped = line.strip()
         if not stripped or stripped.startswith(b"#"):
             return False
         if checkout_path == b".":
             return cls._documentation_fenced_line_executes_inside_clone_checkout(stripped)
+        if cls._documentation_fenced_line_enters_then_executes_clone_checkout(stripped, checkout_path):
+            return True
         path_reference = rb"(?:\./)?" + re.escape(checkout_path)
         prefix = cls._documentation_fenced_shell_command_prefix_pattern()
         return any(
@@ -1689,10 +1701,6 @@ class TextScanner(BaseScanner):
                 + rb"(?:bash|sh|zsh|python(?:[0-9.]+)?|py|node|ruby|perl|source|\.)\s+"
                 + path_reference
                 + rb"/[A-Za-z0-9_./\-]{1,4096}(?:\s|$)",
-                prefix
-                + rb"(?:cd|pushd)\s+"
-                + path_reference
-                + rb"\s*(?:&&|;)\s*(?:\./)?[A-Za-z0-9_./\-]{1,4096}(?:\s|$)",
                 prefix + rb"make\s+-C\s+" + path_reference + rb"(?:\s|$)",
             )
         )
@@ -1723,15 +1731,20 @@ class TextScanner(BaseScanner):
         if line_end == -1:
             return False
         inside_checkout = False
+        directory_stack: list[bool] = []
         for raw_line in payload[line_end + 1 : range_end].splitlines():
             if cls._documentation_fenced_line_executes_clone_checkout(raw_line, checkout_path):
                 return True
             if cls._documentation_fenced_line_pops_directory_stack(raw_line):
-                inside_checkout = False
+                if directory_stack:
+                    inside_checkout = directory_stack.pop()
                 continue
-            cd_target = cls._documentation_fenced_line_cd_target(raw_line)
-            if cd_target is not None:
-                inside_checkout = cls._documentation_fenced_line_enters_clone_checkout(raw_line, checkout_path)
+            directory_change = cls._documentation_fenced_line_directory_change(raw_line)
+            if directory_change is not None:
+                command, target = directory_change
+                if command == b"pushd":
+                    directory_stack.append(inside_checkout)
+                inside_checkout = checkout_path != b"." and target == checkout_path
                 continue
             if inside_checkout and cls._documentation_fenced_line_executes_inside_clone_checkout(raw_line):
                 return True
@@ -2003,7 +2016,7 @@ class TextScanner(BaseScanner):
         string_spans: tuple[tuple[int, int, str, bool], ...],
         string_span_starts: tuple[int, ...],
     ) -> bool:
-        imported_targets: dict[bytes, list[int]] = {}
+        imported_targets: dict[bytes, list[tuple[int, bytes]]] = {}
         network_names = {b"get", b"head", b"post", b"put", b"patch", b"delete", b"request", b"urlopen", b"urlretrieve"}
         for pattern in (
             DOCUMENTATION_FENCED_NETWORK_FUNCTION_IMPORT_PATTERN,
@@ -2027,11 +2040,43 @@ class TextScanner(BaseScanner):
                         continue
                     target = (alias_parts[-1] if len(alias_parts) == 2 else imported_name).strip()
                     if re.fullmatch(rb"[A-Za-z_][A-Za-z0-9_]*", target) is not None:
-                        imported_targets.setdefault(target, []).append(match.start())
-        return any(
-            any(position < call_match.start() for position in imported_targets.get(call_match.group("target"), []))
-            for call_match in DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN.finditer(fenced_code)
-            if not cls._documentation_fenced_match_is_line_comment(fenced_code, call_match.start())
+                        imported_targets.setdefault(target, []).append((match.start(), imported_name.lower()))
+        for call_match in DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN.finditer(fenced_code):
+            if cls._documentation_fenced_match_is_line_comment(fenced_code, call_match.start()):
+                continue
+            for position, imported_name in imported_targets.get(call_match.group("target"), []):
+                if position >= call_match.start():
+                    continue
+                if cls._documentation_fenced_imported_direct_url_call_is_informational(
+                    fenced_code,
+                    call_match,
+                    imported_name,
+                ):
+                    continue
+                return True
+        return False
+
+    @classmethod
+    def _documentation_fenced_imported_direct_url_call_is_informational(
+        cls,
+        fenced_code: bytes,
+        call_match: re.Match[bytes],
+        imported_name: bytes,
+    ) -> bool:
+        if imported_name not in {b"get", b"head", b"urlopen"}:
+            return False
+        direct_call_match = re.match(
+            rb"\b"
+            + re.escape(call_match.group("target"))
+            + rb"\s*\(\s*[rubfRUBF]*[\"'](?P<url>https?://[^\"'\s)]+)[\"']"
+            + DOCUMENTATION_FENCED_PASSIVE_REQUEST_ARGUMENT_SUFFIX,
+            fenced_code[call_match.start() :],
+            flags=re.IGNORECASE,
+        )
+        if direct_call_match is None:
+            return False
+        return cls._documentation_fenced_passive_assigned_url_is_informational(
+            direct_call_match.group("url").decode("utf-8", errors="ignore")
         )
 
     @classmethod
