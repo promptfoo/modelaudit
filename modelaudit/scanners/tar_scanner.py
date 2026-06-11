@@ -354,22 +354,36 @@ class TarScanner(BaseScanner):
         return max(1, self.max_metadata_bytes)
 
     @contextmanager
-    def _open_tar_stream(self, path: str) -> Iterator[tuple[tarfile.TarFile, _TarBoundedStream, str | None]]:
+    def _open_tar_stream(self, path: str) -> Iterator[tuple[tarfile.TarFile, _TarBoundedStream | None, str | None]]:
         """Open a TAR stream through a bounded decompressed-byte reader."""
         compression_codec = self._detect_compressed_tar_wrapper(path)
         with open(path, "rb") as raw, ExitStack() as stack:
+            if compression_codec is None:
+                archive = stack.enter_context(
+                    tarfile.open(
+                        fileobj=raw,
+                        mode="r:",
+                        tarinfo=cast(
+                            type[tarfile.TarInfo],
+                            _tarinfo_class_with_metadata_limit(self._tar_metadata_limit()),
+                        ),
+                    )
+                )
+                yield archive, None, None
+                return
+
             if compression_codec == "gzip":
                 decompressed: Any = stack.enter_context(gzip.GzipFile(fileobj=raw, mode="rb"))
             elif compression_codec == "bzip2":
                 decompressed = stack.enter_context(bz2.BZ2File(raw, mode="rb"))
             elif compression_codec == "xz":
                 decompressed = stack.enter_context(lzma.LZMAFile(raw, mode="rb"))
-            else:
-                decompressed = raw
+            else:  # pragma: no cover - _detect_compressed_tar_wrapper returns only supported codecs.
+                return
 
             bounded_stream = _TarBoundedStream(
                 decompressed,
-                max_bytes=self.max_decompressed_bytes if compression_codec is not None else 0,
+                max_bytes=self.max_decompressed_bytes,
                 max_read_size=self._tar_stream_read_limit(),
             )
             archive = stack.enter_context(
@@ -764,12 +778,12 @@ class TarScanner(BaseScanner):
         result: ScanResult,
         path: str,
         member: tarfile.TarInfo,
-        bounded_stream: _TarBoundedStream,
+        bounded_stream: _TarBoundedStream | None,
         *,
         compression_codec: str | None,
         compressed_size: int,
     ) -> bool:
-        if compression_codec is None or compressed_size <= 0:
+        if compression_codec is None or bounded_stream is None or compressed_size <= 0:
             return False
 
         projected_stream_size = self._project_compressed_stream_size(bounded_stream, member)
@@ -878,7 +892,7 @@ class TarScanner(BaseScanner):
                         )
                         return False
 
-                    if compression_codec is not None:
+                    if compression_codec is not None and bounded_stream is not None:
                         consumed_size = max(consumed_size, bounded_stream.bytes_read)
                         estimated_stream_size = self._finalize_tar_stream_size(consumed_size)
                         actual_ratio = (estimated_stream_size / compressed_size) if compressed_size > 0 else 0.0
@@ -915,7 +929,8 @@ class TarScanner(BaseScanner):
                             )
                             return False
 
-                consumed_size = max(consumed_size, bounded_stream.bytes_read)
+                if bounded_stream is not None:
+                    consumed_size = max(consumed_size, bounded_stream.bytes_read)
 
             result.add_check(
                 name="Entry Count Limit Check",
@@ -1313,16 +1328,18 @@ class TarScanner(BaseScanner):
                             else:
                                 shared_budget.member_bytes_consumed = projected_total
 
-                            if self._record_projected_compressed_member_limit(
+                            stream_budget_exceeded = self._record_projected_compressed_member_limit(
                                 result,
                                 path,
                                 member,
                                 bounded_stream,
                                 compression_codec=compression_codec,
                                 compressed_size=compressed_size,
-                            ):
+                            )
+                            if stream_budget_exceeded:
                                 stream_budget_failed = True
-                            break
+                            if aggregate_size_check_recorded or stream_budget_exceeded:
+                                break
                         continue
 
                     archive_uncompressed_size += member.size
@@ -1482,8 +1499,6 @@ class TarScanner(BaseScanner):
                                 "scan_outcome_reason": TAR_ENTRY_EXTRACTION_INCOMPLETE_REASON,
                             },
                         )
-                        if compression_codec is None:
-                            break
                     except Exception as exc:
                         scan_complete = False
                         mark_archive_scan_incomplete(result, "tar_entry_scan_incomplete")

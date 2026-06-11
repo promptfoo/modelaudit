@@ -1959,7 +1959,7 @@ class TestTarScanner:
         assert "tar entry payload.bin exceeds maximum size of 64 bytes" in oversize_checks[0].message.lower()
         assert "tar_entry_extraction_incomplete" in result.metadata["scan_outcome_reasons"]
 
-    def test_scan_stops_after_oversized_uncompressed_tar_member_without_streaming_body(
+    def test_scan_continues_after_oversized_uncompressed_tar_member_without_streaming_body(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -1995,8 +1995,8 @@ class TestTarScanner:
         assert "tar_entry_extraction_incomplete" in result.metadata["scan_outcome_reasons"]
         contents = result.metadata["contents"]
         assert any(entry["path"].endswith("payload.bin") for entry in contents)
-        assert not any(entry["path"].endswith("later.txt") for entry in contents)
-        assert bytes_read < len(payload)
+        assert any(entry["path"].endswith("later.txt") for entry in contents)
+        assert bytes_read == 0
 
     def test_tiny_total_budget_allows_tar_header_reads_for_empty_member(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "tiny_total_empty.tar"
@@ -2128,8 +2128,11 @@ class TestTarScanner:
         assert oversize_checks[0].severity == IssueSeverity.INFO
         assert "tar entry payload.bin exceeds maximum size of 64 bytes" in oversize_checks[0].message.lower()
 
-    def test_scan_stops_after_oversized_member_and_marks_later_payload_uninspected(self, tmp_path: Path) -> None:
-        """Oversized uncompressed members fail closed instead of streaming ahead to later payloads."""
+    def test_scan_continues_after_oversized_seekable_member_and_detects_later_payload(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Oversized seekable raw members are incomplete but do not hide later payloads."""
         scanner = TarScanner(config={"max_entry_size": 64})
         archive_path = tmp_path / "mixed.tar"
         payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
@@ -2154,10 +2157,8 @@ class TestTarScanner:
             for check in result.checks
         )
         assert "tar_entry_extraction_incomplete" in result.metadata["scan_outcome_reasons"]
-        assert not any(entry["path"].endswith("payload.txt") for entry in result.metadata["contents"])
-        entry_checks = [check for check in result.checks if check.name == "Entry Count Limit Check"]
-        assert not any(check.status == CheckStatus.PASSED for check in entry_checks)
-        assert not any(
+        assert any(entry["path"].endswith("payload.txt") for entry in result.metadata["contents"])
+        assert any(
             issue.severity == IssueSeverity.CRITICAL
             and issue.location == f"{archive_path}:payload.txt"
             and any(global_name in issue.message.lower() for global_name in ("os.system", "posix.system"))
@@ -2168,7 +2169,7 @@ class TestTarScanner:
             cache_enabled=False,
             max_entry_size=64,
         )
-        assert core.determine_exit_code(aggregate) == 2
+        assert core.determine_exit_code(aggregate) == 1
 
     def test_nested_member_scan_exception_returns_inconclusive_exit_code(self, tmp_path: Path) -> None:
         """A member scanner failure is unavailable coverage, not an observed finding."""
@@ -2297,14 +2298,14 @@ class TestTarScanner:
         assert coverage_checks[0].details["member_type"] == "tar_fifo"
         assert any(entry["path"] == f"{archive_path}:data.bin" for entry in result.metadata["contents"])
 
-    def test_scan_stops_after_body_carrying_special_member(self, tmp_path: Path) -> None:
+    def test_scan_continues_after_budgeted_body_carrying_special_member(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "special_body.tar"
         special_payload = b"A" * 128
         later_payload = b"later"
 
         with tarfile.open(archive_path, "w") as archive:
-            special = tarfile.TarInfo("named_pipe")
-            special.type = tarfile.FIFOTYPE
+            special = tarfile.TarInfo("unknown_special")
+            special.type = b"Z"
             special.size = len(special_payload)
             archive.addfile(special, tarfile.io.BytesIO(special_payload))  # type: ignore[attr-defined]
 
@@ -2316,10 +2317,33 @@ class TestTarScanner:
 
         assert result.success is False
         assert "tar_special_member_unsupported" in result.metadata["scan_outcome_reasons"]
-        assert any(entry["path"].endswith("named_pipe") for entry in result.metadata["contents"])
-        assert not any(entry["path"].endswith("later.txt") for entry in result.metadata["contents"])
-        entry_checks = [check for check in result.checks if check.name == "Entry Count Limit Check"]
-        assert not any(check.status == CheckStatus.PASSED for check in entry_checks)
+        assert any(entry["path"].endswith("unknown_special") for entry in result.metadata["contents"])
+        assert any(entry["path"].endswith("later.txt") for entry in result.metadata["contents"])
+
+    def test_raw_tar_preflight_uses_seekable_mode(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        archive_path = tmp_path / "seekable_preflight.tar"
+        payload = b"A" * 1024
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        opened_modes: list[str] = []
+        original_open = tarfile.open
+
+        def tracked_open(*args: Any, **kwargs: Any) -> tarfile.TarFile:
+            mode = kwargs.get("mode")
+            if isinstance(mode, str):
+                opened_modes.append(mode)
+            return original_open(*args, **kwargs)
+
+        monkeypatch.setattr(tarfile, "open", tracked_open)
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert "r:" in opened_modes
+        assert "r|" not in opened_modes
 
     @pytest.mark.parametrize(
         ("member_type", "expected_kind"),
