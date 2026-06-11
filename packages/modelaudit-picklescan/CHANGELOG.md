@@ -9,7 +9,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- suppress source-trusted inert Hugging Face training metadata and safe NumPy ndarray reconstruction noise while keeping unresolved or shadowed framework metadata suspicious
+- suppress installed source-trusted inert Hugging Face training metadata and safe NumPy ndarray reconstruction noise while keeping default-install, unresolved, rebound, or shadowed framework metadata suspicious
 - avoid routing trusted NumPy extension reconstruction exports through module `__getattr__` fallbacks while preserving legacy dotted-`GLOBAL` hook detection
 - preserve nested and aliased callable opcode evidence for downstream scanners
 

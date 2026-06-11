@@ -12,6 +12,7 @@ import faulthandler
 import functools
 import importlib
 import io
+import json
 import logging
 import marshal
 import os
@@ -337,6 +338,62 @@ def _write_shadow_transformers_package(package_root: Path, marker: Path) -> None
         ),
         encoding="utf-8",
     )
+
+
+def _write_rebindable_trusted_transformers_package(site_packages: Path) -> None:
+    package_dir = site_packages / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        "\n".join(
+            [
+                "class TrainingArguments:",
+                "    def __new__(cls):",
+                "        return object.__new__(cls)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_sitecustomize_trusting_site_packages(customize_dir: Path, site_packages: Path) -> None:
+    customize_dir.mkdir(parents=True, exist_ok=True)
+    (customize_dir / "sitecustomize.py").write_text(
+        "\n".join(
+            [
+                "import sysconfig",
+                f"_TRUSTED_SITE_PACKAGES = {str(site_packages)!r}",
+                "_ORIGINAL_GET_PATH = sysconfig.get_path",
+                "def _patched_get_path(name, scheme=None, vars=None, expand=True):",
+                "    if name in {'purelib', 'platlib'}:",
+                "        return _TRUSTED_SITE_PACKAGES",
+                "    if scheme is None and vars is None and expand is True:",
+                "        return _ORIGINAL_GET_PATH(name)",
+                "    return _ORIGINAL_GET_PATH(name, scheme=scheme, vars=vars, expand=expand)",
+                "sysconfig.get_path = _patched_get_path",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _preimport_rebound_subprocess_env(tmp_path: Path, site_packages: Path) -> dict[str, str]:
+    customize_dir = tmp_path / "sitecustomize"
+    _write_sitecustomize_trusting_site_packages(customize_dir, site_packages)
+    package_src = Path(__file__).resolve().parents[1] / "src"
+    pythonpath = os.pathsep.join(
+        entry
+        for entry in (
+            str(customize_dir),
+            str(site_packages),
+            str(package_src),
+            os.environ.get("PYTHONPATH", ""),
+        )
+        if entry
+    )
+    return {**os.environ, "PYTHONPATH": pythonpath}
 
 
 def _assert_shadow_framework_unpickle_executes(
@@ -6229,6 +6286,68 @@ def test_scan_file_warns_on_unresolved_framework_scan_load_divergence(
         tmp_path,
         mode=mode,
         extension_code=extension_code,
+    )
+
+
+def test_scan_file_warns_when_trusted_framework_reference_is_rebound_before_scanner_import(tmp_path: Path) -> None:
+    payload_path = tmp_path / "preimport-rebound-training-args.pkl"
+    payload_path.write_bytes(_shadow_newobj_build_payload())
+    marker = tmp_path / "preimport-rebound.marker"
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_rebindable_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "import transformers.training_args as training_args\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "class ReboundTrainingArguments:\n"
+        "    def __new__(cls):\n"
+        "        return object.__new__(cls)\n"
+        "    def __setstate__(self, state):\n"
+        "        marker.write_text('setstate', encoding='utf-8')\n"
+        "ReboundTrainingArguments.__module__ = 'transformers.training_args'\n"
+        "ReboundTrainingArguments.__qualname__ = 'TrainingArguments'\n"
+        "training_args.TrainingArguments = ReboundTrainingArguments\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'severity': finding.severity.value,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert not (output["status"] == ScanStatus.COMPLETE.value and output["verdict"] == SafetyVerdict.CLEAN.value)
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.TrainingArguments"
+        for finding in output["findings"]
     )
 
 

@@ -2219,11 +2219,95 @@ def _loaded_trusted_reference_matches_baseline(module_name: str, name: str) -> b
     expected = _TRUSTED_LOADED_REFERENCE_BASELINES.get((module_name, name))
     if expected is None:
         return False
+    if _trusted_module_origin_kind(module_name) == "site_packages" and not _loaded_site_package_reference_owner_matches(
+        module_name,
+        name,
+        reference_state[1],
+    ):
+        return False
     return (
         _loaded_interpreter_states_match(module_state, expected[0])
         and _loaded_interpreter_reference_states_match(reference_state, expected[1])
         and _trusted_reference_executable_matches_snapshot(reference_state[1], expected[2])
     )
+
+
+def _loaded_site_package_reference_owner_matches(module_name: str, name: str, value: object) -> bool:
+    if _loaded_extension_callable_bypasses_module_getattr(module_name, name):
+        return True
+    if type(value) is BuiltinFunctionType:
+        return False
+    if isinstance(value, FunctionType):
+        return _function_owner_matches_trusted_source(value)
+    if type(value) is type:
+        class_module = type.__getattribute__(value, "__module__")
+        if type(class_module) is not str or _trusted_python_module_source_path(class_module) is None:
+            return False
+        return all(_function_owner_matches_trusted_source(function) for function in _pickle_executable_functions(value))
+    functions = _pickle_executable_functions(value)
+    if functions:
+        return all(_function_owner_matches_trusted_source(function) for function in functions)
+    return not callable(value)
+
+
+def _pickle_executable_functions(value: object) -> tuple[FunctionType, ...]:
+    functions: list[FunctionType] = []
+
+    def add_functions(member: object) -> None:
+        if isinstance(member, classmethod | staticmethod):
+            member = member.__func__
+        if isinstance(member, FunctionType):
+            functions.append(member)
+            return
+        if isinstance(member, property):
+            functions.extend(
+                function for function in (member.fget, member.fset, member.fdel) if isinstance(function, FunctionType)
+            )
+
+    add_functions(value)
+    if type(value) is type:
+        for base in type.__getattribute__(value, "__mro__"):
+            namespace = type.__getattribute__(base, "__dict__")
+            for member_name in (
+                "__new__",
+                "__init__",
+                "__getattribute__",
+                "__getattr__",
+                "__setstate__",
+                "__setattr__",
+            ):
+                if member_name in namespace:
+                    add_functions(namespace[member_name])
+    return tuple(dict.fromkeys(functions))
+
+
+def _function_owner_matches_trusted_source(function: FunctionType) -> bool:
+    globals_namespace = function.__globals__
+    if type(globals_namespace) is not dict:
+        return False
+    owner_module = globals_namespace.get("__name__")
+    if type(owner_module) is not str:
+        return False
+    source_path = _trusted_python_module_source_path(owner_module)
+    if source_path is None:
+        return False
+    try:
+        code_path = Path(function.__code__.co_filename).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return code_path == source_path
+
+
+def _trusted_python_module_source_path(module_name: str) -> Path | None:
+    if _trusted_module_origin_kind(module_name) not in {"stdlib", "site_packages"}:
+        return None
+    source_path = _loaded_module_source_path(module_name) or _current_module_source_path(module_name)
+    if source_path is None:
+        return None
+    try:
+        return Path(source_path).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
 
 
 def _interpreter_module_resolution_is_trusted(module_name: str) -> bool | None:
