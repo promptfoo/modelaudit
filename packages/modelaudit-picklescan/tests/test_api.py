@@ -548,6 +548,25 @@ def test_scan_bytes_static_getattr_decorated_method_descriptor_stays_critical(
             "    return None\n\n"
             "setattr(Detect, 'forward', evil)\n"
         ),
+        (
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "def evil(self):\n"
+            "    return None\n\n"
+            "(Alias,) = (Detect,)\n"
+            "Alias.forward = evil\n"
+        ),
+        (
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "def evil(self):\n"
+            "    return None\n\n"
+            "def patch(cls):\n"
+            "    cls.forward = evil\n\n"
+            "patch(Detect)\n"
+        ),
     ],
 )
 def test_scan_bytes_static_getattr_post_class_method_rewrite_stays_critical(
@@ -558,6 +577,47 @@ def test_scan_bytes_static_getattr_post_class_method_rewrite_stays_critical(
     _write_ultralytics_head_source(tmp_path, monkeypatch, source)
 
     report = scan_bytes(_static_getattr_reduce_payload(), source="rewritten-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_class_body_rewrite_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n    forward = staticmethod(lambda self: None)\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="class-body-rewritten-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_conditional_class_body_method_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "import os\n\n"
+        "class Base:\n"
+        "    def forward(self):\n"
+        "        os.system('id')\n\n"
+        "class Detect(Base):\n"
+        "    if False:\n"
+        "        def forward(self):\n"
+        "            return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="conditional-class-body-static-getattr.pkl")
 
     findings = _dangerous_getattr_findings(report)
     assert findings

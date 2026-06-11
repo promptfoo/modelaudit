@@ -8321,6 +8321,52 @@ def test_pytorch_zip_static_getattr_post_class_method_rewrite_keeps_s115(
     assert _critical_s115_getattr_issues(result)
 
 
+def test_pytorch_zip_static_getattr_post_class_helper_call_keeps_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n"
+        "    def forward(self):\n"
+        "        return None\n\n"
+        "def evil(self):\n"
+        "    return None\n\n"
+        "def patch(cls):\n"
+        "    cls.forward = evil\n\n"
+        "patch(Detect)\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
+def test_pytorch_zip_static_getattr_conditional_class_body_method_keeps_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "import os\n\n"
+        "class Base:\n"
+        "    def forward(self):\n"
+        "        os.system('id')\n\n"
+        "class Detect(Base):\n"
+        "    if False:\n"
+        "        def forward(self):\n"
+        "            return None\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
 def test_pytorch_zip_static_getattr_inherited_metaclass_lookup_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

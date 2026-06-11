@@ -4892,15 +4892,21 @@ def _class_has_explicit_metaclass(class_node: ast.ClassDef) -> bool:
 
 def _class_has_plain_local_method(class_node: ast.ClassDef, method_name: str) -> bool:
     plain_method_count = 0
-    for child in _definition_scope_statements(class_node.body):
+    for child in class_node.body:
         if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef) and child.name == method_name:
             if child.decorator_list:
                 return False
             plain_method_count += 1
             continue
-        if _class_body_statement_binds_name(child, method_name):
+        if _class_body_statement_or_nested_statement_binds_name(child, method_name):
             return False
     return plain_method_count == 1
+
+
+def _class_body_statement_or_nested_statement_binds_name(statement: ast.stmt, name: str) -> bool:
+    return any(
+        _class_body_statement_binds_name(candidate, name) for candidate in _definition_scope_statements((statement,))
+    )
 
 
 def _class_lookup_has_source_backed_plain_metaclass(
@@ -4957,6 +4963,8 @@ def _class_attribute_rebound_after_definition(context: _ClassSourceContext, attr
             return True
         if _statement_writes_class_attribute(statement, class_aliases, attribute):
             return True
+        if _statement_contains_runtime_call(statement):
+            return True
         class_aliases.update(_statement_class_alias_targets(statement, class_aliases))
     return False
 
@@ -4974,10 +4982,30 @@ def _statement_rebinds_name(statement: ast.stmt, name: str) -> bool:
 def _statement_class_alias_targets(statement: ast.stmt, class_aliases: set[str]) -> set[str]:
     if not isinstance(statement, ast.Assign | ast.AnnAssign) or statement.value is None:
         return set()
-    if not isinstance(statement.value, ast.Name) or statement.value.id not in class_aliases:
-        return set()
     targets = statement.targets if isinstance(statement, ast.Assign) else (statement.target,)
-    return {target.id for target in targets if isinstance(target, ast.Name)}
+    aliases: set[str] = set()
+    for target in targets:
+        aliases.update(_class_alias_targets_from_assignment(target, statement.value, class_aliases))
+    return aliases
+
+
+def _class_alias_targets_from_assignment(
+    target: ast.AST,
+    value: ast.AST,
+    class_aliases: set[str],
+) -> set[str]:
+    if isinstance(value, ast.Name) and value.id in class_aliases:
+        return _assignment_target_names(target)
+    if (
+        isinstance(target, ast.Tuple | ast.List)
+        and isinstance(value, ast.Tuple | ast.List)
+        and len(target.elts) == len(value.elts)
+    ):
+        aliases: set[str] = set()
+        for nested_target, nested_value in zip(target.elts, value.elts, strict=True):
+            aliases.update(_class_alias_targets_from_assignment(nested_target, nested_value, class_aliases))
+        return aliases
+    return set()
 
 
 def _statement_writes_class_attribute(statement: ast.stmt, class_aliases: set[str], attribute: str) -> bool:
@@ -5016,6 +5044,27 @@ def _is_setattr_like_call(func: ast.AST) -> bool:
     if isinstance(func, ast.Attribute):
         return func.attr in {"setattr", "__setattr__"}
     return False
+
+
+def _statement_contains_runtime_call(statement: ast.stmt) -> bool:
+    class RuntimeCallVisitor(ast.NodeVisitor):
+        found = False
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return None
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return None
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return None
+
+        def visit_Call(self, node: ast.Call) -> None:
+            self.found = True
+
+    visitor = RuntimeCallVisitor()
+    visitor.visit(statement)
+    return visitor.found
 
 
 def _inherited_class_methods(
