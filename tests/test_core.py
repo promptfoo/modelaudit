@@ -1629,6 +1629,26 @@ def test_nested_generic_metadata_near_match_stays_clean(tmp_path: Path) -> None:
     assert determine_exit_code(result) == 0
 
 
+def test_nested_ambiguous_generic_metadata_stays_off_jax_child_routing(tmp_path: Path) -> None:
+    nested_dir = tmp_path / "bundle" / "backup-package"
+    nested_dir.mkdir(parents=True)
+    metadata_path = nested_dir / "metadata.json"
+    metadata_path.write_text(
+        json.dumps({"package": "backup-tool", "notes": "A" * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1)}),
+        encoding="utf-8",
+    )
+
+    result = scan_model_directory_or_file(str(tmp_path / "bundle"), cache_scan_results=False)
+
+    assert "jax_checkpoint" not in result.scanner_names
+    assert not any(issue.rule_code == "S302" for issue in result.issues)
+    assert not any(
+        "jax_json_checkpoint_analysis_size_limit" in metadata.get("scan_outcome_reasons", [])
+        for metadata in result.file_metadata.values()
+    )
+    assert determine_exit_code(result) == 0
+
+
 def test_directory_scan_without_logical_owner_keeps_file_walk_semantics(tmp_path: Path) -> None:
     notes_path = tmp_path / "README.md"
     notes_path.write_text("ordinary model documentation", encoding="utf-8")

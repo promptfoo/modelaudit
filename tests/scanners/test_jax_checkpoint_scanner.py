@@ -2659,7 +2659,7 @@ def test_late_jax_identity_routes_visible_dangerous_restore_fn(tmp_path: Path) -
     )
 
 
-def test_late_jax_identity_without_bounded_orbax_evidence_falls_back_to_child_fail_closed(tmp_path: Path) -> None:
+def test_late_jax_identity_without_bounded_orbax_evidence_stays_off_child_jax_routing(tmp_path: Path) -> None:
     checkpoint_dir = tmp_path / "late-jax-identity-and-restore"
     checkpoint_dir.mkdir()
     metadata_path = checkpoint_dir / "metadata.json"
@@ -2672,15 +2672,17 @@ def test_late_jax_identity_without_bounded_orbax_evidence_falls_back_to_child_fa
     assert metadata_path.stat().st_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES
 
     assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is False
+    assert JaxCheckpointScanner.can_handle(str(metadata_path)) is False
 
     result = scan_model_directory_or_file(str(checkpoint_dir), cache_scan_results=False)
-    child_metadata = result.file_metadata[str(metadata_path)]
 
-    assert "jax_checkpoint" in result.scanner_names
-    assert child_metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "jax_json_checkpoint_analysis_size_limit" in child_metadata["scan_outcome_reasons"]
+    assert "jax_checkpoint" not in result.scanner_names
+    assert not any(
+        "jax_json_checkpoint_analysis_size_limit" in metadata.get("scan_outcome_reasons", [])
+        for metadata in result.file_metadata.values()
+    )
     assert not any(issue.rule_code == "S302" for issue in result.issues)
-    assert determine_exit_code(result) == 2
+    assert determine_exit_code(result) == 0
 
 
 def test_jax_identity_before_split_utf8_boundary_remains_confirmed(tmp_path: Path) -> None:

@@ -803,7 +803,7 @@ class JaxCheckpointScanner(BaseScanner):
                 if filename == "metadata.json":
                     if cls._has_regular_orbax_sibling_marker(path_obj):
                         return True
-                    return is_jax_json_checkpoint_file(path)
+                    return is_confirmed_jax_json_checkpoint_file(path)
                 return is_confirmed_jax_json_checkpoint_file(path)
             if ext in cls.supported_extensions:
                 return cls._is_likely_jax_file(path) or is_jax_json_checkpoint_file(path)
