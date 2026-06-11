@@ -37,6 +37,7 @@ from modelaudit.scanner_results import (
     OPERATIONAL_ERROR_METADATA_KEY,
     SCAN_OUTCOME_METADATA_KEY,
     SCAN_OUTCOME_REASONS_METADATA_KEY,
+    SUPPRESSED_FAILED_CHECKS_METADATA_KEY,
     VALIDATED_FORMAT_METADATA_KEY,
     Check,
     Issue,
@@ -1399,6 +1400,18 @@ def _has_only_allowed_alternate_format_inconclusive_reasons(result: ScanResult, 
     return bool(reasons) and all(isinstance(reason, str) and reason in allowed_reasons for reason in reasons)
 
 
+def _has_suppressed_actionable_scanner_evidence(result: ScanResult) -> bool:
+    suppressed_checks = result._private_metadata.get(SUPPRESSED_FAILED_CHECKS_METADATA_KEY)
+    if not isinstance(suppressed_checks, list):
+        return False
+    for suppressed_check in suppressed_checks:
+        if not isinstance(suppressed_check, dict):
+            continue
+        if suppressed_check.get("severity") in {IssueSeverity.WARNING.value, IssueSeverity.CRITICAL.value}:
+            return True
+    return False
+
+
 def _validated_alternate_format_for_mismatch(
     result: ScanResult,
     *,
@@ -1418,7 +1431,7 @@ def _validated_alternate_format_for_mismatch(
         PROTOBUF_MODEL_CANDIDATE_FORMAT,
     }:
         return None
-    if result.has_errors or result.has_warnings:
+    if result.has_errors or result.has_warnings or _has_suppressed_actionable_scanner_evidence(result):
         return None
     if result.metadata.get(OPERATIONAL_ERROR_METADATA_KEY) is True:
         return None

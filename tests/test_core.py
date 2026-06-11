@@ -31,6 +31,7 @@ from modelaudit.config import ModelAuditConfig, set_config
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.rules import Severity
+from modelaudit.scanner_results import SUPPRESSED_FAILED_CHECKS_METADATA_KEY
 from modelaudit.scanners import (
     archive_dispatch,
     flax_msgpack_scanner,
@@ -10071,6 +10072,30 @@ def test_scan_file_keeps_s901_for_malicious_valid_pt_onnx(tmp_path: Path) -> Non
         issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
         for issue in result.issues
     )
+
+
+def test_scan_file_keeps_s901_when_malicious_pt_onnx_finding_is_suppressed(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    rule_config = ModelAuditConfig(suppress={"S902"})
+    set_config(rule_config)
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "suppressed-malicious.pt", op_type="PythonOp")
+
+    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert not any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
+    assert SUPPRESSED_FAILED_CHECKS_METADATA_KEY not in result.metadata
+    assert result._private_metadata[SUPPRESSED_FAILED_CHECKS_METADATA_KEY] == [
+        {
+            "name": "Python Operator Detection",
+            "rule_code": "S902",
+            "severity": "critical",
+        }
+    ]
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
 
 
 def test_scan_file_keeps_s901_for_truncated_pt_onnx(tmp_path: Path) -> None:
