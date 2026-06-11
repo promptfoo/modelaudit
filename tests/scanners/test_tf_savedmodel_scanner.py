@@ -130,7 +130,16 @@ def test_tf_savedmodel_read_failure_is_inconclusive_not_security_finding(
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert direct.metadata["operational_error_reason"] == "savedmodel_read_failed"
     assert "savedmodel_read_failed" in direct.metadata["scan_outcome_reasons"]
-    metadata = aggregate.file_metadata[str(Path(path) / "saved_model.pb")].model_dump()
+    saved_model_metadata = next(
+        (
+            metadata
+            for file_path, metadata in aggregate.file_metadata.items()
+            if Path(file_path).name == "saved_model.pb"
+        ),
+        None,
+    )
+    assert saved_model_metadata is not None
+    metadata = saved_model_metadata.model_dump()
     assert "savedmodel_read_failed" in metadata["scan_outcome_reasons"]
     assert metadata["operational_error_reason"] == "savedmodel_read_failed"
     assert any(

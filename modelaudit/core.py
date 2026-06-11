@@ -441,6 +441,50 @@ def _directory_owner_snapshot_entry(
     )
 
 
+def _directory_owner_root_is_link_like(root_path: Path) -> bool:
+    """Return whether the requested logical owner root is a lexical link."""
+    try:
+        return _directory_owner_snapshot_entry(root_path, ()).entry_type == "link"
+    except OSError:
+        return False
+
+
+@contextmanager
+def _bound_directory_owner_scan_path(root_path: Path) -> Iterator[str]:
+    """Yield a descriptor-backed owner root when the platform exposes one."""
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    expected_root_stat = root_path.lstat()
+    root_descriptor = os.open(root_path, directory_flags)
+    try:
+        root_stat = os.fstat(root_descriptor)
+        if (
+            not stat.S_ISDIR(expected_root_stat.st_mode)
+            or not stat.S_ISDIR(root_stat.st_mode)
+            or not _directory_owner_snapshot_stat_matches(root_stat, expected_root_stat)
+        ):
+            raise OSError("Directory owner root changed before owner dispatch")
+
+        for descriptor_root in (Path("/proc/self/fd") / str(root_descriptor), Path("/dev/fd") / str(root_descriptor)):
+            with suppress(OSError):
+                descriptor_stat = descriptor_root.stat()
+                if stat.S_ISDIR(descriptor_stat.st_mode) and _directory_owner_snapshot_stat_matches(
+                    descriptor_stat,
+                    root_stat,
+                ):
+                    yield str(descriptor_root)
+                    return
+
+        yield str(root_path)
+    finally:
+        os.close(root_descriptor)
+
+
 def _directory_owner_snapshot_stat_matches(
     current: os.stat_result,
     expected: os.stat_result,
@@ -2486,6 +2530,7 @@ def scan_model_directory_or_file(
             directory_owner_initial_snapshot: tuple[_DirectoryOwnerSnapshotEntry, ...] = ()
             directory_owner_snapshot_failure_reason: str | None = None
             directory_owner_snapshot_failure_details: dict[str, Any] = {}
+            directory_owner_snapshot_failure_allows_child_walk = False
 
             def directory_owner_snapshot_failure(error: Exception) -> tuple[str, dict[str, Any]]:
                 if isinstance(error, _DirectoryOwnerSnapshotLimitError):
@@ -2705,6 +2750,11 @@ def scan_model_directory_or_file(
                         directory_owner_snapshot_failure_reason,
                         directory_owner_snapshot_failure_details,
                     ) = directory_owner_snapshot_failure(error)
+                    directory_owner_snapshot_failure_allows_child_walk = _directory_owner_root_is_link_like(
+                        owner_root_path,
+                    )
+                    if directory_owner_snapshot_failure_allows_child_walk:
+                        directory_owner_snapshot_failure_details["child_walk_continued"] = True
                     logger.warning(
                         "Unable to capture initial logical directory-owner namespace for %s: %s",
                         path,
@@ -2721,7 +2771,10 @@ def scan_model_directory_or_file(
             initial_owner_entries = {entry.relative_parts: entry for entry in directory_owner_initial_snapshot}
             directory_walk = (
                 ()
-                if directory_owner_snapshot_failure_reason is not None
+                if (
+                    directory_owner_snapshot_failure_reason is not None
+                    and not directory_owner_snapshot_failure_allows_child_walk
+                )
                 else os.walk(
                     path,
                     followlinks=False,
@@ -3333,8 +3386,12 @@ def scan_model_directory_or_file(
                         owner_config["timeout"] = max(1, timeout - int(time.time() - start_time))
                         directory_scan_started_at = time.time()
                         owner_scan_returned = False
+                        directory_owner_scan_path = path
                         try:
-                            directory_owner_result = directory_owner_class(config=owner_config).scan(path)
+                            with _bound_directory_owner_scan_path(owner_root_path) as directory_owner_scan_path:
+                                directory_owner_result = directory_owner_class(config=owner_config).scan(
+                                    directory_owner_scan_path,
+                                )
                         except Exception as error:
                             aggregate_hash_complete = False
                             directory_owner_result = ScanResult(scanner_name=directory_owner_class.name)
@@ -3358,6 +3415,12 @@ def scan_model_directory_or_file(
                             directory_owner_result.finish(success=False)
                         else:
                             owner_scan_returned = True
+                            if directory_owner_scan_path != path:
+                                _redact_stream_scan_result_for_reporting(
+                                    directory_owner_result,
+                                    directory_owner_scan_path,
+                                    path,
+                                )
 
                         record_scanner_used(
                             directory_owner_class.name,

@@ -488,9 +488,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
             return (
                 relative_parts[-1].lower().endswith((".txt", ".md", ".json", ".yaml", ".yml", ".py", ".cfg", ".conf"))
             )
-        if len(relative_parts) == 1 and root_name in {"saved_model.pb", "keras_metadata.pb"}:
-            return True
-        return not (len(relative_parts) == 1 and root_name == "fingerprint.pb")
+        return len(relative_parts) == 1 and root_name in {"saved_model.pb", "keras_metadata.pb"}
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
