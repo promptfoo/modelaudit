@@ -70,12 +70,21 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
 def _metadata_disqualifies_cache(metadata: Any) -> bool:
     if not isinstance(metadata, dict):
         return False
-    return (
+    if (
         bool(metadata.get("operational_error"))
         or bool(metadata.get("analysis_incomplete"))
         or metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
         or _has_incomplete_coverage_reasons(metadata)
-    )
+    ):
+        return True
+
+    findings = metadata.get("findings")
+    if isinstance(findings, dict):
+        return _metadata_disqualifies_cache(findings)
+    if isinstance(findings, (list, tuple, set, frozenset)):
+        return any(_metadata_disqualifies_cache(finding) for finding in findings)
+
+    return False
 
 
 def _has_incomplete_coverage_reasons(metadata: dict[str, Any]) -> bool:

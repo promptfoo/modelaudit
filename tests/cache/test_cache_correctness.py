@@ -2530,6 +2530,7 @@ def test_cached_scan_skips_persisting_incomplete_metadata(
         {"scan_outcome_reason": "bounded_probe_exhausted"},
         {"scan_outcome_reasons": ["bounded_probe_exhausted"]},
         {"operational_error": True},
+        {"component_count": 2, "findings": [{"analysis_incomplete": True}]},
     ],
 )
 def test_cached_scan_skips_persisting_incomplete_record_details(

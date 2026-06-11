@@ -1821,6 +1821,55 @@ class TestDvcSecurity:
         assert path_state.dvc_covered_paths == set()
         assert path_state.dvc_covered_directories == set()
 
+    def test_cli_incomplete_sibling_location_does_not_block_dvc_coverage(self, tmp_path: Path) -> None:
+        """Coverage matching should use path boundaries, not arbitrary substrings."""
+        from modelaudit.cli import _ScanPathState
+        from modelaudit.models import AssetModel, create_initial_audit_result
+
+        model_path = tmp_path / "model.pkl"
+        model_path.write_bytes(pickle.dumps({"safe": True}))
+        sibling_path = tmp_path / "model.pkl.bak"
+        sibling_path.write_bytes(pickle.dumps({"incomplete": True}))
+        result = create_initial_audit_result()
+        result.assets.append(AssetModel(path=str(model_path), type="pickle"))
+        result.issues.append(
+            Issue(
+                message="Incomplete coverage belongs to a sibling",
+                severity=IssueSeverity.INFO,
+                location=str(sibling_path),
+                details={"analysis_incomplete": True},
+            )
+        )
+        path_state = _ScanPathState(collect_dvc_coverage=True)
+
+        path_state.record_dvc_coverage(str(model_path), result)
+
+        assert path_state.dvc_covered_paths == {str(model_path)}
+
+    def test_cli_nested_incomplete_location_blocks_dvc_coverage(self, tmp_path: Path) -> None:
+        """Nested archive-style locations should still mark the owning file incomplete."""
+        from modelaudit.cli import _ScanPathState
+        from modelaudit.models import AssetModel, create_initial_audit_result
+
+        model_path = tmp_path / "model.pkl"
+        model_path.write_bytes(pickle.dumps({"safe": True}))
+        result = create_initial_audit_result()
+        result.assets.append(AssetModel(path=str(model_path), type="pickle"))
+        result.issues.append(
+            Issue(
+                message="Incomplete coverage in nested member",
+                severity=IssueSeverity.INFO,
+                location=f"{model_path}:member.pkl",
+                details={"analysis_incomplete": True},
+            )
+        )
+        path_state = _ScanPathState(collect_dvc_coverage=True)
+
+        path_state.record_dvc_coverage(str(model_path), result)
+
+        assert path_state.dvc_covered_paths == set()
+        assert path_state.dvc_covered_directories == set()
+
     def test_cli_shard_check_paths_count_as_dvc_coverage(self, tmp_path: Path) -> None:
         """Shard siblings scanned by the advanced handler must discharge capped outputs."""
         from modelaudit.cli import _ScanPathState
@@ -2438,6 +2487,62 @@ class TestDvcSecurity:
         assert not any(
             issue.details.get("scan_outcome_reason") == "dvc_scan_budget_exhausted" for issue in result.issues
         )
+
+    def test_direct_dvc_incomplete_shard_scan_does_not_cover_omitted_shard(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Direct DVC scans must not credit omitted shards from incomplete shard-family details."""
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        first_shard = model_dir / "model-00001-of-00002.safetensors"
+        second_shard = model_dir / "model-00002-of-00002.safetensors"
+        benign = tmp_path / "benign.pkl"
+        first_shard.write_bytes(b"first")
+        second_shard.write_bytes(b"second")
+        benign.write_bytes(pickle.dumps({"safe": True}))
+        dvc_file = tmp_path / "shards.dvc"
+        dvc_file.write_text(
+            "outs:\n"
+            f"- path: model/{first_shard.name}\n" + "- path: benign.pkl\n" * 99 + f"- path: model/{second_shard.name}\n"
+        )
+        original_scan_file = core_module.scan_file
+
+        def fake_scan_file(path: str, config: dict[str, Any]) -> ScanResult:
+            if path != str(first_shard):
+                return original_scan_file(path, config)
+            result = ScanResult(scanner_name="safetensors")
+            result.bytes_scanned = first_shard.stat().st_size
+            result.add_check(
+                name="Sharded Model Detection",
+                passed=True,
+                message="Detected sharded model",
+                details={"shards": [str(first_shard), str(second_shard)]},
+            )
+            result.add_check(
+                name="Shard Scan",
+                passed=False,
+                message="Error scanning shard",
+                severity=IssueSeverity.INFO,
+                location=str(second_shard),
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": "shard_scan_error",
+                },
+            )
+            result.finish(success=True)
+            return result
+
+        monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_enabled=False)
+
+        assert result.files_scanned == 2
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert any(issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in result.issues)
 
     def test_duplicate_yaml_keys_mark_pointer_incomplete(self, tmp_path: Path) -> None:
         """Duplicate outs mappings must not discard an earlier hidden declaration."""

@@ -7,7 +7,7 @@ import os
 import stat
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -168,6 +168,7 @@ _consolidate_checks = core_results.consolidate_checks
 _mark_inconclusive_scan_outcome = core_results.mark_inconclusive_scan_outcome
 _mark_operational_scan_error = core_results.mark_operational_scan_error
 _metadata_has_incomplete_coverage = core_results.metadata_has_incomplete_coverage
+_record_details_have_incomplete_coverage = core_results.record_details_have_incomplete_coverage
 _records_have_incomplete_coverage_for_path = core_results.records_have_incomplete_coverage_for_path
 _results_have_operational_error = core_results.results_have_operational_error
 _results_should_be_unsuccessful = core_results.results_should_be_unsuccessful
@@ -293,6 +294,24 @@ _DVC_EXCLUDED_PATHS_CONFIG_KEY = "_dvc_excluded_paths"
 _DVC_COVERAGE_ROOTS_CONFIG_KEY = "_dvc_coverage_roots"
 DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY = "_dvc_external_covered_paths"
 DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY = "_dvc_external_covered_directories"
+_INCOMPLETE_SHARD_CHECK_NAMES = frozenset(
+    {
+        "Shard Scan",
+        "Sharded Model Coverage Check",
+        "Sharded Model Membership Check",
+    }
+)
+
+
+def _shard_family_has_incomplete_coverage(records: Iterable[Any], shard_paths: set[str]) -> bool:
+    for record in records:
+        if not _record_details_have_incomplete_coverage(record):
+            continue
+        if getattr(record, "name", None) in _INCOMPLETE_SHARD_CHECK_NAMES:
+            return True
+        if any(_records_have_incomplete_coverage_for_path((record,), shard_path) for shard_path in shard_paths):
+            return True
+    return False
 
 
 def _record_incomplete_dvc_resolution(
@@ -3149,10 +3168,12 @@ def scan_model_directory_or_file(
                 _add_scan_result_to_model(results, scan_metadata, file_result, target)
 
                 _add_asset_to_results(results, target, file_result)
+                file_records = (*file_result.checks, *file_result.issues)
                 if (
                     is_dvc_pointer
                     and not _scan_result_has_operational_error(file_result)
                     and not _metadata_has_incomplete_coverage(file_result.metadata or {})
+                    and not _records_have_incomplete_coverage_for_path(file_records, target)
                 ):
                     scanned_dvc_paths.add(resolved_target)
                     internally_scanned_dvc_paths.add(resolved_target)
@@ -3164,6 +3185,8 @@ def scan_model_directory_or_file(
                                 for shard_path in shard_paths
                                 if isinstance(shard_path, str)
                             }
+                            if _shard_family_has_incomplete_coverage(file_records, resolved_shard_paths):
+                                continue
                             scanned_dvc_paths.update(resolved_shard_paths)
                             internally_scanned_dvc_paths.update(resolved_shard_paths)
                 _finish_phase_timing(phase_timings, "result_merge", result_merge_started_at)

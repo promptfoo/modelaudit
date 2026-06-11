@@ -74,6 +74,27 @@ def _metadata_has_incomplete_coverage(metadata: Any) -> bool:
     return False
 
 
+def _details_have_incomplete_coverage(details: Any, *, _depth: int = 0) -> bool:
+    """Return True when details or consolidated detail findings identify incomplete coverage."""
+    if _metadata_has_incomplete_coverage(details):
+        return True
+    if _depth >= 4:
+        return False
+
+    findings = _metadata_value(details, "findings")
+    if isinstance(findings, dict):
+        return _details_have_incomplete_coverage(findings, _depth=_depth + 1)
+    if isinstance(findings, (list, tuple, set, frozenset)):
+        for finding in findings:
+            if _details_have_incomplete_coverage(finding, _depth=_depth + 1):
+                return True
+            nested_details = _metadata_value(finding, "details")
+            if nested_details is not finding and _details_have_incomplete_coverage(nested_details, _depth=_depth + 1):
+                return True
+
+    return False
+
+
 def _file_metadata_has_incomplete_coverage(file_metadata: Any) -> bool:
     """Return True when any file metadata entry reports incomplete scan coverage."""
     if not isinstance(file_metadata, dict):
@@ -85,7 +106,7 @@ def _records_have_incomplete_coverage(records: Any) -> bool:
     """Return True when any issue/check details identify incomplete scan coverage."""
     if not isinstance(records, list):
         return False
-    return any(_metadata_has_incomplete_coverage(_metadata_value(record, "details")) for record in records)
+    return any(_details_have_incomplete_coverage(_metadata_value(record, "details")) for record in records)
 
 
 def _issues_have_security_findings(issues: list[Any]) -> bool:
@@ -597,7 +618,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
 
         # Update success status for operational errors or incomplete coverage.
         records_have_incomplete_coverage = any(
-            _metadata_has_incomplete_coverage(_metadata_value(record, "details"))
+            _details_have_incomplete_coverage(_metadata_value(record, "details"))
             for record in [*scan_result.issues, *scan_result.checks]
         )
         if (
