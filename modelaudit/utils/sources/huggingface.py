@@ -909,12 +909,13 @@ def _get_hf_content_route_scanner_ids() -> set[str]:
     return scanner_ids
 
 
-def _hf_safetensors_shard_excluded_by_selection(
+def _hf_detected_safetensors_shard_excluded_by_selection(
     filename: str,
+    detected_format: str,
     selected_route_scanner_ids: set[str] | None,
 ) -> bool:
-    """Return whether scanner selection excludes a shard-shaped SafeTensors artifact."""
-    if selected_route_scanner_ids is None:
+    """Return whether scanner selection excludes a detected shard-shaped SafeTensors artifact."""
+    if selected_route_scanner_ids is None or detected_format != "safetensors":
         return False
     return (
         "safetensors" not in selected_route_scanner_ids and _HF_SAFETENSORS_SHARD_PATTERN.search(filename) is not None
@@ -1070,8 +1071,6 @@ def _select_streamable_hf_files(
         for file_name in repo_files:
             if file_name in selected_files:
                 continue
-            if _hf_safetensors_shard_excluded_by_selection(file_name, selected_route_scanner_ids):
-                continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
                     "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "
@@ -1080,6 +1079,12 @@ def _select_streamable_hf_files(
             inspected_files += 1
             detected_format = _detect_huggingface_content_route_format(repo_id, file_name, revision, probe_budget)
             if detected_format is None:
+                continue
+            if _hf_detected_safetensors_shard_excluded_by_selection(
+                file_name,
+                detected_format,
+                selected_route_scanner_ids,
+            ):
                 continue
             if selected_route_scanner_ids is not None:
                 from ...scanner_selection import scanner_ids_for_detected_format

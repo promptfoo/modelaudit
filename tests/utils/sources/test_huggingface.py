@@ -2658,20 +2658,22 @@ class TestModelDownloadStreaming:
     )
     @patch("requests.get")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_selected_pickle_skips_safetensors_shard_without_probe(
+    def test_download_model_streaming_selected_pickle_skips_detected_safetensors_shard_after_probe(
         self,
         mock_hf_hub_download: MagicMock,
         mock_requests_get: MagicMock,
         _mock_list_repo_files: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """Shard-shaped SafeTensors artifacts excluded by selection must not be body-sniffed."""
+        """Detected SafeTensors shards excluded by selection must stay bounded and undispatched."""
         policy = resolve_scanner_selection_policy(scanners=["pickle"])
         extensions = selected_scanner_extensions(policy, conservative=True)
         assert extensions is not None
         assert ".pkl" in extensions
         assert ".safetensors" not in extensions
-        mock_requests_get.side_effect = AssertionError("excluded safetensors shard must not be probed")
+        safetensors_header = b'{"__metadata__":{"format":"pt"}}'
+        safetensors_shard = struct.pack("<Q", len(safetensors_header)) + safetensors_header + (b"\x00" * 16)
+        mock_requests_get.return_value = _FakeRangeResponse(safetensors_shard)
 
         def download_side_effect(*, filename: str, **_kwargs: object) -> str:
             assert filename == "payload.pkl"
@@ -2691,10 +2693,53 @@ class TestModelDownloadStreaming:
         )
 
         assert results == [(tmp_path / "payload.pkl", True)]
-        mock_requests_get.assert_not_called()
+        mock_requests_get.assert_called_once()
+        assert mock_requests_get.call_args.kwargs["headers"]["Range"] == "bytes=0-8191"
         mock_hf_hub_download.assert_called_once_with(
             repo_id="test/model",
             filename="payload.pkl",
+            revision=_HF_TEST_REVISION,
+        )
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["model-00001-of-00002.safetensors"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_selected_pickle_routes_shard_shaped_renamed_pickle(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Shard-shaped names must not hide pickle content from pickle-only selection."""
+        policy = resolve_scanner_selection_policy(scanners=["pickle"])
+        malicious_pickle = b"cos\nsystem\n(S'echo pwn'\ntR."
+        mock_requests_get.return_value = _FakeRangeResponse(malicious_pickle)
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / filename
+            path.write_bytes(malicious_pickle)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                scannable_extensions=selected_scanner_extensions(policy, conservative=True),
+                scannable_filenames=selected_scanner_filenames(policy, conservative=True),
+                scannable_scanner_ids=policy.enabled_scanner_ids,
+            )
+        )
+
+        assert results == [(tmp_path / "model-00001-of-00002.safetensors", True)]
+        assert mock_requests_get.call_count == 1
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="model-00001-of-00002.safetensors",
             revision=_HF_TEST_REVISION,
         )
 

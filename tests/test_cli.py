@@ -65,6 +65,25 @@ def test_local_txt_zip_prefilter_uses_bounded_zip_probe(
 _HF_TEST_REVISION = "a" * 40
 
 
+class _FakeRangeResponse:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+        self.headers = {"Content-Length": str(len(payload))}
+        self.status_code = 200
+
+    def __enter__(self) -> "_FakeRangeResponse":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def iter_content(self, chunk_size: int) -> Iterator[bytes]:
+        yield self.payload[:chunk_size]
+
+
 def default_remote_cache_dir() -> str:
     """Compute the CLI's default remote cache root at assertion time."""
     return str(Path.home() / ".modelaudit" / "cache")
@@ -4478,6 +4497,46 @@ def test_scan_huggingface_streaming_routes_unknown_suffix_by_content(
     assert (parsed["failed_checks"] > 0) is malicious
     mock_hf_hub_download.assert_called_once()
     mock_run_download.assert_called_once()
+
+
+@patch("modelaudit.utils.sources.huggingface._run_huggingface_download_with_deadline")
+@patch(
+    "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+    return_value=(["model-00001-of-00002.safetensors"], _HF_TEST_REVISION, None),
+)
+@patch("requests.get")
+@patch("huggingface_hub.hf_hub_download")
+def test_scan_huggingface_streaming_selected_pickle_scans_shard_shaped_renamed_pickle(
+    mock_hf_hub_download: MagicMock,
+    mock_requests_get: MagicMock,
+    _mock_list_repo_files: MagicMock,
+    mock_run_download: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Pickle-only streaming must scan pickle bytes hidden behind shard-shaped names."""
+    malicious_pickle = b"cos\nsystem\n(S'echo shard pwn'\ntR."
+    model_path = tmp_path / "model-00001-of-00002.safetensors"
+    model_path.write_bytes(malicious_pickle)
+    mock_requests_get.return_value = _FakeRangeResponse(malicious_pickle)
+    mock_hf_hub_download.return_value = str(model_path)
+    mock_run_download.side_effect = lambda _operation, download_kwargs, _deadline, _repo_id, *, direct_download: str(
+        direct_download(**download_kwargs)
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--stream", "--scanners", "pickle", "--no-cache", "--format", "json", "hf://test/model"],
+    )
+
+    parsed = parse_click_json_output(result.output)
+    assert result.exit_code == 1
+    assert parsed["has_errors"] is False
+    assert parsed["files_scanned"] == 1
+    assert parsed["failed_checks"] > 0
+    assert any("pickle" in scanner_name for scanner_name in parsed["scanner_names"])
+    mock_requests_get.assert_called_once()
+    mock_hf_hub_download.assert_called_once()
+    assert mock_hf_hub_download.call_args.kwargs["filename"] == "model-00001-of-00002.safetensors"
 
 
 @patch("modelaudit.cli.is_huggingface_url")
