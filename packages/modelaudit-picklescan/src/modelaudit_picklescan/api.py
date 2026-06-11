@@ -848,7 +848,7 @@ def _binary_pickle_probe_should_scan(sample: bytes, *, sample_is_prefix: bool) -
             if opcode.name == "STOP":
                 return opcode_count >= 2
     except Exception:
-        return sample_is_prefix and opcode_count >= 2
+        return sample_is_prefix
     return sample_is_prefix and opcode_count >= 2
 
 

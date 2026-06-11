@@ -1715,7 +1715,7 @@ class PyTorchZipScanner(BaseScanner):
                 if opcode.name == "STOP":
                     return opcode_count >= 2
         except Exception:
-            return sample_is_prefix and opcode_count >= 2
+            return sample_is_prefix
         return sample_is_prefix and opcode_count >= 2
 
     @staticmethod

@@ -90,6 +90,10 @@ def _large_framed_malicious_eval_pickle_payload() -> bytes:
     return pickle.dumps({"pad": b"A" * 10_000, "payload": MaliciousClass()}, protocol=4)
 
 
+def _large_length_prefixed_malicious_eval_pickle_payload() -> bytes:
+    return b"\x80\x04B" + struct.pack("<I", 10_000) + (b"A" * 10_000) + _malicious_eval_pickle_payload()
+
+
 def _malicious_newobj_ex_pickle_payload() -> bytes:
     return pickle.dumps(object.__new__(_NewObjExImportGadget), protocol=4)
 
@@ -563,6 +567,7 @@ def test_pytorch_zip_discovery_trusts_torch_storage_untyped_storage(tmp_path: Pa
         _malicious_proto0_system_payload(),
         _malicious_eval_pickle_payload(),
         _large_framed_malicious_eval_pickle_payload(),
+        _large_length_prefixed_malicious_eval_pickle_payload(),
     ],
 )
 def test_pytorch_zip_discovery_scans_referenced_storage_blob_when_it_is_a_pickle(

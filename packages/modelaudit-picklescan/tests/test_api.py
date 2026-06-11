@@ -179,6 +179,16 @@ def _fake_byte_storage_persistent_id_payload(key: str) -> bytes:
     )
 
 
+def _large_length_prefixed_malicious_payload() -> bytes:
+    declared_payload = b"A" * 10_000
+    return (
+        b"\x80\x04B"
+        + len(declared_payload).to_bytes(4, "little")
+        + declared_payload
+        + pickle.dumps(MaliciousPayload(), protocol=4)
+    )
+
+
 def _pickleish_tensor_storage_bytes() -> bytes:
     # Minimal prefix from pinned PiD raw tensor storage that looks like a pickle FRAME crossing STOP.
     return bytes.fromhex("478727be61f70dbd70953cbd09b996bd5c7a2ebe") + (b"\x00" * 128)
@@ -1892,6 +1902,7 @@ def test_scan_file_routes_torch_storage_untyped_storage_blob_as_raw_storage(tmp_
         b"cposix\nsystem\n(S'echo hidden'\ntR.",
         pickle.dumps(MaliciousPayload(), protocol=4),
         pickle.dumps({"pad": b"A" * 10_000, "payload": MaliciousPayload()}, protocol=4),
+        _large_length_prefixed_malicious_payload(),
     ],
 )
 def test_scan_file_scans_referenced_storage_blob_when_it_is_a_pickle(payload: bytes, tmp_path: Path) -> None:
