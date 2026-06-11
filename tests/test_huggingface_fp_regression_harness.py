@@ -897,6 +897,49 @@ def test_hf_stream_dry_run_openvino_budget_includes_bin_companion() -> None:
     mock_scan.assert_not_called()
 
 
+def test_hf_stream_dry_run_max_size_budgets_unselected_content_route_candidates() -> None:
+    runner = CliRunner()
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": "a" * 40,
+        "total_size": 60,
+        "file_count": 2,
+        "files": [
+            {"name": "model.pt", "size": 20},
+            {"name": "renamed.payload", "size": 40},
+        ],
+    }
+
+    with (
+        _mock_hf_model_info(return_value=metadata),
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+        patch("modelaudit.utils.sources.huggingface._read_huggingface_prefix") as mock_read_prefix,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--stream",
+                "--format",
+                "json",
+                "--max-size",
+                "50B",
+                "--scanners",
+                "pytorch_zip",
+                "hf://test/model",
+            ],
+        )
+
+    assert result.exit_code == 2
+    assert "Selected Hugging Face files total 60 bytes exceeds max size 50 bytes" in result.output
+    mock_read_prefix.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
 def test_hf_file_dry_run_preview_does_not_download_or_scan() -> None:
     url = "https://huggingface.co/test/model/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.json"
     runner = CliRunner()

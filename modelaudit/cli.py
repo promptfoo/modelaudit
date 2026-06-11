@@ -293,13 +293,52 @@ def _huggingface_preview_include_openvino_companions(
 
 def _huggingface_preview_has_uncertain_unselected_files(files: object, selected_files: list[dict[str, Any]]) -> bool:
     """Return whether unselected metadata may hide content-routed model bytes."""
+    return bool(_huggingface_preview_unselected_files(files, selected_files))
+
+
+def _huggingface_preview_unselected_files(files: object, selected_files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return Hugging Face metadata entries not selected without content sniffing."""
+    if not isinstance(files, list):
+        return []
+
     all_names = set(_huggingface_preview_file_names(files))
     selected_names: set[str] = set()
     for item in selected_files:
         name = item.get("name")
         if isinstance(name, str) and name in all_names:
             selected_names.add(name)
-    return bool(all_names.difference(selected_names))
+
+    unselected: list[dict[str, Any]] = []
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if isinstance(name, str) and name in all_names and name not in selected_names:
+            unselected.append(item)
+    return unselected
+
+
+def _huggingface_stream_preview_needs_content_route_budget(runtime: "_ScanRuntimeConfig") -> bool:
+    """Return whether stream dry-run must budget files only content sniffing could prove."""
+    if runtime.hf_stream_include_all_files or runtime.scannable_scanner_ids is None:
+        return False
+
+    from .utils.sources import huggingface as huggingface_source
+
+    selected_scanners = {str(scanner_id).lower() for scanner_id in runtime.scannable_scanner_ids}
+    return bool(selected_scanners.intersection(huggingface_source._get_hf_content_route_scanner_ids()))
+
+
+def _huggingface_stream_preview_budget_files(
+    files: object,
+    selected_files: list[dict[str, Any]],
+    runtime: "_ScanRuntimeConfig",
+) -> list[dict[str, Any]]:
+    """Return stream dry-run files whose metadata sizes must count toward max-size."""
+    if not _huggingface_stream_preview_needs_content_route_budget(runtime):
+        return selected_files
+
+    return [*selected_files, *_huggingface_preview_unselected_files(files, selected_files)]
 
 
 def _huggingface_preview_download_files(metadata: dict[str, Any]) -> list[dict[str, Any]]:
@@ -526,7 +565,11 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
         download_files = _huggingface_preview_download_files(metadata)
     if runtime.scanner_selection_metadata is None and not runtime.scan_and_delete and not download_files:
         raise ValueError("No metadata-routed ModelAudit-scannable Hugging Face files found; refusing dry-run")
-    budget_files = selected_files if runtime.scan_and_delete else (download_files or selected_files)
+    budget_files = (
+        _huggingface_stream_preview_budget_files(files, selected_files, runtime)
+        if runtime.scan_and_delete
+        else (download_files or selected_files)
+    )
     total_size = metadata.get("total_size")
     selected_display_sizes = [_huggingface_preview_file_size(item) for item in selected_files]
     selected_display_size = sum(size for size in selected_display_sizes if size is not None)
