@@ -45,7 +45,7 @@ from .core import (
     determine_exit_code,
     scan_model_directory_or_file,
 )
-from .core_results import metadata_has_incomplete_coverage
+from .core_results import metadata_has_incomplete_coverage, results_have_inconclusive_outcome
 from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import format_sarif_output
 from .integrations.source_redaction import redact_source_value
@@ -2627,36 +2627,50 @@ def _scan_local_or_downloaded_path(
         ]
         issue_count = len(visible_issues)
         has_critical = any(issue.severity == IssueSeverity.CRITICAL for issue in visible_issues)
+        has_incomplete_coverage = results_have_inconclusive_outcome(scan_results)
 
         if spinner:
             spinner.text = f"Scanned {style_text(display_path, fg='cyan')}"
-            if issue_count == 0:
+            if issue_count == 0 and has_incomplete_coverage:
+                spinner.ok(style_text("⚠️  Coverage incomplete", fg="yellow", bold=True))
+            elif issue_count == 0:
                 spinner.ok(style_text("✅ Clean", fg="green", bold=True))
             elif has_critical:
+                status = f"🚨 Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)"
+                if has_incomplete_coverage:
+                    status += ", coverage incomplete"
                 spinner.fail(
                     style_text(
-                        f"🚨 Found {issue_count} issue{'s' if issue_count > 1 else ''} (CRITICAL)",
+                        status,
                         fg="red",
                         bold=True,
                     ),
                 )
             else:
+                status = f"⚠️  Found {issue_count} issue{'s' if issue_count > 1 else ''}"
+                if has_incomplete_coverage:
+                    status += " (coverage incomplete)"
                 spinner.ok(
                     style_text(
-                        f"⚠️  Found {issue_count} issue{'s' if issue_count > 1 else ''}",
+                        status,
                         fg="yellow",
                         bold=True,
                     ),
                 )
         elif runtime.show_styled_output:
-            if issue_count == 0:
+            if issue_count == 0 and has_incomplete_coverage:
+                click.echo(f"Scanned {display_path}: Coverage incomplete")
+            elif issue_count == 0:
                 click.echo(f"Scanned {display_path}: Clean")
             else:
                 issues_str = "issue" if issue_count == 1 else "issues"
                 if has_critical:
-                    click.echo(f"Scanned {display_path}: Found {issue_count} {issues_str} (CRITICAL)")
+                    status = f"Scanned {display_path}: Found {issue_count} {issues_str} (CRITICAL)"
                 else:
-                    click.echo(f"Scanned {display_path}: Found {issue_count} {issues_str}")
+                    status = f"Scanned {display_path}: Found {issue_count} {issues_str}"
+                if has_incomplete_coverage:
+                    status += ", coverage incomplete"
+                click.echo(status)
     except Exception as exc:
         display_error = _display_error(exc, path)
         if spinner:
@@ -4133,6 +4147,7 @@ def scan_command(
 def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     """Format scan results as human-readable text with colors"""
     output_lines = []
+    has_incomplete_coverage = _results_have_incomplete_coverage(results)
 
     # Add scan summary header
     output_lines.append(style_text("\n📊 SCAN SUMMARY", fg="white", bold=True))
@@ -4304,6 +4319,19 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         if len(check_groups) > 5:
             output_lines.append(f"    ... and {len(check_groups) - 5} more check types")
 
+    if has_incomplete_coverage:
+        incomplete_summaries = _incomplete_coverage_summaries(results)
+        output_lines.append("")
+        output_lines.append(style_text("  Scan Coverage:", fg="bright_black"))
+        output_lines.append(
+            "  " + style_text("⚠️  Incomplete security coverage", fg="yellow", bold=True),
+        )
+        for file_path, reason in incomplete_summaries[:5]:
+            output_lines.append(f"    • {_escape_terminal_text(file_path)}: {_escape_terminal_text(reason)}")
+        incomplete_count = len(incomplete_summaries)
+        if incomplete_count > 5:
+            output_lines.append(f"    ... and {incomplete_count - 5} more incomplete files")
+
     # Add issue summary
     issues = results.get("issues", [])
     # Filter out DEBUG severity issues when not in verbose mode
@@ -4412,6 +4440,10 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             output_lines.append(
                 "  " + style_text("⚠️  No model files found to scan", fg="yellow", bold=True),
             )
+        elif has_incomplete_coverage:
+            output_lines.append(
+                "  " + style_text("⚠️  Security coverage incomplete", fg="yellow", bold=True),
+            )
         else:
             output_lines.append(
                 "  " + style_text("✅ No security issues detected", fg="green", bold=True),
@@ -4446,6 +4478,8 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             status_icon = "⚠️"
             status_msg = "WARNINGS DETECTED"
             status_color = "yellow"
+        if has_incomplete_coverage:
+            status_msg += "; COVERAGE INCOMPLETE"
         status_line = style_text(f"{status_icon} {status_msg}", fg=status_color, bold=True)
         output_lines.append(f"  {status_line}")
     # Check if no files were scanned
@@ -4457,6 +4491,12 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         output_lines.append(
             f"  {style_text('Warning: No model files were found at the specified location.', fg='yellow')}"
         )
+    elif has_incomplete_coverage:
+        status_icon = "⚠️"
+        status_msg = "SCAN COVERAGE INCOMPLETE"
+        status_color = "yellow"
+        output_lines.append(f"  {style_text(f'{status_icon} {status_msg}', fg=status_color, bold=True)}")
+        output_lines.append(f"  {style_text('Some selected files could not be fully analyzed.', fg='yellow')}")
     elif visible_issues:
         if has_critical_findings:
             status_icon = "❌"
@@ -4492,6 +4532,48 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
         output_lines.append(encouragement_line)
 
     return "\n".join(output_lines)
+
+
+def _results_have_incomplete_coverage(results: dict[str, Any]) -> bool:
+    file_metadata = results.get("file_metadata")
+    if not isinstance(file_metadata, dict):
+        return False
+    return any(metadata_has_incomplete_coverage(metadata) for metadata in file_metadata.values())
+
+
+def _incomplete_coverage_summaries(results: dict[str, Any]) -> list[tuple[str, str]]:
+    file_metadata = results.get("file_metadata")
+    if not isinstance(file_metadata, dict):
+        return []
+
+    summaries: list[tuple[str, str]] = []
+    for file_path, metadata in file_metadata.items():
+        if metadata_has_incomplete_coverage(metadata):
+            summaries.append((str(file_path), _incomplete_coverage_reason(metadata)))
+    return summaries
+
+
+def _incomplete_coverage_reason(metadata: Any) -> str:
+    if not isinstance(metadata, dict):
+        return "incomplete coverage"
+
+    reason = metadata.get("scan_outcome_reason")
+    if isinstance(reason, str) and reason:
+        return reason
+
+    reasons = metadata.get("scan_outcome_reasons")
+    if isinstance(reasons, str) and reasons:
+        return reasons
+    if isinstance(reasons, (list, tuple, set, frozenset)):
+        joined_reasons = ", ".join(str(reason) for reason in reasons if reason)
+        if joined_reasons:
+            return joined_reasons
+
+    if metadata.get("analysis_incomplete") is True:
+        return "analysis_incomplete"
+    if metadata.get("scan_outcome") == "inconclusive":
+        return "inconclusive"
+    return "incomplete coverage"
 
 
 def _get_issue_attr(issue: dict[str, Any] | Any, attr: str, default: Any = None) -> Any:

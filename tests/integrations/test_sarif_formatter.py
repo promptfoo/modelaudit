@@ -519,6 +519,60 @@ class TestCreateRun:
         assert props["filesScanned"] == 5
         assert props["bytesScanned"] == 1000
         assert props["scanners"] == ["PickleScanner"]
+        assert props["processCompleted"] is True
+        assert props["securityCoverageComplete"] is True
+        assert props["incompleteCoverage"] is False
+        assert props["operationalErrors"] is False
+
+    def test_invocation_properties_mark_incomplete_coverage_without_findings(self) -> None:
+        """Incomplete coverage without findings should be an unsuccessful SARIF invocation."""
+        result = create_initial_audit_result()
+        result.files_scanned = 1
+        result.success = False
+        result.file_metadata["model.bin"] = FileMetadataModel(
+            analysis_incomplete=True,
+            scan_outcome_reasons=["bounded_probe_exhausted"],
+        )
+        result.finalize_statistics()
+
+        run = _create_run(result, ["/test"], verbose=False)
+
+        invocation = run["invocations"][0]
+        assert invocation["exitCode"] == 2
+        assert invocation["exitCodeDescription"] == "Scan outcome was inconclusive"
+        assert invocation["executionSuccessful"] is False
+        assert invocation["properties"]["processCompleted"] is True
+        assert invocation["properties"]["securityCoverageComplete"] is False
+        assert invocation["properties"]["incompleteCoverage"] is True
+        assert invocation["properties"]["operationalErrors"] is False
+
+    def test_invocation_properties_mark_incomplete_coverage_with_security_findings(self) -> None:
+        """Security exit 1 should not hide incomplete coverage in SARIF."""
+        result = create_initial_audit_result()
+        result.files_scanned = 1
+        result.success = False
+        result.file_metadata["model.pkl"] = FileMetadataModel(scan_outcome="inconclusive")
+        result.issues = [
+            Issue(
+                message="Dangerous pickle global",
+                severity=IssueSeverity.WARNING,
+                location="/test/model.pkl",
+                timestamp=time.time(),
+            ),
+        ]
+        result.finalize_statistics()
+
+        run = _create_run(result, ["/test"], verbose=False)
+
+        invocation = run["invocations"][0]
+        assert invocation["exitCode"] == 1
+        assert invocation["exitCodeDescription"] == "Security issues detected; scan coverage incomplete"
+        assert invocation["executionSuccessful"] is False
+        assert invocation["properties"]["processCompleted"] is True
+        assert invocation["properties"]["securityCoverageComplete"] is False
+        assert invocation["properties"]["incompleteCoverage"] is True
+        assert invocation["properties"]["operationalErrors"] is False
+        assert run["results"][0]["message"]["text"] == "Dangerous pickle global"
 
 
 class TestCreateRules:

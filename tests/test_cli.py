@@ -39,7 +39,7 @@ from modelaudit.cli import (
     format_text_output,
 )
 from modelaudit.core import scan_model_directory_or_file
-from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
+from modelaudit.models import FileMetadataModel, ModelAuditResultModel, create_initial_audit_result
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.cli_output import parse_click_json_output
 from tests.helpers import create_mock_pytorch_zip
@@ -3229,6 +3229,99 @@ def test_format_text_output_operational_errors_status():
     clean_output = strip_ansi(output)
     assert "SCAN COMPLETED WITH OPERATIONAL ERRORS" in clean_output
     assert "NO ISSUES FOUND" not in clean_output
+
+
+def test_format_text_output_complete_benign_scan_remains_clean() -> None:
+    """Fully covered benign scans should keep the clean text status."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [],
+        "file_metadata": {"model.pkl": {"scan_outcome_reasons": []}},
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "No security issues detected" in clean_output
+    assert "NO ISSUES FOUND" in clean_output
+    assert "Incomplete security coverage" not in clean_output
+
+
+def test_format_text_output_incomplete_coverage_without_findings_is_not_clean() -> None:
+    """Incomplete coverage without findings should not be presented as a clean scan."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [],
+        "file_metadata": {
+            "model.bin": {
+                "analysis_incomplete": True,
+                "scan_outcome_reasons": ["bounded_probe_exhausted"],
+            },
+        },
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "Incomplete security coverage" in clean_output
+    assert "bounded_probe_exhausted" in clean_output
+    assert "SCAN COVERAGE INCOMPLETE" in clean_output
+    assert "No security issues detected" not in clean_output
+    assert "NO ISSUES FOUND" not in clean_output
+
+
+def test_format_text_output_incomplete_coverage_with_security_findings_is_explicit() -> None:
+    """Security findings should remain visible when coverage is incomplete."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [
+            {"message": "Dangerous pickle global", "severity": "warning", "location": "model.pkl"},
+        ],
+        "file_metadata": {"model.pkl": {"scan_outcome": "inconclusive"}},
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "Dangerous pickle global" in clean_output
+    assert "Incomplete security coverage" in clean_output
+    assert "WARNINGS DETECTED; COVERAGE INCOMPLETE" in clean_output
+    assert "NO ISSUES FOUND" not in clean_output
+
+
+def test_text_cli_incomplete_coverage_path_status_is_not_clean(tmp_path: Path) -> None:
+    """Per-path CLI progress should not call an incomplete scan clean."""
+    test_file = tmp_path / "model.bin"
+    test_file.write_bytes(b"weights")
+    mock_result = create_initial_audit_result()
+    mock_result.files_scanned = 1
+    mock_result.bytes_scanned = len(b"weights")
+    mock_result.success = False
+    mock_result.file_metadata[str(test_file)] = FileMetadataModel(
+        analysis_incomplete=True,
+        scan_outcome_reasons=["bounded_probe_exhausted"],
+    )
+
+    runner = CliRunner()
+    with patch("modelaudit.cli.scan_model_directory_or_file", return_value=mock_result):
+        result = runner.invoke(
+            cli,
+            ["scan", str(test_file), "--format", "text", "--no-cache"],
+            catch_exceptions=False,
+        )
+
+    clean_output = strip_ansi(result.output)
+    assert result.exit_code == 2
+    assert f"Scanned {test_file}: Coverage incomplete" in clean_output
+    assert f"Scanned {test_file}: Clean" not in clean_output
+    assert "No security issues detected" not in clean_output
+    assert "SCAN COVERAGE INCOMPLETE" in clean_output
 
 
 def test_format_text_output_only_info_issues():
