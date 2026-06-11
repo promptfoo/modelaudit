@@ -3100,7 +3100,7 @@ class TestGetModelInfo:
     """Test retrieving model metadata from HuggingFace."""
 
     @patch("huggingface_hub.HfApi")
-    def test_get_model_info_with_author(self, mock_hf_api_class):
+    def test_get_model_info_with_author(self, mock_hf_api_class: MagicMock) -> None:
         """Ensure author is returned when available."""
         mock_api = MagicMock()
         mock_hf_api_class.return_value = mock_api
@@ -3115,17 +3115,20 @@ class TestGetModelInfo:
         # (implementation skips .gitattributes and README.md)
         mock_api.list_repo_tree.return_value = [
             SimpleNamespace(path="config.json", size=100),
+            SimpleNamespace(path="nested/model.safetensors", size=200),
             SimpleNamespace(path="README.md", size=50),  # This will be skipped
         ]
 
         info = get_model_info("https://huggingface.co/test/model")
 
         assert info["author"] == "test-author"
-        assert info["total_size"] == 100
-        assert info["file_count"] == 1
+        assert info["total_size"] == 300
+        assert info["file_count"] == 2
+        assert {file["name"] for file in info["files"]} == {"config.json", "nested/model.safetensors"}
+        mock_api.list_repo_tree.assert_called_once_with("test/model", recursive=True)
 
     @patch("huggingface_hub.HfApi")
-    def test_get_model_info_without_author(self, mock_hf_api_class):
+    def test_get_model_info_without_author(self, mock_hf_api_class: MagicMock) -> None:
         """Default to empty string when author is missing."""
         mock_api = MagicMock()
         mock_hf_api_class.return_value = mock_api

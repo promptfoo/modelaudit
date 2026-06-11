@@ -1485,7 +1485,7 @@ def get_model_info(url: str) -> dict:
         total_size = 0
         files = []
         try:
-            repo_files = api.list_repo_tree(repo_id, recursive=False)
+            repo_files = api.list_repo_tree(repo_id, recursive=True)
             for item in repo_files:
                 # Skip metadata files
                 if hasattr(item, "path") and item.path not in [".gitattributes", "README.md"]:

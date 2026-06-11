@@ -339,6 +339,20 @@ def test_scan_does_not_auto_load_untrusted_local_config(tmp_path: Path) -> None:
     assert any(issue.get("rule_code") == "S405" for issue in output_payload.get("issues", []))
 
 
+def test_scan_dry_run_local_findings_preserve_issue_exit_code(tmp_path: Path) -> None:
+    model_file = tmp_path / "payload.pkl"
+    model_file.write_bytes(b"cos\nsystem\n(S'echo dry-run-control'\ntR.")
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--dry-run", "--format", "json", "--scanners", "pickle", str(model_file)],
+    )
+
+    assert result.exit_code == 1
+    output_payload = parse_click_json_output(result.output)
+    assert any(issue.get("severity") == "critical" for issue in output_payload.get("issues", []))
+
+
 def test_scan_json_subprocess_separates_logs_from_stdout_for_findings(tmp_path: Path) -> None:
     """Real process execution keeps JSON parseable without leaking finding payloads to logs."""
     import tarfile

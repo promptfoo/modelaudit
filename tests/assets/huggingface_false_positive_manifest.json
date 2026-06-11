@@ -11,17 +11,9 @@
     "expected_outcome": {
       "exit_code": 0,
       "success": true,
-      "forbidden_issue_severities": [
-        "warning",
-        "critical"
-      ]
+      "forbidden_issue_severities": ["warning", "critical"]
     },
-    "modes": [
-      "local-directory",
-      "streaming",
-      "dry-run",
-      "scanner-selective"
-    ],
+    "modes": ["local-directory", "streaming", "dry-run", "scanner-selective"],
     "wall_time_budget_seconds": 300,
     "max_download_bytes": 104857600
   },
@@ -35,33 +27,23 @@
         {
           "path": "model.safetensors",
           "size_bytes": 90868376,
-          "scanners": [
-            "safetensors"
-          ],
+          "scanners": ["safetensors"],
           "expected_outcome": "clean"
         }
       ],
       "expected_outcome": {
         "exit_code": 0,
         "success": true,
-        "forbidden_issue_severities": [
-          "warning",
-          "critical"
-        ]
+        "forbidden_issue_severities": ["warning", "critical"]
       },
       "wall_time_budget_seconds": 180,
       "max_download_bytes": 104857600,
       "malicious_control": {
         "path": "controls/rank02_payload.pt",
         "generator": "synthetic_malicious_pytorch_zip",
-        "scanners": [
-          "pytorch_zip",
-          "pickle"
-        ],
+        "scanners": ["pytorch_zip", "pickle"],
         "expected_exit_code": 1,
-        "expected_issue_severities": [
-          "critical"
-        ]
+        "expected_issue_severities": ["critical"]
       }
     },
     {
@@ -73,32 +55,23 @@
         {
           "path": "training_args.bin",
           "size_bytes": 7288,
-          "scanners": [
-            "pickle"
-          ],
+          "scanners": ["pickle"],
           "expected_outcome": "clean"
         }
       ],
       "expected_outcome": {
         "exit_code": 0,
         "success": true,
-        "forbidden_issue_severities": [
-          "warning",
-          "critical"
-        ]
+        "forbidden_issue_severities": ["warning", "critical"]
       },
       "wall_time_budget_seconds": 120,
       "max_download_bytes": 10485760,
       "malicious_control": {
         "path": "controls/rank04_payload.pkl",
         "generator": "synthetic_malicious_pickle",
-        "scanners": [
-          "pickle"
-        ],
+        "scanners": ["pickle"],
         "expected_exit_code": 1,
-        "expected_issue_severities": [
-          "critical"
-        ]
+        "expected_issue_severities": ["critical"]
       }
     },
     {
@@ -110,33 +83,23 @@
         {
           "path": "mmproj-F16.gguf",
           "size_bytes": 175115840,
-          "scanners": [
-            "gguf"
-          ],
+          "scanners": ["gguf"],
           "expected_outcome": "clean"
         }
       ],
       "expected_outcome": {
         "exit_code": 0,
         "success": true,
-        "forbidden_issue_severities": [
-          "warning",
-          "critical"
-        ]
+        "forbidden_issue_severities": ["warning", "critical"]
       },
       "wall_time_budget_seconds": 420,
       "max_download_bytes": 209715200,
       "malicious_control": {
         "path": "controls/rank07_payload.pt",
         "generator": "synthetic_malicious_pytorch_zip",
-        "scanners": [
-          "pytorch_zip",
-          "pickle"
-        ],
+        "scanners": ["pytorch_zip", "pickle"],
         "expected_exit_code": 1,
-        "expected_issue_severities": [
-          "critical"
-        ]
+        "expected_issue_severities": ["critical"]
       }
     },
     {
@@ -148,32 +111,23 @@
         {
           "path": "coreml/fill-mask/float32_model.mlpackage/Data/com.apple.CoreML/model.mlmodel",
           "size_bytes": 164911,
-          "scanners": [
-            "coreml"
-          ],
+          "scanners": ["coreml"],
           "expected_outcome": "clean"
         }
       ],
       "expected_outcome": {
         "exit_code": 0,
         "success": true,
-        "forbidden_issue_severities": [
-          "warning",
-          "critical"
-        ]
+        "forbidden_issue_severities": ["warning", "critical"]
       },
       "wall_time_budget_seconds": 180,
       "max_download_bytes": 10485760,
       "malicious_control": {
         "path": "controls/rank08_payload.pkl",
         "generator": "synthetic_malicious_pickle",
-        "scanners": [
-          "pickle"
-        ],
+        "scanners": ["pickle"],
         "expected_exit_code": 1,
-        "expected_issue_severities": [
-          "critical"
-        ]
+        "expected_issue_severities": ["critical"]
       }
     },
     {
@@ -185,32 +139,23 @@
         {
           "path": "nemotron-3.5-asr-streaming-0.6b.nemo",
           "size_bytes": 2368284501,
-          "scanners": [
-            "nemo"
-          ],
+          "scanners": ["nemo"],
           "expected_outcome": "clean"
         }
       ],
       "expected_outcome": {
         "exit_code": 0,
         "success": true,
-        "forbidden_issue_severities": [
-          "warning",
-          "critical"
-        ]
+        "forbidden_issue_severities": ["warning", "critical"]
       },
       "wall_time_budget_seconds": 1200,
       "max_download_bytes": 3221225472,
       "malicious_control": {
         "path": "controls/rank19_payload.pkl",
         "generator": "synthetic_malicious_pickle",
-        "scanners": [
-          "pickle"
-        ],
+        "scanners": ["pickle"],
         "expected_exit_code": 1,
-        "expected_issue_severities": [
-          "critical"
-        ]
+        "expected_issue_severities": ["critical"]
       }
     },
     {
@@ -233,32 +178,23 @@
         {
           "path": "model.safetensors.index.json",
           "size_bytes": 23950,
-          "scanners": [
-            "manifest"
-          ],
+          "scanners": ["manifest"],
           "expected_outcome": "clean"
         }
       ],
       "expected_outcome": {
         "exit_code": 0,
         "success": true,
-        "forbidden_issue_severities": [
-          "warning",
-          "critical"
-        ]
+        "forbidden_issue_severities": ["warning", "critical"]
       },
       "wall_time_budget_seconds": 180,
       "max_download_bytes": 10485760,
       "malicious_control": {
         "path": "controls/rank21_payload.pkl",
         "generator": "synthetic_malicious_pickle",
-        "scanners": [
-          "pickle"
-        ],
+        "scanners": ["pickle"],
         "expected_exit_code": 1,
-        "expected_issue_severities": [
-          "critical"
-        ]
+        "expected_issue_severities": ["critical"]
       }
     },
     {
@@ -270,34 +206,23 @@
         {
           "path": "sparse_linear.pt",
           "size_bytes": 3516,
-          "scanners": [
-            "pytorch_zip",
-            "pickle"
-          ],
+          "scanners": ["pytorch_zip", "pickle"],
           "expected_outcome": "clean"
         }
       ],
       "expected_outcome": {
         "exit_code": 0,
         "success": true,
-        "forbidden_issue_severities": [
-          "warning",
-          "critical"
-        ]
+        "forbidden_issue_severities": ["warning", "critical"]
       },
       "wall_time_budget_seconds": 180,
       "max_download_bytes": 10485760,
       "malicious_control": {
         "path": "controls/rank23_payload.pt",
         "generator": "synthetic_malicious_pytorch_zip",
-        "scanners": [
-          "pytorch_zip",
-          "pickle"
-        ],
+        "scanners": ["pytorch_zip", "pickle"],
         "expected_exit_code": 1,
-        "expected_issue_severities": [
-          "critical"
-        ]
+        "expected_issue_severities": ["critical"]
       }
     }
   ]

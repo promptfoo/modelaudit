@@ -2443,7 +2443,13 @@ def _record_scan_end_and_exit(
     finally:
         flush_telemetry()
 
-    if dry_run and not audit_result.has_errors and audit_result.success is not False:
+    if (
+        dry_run
+        and audit_result.files_scanned == 0
+        and not audit_result.has_errors
+        and not audit_result.issues
+        and audit_result.success is not False
+    ):
         sys.exit(0)
     sys.exit(determine_exit_code(audit_result))
 
