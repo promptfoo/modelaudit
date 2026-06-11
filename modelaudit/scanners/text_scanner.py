@@ -90,6 +90,46 @@ BARE_NETWORK_TOKEN_PATTERNS = (
     BARE_NETWORK_IPV6_TOKEN_PATTERN,
     BARE_NETWORK_DOMAIN_TOKEN_PATTERN,
 )
+DOCUMENTATION_BARE_DOMAIN_TLDS = frozenset(
+    {
+        "ai",
+        "app",
+        "au",
+        "ca",
+        "cc",
+        "cf",
+        "ch",
+        "cn",
+        "co",
+        "com",
+        "de",
+        "dev",
+        "edu",
+        "es",
+        "example",
+        "fr",
+        "ga",
+        "gov",
+        "int",
+        "io",
+        "it",
+        "jp",
+        "mil",
+        "ml",
+        "net",
+        "nl",
+        "no",
+        "org",
+        "pw",
+        "ru",
+        "se",
+        "tk",
+        "to",
+        "uk",
+        "us",
+        "xyz",
+    }
+)
 MAX_TEXT_FINDING_CONTEXT_BYTES = 4096
 MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES = 1024
 DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
@@ -108,6 +148,12 @@ DOCUMENTATION_EXECUTABLE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN = re.compile(rb"\b(?:href|src)\s*=\s*[\"']?$", re.IGNORECASE)
 DOCUMENTATION_CODE_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$")
 DOCUMENTATION_MARKDOWN_LINK_URL_PREFIX_PATTERN = re.compile(rb"!?\[[^\]\r\n]{0,4096}\]\($")
+DOCUMENTATION_BIBLIOGRAPHY_ENTRY_START_PATTERN = re.compile(rb"(?im)^\s*@[A-Za-z][A-Za-z0-9_-]*\s*\{")
+DOCUMENTATION_BIBLIOGRAPHY_FIELD_PREFIX_PATTERN = re.compile(
+    rb"\s*[A-Za-z][A-Za-z0-9_-]*\s*=\s*[{\"']?[^,\r\n]{0,4096}$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_BIBLIOGRAPHY_URL_FIELD_PREFIX_PATTERN = re.compile(rb"\s*url\s*=\s*\{?\s*$", re.IGNORECASE)
 DOCUMENTATION_MARKDOWN_PREFIX_PATTERN = re.compile(rb"(?:(?:[-*+>]|[0-9]{1,9}[.)])\s+){1,8}")
 DOCUMENTATION_CONFIG_NETWORK_KEY = rb"(?:endpoint|callback|webhook)(?:s|[_-][A-Za-z0-9_.-]{1,128}|(?:url|uri)s?)?"
 DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
@@ -1241,6 +1287,8 @@ class TextScanner(BaseScanner):
             return False
         if cls._documentation_comment_contains_position(payload, position):
             return False
+        if cls._documentation_position_is_in_passive_bibliography_field(payload, position):
+            return False
         if cls._documentation_position_is_in_passive_markdown_link(payload, position):
             return False
         if cls._finding_line_prefix_is_truncated(payload, finding):
@@ -1541,6 +1589,84 @@ class TextScanner(BaseScanner):
         return True
 
     @staticmethod
+    def _documentation_position_is_in_bibliography_entry(payload: bytes, line_start: int) -> bool:
+        context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        context = payload[context_start:line_start]
+        entry_start = None
+        for match in DOCUMENTATION_BIBLIOGRAPHY_ENTRY_START_PATTERN.finditer(context):
+            entry_start = match.start()
+        if entry_start is None:
+            return False
+        entry_context = context[entry_start:]
+        return entry_context.count(b"{") > entry_context.count(b"}")
+
+    @classmethod
+    def _documentation_position_is_in_passive_bibliography_field(cls, payload: bytes, position: int) -> bool:
+        position = min(max(position, 0), len(payload))
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        line_end = payload.find(b"\n", position)
+        if line_end < 0:
+            line_end = len(payload)
+        if not cls._documentation_position_is_in_bibliography_entry(payload, line_start):
+            return False
+        line = payload[line_start:line_end]
+        line_position = position - line_start
+        return DOCUMENTATION_BIBLIOGRAPHY_FIELD_PREFIX_PATTERN.fullmatch(line[:line_position]) is not None
+
+    @classmethod
+    def _documentation_bibliography_url_field_is_passive(
+        cls,
+        payload: bytes,
+        line_start: int,
+        line: bytes,
+        position: int,
+    ) -> bool:
+        return DOCUMENTATION_BIBLIOGRAPHY_URL_FIELD_PREFIX_PATTERN.fullmatch(
+            line[:position]
+        ) is not None and cls._documentation_position_is_in_bibliography_entry(payload, line_start)
+
+    @classmethod
+    def _documentation_network_token_lines_are_passive(cls, payload: bytes) -> bool:
+        line_start = 0
+        while line_start <= len(payload):
+            line_end = payload.find(b"\n", line_start)
+            if line_end < 0:
+                line_end = len(payload)
+            line = payload[line_start:line_end]
+            url_spans: list[tuple[int, int]] = []
+            for match in BARE_NETWORK_URL_TOKEN_PATTERN.finditer(line):
+                url_spans.append((match.start(), match.end()))
+                if cls._documentation_bibliography_url_field_is_passive(payload, line_start, line, match.start()):
+                    continue
+                if cls._documentation_line_is_code_shaped(line, match.start()):
+                    return False
+            for pattern in (
+                BARE_NETWORK_IPV4_TOKEN_PATTERN,
+                BARE_NETWORK_IPV6_TOKEN_PATTERN,
+                BARE_NETWORK_DOMAIN_TOKEN_PATTERN,
+            ):
+                for match in pattern.finditer(line):
+                    if any(start <= match.start() < end for start, end in url_spans):
+                        continue
+                    if pattern is BARE_NETWORK_DOMAIN_TOKEN_PATTERN:
+                        if cls._documentation_position_is_in_passive_bibliography_field(
+                            payload,
+                            line_start + match.start(),
+                        ):
+                            continue
+                        before = line[match.start() - 1 : match.start()] if match.start() > 0 else b""
+                        after = line[match.end() : match.end() + 1]
+                        tld = match.group().rsplit(b".", 1)[-1].decode("utf-8", errors="ignore").casefold()
+                        if before in {b".", b"_"} or after in {b".", b"_"} or tld not in DOCUMENTATION_BARE_DOMAIN_TLDS:
+                            continue
+                    if cls._documentation_line_is_code_shaped(line, match.start()):
+                        return False
+            if line_end == len(payload):
+                break
+            line_start = line_end + 1
+        return True
+
+    @staticmethod
     def _split_detector_finding_limit(
         findings: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
@@ -1561,6 +1687,10 @@ class TextScanner(BaseScanner):
         findings: list[dict[str, Any]],
         finding_limit: dict[str, Any],
     ) -> bool:
+        if finding_limit.get(
+            "truncated_finding_type"
+        ) == "endpoint_redaction_classification" and cls._is_documentation_sidecar(path):
+            return cls._documentation_network_token_lines_are_passive(payload)
         if finding_limit.get("truncated_finding_type") not in PASSIVE_NETWORK_FINDING_TYPES:
             return False
         truncated_finding = finding_limit.get("truncated_finding")
