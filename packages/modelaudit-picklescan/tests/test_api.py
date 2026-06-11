@@ -152,6 +152,7 @@ def _static_getattr_reduce_payload(
     target_name: bytes = b"Detect",
     attribute: bytes = b"forward",
     invoke_result: bool = False,
+    stop: bool = True,
 ) -> bytes:
     payload = (
         b"\x80\x04"
@@ -162,7 +163,11 @@ def _static_getattr_reduce_payload(
     )
     if invoke_result:
         payload += b")R"
-    return payload + b"."
+    return payload + (b"." if stop else b"")
+
+
+def _static_getattr_protocol0_unicode_payload() -> bytes:
+    return b"c__builtin__\ngetattr\ncultralytics.nn.modules.head\nDetect\nVforward\n\x86R."
 
 
 def _static_getattr_with_opaque_target_payload() -> bytes:
@@ -178,7 +183,12 @@ def _static_getattr_with_non_literal_attribute_payload() -> bytes:
     )
 
 
-def _static_getattr_with_memo_alias_payload(*, alias_callable: bool = False, alias_target: bool = False) -> bytes:
+def _static_getattr_with_memo_alias_payload(
+    *,
+    alias_callable: bool = False,
+    alias_target: bool = False,
+    alias_attribute: bool = False,
+) -> bytes:
     payload = b"\x80\x04"
     if alias_callable:
         payload += _global(b"__builtin__", b"getattr") + b"q\x000h\x00"
@@ -188,7 +198,11 @@ def _static_getattr_with_memo_alias_payload(*, alias_callable: bool = False, ali
         payload += _global(b"ultralytics.nn.modules.head", b"Detect") + b"q\x010h\x01"
     else:
         payload += _global(b"ultralytics.nn.modules.head", b"Detect")
-    return payload + _binunicode(b"forward") + b"\x86R."
+    if alias_attribute:
+        payload += _binunicode(b"forward") + b"q\x020h\x02"
+    else:
+        payload += _binunicode(b"forward")
+    return payload + b"\x86R."
 
 
 def _clear_ultralytics_modules() -> None:
@@ -302,6 +316,24 @@ def test_scan_bytes_tracks_static_getattr_reconstructed_result_invocation(
     )
 
 
+def test_scan_bytes_suppresses_protocol0_unicode_static_getattr_reconstruction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
+
+    report = scan_bytes(
+        _static_getattr_protocol0_unicode_payload(),
+        source="protocol0-ultralytics-detect-forward-getattr.pkl",
+    )
+
+    assert not _dangerous_getattr_findings(report)
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -311,6 +343,7 @@ def test_scan_bytes_tracks_static_getattr_reconstructed_result_invocation(
         _static_getattr_with_non_literal_attribute_payload(),
         _static_getattr_with_memo_alias_payload(alias_callable=True),
         _static_getattr_with_memo_alias_payload(alias_target=True),
+        _static_getattr_with_memo_alias_payload(alias_attribute=True),
     ],
 )
 def test_scan_bytes_static_getattr_unsafe_context_stays_critical(payload: bytes) -> None:
@@ -320,6 +353,70 @@ def test_scan_bytes_static_getattr_unsafe_context_stays_critical(payload: bytes)
     findings = _dangerous_getattr_findings(report)
     assert findings
     assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_oversized_attribute_stays_critical_without_metadata_bloat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
+    payload = _static_getattr_reduce_payload(attribute=b"forward" + (b"a" * 1024))
+
+    report = scan_bytes(
+        payload,
+        source="oversized-static-getattr.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8),
+    )
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all("getattr_attribute_name" not in invocation for invocation in report.metadata["callable_invocations"])
+
+
+def test_scan_bytes_repeated_static_getattr_reconstructions_suppress_each_position(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
+    payload = _static_getattr_reduce_payload(stop=False) + b"0" + _static_getattr_reduce_payload()[2:]
+
+    report = scan_bytes(payload, source="repeated-static-getattr.pkl")
+
+    assert not _dangerous_getattr_findings(report)
+    getattr_invocations = [
+        invocation
+        for invocation in report.metadata["callable_invocations"]
+        if invocation.get("import_reference") == "__builtin__.getattr"
+    ]
+    assert len(getattr_invocations) == 2
+    assert len({invocation["opcode_position"] for invocation in getattr_invocations}) == 2
+
+
+def test_scan_bytes_mixed_repeated_static_getattr_keeps_unsafe_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
+    payload = (
+        _static_getattr_reduce_payload(stop=False) + b"0" + _static_getattr_reduce_payload(attribute=b"__dict__")[2:]
+    )
+
+    report = scan_bytes(payload, source="mixed-repeated-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert len(findings) == 1
 
 
 def test_scan_bytes_static_getattr_source_backed_method_sink_stays_critical(
@@ -333,6 +430,23 @@ def test_scan_bytes_static_getattr_source_backed_method_sink_stays_critical(
     )
 
     report = scan_bytes(_static_getattr_reduce_payload(), source="sink-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_decorated_method_descriptor_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    @property\n    def forward(self):\n        return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="decorated-static-getattr.pkl")
 
     findings = _dangerous_getattr_findings(report)
     assert findings

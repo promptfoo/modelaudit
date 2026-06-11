@@ -8036,6 +8036,8 @@ def _static_getattr_reduce_payload(
     non_literal_attribute: bool = False,
     alias_callable: bool = False,
     alias_target: bool = False,
+    alias_attribute: bool = False,
+    stop: bool = True,
 ) -> bytes:
     payload = b"\x80\x04"
     if alias_callable:
@@ -8050,9 +8052,16 @@ def _static_getattr_reduce_payload(
         payload += _pickle_global(b"ultralytics.nn.modules.head", b"Detect")
     if non_literal_attribute:
         payload += b"K\x01"
+    elif alias_attribute:
+        payload += _pickle_binunicode(b"forward") + b"q\x020h\x02"
     else:
         payload += _pickle_binunicode(attribute)
-    return payload + b"\x86R."
+    payload += b"\x86R"
+    return payload + (b"." if stop else b"")
+
+
+def _static_getattr_protocol0_unicode_payload() -> bytes:
+    return b"c__builtin__\ngetattr\ncultralytics.nn.modules.head\nDetect\nVforward\n\x86R."
 
 
 def _clear_ultralytics_modules() -> None:
@@ -8121,6 +8130,22 @@ def test_pytorch_zip_static_getattr_framework_reconstruction_does_not_emit_s115(
     assert not _critical_s115_getattr_issues(result)
 
 
+def test_pytorch_zip_static_getattr_protocol0_reconstruction_does_not_emit_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_protocol0_unicode_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert not _critical_s115_getattr_issues(result)
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -8130,6 +8155,7 @@ def test_pytorch_zip_static_getattr_framework_reconstruction_does_not_emit_s115(
         _static_getattr_reduce_payload(non_literal_attribute=True),
         _static_getattr_reduce_payload(alias_callable=True),
         _static_getattr_reduce_payload(alias_target=True),
+        _static_getattr_reduce_payload(alias_attribute=True),
     ],
 )
 def test_pytorch_zip_static_getattr_unsafe_context_keeps_s115(tmp_path: Path, payload: bytes) -> None:
@@ -8141,6 +8167,42 @@ def test_pytorch_zip_static_getattr_unsafe_context_keeps_s115(tmp_path: Path, pa
     assert _critical_s115_getattr_issues(result)
 
 
+def test_pytorch_zip_repeated_static_getattr_reconstructions_suppress_each_position(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
+    payload = _static_getattr_reduce_payload(stop=False) + b"0" + _static_getattr_reduce_payload()[2:]
+    model_path = _write_getattr_reconstruction_zip(tmp_path, payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert not _critical_s115_getattr_issues(result)
+
+
+def test_pytorch_zip_mixed_repeated_static_getattr_keeps_unsafe_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
+    payload = (
+        _static_getattr_reduce_payload(stop=False) + b"0" + _static_getattr_reduce_payload(attribute=b"__dict__")[2:]
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert len(_critical_s115_getattr_issues(result)) == 1
+
+
 def test_pytorch_zip_static_getattr_source_backed_method_sink_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -8149,6 +8211,22 @@ def test_pytorch_zip_static_getattr_source_backed_method_sink_keeps_s115(
         tmp_path,
         monkeypatch,
         "import os\n\nclass Detect:\n    def forward(self):\n        os.system('id')\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
+def test_pytorch_zip_static_getattr_decorated_method_descriptor_keeps_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    @property\n    def forward(self):\n        return None\n",
     )
     model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
 

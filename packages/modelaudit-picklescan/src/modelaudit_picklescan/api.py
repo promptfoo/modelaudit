@@ -1752,7 +1752,8 @@ def _trusted_static_getattr_reconstruction(invocation: Mapping[str, object]) -> 
 def _getattr_reconstruction_has_source_backed_proof(invocation: Mapping[str, object]) -> bool:
     target_module = str(invocation.get("getattr_target_module", ""))
     target_name = str(invocation.get("getattr_target_name", ""))
-    if not class_static_attribute_lookup_is_proven_source_backed(target_module, target_name):
+    attribute_name = str(invocation.get("getattr_attribute_name", ""))
+    if not class_static_attribute_lookup_is_proven_source_backed(target_module, target_name, attribute_name):
         return False
     _lookup_invocation, resolved_invocation = _getattr_reconstruction_source_proof_invocations(invocation)
     analyzed_positions = find_analyzed_callable_call_graph_global_positions((resolved_invocation,))

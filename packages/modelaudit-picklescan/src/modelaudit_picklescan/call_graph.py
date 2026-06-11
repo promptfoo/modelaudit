@@ -2009,15 +2009,18 @@ def find_analyzed_callable_call_graph_global_positions(
     return frozenset(positions)
 
 
-def class_static_attribute_lookup_is_proven_source_backed(module: str, name: str) -> bool:
-    """Return whether a static class attribute lookup is source-backed and has no explicit metaclass."""
+def class_static_attribute_lookup_is_proven_source_backed(module: str, name: str, attribute: str) -> bool:
+    """Return whether a static class attribute lookup is source-backed as a plain method."""
     class_target = _resolve_class_target(f"{module}.{name}")
     if class_target is None:
         return False
     context = _source_class_context(class_target)
     if context is None:
         return False
-    return not _class_has_explicit_metaclass(context.class_node)
+    return not _class_has_explicit_metaclass(context.class_node) and _class_has_plain_local_method(
+        context.class_node,
+        attribute,
+    )
 
 
 def module_initialization_is_proven_inert(module_name: str) -> bool:
@@ -4882,6 +4885,13 @@ def _class_method_nodes(class_node: ast.ClassDef) -> dict[str, ast.FunctionDef |
 
 def _class_has_explicit_metaclass(class_node: ast.ClassDef) -> bool:
     return any(keyword.arg == "metaclass" for keyword in class_node.keywords)
+
+
+def _class_has_plain_local_method(class_node: ast.ClassDef, method_name: str) -> bool:
+    for child in _definition_scope_statements(class_node.body):
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef) and child.name == method_name:
+            return not child.decorator_list
+    return False
 
 
 def _inherited_class_methods(

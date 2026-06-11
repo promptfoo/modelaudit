@@ -468,6 +468,8 @@ type CallableInvocationDedupeKey = (
     String,
     String,
     Option<usize>,
+    Option<usize>,
+    Option<usize>,
     Option<bool>,
     Option<Vec<String>>,
 );
@@ -510,9 +512,17 @@ fn is_builtin_getattr_reference(reference: &GlobalRef) -> bool {
     )
 }
 
-fn direct_literal_text(value: &StackValue, payload: &[u8]) -> Option<String> {
+fn direct_literal_text(value: &StackValue, payload: &[u8], max_bytes: usize) -> Option<String> {
     match value {
-        StackValue::TextSpan { start, end } if start <= end && *end <= payload.len() => {
+        StackValue::Text {
+            value,
+            memo_read: false,
+        } if value.len() <= max_bytes => Some(value.clone()),
+        StackValue::TextSpan {
+            start,
+            end,
+            memo_read: false,
+        } if start <= end && *end <= payload.len() && end.saturating_sub(*start) <= max_bytes => {
             Some(String::from_utf8_lossy(&payload[*start..*end]).to_string())
         }
         _ => None,
@@ -1102,7 +1112,9 @@ impl<'a> ScanState<'a> {
             return MAX_TRACKED_STATE_BYTES.saturating_add(1);
         }
         match value {
-            StackValue::Text(value) | StackValue::StringTemplate { template: value } => value.len(),
+            StackValue::Text { value, .. } | StackValue::StringTemplate { template: value } => {
+                value.len()
+            }
             StackValue::Global(reference)
             | StackValue::Constructed(reference)
             | StackValue::DefaultDict {
@@ -1193,7 +1205,7 @@ impl<'a> ScanState<'a> {
             StackValue::Tuple(values) => values
                 .iter()
                 .any(Self::tracked_dict_value_is_security_relevant),
-            StackValue::Text(_)
+            StackValue::Text { .. }
             | StackValue::TextSpan { .. }
             | StackValue::Bytes { .. }
             | StackValue::Primitive { .. }
@@ -4561,17 +4573,16 @@ impl<'a> ScanState<'a> {
     fn is_format_string_argument(value: Option<&StackValue>) -> bool {
         matches!(
             value,
-            Some(StackValue::Text(_) | StackValue::TextSpan { .. })
+            Some(StackValue::Text { .. } | StackValue::TextSpan { .. })
         )
     }
 
     fn is_definitely_non_empty_iterable_argument(value: Option<&StackValue>) -> bool {
         match value {
             Some(StackValue::Tuple(items)) => !items.is_empty(),
-            Some(StackValue::Text(value)) => !value.is_empty(),
-            Some(StackValue::TextSpan { start, end }) | Some(StackValue::Bytes { start, end }) => {
-                start < end
-            }
+            Some(StackValue::Text { value, .. }) => !value.is_empty(),
+            Some(StackValue::TextSpan { start, end, .. })
+            | Some(StackValue::Bytes { start, end }) => start < end,
             _ => false,
         }
     }
@@ -5184,6 +5195,22 @@ impl<'a> ScanState<'a> {
                 reference.memo_read |= memo_read;
                 StackValue::Constructed(reference)
             }
+            StackValue::Text {
+                value,
+                memo_read: existing_memo_read,
+            } => StackValue::Text {
+                value: value.clone(),
+                memo_read: *existing_memo_read || memo_read,
+            },
+            StackValue::TextSpan {
+                start,
+                end,
+                memo_read: existing_memo_read,
+            } => StackValue::TextSpan {
+                start: *start,
+                end: *end,
+                memo_read: *existing_memo_read || memo_read,
+            },
             value => value.clone(),
         }
     }
@@ -5323,7 +5350,11 @@ impl<'a> ScanState<'a> {
         if target.malformed {
             return None;
         }
-        let attribute_name = direct_literal_text(attribute_value, self.payload)?;
+        let attribute_name = direct_literal_text(
+            attribute_value,
+            self.payload,
+            self.options.max_string_literal_scan_chars,
+        )?;
         let attribute_is_safe_identifier = safe_static_getattr_attribute(&attribute_name);
         let callable_is_direct = !callable.memo_read;
         let target_is_direct = !target.memo_read;
@@ -5714,7 +5745,10 @@ impl<'a> ScanState<'a> {
             }
             result.push_str(&item);
         }
-        Some(StackValue::Text(result))
+        Some(StackValue::Text {
+            value: result,
+            memo_read: false,
+        })
     }
 
     fn stack_value_tuple_index(value: &StackValue, len: usize) -> Option<usize> {
@@ -6803,7 +6837,10 @@ impl<'a> ScanState<'a> {
         let persistent_id = if opcode.name == "BINPERSID" {
             self.pop_stack_value()
         } else {
-            Some(StackValue::Text(opcode.arg.coerce_text(self.payload)))
+            Some(StackValue::Text {
+                value: opcode.arg.coerce_text(self.payload),
+                memo_read: false,
+            })
         };
         self.push_stack_value(StackValue::Other);
         let storage_descriptor = persistent_id
@@ -7012,6 +7049,8 @@ impl<'a> ScanState<'a> {
             invocation.reference.module.clone(),
             invocation.reference.name.clone(),
             invocation.op_name.to_string(),
+            Some(invocation.reference.position),
+            Some(invocation.opcode_position),
             invocation.positional_arg_count,
             invocation.build_uses_slot_state,
             invocation.keyword_arg_names.clone(),
@@ -8021,6 +8060,8 @@ impl<'a> ScanState<'a> {
             return None;
         }
         let opcode = detail_string(details, "opcode")?;
+        let global_position = detail_usize(details, "global_position");
+        let opcode_position = detail_usize(details, "opcode_position");
         let positional_arg_count = detail_usize(details, "positional_arg_count");
         let build_uses_slot_state = details.iter().find_map(|(key, value)| {
             if key != "build_uses_slot_state" {
@@ -8050,6 +8091,8 @@ impl<'a> ScanState<'a> {
             module,
             name,
             opcode,
+            global_position,
+            opcode_position,
             positional_arg_count,
             build_uses_slot_state,
             keyword_arg_names,
@@ -8303,8 +8346,11 @@ fn nested_scan_has_only_allowlisted_constructor_refs(scan: &ScanState<'_>) -> bo
 
 fn post_budget_owned_stack_value(value: &StackValue, payload: &[u8]) -> StackValue {
     match value {
-        StackValue::TextSpan { start, end } if start <= end && *end <= payload.len() => {
-            StackValue::Text(String::from_utf8_lossy(&payload[*start..*end]).to_string())
+        StackValue::TextSpan { start, end, .. } if start <= end && *end <= payload.len() => {
+            StackValue::Text {
+                value: String::from_utf8_lossy(&payload[*start..*end]).to_string(),
+                memo_read: false,
+            }
         }
         StackValue::Bytes { start, end } if start <= end && *end <= payload.len() => {
             StackValue::Bytes {
@@ -9167,25 +9213,43 @@ mod tests {
         let within_bound = vec![
             callable.clone(),
             StackValue::Tuple(vec![
-                StackValue::Text("x".repeat(MAX_TRACKED_STR_JOIN_RESULT_BYTES - 2)),
+                StackValue::Text {
+                    value: "x".repeat(MAX_TRACKED_STR_JOIN_RESULT_BYTES - 2),
+                    memo_read: false,
+                },
                 StackValue::Tuple(vec![
-                    StackValue::Text("a".to_string()),
-                    StackValue::Text("b".to_string()),
+                    StackValue::Text {
+                        value: "a".to_string(),
+                        memo_read: false,
+                    },
+                    StackValue::Text {
+                        value: "b".to_string(),
+                        memo_read: false,
+                    },
                 ]),
             ]),
         ];
         assert!(matches!(
             scan.str_join_result(&within_bound),
-            Some(StackValue::Text(value)) if value.len() == MAX_TRACKED_STR_JOIN_RESULT_BYTES
+            Some(StackValue::Text { value, .. }) if value.len() == MAX_TRACKED_STR_JOIN_RESULT_BYTES
         ));
 
         let over_bound = vec![
             callable,
             StackValue::Tuple(vec![
-                StackValue::Text("x".repeat(MAX_TRACKED_STR_JOIN_RESULT_BYTES - 1)),
+                StackValue::Text {
+                    value: "x".repeat(MAX_TRACKED_STR_JOIN_RESULT_BYTES - 1),
+                    memo_read: false,
+                },
                 StackValue::Tuple(vec![
-                    StackValue::Text("a".to_string()),
-                    StackValue::Text("b".to_string()),
+                    StackValue::Text {
+                        value: "a".to_string(),
+                        memo_read: false,
+                    },
+                    StackValue::Text {
+                        value: "b".to_string(),
+                        memo_read: false,
+                    },
                 ]),
             ]),
         ];
@@ -10053,7 +10117,10 @@ mod tests {
             0,
             None,
         );
-        scan.stack.push(StackValue::Text("survivor".to_string()));
+        scan.stack.push(StackValue::Text {
+            value: "survivor".to_string(),
+            memo_read: false,
+        });
 
         assert!(scan.consume_top_operand_values(2).is_none());
 
@@ -10495,7 +10562,7 @@ mod tests {
         scan.push_callable_invocation(&second);
         scan.push_callable_invocation(&duplicate_reduce);
 
-        assert_eq!(scan.callable_invocations.len(), 2);
+        assert_eq!(scan.callable_invocations.len(), 3);
         assert!(!scan.callable_invocations_truncated);
     }
 
