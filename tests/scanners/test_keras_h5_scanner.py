@@ -808,6 +808,42 @@ def test_large_hdf5_soft_link_to_external_storage_still_detected(tmp_path: Path)
     ]
 
 
+def test_large_hdf5_virtual_dataset_source_still_detected(tmp_path: Path) -> None:
+    virtual_source = tmp_path / "virtual_source.h5"
+    with h5py.File(virtual_source, "w") as f:
+        f.create_dataset("payload", data=[1.0, 2.0])
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        keras_version="3.13.1",
+        file_name="large_virtual_dataset.h5",
+    )
+    with h5py.File(model_path, "a") as f:
+        dense = f.require_group("model_weights").create_group("dense")
+        dense.attrs["weight_names"] = [b"virtual_kernel"]
+        f["model_weights"].attrs["layer_names"] = [b"dense"]
+        layout = h5py.VirtualLayout(shape=(2,), dtype="float64")
+        layout[:] = h5py.VirtualSource(virtual_source.name, "/payload", shape=(2,))
+        dense.create_virtual_dataset("virtual_kernel", layout)
+    inflate_h5_file_to_size(model_path)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert_not_rejected_by_read_cap(result)
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "virtual_dataset",
+            "hdf5_path": "/model_weights/dense/virtual_kernel",
+            "sources": [{"filename": "virtual_source.h5", "path": "/payload"}],
+        },
+    ]
+
+
 def test_large_hdf5_soft_link_cycle_fails_closed_without_size_limit(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
@@ -925,6 +961,22 @@ def test_keras_h5_oversized_config_attribute_fails_closed_before_json_parse(
     )
 
 
+def test_generic_hdf5_dangling_layers_soft_link_stays_clean(tmp_path: Path) -> None:
+    model_path = tmp_path / "generic_dangling_layers_soft_link.h5"
+    with h5py.File(model_path, "w") as f:
+        f["layers"] = h5py.SoftLink("/missing")
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+    assert any(
+        check.name == "Keras Model Format Check" and check.details.get("format") == "generic_h5"
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize("attr_name", ["layer_names", "weight_names"])
 def test_keras_h5_oversized_weight_name_attribute_fails_closed_before_materialization(
     tmp_path: Path,
@@ -985,6 +1037,15 @@ def test_real_hf_xlm_roberta_large_h5_reaches_keras_scan_without_read_cap(tmp_pa
 
     assert model_path.stat().st_size == 2_240_076_248
     assert metadata.file_size == 2_240_076_248
+    with h5py.File(model_path, "r") as h5_file:
+        assert sorted(h5_file.keys()) == ["roberta", "top_level_model_weights"]
+        assert set(h5_file.attrs.keys()) == {"backend", "keras_version", "layer_names"}
+        layer_names, layer_names_truncated = KerasH5Scanner._read_bounded_hdf5_name_attribute(
+            h5_file.attrs,
+            "layer_names",
+        )
+        assert layer_names_truncated is False
+        assert layer_names == ["roberta"]
     assert audit_result.files_scanned == 1
     assert "keras_h5" in audit_result.scanner_names
     assert "max_file_read_size_exceeded" not in (metadata_extra.get("scan_outcome_reasons") or [])

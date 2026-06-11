@@ -347,6 +347,7 @@ class KerasH5Scanner(BaseScanner):
     _MAX_HDF5_LINK_VISITS: ClassVar[int] = 4096
     _MAX_HDF5_EXTERNAL_REFERENCE_REPORTS: ClassVar[int] = 20
     _MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS: ClassVar[int] = 20
+    _MAX_HDF5_VIRTUAL_SOURCE_REPORTS: ClassVar[int] = 20
     _MAX_HDF5_REFERENCE_TEXT_CHARS: ClassVar[int] = 4096
     _MAX_HDF5_JSON_ATTRIBUTE_BYTES: ClassVar[int] = 10 * 1024 * 1024
     _MAX_HDF5_NAME_ATTRIBUTE_BYTES: ClassVar[int] = 10 * 1024 * 1024
@@ -859,12 +860,24 @@ class KerasH5Scanner(BaseScanner):
     def _has_keras3_weights_layout(cls, h5_file: Any) -> bool:
         """Detect Keras 3 H5IOStore weights-only layouts without generic HDF5 overreach."""
         layers_link = h5_file.get("layers", getlink=True)
-        if isinstance(layers_link, (h5py.ExternalLink, h5py.SoftLink)):
+        if isinstance(layers_link, h5py.ExternalLink):
             return True
-        if not isinstance(layers_link, h5py.HardLink):
+        if isinstance(layers_link, h5py.SoftLink):
+            target_path, target_link, incomplete = cls._resolve_hdf5_soft_link(h5_file, "layers", layers_link)
+            if incomplete or target_path is None or target_link is None:
+                return False
+            if isinstance(target_link, h5py.ExternalLink):
+                return True
+            if not isinstance(target_link, h5py.HardLink):
+                return False
+            layers = h5_file.get(target_path, getlink=False)
+            layer_source_prefix = target_path
+        elif isinstance(layers_link, h5py.HardLink):
+            layers = h5_file.get("layers", getlink=False)
+            layer_source_prefix = "layers"
+        else:
             return False
 
-        layers = h5_file.get("layers", getlink=False)
         if not isinstance(layers, h5py.Group):
             return False
 
@@ -873,12 +886,22 @@ class KerasH5Scanner(BaseScanner):
                 return True
 
             layer_link = layers.get(layer_name, getlink=True)
-            if isinstance(layer_link, (h5py.ExternalLink, h5py.SoftLink)):
+            if isinstance(layer_link, h5py.ExternalLink):
                 return True
-            if not isinstance(layer_link, h5py.HardLink):
+            if isinstance(layer_link, h5py.SoftLink):
+                source_name = f"{layer_source_prefix}/{layer_name}" if layer_source_prefix else str(layer_name)
+                target_path, target_link, incomplete = cls._resolve_hdf5_soft_link(h5_file, source_name, layer_link)
+                if incomplete or target_path is None or target_link is None:
+                    continue
+                if isinstance(target_link, h5py.ExternalLink):
+                    return True
+                if not isinstance(target_link, h5py.HardLink):
+                    continue
+                layer = h5_file.get(target_path, getlink=False)
+            elif isinstance(layer_link, h5py.HardLink):
+                layer = layers.get(layer_name, getlink=False)
+            else:
                 continue
-
-            layer = layers.get(layer_name, getlink=False)
             if isinstance(layer, h5py.Group) and cls._has_group_or_external_link(layer, "vars"):
                 return True
 
@@ -1201,6 +1224,7 @@ class KerasH5Scanner(BaseScanner):
         findings: list[dict[str, Any]] = []
         external_reference_count = 0
         external_storage_segments_truncated = False
+        virtual_dataset_sources_truncated = False
         soft_link_resolution_incomplete = False
         weight_roots, weight_roots_truncated = self._hdf5_weight_scan_roots(h5_file)
 
@@ -1244,6 +1268,50 @@ class KerasH5Scanner(BaseScanner):
                 external_storage_finding["segments_truncated"] = True
             findings.append(external_storage_finding)
 
+        def record_virtual_dataset_sources(name: str, obj: Any) -> None:
+            nonlocal external_reference_count, virtual_dataset_sources_truncated
+            storage_properties = obj.id.get_create_plist()
+            if storage_properties.get_layout() != h5py.h5d.VIRTUAL:
+                return
+            virtual_source_count = storage_properties.get_virtual_count()
+            if virtual_source_count <= 0:
+                return
+
+            external_reference_count += 1
+            if len(findings) >= self._MAX_HDF5_EXTERNAL_REFERENCE_REPORTS:
+                return
+            sources = []
+            for index in range(min(virtual_source_count, self._MAX_HDF5_VIRTUAL_SOURCE_REPORTS)):
+                filename, filename_truncated = self._bounded_hdf5_reference_text(
+                    storage_properties.get_virtual_filename(index)
+                )
+                dataset_name, dataset_name_truncated = self._bounded_hdf5_reference_text(
+                    storage_properties.get_virtual_dsetname(index)
+                )
+                source_details: dict[str, Any] = {
+                    "filename": filename,
+                    "path": dataset_name,
+                }
+                if filename_truncated:
+                    source_details["filename_truncated"] = True
+                if dataset_name_truncated:
+                    source_details["path_truncated"] = True
+                sources.append(source_details)
+
+            hdf5_path, hdf5_path_truncated = self._bounded_hdf5_reference_text(f"/{name}".replace("//", "/"))
+            virtual_dataset_finding: dict[str, Any] = {
+                "kind": "virtual_dataset",
+                "hdf5_path": hdf5_path,
+                "sources": sources,
+            }
+            if hdf5_path_truncated:
+                virtual_dataset_finding["hdf5_path_truncated"] = True
+            if virtual_source_count > len(sources):
+                virtual_dataset_sources_truncated = True
+                virtual_dataset_finding["source_count"] = virtual_source_count
+                virtual_dataset_finding["sources_truncated"] = True
+            findings.append(virtual_dataset_finding)
+
         def visit(name: str, link: Any, *, obj: Any | None = None, source_name: str | None = None) -> None:
             nonlocal external_reference_count, soft_link_resolution_incomplete
             resolution_source_name = source_name or name
@@ -1285,6 +1353,7 @@ class KerasH5Scanner(BaseScanner):
                 target_obj = h5_file.get(soft_target_path, getlink=False)
                 if isinstance(target_obj, h5py.Dataset):
                     record_external_storage(name, target_obj)
+                    record_virtual_dataset_sources(name, target_obj)
                 return
 
             if not isinstance(link, h5py.HardLink):
@@ -1294,6 +1363,7 @@ class KerasH5Scanner(BaseScanner):
                 obj = h5_file.get(name, getlink=False)
             if isinstance(obj, h5py.Dataset):
                 record_external_storage(name, obj)
+                record_virtual_dataset_sources(name, obj)
 
         visited_link_count = 0
         link_visits_truncated = False
@@ -1366,6 +1436,7 @@ class KerasH5Scanner(BaseScanner):
             or link_visits_truncated
             or external_references_truncated
             or external_storage_segments_truncated
+            or virtual_dataset_sources_truncated
             or soft_link_resolution_incomplete
         ):
             reason = "keras_h5_external_reference_analysis_limit_exceeded"
@@ -1387,6 +1458,7 @@ class KerasH5Scanner(BaseScanner):
                     "reported_external_reference_count": len(findings),
                     "external_references_truncated": external_references_truncated,
                     "external_storage_segments_truncated": external_storage_segments_truncated,
+                    "virtual_dataset_sources_truncated": virtual_dataset_sources_truncated,
                     "soft_link_resolution_incomplete": soft_link_resolution_incomplete,
                 },
                 rule_code="S902",
@@ -1401,17 +1473,18 @@ class KerasH5Scanner(BaseScanner):
             "cvss": 8.1,
             "cwe": "CWE-200, CWE-73",
             "description": (
-                "HDF5 external storage or ExternalLink entries can cause Keras weight loading to read arbitrary "
-                "host files into model tensors."
+                "HDF5 external storage, ExternalLink, or Virtual Dataset entries can cause Keras weight loading to "
+                "read arbitrary host files into model tensors."
             ),
             "remediation": "Upgrade to Keras >= 3.12.1 or >= 3.13.2 and reject weights using HDF5 external references.",
             "external_references": findings,
             "affected_versions": "Keras >= 3.0.0, < 3.12.1 and >= 3.13.0, < 3.13.2",
         }
-        if external_references_truncated or external_storage_segments_truncated:
+        if external_references_truncated or external_storage_segments_truncated or virtual_dataset_sources_truncated:
             details["external_reference_count"] = external_reference_count
             details["external_references_truncated"] = external_references_truncated
             details["external_storage_segments_truncated"] = external_storage_segments_truncated
+            details["virtual_dataset_sources_truncated"] = virtual_dataset_sources_truncated
 
         display_keras_version = redact_evidence_string(keras_version) if isinstance(keras_version, str) else None
         vuln_status = self._is_vulnerable_to_cve_2026_1669(keras_version) if isinstance(keras_version, str) else None
