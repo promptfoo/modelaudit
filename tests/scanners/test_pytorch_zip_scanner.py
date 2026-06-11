@@ -148,6 +148,13 @@ def _pytorch_storage_protocol0_persistent_id_payload(
     return f"(dp0\nVx\np1\nP('storage', <class '{storage_qualname}'>, '{key}', 'cpu', {size})\ns.".encode("ascii")
 
 
+def _pytorch_storage_persistent_id_sequence_payload(keys: list[str]) -> bytes:
+    payload = b"\x80\x04]("
+    for key in keys:
+        payload += _pytorch_storage_persistent_id_payload(key)[2:-1]
+    return payload + b"e."
+
+
 def _pytorch_storage_persistent_id_payload_with_popped_key(key: str, popped_key: str) -> bytes:
     payload = _pytorch_storage_persistent_id_payload(key)
     popped_key_bytes = popped_key.encode("utf-8")
@@ -1059,6 +1066,26 @@ def test_pytorch_zip_scanner_does_not_treat_tensor_storage_bytes_as_executable_s
         check.name == "Executable File Detection"
         and check.status == CheckStatus.FAILED
         and check.details.get("file") == "archive/data/0"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_trusts_all_validated_tensor_storage_bytes_as_non_executable(
+    tmp_path: Path,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "multi_tensor_bytes.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_sequence_payload(["0", "1"]))
+        zip_file.writestr("archive/data/0", b"\x00" * 64)
+        zip_file.writestr("archive/data/1", b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("file") == "archive/data/1"
         for check in result.checks
     )
 

@@ -482,7 +482,13 @@ class PyTorchZipScanner(BaseScanner):
                 bytes_scanned += self._scan_for_jit_patterns(zip_file, safe_entries, result, path)
 
                 # Detect suspicious non-pickle files
-                self._detect_suspicious_files(zip_file, safe_entries, result, path)
+                self._detect_suspicious_files(
+                    zip_file,
+                    safe_entries,
+                    result,
+                    path,
+                    trusted_pytorch_storage_data_pkl_members=validated_storage_data_pkl_members,
+                )
 
                 # Validate PyTorch model structure
                 self._validate_pytorch_structure(pickle_files, result)
@@ -2635,13 +2641,20 @@ class PyTorchZipScanner(BaseScanner):
         safe_entries: list[zipfile.ZipInfo],
         result: ScanResult,
         path: str,
+        *,
+        trusted_pytorch_storage_data_pkl_members: dict[str, set[str]] | None = None,
     ) -> None:
         """Detect suspicious non-pickle files in the archive"""
         python_files_found = False
         executable_files_found = False
         executable_probe_failures: list[dict[str, str]] = []
         member_names = {self._get_zip_member_name(entry).replace("\\", "/").lstrip("/") for entry in safe_entries}
-        trusted_storage_blob_members = self._trusted_pytorch_storage_blob_members(safe_entries, result)
+        if trusted_pytorch_storage_data_pkl_members is None:
+            trusted_storage_blob_members = self._trusted_pytorch_storage_blob_members(safe_entries, result)
+        else:
+            trusted_storage_blob_members = self._storage_blob_members_from_data_pkl_members(
+                trusted_pytorch_storage_data_pkl_members
+            )
         entries_by_normalized_name = {
             self._get_zip_member_name(entry).replace("\\", "/").lstrip("/"): entry for entry in safe_entries
         }
