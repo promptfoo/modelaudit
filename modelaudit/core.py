@@ -2295,7 +2295,10 @@ def _staged_directory_owner_scan_path(
     deadline: float,
 ) -> Iterator[str]:
     """Yield a copied owner snapshot when descriptor-backed paths are unavailable."""
-    with tempfile.TemporaryDirectory(prefix="modelaudit-directory-owner-") as temporary_directory:
+    with tempfile.TemporaryDirectory(
+        prefix="modelaudit-directory-owner-",
+        ignore_cleanup_errors=True,
+    ) as temporary_directory:
         staged_root = Path(temporary_directory) / (root_path.name or "owner-root")
         staged_root.mkdir()
         for owner_entry in owner_snapshot:

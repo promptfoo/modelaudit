@@ -153,6 +153,25 @@ def _install_stale_directory_scandir_stats(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(core_module.os, "scandir", StaleScandir)
 
 
+def _force_staged_directory_owner_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    class UnavailableBoundOwnerPath:
+        def __enter__(self) -> str:
+            raise OSError("simulated descriptor owner path unavailable")
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            traceback: object | None,
+        ) -> None:
+            return None
+
+    def unavailable_bound_owner_path(_root_path: Path) -> UnavailableBoundOwnerPath:
+        return UnavailableBoundOwnerPath()
+
+    monkeypatch.setattr(core_module, "_bound_directory_owner_scan_path", unavailable_bound_owner_path)
+
+
 def test_directory_owner_snapshot_ignores_directory_link_count_drift() -> None:
     def snapshot_stat(*, mode: int, link_count: int) -> Any:
         return SimpleNamespace(
@@ -1667,9 +1686,66 @@ def test_filtered_savedmodel_owner_hash_survives_stale_scandir_directory_metadat
     asset_path = assets_dir / "notes.txt"
     asset_path.write_bytes(b"benign asset")
     _install_stale_directory_scandir_stats(monkeypatch)
+    _force_staged_directory_owner_scan(monkeypatch)
 
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
 
+    assert result.content_hash is not None, [
+        (check.name, check.message, check.details)
+        for check in result.checks
+        if check.name.startswith("Directory Owner")
+    ]
+    assert result.files_scanned == 2
+    assert result.bytes_scanned == saved_model_path.stat().st_size + asset_path.stat().st_size
+    assert result.file_metadata[str(model_dir)]["directory_owner_scan"] is True
+    assert determine_exit_code(result) == 0
+
+
+def test_staged_savedmodel_owner_hash_survives_temp_cleanup_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_tf_protos()
+    model_dir = tmp_path / "saved-model"
+    model_dir.mkdir()
+    saved_model_path = model_dir / "saved_model.pb"
+    _write_safe_savedmodel(saved_model_path)
+    assets_dir = model_dir / "assets"
+    assets_dir.mkdir()
+    asset_path = assets_dir / "notes.txt"
+    asset_path.write_bytes(b"benign asset")
+    _force_staged_directory_owner_scan(monkeypatch)
+    real_temporary_directory: Any = core_module.tempfile.TemporaryDirectory
+    cleanup_modes: list[bool] = []
+
+    class CleanupSensitiveTemporaryDirectory:
+        def __init__(self, *args: Any, ignore_cleanup_errors: bool = False, **kwargs: Any) -> None:
+            cleanup_modes.append(ignore_cleanup_errors)
+            self._ignore_cleanup_errors = ignore_cleanup_errors
+            self._temporary_directory = real_temporary_directory(
+                *args,
+                ignore_cleanup_errors=ignore_cleanup_errors,
+                **kwargs,
+            )
+
+        def __enter__(self) -> str:
+            return cast(str, self._temporary_directory.__enter__())
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            traceback: object | None,
+        ) -> None:
+            self._temporary_directory.__exit__(exc_type, exc, traceback)
+            if not self._ignore_cleanup_errors:
+                raise OSError("unable to remove staged directory")
+
+    monkeypatch.setattr(core_module.tempfile, "TemporaryDirectory", CleanupSensitiveTemporaryDirectory)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    assert cleanup_modes == [True]
     assert result.content_hash is not None
     assert result.files_scanned == 2
     assert result.bytes_scanned == saved_model_path.stat().st_size + asset_path.stat().st_size
