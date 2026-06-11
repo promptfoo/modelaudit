@@ -4931,6 +4931,7 @@ def scan_model_streaming(
             openvino_companion_pre_scan_identity: _FileIdentitySnapshot | None = None
             openvino_companion_bytes_scanned = 0
             onnx_external_data_pre_scan_identities: dict[Path, _FileIdentitySnapshot] = {}
+            onnx_external_data_bytes_scanned = 0
 
             # Check for interruption before starting work on the yielded file.
             try:
@@ -4954,7 +4955,7 @@ def scan_model_streaming(
                     continue
 
                 if base_dir is not None:
-                    resolved_path, _is_hf_cache_symlink, entry_unavailable = _resolve_directory_scan_target(
+                    resolved_path, is_hf_cache_symlink, entry_unavailable = _resolve_directory_scan_target(
                         source_path,
                         base_dir,
                         is_hf_cache=is_hf_cache,
@@ -4966,7 +4967,12 @@ def scan_model_streaming(
                         preserve_shard_reconciliation_errors = True
                     if resolved_path is None:
                         continue
-                    scan_path = resolved_path
+                    snapshot_path = Path(os.path.abspath(source_path))
+                    route_hf_onnx_alias = is_hf_cache_symlink and _should_scan_hf_cache_alias_lexically_for_onnx(
+                        snapshot_path,
+                        hf_cache_root,
+                    )
+                    scan_path = snapshot_path if route_hf_onnx_alias else resolved_path
 
                 # Build config before skip filtering so bin-first OpenVINO
                 # sidecars can wait for their selected XML owner.
@@ -5092,6 +5098,7 @@ def scan_model_streaming(
                         external_data_identity = _snapshot_file_identity(onnx_external_data_path)
                         if external_data_identity is not None:
                             onnx_external_data_pre_scan_identities[onnx_external_data_path] = external_data_identity
+                            onnx_external_data_bytes_scanned += _snapshot_file_size(external_data_identity)
                         append_streamed_file_hash(
                             onnx_external_data_path,
                             scan_config,
@@ -5107,6 +5114,7 @@ def scan_model_streaming(
                     config=scan_config,
                 )
                 scan_result.bytes_scanned += openvino_companion_bytes_scanned
+                scan_result.bytes_scanned += onnx_external_data_bytes_scanned
                 if (
                     openvino_scan_companion_path is not None
                     and openvino_companion_pre_scan_identity is not None

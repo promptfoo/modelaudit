@@ -2002,6 +2002,32 @@ def test_scan_model_streaming_onnx_external_data_contributes_content_hash(tmp_pa
     assert changed_result.content_hash != result.content_hash
 
 
+def test_scan_model_streaming_onnx_external_data_counts_toward_max_total_size(tmp_path: Path) -> None:
+    """Staged ONNX external_data sidecars must count against total streaming caps."""
+    model_path = tmp_path / "model.onnx"
+    sidecar_path = tmp_path / "model.onnx_data"
+    sidecar_size = 64
+    model_path.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_path.write_bytes(b"\x00" * sidecar_size)
+    max_total_size = model_path.stat().st_size + sidecar_size - 1
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+        max_total_size=max_total_size,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert determine_exit_code(result) == 2
+    assert result.bytes_scanned > max_total_size
+    assert result.bytes_scanned >= model_path.stat().st_size + sidecar_size
+    assert result.content_hash is None
+    assert any("Total scan size limit exceeded" in issue.message for issue in result.issues)
+
+
 def test_scan_model_streaming_hashes_reused_path_file_instances(tmp_path: Path) -> None:
     """A streaming source may reuse one staging path for multiple distinct files."""
     stage_path = tmp_path / "stage.txt"
@@ -2693,6 +2719,106 @@ def test_scan_model_streaming_hf_cache_symlink_reports_snapshot_path(
     check_locations = {check.name: check.location for check in result.checks}
     assert check_locations["Suspicious Payload"] == str(model_link)
     assert check_locations["Layout Inspection"] == f"{model_link}:tensor"
+
+
+def test_scan_model_streaming_hf_cache_onnx_external_data_uses_snapshot_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Streaming scans over trusted HF cache aliases should keep ONNX sidecar context."""
+    cache_hub = tmp_path / "hf-hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+    cache_root = cache_hub / "models--test--model"
+    blobs_dir = cache_root / "blobs"
+    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    model_link = snapshot_dir / "model.onnx"
+    sidecar_link = snapshot_dir / "model.onnx_data"
+    model_link.symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    sidecar_link.symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+
+    result = scan_model_streaming(
+        file_generator=iterate_files_streaming(snapshot_dir),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(snapshot_dir),
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    failed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status.value == "failed"
+    ]
+    passed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check"
+        and check.status.value == "passed"
+        and check.details.get("file") == "model.onnx_data"
+    ]
+    symlink_traversal_checks = [
+        check for check in result.checks if check.name == "CVE-2026-34447: External Data Symlink Traversal"
+    ]
+
+    assert failed_external == []
+    assert len(passed_external) == 1
+    assert symlink_traversal_checks == []
+    assert determine_exit_code(result) == 0
+
+
+def test_scan_model_streaming_hf_cache_onnx_external_data_rejects_nested_cache_lookalike(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Nested models--* lookalikes must not gain trusted HF cache alias handling."""
+    cache_hub = tmp_path / "hf-hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+    fake_cache_root = cache_hub / "scratch" / "models--test--model"
+    blobs_dir = fake_cache_root / "blobs"
+    snapshot_dir = fake_cache_root / "snapshots" / ("a" * 40) / "onnx"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    (snapshot_dir / "model.onnx").symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    (snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+
+    result = scan_model_streaming(
+        file_generator=iterate_files_streaming(snapshot_dir),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(snapshot_dir),
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    traversal_issues = [issue for issue in result.issues if "path traversal" in issue.message.lower()]
+    passed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check"
+        and check.status.value == "passed"
+        and check.details.get("file") == "model.onnx_data"
+    ]
+
+    assert traversal_issues
+    assert passed_external == []
+    assert determine_exit_code(result) == 1
 
 
 def test_scan_model_streaming_with_deletion(temp_test_files: list[Path]) -> None:
