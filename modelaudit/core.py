@@ -670,7 +670,8 @@ def _snapshot_file_identity(path: Path) -> _FileIdentitySnapshot | None:
         )
         resolved_path = str(path.resolve(strict=True))
     except OSError:
-        pass
+        # TOCTOU races or inaccessible symlink targets still leave a useful lstat snapshot.
+        logger.debug("Could not snapshot target identity for %s", path, exc_info=True)
 
     return _FileIdentitySnapshot(
         lstat=(
