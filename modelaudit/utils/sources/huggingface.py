@@ -1340,12 +1340,16 @@ def _extract_huggingface_tree_page_files(repo_id: str, page_items: object) -> li
     for item in page_items:
         if not isinstance(item, dict):
             raise ValueError(f"Hugging Face repository inventory incomplete: invalid tree item for {repo_id}")
-        if item.get("type") != "file":
-            continue
+        item_type = item.get("type")
+        if item_type not in {"file", "directory"}:
+            raise ValueError(f"Hugging Face repository inventory incomplete: unknown tree item type for {repo_id}")
         path = item.get("path")
         if not isinstance(path, str):
             raise ValueError(f"Hugging Face repository inventory incomplete: invalid repository filename for {repo_id}")
-        files.append(path)
+        safe_path = _validate_huggingface_repo_filename(repo_id, path)
+        if item_type == "directory":
+            continue
+        files.append(safe_path)
     return files
 
 

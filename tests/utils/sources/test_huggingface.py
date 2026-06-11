@@ -619,6 +619,38 @@ class TestModelDownload:
         assert error is not None
         assert "unsafe repository filename" in error
 
+    @pytest.mark.parametrize(
+        "tree_item",
+        [
+            {"path": "malicious.pkl"},
+            {"type": None, "path": "malicious.pkl"},
+            {"type": "lfs", "path": "malicious.pkl"},
+        ],
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_unknown_paginated_tree_item_types(
+        self,
+        mock_repo_info: MagicMock,
+        mock_requests_get: MagicMock,
+        tree_item: dict[str, object],
+    ) -> None:
+        """Unknown tree item types must not create a partial benign inventory."""
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_requests_get.return_value = _FakeTreeResponse(
+            [
+                {"type": "file", "path": "benign.bin"},
+                tree_item,
+            ]
+        )
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "unknown tree item type" in error
+
     @patch("requests.get")
     @patch("huggingface_hub.HfApi.repo_info")
     def test_list_repo_files_rejects_repeated_pagination_cursor(
