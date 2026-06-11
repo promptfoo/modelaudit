@@ -2250,6 +2250,10 @@ def _is_malformed_sentencepiece_model_proto_candidate_file(path: str | Path) -> 
     return _classify_sentencepiece_model_proto_file(path) == "malformed_candidate"
 
 
+def _should_fail_closed_malformed_sentencepiece_model_proto_file(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in {"", ".proto"} and _is_malformed_sentencepiece_model_proto_candidate_file(path)
+
+
 def is_sentencepiece_model_proto_file(path: str | Path) -> bool:
     """Return True for strongly identified SentencePiece tokenizer ModelProto files."""
     return _classify_sentencepiece_model_proto_file(path) == "strong"
@@ -6995,8 +6999,9 @@ def detect_format_from_magic_bytes(
         )
         if xgboost_route is not None:
             return xgboost_route
-        if _is_malformed_sentencepiece_model_proto_candidate_file(file_path):
-            return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+
+    if file_path is not None and _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+        return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
 
     if file_path is not None and file_path.suffix.lower() == ".model" and is_sentencepiece_model_proto_file(file_path):
         return "unknown"
@@ -7156,6 +7161,9 @@ def detect_file_format_from_magic(path: str) -> str:
                 )
                 if xgboost_route is not None:
                     return xgboost_route
+
+            if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+                return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
 
             if (
                 _allows_renamed_binary_content_route(file_path)
@@ -7341,8 +7349,9 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             xgboost_route = _detect_extensionless_xgboost_ubjson_route(prefix[:xgboost_probe_size])
             if xgboost_route is not None:
                 return xgboost_route
-            if _is_malformed_sentencepiece_model_proto_candidate_file(file_path):
-                return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+
+        if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+            return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
 
         if file_path.suffix.lower() == ".model" and is_sentencepiece_model_proto_file(file_path):
             return "unknown"
@@ -7556,8 +7565,9 @@ def detect_file_format(path: str) -> str:
         )
         if xgboost_route is not None:
             return xgboost_route
-        if _is_malformed_sentencepiece_model_proto_candidate_file(file_path):
-            return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+
+    if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+        return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
 
     if ext == ".model" and is_sentencepiece_model_proto_file(file_path):
         return "unknown"
@@ -7616,7 +7626,7 @@ def detect_file_format(path: str) -> str:
         )
         if xgboost_route is not None:
             return xgboost_route
-        if _is_malformed_sentencepiece_model_proto_candidate_file(file_path):
+        if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
             return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
     # For .bin files, do more sophisticated detection
     if ext == ".bin":

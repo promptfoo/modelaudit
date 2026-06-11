@@ -2067,6 +2067,20 @@ class TestXGBoostFailClosedEndToEnd:
         assert direct.scanner_name == "unknown"
         _assert_no_xgboost_s1004(aggregate)
 
+    def test_sentencepiece_tokenizer_proto_core_is_clean_unknown(self, tmp_path: Path) -> None:
+        tokenizer_proto = tmp_path / "tokenizer.proto"
+        tokenizer_proto.write_bytes(_sentencepiece_model_proto())
+
+        direct = scan_file(str(tokenizer_proto), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+        assert detect_file_format(str(tokenizer_proto)) == "unknown"
+        assert detect_file_format_from_magic(str(tokenizer_proto)) == "unknown"
+        assert detect_file_format_for_skip_filter(str(tokenizer_proto)) == "unknown"
+        assert direct.success is True
+        assert direct.scanner_name == "unknown"
+        _assert_no_xgboost_s1004(aggregate)
+
     @pytest.mark.parametrize("payload_factory", _SENTENCEPIECE_SEMANTIC_MALFORMED_FACTORIES)
     def test_extensionless_malformed_sentencepiece_model_fails_closed_without_xgboost(
         self, tmp_path: Path, payload_factory: Callable[[], bytes]
@@ -2105,6 +2119,51 @@ class TestXGBoostFailClosedEndToEnd:
         _assert_inconclusive_metadata(streaming, tokenizer_model, expected_reason)
         assert determine_exit_code(aggregate) == 2
         assert determine_exit_code(streaming) == 2
+        assert cli_result.exit_code == 2
+        assert "xgboost" not in cli_payload.get("scanner_names", [])
+        assert any(
+            expected_reason in issue.get("details", {}).get("scan_outcome_reason", "")
+            or "SentencePiece ModelProto routing was inconclusive" in issue.get("message", "")
+            for issue in cli_payload.get("issues", [])
+        )
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            pytest.param(_sentencepiece_model_proto() + b"\x12\x80", id="truncated-tail"),
+            pytest.param(
+                _sentencepiece_model_proto() + _proto_field(2, 0, _proto_varint(0)),
+                id="wrong-wire-trainer-spec",
+            ),
+            pytest.param(_sentencepiece_model_proto_with_duplicate_unknown_pieces(), id="duplicate-unknown-pieces"),
+        ],
+    )
+    def test_malformed_sentencepiece_proto_fails_closed_without_xgboost(self, tmp_path: Path, payload: bytes) -> None:
+        tokenizer_proto = tmp_path / "tokenizer.proto"
+        tokenizer_proto.write_bytes(payload)
+        expected_format = file_detection.SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+        expected_reason = "sentencepiece_model_proto_routing_incomplete"
+
+        direct = scan_file(str(tokenizer_proto), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+        cli_result = CliRunner().invoke(
+            cli,
+            ["scan", "--no-cache", "--format", "json", str(tmp_path)],
+            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+        )
+        cli_payload = parse_click_json_output(cli_result.output)
+
+        assert detect_file_format(str(tokenizer_proto)) == expected_format
+        assert detect_file_format_from_magic(str(tokenizer_proto)) == expected_format
+        assert detect_file_format_for_skip_filter(str(tokenizer_proto)) == expected_format
+        assert direct.success is False
+        assert direct.scanner_name == "unknown"
+        assert expected_reason in direct.metadata["scan_outcome_reasons"]
+        assert not any(issue.rule_code == "S1004" for issue in direct.issues)
+        assert "xgboost" not in aggregate.scanner_names
+        assert not any(issue.rule_code == "S1004" for issue in aggregate.issues)
+        _assert_inconclusive_metadata(aggregate, tokenizer_proto, expected_reason)
+        assert determine_exit_code(aggregate) == 2
         assert cli_result.exit_code == 2
         assert "xgboost" not in cli_payload.get("scanner_names", [])
         assert any(
