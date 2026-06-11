@@ -17,6 +17,7 @@ ASSETS_DIR = REPO_ROOT / "tests" / "assets"
 SAFETENSORS_DIR = ASSETS_DIR / "samples" / "safetensors"
 KERAS_DIR = ASSETS_DIR / "samples" / "keras"
 JINJA2_DIR = ASSETS_DIR / "samples" / "jinja2"
+SENTENCEPIECE_DIR = ASSETS_DIR / "samples" / "sentencepiece"
 
 EXPECTED_SAFETENSORS_FIXTURES = {
     "tests/assets/samples/safetensors/malicious_import.safetensors",
@@ -66,6 +67,11 @@ EXPECTED_JINJA2_FIXTURES = {
     "tests/assets/samples/jinja2/standalone/suspicious_benign.template",
     "tests/assets/samples/jinja2/yaml/malicious_config.yaml",
     "tests/assets/samples/jinja2/yaml/model_config.yaml",
+}
+
+EXPECTED_SENTENCEPIECE_FIXTURES = {
+    "tests/assets/samples/sentencepiece/custom_unknown_disabled_specials.model",
+    "tests/assets/samples/sentencepiece/custom_unknown_disabled_specials_byte_fallback.model",
 }
 
 LARGE_ASSET_BYTES = 100 * 1024
@@ -134,6 +140,12 @@ def test_jinja2_corpus_matches_routed_inventory() -> None:
     jinja2_files = {_repo_relative(path) for path in _tracked_under(JINJA2_DIR)}
 
     assert jinja2_files == EXPECTED_JINJA2_FIXTURES
+
+
+def test_sentencepiece_corpus_matches_routed_inventory() -> None:
+    sentencepiece_files = {_repo_relative(path) for path in _tracked_under(SENTENCEPIECE_DIR)}
+
+    assert sentencepiece_files == EXPECTED_SENTENCEPIECE_FIXTURES
 
 
 def test_pickle_bypass_poc_generators_are_not_committed() -> None:
