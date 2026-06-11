@@ -438,6 +438,11 @@ DOCUMENTATION_FENCED_URL_ASSIGNMENT_PATTERN = re.compile(
     rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*[rubfRUBF]*[\"'](?P<url>https?://[^\"'\s]+)[\"']",
     re.IGNORECASE,
 )
+DOCUMENTATION_FENCED_URL_REQUEST_ASSIGNMENT_PATTERN = re.compile(
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:urllib\.request\.)?Request\s*\(\s*"
+    rb"[rubfRUBF]*[\"'](?P<url>https?://[^\"'\s)]+)[\"']",
+    re.IGNORECASE,
+)
 DOCUMENTATION_FENCED_URL_VARIABLE_CALL_PATTERN = re.compile(
     rb"\b(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(\s*(?P<target>[A-Za-z_][A-Za-z0-9_]*)\b",
     re.IGNORECASE,
@@ -1404,6 +1409,16 @@ class TextScanner(BaseScanner):
         ) or cls._documentation_fenced_passive_media_url_is_informational(url)
 
     @classmethod
+    def _documentation_fenced_bare_url_is_informational(cls, url: str) -> bool:
+        try:
+            parsed_url = urlsplit(url)
+        except ValueError:
+            return False
+        if parsed_url.scheme.casefold() not in {"http", "https"}:
+            return True
+        return cls._documentation_fenced_passive_assigned_url_is_informational(url)
+
+    @classmethod
     def _documentation_fenced_passive_network_example_is_informational(cls, fenced_code: bytes) -> bool:
         if DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN.search(fenced_code):
             return False
@@ -1416,29 +1431,34 @@ class TextScanner(BaseScanner):
             return False
         assigned_urls = {
             match.group("target"): match.group("url").decode("utf-8", errors="ignore")
-            for match in DOCUMENTATION_FENCED_URL_ASSIGNMENT_PATTERN.finditer(fenced_code)
-        }
-        if any(
-            target in assigned_urls
-            and not cls._documentation_fenced_passive_assigned_url_is_informational(assigned_urls[target])
-            for target in (
-                match.group("target") for match in DOCUMENTATION_FENCED_URL_VARIABLE_CALL_PATTERN.finditer(fenced_code)
+            for pattern in (
+                DOCUMENTATION_FENCED_URL_ASSIGNMENT_PATTERN,
+                DOCUMENTATION_FENCED_URL_REQUEST_ASSIGNMENT_PATTERN,
             )
+            for match in pattern.finditer(fenced_code)
+        }
+        call_targets = [
+            match.group("target") for match in DOCUMENTATION_FENCED_URL_VARIABLE_CALL_PATTERN.finditer(fenced_code)
+        ]
+        if any(
+            target not in assigned_urls
+            or not cls._documentation_fenced_passive_assigned_url_is_informational(assigned_urls[target])
+            for target in call_targets
         ):
             return False
-        if any(
-            cls._documentation_loopback_api_url_is_informational(match.group().decode("utf-8", errors="ignore"))
+        bare_urls = [
+            match.group().decode("utf-8", errors="ignore").rstrip(")]}'\"`,.;")
             for match in BARE_NETWORK_URL_TOKEN_PATTERN.finditer(fenced_code)
-        ):
+        ]
+        if any(not cls._documentation_fenced_bare_url_is_informational(url) for url in bare_urls):
+            return False
+        if any(cls._documentation_loopback_api_url_is_informational(url) for url in bare_urls):
             return True
         passive_targets = {
             target
             for target, url in assigned_urls.items()
             if cls._documentation_fenced_passive_media_url_is_informational(url)
         }
-        call_targets = [
-            match.group("target") for match in DOCUMENTATION_FENCED_URL_VARIABLE_CALL_PATTERN.finditer(fenced_code)
-        ]
         return bool(call_targets) and all(target in passive_targets for target in call_targets)
 
     @classmethod
