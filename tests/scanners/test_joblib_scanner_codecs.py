@@ -549,7 +549,7 @@ def test_scan_keeps_untrusted_numpy_wrapper_origin_review_after_valid_raw_array(
         trust_numpy_array_wrapper=False,
     )
 
-    assert result.success is False
+    assert result.metadata["pickle_verdict"] == "suspicious"
     assert "trusted_incomplete_tail" not in result.metadata
 
     def has_numpy_wrapper_origin_review(finding: object) -> bool:
