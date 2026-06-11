@@ -384,7 +384,7 @@ def _detect_huggingface_xgboost_ubjson_route(
     prefix: bytes,
 ) -> str | None:
     """Return a bounded XGBoost UBJSON route for a suffix-skipped remote file."""
-    if Path(filename).suffix:
+    if Path(filename).suffix and _HF_SAFETENSORS_SHARD_PATTERN.search(filename) is None:
         return None
 
     from modelaudit.utils.file.detection import (
@@ -1098,11 +1098,18 @@ def _select_streamable_hf_files(
         for file_name in repo_files:
             if file_name in selected_files:
                 continue
-            if _hf_safetensors_shard_excluded_by_selection(
+            may_skip_detected_safetensors_shard = _hf_safetensors_shard_excluded_by_selection(
                 file_name,
                 selected_route_scanner_ids,
                 selected_route_formats,
-            ):
+            )
+            if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES and not may_skip_detected_safetensors_shard:
+                raise ValueError(
+                    "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "
+                    f"for {repo_id} ({_HF_CONTENT_SNIFF_MAX_FILES} files)"
+                )
+            detected_format = _detect_huggingface_content_route_format(repo_id, file_name, revision, probe_budget)
+            if detected_format == "safetensors" and may_skip_detected_safetensors_shard:
                 continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
@@ -1110,14 +1117,7 @@ def _select_streamable_hf_files(
                     f"for {repo_id} ({_HF_CONTENT_SNIFF_MAX_FILES} files)"
                 )
             inspected_files += 1
-            detected_format = _detect_huggingface_content_route_format(repo_id, file_name, revision, probe_budget)
             if detected_format is None:
-                continue
-            if detected_format == "safetensors" and _hf_safetensors_shard_excluded_by_selection(
-                file_name,
-                selected_route_scanner_ids,
-                selected_route_formats,
-            ):
                 continue
             if selected_route_scanner_ids is not None:
                 from ...scanner_selection import scanner_ids_for_detected_format

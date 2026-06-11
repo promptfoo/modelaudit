@@ -101,18 +101,15 @@ def _ubjson_key(key: bytes) -> bytes:
     return b"U" + bytes([len(key)]) + key
 
 
-def _make_xgboost_ubjson_payload() -> bytes:
-    return (
-        b"{"
-        + _ubjson_key(b"learner")
-        + b"{"
-        + _ubjson_key(b"learner_model_param")
-        + b"{}"
-        + b"}"
-        + _ubjson_key(b"version")
-        + b"[]"
-        + b"}"
-    )
+def _ubjson_string(value: bytes) -> bytes:
+    return b"SL" + len(value).to_bytes(8, byteorder="big", signed=True) + value
+
+
+def _make_xgboost_ubjson_payload(*, malicious: bool = False) -> bytes:
+    learner_body = _ubjson_key(b"learner_model_param") + b"{}"
+    if malicious:
+        learner_body += _ubjson_key(b"malicious_code") + _ubjson_string(b"system(cpu)")
+    return b"{" + _ubjson_key(b"learner") + b"{" + learner_body + b"}" + _ubjson_key(b"version") + b"[]" + b"}"
 
 
 def _make_tensorflow_savedmodel_payload(_tmp_path: Path) -> bytes:
@@ -2667,19 +2664,22 @@ class TestModelDownloadStreaming:
     )
     @patch("requests.get")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_selected_non_overlap_skips_declared_safetensors_shards_before_probe(
+    def test_download_model_streaming_selected_non_overlap_skips_detected_safetensors_shards_without_cap(
         self,
         mock_hf_hub_download: MagicMock,
         mock_requests_get: MagicMock,
         _mock_list_repo_files: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """Non-overlap selection must not range-probe declared SafeTensors shards or hit the sniff cap."""
+        """Non-overlap selection must skip proven SafeTensors shards without hitting the sniff cap."""
         policy = resolve_scanner_selection_policy(scanners=["xgboost"])
         extensions = selected_scanner_extensions(policy, conservative=True)
         assert extensions is not None
         assert ".ubj" in extensions
         assert ".safetensors" not in extensions
+        safetensors_header = b'{"__metadata__":{"format":"pt"}}'
+        safetensors_shard = struct.pack("<Q", len(safetensors_header)) + safetensors_header
+        mock_requests_get.return_value = _FakeRangeResponse(safetensors_shard)
 
         def download_side_effect(*, filename: str, **_kwargs: object) -> str:
             assert filename == "MODEL.UBJ"
@@ -2699,7 +2699,7 @@ class TestModelDownloadStreaming:
         )
 
         assert results == [(tmp_path / "MODEL.UBJ", True)]
-        mock_requests_get.assert_not_called()
+        assert mock_requests_get.call_count == _HF_CONTENT_SNIFF_MAX_FILES + 1
         mock_hf_hub_download.assert_called_once_with(
             repo_id="test/model",
             filename="MODEL.UBJ",
@@ -2722,14 +2722,17 @@ class TestModelDownloadStreaming:
     )
     @patch("requests.get")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_extension_only_non_overlap_skips_declared_safetensors_shards_before_probe(
+    def test_download_model_streaming_extension_only_non_overlap_skips_detected_safetensors_shards_without_cap(
         self,
         mock_hf_hub_download: MagicMock,
         mock_requests_get: MagicMock,
         _mock_list_repo_files: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """Extension-only selection must also avoid probing declared non-overlap SafeTensors shards."""
+        """Extension-only selection must also skip proven SafeTensors shards without hitting the sniff cap."""
+        safetensors_header = b'{"__metadata__":{"format":"pt"}}'
+        safetensors_shard = struct.pack("<Q", len(safetensors_header)) + safetensors_header
+        mock_requests_get.return_value = _FakeRangeResponse(safetensors_shard)
 
         def download_side_effect(*, filename: str, **_kwargs: object) -> str:
             assert filename == "MODEL.UBJ"
@@ -2747,10 +2750,52 @@ class TestModelDownloadStreaming:
         )
 
         assert results == [(tmp_path / "MODEL.UBJ", True)]
-        mock_requests_get.assert_not_called()
+        assert mock_requests_get.call_count == _HF_CONTENT_SNIFF_MAX_FILES + 1
         mock_hf_hub_download.assert_called_once_with(
             repo_id="test/model",
             filename="MODEL.UBJ",
+            revision=_HF_TEST_REVISION,
+        )
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["model-00001-of-00002.safetensors"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_selected_xgboost_routes_shard_shaped_renamed_ubjson(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Shard-shaped names must not hide XGBoost UBJSON content from XGBoost selection."""
+        policy = resolve_scanner_selection_policy(scanners=["xgboost"])
+        malicious_xgboost = _make_xgboost_ubjson_payload(malicious=True)
+        mock_requests_get.return_value = _FakeRangeResponse(malicious_xgboost)
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / filename
+            path.write_bytes(malicious_xgboost)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                scannable_extensions=selected_scanner_extensions(policy, conservative=True),
+                scannable_filenames=selected_scanner_filenames(policy, conservative=True),
+                scannable_scanner_ids=policy.enabled_scanner_ids,
+            )
+        )
+
+        assert results == [(tmp_path / "model-00001-of-00002.safetensors", True)]
+        mock_requests_get.assert_called_once()
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="model-00001-of-00002.safetensors",
             revision=_HF_TEST_REVISION,
         )
 
