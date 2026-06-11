@@ -159,6 +159,23 @@ def test_bare_compressed_raw_binary_routes_inner_as_pytorch_binary(tmp_path: Pat
     assert metadata_extra["decompressed_bytes"] == 146
 
 
+def test_tokenizer_gzip_raw_binary_routes_inner_as_pytorch_binary_security_scan(tmp_path: Path) -> None:
+    wrapper = tmp_path / "tokenizer.gz"
+    wrapper.write_bytes(gzip.compress(b"\0" * 50 + b"CONFIDENTIAL_DATA" + b"\0" * 50))
+
+    result = scan_model_directory_or_file(
+        str(wrapper),
+        blacklist_patterns=["CONFIDENTIAL"],
+        cache_enabled=False,
+    )
+    metadata = result.file_metadata[str(wrapper)]
+    metadata_extra = metadata.model_extra or {}
+
+    assert determine_exit_code(result) == 1
+    assert metadata_extra["scanner_dependency_ids"] == ["compressed", "pytorch_binary"]
+    assert any(issue.rule_code == "S1001" and "CONFIDENTIAL" in issue.message for issue in result.issues)
+
+
 def test_compressed_scanner_can_handle_header_routed_misnamed_wrapper(tmp_path: Path) -> None:
     disguised_gzip_path = tmp_path / "model.jpg"
     disguised_gzip_path.write_bytes(gzip.compress(pickle.dumps({"weights": [1, 2, 3]})))

@@ -13,6 +13,7 @@ import zipfile
 import zlib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from functools import lru_cache
 from io import BytesIO, StringIO
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Literal, cast
@@ -91,6 +92,7 @@ _PROTO_GROUP_MAX_ROUTING_FIELDS = 512
 _PROTO_GROUP_MAX_ROUTING_DEPTH = 8
 _COREML_PROTO_SIGNATURE_READ_BYTES = 1024 * 1024
 _SENTENCEPIECE_MODEL_PROTO_READ_BYTES = 10 * 1024 * 1024
+_SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES = 4096
 _SENTENCEPIECE_MODEL_MAX_FIELDS = 512 * 1024
 _SENTENCEPIECE_MIN_STRONG_PIECES = 8
 _SENTENCEPIECE_MAX_PIECE_FIELDS = 16
@@ -1445,13 +1447,30 @@ class _SentencePieceTrainerSpecSignals:
     model_type: int | None = None
     vocab_size: int | None = None
     unk_id: int = 0
+    unk_id_explicit: bool = False
     unk_piece: str | None = None
     unk_piece_explicit: bool = False
     byte_fallback: bool = False
+    byte_fallback_explicit: bool = False
 
     @property
     def has_core_metadata(self) -> bool:
         return self.model_type is not None and self.vocab_size is not None
+
+    def merge_from(self, other: "_SentencePieceTrainerSpecSignals") -> None:
+        if other.model_type is not None:
+            self.model_type = other.model_type
+        if other.vocab_size is not None:
+            self.vocab_size = other.vocab_size
+        if other.unk_id_explicit:
+            self.unk_id = other.unk_id
+            self.unk_id_explicit = True
+        if other.unk_piece_explicit:
+            self.unk_piece = other.unk_piece
+            self.unk_piece_explicit = True
+        if other.byte_fallback_explicit:
+            self.byte_fallback = other.byte_fallback
+            self.byte_fallback_explicit = True
 
 
 @dataclass
@@ -1580,8 +1599,10 @@ def _parse_sentencepiece_trainer_spec_proto(
                 if value not in {0, 1}:
                     return None
                 signals.byte_fallback = bool(value)
+                signals.byte_fallback_explicit = True
             elif field_number == 40:
                 signals.unk_id = _decode_proto_int32_varint(value)
+                signals.unk_id_explicit = True
         elif field_number in _SENTENCEPIECE_TRAINER_SPEC_STRING_FIELDS:
             if wire_type != 2:
                 return None
@@ -1829,9 +1850,13 @@ def _has_strong_sentencepiece_model_proto_prefix(data: bytes, *, sample_is_prefi
             _length, value_start, _sampled_value_end, actual_value_end = bounds
             if actual_value_end > len(data):
                 return accept_incomplete_prefix()
-            trainer_spec = _parse_sentencepiece_trainer_spec_proto(data, value_start, actual_value_end)
-            if trainer_spec is None:
+            parsed_trainer_spec = _parse_sentencepiece_trainer_spec_proto(data, value_start, actual_value_end)
+            if parsed_trainer_spec is None:
                 return False
+            if trainer_spec is None:
+                trainer_spec = parsed_trainer_spec
+            else:
+                trainer_spec.merge_from(parsed_trainer_spec)
             offset = actual_value_end
         elif field_number == 3:
             bounds = _read_length_delimited_proto_value(data, value_offset)
@@ -2084,9 +2109,13 @@ def _classify_sentencepiece_model_proto_stream(
             if bounds is None:
                 return reject_candidate()
             _length, _value_start, actual_value_end = bounds
-            trainer_spec = _parse_sentencepiece_trainer_spec_proto_stream(stream, actual_value_end)
-            if trainer_spec is None:
+            parsed_trainer_spec = _parse_sentencepiece_trainer_spec_proto_stream(stream, actual_value_end)
+            if parsed_trainer_spec is None:
                 return reject_candidate()
+            if trainer_spec is None:
+                trainer_spec = parsed_trainer_spec
+            else:
+                trainer_spec.merge_from(parsed_trainer_spec)
             stream.seek(actual_value_end)
             offset = actual_value_end
         elif field_number == 3:
@@ -2133,6 +2162,46 @@ def _classify_sentencepiece_model_proto_stream(
     return "malformed_candidate" if piece_count else "unknown"
 
 
+@lru_cache(maxsize=1024)
+def _classify_sentencepiece_model_proto_file_cached(
+    path: str,
+    size: int,
+    mtime_ns: int,
+    ctime_ns: int,
+    fingerprint_head: bytes,
+    fingerprint_tail: bytes,
+) -> _SentencePieceModelProtoRoute:
+    del mtime_ns, ctime_ns, fingerprint_head, fingerprint_tail
+    file_path = Path(path)
+    try:
+        with file_path.open("rb") as handle:
+            if size <= _SENTENCEPIECE_MODEL_PROTO_READ_BYTES:
+                payload = handle.read(size)
+                if len(payload) != size:
+                    return "unknown"
+                return _classify_sentencepiece_model_proto_stream(BytesIO(payload), size)
+            return _classify_sentencepiece_model_proto_stream(
+                handle,
+                size,
+                max_decoded_piece_text_bytes=_SENTENCEPIECE_MODEL_PROTO_READ_BYTES,
+            )
+    except OSError:
+        return "unknown"
+
+
+def _sentencepiece_model_proto_cache_fingerprint(file_path: Path, size: int) -> tuple[bytes, bytes]:
+    try:
+        with file_path.open("rb") as handle:
+            head = handle.read(min(size, _SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES))
+            if size <= _SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES:
+                return head, b""
+            handle.seek(max(size - _SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES, 0))
+            tail = handle.read(_SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES)
+            return head, tail
+    except OSError:
+        return b"", b""
+
+
 def _classify_sentencepiece_model_proto_file(path: str | Path) -> _SentencePieceModelProtoRoute:
     file_path = Path(path)
     try:
@@ -2141,17 +2210,15 @@ def _classify_sentencepiece_model_proto_file(path: str | Path) -> _SentencePiece
         stat = file_path.stat()
         if stat.st_size < 32:
             return "unknown"
-        with file_path.open("rb") as handle:
-            if stat.st_size <= _SENTENCEPIECE_MODEL_PROTO_READ_BYTES:
-                payload = handle.read(stat.st_size)
-                if len(payload) != stat.st_size:
-                    return "unknown"
-                return _classify_sentencepiece_model_proto_stream(BytesIO(payload), stat.st_size)
-            return _classify_sentencepiece_model_proto_stream(
-                handle,
-                stat.st_size,
-                max_decoded_piece_text_bytes=_SENTENCEPIECE_MODEL_PROTO_READ_BYTES,
-            )
+        fingerprint_head, fingerprint_tail = _sentencepiece_model_proto_cache_fingerprint(file_path, stat.st_size)
+        return _classify_sentencepiece_model_proto_file_cached(
+            str(file_path.resolve()),
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+            fingerprint_head,
+            fingerprint_tail,
+        )
     except OSError:
         return "unknown"
 
