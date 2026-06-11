@@ -190,7 +190,12 @@ def pickle_report_to_scan_result(
     report_dict = report.to_dict()
     report_metadata = report_dict["metadata"]
     result = ScanResult(scanner_name=scanner_name, scanner=scanner)
-    fingerprint_metadata = report.private_metadata.get(_CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY)
+    private_metadata = getattr(report, "private_metadata", {})
+    fingerprint_metadata = (
+        private_metadata.get(_CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY)
+        if isinstance(private_metadata, Mapping)
+        else None
+    )
     if isinstance(fingerprint_metadata, Mapping):
         result._private_metadata[_CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY] = _deep_mutable_copy(
             fingerprint_metadata
