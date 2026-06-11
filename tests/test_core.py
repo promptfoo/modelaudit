@@ -5120,6 +5120,24 @@ def test_scan_file_fails_closed_for_printable_utf8_non_text_suffix_binary_candid
     assert core_module.determine_exit_code(aggregate) == 2
 
 
+def test_scan_file_fails_closed_for_printable_utf8_invalid_json_protobuf_candidate(tmp_path: Path) -> None:
+    payload = _build_printable_utf8_ambiguous_binary_route()
+    candidate = tmp_path / "ambiguous.json"
+    candidate.write_bytes(payload)
+
+    assert file_detection.detect_file_format(str(candidate)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert file_detection.detect_file_format_from_magic(str(candidate)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert file_detection.detect_file_format_for_skip_filter(str(candidate)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+    result = scan_file(str(candidate), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(candidate), cache_scan_results=False)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "onnx_tentative_candidate_analysis_unavailable" in result.metadata["scan_outcome_reasons"]
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
 def test_scan_file_fails_closed_for_large_printable_utf8_non_text_suffix_binary_candidate(tmp_path: Path) -> None:
     unit = _build_printable_utf8_ambiguous_binary_route()
     payload = unit * ((2 * 1024 * 1024) // len(unit) + 1)
