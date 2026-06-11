@@ -251,6 +251,10 @@ _SENTENCEPIECE_MALFORMED_TAILS = (
     pytest.param(b"\x12\x80", id="truncated-length-varint"),
     pytest.param(b"\x80", id="truncated-tag-varint"),
     pytest.param(_proto_field(2, 2, _proto_varint(4) + b"x"), id="truncated-length-payload"),
+    pytest.param(_proto_field(2, 0, _proto_varint(0)), id="wrong-wire-trainer-spec"),
+    pytest.param(_proto_field(3, 0, _proto_varint(0)), id="wrong-wire-normalizer-spec"),
+    pytest.param(_proto_field(4, 0, _proto_varint(0)), id="wrong-wire-self-test-data"),
+    pytest.param(_proto_field(5, 0, _proto_varint(0)), id="wrong-wire-denormalizer-spec"),
     pytest.param(_proto_varint((2 << 3) | 6), id="invalid-wire-type-6"),
     pytest.param(_proto_varint((2 << 3) | 7), id="invalid-wire-type-7"),
     pytest.param(b"\x00not a protobuf tail", id="arbitrary-tail"),
@@ -2657,6 +2661,22 @@ class TestXGBoostFailClosedEndToEnd:
         assert cli_result.exit_code == 2
         assert "xgboost" in cli_payload.get("scanner_names", [])
         assert any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
+
+    def test_large_sentencepiece_wrong_wire_type_metadata_still_fails_closed_in_xgboost(self, tmp_path: Path) -> None:
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(
+            _large_real_sentencepiece_model_proto_shape() + _proto_field(2, 0, _proto_varint(0))
+        )
+
+        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+        assert tokenizer_model.stat().st_size > file_detection._SENTENCEPIECE_MODEL_PROTO_READ_BYTES
+        assert direct.success is False
+        assert direct.scanner_name == "xgboost"
+        assert "xgboost_binary_structure_unrecognized" in direct.metadata["scan_outcome_reasons"]
+        assert any(issue.rule_code == "S1004" for issue in direct.issues)
+        _assert_xgboost_s1004(aggregate)
 
     def test_xgboost_binary_model_extension_still_scans_cleanly(self, tmp_path: Path) -> None:
         binary_model = tmp_path / "native.model"

@@ -2105,6 +2105,8 @@ def _classify_sentencepiece_model_proto_stream(
             stream.seek(actual_value_end)
             offset = actual_value_end
         elif field_number == 2:
+            if wire_type != 2:
+                return reject_candidate()
             bounds = _read_proto_length_delimited_bounds_stream(stream, file_size)
             if bounds is None:
                 return reject_candidate()
@@ -2119,6 +2121,8 @@ def _classify_sentencepiece_model_proto_stream(
             stream.seek(actual_value_end)
             offset = actual_value_end
         elif field_number == 3:
+            if wire_type != 2:
+                return reject_candidate()
             bounds = _read_proto_length_delimited_bounds_stream(stream, file_size)
             if bounds is None:
                 return reject_candidate()
@@ -2132,6 +2136,8 @@ def _classify_sentencepiece_model_proto_stream(
             stream.seek(actual_value_end)
             offset = actual_value_end
         elif field_number in {4, 5}:
+            if wire_type != 2:
+                return reject_candidate()
             bounds = _read_proto_length_delimited_bounds_stream(stream, file_size)
             if bounds is None:
                 return reject_candidate()
