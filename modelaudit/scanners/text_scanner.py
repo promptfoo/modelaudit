@@ -452,6 +452,14 @@ DOCUMENTATION_FENCED_DIRECT_URL_CALL_PATTERN = re.compile(
     rb"(?P<url>https?://[^\"'\s)]+)",
     re.IGNORECASE,
 )
+DOCUMENTATION_FENCED_ALLOWED_NETWORK_CALL_PATTERN = re.compile(
+    rb"\b(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_VARIABLE_ASSIGNMENT_PATTERN = re.compile(
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)",
+    re.IGNORECASE,
+)
 DOCUMENTATION_FENCED_REQUESTS_CALL_PATTERN = re.compile(
     rb"\brequests\.(?P<method>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
     re.IGNORECASE,
@@ -698,12 +706,36 @@ class TextScanner(BaseScanner):
         return not (marker.startswith(b"`") and b"`" in suffix)
 
     @classmethod
+    def _documentation_has_closed_bare_tilde_fence(cls, payload: bytes) -> bool:
+        opening_marker: bytes | None = None
+        opening_end: int | None = None
+        for match in DOCUMENTATION_FENCE_LINE_PATTERN.finditer(payload):
+            marker = match.group("marker")
+            suffix = match.group("suffix")
+            if not marker.startswith(b"~") or suffix.strip():
+                continue
+            if opening_marker is None:
+                previous_line_end = match.start() - 1
+                if previous_line_end >= 0:
+                    previous_line_start = payload.rfind(b"\n", 0, previous_line_end) + 1
+                    if payload[previous_line_start:previous_line_end].strip():
+                        continue
+                opening_marker = marker
+                opening_end = match.end()
+                continue
+            if len(marker) >= len(opening_marker) and opening_end is not None and opening_end < match.start():
+                return True
+        return False
+
+    @classmethod
     def _documentation_uses_markdown_fences(cls, path: str, payload: bytes) -> bool:
         filename = os.path.basename(path).lower()
         extension = os.path.splitext(filename)[1]
         if extension == ".rst":
             return False
         if extension in {".md", ".markdown"}:
+            return True
+        if cls._documentation_has_closed_bare_tilde_fence(payload):
             return True
         return any(
             cls._documentation_fence_match_can_open_code(match)
@@ -1438,23 +1470,41 @@ class TextScanner(BaseScanner):
             for match in DOCUMENTATION_FENCED_DIRECT_URL_CALL_PATTERN.finditer(fenced_code)
         ):
             return False
-        assigned_urls = {
-            match.group("target"): match.group("url").decode("utf-8", errors="ignore")
+        direct_url_calls = tuple(DOCUMENTATION_FENCED_DIRECT_URL_CALL_PATTERN.finditer(fenced_code))
+        variable_call_matches = tuple(DOCUMENTATION_FENCED_URL_VARIABLE_CALL_PATTERN.finditer(fenced_code))
+        allowed_call_positions = {match.start() for match in direct_url_calls} | {
+            match.start() for match in variable_call_matches
+        }
+        if any(
+            match.start() not in allowed_call_positions
+            for match in DOCUMENTATION_FENCED_ALLOWED_NETWORK_CALL_PATTERN.finditer(fenced_code)
+        ):
+            return False
+        safe_assigned_urls = {
+            (match.group("target"), match.start()): match.group("url").decode("utf-8", errors="ignore")
             for pattern in (
                 DOCUMENTATION_FENCED_URL_ASSIGNMENT_PATTERN,
                 DOCUMENTATION_FENCED_URL_REQUEST_ASSIGNMENT_PATTERN,
             )
             for match in pattern.finditer(fenced_code)
         }
-        call_targets = [
-            match.group("target") for match in DOCUMENTATION_FENCED_URL_VARIABLE_CALL_PATTERN.finditer(fenced_code)
-        ]
-        if any(
-            target not in assigned_urls
-            or not cls._documentation_fenced_passive_assigned_url_is_informational(assigned_urls[target])
-            for target in call_targets
-        ):
-            return False
+        assignment_positions: dict[bytes, list[int]] = {}
+        for match in DOCUMENTATION_FENCED_VARIABLE_ASSIGNMENT_PATTERN.finditer(fenced_code):
+            assignment_positions.setdefault(match.group("target"), []).append(match.start())
+        call_target_urls: list[str] = []
+        for match in variable_call_matches:
+            target = match.group("target")
+            preceding_assignments = [
+                position for position in assignment_positions.get(target, []) if position < match.start()
+            ]
+            if not preceding_assignments:
+                return False
+            assigned_url = safe_assigned_urls.get((target, preceding_assignments[-1]))
+            if assigned_url is None or not cls._documentation_fenced_passive_assigned_url_is_informational(
+                assigned_url
+            ):
+                return False
+            call_target_urls.append(assigned_url)
         bare_urls = [
             match.group().decode("utf-8", errors="ignore").rstrip(")]}'\"`,.;")
             for match in BARE_NETWORK_URL_TOKEN_PATTERN.finditer(fenced_code)
@@ -1463,12 +1513,9 @@ class TextScanner(BaseScanner):
             return False
         if any(cls._documentation_loopback_api_url_is_informational(url) for url in bare_urls):
             return True
-        passive_targets = {
-            target
-            for target, url in assigned_urls.items()
-            if cls._documentation_fenced_passive_media_url_is_informational(url)
-        }
-        return bool(call_targets) and all(target in passive_targets for target in call_targets)
+        return bool(call_target_urls) and all(
+            cls._documentation_fenced_passive_media_url_is_informational(url) for url in call_target_urls
+        )
 
     @classmethod
     def _documentation_fenced_passive_network_example_ranges(
