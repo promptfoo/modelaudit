@@ -415,8 +415,9 @@ def _advance_ordered_literal_anchors(
     value: str,
     anchor_matchers: tuple[tuple[str, re.Pattern[str]], ...],
     start_index: int,
+    search_floor: int = 0,
 ) -> int:
-    search_offset = 0
+    search_offset = search_floor if start_index > 0 else 0
     index = start_index
     while index < len(anchor_matchers):
         match = anchor_matchers[index][1].search(value, search_offset)
@@ -2235,8 +2236,12 @@ class FlaxMsgpackScanner(BaseScanner):
                         window_has_all_anchors = _advance_ordered_literal_anchors(
                             normalized_window, anchor_matchers, 0
                         ) == len(anchor_matchers)
+                        previous_anchor_count = seen_pattern_anchor_counts.get(pattern, 0)
                         next_anchor_index = _advance_ordered_literal_anchors(
-                            normalized_window, anchor_matchers, seen_pattern_anchor_counts.get(pattern, 0)
+                            normalized_window,
+                            anchor_matchers,
+                            previous_anchor_count,
+                            len(normalized_tail),
                         )
                         seen_pattern_anchor_counts[pattern] = next_anchor_index
                         if next_anchor_index == len(anchor_matchers):
@@ -2547,7 +2552,7 @@ class FlaxMsgpackScanner(BaseScanner):
         saw_getattr_dunder_candidate = False
         raw_tail = b""
 
-        def inspect_window(raw_bytes: bytes) -> None:
+        def inspect_window(raw_bytes: bytes, normalized_search_floor: int) -> None:
             nonlocal saw_getattr_call_candidate, saw_getattr_dunder_candidate
             raw_window_lower = raw_bytes.lower()
             transform_candidates = [
@@ -2630,8 +2635,12 @@ class FlaxMsgpackScanner(BaseScanner):
 
                 anchor_matchers = self._stream_unsafe_anchor_matchers[pattern]
                 assert anchor_matchers is not None
+                previous_anchor_count = seen_pattern_anchor_counts.get(pattern, 0)
                 next_anchor_index = _advance_ordered_literal_anchors(
-                    normalized_window, anchor_matchers, seen_pattern_anchor_counts.get(pattern, 0)
+                    normalized_window,
+                    anchor_matchers,
+                    previous_anchor_count,
+                    normalized_search_floor,
                 )
                 seen_pattern_anchor_counts[pattern] = next_anchor_index
                 if next_anchor_index == len(anchor_matchers):
@@ -2648,8 +2657,13 @@ class FlaxMsgpackScanner(BaseScanner):
 
         chunk = first_chunk
         while True:
-            inspect_window(raw_tail + chunk)
-            raw_tail = (raw_tail + chunk)[-_STREAM_TEXT_OVERLAP_CHARS:]
+            raw_window_bytes = raw_tail + chunk
+            normalized_search_floor = 0
+            if raw_tail:
+                normalized_tail = _WHITESPACE_RUN_PATTERN.sub(" ", raw_tail.decode("utf-8", errors="replace"))
+                normalized_search_floor = len(normalized_tail)
+            inspect_window(raw_window_bytes, normalized_search_floor)
+            raw_tail = raw_window_bytes[-_STREAM_TEXT_OVERLAP_CHARS:]
             if remaining <= 0:
                 break
             chunk = cursor._read_exact(min(remaining, _STREAM_TEXT_CHUNK_BYTES))

@@ -22,6 +22,8 @@ from modelaudit.integrations.sarif_formatter import _create_results
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.flax_msgpack_scanner import (
+    _STREAM_TEXT_CHUNK_BYTES,
+    _STREAM_TEXT_OVERLAP_CHARS,
     _UNBOUNDED_GETATTR_PATTERN,
     FlaxMsgpackScanner,
     _matching_jax_transforms,
@@ -1376,6 +1378,20 @@ def test_flax_msgpack_large_binary_fails_closed_for_split_stream_unsafe_custom_p
 def test_flax_msgpack_large_binary_does_not_fail_closed_for_reversed_custom_pattern_anchors(tmp_path: Path) -> None:
     path = tmp_path / "large_binary_reversed_custom_pattern.msgpack"
     payload = (b"\x00" * 128) + b"bar" + (b"x" * (64 * 1024 + 4096 + 100)) + b"foo"
+    create_msgpack_file(path, {"params": {"blob": payload}})
+
+    result = FlaxMsgpackScanner(config={"suspicious_patterns": [r"foo.*bar"]}).scan(str(path))
+
+    assert result.success is True
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON not in result.metadata.get("scan_outcome_reasons", [])
+    assert all(check.name != "Flax MessagePack Binary Pattern Coverage" for check in result.checks)
+
+
+def test_flax_msgpack_large_binary_preserves_custom_pattern_anchor_order_across_overlap(tmp_path: Path) -> None:
+    path = tmp_path / "large_binary_reversed_overlap_custom_pattern.msgpack"
+    reversed_overlap = b"bar" + (b"x" * (_STREAM_TEXT_OVERLAP_CHARS - len(b"bar") - len(b"foo"))) + b"foo"
+    first_chunk = (b"\x00" * (_STREAM_TEXT_CHUNK_BYTES - len(reversed_overlap))) + reversed_overlap
+    payload = first_chunk + (b"x" * 1024)
     create_msgpack_file(path, {"params": {"blob": payload}})
 
     result = FlaxMsgpackScanner(config={"suspicious_patterns": [r"foo.*bar"]}).scan(str(path))
