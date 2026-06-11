@@ -1232,7 +1232,10 @@ def _select_non_hdf5_preferred_scanner_id(
     if ext in _R_SERIALIZED_EXTENSIONS and header_format in _COMPRESSED_HEADER_FORMATS | {"r_serialized"}:
         return "r_serialized"
 
-    if header_format == "tar" and ext == ".nemo":
+    if ext == ".nemo" and (
+        header_format == "tar"
+        or (header_format == "gzip" and validate_file_type_with_formats(path, header_format, "nemo"))
+    ):
         return "nemo"
 
     return _registry.get_scanner_id_for_header_format(header_format)

@@ -128,19 +128,54 @@ class TestNemoScannerBasic:
         ]
         assert len(mismatch_checks) == 0
 
-    def test_gzip_framed_nemo_does_not_trigger_s901(self, tmp_path: Path) -> None:
-        """Valid gzip-compressed .nemo tar archives should not be flagged as spoofed."""
+    def test_gzip_framed_nemo_keeps_nemo_ownership_when_header_stays_gzip(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Validated gzip TARs remain NeMo-owned when routing retains gzip framing."""
         path = _create_nemo_file(tmp_path, {"model": {"_target_": "nemo.Model"}}, mode="w:gz")
+        monkeypatch.setattr("modelaudit.core.detect_file_format", lambda _path: "gzip")
 
-        direct_result = NemoScanner().scan(str(path))
-        aggregate_result = scan_file(str(path), config={"cache_scan_results": False})
+        file_result = scan_file(str(path), config={"cache_scan_results": False})
+        aggregate_result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
 
-        direct_s901 = [check for check in direct_result.checks if check.rule_code == "S901"]
-        aggregate_s901 = [check for check in aggregate_result.checks if check.rule_code == "S901"]
+        assert file_result.scanner_name == "nemo"
+        assert not [check for check in file_result.checks if check.rule_code == "S901"]
+        assert aggregate_result.scanner_names == ["nemo"]
+        assert not [issue for issue in aggregate_result.issues if issue.severity == IssueSeverity.CRITICAL]
+        assert determine_exit_code(aggregate_result) == 0
 
-        assert direct_s901 == []
-        assert aggregate_s901 == []
-        assert aggregate_result.scanner_name == "nemo"
+    def test_gzip_framed_malicious_nemo_keeps_nemo_findings_when_header_stays_gzip(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Retained gzip framing must not hide NeMo Hydra findings from either API."""
+        path = _create_nemo_file_from_bytes(
+            tmp_path,
+            b"model:\n  _target_: os.system\n  command: echo pwned\n",
+            mode="w:gz",
+        )
+        monkeypatch.setattr("modelaudit.core.detect_file_format", lambda _path: "gzip")
+
+        file_result = scan_file(str(path), config={"cache_scan_results": False})
+        aggregate_result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        assert file_result.scanner_name == "nemo"
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details.get("target") == "os.system"
+            for check in file_result.checks
+        )
+        assert aggregate_result.scanner_names == ["nemo"]
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL and issue.details.get("target") == "os.system"
+            for issue in aggregate_result.issues
+        )
+        assert determine_exit_code(aggregate_result) == 1
 
     def test_malformed_gzip_nemo_still_reports_s901(self, tmp_path: Path) -> None:
         """A .nemo suffix plus gzip magic is not enough unless it is a valid TAR."""
@@ -150,6 +185,7 @@ class TestNemoScannerBasic:
         result = scan_file(str(path), config={"cache_scan_results": False})
 
         s901_checks = [check for check in result.checks if check.rule_code == "S901"]
+        assert result.scanner_name == "compressed"
         assert s901_checks
         assert any(
             check.details.get("extension_format") == "nemo" and check.details.get("header_format") == "gzip"
@@ -164,6 +200,7 @@ class TestNemoScannerBasic:
         result = scan_file(str(path), config={"cache_scan_results": False})
 
         s901_checks = [check for check in result.checks if check.rule_code == "S901"]
+        assert result.scanner_name == "compressed"
         assert s901_checks
         assert any(
             check.details.get("extension_format") == "nemo" and check.details.get("header_format") == "gzip"
