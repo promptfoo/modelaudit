@@ -1783,6 +1783,28 @@ def test_hf_tokenizer_json_jax_identity_is_not_claimed(tmp_path: Path) -> None:
     assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
 
 
+def test_hf_tokenizer_json_jax_route_evidence_requires_identity_value(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(',"chat_template":"{{ harmless_user }}","framework":"transformers"'),
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+    assert file_detection.huggingface_tokenizer_json_has_jax_route_evidence(tokenizer_path) is False
+
+
+def test_hf_tokenizer_json_jax_route_evidence_accepts_library_identity_value(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(',"chat_template":"{{ harmless_user }}","library":"jax"'),
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+    assert file_detection.huggingface_tokenizer_json_has_jax_route_evidence(tokenizer_path) is True
+
+
 def test_hf_tokenizer_json_vocab_template_token_is_claimed(tmp_path: Path) -> None:
     tokenizer_path = _write_ordered_hf_tokenizer_json(
         tmp_path / "tokenizer.json",

@@ -83,6 +83,7 @@ _INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
 _JINJA_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
 _JINJA_TEMPLATE_INDICATOR_BYTES = tuple(indicator.encode("utf-8") for indicator in _JINJA_TEMPLATE_INDICATORS)
 _TEMPLATE_FIELD_KEYS = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
+JINJA_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY = "_jinja_skip_jax_json_overlap"
 _DETECTION_MESSAGE_LABELS = {
     "critical_injection": "critical injection",
     "object_traversal": "object hierarchy access",
@@ -779,6 +780,8 @@ class Jinja2TemplateScanner(BaseScanner):
 
     def _scan_jax_json_overlap(self, path: str, result: ScanResult) -> None:
         """Preserve JAX analysis for Jinja-owned tokenizer JSON files."""
+        if self.config.get(JINJA_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY) is True:
+            return
         if Path(path).name.lower() != "tokenizer.json" or not huggingface_tokenizer_json_has_jax_route_evidence(path):
             return
 

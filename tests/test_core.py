@@ -9983,7 +9983,7 @@ def test_scan_file_tokenizer_template_preserves_explicit_jax_selection(tmp_path:
     )
 
 
-def test_scan_file_selected_jax_requires_positive_json_evidence(tmp_path: Path) -> None:
+def test_scan_file_selected_jax_preserves_ambiguous_json_fail_closed(tmp_path: Path) -> None:
     generic_path = tmp_path / "generic.json"
     generic_path.write_text(
         json.dumps({"padding": "x" * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 16)}),
@@ -9995,8 +9995,9 @@ def test_scan_file_selected_jax_requires_positive_json_evidence(tmp_path: Path) 
         config={"cache_scan_results": False, "scanners": ["jax_checkpoint"]},
     )
 
-    assert result.scanner_name != "jax_checkpoint"
-    assert "jax_json_checkpoint_analysis_size_limit" not in result.metadata.get("scan_outcome_reasons", [])
+    assert result.scanner_name == "jax_checkpoint"
+    assert result.success is False
+    assert "jax_json_checkpoint_analysis_size_limit" in result.metadata.get("scan_outcome_reasons", [])
 
 
 def test_scan_file_oversized_tokenizer_json_late_mxnet_root_preserves_mxnet_detection(
@@ -10305,6 +10306,43 @@ def test_scan_file_tokenizer_json_jax_identity_preserves_jax_checkpoint_analysis
     assert any(
         check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
     )
+    assert not any(check.name == "Template Extraction" for check in result.checks)
+
+
+def test_scan_file_tokenizer_json_non_jax_identity_does_not_merge_jax(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"framework":"transformers",'
+            '"chat_template":"{{ harmless_user }}",'
+            f'"padding":"{"x" * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 16)}"'
+        ),
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert "jax_json_checkpoint_analysis_size_limit" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "JSON Checkpoint Analysis Limit" for check in result.checks)
+
+
+def test_scan_file_tokenizer_json_library_jax_identity_composes_jinja_template_analysis(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"library":"jax",'
+            '"payload":"jax.experimental.host_callback.call(os.system, \'id\')",'
+            '"chat_template":"{{ harmless_user }}"'
+        ),
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert set(result.metadata["scanner_dependency_ids"]) >= {"jinja2_template", "jax_checkpoint"}
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
 
 
 def test_scan_file_tokenizer_json_jax_identity_composes_jinja_template_analysis(tmp_path: Path) -> None:
@@ -10327,6 +10365,39 @@ def test_scan_file_tokenizer_json_jax_identity_composes_jinja_template_analysis(
     assert any(
         check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
         for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_xgboost_jax_jinja_overlap_does_not_recurse(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+            '"framework":"jax",'
+            '"payload":"jax.experimental.host_callback.call(os.system, \'id\')",'
+            '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"'
+        ),
+        version_json="[1,7,4]",
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is False
+    assert set(result.metadata["scanner_dependency_ids"]) >= {
+        "jinja2_template",
+        "jax_checkpoint",
+        "xgboost",
+    }
+    assert (
+        sum(
+            check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+        == 1
+    )
+    assert (
+        sum(check.name == "JSON Content Analysis" and check.status == CheckStatus.FAILED for check in result.checks)
+        == 1
     )
 
 

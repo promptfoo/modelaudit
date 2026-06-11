@@ -739,7 +739,7 @@ class XGBoostScanner(BaseScanner):
     ) -> None:
         """Preserve additional JSON analyses for XGBoost-shaped content."""
         from .jax_checkpoint_scanner import JAX_SKIP_XGBOOST_JSON_OVERLAP_CONFIG_KEY, JaxCheckpointScanner
-        from .jinja2_template_scanner import Jinja2TemplateScanner
+        from .jinja2_template_scanner import JINJA_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY, Jinja2TemplateScanner
         from .manifest_scanner import ManifestScanner
 
         scanner_selection = policy_from_config(self.config)
@@ -776,7 +776,9 @@ class XGBoostScanner(BaseScanner):
                 )
         if not manifest_covered_templates and Jinja2TemplateScanner.can_handle(path):
             if scanner_selection.allows("jinja2_template"):
-                self._merge_filename_owned_result(result, Jinja2TemplateScanner(config=self.config).scan(path))
+                jinja_config = dict(self.config)
+                jinja_config[JINJA_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY] = True
+                self._merge_filename_owned_result(result, Jinja2TemplateScanner(config=jinja_config).scan(path))
             elif scanner_selection.active:
                 add_scanner_selection_skip_check(
                     result,
