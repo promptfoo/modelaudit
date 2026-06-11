@@ -42,7 +42,7 @@ from modelaudit.scanners import (
     safetensors_scanner,
     tf_savedmodel_scanner,
 )
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
 from modelaudit.scanners.tf_metagraph_scanner import _MAX_PARSE_BYTES
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
@@ -1562,6 +1562,12 @@ def test_directory_owner_snapshot_rejects_directory_swapped_to_symlink_before_de
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class RecursiveDirectoryOwnerScanner(BaseScanner):
+        name = "recursive_directory_owner"
+
+        def scan(self, path: str) -> ScanResult:
+            raise AssertionError("scan is not used by namespace snapshot tests")
+
     model_dir = tmp_path / "orbax-model"
     nested_dir = model_dir / "checkpoint_1"
     nested_dir.mkdir(parents=True)
@@ -1592,7 +1598,7 @@ def test_directory_owner_snapshot_rejects_directory_swapped_to_symlink_before_de
     with pytest.raises(OSError):
         core_module._capture_directory_owner_namespace_by_descriptor(
             model_dir,
-            JaxCheckpointScanner,
+            RecursiveDirectoryOwnerScanner,
             deadline=core_module.time.time() + 10,
             max_entries=10,
         )
@@ -1733,6 +1739,35 @@ def test_directory_owner_snapshot_entry_limit_fails_closed(
     )
     assert result.content_hash is None
     assert determine_exit_code(result) == 2
+
+
+def test_jax_owner_snapshot_prunes_ignored_nested_directories_from_entry_limit(tmp_path: Path) -> None:
+    model_dir = tmp_path / "orbax-model"
+    metadata_path = _write_orbax_metadata(model_dir, restore_fn="os.system")
+    ignored_dir = model_dir / "ignored"
+    ignored_dir.mkdir()
+    for index in range(5):
+        (ignored_dir / f"ignored-{index}.txt").write_text("ignored", encoding="utf-8")
+
+    result = scan_model_directory_or_file(
+        str(model_dir),
+        cache_scan_results=False,
+        max_directory_owner_snapshot_entries=2,
+    )
+
+    owner_metadata = result.file_metadata[str(model_dir)]
+    restore_checks = [
+        check
+        for check in result.checks
+        if check.name == "Orbax Restore Function Check"
+        and check.status == CheckStatus.FAILED
+        and any(finding.get("restore_fn") == "os.system" for finding in check.details.get("findings", []))
+    ]
+    assert owner_metadata["directory_owner_scan"] is True
+    assert owner_metadata["directory_owner_bytes_scanned"] == metadata_path.stat().st_size
+    assert "directory_owner_entry_limit" not in owner_metadata.get("scan_outcome_reasons", [])
+    assert len(restore_checks) == 1
+    assert determine_exit_code(result) == 1
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO creation is unavailable")

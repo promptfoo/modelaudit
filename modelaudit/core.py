@@ -579,7 +579,13 @@ def _capture_directory_owner_namespace_by_descriptor(
                     raw_link_target = os.readlink(lexical_entry.name, dir_fd=directory_descriptor)
 
             entry_path = root_path.joinpath(*relative_parts)
-            if stat.S_ISDIR(entry_mode) or owner_class.directory_owner_source_in_scope(relative_parts):
+            directory_in_scope = stat.S_ISDIR(entry_mode) and owner_class.directory_owner_directory_in_scope(
+                relative_parts
+            )
+            should_descend = stat.S_ISDIR(entry_mode) and owner_class.directory_owner_should_descend_into_directory(
+                relative_parts
+            )
+            if directory_in_scope or owner_class.directory_owner_source_in_scope(relative_parts):
                 snapshot.append(
                     _directory_owner_snapshot_entry(
                         entry_path,
@@ -589,7 +595,7 @@ def _capture_directory_owner_namespace_by_descriptor(
                     )
                 )
 
-            if not stat.S_ISDIR(entry_mode) or is_link:
+            if not should_descend or is_link:
                 continue
 
             child_descriptor = os.open(
@@ -662,10 +668,16 @@ def _capture_directory_owner_namespace(
                 file_attributes = getattr(entry_stat, "st_file_attributes", 0) or 0
                 entry_mode = _directory_owner_stat_mode(entry_stat)
                 is_link = stat.S_ISLNK(entry_mode) or bool(reparse_flag and file_attributes & reparse_flag)
-                if stat.S_ISDIR(entry_mode) and not is_link:
+                directory_in_scope = stat.S_ISDIR(entry_mode) and owner_class.directory_owner_directory_in_scope(
+                    relative_parts
+                )
+                should_descend = stat.S_ISDIR(entry_mode) and owner_class.directory_owner_should_descend_into_directory(
+                    relative_parts
+                )
+                if should_descend and not is_link:
                     child_directories.append((entry_path, relative_parts, entry_stat))
 
-                if not (stat.S_ISDIR(entry_mode) or owner_class.directory_owner_source_in_scope(relative_parts)):
+                if not (directory_in_scope or owner_class.directory_owner_source_in_scope(relative_parts)):
                     continue
                 snapshot.append(
                     _directory_owner_snapshot_entry(

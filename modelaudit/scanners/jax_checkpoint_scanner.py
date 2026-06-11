@@ -1085,6 +1085,16 @@ class JaxCheckpointScanner(BaseScanner):
         )
 
     @classmethod
+    def directory_owner_directory_in_scope(cls, relative_parts: tuple[str, ...]) -> bool:
+        """Bind only top-level directories whose entries Orbax directory analysis can inspect."""
+        return len(relative_parts) == 1
+
+    @classmethod
+    def directory_owner_should_descend_into_directory(cls, relative_parts: tuple[str, ...]) -> bool:
+        """Orbax directory analysis reads top-level entries, not nested directory contents."""
+        return False
+
+    @classmethod
     def _header_starts_with_legacy_pickle_opcode(cls, header: bytes) -> bool:
         return bool(header) and header[:1] in cls._LEGACY_PICKLE_INITIAL_OPCODES
 
