@@ -69,6 +69,26 @@ def test_valid_safetensors_file(tmp_path: Path) -> None:
     assert header_limit_check.status.value == "passed"
 
 
+def test_duplicate_safetensors_header_keys_are_inconclusive(tmp_path: Path) -> None:
+    file_path = tmp_path / "duplicate-key.safetensors"
+    header = (
+        b'{"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]},'
+        b'"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}'
+    )
+    write_raw_safetensors_header(file_path, header, b"\x00")
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "safetensors_structure_validation_failed" in result.metadata["scan_outcome_reasons"]
+    duplicate_check = next(
+        check for check in result.checks if check.name == "SafeTensors Duplicate Header Key Validation"
+    )
+    assert duplicate_check.status == CheckStatus.FAILED
+    assert duplicate_check.details["duplicate_keys"] == ["tensor"]
+
+
 @pytest.mark.parametrize(
     ("dtype", "shape", "data_size"),
     [

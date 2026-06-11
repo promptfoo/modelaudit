@@ -3,10 +3,12 @@
 import json
 import logging
 import os
+import re
 import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Collection, Iterator
 from contextlib import suppress
@@ -15,6 +17,7 @@ from glob import escape as escape_glob
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
+from urllib.parse import parse_qs, urljoin, urlparse
 
 from ..helpers.disk_space import check_disk_space
 from .huggingface_paths import (
@@ -37,6 +40,9 @@ _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
 _MAX_HF_STREAMING_EXTENSIONLESS_FILES = 128
 _MAX_HF_STREAMING_UNFILTERED_FILES = 128
+_MAX_HF_SAFETENSORS_INDEX_BYTES = 16 * 1024 * 1024
+_HF_SAFETENSORS_STRICT_RANGE_REDIRECTS = 5
+_HF_SAFETENSORS_RANGE_ATTEMPTS = 3
 _HF_DOWNLOAD_WORKER_RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
 _POSIX_TERMINATE_SIGNAL = getattr(signal, "SIGTERM", 15)
 _POSIX_KILL_SIGNAL = getattr(signal, "SIGKILL", 9)
@@ -99,6 +105,465 @@ class _HuggingFaceProbeBudget:
                 f"Hugging Face selective filtering incomplete: inconsistent skipped file size for {repo_id}/{filename}"
             )
         self.file_sizes[filename] = file_size
+
+
+@dataclass(frozen=True)
+class _HuggingFaceStrictRangeRead:
+    data: bytes
+    total_size: int
+    validator: str
+    final_url: str
+    bytes_transferred: int
+
+
+def _remote_safetensors_source_path(repo_id: str, revision: str, filename: str) -> str:
+    return f"hf://{repo_id}@{revision}/{filename}"
+
+
+def _requested_huggingface_revision(url: str) -> str | None:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    query = parse_qs(parsed.query, keep_blank_values=False)
+    raw_values = query.get("revision") or query.get("rev")
+    if not raw_values:
+        return None
+    if len(raw_values) != 1 or not _is_huggingface_commit_sha(raw_values[0]):
+        raise ValueError("Hugging Face revision query must be a full immutable commit SHA")
+    return raw_values[0]
+
+
+def _is_trusted_huggingface_range_host(hostname: str | None) -> bool:
+    if hostname is None:
+        return False
+    host = hostname.rstrip(".").lower()
+    return host in {"huggingface.co", "hf.co"} or host.endswith(".huggingface.co") or host.endswith(".hf.co")
+
+
+def _validate_huggingface_range_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError("Hugging Face range redirect used an untrusted scheme")
+    if parsed.username or parsed.password:
+        raise ValueError("Hugging Face range redirect used userinfo credentials")
+    if not _is_trusted_huggingface_range_host(parsed.hostname):
+        raise ValueError("Hugging Face range redirect used an untrusted final host")
+
+
+def _range_response_validator(headers: Any) -> str:
+    validator_parts: list[str] = []
+    for key in ("ETag", "X-Linked-ETag", "X-Xet-Hash"):
+        value = headers.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        normalized = value.strip()
+        if normalized.lower().startswith("w/"):
+            raise ValueError("Hugging Face range response used a weak object validator")
+        validator_value = normalized.strip('"')
+        validator_parts.append(f"{key.lower()}={validator_value}")
+    if not validator_parts:
+        raise ValueError("Hugging Face range response omitted a stable object validator")
+    return ";".join(validator_parts)
+
+
+def _parse_strict_content_range(response: Any, expected_size: int | None, max_bytes: int) -> tuple[int, int]:
+    content_range = response.headers.get("Content-Range", "")
+    match = re.fullmatch(r"bytes 0-(\d+)/(\d+)", content_range.strip(), flags=re.IGNORECASE)
+    if match is None:
+        raise ValueError("Hugging Face range response omitted a valid Content-Range")
+    end_offset, total_size = (int(value) for value in match.groups())
+    if expected_size is not None and total_size != expected_size:
+        raise ValueError("Hugging Face range response size changed during header scan")
+    expected_bytes = min(total_size, max_bytes)
+    if end_offset + 1 != expected_bytes:
+        raise ValueError("Hugging Face range response returned an unexpected byte range")
+    return expected_bytes, total_size
+
+
+def _is_retryable_huggingface_range_error(error: BaseException) -> bool:
+    """Return whether a remote range failure is likely transport-side, not evidence-side."""
+    try:
+        import requests
+    except Exception:
+        return False
+
+    if isinstance(
+        error,
+        (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ContentDecodingError,
+            requests.exceptions.SSLError,
+        ),
+    ):
+        return True
+    if isinstance(error, requests.exceptions.HTTPError):
+        status_code = getattr(getattr(error, "response", None), "status_code", None)
+        return status_code in {408, 425, 429, 500, 502, 503, 504}
+    return False
+
+
+def _read_huggingface_strict_range(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    max_bytes: int,
+    *,
+    expected_size: int | None,
+    deadline: float | None,
+) -> _HuggingFaceStrictRangeRead:
+    """Read a trusted prefix range and reject ambiguous range or object identity semantics."""
+    if max_bytes <= 0:
+        raise ValueError("Hugging Face range read size must be positive")
+
+    import requests
+    from huggingface_hub import hf_hub_url
+    from huggingface_hub.utils import build_hf_headers
+
+    request_deadline = _HuggingFaceProbeBudget(remaining_bytes=max_bytes, deadline=deadline)
+    current_url = hf_hub_url(repo_id=repo_id, filename=filename, revision=revision)
+    _validate_huggingface_range_url(current_url)
+    headers = build_hf_headers(
+        token=None,
+        headers={
+            "Range": f"bytes=0-{max_bytes - 1}",
+            "Accept-Encoding": "identity",
+        },
+    )
+    current_headers = dict(headers)
+    original_host = urlparse(current_url).hostname
+
+    response = None
+    for _redirect_count in range(_HF_SAFETENSORS_STRICT_RANGE_REDIRECTS + 1):
+        request_deadline.check_deadline(repo_id)
+        response = requests.get(
+            current_url,
+            headers=current_headers,
+            stream=True,
+            timeout=request_deadline.request_timeout(repo_id),
+            allow_redirects=False,
+        )
+        if response.status_code in {301, 302, 303, 307, 308}:
+            location = response.headers.get("Location")
+            response.close()
+            if not isinstance(location, str) or not location:
+                raise ValueError("Hugging Face range redirect omitted a Location header")
+            next_url = urljoin(current_url, location)
+            _validate_huggingface_range_url(next_url)
+            next_host = urlparse(next_url).hostname
+            if next_host != original_host:
+                current_headers.pop("authorization", None)
+                current_headers.pop("Authorization", None)
+                current_headers.pop("cookie", None)
+                current_headers.pop("Cookie", None)
+            current_url = next_url
+            continue
+        break
+    else:
+        raise ValueError("Hugging Face range redirect limit exceeded")
+
+    assert response is not None
+    with response:
+        response.raise_for_status()
+        if response.status_code != 206:
+            raise ValueError("Hugging Face server did not honor required range semantics")
+        content_encoding = response.headers.get("Content-Encoding", "identity").strip().lower()
+        if content_encoding not in {"", "identity"}:
+            raise ValueError("Hugging Face range response used encoded content")
+        expected_bytes, total_size = _parse_strict_content_range(response, expected_size, max_bytes)
+        content_length = response.headers.get("Content-Length")
+        if content_length is not None:
+            try:
+                parsed_content_length = int(content_length)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Hugging Face range response used invalid Content-Length") from exc
+            if parsed_content_length != expected_bytes:
+                raise ValueError("Hugging Face range response Content-Length did not match Content-Range")
+        validator = _range_response_validator(response.headers)
+
+        chunks: list[bytes] = []
+        total = 0
+        chunk_size = min(1024 * 1024, max(1, expected_bytes))
+        for chunk in response.iter_content(chunk_size=chunk_size):
+            request_deadline.check_deadline(repo_id)
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > expected_bytes:
+                raise ValueError("Hugging Face range response body exceeded declared range")
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        if len(data) != expected_bytes:
+            raise ValueError("Hugging Face range response ended before declared range")
+        return _HuggingFaceStrictRangeRead(
+            data=data,
+            total_size=total_size,
+            validator=validator,
+            final_url=response.url,
+            bytes_transferred=len(data),
+        )
+
+
+def _remote_safetensors_failure_result(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    *,
+    declared_size: int | None,
+    bytes_transferred: int,
+    reason: str,
+    error: BaseException,
+) -> Any:
+    from ...core_results import mark_operational_scan_error
+    from ...scanner_results import ScanResult, mark_inconclusive_scan_result
+    from ...scanners.base import IssueSeverity
+
+    source_path = _remote_safetensors_source_path(repo_id, revision, filename)
+    result = ScanResult(scanner_name="safetensors")
+    result.metadata.update(
+        {
+            "source_path": source_path,
+            "remote_source_path": source_path,
+            "hf_repo_id": repo_id,
+            "hf_revision": revision,
+            "hf_filename": filename,
+            "file_size": declared_size,
+            "remote_declared_size": declared_size,
+            "remote_bytes_transferred": bytes_transferred,
+            "remote_header_only": True,
+            "analysis_scope": "safetensors_header_and_metadata",
+        }
+    )
+    mark_inconclusive_scan_result(result, reason)
+    mark_operational_scan_error(result, reason)
+    result.add_check(
+        name="Hugging Face SafeTensors Header Range Read",
+        passed=False,
+        message=f"Unable to inspect remote SafeTensors header: {type(error).__name__}",
+        severity=IssueSeverity.INFO,
+        location=source_path,
+        details={
+            "exception_type": type(error).__name__,
+            "exception": redact_huggingface_urls_in_text(str(error)),
+            "analysis_incomplete": True,
+            "scan_outcome_reason": reason,
+            "remote_bytes_transferred": bytes_transferred,
+        },
+    )
+    result.bytes_scanned = bytes_transferred
+    result.finish(success=False)
+    return result
+
+
+def _scan_remote_huggingface_safetensors_header(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    *,
+    declared_size: int,
+    deadline: float | None,
+    shard_details: dict[str, Any] | None = None,
+) -> Any:
+    """Inspect one remote SafeTensors header without downloading tensor payload bytes."""
+    from ...scanners.safetensors_scanner import (
+        _REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY,
+        _REMOTE_HEADER_INTEGRITY_CONFIG_KEY,
+        _REMOTE_HEADER_ONLY_CONFIG_KEY,
+        MAX_HEADER_BYTES,
+        SafeTensorsScanner,
+    )
+
+    source_path = _remote_safetensors_source_path(repo_id, revision, filename)
+    total_bytes_transferred = 0
+    for attempt in range(_HF_SAFETENSORS_RANGE_ATTEMPTS):
+        attempt_bytes_transferred = 0
+        temp_path: str | None = None
+        try:
+            first_range = _read_huggingface_strict_range(
+                repo_id,
+                filename,
+                revision,
+                8,
+                expected_size=declared_size,
+                deadline=deadline,
+            )
+            attempt_bytes_transferred += first_range.bytes_transferred
+            if len(first_range.data) != 8:
+                raise ValueError("SafeTensors header length range returned a short body")
+
+            header_len = struct.unpack("<Q", first_range.data)[0]
+            header_payload = first_range.data
+            final_url = first_range.final_url
+            validator = first_range.validator
+            if 0 < header_len <= MAX_HEADER_BYTES and header_len <= declared_size - 8:
+                header_range = _read_huggingface_strict_range(
+                    repo_id,
+                    filename,
+                    revision,
+                    8 + header_len,
+                    expected_size=declared_size,
+                    deadline=deadline,
+                )
+                attempt_bytes_transferred += header_range.bytes_transferred
+                if header_range.validator != first_range.validator:
+                    raise ValueError("Hugging Face SafeTensors object validator changed during header scan")
+                if header_range.total_size != first_range.total_size:
+                    raise ValueError("Hugging Face SafeTensors declared size changed during header scan")
+                header_payload = header_range.data
+                final_url = header_range.final_url
+                validator = header_range.validator
+
+            bytes_transferred = total_bytes_transferred + attempt_bytes_transferred
+            suffix = ".safetensors" if not Path(filename).suffix else Path(filename).suffix
+            with tempfile.NamedTemporaryFile(
+                prefix="modelaudit_hf_safetensors_",
+                suffix=suffix,
+                delete=False,
+            ) as temp_file:
+                temp_path = temp_file.name
+                temp_file.write(header_payload)
+                temp_file.truncate(declared_size)
+
+            integrity_details: dict[str, Any] = {
+                "hf_repo_id": repo_id,
+                "hf_revision": revision,
+                "hf_filename": filename,
+                "remote_source_path": source_path,
+                "remote_declared_size": declared_size,
+                "remote_header_len": header_len,
+                "remote_bytes_transferred": bytes_transferred,
+                "remote_object_validator": validator,
+                "remote_final_host": urlparse(final_url).hostname,
+                "range_semantics": "strict_206_content_range",
+                "range_attempts": attempt + 1,
+            }
+            scanner = SafeTensorsScanner(
+                config={
+                    _REMOTE_HEADER_ONLY_CONFIG_KEY: True,
+                    _REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY: bytes_transferred,
+                    _REMOTE_HEADER_INTEGRITY_CONFIG_KEY: integrity_details,
+                }
+            )
+            result = scanner.scan(temp_path)
+            result.metadata.update(integrity_details)
+            result.metadata.update(
+                {
+                    "source_path": source_path,
+                    "remote_source_path": source_path,
+                    "file_size": declared_size,
+                    "remote_header_only": True,
+                    "analysis_scope": "safetensors_header_and_metadata",
+                    "content_hash_unavailable_reason": "remote_safetensors_header_only",
+                    "tensor_payload_bytes_downloaded": 0,
+                }
+            )
+            if shard_details is not None:
+                from ...scanners.base import IssueSeverity
+
+                result.metadata["remote_shard_family"] = dict(shard_details)
+                result.add_check(
+                    name="Hugging Face SafeTensors Shard Coverage",
+                    passed=bool(shard_details.get("complete")),
+                    message=str(shard_details.get("message", "Remote SafeTensors shard coverage evaluated")),
+                    severity=None if shard_details.get("complete") else IssueSeverity.INFO,
+                    location=temp_path,
+                    details=shard_details,
+                )
+                if not shard_details.get("complete"):
+                    from ...scanner_results import mark_inconclusive_scan_result
+
+                    mark_inconclusive_scan_result(result, "remote_safetensors_shard_coverage_incomplete")
+                    result.finish(success=False)
+            result.bytes_scanned = bytes_transferred
+            return result
+        except Exception as exc:
+            total_bytes_transferred += attempt_bytes_transferred
+            if not _is_retryable_huggingface_range_error(exc) or attempt + 1 >= _HF_SAFETENSORS_RANGE_ATTEMPTS:
+                return _remote_safetensors_failure_result(
+                    repo_id,
+                    filename,
+                    revision,
+                    declared_size=declared_size,
+                    bytes_transferred=total_bytes_transferred,
+                    reason="remote_safetensors_header_range_failed",
+                    error=exc,
+                )
+            time.sleep(0.25 * (attempt + 1))
+        finally:
+            if temp_path is not None:
+                with suppress(OSError):
+                    Path(temp_path).unlink()
+
+    raise AssertionError("unreachable SafeTensors range retry state")
+
+
+def _remote_safetensors_shard_details_by_file(
+    model_files: list[str], repo_files: list[str]
+) -> dict[str, dict[str, Any]]:
+    """Return per-shard remote coverage details derived from the immutable repository listing."""
+    from modelaudit.utils.file.handlers import ShardedModelDetector
+
+    grouped: dict[tuple[str, str, int], dict[str, Any]] = {}
+    selected = set(model_files)
+    for filename in repo_files:
+        match = ShardedModelDetector.match_shard_filename(PurePosixPath(filename).name)
+        if match is None:
+            continue
+        expected_total = match.get("expected_total_shards")
+        shard_index = match.get("current_shard_index")
+        pattern = match.get("pattern")
+        if (
+            not isinstance(expected_total, int)
+            or not isinstance(shard_index, int)
+            or not isinstance(pattern, str)
+            or expected_total <= 0
+        ):
+            continue
+        parent = PurePosixPath(filename).parent.as_posix()
+        key = (parent, pattern, expected_total)
+        entry = grouped.setdefault(key, {"expected_total_shards": expected_total, "by_index": {}, "filenames": []})
+        entry["filenames"].append(filename)
+        entry["by_index"].setdefault(shard_index, []).append(filename)
+
+    details_by_file: dict[str, dict[str, Any]] = {}
+    for (_parent, pattern, expected_total), entry in grouped.items():
+        by_index = cast(dict[int, list[str]], entry["by_index"])
+        missing_indices = [index for index in range(1, expected_total + 1) if index not in by_index]
+        duplicate_indices = {index: names for index, names in by_index.items() if len(names) > 1}
+        present_filenames = [name for names in by_index.values() for name in names]
+        unselected = sorted(name for name in present_filenames if name not in selected)
+        complete = (
+            not missing_indices
+            and not duplicate_indices
+            and not unselected
+            and len(present_filenames) == expected_total
+        )
+        message = (
+            f"All {expected_total} remote SafeTensors shard headers are selected for inspection."
+            if complete
+            else "Remote SafeTensors shard coverage is incomplete."
+        )
+        group_details: dict[str, Any] = {
+            "complete": complete,
+            "message": message,
+            "pattern": pattern,
+            "expected_total_shards": expected_total,
+            "present_total_shards": len(present_filenames),
+            "missing_shard_count": len(missing_indices),
+            "missing_shard_indices": missing_indices[:20],
+            "missing_shard_indices_truncated": len(missing_indices) > 20,
+            "duplicate_shard_count": len(duplicate_indices),
+            "duplicate_shard_indices": sorted(duplicate_indices)[:20],
+            "unselected_shard_count": len(unselected),
+            "unselected_shards": unselected[:20],
+            "unselected_shards_truncated": len(unselected) > 20,
+        }
+        for filename in present_filenames:
+            if filename in selected:
+                details_by_file[filename] = dict(group_details)
+    return details_by_file
 
 
 def _parse_huggingface_response_file_size(response: Any, bytes_read: int, max_bytes: int) -> int | None:
@@ -988,11 +1453,19 @@ def _select_streamable_hf_files(
         selected_route_formats = _get_selected_hf_content_route_formats(authoritative_extensions, None)
     else:
         selected_route_formats = _get_selected_hf_content_route_formats(scannable_extensions, scannable_filenames)
+    safetensors_suffix_only = (
+        selected_route_scanner_ids == {"safetensors"}
+        and scannable_extensions is not None
+        and {str(extension).lower() for extension in scannable_extensions} == {".safetensors"}
+        and not scannable_filenames
+    )
     sniff_renamed_files = not include_all_files and (
         bool(selected_route_scanner_ids)
         if selected_route_scanner_ids is not None
         else selected_route_formats is None or bool(selected_route_formats)
     )
+    if safetensors_suffix_only:
+        sniff_renamed_files = False
     if scannable_extensions is None:
         extensions = _get_default_hf_streaming_extensions()
         filenames = (
@@ -1149,14 +1622,21 @@ def _list_repo_files_with_timeout(
     repo_id: str,
     timeout_seconds: float = 30,
     *,
+    requested_revision: str | None = None,
     deadline: float | None = None,
 ) -> tuple[list[str] | None, str | None, str | None]:
     """Return repository files, their immutable revision, or a failure reason."""
     if deadline is not None:
         try:
+            operation_kwargs: dict[str, Any] = {
+                "repo_id": repo_id,
+                "request_timeout": timeout_seconds,
+            }
+            if requested_revision is not None:
+                operation_kwargs["requested_revision"] = requested_revision
             worker_result = _run_huggingface_worker_with_deadline(
                 "list_repo_files",
-                {"repo_id": repo_id, "request_timeout": timeout_seconds},
+                operation_kwargs,
                 deadline,
                 repo_id,
             )
@@ -1180,7 +1660,10 @@ def _list_repo_files_with_timeout(
     from huggingface_hub import HfApi
 
     try:
-        repo_info = HfApi().repo_info(repo_id, timeout=timeout_seconds, files_metadata=False)
+        repo_info_kwargs: dict[str, Any] = {"timeout": timeout_seconds, "files_metadata": False}
+        if requested_revision is not None:
+            repo_info_kwargs["revision"] = requested_revision
+        repo_info = HfApi().repo_info(repo_id, **repo_info_kwargs)
     except Exception as exc:
         return None, None, str(exc)
 
@@ -1474,11 +1957,15 @@ def get_model_info(url: str) -> dict:
     namespace, repo_name = parse_huggingface_url(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
     display_url = redact_huggingface_url_for_display(url)
+    requested_revision = _requested_huggingface_revision(url)
 
     api = HfApi()
     try:
         # Get model info for metadata
-        model_info = api.model_info(repo_id)
+        model_info_kwargs: dict[str, Any] = {}
+        if requested_revision is not None:
+            model_info_kwargs["revision"] = requested_revision
+        model_info = api.model_info(repo_id, **model_info_kwargs)
 
         # Use list_repo_tree to get accurate file sizes
         # (model_info.siblings often returns None for size)
@@ -1602,6 +2089,7 @@ def download_model(
     namespace, repo_name = parse_huggingface_url(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
     display_url = redact_huggingface_url_for_display(url)
+    requested_revision = _requested_huggingface_revision(url)
     deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
     # Disk space check and path setup
@@ -1648,10 +2136,13 @@ def download_model(
             listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
             if listing_timeout <= 0:
                 raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+        listing_kwargs: dict[str, Any] = {"deadline": deadline}
+        if requested_revision is not None:
+            listing_kwargs["requested_revision"] = requested_revision
         repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
             repo_id,
             listing_timeout,
-            deadline=deadline,
+            **listing_kwargs,
         )
         if repo_files is None:
             raise ValueError(
@@ -1662,6 +2153,11 @@ def download_model(
             raise ValueError(
                 "Hugging Face selective filtering incomplete: "
                 f"{repo_listing_error or 'repository listing did not include an immutable commit SHA'}"
+            )
+        if requested_revision is not None and repo_revision != requested_revision:
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: "
+                f"resolved revision {repo_revision} did not match requested immutable revision {requested_revision}"
             )
 
         # Find model files in the repository (using centralized model extensions)
@@ -1758,7 +2254,7 @@ def download_model_streaming(
     scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
     include_all_files: bool = False,
-) -> Iterator[tuple[Path, bool]]:
+) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any]]:
     """Download a model from HuggingFace one file at a time (streaming mode).
 
     This generator yields (file_path, is_last_file) tuples as each file is downloaded.
@@ -1776,7 +2272,8 @@ def download_model_streaming(
         include_all_files: Include otherwise-unrecognized files under a bounded fail-closed limit
 
     Yields:
-        Tuple of (Path, bool) - (downloaded file path, is_last_file flag)
+        Tuple of (Path, bool) for downloaded files, or (Path, bool, ScanResult)
+        for trusted source-native header scans.
 
     Raises:
         ValueError: If URL is invalid
@@ -1793,6 +2290,7 @@ def download_model_streaming(
     namespace, repo_name = parse_huggingface_url(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
     display_url = redact_huggingface_url_for_display(url)
+    requested_revision = _requested_huggingface_revision(url)
 
     try:
         # List all files in the repository
@@ -1819,6 +2317,7 @@ def download_model_streaming(
         repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
             repo_id,
             listing_timeout,
+            requested_revision=requested_revision,
             deadline=deadline,
         )
         if repo_files is None:
@@ -1829,6 +2328,11 @@ def download_model_streaming(
             raise Exception(
                 f"Failed listing files in repository {repo_id}: "
                 f"{repo_listing_error or 'repository listing did not include an immutable commit SHA'}"
+            )
+        if requested_revision is not None and repo_revision != requested_revision:
+            raise Exception(
+                f"Failed listing files in repository {repo_id}: resolved revision {repo_revision} "
+                f"did not match requested immutable revision {requested_revision}"
             )
 
         model_files = _select_streamable_hf_files(
@@ -1841,14 +2345,32 @@ def download_model_streaming(
             include_all_files=include_all_files,
             deadline=deadline,
         )
-        revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
-            repo_id,
-            model_files,
-            size_limit,
-            resolved_revision=repo_revision,
-            deadline=deadline,
-        )
-        download_revision = revision or repo_revision
+        safetensors_header_files = {
+            filename for filename in model_files if PurePosixPath(filename).suffix.lower() == ".safetensors"
+        }
+        selected_sizes: dict[str, int] = {}
+        if size_limit is not None or safetensors_header_files:
+            path_sizes, metadata_revision = _get_huggingface_path_sizes(
+                repo_id,
+                model_files,
+                requested_revision=requested_revision,
+                resolved_revision=repo_revision,
+                deadline=deadline,
+            )
+            if metadata_revision != repo_revision:
+                raise Exception(
+                    f"Cannot stream {repo_id}: file metadata revision {metadata_revision} "
+                    f"did not match listing revision {repo_revision}"
+                )
+            for filename in model_files:
+                if size_limit is None and filename not in safetensors_header_files:
+                    continue
+                file_size = path_sizes.get(filename)
+                if file_size is None:
+                    raise Exception(f"Cannot stream {repo_id}: unknown size for selected file {filename}")
+                selected_sizes[filename] = file_size
+        download_revision = repo_revision
+        shard_details_by_file = _remote_safetensors_shard_details_by_file(model_files, repo_files)
 
         # Setup cache directory
         download_path = None
@@ -1864,6 +2386,37 @@ def download_model_streaming(
 
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+
+            if filename in safetensors_header_files:
+                declared_size = selected_sizes[filename]
+                if size_limit is not None and downloaded_total_size + 8 > size_limit:
+                    raise ValueError(
+                        f"Cannot stream {repo_id}: remote SafeTensors header preflight for {filename} "
+                        f"would exceed max size {size_limit} bytes"
+                    )
+                scan_result = _scan_remote_huggingface_safetensors_header(
+                    repo_id,
+                    filename,
+                    download_revision,
+                    declared_size=declared_size,
+                    deadline=deadline,
+                    shard_details=shard_details_by_file.get(filename),
+                )
+                transferred = scan_result.metadata.get("remote_bytes_transferred", scan_result.bytes_scanned)
+                transferred_bytes = (
+                    transferred
+                    if isinstance(transferred, int) and not isinstance(transferred, bool) and transferred >= 0
+                    else scan_result.bytes_scanned
+                )
+                if size_limit is not None and downloaded_total_size + transferred_bytes > size_limit:
+                    raise ValueError(
+                        f"Cannot stream {repo_id}: remote SafeTensors header bytes plus prior downloads "
+                        f"would total {downloaded_total_size + transferred_bytes} bytes, "
+                        f"exceeding max size {size_limit} bytes"
+                    )
+                downloaded_total_size += transferred_bytes
+                yield (Path(filename), is_last, scan_result)
+                continue
 
             if size_limit is not None:
                 advertised_size = selected_sizes[filename]

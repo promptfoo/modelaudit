@@ -46,6 +46,9 @@ SAFETENSORS_HEADER_INCONCLUSIVE_REASON = "safetensors_header_validation_failed"
 SAFETENSORS_STRUCTURE_INCONCLUSIVE_REASON = "safetensors_structure_validation_failed"
 SAFETENSORS_HEADER_LIMIT_INCONCLUSIVE_REASON = "safetensors_header_size_limit_exceeded"
 SAFETENSORS_READ_INCONCLUSIVE_REASON = "safetensors_read_failed"
+_REMOTE_HEADER_ONLY_CONFIG_KEY = "_safetensors_header_only_remote"
+_REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY = "_safetensors_remote_header_bytes_scanned"
+_REMOTE_HEADER_INTEGRITY_CONFIG_KEY = "_safetensors_remote_header_integrity"
 
 _HTML_METADATA_PATTERNS = (
     r"javascript:",
@@ -234,6 +237,18 @@ class SafeTensorsScanner(BaseScanner):
     def _is_unreadable_path_result(result: ScanResult) -> bool:
         return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
 
+    @staticmethod
+    def _json_duplicate_key_hook(duplicate_keys: list[str]) -> Any:
+        def hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            parsed: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in parsed:
+                    duplicate_keys.append(key)
+                parsed[key] = value
+            return parsed
+
+        return hook
+
     @classmethod
     def _finish_read_failure(cls, result: ScanResult, path: str, error: OSError) -> ScanResult:
         cls._mark_inconclusive(result, SAFETENSORS_READ_INCONCLUSIVE_REASON)
@@ -396,6 +411,7 @@ class SafeTensorsScanner(BaseScanner):
 
     def scan(self, path: str) -> ScanResult:
         """Scan a SafeTensors file."""
+        remote_header_only = bool(self.config.get(_REMOTE_HEADER_ONLY_CONFIG_KEY))
         path_check_result = self._check_path(path)
         if path_check_result:
             if self._is_unreadable_path_result(path_check_result):
@@ -406,9 +422,14 @@ class SafeTensorsScanner(BaseScanner):
                 )
             return path_check_result
 
-        size_check = self._check_size_limit(path)
-        if size_check:
-            return size_check
+        if remote_header_only:
+            if self._path_validation_result is None:
+                self._path_validation_result = ScanResult(scanner_name=self.name, scanner=self)
+            self._path_validation_result.metadata["file_size"] = self.get_file_size(path)
+        else:
+            size_check = self._check_size_limit(path)
+            if size_check:
+                return size_check
 
         result = self._create_result()
         file_size = self.get_file_size(path)
@@ -474,7 +495,15 @@ class SafeTensorsScanner(BaseScanner):
                     )
                     result.metadata["analysis_incomplete"] = True
                     self._mark_inconclusive(result, SAFETENSORS_HEADER_LIMIT_INCONCLUSIVE_REASON)
-                    result.bytes_scanned = file_size
+                    remote_bytes_scanned = self.config.get(_REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY)
+                    result.bytes_scanned = (
+                        remote_bytes_scanned
+                        if remote_header_only
+                        and isinstance(remote_bytes_scanned, int)
+                        and not isinstance(remote_bytes_scanned, bool)
+                        and remote_bytes_scanned >= 0
+                        else file_size
+                    )
                     result.finish(success=False)
                     return result
 
@@ -487,7 +516,19 @@ class SafeTensorsScanner(BaseScanner):
                 )
 
                 # Do not hash an artifact that has already failed the bounded header gate.
-                self.add_file_integrity_check(path, result)
+                if remote_header_only:
+                    integrity_details = self.config.get(_REMOTE_HEADER_INTEGRITY_CONFIG_KEY)
+                    result.add_check(
+                        name="Remote SafeTensors Header Integrity",
+                        passed=True,
+                        message="SafeTensors header was fetched with bounded remote range validation",
+                        location=path,
+                        details=integrity_details if isinstance(integrity_details, dict) else {},
+                    )
+                    result.metadata["remote_header_only"] = True
+                    result.metadata["content_hash_unavailable_reason"] = "remote_safetensors_header_only"
+                else:
+                    self.add_file_integrity_check(path, result)
 
                 header_bytes = f.read(header_len)
                 if len(header_bytes) != header_len:
@@ -523,7 +564,11 @@ class SafeTensorsScanner(BaseScanner):
                     )
 
                 try:
-                    header = json.loads(header_bytes.decode("utf-8"))
+                    duplicate_keys: list[str] = []
+                    header = json.loads(
+                        header_bytes.decode("utf-8"),
+                        object_pairs_hook=self._json_duplicate_key_hook(duplicate_keys),
+                    )
                 except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as e:
                     result.add_check(
                         name="SafeTensors JSON Parse",
@@ -537,6 +582,22 @@ class SafeTensorsScanner(BaseScanner):
                     self._mark_inconclusive(result, SAFETENSORS_HEADER_INCONCLUSIVE_REASON)
                     result.finish(success=False)
                     return result
+
+                if duplicate_keys:
+                    result.add_check(
+                        name="SafeTensors Duplicate Header Key Validation",
+                        passed=False,
+                        message="SafeTensors header contains duplicate JSON keys",
+                        severity=IssueSeverity.INFO,
+                        location=path,
+                        details={
+                            "duplicate_keys": duplicate_keys[:20],
+                            "duplicate_key_count": len(duplicate_keys),
+                            "duplicate_keys_truncated": len(duplicate_keys) > 20,
+                        },
+                    )
+                    self._mark_inconclusive(result, SAFETENSORS_STRUCTURE_INCONCLUSIVE_REASON)
+                    structural_validation_failed = True
 
                 if "__metadata__" in header:
                     custom_metadata_summary = self._summarize_custom_metadata_structure(header["__metadata__"])
@@ -851,8 +912,18 @@ class SafeTensorsScanner(BaseScanner):
                 if "__metadata__" in header:
                     result.metadata["custom_metadata_security_flags"] = sorted(custom_metadata_security_flags)
 
-                # Bytes scanned = file size
-                result.bytes_scanned = file_size
+                # Bytes scanned = file size for local scans. Remote header-only scans
+                # report transferred header bytes while retaining the declared file size
+                # in metadata.
+                remote_bytes_scanned = self.config.get(_REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY)
+                result.bytes_scanned = (
+                    remote_bytes_scanned
+                    if remote_header_only
+                    and isinstance(remote_bytes_scanned, int)
+                    and not isinstance(remote_bytes_scanned, bool)
+                    and remote_bytes_scanned >= 0
+                    else file_size
+                )
 
         except OSError as e:
             return self._finish_read_failure(result, path, e)

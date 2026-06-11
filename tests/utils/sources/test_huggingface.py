@@ -1,6 +1,7 @@
 """Tests for HuggingFace URL handling."""
 
 import importlib
+import json
 import os
 import pickle
 import signal
@@ -13,7 +14,7 @@ from collections.abc import Callable, Iterator
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
@@ -54,10 +55,12 @@ class _FakeRangeResponse:
         *,
         headers: dict[str, str] | None = None,
         status_code: int = 200,
+        url: str = "https://huggingface.co/test/model/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/model.bin",
     ) -> None:
         self.payload = payload
         self.headers = headers if headers is not None else {"Content-Length": str(len(payload))}
         self.status_code = status_code
+        self.url = url
 
     def __enter__(self) -> "_FakeRangeResponse":
         return self
@@ -66,6 +69,9 @@ class _FakeRangeResponse:
         return None
 
     def raise_for_status(self) -> None:
+        return None
+
+    def close(self) -> None:
         return None
 
     def iter_content(self, chunk_size: int) -> Iterator[bytes]:
@@ -105,6 +111,33 @@ def _make_xgboost_ubjson_payload() -> bytes:
         + b"[]"
         + b"}"
     )
+
+
+def _make_safetensors_frame(header: dict[str, object], data: bytes) -> tuple[bytes, int]:
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    return struct.pack("<Q", len(header_bytes)) + header_bytes + data, len(header_bytes)
+
+
+def _fake_remote_safetensors_scan(filename: str, declared_size: int = 500) -> Any:
+    from modelaudit.scanner_results import ScanResult
+
+    result = ScanResult(scanner_name="safetensors")
+    result.metadata.update(
+        {
+            "source_path": f"hf://test/model@{_HF_TEST_REVISION}/{filename}",
+            "hf_repo_id": "test/model",
+            "hf_revision": _HF_TEST_REVISION,
+            "hf_filename": filename,
+            "file_size": declared_size,
+            "remote_declared_size": declared_size,
+            "remote_bytes_transferred": 64,
+            "remote_header_only": True,
+            "tensor_payload_bytes_downloaded": 0,
+        }
+    )
+    result.bytes_scanned = 64
+    result.finish(success=True)
+    return result
 
 
 def _make_tensorflow_savedmodel_payload(_tmp_path: Path) -> bytes:
@@ -184,6 +217,7 @@ class TestHuggingFaceURLParsing:
             ("hf://bert-base/uncased", ("bert-base", "uncased")),
             ("hf://facebook/bart-large", ("facebook", "bart-large")),
             ("hf://user/model/", ("user", "model")),
+            (f"hf://user/model?revision={_HF_TEST_REVISION}", ("user", "model")),
         ]
         for url, expected in test_cases:
             namespace, repo = parse_huggingface_url(url)
@@ -2037,6 +2071,34 @@ class TestModelDownloadStreaming:
         assert deadline > time.monotonic()
         assert repo_id == "test/model"
 
+    @patch("modelaudit.utils.sources.huggingface._run_huggingface_download_with_deadline")
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin"], _HF_TEST_REVISION, None),
+    )
+    def test_download_model_streaming_passes_requested_revision_to_listing(
+        self,
+        mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        mock_run_download: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Pinned streaming scans must list the requested immutable revision, not repository default."""
+        downloaded_file = tmp_path / "pytorch_model.bin"
+        downloaded_file.write_bytes(b"weights")
+        mock_run_download.return_value = str(downloaded_file)
+
+        results = list(
+            download_model_streaming(
+                f"hf://test/model?revision={_HF_TEST_REVISION}",
+                timeout_seconds=30,
+            )
+        )
+
+        assert results == [(downloaded_file, True)]
+        assert mock_list_repo_files.call_args.kwargs["requested_revision"] == _HF_TEST_REVISION
+
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={"", ".bin"})
     @patch(
@@ -2138,7 +2200,7 @@ class TestModelDownloadStreaming:
         with pytest.raises(Exception, match=r"hidden\.payload \(TimeoutError\)"):
             list(download_model_streaming("https://huggingface.co/test/model", timeout_seconds=1))
 
-        _mock_list_repo_files.assert_called_once_with("test/model", 1.0, deadline=101.0)
+        _mock_list_repo_files.assert_called_once_with("test/model", 1.0, requested_revision=None, deadline=101.0)
         mock_requests_get.assert_not_called()
         mock_hf_hub_download.assert_not_called()
 
@@ -2184,11 +2246,14 @@ class TestModelDownloadStreaming:
     ) -> None:
         """Streaming mode should enforce max-size before downloading selected files."""
         mock_get_paths_info.return_value = [
-            SimpleNamespace(path="pytorch_model.bin", size=700),
+            SimpleNamespace(path="pytorch_model.bin", size=1200),
             SimpleNamespace(path="model.safetensors", size=500),
         ]
 
-        with pytest.raises(Exception, match="selected Hugging Face files total 1200 bytes exceeds max size 1000 bytes"):
+        with pytest.raises(
+            Exception,
+            match=r"selected file pytorch_model\.bin would total 1200 bytes, exceeding max size 1000 bytes",
+        ):
             list(download_model_streaming("https://huggingface.co/test/model", max_size=1000))
 
         mock_hf_hub_download.assert_not_called()
@@ -2447,20 +2512,27 @@ class TestModelDownloadStreaming:
         mock_hf_hub_download: MagicMock,
         _mock_list_repo_files: MagicMock,
         _mock_get_extensions: MagicMock,
-        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Streaming downloads should recognize mixed-case supported suffixes."""
-        downloaded_file = tmp_path / "MODEL.SaFeTeNsOrS"
-        mock_hf_hub_download.return_value = str(downloaded_file)
+        filename = "MODEL.SaFeTeNsOrS"
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: ({filename: 500}, _HF_TEST_REVISION),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._scan_remote_huggingface_safetensors_header",
+            lambda _repo_id, scanned_filename, _revision, **_kwargs: _fake_remote_safetensors_scan(scanned_filename),
+        )
 
         results = list(download_model_streaming("https://huggingface.co/test/model"))
 
-        assert results == [(downloaded_file, True)]
-        mock_hf_hub_download.assert_called_once_with(
-            repo_id="test/model",
-            filename="MODEL.SaFeTeNsOrS",
-            revision=_HF_TEST_REVISION,
-        )
+        assert len(results) == 1
+        path, is_last, scan_result = cast(tuple[Path, bool, Any], results[0])
+        assert path == Path(filename)
+        assert is_last is True
+        assert scan_result.metadata["hf_filename"] == filename
+        mock_hf_hub_download.assert_not_called()
 
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -2658,8 +2730,20 @@ class TestModelDownloadStreaming:
         mock_detect_content: MagicMock,
         _mock_list_repo_files: MagicMock,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Scanner-specific suffix filters must not miss disguised supported artifacts."""
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: (
+                {"model.safetensors": 500, "renamed.jpg": 10},
+                _HF_TEST_REVISION,
+            ),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._scan_remote_huggingface_safetensors_header",
+            lambda _repo_id, scanned_filename, _revision, **_kwargs: _fake_remote_safetensors_scan(scanned_filename),
+        )
 
         def download_side_effect(*, filename: str, **_kwargs: object) -> str:
             path = tmp_path / filename
@@ -2677,9 +2761,13 @@ class TestModelDownloadStreaming:
             )
         )
 
-        assert results == [(tmp_path / "model.safetensors", False), (tmp_path / "renamed.jpg", True)]
+        assert len(results) == 2
+        model_path, model_is_last, model_result = cast(tuple[Path, bool, Any], results[0])
+        assert model_path == Path("model.safetensors")
+        assert model_is_last is False
+        assert model_result.metadata["remote_header_only"] is True
+        assert results[1] == (tmp_path / "renamed.jpg", True)
         assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
-            "model.safetensors",
             "renamed.jpg",
         ]
         mock_detect_content.assert_called_once_with("test/model", "renamed.jpg", _HF_TEST_REVISION, ANY)
@@ -2699,8 +2787,20 @@ class TestModelDownloadStreaming:
         mock_detect_content: MagicMock,
         _mock_list_repo_files: MagicMock,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Exact filename filters must not disable renamed routes from selected suffixes."""
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: (
+                {"model.safetensors": 500, "renamed.jpg": 10},
+                _HF_TEST_REVISION,
+            ),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._scan_remote_huggingface_safetensors_header",
+            lambda _repo_id, scanned_filename, _revision, **_kwargs: _fake_remote_safetensors_scan(scanned_filename),
+        )
 
         def download_side_effect(*, filename: str, **_kwargs: object) -> str:
             path = tmp_path / filename
@@ -2717,8 +2817,213 @@ class TestModelDownloadStreaming:
             )
         )
 
-        assert results == [(tmp_path / "model.safetensors", False), (tmp_path / "renamed.jpg", True)]
+        assert len(results) == 2
+        model_path, model_is_last, model_result = cast(tuple[Path, bool, Any], results[0])
+        assert model_path == Path("model.safetensors")
+        assert model_is_last is False
+        assert model_result.metadata["remote_header_only"] is True
+        assert results[1] == (tmp_path / "renamed.jpg", True)
         mock_detect_content.assert_called_once_with("test/model", "renamed.jpg", _HF_TEST_REVISION, ANY)
+
+    @patch("huggingface_hub.hf_hub_download")
+    @patch("huggingface_hub.utils.build_hf_headers", return_value={"Authorization": "Bearer hf_secret"})
+    @patch("huggingface_hub.hf_hub_url", return_value="https://huggingface.co/test/model/resolve/rev/model.safetensors")
+    @patch("requests.get")
+    def test_download_model_streaming_streams_safetensors_header_without_body_download(
+        self,
+        mock_requests_get: MagicMock,
+        _mock_hf_hub_url: MagicMock,
+        _mock_build_headers: MagicMock,
+        mock_hf_hub_download: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """SafeTensors streaming should inspect bounded headers without hf_hub_download."""
+        filename = "model-00001-of-00001.safetensors"
+        frame, header_len = _make_safetensors_frame(
+            {"tensor": {"dtype": "U8", "shape": [4], "data_offsets": [0, 4]}},
+            b"\x00" * 4,
+        )
+        declared_size = len(frame)
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            lambda *_args, **_kwargs: ([filename], _HF_TEST_REVISION, None),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: ({filename: declared_size}, _HF_TEST_REVISION),
+        )
+        _mock_build_headers.side_effect = lambda *, token=None, headers=None: {
+            "Authorization": "Bearer hf_secret",
+            **(headers or {}),
+        }
+        mock_requests_get.side_effect = [
+            _FakeRangeResponse(
+                frame[:8],
+                headers={
+                    "Content-Range": f"bytes 0-7/{declared_size}",
+                    "Content-Length": "8",
+                    "ETag": '"stable"',
+                },
+                status_code=206,
+            ),
+            _FakeRangeResponse(
+                frame[: 8 + header_len],
+                headers={
+                    "Content-Range": f"bytes 0-{7 + header_len}/{declared_size}",
+                    "Content-Length": str(8 + header_len),
+                    "ETag": '"stable"',
+                },
+                status_code=206,
+            ),
+        ]
+
+        results = list(
+            download_model_streaming(
+                f"hf://test/model?revision={_HF_TEST_REVISION}",
+                max_size=1024,
+                scannable_extensions={".safetensors"},
+                scannable_scanner_ids={"safetensors"},
+            )
+        )
+
+        assert len(results) == 1
+        path, is_last, scan_result = cast(tuple[Path, bool, Any], results[0])
+        assert path == Path(filename)
+        assert is_last is True
+        assert scan_result.success is True
+        assert scan_result.metadata["remote_declared_size"] == declared_size
+        assert scan_result.metadata["remote_bytes_transferred"] == 16 + header_len
+        assert scan_result.metadata["hf_revision"] == _HF_TEST_REVISION
+        assert scan_result.metadata["tensor_payload_bytes_downloaded"] == 0
+        assert scan_result.metadata["remote_shard_family"]["complete"] is True
+        mock_hf_hub_download.assert_not_called()
+        assert [call.kwargs["headers"]["Range"] for call in mock_requests_get.call_args_list] == [
+            "bytes=0-7",
+            f"bytes=0-{7 + header_len}",
+        ]
+
+    @patch("huggingface_hub.hf_hub_download")
+    @patch("huggingface_hub.utils.build_hf_headers", return_value={})
+    @patch("huggingface_hub.hf_hub_url", return_value="https://huggingface.co/test/model/resolve/rev/model.safetensors")
+    @patch("requests.get")
+    def test_download_model_streaming_retries_transient_safetensors_range_errors(
+        self,
+        mock_requests_get: MagicMock,
+        _mock_hf_hub_url: MagicMock,
+        _mock_build_headers: MagicMock,
+        mock_hf_hub_download: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Retryable transport failures should not force an incomplete remote header scan."""
+        import requests
+
+        filename = "model-00001-of-00001.safetensors"
+        frame, header_len = _make_safetensors_frame(
+            {"tensor": {"dtype": "U8", "shape": [4], "data_offsets": [0, 4]}},
+            b"\x00" * 4,
+        )
+        declared_size = len(frame)
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            lambda *_args, **_kwargs: ([filename], _HF_TEST_REVISION, None),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: ({filename: declared_size}, _HF_TEST_REVISION),
+        )
+        _mock_build_headers.side_effect = lambda *, token=None, headers=None: headers or {}
+        mock_requests_get.side_effect = [
+            requests.exceptions.Timeout("temporary storage timeout"),
+            _FakeRangeResponse(
+                frame[:8],
+                headers={
+                    "Content-Range": f"bytes 0-7/{declared_size}",
+                    "Content-Length": "8",
+                    "ETag": '"stable"',
+                },
+                status_code=206,
+            ),
+            _FakeRangeResponse(
+                frame[: 8 + header_len],
+                headers={
+                    "Content-Range": f"bytes 0-{7 + header_len}/{declared_size}",
+                    "Content-Length": str(8 + header_len),
+                    "ETag": '"stable"',
+                },
+                status_code=206,
+            ),
+        ]
+
+        results = list(
+            download_model_streaming(
+                f"hf://test/model?revision={_HF_TEST_REVISION}",
+                max_size=1024,
+                scannable_extensions={".safetensors"},
+                scannable_scanner_ids={"safetensors"},
+            )
+        )
+
+        _path, _is_last, scan_result = cast(tuple[Path, bool, Any], results[0])
+        assert scan_result.success is True
+        assert scan_result.metadata["range_attempts"] == 2
+        assert scan_result.metadata["remote_bytes_transferred"] == 16 + header_len
+        assert [call.kwargs["headers"]["Range"] for call in mock_requests_get.call_args_list] == [
+            "bytes=0-7",
+            "bytes=0-7",
+            f"bytes=0-{7 + header_len}",
+        ]
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("huggingface_hub.hf_hub_download")
+    @patch("huggingface_hub.utils.build_hf_headers", return_value={})
+    @patch("huggingface_hub.hf_hub_url", return_value="https://huggingface.co/test/model/resolve/rev/model.safetensors")
+    @patch("requests.get")
+    def test_download_model_streaming_ignored_safetensors_range_is_inconclusive(
+        self,
+        mock_requests_get: MagicMock,
+        _mock_hf_hub_url: MagicMock,
+        _mock_build_headers: MagicMock,
+        mock_hf_hub_download: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Ignored Range responses must not be trusted as complete header coverage."""
+        filename = "model-00001-of-00001.safetensors"
+        frame, _header_len = _make_safetensors_frame(
+            {"tensor": {"dtype": "U8", "shape": [4], "data_offsets": [0, 4]}},
+            b"\x00" * 4,
+        )
+        declared_size = len(frame)
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            lambda *_args, **_kwargs: ([filename], _HF_TEST_REVISION, None),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: ({filename: declared_size}, _HF_TEST_REVISION),
+        )
+        mock_requests_get.return_value = _FakeRangeResponse(
+            frame,
+            headers={"Content-Length": str(declared_size), "ETag": '"stable"'},
+            status_code=200,
+        )
+
+        results = list(
+            download_model_streaming(
+                f"hf://test/model?revision={_HF_TEST_REVISION}",
+                max_size=1024,
+                scannable_extensions={".safetensors"},
+                scannable_scanner_ids={"safetensors"},
+            )
+        )
+
+        _path, _is_last, scan_result = cast(tuple[Path, bool, Any], results[0])
+        assert scan_result.success is False
+        assert scan_result.metadata["scan_outcome"] == "inconclusive"
+        assert scan_result.metadata["operational_error"] is True
+        assert scan_result.metadata["remote_bytes_transferred"] == 0
+        assert "remote_safetensors_header_range_failed" in scan_result.metadata["scan_outcome_reasons"]
+        assert mock_requests_get.call_count == 1
+        mock_hf_hub_download.assert_not_called()
 
     @pytest.mark.parametrize(
         ("hidden_payload", "expected_filenames"),
@@ -2774,7 +3079,7 @@ class TestModelDownloadStreaming:
             )
         )
 
-        assert [path.name for path, _is_last in results] == expected_filenames
+        assert [item[0].name for item in results] == expected_filenames
         assert results[-1][1] is True
 
     @patch(
@@ -2791,12 +3096,17 @@ class TestModelDownloadStreaming:
         mock_hf_hub_download: MagicMock,
         mock_detect_content: MagicMock,
         _mock_list_repo_files: MagicMock,
-        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Content sniffing must not widen an explicit scanner selection."""
-        model_path = tmp_path / "model.safetensors"
-        model_path.write_bytes(b"downloaded")
-        mock_hf_hub_download.return_value = str(model_path)
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: ({"model.safetensors": 500}, _HF_TEST_REVISION),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._scan_remote_huggingface_safetensors_header",
+            lambda _repo_id, scanned_filename, _revision, **_kwargs: _fake_remote_safetensors_scan(scanned_filename),
+        )
 
         results = list(
             download_model_streaming(
@@ -2806,13 +3116,13 @@ class TestModelDownloadStreaming:
             )
         )
 
-        assert results == [(model_path, True)]
-        mock_hf_hub_download.assert_called_once_with(
-            repo_id="test/model",
-            filename="model.safetensors",
-            revision=_HF_TEST_REVISION,
-        )
-        mock_detect_content.assert_called_once_with("test/model", "renamed.jpg", _HF_TEST_REVISION, ANY)
+        assert len(results) == 1
+        path, is_last, scan_result = cast(tuple[Path, bool, Any], results[0])
+        assert path == Path("model.safetensors")
+        assert is_last is True
+        assert scan_result.metadata["remote_header_only"] is True
+        mock_hf_hub_download.assert_not_called()
+        mock_detect_content.assert_not_called()
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch("huggingface_hub.hf_hub_download")

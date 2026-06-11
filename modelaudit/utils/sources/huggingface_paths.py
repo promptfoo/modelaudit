@@ -249,8 +249,10 @@ def parse_huggingface_file_url(url: str) -> tuple[str, str, str]:
 def parse_huggingface_url(url: str) -> tuple[str, str]:
     """Parse a HuggingFace model URL into namespace and repository name."""
     if url.startswith("hf://"):
+        parsed = urlparse(url)
+        raw_repo_path = parsed.netloc + parsed.path
         try:
-            namespace, repo_name, raw_parts = _split_huggingface_repo_path(url[5:])
+            namespace, repo_name, raw_parts = _split_huggingface_repo_path(raw_repo_path)
         except ValueError as exc:
             raise ValueError(f"Invalid HuggingFace URL format: {redact_huggingface_url_for_display(url)}") from exc
         if len(raw_parts) == 1:

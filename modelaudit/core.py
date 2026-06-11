@@ -4234,7 +4234,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
 
 def scan_model_streaming(
-    file_generator: Iterator[tuple[Path, bool]],
+    file_generator: Iterator[tuple[Path, bool] | tuple[Path, bool, ScanResult]],
     timeout: int = 3600,
     progress_callback: ProgressCallback | None = None,
     delete_after_scan: bool = True,
@@ -4343,7 +4343,12 @@ def scan_model_streaming(
     is_hf_cache = base_dir is not None and hf_cache_root is not None
 
     try:
-        for file_path, _is_last in file_generator:
+        for streamed_item in file_generator:
+            precomputed_result: ScanResult | None = None
+            if len(streamed_item) == 3:
+                file_path, _is_last, precomputed_result = streamed_item
+            else:
+                file_path, _is_last = streamed_item
             source_path = Path(file_path)
             scan_path = source_path
             report_path = str(source_path)
@@ -4366,6 +4371,56 @@ def scan_model_streaming(
                 break
 
             try:
+                if precomputed_result is not None:
+                    _normalize_unclassified_scan_failure(precomputed_result)
+                    metadata_dict = dict(precomputed_result.metadata or {})
+                    report_path = str(
+                        metadata_dict.get("source_path") or metadata_dict.get("remote_source_path") or source_path
+                    )
+                    resolved_report_path = str(source_path)
+                    operational_scan_failure = _scan_result_has_operational_error(precomputed_result)
+                    if operational_scan_failure:
+                        preserve_shard_reconciliation_errors = True
+                    aggregate_hash_complete = False
+                    scan_result_dict = {
+                        "bytes_scanned": precomputed_result.bytes_scanned,
+                        "files_scanned": 1,
+                        "has_errors": operational_scan_failure,
+                        "success": precomputed_result.success,
+                        "issues": _serialize_streamed_records(
+                            list(precomputed_result.issues or []),
+                            report_path,
+                            resolved_report_path,
+                        ),
+                        "checks": _serialize_streamed_records(
+                            list(precomputed_result.checks or []),
+                            report_path,
+                            resolved_report_path,
+                        ),
+                        "scanners": [precomputed_result.scanner_name] if precomputed_result.scanner_name else [],
+                        "file_metadata": {report_path: metadata_dict},
+                    }
+                    results.aggregate_scan_result(scan_result_dict)
+                    asset = asset_from_scan_result(report_path, precomputed_result, metadata=metadata_dict)
+                    if asset:
+                        asset["is_streamed"] = True
+                        asset["is_remote_header_only"] = bool(metadata_dict.get("remote_header_only"))
+                        results.assets.extend(convert_assets_to_models([asset]))
+                    files_processed += 1
+                    if max_total_size > 0 and results.bytes_scanned > max_total_size:
+                        aggregate_hash_complete = False
+                        _add_issue_to_model(
+                            results,
+                            f"Total scan size limit exceeded: {results.bytes_scanned} bytes (max: {max_total_size})",
+                            severity=IssueSeverity.INFO.value,
+                            location=report_path,
+                            details={"max_total_size": max_total_size, "analysis_incomplete": True},
+                        )
+                        results.has_errors = True
+                        preserve_shard_reconciliation_errors = True
+                        break
+                    continue
+
                 if is_hf_cache and _is_huggingface_cache_file(str(source_path)):
                     logger.debug(f"Skipping HuggingFace cache file: {source_path}")
                     continue
