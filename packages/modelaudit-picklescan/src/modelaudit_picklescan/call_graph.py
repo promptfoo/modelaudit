@@ -2167,7 +2167,13 @@ def _module_source_context_initialization_is_proven_inert(context: _ModuleSource
     ) and all(_module_initialization_statement_is_inert(statement) for statement in context.module_statements)
 
 
-def import_only_reference_is_proven_trusted(module_name: str, name: str) -> bool:
+def import_only_reference_is_proven_trusted(
+    module_name: str,
+    name: str,
+    *,
+    pickle_entrypoint_methods: tuple[str, ...] | None = None,
+    pickle_invokes_metaclass_call: bool | None = None,
+) -> bool:
     """Return whether a known-safe reference resolves from a trusted installation path."""
     if _legacy_pickle_compat_reference_is_trusted(module_name, name):
         return True
@@ -2189,8 +2195,28 @@ def import_only_reference_is_proven_trusted(module_name: str, name: str) -> bool
         origin_kind in {"stdlib", "site_packages"}
         and _interpreter_module_origin_without_import_hooks(module_name) is None
     ):
-        return _loaded_trusted_reference_matches_baseline(module_name, name)
+        return _loaded_trusted_reference_matches_baseline(
+            module_name,
+            name,
+            pickle_entrypoint_methods=pickle_entrypoint_methods,
+            pickle_invokes_metaclass_call=pickle_invokes_metaclass_call,
+        )
     return True
+
+
+def import_only_reference_is_proven_trusted_for_pickle_invocation(
+    module_name: str,
+    name: str,
+    reference: Mapping[str, object],
+) -> bool:
+    """Return whether a trusted import reference is safe for one pickle invocation."""
+    entrypoint_methods, invokes_metaclass_call = _pickle_owner_proof_for_reference(reference)
+    return import_only_reference_is_proven_trusted(
+        module_name,
+        name,
+        pickle_entrypoint_methods=entrypoint_methods,
+        pickle_invokes_metaclass_call=invokes_metaclass_call,
+    )
 
 
 def import_only_module_requires_origin_review(module_name: str, name: str) -> bool:
@@ -2326,7 +2352,13 @@ def _interpreter_reference_is_trusted(module_name: str, name: str) -> bool:
     return state[0] and name in trusted and state[1] is trusted[name]
 
 
-def _loaded_trusted_reference_matches_baseline(module_name: str, name: str) -> bool:
+def _loaded_trusted_reference_matches_baseline(
+    module_name: str,
+    name: str,
+    *,
+    pickle_entrypoint_methods: tuple[str, ...] | None = None,
+    pickle_invokes_metaclass_call: bool | None = None,
+) -> bool:
     module_state = _current_loaded_interpreter_module_state(module_name)
     reference_state = _current_loaded_interpreter_reference_state(module_name, name)
     _track_loaded_interpreter_module_state(module_name, module_state)
@@ -2339,7 +2371,13 @@ def _loaded_trusted_reference_matches_baseline(module_name: str, name: str) -> b
     expected = _TRUSTED_LOADED_REFERENCE_BASELINES.get((module_name, name))
     origin_kind = _trusted_module_origin_kind(module_name)
     if origin_kind == "site_packages":
-        if not _loaded_site_package_reference_owner_matches(module_name, name, reference_state[1]):
+        if not _loaded_site_package_reference_owner_matches(
+            module_name,
+            name,
+            reference_state[1],
+            pickle_entrypoint_methods=pickle_entrypoint_methods,
+            pickle_invokes_metaclass_call=pickle_invokes_metaclass_call,
+        ):
             return False
         if expected is None:
             return True
@@ -2352,7 +2390,14 @@ def _loaded_trusted_reference_matches_baseline(module_name: str, name: str) -> b
     )
 
 
-def _loaded_site_package_reference_owner_matches(module_name: str, name: str, value: object) -> bool:
+def _loaded_site_package_reference_owner_matches(
+    module_name: str,
+    name: str,
+    value: object,
+    *,
+    pickle_entrypoint_methods: tuple[str, ...] | None = None,
+    pickle_invokes_metaclass_call: bool | None = None,
+) -> bool:
     if _loaded_extension_callable_bypasses_module_getattr(module_name, name):
         return True
     if type(value) is BuiltinFunctionType:
@@ -2376,11 +2421,15 @@ def _loaded_site_package_reference_owner_matches(module_name: str, name: str, va
             or _trusted_python_module_source_path(class_module) is None
         ):
             return False
-        return (
-            _class_metaclass_call_matches_trusted_source(class_, expected_module=module_name)
-            and _class_pickle_executable_members_match_trusted_source(class_, expected_module=module_name)
-            and _class_pickle_data_descriptors_match_trusted_source(class_, expected_module=module_name)
-            and _trusted_reference_runtime_dependencies_are_source_independent(value)
+        return _class_pickle_owner_matches_trusted_source(
+            class_,
+            expected_module=module_name,
+            pickle_entrypoint_methods=pickle_entrypoint_methods,
+            pickle_invokes_metaclass_call=pickle_invokes_metaclass_call,
+        ) and _class_pickle_runtime_dependencies_are_source_independent(
+            class_,
+            pickle_entrypoint_methods=pickle_entrypoint_methods,
+            pickle_invokes_metaclass_call=pickle_invokes_metaclass_call,
         )
     functions = _pickle_executable_functions(value)
     if functions:
@@ -2394,10 +2443,60 @@ def _reference_leaf_name(name: str) -> str:
     return name.rpartition(".")[2]
 
 
-def _class_pickle_executable_members_match_trusted_source(class_: type[object], *, expected_module: str) -> bool:
+def _pickle_owner_proof_for_reference(
+    reference: Mapping[str, object],
+) -> tuple[tuple[str, ...] | None, bool | None]:
+    opcode = str(reference.get("opcode", ""))
+    if opcode in _NEWOBJ_OPCODES:
+        if not isinstance(reference.get("positional_arg_count"), int):
+            return (*_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS, "__new__"), False
+        return ("__new__",), False
+    if opcode in _BUILD_OPCODES:
+        methods: tuple[str, ...] = _PICKLE_BUILD_ENTRYPOINT_METHODS
+        if reference.get("build_uses_slot_state") is False:
+            methods = tuple(method for method in methods if method != "__setattr__")
+        return methods, False
+    if opcode in _CONSTRUCTOR_OPCODES:
+        return _PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS, True
+    return None, None
+
+
+def _class_pickle_owner_matches_trusted_source(
+    class_: type[object],
+    *,
+    expected_module: str,
+    pickle_entrypoint_methods: tuple[str, ...] | None,
+    pickle_invokes_metaclass_call: bool | None,
+) -> bool:
+    invokes_metaclass_call = True if pickle_invokes_metaclass_call is None else pickle_invokes_metaclass_call
+    return (
+        (not invokes_metaclass_call or _class_metaclass_call_matches_trusted_source(class_))
+        and _class_pickle_executable_members_match_trusted_source(
+            class_,
+            expected_module=expected_module,
+            pickle_entrypoint_methods=pickle_entrypoint_methods,
+        )
+        and (
+            "__setattr__" not in _class_pickle_entrypoint_methods(pickle_entrypoint_methods)
+            or _class_pickle_data_descriptors_match_trusted_source(class_, expected_module=expected_module)
+        )
+    )
+
+
+def _class_pickle_entrypoint_methods(pickle_entrypoint_methods: tuple[str, ...] | None) -> tuple[str, ...]:
+    return pickle_entrypoint_methods or _PICKLE_ENTERED_IMPORT_EXECUTION_METHODS
+
+
+def _class_pickle_executable_members_match_trusted_source(
+    class_: type[object],
+    *,
+    expected_module: str,
+    pickle_entrypoint_methods: tuple[str, ...] | None = None,
+) -> bool:
+    entrypoint_methods = _class_pickle_entrypoint_methods(pickle_entrypoint_methods)
     for base in type.__getattribute__(class_, "__mro__"):
         namespace = type.__getattribute__(base, "__dict__")
-        for member_name in _PICKLE_ENTERED_IMPORT_EXECUTION_METHODS:
+        for member_name in entrypoint_methods:
             if member_name in namespace and not _pickle_executable_member_matches_trusted_source(
                 base,
                 member_name,
@@ -2408,18 +2507,51 @@ def _class_pickle_executable_members_match_trusted_source(class_: type[object], 
     return True
 
 
-def _class_metaclass_call_matches_trusted_source(class_: type[object], *, expected_module: str) -> bool:
+def _class_metaclass_call_matches_trusted_source(class_: type[object]) -> bool:
     metaclass = type(class_)
     for base in type.__getattribute__(metaclass, "__mro__"):
         namespace = type.__getattribute__(base, "__dict__")
         if "__call__" in namespace:
-            return _pickle_executable_member_matches_trusted_source(
-                base,
-                "__call__",
-                namespace["__call__"],
-                expected_module=expected_module,
-            )
+            member = namespace["__call__"]
+            return _pickle_executable_member_matches_trusted_stdlib_source(base, "__call__", member)
     return True
+
+
+def _class_pickle_runtime_dependencies_are_source_independent(
+    class_: type[object],
+    *,
+    pickle_entrypoint_methods: tuple[str, ...] | None,
+    pickle_invokes_metaclass_call: bool | None,
+) -> bool:
+    entrypoint_methods = _class_pickle_entrypoint_methods(pickle_entrypoint_methods)
+    invokes_metaclass_call = True if pickle_invokes_metaclass_call is None else pickle_invokes_metaclass_call
+    snapshots: list[_TrustedExecutableValueSnapshot] = []
+    if invokes_metaclass_call:
+        metaclass = type(class_)
+        for base in type.__getattribute__(metaclass, "__mro__"):
+            namespace = type.__getattribute__(base, "__dict__")
+            if "__call__" in namespace:
+                member = namespace["__call__"]
+                if not _pickle_executable_member_matches_trusted_stdlib_source(base, "__call__", member):
+                    snapshots.append(_trusted_executable_value_snapshot(member))
+                break
+    for base in type.__getattribute__(class_, "__mro__"):
+        namespace = type.__getattribute__(base, "__dict__")
+        snapshots.extend(
+            _trusted_executable_value_snapshot(namespace[member_name])
+            for member_name in entrypoint_methods
+            if member_name in namespace
+            and not _pickle_executable_member_matches_trusted_stdlib_source(base, member_name, namespace[member_name])
+        )
+        if "__setattr__" in entrypoint_methods:
+            snapshots.extend(
+                _trusted_executable_value_snapshot(member)
+                for member in namespace.values()
+                if _runtime_type_member_is_data_descriptor(member)
+            )
+    return all(
+        _trusted_executable_value_runtime_dependencies_are_source_independent(snapshot) for snapshot in snapshots
+    )
 
 
 def _class_pickle_data_descriptors_match_trusted_source(class_: type[object], *, expected_module: str) -> bool:
@@ -2479,16 +2611,44 @@ def _pickle_executable_member_matches_trusted_source(
     if isinstance(member, classmethod | staticmethod):
         member = member.__func__
     if isinstance(member, FunctionType):
-        return _function_owner_matches_trusted_source(member, expected_module=expected_module)
+        return _function_owner_matches_trusted_source(
+            member,
+            expected_module=expected_module,
+        ) or _function_owner_matches_trusted_stdlib_source(member)
     if type(member) is property:
         functions = tuple(
             function for function in (member.fget, member.fset, member.fdel) if isinstance(function, FunctionType)
         )
         return bool(functions) and all(
-            _function_owner_matches_trusted_source(function, expected_module=expected_module) for function in functions
+            _function_owner_matches_trusted_source(function, expected_module=expected_module)
+            or _function_owner_matches_trusted_stdlib_source(function)
+            for function in functions
         )
+    if _pickle_executable_member_matches_trusted_stdlib_source(owner, name, member):
+        return True
     if _trusted_owner_bound_builtin_descriptor_matches(owner, name, member):
         return True
+    return not _runtime_type_member_is_executable(member)
+
+
+def _pickle_executable_member_matches_trusted_stdlib_source(
+    owner: type[object],
+    name: str,
+    member: object,
+) -> bool:
+    if isinstance(member, classmethod | staticmethod):
+        member = member.__func__
+    if isinstance(member, FunctionType):
+        return _function_owner_matches_trusted_stdlib_source(member)
+    if type(member) is property:
+        functions = tuple(
+            function for function in (member.fget, member.fset, member.fdel) if isinstance(function, FunctionType)
+        )
+        return bool(functions) and all(
+            _function_owner_matches_trusted_stdlib_source(function) for function in functions
+        )
+    if _trusted_owner_bound_builtin_descriptor_matches(owner, name, member):
+        return _trusted_runtime_stdlib_class_owner(owner)
     return not _runtime_type_member_is_executable(member)
 
 
@@ -2521,6 +2681,13 @@ def _trusted_runtime_class_owner(owner: type[object]) -> bool:
     module_name = type.__getattribute__(owner, "__module__")
     return type(module_name) is str and (
         module_name == "builtins" or _trusted_module_origin_kind(module_name) in {"stdlib", "site_packages"}
+    )
+
+
+def _trusted_runtime_stdlib_class_owner(owner: type[object]) -> bool:
+    module_name = type.__getattribute__(owner, "__module__")
+    return type(module_name) is str and (
+        module_name == "builtins" or _trusted_module_origin_kind(module_name) == "stdlib"
     )
 
 
@@ -2562,6 +2729,23 @@ def _function_owner_matches_trusted_source(function: FunctionType, *, expected_m
         return False
     owner_module = globals_namespace.get("__name__")
     if type(owner_module) is not str or owner_module != expected_module:
+        return False
+    source_path = _trusted_python_module_source_path(owner_module)
+    if source_path is None:
+        return False
+    try:
+        code_path = Path(function.__code__.co_filename).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return code_path == source_path and _function_code_matches_trusted_source(function, source_path)
+
+
+def _function_owner_matches_trusted_stdlib_source(function: FunctionType) -> bool:
+    globals_namespace = function.__globals__
+    if type(globals_namespace) is not dict:
+        return False
+    owner_module = globals_namespace.get("__name__")
+    if type(owner_module) is not str or _trusted_module_origin_kind(owner_module) != "stdlib":
         return False
     source_path = _trusted_python_module_source_path(owner_module)
     if source_path is None:

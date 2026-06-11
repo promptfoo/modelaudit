@@ -581,10 +581,6 @@ class NumPyScanner(BaseScanner):
 
                             pickle_end_offset = embedded_result.metadata.get("first_pickle_end_pos")
                             if isinstance(pickle_end_offset, int) and pickle_end_offset < file_size:
-                                if data_offset <= pickle_end_offset <= data_offset + len(embedded_payload_proof):
-                                    safe_numpy_reconstruct_payload = _numpy_object_payload_has_safe_reconstruct_proof(
-                                        embedded_payload_proof[: pickle_end_offset - data_offset]
-                                    )
                                 trailing_bytes = file_size - pickle_end_offset
                                 result.issues.extend(
                                     issue

@@ -28,6 +28,7 @@ from .call_graph import (
     import_only_module_load_is_proven_safe_for_invocation,
     import_only_module_requires_origin_review,
     import_only_reference_is_proven_trusted,
+    import_only_reference_is_proven_trusted_for_pickle_invocation,
     module_initialization_is_proven_inert,
     shared_source_fingerprint_metadata,
     shared_source_sensitive_caches,
@@ -1633,6 +1634,7 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
     source_fingerprints: Mapping[str, Any] | None = None
     inert_initialization_modules: frozenset[str] = frozenset()
     trusted_import_references: frozenset[tuple[str, str]] = frozenset()
+    trusted_invocation_global_positions: frozenset[int] = frozenset()
     analyzed_invocation_global_positions: frozenset[int] = frozenset()
     analyzed_invocation_references: frozenset[tuple[str, str]] = frozenset()
     invocation_load_safe_modules: frozenset[str] = frozenset()
@@ -1707,6 +1709,10 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
         except Exception as error:
             enrichment_errors.append(("python_import_invocation_analysis", error))
         try:
+            trusted_invocation_global_positions = _proven_trusted_invocation_global_positions(callable_invocations)
+        except Exception as error:
+            enrichment_errors.append(("python_import_invocation_loaded_identity", error))
+        try:
             invocation_load_safe_modules = _invocation_load_safe_modules(
                 callable_invocations,
                 invocation_classification[0] if invocation_classification is not None else frozenset(),
@@ -1721,6 +1727,7 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
                 analyzed_invocation_global_positions,
                 invocation_load_safe_modules,
                 invocation_classification[1] if invocation_classification is not None else frozenset(),
+                trusted_invocation_global_positions,
                 suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
             )
         except Exception as error:
@@ -1745,7 +1752,7 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
         and callable_invocations_complete
         and non_allowlisted_global_imports_complete
         and invocation_classification is not None
-        and (inert_initialization_modules or trusted_import_references)
+        and (inert_initialization_modules or trusted_import_references or trusted_invocation_global_positions)
     ):
         (
             invoked_global_positions,
@@ -1762,6 +1769,7 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
             invocation_load_safe_modules,
             trusted_reconstruction_global_positions,
             trusted_reconstruction_references,
+            trusted_invocation_global_positions,
         )
     updated_report = _with_call_graph_source_fingerprint_metadata(report, source_fingerprints)
     updated_report = (
@@ -1939,6 +1947,7 @@ def _with_untrusted_invoked_allowlisted_import_findings(
     analyzed_invocation_global_positions: frozenset[int],
     invocation_load_safe_modules: frozenset[str],
     trusted_reconstruction_global_positions: frozenset[int],
+    trusted_invocation_global_positions: frozenset[int],
     *,
     suppress_safe_numpy_reconstruct: bool,
 ) -> PickleReport:
@@ -1976,6 +1985,7 @@ def _with_untrusted_invoked_allowlisted_import_findings(
                 analyzed_invocation_global_positions,
                 invocation_load_safe_modules,
                 trusted_reconstruction_global_positions,
+                trusted_invocation_global_positions,
                 suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
             )
         ):
@@ -2023,16 +2033,52 @@ def _invoked_allowlisted_import_reference_is_proven_safe(
     analyzed_invocation_global_positions: frozenset[int],
     invocation_load_safe_modules: frozenset[str],
     trusted_reconstruction_global_positions: frozenset[int],
+    trusted_invocation_global_positions: frozenset[int],
     *,
     suppress_safe_numpy_reconstruct: bool,
 ) -> bool:
-    if not import_only_reference_is_proven_trusted(module, name):
+    if (
+        not import_only_reference_is_proven_trusted(module, name)
+        and position not in trusted_invocation_global_positions
+    ):
         return False
     if (module, name) in _NUMPY_RECONSTRUCT_REFERENCES and not suppress_safe_numpy_reconstruct:
         return False
     if position in trusted_reconstruction_global_positions:
         return True
+    if position in trusted_invocation_global_positions:
+        return module in invocation_load_safe_modules
     return position in analyzed_invocation_global_positions and module in invocation_load_safe_modules
+
+
+def _proven_trusted_invocation_global_positions(callable_invocations: object) -> frozenset[int]:
+    grouped: dict[int, list[Mapping[str, object]]] = {}
+    for raw_invocation in _sequence(callable_invocations):
+        invocation = _mapping(raw_invocation)
+        position = _optional_int(invocation.get("global_position"))
+        module = str(invocation.get("module", ""))
+        name = str(invocation.get("name", ""))
+        if position is None or not module or not name:
+            continue
+        if module == "numpy" or module.startswith("numpy."):
+            continue
+        if (module, name) not in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES:
+            continue
+        grouped.setdefault(position, []).append(invocation)
+    trusted_positions: list[int] = []
+    for position, invocations in grouped.items():
+        if all(
+            import_only_reference_is_proven_trusted_for_pickle_invocation(
+                str(invocation.get("module", "")),
+                str(invocation.get("name", "")),
+                invocation,
+            )
+            for invocation in invocations
+        ):
+            trusted_positions.append(position)
+            if len(trusted_positions) >= _MAX_INERT_INITIALIZATION_MODULES:
+                break
+    return frozenset(trusted_positions)
 
 
 def _proven_trusted_import_references(report: PickleReport) -> frozenset[tuple[str, str]]:
@@ -2060,6 +2106,7 @@ def _without_proven_safe_import_findings(
     invocation_load_safe_modules: frozenset[str],
     trusted_reconstruction_global_positions: frozenset[int],
     trusted_reconstruction_references: frozenset[tuple[str, str]],
+    trusted_invocation_global_positions: frozenset[int],
 ) -> PickleReport:
     findings = tuple(
         finding
@@ -2075,6 +2122,7 @@ def _without_proven_safe_import_findings(
             invocation_load_safe_modules,
             trusted_reconstruction_global_positions,
             trusted_reconstruction_references,
+            trusted_invocation_global_positions,
         )
     )
     if len(findings) == len(report.findings):
@@ -2110,6 +2158,7 @@ def _non_allowlisted_import_finding_is_proven_safe(
     invocation_load_safe_modules: frozenset[str],
     trusted_reconstruction_global_positions: frozenset[int],
     trusted_reconstruction_references: frozenset[tuple[str, str]],
+    trusted_invocation_global_positions: frozenset[int] = frozenset(),
 ) -> bool:
     module = str(finding.details.get("module", ""))
     name = str(finding.details.get("name", ""))
@@ -2131,10 +2180,16 @@ def _non_allowlisted_import_finding_is_proven_safe(
         if position is not None
         else reference in trusted_reconstruction_references
     )
+    invocation_identity_is_trusted = (
+        position in trusted_invocation_global_positions and module in invocation_load_safe_modules
+        if position is not None
+        else False
+    )
     inert_reference_is_proven_safe = position is not None and not finding_is_invoked
     trusted_reference_is_proven_safe = position is not None and (
         not finding_is_invoked
         or invocation_is_trusted_reconstruction
+        or invocation_identity_is_trusted
         or (
             invocation_is_analyzed
             and (
@@ -2142,7 +2197,8 @@ def _non_allowlisted_import_finding_is_proven_safe(
             )
         )
     )
-    return (trusted_reference_is_proven_safe and (module, name) in trusted_import_references) or (
+    trusted_origin_is_proven = (module, name) in trusted_import_references or invocation_identity_is_trusted
+    return (trusted_reference_is_proven_safe and trusted_origin_is_proven) or (
         inert_reference_is_proven_safe and module in inert_initialization_modules
     )
 

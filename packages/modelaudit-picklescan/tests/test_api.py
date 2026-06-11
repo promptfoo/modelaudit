@@ -362,6 +362,45 @@ def _write_rebindable_trusted_transformers_package(site_packages: Path) -> None:
     )
 
 
+def _write_init_heavy_trusted_transformers_package(site_packages: Path) -> None:
+    package_dir = site_packages / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        "\n".join(
+            [
+                "HELPER = object()",
+                "class TrainingArguments:",
+                "    def __new__(cls):",
+                "        return object.__new__(cls)",
+                "    def __init__(self):",
+                "        self.helper = HELPER",
+                "    def __setstate__(self, state):",
+                "        self.__dict__.update(state)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_enum_trusted_transformers_package(site_packages: Path) -> None:
+    package_dir = site_packages / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "trainer_utils.py").write_text(
+        "\n".join(
+            [
+                "from enum import Enum",
+                "class IntervalStrategy(str, Enum):",
+                "    STEPS = 'steps'",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def _write_rebindable_trusted_torch_utils_package(site_packages: Path) -> None:
     package_dir = site_packages / "torch"
     package_dir.mkdir(parents=True, exist_ok=True)
@@ -6485,6 +6524,98 @@ def test_scan_file_trusts_source_backed_framework_reference_imported_after_scann
     assert not any(
         finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
         and finding["import_reference"] == "transformers.training_args.TrainingArguments"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_trusts_newobj_build_without_reaching_init(tmp_path: Path) -> None:
+    payload_path = tmp_path / "newobj-build-unused-init.pkl"
+    payload_path.write_bytes(_metadata_newobj_build_payload("transformers.training_args", "TrainingArguments") + b".")
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_init_heavy_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "import transformers.training_args\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "report = scan_file(payload_path)\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["status"] == ScanStatus.COMPLETE.value
+    assert output["verdict"] == SafetyVerdict.CLEAN.value
+    assert not any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.TrainingArguments"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_trusts_stdlib_enum_metaclass_reduce(tmp_path: Path) -> None:
+    payload_path = tmp_path / "enum-interval-strategy.pkl"
+    payload_path.write_bytes(
+        _metadata_reduce_payload("transformers.trainer_utils", "IntervalStrategy", b"steps") + b"."
+    )
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_enum_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "import transformers.trainer_utils\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "report = scan_file(payload_path)\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["status"] == ScanStatus.COMPLETE.value
+    assert output["verdict"] == SafetyVerdict.CLEAN.value
+    assert not any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.trainer_utils.IntervalStrategy"
         for finding in output["findings"]
     )
 

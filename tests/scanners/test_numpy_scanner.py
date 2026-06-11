@@ -1107,6 +1107,59 @@ def test_object_dtype_numpy_trailing_bytes_malicious_exit1(tmp_path: Path) -> No
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_object_dtype_numpy_trailing_stream_keeps_unproven_reconstruct_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arr = np.array([{"k": "v"}], dtype=object)
+    path = tmp_path / "safe_first_stream_unsafe_reconstruct_tail.npy"
+    np.save(path, arr, allow_pickle=True)
+    path.write_bytes(path.read_bytes() + b"TAIL")
+
+    def payload_has_safe_reconstruct_proof(payload: bytes) -> bool:
+        return not payload.endswith(b"TAIL")
+
+    def fake_embedded_scan(
+        self: NumPyScanner,
+        file_obj: Any,
+        payload_size: int,
+        context_path: str,
+    ) -> ScanResult:
+        result = ScanResult(scanner_name="pickle")
+        result.metadata["first_pickle_end_pos"] = file_obj.tell() + 1
+        result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="unproven trailing reconstruct",
+            severity=IssueSeverity.WARNING,
+            location=context_path,
+            details={
+                "import_reference": "numpy._core.multiarray._reconstruct",
+                "module": "numpy._core.multiarray",
+                "name": "_reconstruct",
+                "position": file_obj.tell() + 2,
+            },
+            rule_code="NON_ALLOWLISTED_GLOBAL",
+        )
+        result.finish(success=False)
+        return result
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_payload_has_safe_reconstruct_proof",
+        payload_has_safe_reconstruct_proof,
+    )
+    monkeypatch.setattr(NumPyScanner, "_scan_embedded_pickle_payload", fake_embedded_scan)
+
+    result = NumPyScanner().scan(str(path))
+
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(
+        issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and issue.details.get("import_reference") == "numpy._core.multiarray._reconstruct"
+        for issue in result.issues
+    )
+
+
 def test_corrupted_npz_fails_safely(tmp_path: Path) -> None:
     npz_path = tmp_path / "corrupt.npz"
     npz_path.write_bytes(b"not-a-zip")

@@ -291,6 +291,45 @@ def _write_rebindable_trusted_transformers_package(site_packages: Path) -> None:
     )
 
 
+def _write_init_heavy_trusted_transformers_package(site_packages: Path) -> None:
+    package_dir = site_packages / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        "\n".join(
+            [
+                "HELPER = object()",
+                "class TrainingArguments:",
+                "    def __new__(cls):",
+                "        return object.__new__(cls)",
+                "    def __init__(self):",
+                "        self.helper = HELPER",
+                "    def __setstate__(self, state):",
+                "        self.__dict__.update(state)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_enum_trusted_transformers_package(site_packages: Path) -> None:
+    package_dir = site_packages / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "trainer_utils.py").write_text(
+        "\n".join(
+            [
+                "from enum import Enum",
+                "class IntervalStrategy(str, Enum):",
+                "    STEPS = 'steps'",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def _write_rebindable_trusted_torch_utils_package(site_packages: Path) -> None:
     package_dir = site_packages / "torch"
     package_dir.mkdir(parents=True, exist_ok=True)
@@ -905,6 +944,98 @@ def test_pytorch_zip_trusts_source_backed_framework_reference_imported_after_sca
     assert not any(
         issue["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
         and issue["import_reference"] == "transformers.training_args.TrainingArguments"
+        for issue in output["issues"]
+    )
+
+
+def test_pytorch_zip_trusts_newobj_build_without_reaching_init(tmp_path: Path) -> None:
+    payload = _metadata_newobj_build_payload("transformers.training_args", "TrainingArguments") + b"."
+    model_path = tmp_path / "newobj_build_unused_init.bin"
+    _write_training_args_bin(model_path, payload)
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_init_heavy_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner\n"
+        "import transformers.training_args\n"
+        "model_path = Path(sys.argv[1])\n"
+        "result = PyTorchZipScanner().scan(str(model_path))\n"
+        "print(json.dumps({\n"
+        "    'success': result.success,\n"
+        "    'pickle_verdict': result.metadata.get('pickle_verdict'),\n"
+        "    'issues': [\n"
+        "        {\n"
+        "            'rule_code': issue.rule_code,\n"
+        "            'import_reference': (issue.details or {}).get('import_reference'),\n"
+        "        }\n"
+        "        for issue in result.issues\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(model_path)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["success"] is True
+    assert output["pickle_verdict"] == "clean"
+    assert not any(
+        issue["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and issue["import_reference"] == "transformers.training_args.TrainingArguments"
+        for issue in output["issues"]
+    )
+
+
+def test_pytorch_zip_trusts_stdlib_enum_metaclass_reduce(tmp_path: Path) -> None:
+    payload = _metadata_reduce_payload("transformers.trainer_utils", "IntervalStrategy", b"steps") + b"."
+    model_path = tmp_path / "enum_interval_strategy.bin"
+    _write_training_args_bin(model_path, payload)
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_enum_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner\n"
+        "import transformers.trainer_utils\n"
+        "model_path = Path(sys.argv[1])\n"
+        "result = PyTorchZipScanner().scan(str(model_path))\n"
+        "print(json.dumps({\n"
+        "    'success': result.success,\n"
+        "    'pickle_verdict': result.metadata.get('pickle_verdict'),\n"
+        "    'issues': [\n"
+        "        {\n"
+        "            'rule_code': issue.rule_code,\n"
+        "            'import_reference': (issue.details or {}).get('import_reference'),\n"
+        "        }\n"
+        "        for issue in result.issues\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(model_path)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["success"] is True
+    assert output["pickle_verdict"] == "clean"
+    assert not any(
+        issue["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and issue["import_reference"] == "transformers.trainer_utils.IntervalStrategy"
         for issue in output["issues"]
     )
 
