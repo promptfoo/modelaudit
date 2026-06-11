@@ -386,6 +386,21 @@ BASIC_AUTH_HEADERS_INIT_START_PATTERN = re.compile(
     r"(?:^|[^\w$])(?:\\?[\"']\s*)?headers\s*(?:\\?[\"'])?\s*[:=]\s*\[",
     re.IGNORECASE,
 )
+BASIC_AUTH_HEADERS_OBJECT_CONTEXT_START_PATTERN = re.compile(
+    r"(?:^|[^\w$])(?:\\?[\"']\s*)?headers\s*(?:\\?[\"'])?\s*(?:=>|[:=])",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADER_OBJECT_VALUE_PREFIX_PATTERN = re.compile(
+    r"(?:^|[^\w$])(?:\\?[\"']\s*)?(?:header[-_]?value|value)\s*(?:\\?[\"'])?\s*(?:=>|[:=])\s*"
+    r"(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADER_OBJECT_NAME_FIELD_PATTERN = re.compile(
+    r"(?:^|[^\w$])(?:\\?[\"']\s*)?(?:header[-_]?name|header|key|name)\s*(?:\\?[\"'])?\s*(?:=>|[:=])\s*"
+    r"(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*(?P<name>[A-Za-z0-9_. -]{1,96})",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADER_OBJECT_ITEM_START_PATTERN = re.compile(r"[\r\n]\s*-\s*")
 BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS = 256
 BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS = 4096
 BASIC_AUTH_HEADER_NAMES = {
@@ -689,6 +704,10 @@ class SecretsDetector:
                     return True
                 if SecretsDetector._basic_auth_prefix_has_headers_init_context(collection_prefix):
                     return True
+        collection_search_start = max(0, position - BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS)
+        collection_prefix = text[collection_search_start:position]
+        if SecretsDetector._basic_auth_prefix_has_headers_object_context(collection_prefix):
+            return True
         if BASIC_AUTH_CONTINUATION_PREFIX_PATTERN.fullmatch(line_prefix) is None:
             return False
 
@@ -712,6 +731,28 @@ class SecretsDetector:
             BASIC_AUTH_HEADER_PREFIX_PATTERN.search(previous_line) is not None
             or BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(previous_line) is not None
         )
+
+    @staticmethod
+    def _basic_auth_prefix_has_headers_object_context(prefix: str) -> bool:
+        if BASIC_AUTH_HEADER_OBJECT_VALUE_PREFIX_PATTERN.search(prefix) is None:
+            return False
+
+        headers_match: re.Match[str] | None = None
+        for match in BASIC_AUTH_HEADERS_OBJECT_CONTEXT_START_PATTERN.finditer(prefix):
+            headers_match = match
+        if headers_match is None:
+            return False
+
+        headers_prefix = prefix[headers_match.end() :]
+        item_start = headers_prefix.rfind("{")
+        for match in BASIC_AUTH_HEADER_OBJECT_ITEM_START_PATTERN.finditer(headers_prefix):
+            item_start = max(item_start, match.end())
+        item_prefix = headers_prefix[item_start if item_start >= 0 else 0 :]
+
+        for match in BASIC_AUTH_HEADER_OBJECT_NAME_FIELD_PATTERN.finditer(item_prefix):
+            if _canonical_basic_auth_header_key(match.group("name")) is not None:
+                return True
+        return False
 
     @staticmethod
     def _basic_auth_prefix_has_headers_constructor_context(prefix: str) -> bool:

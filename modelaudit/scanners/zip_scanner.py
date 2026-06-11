@@ -59,6 +59,7 @@ _ZIP_MAX_LOCAL_PAYLOAD_VALIDATION_TOTAL = 64 * 1024 * 1024
 _ZIP_MAX_LOCAL_DESCRIPTOR_SEARCH_WORK = 1_000_000
 _ZIP_MAX_LOCAL_ENTRY_PADDING = 64 * 1024
 _ZIP_MAX_LOCAL_HEADER_CANDIDATES = 10000
+_ZIP_TEMP_MEMBER_BASENAME_MAX_LENGTH = 160
 _ZIP64_EOCD_LOCATOR_SIGNATURE = b"PK\x06\x07"
 _ZIP64_EOCD_LOCATOR_SIZE = 20
 _ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
@@ -272,6 +273,15 @@ class ZipScanner(BaseScanner):
     @staticmethod
     def _archive_entry_basename(name: str) -> str:
         return name.replace("\\", "/").rsplit("/", 1)[-1]
+
+    @staticmethod
+    def _safe_preserved_temp_basename(name: str) -> str:
+        if len(name) <= _ZIP_TEMP_MEMBER_BASENAME_MAX_LENGTH:
+            return name
+
+        stem, ext = os.path.splitext(name)
+        max_stem_length = max(1, _ZIP_TEMP_MEMBER_BASENAME_MAX_LENGTH - len(ext))
+        return f"{stem[:max_stem_length]}{ext}"
 
     @classmethod
     def _preserve_nested_routing_basename(cls, name: str) -> bool:
@@ -1584,9 +1594,15 @@ class ZipScanner(BaseScanner):
         """Yield a writable temporary member path plus its optional parent directory."""
         if preserve_nested_routing_basename:
             tmp_dir = tempfile.mkdtemp()
-            tmp_path = os.path.join(tmp_dir, safe_name or "archive-member")
-            with open(tmp_path, "wb") as tmp:
-                yield tmp_path, tmp, tmp_dir
+            try:
+                tmp_name = ZipScanner._safe_preserved_temp_basename(safe_name or "archive-member")
+                tmp_path = os.path.join(tmp_dir, tmp_name)
+                with open(tmp_path, "wb") as tmp:
+                    yield tmp_path, tmp, tmp_dir
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.rmdir(tmp_dir)
+                raise
             return
 
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as named_tmp:

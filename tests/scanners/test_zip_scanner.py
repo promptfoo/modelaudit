@@ -10962,6 +10962,41 @@ class TestZipScanner:
         assert isinstance(zip_entry, str)
         assert zip_entry.replace("\\", "/") == "docs/README"
 
+    def test_scan_zip_long_preserved_readme_member_cleans_tempdir(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "long_readme.zip"
+        temp_root = tmp_path / "temp-root"
+        temp_root.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+        long_readme_name = "readme." + ("a" * 300) + ".md"
+
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(long_readme_name, "Authorization: Basic bG9uZy1yZWFkbWU6cGFzcw==\n")
+
+        result = core.scan_file(
+            str(archive_path),
+            config={
+                "cache_scan_results": False,
+                "check_network_comm": False,
+            },
+        )
+
+        failed_secret_checks = [
+            check
+            for check in result.checks
+            if check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("secret_type") == "Basic Auth Credentials"
+        ]
+        assert result.success is False
+        assert failed_secret_checks
+        assert failed_secret_checks[0].rule_code == "S702"
+        assert failed_secret_checks[0].details.get("zip_entry") == long_readme_name
+        assert list(temp_root.iterdir()) == []
+
     def test_scan_nested_zip_text_member_detects_valid_basic_auth_header(self, tmp_path: Path) -> None:
         inner_payload = io.BytesIO()
         with zipfile.ZipFile(inner_payload, "w") as inner_archive:

@@ -356,6 +356,22 @@ class TestSecretsDetector:
                 _basic_auth_token(b"init-headers:pass"),
             ),
             (
+                f'fetch("/model", {{ headers: [{{ name: "Authorization", value: "Basic '
+                f'{_basic_auth_token(b"object-list:pass")}" }}] }})',
+                _basic_auth_token(b"object-list:pass"),
+            ),
+            (
+                "headers:\n"
+                "  - name: Proxy-Authorization\n"
+                f"    value: Basic {_basic_auth_token(b'yaml-object-list:pass')}\n",
+                _basic_auth_token(b"yaml-object-list:pass"),
+            ),
+            (
+                f'{{"headers":[{{"headerName":"proxy_authorization_header","headerValue":"Basic '
+                f'{_basic_auth_token(b"json-header-object:pass")}"}}]}}',
+                _basic_auth_token(b"json-header-object:pass"),
+            ),
+            (
                 f"headers=[('Authorization', 'Basic {_basic_auth_token(b'assignment-tuple:pass')}')]",
                 _basic_auth_token(b"assignment-tuple:pass"),
             ),
@@ -451,6 +467,16 @@ class TestSecretsDetector:
             (
                 'const pairs = [["Accept", "application/json"], '
                 f'["Proxy-Authorization", "Basic {_basic_auth_token(b"array-proxy:pass")}"]]'
+            ),
+            (f'metadata: [{{ name: "Authorization", value: "Basic {_basic_auth_token(b"metadata-object:pass")}" }}]'),
+            (
+                "headers:\n"
+                "  - name: Authorization\n"
+                f"    description: Basic {_basic_auth_token(b'description-object:pass')}\n"
+            ),
+            (
+                'headers: [{ name: "Authorization", description: "documented" }, '
+                f'{{ name: "Accept", value: "Basic {_basic_auth_token(b"wrong-object:pass")}" }}]'
             ),
             f'notes.append("Authorization notes", "Basic {_basic_auth_token(b"notes:pass")}")',
             f"\u0391uthorization: Basic {_basic_auth_token(b'confusable-alpha:pass')}",
