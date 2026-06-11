@@ -5,6 +5,7 @@ import logging
 import ntpath
 import os
 import posixpath
+import re
 import signal
 import struct
 import subprocess
@@ -14,6 +15,7 @@ import unicodedata
 from collections.abc import Callable, Collection, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
+from functools import cache
 from glob import escape as escape_glob
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -46,6 +48,14 @@ _MAX_HF_STREAMING_ONNX_EXTERNAL_DATA_FILES = 256
 _HF_DOWNLOAD_WORKER_RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
 _POSIX_TERMINATE_SIGNAL = getattr(signal, "SIGTERM", 15)
 _POSIX_KILL_SIGNAL = getattr(signal, "SIGKILL", 9)
+_HF_SAFETENSORS_SHARD_PATTERN = re.compile(
+    r"(?P<stem>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})\.safetensors",
+    re.IGNORECASE,
+)
+_HF_SAFETENSORS_SHARD_SHAPE_PATTERN = re.compile(
+    r".+-\d+-of-\d+\.safetensors",
+    re.IGNORECASE,
+)
 _HF_REPO_BOOKKEEPING_FILENAMES = frozenset({".gitattributes"})
 
 __all__ = [
@@ -718,7 +728,7 @@ def _detect_huggingface_xgboost_ubjson_route(
     prefix: bytes,
 ) -> str | None:
     """Return a bounded XGBoost UBJSON route for a suffix-skipped remote file."""
-    if Path(filename).suffix:
+    if Path(filename).suffix and not _has_hf_safetensors_shard_shape(filename):
         return None
 
     from modelaudit.utils.file.detection import (
@@ -1351,6 +1361,101 @@ def _get_hf_content_route_scanner_ids() -> set[str]:
     return scanner_ids
 
 
+@cache
+def _hf_safetensors_route_scanner_ids() -> frozenset[str]:
+    from ...scanner_selection import scanner_ids_for_detected_format
+
+    return scanner_ids_for_detected_format("safetensors")
+
+
+@cache
+def _hf_route_scanner_ids_for_formats(format_names: frozenset[str]) -> frozenset[str]:
+    from ...scanner_selection import scanner_ids_for_detected_format
+
+    scanner_ids: set[str] = set()
+    for format_name in format_names:
+        scanner_ids.update(scanner_ids_for_detected_format(format_name))
+    return frozenset(scanner_ids)
+
+
+def _hf_safetensors_shard_excluded_by_selection(
+    filename: str,
+    selected_route_scanner_ids: set[str] | None,
+    selected_route_formats: set[str] | None,
+    *,
+    complete_safetensors_shard_files: Collection[str] | None = None,
+) -> bool:
+    """Return whether no selected scanner can claim a declared SafeTensors shard."""
+    if _parse_hf_safetensors_shard(filename) is None:
+        return False
+    if complete_safetensors_shard_files is not None and filename not in complete_safetensors_shard_files:
+        return False
+
+    # SafeTensors content routes intentionally include overlap-capable scanners
+    # such as pickle and compressed, not only the SafeTensors scanner itself.
+    safetensors_route_scanner_ids = _hf_safetensors_route_scanner_ids()
+    if selected_route_scanner_ids is not None:
+        selected_safetensors_routes = selected_route_scanner_ids.intersection(safetensors_route_scanner_ids)
+        return not selected_safetensors_routes
+    if selected_route_formats is None:
+        return False
+
+    selected_format_route_scanner_ids = _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
+    return not selected_format_route_scanner_ids.intersection(safetensors_route_scanner_ids)
+
+
+def _parse_hf_safetensors_shard(filename: str) -> tuple[str, int, int] | None:
+    match = _HF_SAFETENSORS_SHARD_PATTERN.fullmatch(filename)
+    if match is None:
+        return None
+    index = int(match.group("index"))
+    total = int(match.group("total"))
+    if index < 1 or total < 2 or index > total:
+        return None
+    return match.group("stem"), index, total
+
+
+def _has_hf_safetensors_shard_shape(filename: str) -> bool:
+    return _HF_SAFETENSORS_SHARD_SHAPE_PATTERN.fullmatch(filename) is not None
+
+
+def _complete_hf_safetensors_shard_files(repo_files: Collection[str]) -> frozenset[str]:
+    """Return canonical SafeTensors shards whose directory-scoped family is complete."""
+    families: dict[tuple[str, int], dict[int, set[str]]] = {}
+    for filename in repo_files:
+        parsed = _parse_hf_safetensors_shard(filename)
+        if parsed is None:
+            continue
+        stem, index, total = parsed
+        families.setdefault((stem, total), {}).setdefault(index, set()).add(filename)
+
+    complete_files: set[str] = set()
+    for (_stem, total), indexed_files in families.items():
+        if len(indexed_files) != total:
+            continue
+        if any(index not in indexed_files or len(indexed_files[index]) != 1 for index in range(1, total + 1)):
+            continue
+        for filenames in indexed_files.values():
+            complete_files.update(filenames)
+    return frozenset(complete_files)
+
+
+def _hf_detected_format_excluded_by_selected_route_formats(
+    detected_format: str,
+    selected_route_formats: set[str],
+) -> bool:
+    """Return whether inferred route formats cannot claim a detected route."""
+    normalized_detected_format = str(detected_format).lower()
+    if normalized_detected_format in selected_route_formats:
+        return False
+
+    from ...scanner_selection import scanner_ids_for_detected_format
+
+    selected_route_scanner_ids = _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
+    detected_route_scanner_ids = scanner_ids_for_detected_format(normalized_detected_format)
+    return not selected_route_scanner_ids.intersection(detected_route_scanner_ids)
+
+
 def _get_selected_hf_content_route_formats(
     scannable_extensions: Collection[str] | None,
     scannable_filenames: Collection[str] | None,
@@ -1362,14 +1467,40 @@ def _get_selected_hf_content_route_formats(
     from ...scanner_registry_metadata import EXTENSION_FORMAT_MAP, get_scanner_registry_metadata
 
     content_route_formats = _get_hf_content_route_formats()
-    selected_extensions = (
+    selected_extensions: set[str] = (
         set() if scannable_extensions is None else {str(extension).lower() for extension in scannable_extensions}
     )
     selected_filenames = (
         set() if scannable_filenames is None else {str(filename).lower() for filename in scannable_filenames}
     )
+    for filename in selected_filenames:
+        suffix = PurePosixPath(filename).suffix.lower()
+        if suffix:
+            selected_extensions.add(suffix)
+
+    scanner_metadata = get_scanner_registry_metadata()
+    extension_claimants: dict[str, set[str]] = {extension: set() for extension in selected_extensions if extension}
+    for scanner_id, scanner_info in scanner_metadata.items():
+        remote_excluded_extensions = {
+            str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])
+        }
+        for key in ("extensions", "content_routed_extensions", "scanner_only_extensions"):
+            for extension in scanner_info.get(key, []):
+                extension_text = str(extension).lower()
+                if extension_text in extension_claimants and extension_text not in remote_excluded_extensions:
+                    extension_claimants[extension_text].add(scanner_id)
+
+    selected_extensions = {
+        extension
+        for extension in selected_extensions
+        if extension in EXTENSION_FORMAT_MAP
+        or (
+            len(extension_claimants.get(extension, set())) == 1
+            and bool(extension_claimants.get(extension, set()).intersection(content_route_formats))
+        )
+    }
     selected_formats: set[str] = set()
-    for scanner_id, scanner_info in get_scanner_registry_metadata().items():
+    for scanner_id, scanner_info in scanner_metadata.items():
         remote_excluded_extensions = {
             str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])
         }
@@ -1417,19 +1548,6 @@ def _select_streamable_hf_files(
         selected_route_scanner_ids = {str(scanner_id).lower() for scanner_id in scannable_scanner_ids}.intersection(
             _get_hf_content_route_scanner_ids()
         )
-    elif scannable_filenames:
-        from ...scanner_registry_metadata import EXTENSION_FORMAT_MAP
-
-        authoritative_extensions = (
-            set()
-            if scannable_extensions is None
-            else {
-                str(extension).lower()
-                for extension in scannable_extensions
-                if str(extension).lower() in EXTENSION_FORMAT_MAP
-            }
-        )
-        selected_route_formats = _get_selected_hf_content_route_formats(authoritative_extensions, None)
     else:
         selected_route_formats = _get_selected_hf_content_route_formats(scannable_extensions, scannable_filenames)
     sniff_renamed_files = not include_all_files and (
@@ -1510,13 +1628,23 @@ def _select_streamable_hf_files(
             remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
             deadline=deadline,
         )
-        selected_files = set(model_files)
+        processed_files = set(model_files)
+        complete_safetensors_shard_files = _complete_hf_safetensors_shard_files(repo_files)
+        unskippable_detected_safetensors_shards: list[str] = []
         for file_name in repo_files:
-            if file_name in selected_files:
+            if file_name in processed_files:
                 continue
+            processed_files.add(file_name)
             if _is_huggingface_repo_bookkeeping_file(file_name):
                 continue
             if file_name in exact_openvino_companion_candidates:
+                continue
+            if _hf_safetensors_shard_excluded_by_selection(
+                file_name,
+                selected_route_scanner_ids,
+                selected_route_formats,
+                complete_safetensors_shard_files=complete_safetensors_shard_files,
+            ):
                 continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
@@ -1531,12 +1659,27 @@ def _select_streamable_hf_files(
                 from ...scanner_selection import scanner_ids_for_detected_format
 
                 if not selected_route_scanner_ids.intersection(scanner_ids_for_detected_format(detected_format)):
+                    if detected_format == "safetensors" and _has_hf_safetensors_shard_shape(file_name):
+                        unskippable_detected_safetensors_shards.append(file_name)
                     continue
-            elif selected_route_formats is not None and detected_format not in selected_route_formats:
+            elif selected_route_formats is not None and _hf_detected_format_excluded_by_selected_route_formats(
+                detected_format,
+                selected_route_formats,
+            ):
+                if detected_format == "safetensors" and _has_hf_safetensors_shard_shape(file_name):
+                    unskippable_detected_safetensors_shards.append(file_name)
                 continue
             model_files.append(file_name)
             content_route_formats[file_name] = detected_format
-            selected_files.add(file_name)
+        if unskippable_detected_safetensors_shards:
+            preview = ", ".join(unskippable_detected_safetensors_shards[:3])
+            if len(unskippable_detected_safetensors_shards) > 3:
+                preview = f"{preview}, ..."
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: detected SafeTensors shard candidates "
+                f"that do not form a complete canonical shard family for {repo_id}: {preview}; "
+                "streaming coverage is incomplete"
+            )
 
     if not model_files:
         _raise_no_scannable_hf_files(repo_id)
@@ -2826,7 +2969,6 @@ def download_model_streaming(
             if (
                 onnx_external_data_enabled
                 and content_route_format is None
-                and include_all_files
                 and PurePosixPath(filename).suffix.lower() != ".onnx"
             ):
                 try:
