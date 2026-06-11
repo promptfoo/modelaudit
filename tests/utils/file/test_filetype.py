@@ -447,6 +447,15 @@ def test_detect_binary_ambiguous_text_suffix_still_fails_closed_as_flax(tmp_path
     assert detect_file_format(str(document)) == "flax_msgpack"
 
 
+def test_detect_utf8_scalar_readme_still_fails_closed_as_flax(tmp_path: Path) -> None:
+    document = tmp_path / "README.md"
+    document.write_bytes(b"\xc2\xa0" * ((FLAX_MSGPACK_STRUCTURE_READ_BYTES // 2) + 1))
+
+    assert detect_file_format_from_magic(str(document)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(document)) == "flax_msgpack"
+    assert detect_file_format(str(document)) == "flax_msgpack"
+
+
 @pytest.mark.parametrize(
     ("prefix", "has_pickle_overlap"),
     [

@@ -515,6 +515,18 @@ class TestDirectoryFileFiltering:
         metadata = results.file_metadata[str(readme)].model_dump(mode="python")
         assert "flax_msgpack_routing_incomplete" in metadata["scan_outcome_reasons"]
 
+    def test_utf8_scalar_readme_fails_closed_as_flax(self, tmp_path: Path) -> None:
+        readme = tmp_path / "README.md"
+        readme.write_bytes(b"\xc2\xa0" * ((FLAX_MSGPACK_STRUCTURE_READ_BYTES // 2) + 1))
+
+        results = scan_model_directory_or_file(str(readme), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["flax_msgpack"]
+        assert determine_exit_code(results) == 2
+        metadata = results.file_metadata[str(readme)].model_dump(mode="python")
+        assert "flax_msgpack_routing_incomplete" in metadata["scan_outcome_reasons"]
+
     def test_oversized_plain_text_document_suffix_fails_closed_in_directory_scan(self, tmp_path: Path) -> None:
         document = tmp_path / "notes.txt"
         document.write_bytes(b" " * (2 * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1) + 2))

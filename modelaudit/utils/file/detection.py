@@ -57,6 +57,8 @@ _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES = b"\t\n\r" + bytes(range(0x20, 0x7F))
 _CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES = (
     bytes(byte for byte in range(0x20) if byte not in {0x09, 0x0A, 0x0C, 0x0D}) + b"\x7f"
 )
+_CONTENT_ROUTE_UTF8_SCALAR_STREAM_MIN_CHARS = 64
+_CONTENT_ROUTE_UTF8_SCALAR_STREAM_MAX_UNIQUE_CHARS = 2
 _TensorFlowProtoRoute = Literal[
     "unknown",
     "tf_metagraph",
@@ -5230,6 +5232,8 @@ def _probe_flax_msgpack_checkpoint_stream(
         return sample_is_prefix and recognized_checkpoint_root[0]
     except _MsgpackProbeInvalid:
         return False
+    if sample_is_prefix and inline_scalars_seen >= _FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS:
+        return None
     return False
 
 
@@ -5366,8 +5370,25 @@ def _is_complete_bounded_text_payload(payload: bytes) -> bool:
         decoded = payload.decode("utf-8-sig")
     except UnicodeDecodeError:
         return False
-    return not any(
-        unicodedata.category(character) in {"Cc", "Cs"} and character not in "\t\n\r\f" for character in decoded
+    content_characters: set[str] = set()
+    content_character_count = 0
+    saw_textual_character = False
+    for character in decoded:
+        category = unicodedata.category(character)
+        if category in {"Cc", "Cs"} and character not in "\t\n\r\f":
+            return False
+        if character.isspace():
+            continue
+        content_character_count += 1
+        content_characters.add(character)
+        if category[0] in {"L", "N", "P", "S"}:
+            saw_textual_character = True
+
+    if not saw_textual_character:
+        return False
+    return not (
+        content_character_count >= _CONTENT_ROUTE_UTF8_SCALAR_STREAM_MIN_CHARS
+        and len(content_characters) <= _CONTENT_ROUTE_UTF8_SCALAR_STREAM_MAX_UNIQUE_CHARS
     )
 
 

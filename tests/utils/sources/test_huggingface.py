@@ -19,10 +19,11 @@ from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
-from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
+from modelaudit.utils.file.detection import FLAX_MSGPACK_STRUCTURE_READ_BYTES, detect_file_format_for_skip_filter
 from modelaudit.utils.sources._huggingface_download_worker import _run_operation as _run_huggingface_worker_operation
 from modelaudit.utils.sources.huggingface import (
     _detect_huggingface_content_route_format,
+    _detect_huggingface_flax_msgpack_route,
     _get_huggingface_path_sizes,
     _HuggingFaceProbeBudget,
     _list_huggingface_repo_files_at_revision,
@@ -2150,6 +2151,31 @@ class TestModelDownloadStreaming:
         assert detected_format is None
 
     @patch("requests.get")
+    def test_detect_huggingface_flax_route_rejects_large_complete_multilingual_readme_text(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Remote text ownership should use the complete bounded text window, not only 8 KiB."""
+        readme_payload = (
+            "# Model Card\n"
+            + ("This multilingual README has こんにちは, café, naïve, résumé, and 😀 examples.\n" * 12_000)
+        ).encode()
+        assert len(readme_payload) > FLAX_MSGPACK_STRUCTURE_READ_BYTES
+        assert len(readme_payload) < 2 * FLAX_MSGPACK_STRUCTURE_READ_BYTES
+        mock_requests_get.side_effect = _fake_bounded_range_response(readme_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_flax_msgpack_route(
+            "intfloat/multilingual-e5-small",
+            "README.md",
+            _HF_MULTILINGUAL_E5_README_REVISION,
+            budget,
+            readme_payload[:8192],
+        )
+
+        assert detected_format is None
+
+    @patch("requests.get")
     def test_detect_huggingface_flax_route_preserves_binary_readme_checkpoint(
         self,
         mock_requests_get: MagicMock,
@@ -2161,6 +2187,25 @@ class TestModelDownloadStreaming:
             use_bin_type=True,
         )
         mock_requests_get.side_effect = _fake_bounded_range_response(hidden_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_content_route_format(
+            "intfloat/multilingual-e5-small",
+            "README.md",
+            _HF_MULTILINGUAL_E5_README_REVISION,
+            budget,
+        )
+
+        assert detected_format == "flax_msgpack"
+
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_preserves_utf8_scalar_readme_fail_closed(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Remote low-diversity UTF-8 scalar streams should not claim text ownership."""
+        payload = b"\xc2\xa0" * ((FLAX_MSGPACK_STRUCTURE_READ_BYTES // 2) + 1)
+        mock_requests_get.side_effect = _fake_bounded_range_response(payload)
         budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
 
         detected_format = _detect_huggingface_content_route_format(

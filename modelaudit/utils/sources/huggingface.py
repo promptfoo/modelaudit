@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 _HF_CONTENT_SNIFF_BYTES = 8 * 1024
 _HF_CONTENT_SNIFF_MAX_FILES = 256
 _HF_CONTENT_SNIFF_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+_HF_TEXT_ROUTE_DECLARED_FILENAMES = frozenset({"readme", "model_card", "requirements.txt"})
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
 _MAX_HF_STREAMING_EXTENSIONLESS_FILES = 128
@@ -579,31 +580,59 @@ def _detect_huggingface_flax_msgpack_route(
 ) -> str | None:
     """Return a bounded Flax MessagePack route for a suffix-skipped remote file."""
     from modelaudit.utils.file.detection import (
+        _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES,
+        _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES,
         FLAX_MSGPACK_STRUCTURE_READ_BYTES,
         _probe_flax_msgpack_checkpoint_stream,
     )
 
-    if Path(filename).suffix.lower() in {".py", ".pyw"}:
+    remote_path = PurePosixPath(filename)
+    suffix = remote_path.suffix.lower()
+    if suffix in {".py", ".pyw"}:
         return None
 
+    sample_is_prefix = _huggingface_sample_is_prefix(
+        budget,
+        filename,
+        prefix,
+        _HF_CONTENT_SNIFF_BYTES,
+    )
     initial_probe_state = _probe_flax_msgpack_checkpoint_stream(
         BytesIO(prefix),
         len(prefix),
-        sample_is_prefix=_huggingface_sample_is_prefix(
-            budget,
-            filename,
-            prefix,
-            _HF_CONTENT_SNIFF_BYTES,
-        ),
+        sample_is_prefix=sample_is_prefix,
         incomplete_prefix_is_inconclusive=True,
     )
     if initial_probe_state is True:
         return "flax_msgpack"
-    if initial_probe_state is False or len(prefix) < _HF_CONTENT_SNIFF_BYTES:
+    declared_text_asset = (
+        suffix in _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES
+        or remote_path.name.lower() in _HF_TEXT_ROUTE_DECLARED_FILENAMES
+    )
+    max_probe_size = FLAX_MSGPACK_STRUCTURE_READ_BYTES
+    raw_probe: bytes | None = None
+    should_probe_complete_text = initial_probe_state is False or (initial_probe_state is None and declared_text_asset)
+    if should_probe_complete_text:
+        if len(prefix) < _HF_CONTENT_SNIFF_BYTES or not declared_text_asset:
+            return None
+        raw_text_probe = _read_huggingface_probe(
+            repo_id,
+            filename,
+            revision,
+            budget,
+            prefix,
+            _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES + 1,
+        )
+        text_sample_is_prefix = len(raw_text_probe) > _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+        text_probe = raw_text_probe[:_CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES]
+        if _is_complete_huggingface_text_or_json(text_probe, sample_is_prefix=text_sample_is_prefix):
+            return None
+        raw_probe = raw_text_probe
+    elif len(prefix) < _HF_CONTENT_SNIFF_BYTES:
         return None
 
-    max_probe_size = FLAX_MSGPACK_STRUCTURE_READ_BYTES
-    raw_probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, max_probe_size + 1)
+    if raw_probe is None:
+        raw_probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, max_probe_size + 1)
     sample_is_prefix = len(raw_probe) > max_probe_size
     probe = raw_probe[:max_probe_size]
     if _is_complete_huggingface_text_or_json(probe, sample_is_prefix=sample_is_prefix):
