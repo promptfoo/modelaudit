@@ -2,7 +2,7 @@
 
 import pickle
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
@@ -429,6 +429,20 @@ def test_exit_code_empty_results():
 def test_exit_code_no_files_scanned():
     """Test exit code 2 when no files are scanned."""
     results = _create_result_model(files_scanned=0)
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_dry_run_no_files_scanned_success() -> None:
+    """Dry-run previews should succeed even when no local files are scanned."""
+    results = _create_result_model(files_scanned=0)
+    cast(Any, results).dry_run = True
+    assert determine_exit_code(results) == 0
+
+
+def test_exit_code_dry_run_operational_error_still_errors() -> None:
+    """Dry-run mode should not mask operational failures."""
+    results = _create_result_model(files_scanned=0, has_errors=True)
+    cast(Any, results).dry_run = True
     assert determine_exit_code(results) == 2
 
 
