@@ -172,6 +172,27 @@ class TestSecretsDetector:
                 _basic_auth_token(b"json-multiline:pass"),
             ),
             (f"Authorization: >\n  Basic {_basic_auth_token(b'block:pass')}", _basic_auth_token(b"block:pass")),
+            (f"Authorization: |-\n  Basic {_basic_auth_token(b'chomp:pass')}", _basic_auth_token(b"chomp:pass")),
+            (
+                f"Proxy-Authorization: >+\n  Basic {_basic_auth_token(b'folded:pass')}",
+                _basic_auth_token(b"folded:pass"),
+            ),
+            (
+                f"`Authorization: Basic {_basic_auth_token(b'markdown:pass')}`",
+                _basic_auth_token(b"markdown:pass"),
+            ),
+            (
+                f"<code>Authorization: Basic {_basic_auth_token(b'html:pass')}</code>",
+                _basic_auth_token(b"html:pass"),
+            ),
+            (
+                f'headers["Authorization"] = "Basic {_basic_auth_token(b"bracket:pass")}"',
+                _basic_auth_token(b"bracket:pass"),
+            ),
+            (
+                f"headers['Proxy-Authorization'] = 'Basic {_basic_auth_token(b'proxy-bracket:pass')}'",
+                _basic_auth_token(b"proxy-bracket:pass"),
+            ),
         ],
     )
     def test_basic_auth_valid_headers_are_detected(self, text: str, token: str) -> None:

@@ -18,7 +18,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 BASIC_AUTH_SECRET_TYPE = "Basic Auth Credentials"
 BASIC_AUTH_TOKEN_MAX_LENGTH = 8192
 BASIC_AUTH_CONFIDENCE = 0.8
-BASIC_AUTH_TOKEN_TERMINATOR = r"(?=$|[\s\"',;\]\)}])"
+BASIC_AUTH_TOKEN_TERMINATOR = r"(?=$|[\s\"'`,;<\]\)}])"
 BASIC_AUTH_PATTERN = (
     rf"\bBasic\s+([A-Za-z0-9+/]{{2,{BASIC_AUTH_TOKEN_MAX_LENGTH}}}={{0,2}}){BASIC_AUTH_TOKEN_TERMINATOR}"
 )
@@ -353,8 +353,8 @@ BINARY_FALSE_POSITIVE_TYPES = frozenset(
 FLOAT_LIKE_PATTERN = re.compile(r"[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?")
 REDACTED_CONTEXT_SECRET = "<redacted-secret>"
 BASIC_AUTH_HEADER_PREFIX_PATTERN = re.compile(
-    r"(?:^|[^\w-])(?:proxy-authorization|authorization)\s*[\"']?\s*[:=]\s*"
-    r"(?:[\"']|\[\s*[\"']?|\(\s*[\"']?)?\s*(?:[>|]\s*)?$",
+    r"(?:^|[^\w-])(?:proxy-authorization|authorization)\s*[\"']?\s*\]?\s*[:=]\s*"
+    r"(?:[\"']|\[\s*[\"']?|\(\s*[\"']?)?\s*(?:[>|][+-]?\s*)?$",
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS = 256
