@@ -27,6 +27,7 @@ from ._evidence_redaction import redact_evidence_string
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 JAX_SKIP_XGBOOST_JSON_OVERLAP_CONFIG_KEY = "_jax_skip_xgboost_json_overlap"
+JAX_SKIP_JINJA_JSON_OVERLAP_CONFIG_KEY = "_jax_skip_jinja_json_overlap"
 
 try:
     import numpy as np
@@ -1833,6 +1834,8 @@ class JaxCheckpointScanner(BaseScanner):
 
     def _scan_jinja_json_overlap(self, path: str, result: ScanResult) -> None:
         """Preserve template analysis for JAX-owned tokenizer/config JSON files."""
+        if self.config.get(JAX_SKIP_JINJA_JSON_OVERLAP_CONFIG_KEY) is True:
+            return
         if Path(path).name.lower() not in {
             "tokenizer.json",
             "tokenizer_config.json",

@@ -7541,7 +7541,8 @@ def test_scan_file_routes_jax_json_on_pickle_owned_suffixes_through_json_analysi
 
     result = scan_file(str(model_path), config={"cache_scan_results": False})
 
-    assert result.scanner_name == "jax_checkpoint"
+    assert result.scanner_name == "jinja2_template"
+    assert set(result.metadata["scanner_dependency_ids"]) >= {"jinja2_template", "jax_checkpoint"}
     assert any(
         check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
     )
@@ -10223,7 +10224,8 @@ def test_scan_file_tokenizer_json_jax_identity_composes_jinja_template_analysis(
 
     result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
 
-    assert result.scanner_name == "jax_checkpoint"
+    assert result.scanner_name == "jinja2_template"
+    assert set(result.metadata["scanner_dependency_ids"]) >= {"jinja2_template", "jax_checkpoint"}
     assert any(
         check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
     )
