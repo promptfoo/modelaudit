@@ -2141,6 +2141,23 @@ def module_initialization_is_proven_inert(module_name: str) -> bool:
     return True
 
 
+def module_is_loaded_without_import_hooks(module_name: str) -> bool:
+    """Return whether a module is already loaded without invoking import hooks."""
+    state = _current_loaded_interpreter_module_state(module_name)
+    if state[0]:
+        _track_loaded_interpreter_module_state(module_name, state)
+    return state[0]
+
+
+def import_only_module_load_is_proven_safe_for_invocation(module_name: str) -> bool:
+    """Return whether invoking an import-only reference can safely resolve its module."""
+    return (
+        _trusted_module_origin_kind(module_name) == "stdlib"
+        or module_is_loaded_without_import_hooks(module_name)
+        or module_initialization_is_proven_inert(module_name)
+    )
+
+
 def _module_source_context_initialization_is_proven_inert(context: _ModuleSourceContext) -> bool:
     guarded_names = {"__getattr__", *_IMPORT_AFFECTING_MODULE_NAMES}
     return not any(
@@ -2341,6 +2358,8 @@ def _loaded_site_package_reference_owner_matches(module_name: str, name: str, va
     if type(value) is BuiltinFunctionType:
         return False
     if isinstance(value, FunctionType):
+        if value.__code__.co_name != _reference_leaf_name(name):
+            return False
         return _function_owner_matches_trusted_source(
             value,
             expected_module=module_name,
@@ -2348,9 +2367,12 @@ def _loaded_site_package_reference_owner_matches(module_name: str, name: str, va
     if _runtime_value_is_class(value):
         class_ = cast(type[object], value)
         class_module = type.__getattribute__(class_, "__module__")
+        class_name = type.__getattribute__(class_, "__name__")
         if (
             type(class_module) is not str
             or class_module != module_name
+            or type(class_name) is not str
+            or class_name != _reference_leaf_name(name)
             or _trusted_python_module_source_path(class_module) is None
         ):
             return False
@@ -2366,6 +2388,10 @@ def _loaded_site_package_reference_owner_matches(module_name: str, name: str, va
             _function_owner_matches_trusted_source(function, expected_module=module_name) for function in functions
         ) and _trusted_reference_runtime_dependencies_are_source_independent(value)
     return not callable(value)
+
+
+def _reference_leaf_name(name: str) -> str:
+    return name.rpartition(".")[2]
 
 
 def _class_pickle_executable_members_match_trusted_source(class_: type[object], *, expected_module: str) -> bool:
