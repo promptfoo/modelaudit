@@ -842,12 +842,52 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
+    def _documentation_without_closed_inline_code_spans(source: bytes) -> bytes:
+        if b"`" not in source:
+            return source
+
+        result = bytearray()
+        cursor = 0
+        while cursor < len(source):
+            if source[cursor : cursor + 1] != b"`":
+                result.append(source[cursor])
+                cursor += 1
+                continue
+
+            fence_end = cursor
+            while fence_end < len(source) and source[fence_end : fence_end + 1] == b"`":
+                fence_end += 1
+            fence = source[cursor:fence_end]
+            closing_fence = source.find(fence, fence_end)
+            if closing_fence < 0:
+                result.extend(source[cursor:])
+                break
+
+            if result and result[-1] not in b" \t\r\n":
+                result.append(ord(" "))
+            cursor = closing_fence + len(fence)
+            if cursor < len(source) and source[cursor] not in b" \t\r\n|,.;:)":
+                result.append(ord(" "))
+        return bytes(result)
+
+    @staticmethod
+    def _documentation_prefix_is_markdown_table_row(prefix: bytes) -> bool:
+        source = prefix.lstrip()
+        markdown_prefix = DOCUMENTATION_MARKDOWN_PREFIX_PATTERN.match(source)
+        if markdown_prefix is not None:
+            source = source[markdown_prefix.end() :].lstrip()
+        return source.startswith(b"|") and b"|" in source[1:]
+
+    @staticmethod
     def _documentation_prefix_has_enclosing_call(prefix: bytes) -> bool:
         """Return whether a bounded Python prefix leaves a function call open at the finding."""
         source = prefix.strip()
         markdown_prefix = DOCUMENTATION_MARKDOWN_PREFIX_PATTERN.match(source)
         if markdown_prefix is not None:
             source = source[markdown_prefix.end() :].lstrip()
+        source = TextScanner._documentation_without_closed_inline_code_spans(source).strip()
+        if TextScanner._documentation_prefix_is_markdown_table_row(source):
+            return False
         for fence_length in (3, 2, 1):
             fence = b"`" * fence_length
             if source.startswith(fence):
@@ -1253,6 +1293,7 @@ class TextScanner(BaseScanner):
         stripped = line.lstrip()
         passive_markdown_link_match = cls._documentation_passive_markdown_link_match(prefix)
         passive_markdown_link = passive_markdown_link_match is not None
+        markdown_table_context = cls._documentation_prefix_is_markdown_table_row(prefix)
         markdown_link_code_context = (
             cls._documentation_markdown_link_is_in_code_context(prefix, passive_markdown_link_match.start())
             if passive_markdown_link_match is not None
@@ -1280,8 +1321,16 @@ class TextScanner(BaseScanner):
                 and cls._documentation_assignment_is_actionable(prefix)
             )
             or markdown_link_code_context
-            or (not passive_markdown_link and DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None)
-            or (not passive_markdown_link and cls._documentation_prefix_has_enclosing_call(prefix))
+            or (
+                not markdown_table_context
+                and not passive_markdown_link
+                and DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
+            )
+            or (
+                not markdown_table_context
+                and not passive_markdown_link
+                and cls._documentation_prefix_has_enclosing_call(prefix)
+            )
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
             or cls._documentation_nested_config_is_actionable(prefix)
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
@@ -1398,9 +1447,11 @@ class TextScanner(BaseScanner):
     def _documentation_open_call_contains_position(cls, payload: bytes, position: int) -> bool:
         line_start = payload.rfind(b"\n", 0, position) + 1
         current_line_prefix = payload[line_start:position]
-        current_indent = len(current_line_prefix) - len(current_line_prefix.lstrip(b" \t"))
-        if current_indent == 0:
+        if cls._documentation_prefix_is_markdown_table_row(current_line_prefix):
             return False
+        if cls._documentation_shell_comment_before_position(current_line_prefix, len(current_line_prefix)):
+            return False
+        current_indent = len(current_line_prefix) - len(current_line_prefix.lstrip(b" \t"))
 
         context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
         previous_line_end = line_start - 1
@@ -1413,6 +1464,11 @@ class TextScanner(BaseScanner):
             stripped = previous_line.strip()
             if stripped and not stripped.startswith(b"#"):
                 previous_indent = len(previous_line) - len(previous_line.lstrip(b" \t"))
+                if current_indent == 0 and previous_indent == 0:
+                    if cls._documentation_prefix_has_enclosing_call(payload[previous_line_start:line_start]):
+                        return True
+                    previous_line_end = previous_line_start - 1
+                    continue
                 if previous_indent < current_indent:
                     return cls._documentation_prefix_has_enclosing_call(previous_line)
             if previous_line_start == context_start:
@@ -1474,10 +1530,14 @@ class TextScanner(BaseScanner):
         if cls._finding_line_prefix_is_truncated(payload, finding):
             return True
         line_parts = cls._finding_line_parts(payload, finding)
+        markdown_table_context = False
         if line_parts is not None:
             line, line_position = line_parts
+            markdown_table_context = cls._documentation_prefix_is_markdown_table_row(line[:line_position])
             if cls._documentation_line_is_code_shaped(line, line_position):
                 return True
+            if cls._documentation_shell_comment_before_position(line, line_position):
+                return False
         if cls._documentation_previous_line_continues_command(payload, position):
             return True
         if cls._documentation_python_definition_contains_finding(payload, position):
@@ -1486,8 +1546,16 @@ class TextScanner(BaseScanner):
         passive_markdown_link = cls._documentation_prefix_is_passive_markdown_link(prefix)
         return (
             cls._documentation_assignment_is_actionable(prefix)
-            or (not passive_markdown_link and DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None)
-            or (not passive_markdown_link and cls._documentation_prefix_has_enclosing_call(prefix))
+            or (
+                not markdown_table_context
+                and not passive_markdown_link
+                and DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
+            )
+            or (
+                not markdown_table_context
+                and not passive_markdown_link
+                and cls._documentation_prefix_has_enclosing_call(prefix)
+            )
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
             or cls._documentation_nested_config_is_actionable(prefix)
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None

