@@ -10012,7 +10012,7 @@ def _create_truncated_tensor_onnx(path: Path) -> Path:
 
 
 def _create_future_ir_onnx_candidate(path: Path) -> Path:
-    onnx = pytest.importorskip("onnx")
+    pytest.importorskip("onnx")
     from onnx import TensorProto, helper
 
     x_value = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
@@ -10059,6 +10059,8 @@ def _assert_schema_rejected_pt_onnx_keeps_s901(path: Path) -> ScanResult:
 
     assert result.scanner_name == "onnx"
     assert "validated_format" not in result.metadata
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "onnx_schema_validation_failed" in result.metadata["scan_outcome_reasons"]
     assert any(
         check.name == "ONNX Schema Validation"
         and check.status == CheckStatus.FAILED

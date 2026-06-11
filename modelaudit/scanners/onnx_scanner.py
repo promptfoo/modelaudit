@@ -2569,6 +2569,7 @@ def _mark_onnx_schema_incomplete(
     message: str,
     details: dict[str, Any],
 ) -> None:
+    _mark_inconclusive_scan_result(result, ONNX_SCHEMA_INCONCLUSIVE_REASON)
     result.add_check(
         name="ONNX Schema Validation",
         passed=False,
@@ -2757,7 +2758,7 @@ class OnnxScanner(BaseScanner):
             else:
                 try:
                     self.check_interrupted()
-                    check_model(model)
+                    check_model(path)
                     self.check_interrupted()
                 except KeyboardInterrupt:
                     raise
