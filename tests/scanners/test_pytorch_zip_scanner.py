@@ -8254,6 +8254,27 @@ def test_get_installed_pytorch_version_binds_metadata_to_python_import_origin(
     assert not any(name == "torch" or name.startswith("torch.") for name in import_calls)
 
 
+def test_get_installed_pytorch_version_ignores_metadata_when_import_origin_untrusted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    scanner = PyTorchZipScanner()
+    trusted_root = tmp_path / "site-packages"
+    _write_torch_distribution_metadata(trusted_root, "2.10.0")
+    repo_torch = tmp_path / "repo" / "torch.py"
+    repo_torch.parent.mkdir()
+    repo_torch.write_text("__version__ = '2.5.1'\n", encoding="utf-8")
+
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    monkeypatch.setattr(scanner, "_trusted_python_package_roots", lambda: (trusted_root,))
+    monkeypatch.setattr(scanner, "_resolve_torch_import_origin", lambda: repo_torch)
+    import_calls = _forbid_torch_import(monkeypatch)
+
+    assert scanner._get_installed_pytorch_version() is None
+    assert scanner._get_installed_pytorch_metadata_path() is None
+    assert not any(name == "torch" or name.startswith("torch.") for name in import_calls)
+
+
 def test_pytorch_zip_version_detection_uses_local_torch_when_metadata_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -8427,6 +8448,39 @@ def test_pytorch_zip_installed_torch_metadata_still_emits_runtime_cves_without_i
         assert check.details["pytorch_version_source"] == "local_environment"
         assert check.details["installed_pytorch_version"] == "2.5.1"
         assert check.details["installed_pytorch_metadata_path"] == str(dist_info.resolve())
+    assert not any(name == "torch" or name.startswith("torch.") for name in import_calls)
+
+
+def test_pytorch_zip_untrusted_import_origin_does_not_use_unrelated_fixed_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.5.1")
+    trusted_root = tmp_path / "site-packages"
+    _write_torch_distribution_metadata(trusted_root, "2.10.0")
+    repo_torch = tmp_path / "repo" / "torch.py"
+    repo_torch.parent.mkdir()
+    repo_torch.write_text("__version__ = '2.5.1'\n", encoding="utf-8")
+    scanner = PyTorchZipScanner()
+
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    monkeypatch.setattr(scanner, "_trusted_python_package_roots", lambda: (trusted_root,))
+    monkeypatch.setattr(scanner, "_resolve_torch_import_origin", lambda: repo_torch)
+    import_calls = _forbid_torch_import(monkeypatch)
+
+    result = scanner.scan(str(model_path))
+
+    skipped_checks = [
+        check
+        for check in result.checks
+        if check.status == CheckStatus.SKIPPED and check.details.get("runtime_cve_applicability") == "unknown"
+    ]
+    assert {check.details["cve_id"] for check in skipped_checks} == set(_PYTORCH_RUNTIME_CVE_IDS)
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert PyTorchZipScanner.RUNTIME_VERSION_UNKNOWN_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert not any(
+        check.details.get("detected_pytorch_version") == "2.10.0" for check in result.checks if check.details
+    )
     assert not any(name == "torch" or name.startswith("torch.") for name in import_calls)
 
 

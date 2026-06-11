@@ -3170,6 +3170,9 @@ class PyTorchZipScanner(BaseScanner):
                 (root for root in resolved_roots if self._path_is_relative_to(import_origin, root)),
                 None,
             )
+            if trusted_import_root is None:
+                logger.debug("Ignoring trusted torch metadata because torch resolves outside trusted package roots")
+                return None, None
 
         search_roots = [trusted_import_root] if trusted_import_root is not None else resolved_roots
         fallback_distribution: tuple[Any, Path] | None = None
