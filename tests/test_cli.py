@@ -4606,6 +4606,84 @@ def test_scan_huggingface_streaming_preserves_selected_extensionless_filenames(
 
 
 @patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.get_model_info")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_preview_uses_selected_stream_policy(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_get_model_info: MagicMock,
+    mock_is_hf_url: MagicMock,
+) -> None:
+    """Streaming preview should use the same selected scanner policy as acquisition."""
+    mock_is_hf_url.return_value = True
+    mock_download_streaming.return_value = iter(())
+    mock_scan_streaming.return_value = create_mock_scan_result(bytes_scanned=2048, files_scanned=1, issues=[])
+    mock_get_model_info.return_value = {
+        "model_id": "test/model",
+        "total_size": 2048,
+        "file_count": 1,
+        "inventory_status": "complete",
+        "inaccessible_gated_bytes": 0,
+        "unknown_size_count": 0,
+    }
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--stream", "--timeout", "7", "--scanners", "metadata", "--format", "text", "hf://test/model"],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, output
+    assert "Size: 2.00 KB (1 files)" in output
+    preview_kwargs = mock_get_model_info.call_args.kwargs
+    stream_kwargs = mock_download_streaming.call_args.kwargs
+    assert preview_kwargs["timeout_seconds"] == 7
+    assert preview_kwargs["streaming_selection"] is True
+    assert preview_kwargs["include_all_files"] is False
+    assert preview_kwargs["scannable_extensions"] == stream_kwargs["scannable_extensions"]
+    assert preview_kwargs["scannable_filenames"] == stream_kwargs["scannable_filenames"]
+    assert preview_kwargs["scannable_scanner_ids"] == stream_kwargs["scannable_scanner_ids"]
+    assert preview_kwargs["scannable_filenames"] == frozenset({"readme", "model_card"})
+    assert "metadata" in preview_kwargs["scannable_scanner_ids"]
+    assert stream_kwargs["timeout_seconds"] == 7
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.get_model_info")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_preview_preserves_include_all_files_policy(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_get_model_info: MagicMock,
+    mock_is_hf_url: MagicMock,
+) -> None:
+    """Default streaming preview should include the bounded unfiltered inventory."""
+    mock_is_hf_url.return_value = True
+    mock_download_streaming.return_value = iter(())
+    mock_scan_streaming.return_value = create_mock_scan_result(bytes_scanned=4096, files_scanned=2, issues=[])
+    mock_get_model_info.return_value = {
+        "model_id": "test/model",
+        "total_size": 4096,
+        "file_count": 2,
+        "inventory_status": "complete",
+        "inaccessible_gated_bytes": 0,
+        "unknown_size_count": 0,
+    }
+
+    result = CliRunner().invoke(cli, ["scan", "--stream", "--format", "text", "hf://test/model"])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, output
+    preview_kwargs = mock_get_model_info.call_args.kwargs
+    assert preview_kwargs["streaming_selection"] is True
+    assert preview_kwargs["include_all_files"] is True
+    assert "scannable_extensions" not in preview_kwargs
+    assert mock_download_streaming.call_args.kwargs["include_all_files"] is True
+
+
+@patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
 def test_scan_huggingface_streaming_passes_max_size_to_download(

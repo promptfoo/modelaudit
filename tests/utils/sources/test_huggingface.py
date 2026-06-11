@@ -4123,6 +4123,105 @@ class TestGetModelInfo:
         ) == sorted(expected_files)
 
     @patch("huggingface_hub.HfApi")
+    def test_get_model_info_streaming_selection_uses_streamable_policy(
+        self,
+        mock_hf_api_class: MagicMock,
+    ) -> None:
+        """Streaming preview inventory should match streaming prefilter semantics."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            modelId="test/model",
+            siblings=[
+                SimpleNamespace(rfilename=".gitattributes", size=64),
+                SimpleNamespace(rfilename="README.md", size=100),
+                SimpleNamespace(rfilename="model_card", size=50),
+                SimpleNamespace(rfilename="model.safetensors", size=10_000),
+                SimpleNamespace(rfilename="src/helper.py", size=400),
+            ],
+        )
+        mock_api.get_paths_info.return_value = [
+            SimpleNamespace(path="README.md", size=100),
+            SimpleNamespace(path="model_card", size=50),
+        ]
+
+        with patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None):
+            info = get_model_info(
+                "hf://test/model",
+                streaming_selection=True,
+                scannable_extensions={".md"},
+                scannable_filenames={"model_card"},
+                scannable_scanner_ids={"metadata"},
+                include_all_files=False,
+            )
+
+        assert info["file_count"] == 2
+        assert info["total_size"] == 150
+        assert [file_info["name"] for file_info in info["files"]] == ["README.md", "model_card"]
+        mock_api.get_paths_info.assert_called_once_with(
+            "test/model",
+            ["README.md", "model_card"],
+            revision=_HF_TEST_REVISION,
+        )
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_info_timeout_deadline_reaches_probes_and_path_sizes(
+        self,
+        mock_hf_api_class: MagicMock,
+    ) -> None:
+        """Preview timeout should bound content probes and path-size metadata."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            modelId="test/model",
+            siblings=[
+                SimpleNamespace(rfilename="model.safetensors", size=1000),
+                SimpleNamespace(rfilename="renamed.payload", size=2000),
+            ],
+        )
+        probe_deadlines: list[float | None] = []
+        path_size_deadlines: list[float | None] = []
+
+        def detect_side_effect(
+            _repo_id: str,
+            _filename: str,
+            _revision: str,
+            budget: _HuggingFaceProbeBudget,
+        ) -> str | None:
+            probe_deadlines.append(budget.deadline)
+            return "pytorch"
+
+        def path_sizes_side_effect(
+            _repo_id: str,
+            _filenames: list[str],
+            **kwargs: object,
+        ) -> tuple[dict[str, int | None], str]:
+            deadline = kwargs.get("deadline")
+            path_size_deadlines.append(deadline if isinstance(deadline, float) else None)
+            return {"model.safetensors": 1000, "renamed.payload": 2000}, _HF_TEST_REVISION
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
+                side_effect=detect_side_effect,
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                side_effect=path_sizes_side_effect,
+            ),
+        ):
+            info = get_model_info("hf://test/model", timeout_seconds=12)
+
+        assert info["total_size"] == 3000
+        repo_info_timeout = mock_api.repo_info.call_args.kwargs["timeout"]
+        assert 0 < repo_info_timeout <= 12
+        assert probe_deadlines and all(deadline is not None for deadline in probe_deadlines)
+        assert path_size_deadlines and all(deadline is not None for deadline in path_size_deadlines)
+        assert path_size_deadlines[0] == probe_deadlines[0]
+
+    @patch("huggingface_hub.HfApi")
     def test_get_model_info_still_counts_renamed_detected_payload(
         self,
         mock_hf_api_class: MagicMock,
@@ -4225,6 +4324,38 @@ class TestGetModelInfo:
         assert info["unknown_size_count"] == 1
         assert info["unknown_size_files"] == ["model.safetensors"]
         assert info["files"] == [{"name": "model.safetensors", "size": None, "access": "gated"}]
+
+    @pytest.mark.parametrize("selected_sizes", [{}, {"model.safetensors": None}])
+    def test_get_model_info_counts_missing_path_size_metadata_for_gated_selected_file(
+        self,
+        selected_sizes: dict[str, int | None],
+    ) -> None:
+        """Gated selected files with absent path-size metadata should use disclosed LFS size."""
+        mock_api = MagicMock()
+        mock_api.repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            modelId="test/model",
+            gated="auto",
+            siblings=[SimpleNamespace(rfilename="model.safetensors", size=None, lfs=SimpleNamespace(size=4096))],
+        )
+
+        with (
+            patch("huggingface_hub.HfApi", return_value=mock_api),
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                return_value=(selected_sizes, _HF_TEST_REVISION),
+            ),
+        ):
+            info = get_model_info("https://huggingface.co/test/model")
+
+        assert info["inventory_status"] == "gated_inaccessible"
+        assert info["total_size"] == 4096
+        assert info["accessible_size"] == 0
+        assert info["inaccessible_gated_bytes"] == 4096
+        assert info["inaccessible_gated_file_count"] == 1
+        assert info["inaccessible_gated_files"] == ["model.safetensors"]
+        assert info["unknown_size_count"] == 0
+        assert info["files"] == [{"name": "model.safetensors", "size": 4096, "access": "gated"}]
 
     @patch("huggingface_hub.HfApi")
     def test_get_model_info_counts_unknown_size_for_gated_probe_candidate(

@@ -1993,22 +1993,54 @@ def _build_huggingface_model_info(
     repo_info: Any,
     repo_files: list[str],
     repo_revision: str,
+    *,
+    deadline: float | None = None,
+    streaming_selection: bool = False,
+    scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
+    scannable_scanner_ids: Collection[str] | None = None,
+    include_all_files: bool = False,
 ) -> dict[str, Any]:
     """Build selected recursive inventory metadata using the downloader's selection policy."""
-    model_extensions = _get_model_extensions()
     inaccessible_probe_files: list[str] = []
     allow_inaccessible_probe_errors = _is_huggingface_gated_repo(repo_info)
-    model_files = _select_huggingface_model_files(
-        repo_id,
-        repo_files,
-        repo_revision,
-        model_extensions,
-        allow_inaccessible_probe_errors=allow_inaccessible_probe_errors,
-        inaccessible_probe_files=inaccessible_probe_files if allow_inaccessible_probe_errors else None,
-    )
+    if streaming_selection:
+        model_files = _select_streamable_hf_files(
+            repo_id,
+            repo_files,
+            repo_revision,
+            scannable_extensions,
+            scannable_filenames,
+            scannable_scanner_ids,
+            include_all_files=include_all_files,
+            deadline=deadline,
+        )
+        include_openvino_companions = scannable_scanner_ids is None or "openvino" in {
+            str(scanner_id).lower() for scanner_id in scannable_scanner_ids
+        }
+        model_files = _include_huggingface_openvino_companions(
+            repo_id,
+            repo_files,
+            repo_revision,
+            model_files,
+            include_openvino_companions=include_openvino_companions,
+            deadline=deadline,
+        )
+    else:
+        model_extensions = _get_model_extensions()
+        model_files = _select_huggingface_model_files(
+            repo_id,
+            repo_files,
+            repo_revision,
+            model_extensions,
+            allow_inaccessible_probe_errors=allow_inaccessible_probe_errors,
+            inaccessible_probe_files=inaccessible_probe_files if allow_inaccessible_probe_errors else None,
+            deadline=deadline,
+        )
     inventory_files = list(dict.fromkeys([*model_files, *inaccessible_probe_files]))
     inaccessible_probe_file_set = set(inaccessible_probe_files)
     repo_metadata_sizes = _extract_huggingface_repo_file_sizes(repo_info)
+    repo_is_gated = _is_huggingface_gated_repo(repo_info)
 
     path_size_error: str | None = None
     path_size_gated = False
@@ -2017,11 +2049,12 @@ def _build_huggingface_model_info(
             repo_id,
             inventory_files,
             resolved_revision=repo_revision,
+            deadline=deadline,
         )
     except Exception as exc:
         selected_sizes = {}
         size_revision = repo_revision
-        path_size_gated = _is_huggingface_gated_or_auth_error(exc) or _is_huggingface_gated_repo(repo_info)
+        path_size_gated = _is_huggingface_gated_or_auth_error(exc) or repo_is_gated
         path_size_error = redact_huggingface_urls_in_text(str(exc))
 
     files: list[dict[str, Any]] = []
@@ -2036,7 +2069,8 @@ def _build_huggingface_model_info(
         path_size = selected_sizes.get(filename)
         size = path_size if isinstance(path_size, int) and not isinstance(path_size, bool) else None
         inaccessible_gated = filename in inaccessible_probe_file_set
-        if size is None and (path_size_gated or inaccessible_gated):
+        gated_missing_path_size = repo_is_gated and (filename not in selected_sizes or path_size is None)
+        if size is None and (path_size_gated or inaccessible_gated or gated_missing_path_size):
             metadata_size = repo_metadata_sizes.get(filename)
             if metadata_size is not None:
                 size = metadata_size
@@ -2082,17 +2116,32 @@ def _build_huggingface_model_info(
         "files": files,
         "inventory_status": inventory_status,
         "inventory_error": path_size_error,
-        "gated": _is_huggingface_gated_repo(repo_info),
+        "gated": repo_is_gated,
         "model_id": getattr(repo_info, "modelId", repo_id),
         "author": getattr(repo_info, "author", ""),
     }
 
 
-def get_model_info(url: str) -> dict:
+def get_model_info(
+    url: str,
+    *,
+    timeout_seconds: float | None = None,
+    streaming_selection: bool = False,
+    scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
+    scannable_scanner_ids: Collection[str] | None = None,
+    include_all_files: bool = False,
+) -> dict[str, Any]:
     """Get information about a HuggingFace model without downloading it.
 
     Args:
         url: HuggingFace model URL
+        timeout_seconds: Optional end-to-end preview deadline in seconds
+        streaming_selection: Match streaming acquisition selection instead of snapshot selection
+        scannable_extensions: Optional remote prefilter extensions from scanner selection policy
+        scannable_filenames: Optional exact remote prefilter basenames from scanner selection policy
+        scannable_scanner_ids: Optional exact scanner IDs from scanner selection policy
+        include_all_files: Include otherwise-unrecognized files under streaming selection bounds
 
     Returns:
         Dictionary with model information including size
@@ -2108,10 +2157,16 @@ def get_model_info(url: str) -> dict:
     namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
     display_url = redact_huggingface_url_for_display(url)
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
     api = HfApi()
     try:
         repo_info_kwargs: dict[str, Any] = {"files_metadata": True}
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+            repo_info_kwargs["timeout"] = min(30.0, remaining)
         if requested_revision is not None:
             repo_info_kwargs["revision"] = requested_revision
         model_info = api.repo_info(repo_id, **repo_info_kwargs)
@@ -2123,7 +2178,18 @@ def get_model_info(url: str) -> dict:
             raise Exception("repository listing did not include an immutable commit SHA")
         assert isinstance(repo_revision, str)
 
-        return _build_huggingface_model_info(repo_id, model_info, repo_files, repo_revision)
+        return _build_huggingface_model_info(
+            repo_id,
+            model_info,
+            repo_files,
+            repo_revision,
+            deadline=deadline,
+            streaming_selection=streaming_selection,
+            scannable_extensions=scannable_extensions,
+            scannable_filenames=scannable_filenames,
+            scannable_scanner_ids=scannable_scanner_ids,
+            include_all_files=include_all_files,
+        )
     except Exception as e:
         raise Exception(f"Failed to get model info for {display_url}: {redact_huggingface_urls_in_text(str(e))}") from e
 

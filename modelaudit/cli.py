@@ -2879,13 +2879,28 @@ def _resolve_scan_source_for_path(
 
     if is_huggingface_url(path):
         display_path = _display_path(path)
+        hf_stream_kwargs: dict[str, Any] = {}
+        if runtime.scan_and_delete:
+            if runtime.scannable_extensions is not None:
+                hf_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
+            if runtime.scannable_filenames is not None:
+                hf_stream_kwargs["scannable_filenames"] = runtime.scannable_filenames
+            if runtime.scannable_scanner_ids is not None:
+                hf_stream_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
+            if runtime.hf_stream_include_all_files:
+                hf_stream_kwargs["include_all_files"] = True
         if runtime.show_styled_output:
             click.echo(f"\n📥 Preparing to download from {style_text(display_path, fg='cyan')}")
 
             try:
                 from .utils.sources.huggingface import get_model_info
 
-                model_info = get_model_info(path)
+                preview_kwargs: dict[str, Any] = {"timeout_seconds": runtime.timeout}
+                if runtime.scan_and_delete:
+                    preview_kwargs.update(hf_stream_kwargs)
+                    preview_kwargs["streaming_selection"] = True
+                    preview_kwargs.setdefault("include_all_files", False)
+                model_info = get_model_info(path, **preview_kwargs)
                 size_bytes = int(model_info.get("total_size") or 0)
                 inaccessible_gated_bytes = int(model_info.get("inaccessible_gated_bytes") or 0)
                 unknown_size_count = int(model_info.get("unknown_size_count") or 0)
@@ -2953,15 +2968,6 @@ def _resolve_scan_source_for_path(
                 if runtime.show_styled_output:
                     click.echo(style_text("🔄 Starting streaming scan...", fg="cyan"))
 
-                hf_stream_kwargs: dict[str, Any] = {}
-                if runtime.scannable_extensions is not None:
-                    hf_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
-                if runtime.scannable_filenames is not None:
-                    hf_stream_kwargs["scannable_filenames"] = runtime.scannable_filenames
-                if runtime.scannable_scanner_ids is not None:
-                    hf_stream_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
-                if runtime.hf_stream_include_all_files:
-                    hf_stream_kwargs["include_all_files"] = True
                 file_generator = _track_huggingface_stream_acquisition(
                     download_model_streaming(
                         path,
