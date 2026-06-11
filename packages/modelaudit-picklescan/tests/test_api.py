@@ -6582,6 +6582,7 @@ def test_safe_numpy_ndarray_reconstruct_dataflow_fails_closed_after_opcode_cap(
 
 
 def test_safe_numpy_ndarray_reconstruct_dataflow_fails_closed_on_unsafe_follow_on_stream() -> None:
+    pytest.importorskip("numpy")
     safe_payload = _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD.replace(
         b"cnumpy._core.multiarray\n_reconstruct\n",
         b"cnumpy.core.multiarray\n_reconstruct\n",
