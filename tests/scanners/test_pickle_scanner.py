@@ -2060,7 +2060,8 @@ def test_large_non_seekable_legacy_preamble_without_layout_keeps_file_size_limit
     )
 
     assert result.success is False
-    assert "scan_outcome" not in result.metadata
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "max_file_read_size_exceeded" in result.metadata["scan_outcome_reasons"]
     assert "legacy_pytorch_control_layout_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
     assert any(check.name == "File Size Limit" and check.rule_code == "S904" for check in result.checks)
     assert stream.tell() == min(len(payload), pickle_scanner._PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES)
