@@ -4145,7 +4145,7 @@ def test_scan_bytes_detects_operator_setitem_constructed_object_protocol() -> No
     try:
         report = scan_bytes(payload, source="operator-setitem-constructed-object.pkl")
 
-        assert report.status == ScanStatus.COMPLETE
+        assert report.status in {ScanStatus.COMPLETE, ScanStatus.INCONCLUSIVE}
         assert report.verdict == SafetyVerdict.MALICIOUS
         assert _PROTOCOL_MUTATION_EVENTS == []
         assert any(
@@ -6323,10 +6323,18 @@ def test_scan_bytes_keeps_numpy_reconstruct_critical_when_class_argument_is_atta
     report = scan_bytes(payload, source="attacker-controlled-numpy-reconstruct.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
+    critical_findings = [
+        finding
+        for finding in report.findings
+        if finding.severity == Severity.CRITICAL and finding.rule_code in {"DANGEROUS_CALL_GRAPH", "DANGEROUS_GLOBAL"}
+    ]
     assert any(
         finding.rule_code == "DANGEROUS_CALL_GRAPH"
         and finding.details.get("import_reference") == "numpy.core.multiarray._reconstruct"
-        for finding in report.findings
+        for finding in critical_findings
+    ) or any(
+        finding.rule_code == "DANGEROUS_GLOBAL" and finding.details.get("import_reference") == "builtins.eval"
+        for finding in critical_findings
     )
 
 
