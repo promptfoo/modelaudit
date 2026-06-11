@@ -325,6 +325,46 @@ def test_hf_repo_dry_run_preview_enforces_max_size() -> None:
     mock_scan.assert_not_called()
 
 
+def test_hf_repo_dry_run_preview_treats_zero_max_size_as_unlimited() -> None:
+    runner = CliRunner()
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": "main",
+        "total_size": 20,
+        "file_count": 1,
+        "files": [{"name": "model.safetensors", "size": 20}],
+    }
+
+    with (
+        _mock_hf_model_info(return_value=metadata),
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--format",
+                "json",
+                "--max-size",
+                "0B",
+                "--scanners",
+                "safetensors",
+                "hf://test/model",
+            ],
+        )
+
+    parsed = parse_click_json_output(result.stdout)
+    assert result.exit_code == 0, result.output
+    assert parsed["files_scanned"] == 0
+    assert "Scannable files: 1 of 1" in result.stderr
+    assert "Scannable size: 20 B" in result.stderr
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "revision",
     [None, "main", "g" * 40],
@@ -814,6 +854,49 @@ def test_hf_stream_dry_run_preview_enforces_unfiltered_file_limit() -> None:
     mock_scan.assert_not_called()
 
 
+def test_hf_stream_dry_run_openvino_budget_includes_bin_companion() -> None:
+    runner = CliRunner()
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": "a" * 40,
+        "total_size": 110,
+        "file_count": 2,
+        "files": [
+            {"name": "model.xml", "size": 10},
+            {"name": "model.bin", "size": 100},
+        ],
+    }
+
+    with (
+        _mock_hf_model_info(return_value=metadata),
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+        patch("modelaudit.utils.sources.huggingface._read_huggingface_prefix") as mock_read_prefix,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--stream",
+                "--format",
+                "json",
+                "--max-size",
+                "50B",
+                "--scanners",
+                "openvino",
+                "hf://test/model",
+            ],
+        )
+
+    assert result.exit_code == 2
+    assert "Selected Hugging Face files total 110 bytes exceeds max size 50 bytes" in result.output
+    mock_read_prefix.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
 def test_hf_file_dry_run_preview_does_not_download_or_scan() -> None:
     url = "https://huggingface.co/test/model/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.json"
     runner = CliRunner()
@@ -840,6 +923,66 @@ def test_hf_file_dry_run_preview_does_not_download_or_scan() -> None:
     assert parsed["files_scanned"] == 0
     assert "Type: Hugging Face file" in result.stderr
     assert "Revision: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" in result.stderr
+    mock_get_file_info.assert_called_once_with(url, max_size=None, timeout_seconds=3600)
+    mock_download_file.assert_not_called()
+    mock_scan.assert_not_called()
+
+
+def test_hf_file_dry_run_preview_allows_exact_zip_scanner_file() -> None:
+    url = "https://huggingface.co/test/model/resolve/main/model.zip"
+    runner = CliRunner()
+
+    with (
+        patch(
+            "modelaudit.cli.get_huggingface_file_info",
+            return_value={
+                "repo_id": "test/model",
+                "revision": "main",
+                "resolved_revision": "b" * 40,
+                "filename": "model.zip",
+                "size": 123,
+            },
+        ) as mock_get_file_info,
+        patch("modelaudit.cli.download_file_from_hf") as mock_download_file,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+    ):
+        result = runner.invoke(cli, ["scan", "--dry-run", "--format", "json", "--scanners", "zip", url])
+
+    parsed = parse_click_json_output(result.stdout)
+    assert result.exit_code == 0, result.output
+    assert parsed["files_scanned"] == 0
+    assert "Type: Hugging Face file" in result.stderr
+    assert "File: model.zip" in result.stderr
+    mock_get_file_info.assert_called_once_with(url, max_size=None, timeout_seconds=3600)
+    mock_download_file.assert_not_called()
+    mock_scan.assert_not_called()
+
+
+def test_hf_file_dry_run_preview_allows_mixed_exact_scanner_file() -> None:
+    url = "https://huggingface.co/test/model/resolve/main/model.pkl"
+    runner = CliRunner()
+
+    with (
+        patch(
+            "modelaudit.cli.get_huggingface_file_info",
+            return_value={
+                "repo_id": "test/model",
+                "revision": "main",
+                "resolved_revision": "b" * 40,
+                "filename": "model.pkl",
+                "size": 123,
+            },
+        ) as mock_get_file_info,
+        patch("modelaudit.cli.download_file_from_hf") as mock_download_file,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+    ):
+        result = runner.invoke(cli, ["scan", "--dry-run", "--format", "json", "--scanners", "zip,pickle", url])
+
+    parsed = parse_click_json_output(result.stdout)
+    assert result.exit_code == 0, result.output
+    assert parsed["files_scanned"] == 0
+    assert "Type: Hugging Face file" in result.stderr
+    assert "File: model.pkl" in result.stderr
     mock_get_file_info.assert_called_once_with(url, max_size=None, timeout_seconds=3600)
     mock_download_file.assert_not_called()
     mock_scan.assert_not_called()

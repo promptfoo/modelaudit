@@ -209,6 +209,13 @@ def _huggingface_preview_file_size(item: dict[str, Any]) -> int | None:
     return size
 
 
+def _huggingface_preview_size_limit(max_size: int | None) -> int | None:
+    """Normalize Hugging Face preview size caps to match download semantics."""
+    if max_size is None or max_size <= 0:
+        return None
+    return max_size
+
+
 def _require_huggingface_preview_immutable_revision(metadata: dict[str, Any]) -> None:
     """Fail closed unless repository metadata was resolved to an immutable revision."""
     from .utils.sources import huggingface as huggingface_source
@@ -253,6 +260,29 @@ def _huggingface_preview_files_by_name(files: object, names: list[str]) -> list[
     return selected
 
 
+def _huggingface_preview_include_openvino_companions(
+    file_names: list[str],
+    selected_names: list[str],
+    *,
+    include_openvino_companions: bool,
+) -> list[str]:
+    """Include exact OpenVINO BIN companions for metadata-only dry-run budgeting."""
+    if not include_openvino_companions:
+        return selected_names
+
+    from .utils.sources import huggingface as huggingface_source
+
+    repo_file_set = set(file_names)
+    selected_file_set = set(selected_names)
+    expanded_names = list(selected_names)
+    for selected_name in selected_names:
+        companion = huggingface_source._openvino_bin_companion_name(selected_name, file_names)
+        if companion is not None and companion in repo_file_set and companion not in selected_file_set:
+            expanded_names.append(companion)
+            selected_file_set.add(companion)
+    return expanded_names
+
+
 def _huggingface_preview_has_uncertain_unselected_files(files: object, selected_files: list[dict[str, Any]]) -> bool:
     """Return whether unselected metadata may hide content-routed model bytes."""
     all_names = set(_huggingface_preview_file_names(files))
@@ -277,6 +307,11 @@ def _huggingface_preview_download_files(metadata: dict[str, Any]) -> list[dict[s
         str(metadata.get("revision") or ""),
         model_extensions,
         sniff_content=False,
+    )
+    selected_names = _huggingface_preview_include_openvino_companions(
+        file_names,
+        selected_names,
+        include_openvino_companions=True,
     )
     return _huggingface_preview_files_by_name(files, selected_names)
 
@@ -305,6 +340,14 @@ def _huggingface_preview_stream_files(metadata: dict[str, Any], runtime: "_ScanR
         revision,
         **stream_kwargs,
         sniff_content=False,
+    )
+    include_openvino_companions = runtime.scannable_scanner_ids is None or "openvino" in {
+        str(scanner_id).lower() for scanner_id in runtime.scannable_scanner_ids
+    }
+    selected_names = _huggingface_preview_include_openvino_companions(
+        file_names,
+        selected_names,
+        include_openvino_companions=include_openvino_companions,
     )
     return _huggingface_preview_files_by_name(files, selected_names)
 
@@ -338,6 +381,43 @@ def _selected_huggingface_preview_files(files: object, runtime: "_ScanRuntimeCon
     return selected
 
 
+def _scanner_selection_metadata_id_set(value: object) -> set[str]:
+    """Return normalized scanner IDs from scanner-selection metadata."""
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return set()
+    return {str(item).lower() for item in value if str(item)}
+
+
+def _huggingface_direct_preview_matches_exact_selected_scanner(
+    filename: str,
+    runtime: "_ScanRuntimeConfig",
+) -> bool:
+    """Allow exact-selected direct-file previews proven by scanner suffix metadata."""
+    if runtime.scanner_selection_metadata is None or runtime.scannable_extensions is not None:
+        return False
+
+    requested_scanners = _scanner_selection_metadata_id_set(
+        runtime.scanner_selection_metadata.get("requested_scanner_ids")
+    )
+    enabled_scanners = _scanner_selection_metadata_id_set(runtime.scanner_selection_metadata.get("enabled_scanner_ids"))
+    scanner_ids = requested_scanners.intersection(enabled_scanners)
+    if not scanner_ids:
+        return False
+
+    from .scanner_registry_metadata import get_scanner_registry_metadata
+
+    filename_lower = filename.lower()
+    scanner_metadata = get_scanner_registry_metadata()
+    for scanner_id in scanner_ids:
+        scanner_info = scanner_metadata.get(scanner_id, {})
+        for key in ("extensions", "content_routed_extensions", "scanner_only_extensions"):
+            for extension in scanner_info.get(key, ()):
+                extension_text = str(extension).lower()
+                if extension_text and filename_lower.endswith(extension_text):
+                    return True
+    return False
+
+
 def _huggingface_direct_preview_matches_metadata_route(filename: str, runtime: "_ScanRuntimeConfig") -> bool:
     """Return whether a direct Hub file can be proven scannable from metadata alone."""
     remote_path = PurePosixPath(filename)
@@ -362,6 +442,8 @@ def _huggingface_direct_preview_matches_metadata_route(filename: str, runtime: "
         if runtime.scannable_extensions is not None:
             extensions = {str(extension).lower() for extension in runtime.scannable_extensions if str(extension)}
             return any(filename_lower.endswith(extension) for extension in extensions)
+        if _huggingface_direct_preview_matches_exact_selected_scanner(filename, runtime):
+            return True
         requested_scanners = runtime.scanner_selection_metadata.get("requested_scanner_ids")
         excluded_scanners = runtime.scanner_selection_metadata.get("excluded_scanner_ids")
         if requested_scanners or not excluded_scanners:
@@ -388,7 +470,11 @@ def _preview_huggingface_file_source(
     """Print a no-download preview for a direct Hugging Face file URL."""
     display_path = _display_path(path)
     repo_id, revision, filename = parse_huggingface_file_url(path)
-    metadata = get_huggingface_file_info(path, max_size=max_size, timeout_seconds=runtime.timeout)
+    metadata = get_huggingface_file_info(
+        path,
+        max_size=_huggingface_preview_size_limit(max_size),
+        timeout_seconds=runtime.timeout,
+    )
     preview_revision = str(metadata.get("resolved_revision") or revision)
     if not _huggingface_direct_preview_matches_metadata_route(filename, runtime):
         raise ValueError(
@@ -409,7 +495,8 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
     """Print a no-download preview for a Hugging Face repository URL."""
     display_path = _display_path(path)
     metadata = get_model_info(path, timeout_seconds=runtime.timeout)
-    if runtime.max_download_bytes is not None:
+    max_download_bytes = _huggingface_preview_size_limit(runtime.max_download_bytes)
+    if max_download_bytes is not None:
         _require_huggingface_preview_immutable_revision(metadata)
     files = metadata.get("files", [])
     selected_files = (
@@ -430,7 +517,7 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
     selected_display_size = sum(size for size in selected_display_sizes if size is not None)
     budget_sizes = [_huggingface_preview_file_size(item) for item in budget_files]
     budget_size = sum(size for size in budget_sizes if size is not None)
-    if runtime.max_download_bytes is not None and any(size is None for size in budget_sizes):
+    if max_download_bytes is not None and any(size is None for size in budget_sizes):
         raise ValueError("Selected Hugging Face file sizes are unknown; refusing dry-run with max size")
     if (
         not runtime.scan_and_delete
@@ -440,9 +527,9 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
         raise ValueError(
             "Hugging Face dry-run cannot account for content-routed files without reading model bytes; refusing dry-run"
         )
-    if runtime.max_download_bytes is not None and budget_size > runtime.max_download_bytes:
+    if max_download_bytes is not None and budget_size > max_download_bytes:
         raise ValueError(
-            f"Selected Hugging Face files total {budget_size} bytes exceeds max size {runtime.max_download_bytes} bytes"
+            f"Selected Hugging Face files total {budget_size} bytes exceeds max size {max_download_bytes} bytes"
         )
 
     _preview_echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:", err=err)
