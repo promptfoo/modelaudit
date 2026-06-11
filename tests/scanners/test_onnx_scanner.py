@@ -22,6 +22,7 @@ from modelaudit.detectors.network_comm import NetworkCommDetector
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.onnx_scanner import (
+    ONNX_SCHEMA_INCONCLUSIVE_REASON,
     ONNX_STRUCTURE_INCONCLUSIVE_REASON,
     ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON,
     OnnxScanner,
@@ -80,15 +81,7 @@ def create_onnx_model(
 
     initializers: list[Any] = []
     if include_initializer and external:
-        value_count = 1
-        for dim in tensor_shape:
-            value_count *= dim
-        tensor = helper.make_tensor("W", TensorProto.FLOAT, list(tensor_shape), vals=[1.0] * max(1, value_count))
-        tensor.data_location = onnx.TensorProto.EXTERNAL
-        entry = StringStringEntryProto()
-        entry.key = "location"
-        entry.value = external_path
-        tensor.external_data.append(entry)
+        tensor = _make_external_tensor("W", TensorProto.FLOAT, list(tensor_shape), external_path)
         for key, value in (external_metadata or {}).items():
             extra_entry = StringStringEntryProto()
             extra_entry.key = key
@@ -1737,12 +1730,7 @@ def create_onnx_model_with_nested_external_initializer(
     external_path: str,
     missing_external: bool = False,
 ) -> Path:
-    tensor = helper.make_tensor("nested_W", TensorProto.FLOAT, [1], vals=[1.0])
-    tensor.data_location = onnx.TensorProto.EXTERNAL
-    entry = StringStringEntryProto()
-    entry.key = "location"
-    entry.value = external_path
-    tensor.external_data.append(entry)
+    tensor = _make_external_tensor("nested_W", TensorProto.FLOAT, [1], external_path)
 
     then_branch = helper.make_graph(
         [helper.make_node("Identity", ["nested_W"], ["Z"])],
@@ -2122,9 +2110,24 @@ def _scan_and_extract_custom_domains(model_path: Path) -> tuple[Any, list[Any], 
     return result, _failed_custom_domain_checks(result), custom_domains
 
 
-_PINNED_HF_MULTILINGUAL_E5_LARGE = "intfloat/multilingual-e5-large"
-_PINNED_HF_MULTILINGUAL_E5_LARGE_REVISION = "3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3"
-_PINNED_HF_MULTILINGUAL_E5_LARGE_ONNX = "onnx/model_O4.onnx"
+_PINNED_HF_ONNX_O4_CASES = (
+    (
+        "rank2_all_minilm_l6_v2",
+        "sentence-transformers/all-MiniLM-L6-v2",
+        "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+    ),
+    (
+        "rank5_ms_marco_minilm_l6_v2",
+        "cross-encoder/ms-marco-MiniLM-L6-v2",
+        "c5ee24cb16019beea0893ab7796b1df96625c6b8",
+    ),
+    (
+        "rank20_all_mpnet_base_v2",
+        "sentence-transformers/all-mpnet-base-v2",
+        "e8c3b32edf5434bc2275fc9bab85f82640a19130",
+    ),
+)
+_PINNED_HF_ONNX_O4_FILENAME = "onnx/model_O4.onnx"
 _PINNED_HF_ONNX_MAX_BYTES = 250 * 1024 * 1024
 
 
@@ -2205,6 +2208,53 @@ def create_onnx_model_with_repeated_custom_domain_and_missing_external_data(tmp_
     model_path = tmp_path / "custom_external_data.onnx"
     onnx.save(model, str(model_path))
     return model_path
+
+
+def create_onnx_model_with_mixed_custom_domains(tmp_path: Path) -> Path:
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
+    Z = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
+    nodes = [
+        helper.make_node("FastGelu", ["input"], ["hidden"], domain="com.microsoft", name="ort_fast_gelu"),
+        helper.make_node("BackdoorOp", ["hidden"], ["output"], domain="com.acme.ops", name="backdoor"),
+    ]
+    graph = helper.make_graph(nodes, "mixed_custom_domains", [X], [Z])
+    model = helper.make_model(
+        graph,
+        opset_imports=[
+            helper.make_opsetid("", 13),
+            helper.make_opsetid("com.microsoft", 1),
+            helper.make_opsetid("com.acme.ops", 1),
+        ],
+    )
+    path = tmp_path / "mixed_custom_domains.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_onnx_model_with_function_microsoft_operator(tmp_path: Path, *, op_type: str) -> Path:
+    function = helper.make_function(
+        "local",
+        "MicrosoftWrapper",
+        ["X"],
+        ["Y"],
+        [helper.make_node(op_type, ["X"], ["Y"], domain="com.microsoft")],
+        [helper.make_opsetid("", 13), helper.make_opsetid("com.microsoft", 1)],
+    )
+    graph = helper.make_graph(
+        [helper.make_node("MicrosoftWrapper", ["X"], ["Y"], domain="local")],
+        "graph",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+    )
+    model = helper.make_model(
+        graph,
+        functions=[function],
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+    )
+    model.ir_version = 10
+    path = tmp_path / f"function_microsoft_{op_type}.onnx"
+    onnx.save(model, str(path))
+    return path
 
 
 def test_onnx_scanner_can_handle(tmp_path):
@@ -2348,6 +2398,7 @@ def test_onnx_scanner_standard_ai_onnx_ml_domain_not_flagged(tmp_path: Path) -> 
         custom=True,
         custom_domain="ai.onnx.ml",
         custom_op_type="LinearRegressor",
+        custom_opset_version=1,
     )
     result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
     assert len(custom_domain_checks) == 0, (
@@ -2359,12 +2410,29 @@ def test_onnx_scanner_standard_ai_onnx_ml_domain_not_flagged(tmp_path: Path) -> 
 
 
 def test_onnx_scanner_standard_preview_training_domain_not_flagged(tmp_path: Path) -> None:
-    model_path = create_onnx_model(
-        tmp_path,
-        custom=True,
-        custom_domain="ai.onnx.preview.training",
-        custom_op_type="Adam",
+    r_value = helper.make_tensor_value_info("R", TensorProto.FLOAT, [])
+    t_value = helper.make_tensor_value_info("T", TensorProto.INT64, [])
+    x_value = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1])
+    y_value = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])
+    node = helper.make_node(
+        "Adam",
+        ["R", "T", "X"],
+        ["Y"],
+        domain="ai.onnx.preview.training",
+        name="adam",
     )
+    graph = helper.make_graph([node], "graph", [r_value, t_value, x_value], [y_value])
+    model = helper.make_model(
+        graph,
+        opset_imports=[
+            helper.make_opsetid("", 13),
+            helper.make_opsetid("ai.onnx.preview.training", 1),
+        ],
+    )
+    model.ir_version = 8
+    model_path = tmp_path / "model.onnx"
+    onnx.save(model, str(model_path))
+
     result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
     assert len(custom_domain_checks) == 0, (
         f"Expected no custom-domain finding for ai.onnx.preview.training. Checks: {[c.message for c in result.checks]}"
@@ -2375,10 +2443,11 @@ def test_onnx_scanner_standard_preview_training_domain_not_flagged(tmp_path: Pat
 
 
 def test_onnx_scanner_repeated_custom_domain_nodes_emit_one_domain_check(tmp_path: Path) -> None:
+    domain = "com.vendor.runtime"
     custom_nodes = [
-        *[("com.microsoft", "Attention", f"attention_{index}") for index in range(4)],
-        ("com.microsoft", "BiasAttention", "bias_attention"),
-        ("com.microsoft", "PackedAttention", "packed_attention"),
+        *[(domain, "Attention", f"attention_{index}") for index in range(4)],
+        (domain, "BiasAttention", "bias_attention"),
+        (domain, "PackedAttention", "packed_attention"),
     ]
     model_path = create_onnx_model_with_custom_nodes(tmp_path, custom_nodes)
 
@@ -2389,13 +2458,13 @@ def test_onnx_scanner_repeated_custom_domain_nodes_emit_one_domain_check(tmp_pat
     assert check.rule_code == "S1111"
     assert check.severity == IssueSeverity.INFO
     assert check.location == str(model_path)
-    assert check.details["domain"] == "com.microsoft"
+    assert check.details["domain"] == domain
     assert check.details["occurrence_count"] == len(custom_nodes)
     assert check.details["operator_samples"] == ["Attention", "BiasAttention", "PackedAttention"]
     assert len(check.details["representative_nodes"]) == 5
     assert check.details["representative_nodes_truncated"] is True
-    assert result.metadata["custom_domains"] == ["com.microsoft"]
-    assert metadata_custom_domains == ["com.microsoft"]
+    assert result.metadata["custom_domains"] == [domain]
+    assert metadata_custom_domains == [domain]
     assert len([issue for issue in result.issues if issue.rule_code == "S1111"]) == 1
 
 
@@ -2483,8 +2552,8 @@ def test_onnx_scanner_custom_domain_custom_op_overloads_survive_json_and_sarif_s
 
 def test_onnx_scanner_repeated_custom_domains_emit_one_check_per_domain(tmp_path: Path) -> None:
     custom_nodes = [
-        ("com.microsoft", "Attention", "attention_0"),
-        ("com.microsoft", "Attention", "attention_1"),
+        ("com.vendor.alpha", "Attention", "attention_0"),
+        ("com.vendor.alpha", "Attention", "attention_1"),
         ("com.attacker", "BackdoorOp", "backdoor_0"),
         ("com.attacker", "BackdoorOp", "backdoor_1"),
         ("ai.onnx.ml.malicious", "BackdoorOp", "lookalike"),
@@ -2494,16 +2563,16 @@ def test_onnx_scanner_repeated_custom_domains_emit_one_check_per_domain(tmp_path
     _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
 
     checks_by_domain = {check.details["domain"]: check for check in custom_domain_checks}
-    assert sorted(checks_by_domain) == ["ai.onnx.ml.malicious", "com.attacker", "com.microsoft"]
-    assert checks_by_domain["com.microsoft"].details["occurrence_count"] == 2
+    assert sorted(checks_by_domain) == ["ai.onnx.ml.malicious", "com.attacker", "com.vendor.alpha"]
+    assert checks_by_domain["com.vendor.alpha"].details["occurrence_count"] == 2
     assert checks_by_domain["com.attacker"].details["occurrence_count"] == 2
     assert checks_by_domain["ai.onnx.ml.malicious"].details["occurrence_count"] == 1
-    assert metadata_custom_domains == ["ai.onnx.ml.malicious", "com.attacker", "com.microsoft"]
+    assert metadata_custom_domains == ["ai.onnx.ml.malicious", "com.attacker", "com.vendor.alpha"]
 
 
 def test_onnx_scanner_custom_domains_survive_core_check_consolidation(tmp_path: Path) -> None:
     custom_nodes = [
-        ("com.microsoft", "Attention", "attention_0"),
+        ("com.vendor.alpha", "Attention", "attention_0"),
         ("com.attacker", "BackdoorOp", "backdoor_0"),
         ("ai.onnx.ml.malicious", "BackdoorOp", "lookalike"),
     ]
@@ -2524,7 +2593,7 @@ def test_onnx_scanner_custom_domains_survive_core_check_consolidation(tmp_path: 
     ]
     checks_by_domain = {check.details["domain"]: check for check in custom_checks}
 
-    assert sorted(checks_by_domain) == ["ai.onnx.ml.malicious", "com.attacker", "com.microsoft"]
+    assert sorted(checks_by_domain) == ["ai.onnx.ml.malicious", "com.attacker", "com.vendor.alpha"]
     assert len({check.details["check_consolidation_key"] for check in custom_checks}) == len(custom_nodes)
     assert all(
         check.details["check_consolidation_key"] == f"onnx_custom_operator_domain:{check.details['domain_hash']}"
@@ -2735,12 +2804,353 @@ def test_onnx_scanner_custom_domain_dedup_preserves_multi_file_evidence(tmp_path
     assert all(check.details["occurrence_count"] == 2 for check in custom_checks)
 
 
-@pytest.mark.onnx
+def test_onnx_scanner_explicit_custom_op_identity_survives_json_and_sarif_serialization(
+    tmp_path: Path,
+) -> None:
+    custom_nodes = [
+        ("", "custom_op", "float", "default_float"),
+        ("", "custom_op", "int", "default_int"),
+        ("ai.onnx", "custom_op", "float", "ai_onnx_float"),
+    ]
+    model_path = create_onnx_model_with_explicit_custom_operator_identities(tmp_path, custom_nodes)
+
+    result = scan_model_directory_or_file(
+        str(model_path),
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    expected_identities = {
+        ("", "custom_op", "float"),
+        ("", "custom_op", "int"),
+        ("ai.onnx", "custom_op", "float"),
+    }
+    json_payload = result.model_dump(mode="json")
+    json_custom_issues = [
+        issue
+        for issue in json_payload["issues"]
+        if issue.get("rule_code") == "S1111"
+        and issue.get("details", {}).get("operator_identity", {}).get("op_type") == "custom_op"
+    ]
+
+    assert len(json_custom_issues) == len(expected_identities)
+    assert {
+        (
+            issue["details"]["operator_identity"]["domain"],
+            issue["details"]["operator_identity"]["op_type"],
+            issue["details"]["operator_identity"]["overload"],
+        )
+        for issue in json_custom_issues
+    } == expected_identities
+    assert len({issue["message"] for issue in json_custom_issues}) == len(expected_identities)
+    assert all(issue["location"] == str(model_path) for issue in json_custom_issues)
+
+    sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+    sarif_results = [item for item in sarif_payload["runs"][0]["results"] if item["ruleId"] == "S1111"]
+
+    assert len(sarif_results) == len(expected_identities)
+    assert {item["message"]["text"] for item in sarif_results} == {issue["message"] for issue in json_custom_issues}
+    assert len({item["partialFingerprints"]["primaryLocationLineHash"] for item in sarif_results}) == len(
+        expected_identities
+    )
+    assert {
+        (
+            item["properties"]["operator_identity"]["domain"],
+            item["properties"]["operator_identity"]["op_type"],
+            item["properties"]["operator_identity"]["overload"],
+        )
+        for item in sarif_results
+    } == expected_identities
+
+
+def test_onnx_scanner_long_explicit_custom_op_names_survive_json_and_sarif_dedup(
+    tmp_path: Path,
+) -> None:
+    shared_display_prefix = "custom_op_" + ("a" * 280)
+    custom_nodes = [
+        ("", f"{shared_display_prefix}_float", "", "long_float"),
+        ("", f"{shared_display_prefix}_int", "", "long_int"),
+    ]
+    model_path = create_onnx_model_with_explicit_custom_operator_identities(tmp_path, custom_nodes)
+
+    result = scan_model_directory_or_file(
+        str(model_path),
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    json_payload = result.model_dump(mode="json")
+    json_custom_issues = [
+        issue
+        for issue in json_payload["issues"]
+        if issue.get("rule_code") == "S1111"
+        and issue.get("details", {}).get("operator_identity", {}).get("op_type", "").startswith(shared_display_prefix)
+    ]
+
+    assert len(json_custom_issues) == len(custom_nodes)
+    assert {issue["details"]["operator_identity"]["op_type"] for issue in json_custom_issues} == {
+        op_type for _domain, op_type, _overload, _node_name in custom_nodes
+    }
+    assert len({issue["details"]["operator_identity_hash"] for issue in json_custom_issues}) == len(custom_nodes)
+    assert len({issue["message"] for issue in json_custom_issues}) == len(custom_nodes)
+
+    sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+    sarif_results = [
+        item
+        for item in sarif_payload["runs"][0]["results"]
+        if item["ruleId"] == "S1111"
+        and item.get("properties", {}).get("operator_identity", {}).get("op_type", "").startswith(shared_display_prefix)
+    ]
+
+    assert len(sarif_results) == len(custom_nodes)
+    assert len({item["properties"]["operator_identity_hash"] for item in sarif_results}) == len(custom_nodes)
+    assert len({item["partialFingerprints"]["primaryLocationLineHash"] for item in sarif_results}) == len(custom_nodes)
+
+
+def test_onnx_scanner_custom_operator_identity_hash_length_frames_nul_values(
+    tmp_path: Path,
+) -> None:
+    custom_nodes = [
+        ("", "custom_op\0x", "", "nul_in_op_type"),
+        ("", "custom_op", "x\0", "nul_in_overload"),
+    ]
+    model_path = create_onnx_model_with_explicit_custom_operator_identities(tmp_path, custom_nodes)
+
+    result = scan_model_directory_or_file(
+        str(model_path),
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    expected_identities = {
+        ("", "custom_op\0x", ""),
+        ("", "custom_op", "x\0"),
+    }
+    json_payload = result.model_dump(mode="json")
+    json_custom_issues = [
+        issue
+        for issue in json_payload["issues"]
+        if issue.get("rule_code") == "S1111" and "operator_identity_hash" in issue.get("details", {})
+    ]
+
+    assert len(json_custom_issues) == len(expected_identities)
+    assert {
+        (
+            issue["details"]["operator_identity"]["domain"],
+            issue["details"]["operator_identity"]["op_type"],
+            issue["details"]["operator_identity"]["overload"],
+        )
+        for issue in json_custom_issues
+    } == expected_identities
+    assert len({issue["details"]["operator_identity_hash"] for issue in json_custom_issues}) == len(expected_identities)
+
+    sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+    sarif_results = [
+        item
+        for item in sarif_payload["runs"][0]["results"]
+        if item["ruleId"] == "S1111" and "operator_identity_hash" in item.get("properties", {})
+    ]
+
+    assert len(sarif_results) == len(expected_identities)
+    assert len({item["properties"]["operator_identity_hash"] for item in sarif_results}) == len(expected_identities)
+    assert len({item["partialFingerprints"]["primaryLocationLineHash"] for item in sarif_results}) == len(
+        expected_identities
+    )
+
+
+@pytest.mark.parametrize("op_type", ["FastGelu", "SkipLayerNormalization"])
+def test_onnx_scanner_known_microsoft_runtime_ops_not_flagged(tmp_path: Path, op_type: str) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="com.microsoft",
+        custom_op_type=op_type,
+        custom_opset_version=1,
+    )
+
+    result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert custom_domain_checks == []
+    assert "com.microsoft" not in result.metadata.get("custom_domains", [])
+    assert "com.microsoft" not in metadata_custom_domains
+    assert not [issue for issue in result.issues if issue.rule_code == "S1111"]
+
+
+def test_onnx_scanner_mixed_microsoft_and_unknown_domains_flags_only_unknown(tmp_path: Path) -> None:
+    model_path = create_onnx_model_with_mixed_custom_domains(tmp_path)
+
+    result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].rule_code == "S1111"
+    assert custom_domain_checks[0].details["domain"] == "com.acme.ops"
+    assert custom_domain_checks[0].details["op_type"] == "BackdoorOp"
+    assert result.metadata["custom_domains"] == ["com.acme.ops"]
+    assert metadata_custom_domains == ["com.acme.ops"]
+
+
+def test_onnx_scanner_unknown_microsoft_runtime_op_still_flagged(tmp_path: Path) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="com.microsoft",
+        custom_op_type="BackdoorOp",
+        custom_opset_version=1,
+    )
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].rule_code == "S1111"
+    assert custom_domain_checks[0].details["domain"] == "com.microsoft"
+    assert custom_domain_checks[0].details["op_type"] == "BackdoorOp"
+    assert metadata_custom_domains == ["com.microsoft"]
+
+
+@pytest.mark.parametrize(
+    "domain",
+    ["com.microsoft.evil", "com.microsoftx", "microsoft.com", "COM.MICROSOFT", "com.microsoft "],
+)
+def test_onnx_scanner_microsoft_domain_lookalikes_still_flagged(tmp_path: Path, domain: str) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain=domain,
+        custom_op_type="FastGelu",
+        custom_opset_version=1,
+    )
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].rule_code == "S1111"
+    assert custom_domain_checks[0].details["domain"] == domain
+    assert metadata_custom_domains == [domain]
+
+
+@pytest.mark.parametrize(
+    ("custom_opset_version", "overload"),
+    [(None, ""), (999, ""), (1, "evil")],
+    ids=["missing-opset", "unsupported-opset", "nonempty-overload"],
+)
+def test_onnx_scanner_microsoft_runtime_policy_fails_closed_when_ambiguous(
+    tmp_path: Path,
+    custom_opset_version: int | None,
+    overload: str,
+) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="com.microsoft",
+        custom_op_type="FastGelu",
+        custom_opset_version=custom_opset_version,
+    )
+    if overload:
+        model = onnx.load(str(model_path))
+        model.graph.node[0].overload = overload
+        onnx.save(model, str(model_path))
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].rule_code == "S1111"
+    assert custom_domain_checks[0].details["domain"] == "com.microsoft"
+    assert custom_domain_checks[0].details["op_type"] == "FastGelu"
+    assert metadata_custom_domains == ["com.microsoft"]
+
+
+def test_onnx_scanner_microsoft_runtime_policy_fails_closed_on_conflicting_opsets(tmp_path: Path) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="com.microsoft",
+        custom_op_type="FastGelu",
+        custom_opset_version=1,
+    )
+    model = onnx.load(str(model_path))
+    model = helper.make_model(
+        model.graph,
+        opset_imports=[
+            helper.make_opsetid("", 13),
+            helper.make_opsetid("com.microsoft", 999),
+            helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    onnx.save(model, str(model_path))
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].rule_code == "S1111"
+    assert custom_domain_checks[0].details["domain"] == "com.microsoft"
+    assert metadata_custom_domains == ["com.microsoft"]
+
+
+def test_onnx_scanner_microsoft_python_operator_still_critical(tmp_path: Path) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="com.microsoft",
+        custom_op_type="PythonOp",
+        custom_opset_version=1,
+    )
+
+    result = OnnxScanner().scan(str(model_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Operator Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert result.success is False
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S902"
+    assert python_checks[0].severity == IssueSeverity.CRITICAL
+    assert python_checks[0].details["domain"] == "com.microsoft"
+    assert python_checks[0].details["op_type"] == "PythonOp"
+
+
+def test_onnx_scanner_function_body_microsoft_runtime_op_uses_function_opset(tmp_path: Path) -> None:
+    model_path = create_onnx_model_with_function_microsoft_operator(tmp_path, op_type="FastGelu")
+
+    result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert custom_domain_checks == []
+    assert "com.microsoft" not in result.metadata.get("custom_domains", [])
+    assert "com.microsoft" not in metadata_custom_domains
+
+
+def test_onnx_scanner_function_body_unknown_microsoft_op_still_flagged(tmp_path: Path) -> None:
+    model_path = create_onnx_model_with_function_microsoft_operator(tmp_path, op_type="BackdoorOp")
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].rule_code == "S1111"
+    assert custom_domain_checks[0].details["domain"] == "com.microsoft"
+    assert custom_domain_checks[0].details["op_type"] == "BackdoorOp"
+    assert metadata_custom_domains == ["com.microsoft"]
+
+
 @pytest.mark.slow
 @pytest.mark.integration
-def test_onnx_scanner_pinned_hf_multilingual_e5_large_custom_domains_deduped(
+@pytest.mark.parametrize(
+    ("case_id", "repo_id", "revision"),
+    _PINNED_HF_ONNX_O4_CASES,
+    ids=[case[0] for case in _PINNED_HF_ONNX_O4_CASES],
+)
+def test_onnx_scanner_pinned_hf_microsoft_runtime_domains_are_low_noise(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    case_id: str,
+    repo_id: str,
+    revision: str,
 ) -> None:
     if os.environ.get("MODELAUDIT_RUN_HF_REAL_MODEL_TESTS") != "1":
         pytest.skip("set MODELAUDIT_RUN_HF_REAL_MODEL_TESTS=1 to download pinned Hugging Face ONNX models")
@@ -2749,34 +3159,31 @@ def test_onnx_scanner_pinned_hf_multilingual_e5_large_custom_domains_deduped(
     monkeypatch.setenv("HF_HUB_DISABLE_TELEMETRY", "1")
     huggingface_hub = pytest.importorskip("huggingface_hub")
     cache_dir = tmp_path / "hf-cache"
+
     model_path = Path(
         huggingface_hub.hf_hub_download(
-            repo_id=_PINNED_HF_MULTILINGUAL_E5_LARGE,
-            revision=_PINNED_HF_MULTILINGUAL_E5_LARGE_REVISION,
-            filename=_PINNED_HF_MULTILINGUAL_E5_LARGE_ONNX,
+            repo_id=repo_id,
+            revision=revision,
+            filename=_PINNED_HF_ONNX_O4_FILENAME,
             cache_dir=str(cache_dir),
         )
     )
     assert model_path.stat().st_size <= _PINNED_HF_ONNX_MAX_BYTES
 
     model = onnx.load(str(model_path), load_external_data=False)
-    microsoft_node_count = sum(1 for node in model.graph.node if node.domain == "com.microsoft")
-    assert microsoft_node_count == 96
+    microsoft_ops = {node.op_type for node in model.graph.node if node.domain == "com.microsoft"}
+    assert {"FastGelu", "SkipLayerNormalization"}.issubset(microsoft_ops), case_id
 
     scanner = OnnxScanner({"check_jit_script": False, "check_network_comm": False, "max_array_size": 1})
     result = scanner.scan(str(model_path))
     metadata = scanner.extract_metadata(str(model_path))
 
-    custom_domain_checks = _failed_custom_domain_checks(result)
     microsoft_domain_checks = [
-        check for check in custom_domain_checks if check.details.get("domain") == "com.microsoft"
+        check for check in _failed_custom_domain_checks(result) if check.details.get("domain") == "com.microsoft"
     ]
-    assert len(microsoft_domain_checks) == 1
-    assert microsoft_domain_checks[0].details["occurrence_count"] == microsoft_node_count
-    assert microsoft_domain_checks[0].details["representative_nodes_truncated"] is True
-    assert [check.details["domain"] for check in custom_domain_checks].count("com.microsoft") == 1
-    assert result.metadata["custom_domains"] == ["com.microsoft"]
-    assert metadata["custom_domains"] == ["com.microsoft"]
+    assert microsoft_domain_checks == []
+    assert "com.microsoft" not in result.metadata.get("custom_domains", [])
+    assert "com.microsoft" not in metadata.get("custom_domains", [])
 
 
 def test_onnx_scanner_registered_ai_onnx_preview_operator_not_flagged(
@@ -3682,6 +4089,33 @@ def test_onnx_scanner_external_data_exists(tmp_path: Path) -> None:
     assert resolved_checks[0].status.value == "passed"
 
 
+def test_onnx_scanner_skips_path_schema_validation_for_external_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_onnx_model(tmp_path, external=True, external_path="weights.bin")
+
+    def fail_if_called(_model_or_path: Any, *args: Any, **kwargs: Any) -> None:
+        raise AssertionError("external_data schema validation must not resolve through check_model")
+
+    monkeypatch.setattr(onnx.checker, "check_model", fail_if_called)
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    schema_checks = [c for c in result.checks if c.name == "ONNX Schema Validation"]
+    assert len(schema_checks) == 1
+    assert schema_checks[0].details["external_data_present"] is True
+    assert any(
+        c.name == "External Data Reference Check"
+        and c.status == CheckStatus.PASSED
+        and c.details.get("file") == "weights.bin"
+        for c in result.checks
+    )
+
+
 def test_onnx_scanner_corrupted(tmp_path: Path) -> None:
     model_path = create_onnx_model(tmp_path)
     data = model_path.read_bytes()
@@ -3762,7 +4196,9 @@ def test_onnx_scanner_python_substring_near_match_not_flagged(tmp_path: Path) ->
 
     result = OnnxScanner().scan(str(model_path))
 
-    assert result.success is True
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
     assert not [c for c in result.checks if c.name == "Python Operator Detection" and c.status == CheckStatus.FAILED]
 
 
@@ -3793,7 +4229,9 @@ def test_onnx_scanner_uppercase_snake_python_near_match_not_flagged(tmp_path: Pa
 
     result = OnnxScanner().scan(str(model_path))
 
-    assert result.success is True
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
     assert not [c for c in result.checks if c.name == "Python Operator Detection" and c.status == CheckStatus.FAILED]
 
 
@@ -3904,174 +4342,6 @@ def test_onnx_scanner_explicit_custom_op_in_standard_domain_still_flagged(tmp_pa
     assert len(custom_operator_issues) == 1
     assert custom_operator_issues[0].severity == IssueSeverity.INFO
     assert custom_operator_issues[0].details["op_type"] == "custom_op"
-    assert custom_operator_issues[0].details["overload"] == ""
-    assert custom_operator_issues[0].details["operator_identity"] == {
-        "domain": "",
-        "op_type": "custom_op",
-        "overload": "",
-    }
-    assert "ONNX domain '<default>'" in custom_operator_issues[0].message
-    assert "overload '<default>'" in custom_operator_issues[0].message
-
-
-def test_onnx_scanner_explicit_custom_op_identity_survives_json_and_sarif_serialization(
-    tmp_path: Path,
-) -> None:
-    custom_nodes = [
-        ("", "custom_op", "float", "default_float"),
-        ("", "custom_op", "int", "default_int"),
-        ("ai.onnx", "custom_op", "float", "ai_onnx_float"),
-    ]
-    model_path = create_onnx_model_with_explicit_custom_operator_identities(tmp_path, custom_nodes)
-
-    result = scan_model_directory_or_file(
-        str(model_path),
-        cache_scan_results=False,
-        check_jit_script=False,
-        check_network_comm=False,
-        max_array_size=1,
-    )
-
-    expected_identities = {
-        ("", "custom_op", "float"),
-        ("", "custom_op", "int"),
-        ("ai.onnx", "custom_op", "float"),
-    }
-    json_payload = result.model_dump(mode="json")
-    json_custom_issues = [
-        issue
-        for issue in json_payload["issues"]
-        if issue.get("rule_code") == "S1111"
-        and issue.get("details", {}).get("operator_identity", {}).get("op_type") == "custom_op"
-    ]
-
-    assert len(json_custom_issues) == len(expected_identities)
-    assert {
-        (
-            issue["details"]["operator_identity"]["domain"],
-            issue["details"]["operator_identity"]["op_type"],
-            issue["details"]["operator_identity"]["overload"],
-        )
-        for issue in json_custom_issues
-    } == expected_identities
-    assert len({issue["message"] for issue in json_custom_issues}) == len(expected_identities)
-    assert all(issue["location"] == str(model_path) for issue in json_custom_issues)
-
-    sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
-    sarif_results = [item for item in sarif_payload["runs"][0]["results"] if item["ruleId"] == "S1111"]
-
-    assert len(sarif_results) == len(expected_identities)
-    assert {item["message"]["text"] for item in sarif_results} == {issue["message"] for issue in json_custom_issues}
-    assert len({item["partialFingerprints"]["primaryLocationLineHash"] for item in sarif_results}) == len(
-        expected_identities
-    )
-    assert {
-        (
-            item["properties"]["operator_identity"]["domain"],
-            item["properties"]["operator_identity"]["op_type"],
-            item["properties"]["operator_identity"]["overload"],
-        )
-        for item in sarif_results
-    } == expected_identities
-
-
-def test_onnx_scanner_long_explicit_custom_op_names_survive_json_and_sarif_dedup(
-    tmp_path: Path,
-) -> None:
-    shared_display_prefix = "custom_op_" + ("a" * 280)
-    custom_nodes = [
-        ("", f"{shared_display_prefix}_float", "", "long_float"),
-        ("", f"{shared_display_prefix}_int", "", "long_int"),
-    ]
-    model_path = create_onnx_model_with_explicit_custom_operator_identities(tmp_path, custom_nodes)
-
-    result = scan_model_directory_or_file(
-        str(model_path),
-        cache_scan_results=False,
-        check_jit_script=False,
-        check_network_comm=False,
-        max_array_size=1,
-    )
-
-    json_payload = result.model_dump(mode="json")
-    json_custom_issues = [
-        issue
-        for issue in json_payload["issues"]
-        if issue.get("rule_code") == "S1111"
-        and issue.get("details", {}).get("operator_identity", {}).get("op_type", "").startswith(shared_display_prefix)
-    ]
-
-    assert len(json_custom_issues) == len(custom_nodes)
-    assert {issue["details"]["operator_identity"]["op_type"] for issue in json_custom_issues} == {
-        op_type for _domain, op_type, _overload, _node_name in custom_nodes
-    }
-    assert len({issue["details"]["operator_identity_hash"] for issue in json_custom_issues}) == len(custom_nodes)
-    assert len({issue["message"] for issue in json_custom_issues}) == len(custom_nodes)
-
-    sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
-    sarif_results = [
-        item
-        for item in sarif_payload["runs"][0]["results"]
-        if item["ruleId"] == "S1111"
-        and item.get("properties", {}).get("operator_identity", {}).get("op_type", "").startswith(shared_display_prefix)
-    ]
-
-    assert len(sarif_results) == len(custom_nodes)
-    assert len({item["properties"]["operator_identity_hash"] for item in sarif_results}) == len(custom_nodes)
-    assert len({item["partialFingerprints"]["primaryLocationLineHash"] for item in sarif_results}) == len(custom_nodes)
-
-
-def test_onnx_scanner_custom_operator_identity_hash_length_frames_nul_values(
-    tmp_path: Path,
-) -> None:
-    custom_nodes = [
-        ("", "custom_op\0x", "", "nul_in_op_type"),
-        ("", "custom_op", "x\0", "nul_in_overload"),
-    ]
-    model_path = create_onnx_model_with_explicit_custom_operator_identities(tmp_path, custom_nodes)
-
-    result = scan_model_directory_or_file(
-        str(model_path),
-        cache_scan_results=False,
-        check_jit_script=False,
-        check_network_comm=False,
-        max_array_size=1,
-    )
-
-    expected_identities = {
-        ("", "custom_op\0x", ""),
-        ("", "custom_op", "x\0"),
-    }
-    json_payload = result.model_dump(mode="json")
-    json_custom_issues = [
-        issue
-        for issue in json_payload["issues"]
-        if issue.get("rule_code") == "S1111" and "operator_identity_hash" in issue.get("details", {})
-    ]
-
-    assert len(json_custom_issues) == len(expected_identities)
-    assert {
-        (
-            issue["details"]["operator_identity"]["domain"],
-            issue["details"]["operator_identity"]["op_type"],
-            issue["details"]["operator_identity"]["overload"],
-        )
-        for issue in json_custom_issues
-    } == expected_identities
-    assert len({issue["details"]["operator_identity_hash"] for issue in json_custom_issues}) == len(expected_identities)
-
-    sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
-    sarif_results = [
-        item
-        for item in sarif_payload["runs"][0]["results"]
-        if item["ruleId"] == "S1111" and "operator_identity_hash" in item.get("properties", {})
-    ]
-
-    assert len(sarif_results) == len(expected_identities)
-    assert len({item["properties"]["operator_identity_hash"] for item in sarif_results}) == len(expected_identities)
-    assert len({item["partialFingerprints"]["primaryLocationLineHash"] for item in sarif_results}) == len(
-        expected_identities
-    )
 
 
 def test_onnx_scanner_real_pyop_node_still_flagged_despite_weight_bytes(tmp_path: Path) -> None:
@@ -4417,7 +4687,9 @@ class TestCVE202634447SymlinkTraversal:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
         traversal_checks = [
             c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
@@ -4439,7 +4711,9 @@ class TestCVE202634447SymlinkTraversal:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
         assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2025-51480"]
         missing_checks = [
@@ -4688,7 +4962,9 @@ class TestCVE202427318NestedPathTraversal:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         traversal_checks = [
             c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
         ]
@@ -4707,7 +4983,9 @@ class TestCVE202427318NestedPathTraversal:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         traversal_checks = [
             c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
         ]
@@ -4727,7 +5005,9 @@ class TestCVE202427318NestedPathTraversal:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         traversal_checks = [
             c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
         ]
@@ -4747,7 +5027,9 @@ class TestCVE202427318NestedPathTraversal:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         traversal_checks = [
             c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
         ]
@@ -4865,7 +5147,9 @@ class TestExternalDataSizeValidation:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         size_checks = [
             c for c in result.checks if c.name == "External Data Size Validation" and c.status == CheckStatus.PASSED
         ]

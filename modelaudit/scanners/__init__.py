@@ -367,6 +367,11 @@ class ScannerRegistry:
         # If stricter extension-specific scanners all decline, fall back to the
         # generic ZIP scanner so helper-level routing does not drop coverage.
         if is_zip_file and (scanner_selection is None or scanner_selection.allows("zip")):
+            if file_ext == ".model":
+                from modelaudit.utils.file.detection import _is_malformed_sentencepiece_model_proto_candidate_file
+
+                if _is_malformed_sentencepiece_model_proto_candidate_file(path):
+                    return None
             scanner_class = self._load_scanner("zip")
             if scanner_class and scanner_class.can_handle(path):
                 return scanner_class
