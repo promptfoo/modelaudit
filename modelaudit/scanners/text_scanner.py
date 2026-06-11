@@ -60,6 +60,7 @@ DOCUMENTATION_FENCED_PASSIVE_NETWORK_FINDING_TYPES = PASSIVE_NETWORK_FINDING_TYP
 PASSIVE_DATA_TEXT_FILENAMES = frozenset({"classes.txt"})
 PASSIVE_DATA_TEXT_PREFIXES = ("label", "token", "vocab")
 BARE_NETWORK_URL_TOKEN_PATTERN = re.compile(rb"[A-Za-z][A-Za-z0-9+.-]*://\S+")
+DOCUMENTATION_FENCED_BARE_URL_TOKEN_PATTERN = re.compile(rb"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"')\]}>,;]+")
 REQUIREMENTS_RAW_URL_PATTERN = re.compile(rb"https?://\S+", re.IGNORECASE)
 BARE_NETWORK_IPV4_TOKEN_PATTERN = re.compile(
     rb"(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}"
@@ -427,7 +428,7 @@ DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN = re.compile(
-    rb"\|\s*(?:bash|sh|zsh|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh)\b",
+    rb"\|\s*(?:(?:/[A-Za-z0-9._-]+)*/)?(?:bash|sh|zsh|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh)\b",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_ACTIONABLE_URL_TOKEN_PATTERN = re.compile(
@@ -462,6 +463,12 @@ DOCUMENTATION_FENCED_VARIABLE_ASSIGNMENT_PATTERN = re.compile(
 )
 DOCUMENTATION_FENCED_REQUESTS_CALL_PATTERN = re.compile(
     rb"\brequests\.(?P<method>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_NETWORK_FUNCTION_PATTERN = re.compile(
+    rb"\b(?:urlopen|urlretrieve|socket\.connect|socket\.create_connection|requests\.(?:get|post|put|delete)|"
+    rb"http\.request|ftp\.connect|ssh\.connect|telnet\.open|smtp\.connect|imap\.login|redis\.connect|"
+    rb"mongo\.connect|getaddrinfo|gethostbyname|gethostbyaddr|dns\.resolver)\b",
     re.IGNORECASE,
 )
 DOCUMENTATION_PIP_OPTION_WITH_ARGUMENT = (
@@ -1463,14 +1470,10 @@ class TextScanner(BaseScanner):
             for match in DOCUMENTATION_FENCED_REQUESTS_CALL_PATTERN.finditer(fenced_code)
         ):
             return False
-        if any(
-            not cls._documentation_loopback_api_url_is_informational(
-                match.group("url").decode("utf-8", errors="ignore")
-            )
-            for match in DOCUMENTATION_FENCED_DIRECT_URL_CALL_PATTERN.finditer(fenced_code)
-        ):
-            return False
         direct_url_calls = tuple(DOCUMENTATION_FENCED_DIRECT_URL_CALL_PATTERN.finditer(fenced_code))
+        direct_call_urls = [match.group("url").decode("utf-8", errors="ignore") for match in direct_url_calls]
+        if any(not cls._documentation_fenced_passive_assigned_url_is_informational(url) for url in direct_call_urls):
+            return False
         variable_call_matches = tuple(DOCUMENTATION_FENCED_URL_VARIABLE_CALL_PATTERN.finditer(fenced_code))
         allowed_call_positions = {match.start() for match in direct_url_calls} | {
             match.start() for match in variable_call_matches
@@ -1478,6 +1481,11 @@ class TextScanner(BaseScanner):
         if any(
             match.start() not in allowed_call_positions
             for match in DOCUMENTATION_FENCED_ALLOWED_NETWORK_CALL_PATTERN.finditer(fenced_code)
+        ):
+            return False
+        if any(
+            match.group().lower() not in {b"requests.get", b"urlopen"}
+            for match in DOCUMENTATION_FENCED_NETWORK_FUNCTION_PATTERN.finditer(fenced_code)
         ):
             return False
         safe_assigned_urls = {
@@ -1506,15 +1514,16 @@ class TextScanner(BaseScanner):
                 return False
             call_target_urls.append(assigned_url)
         bare_urls = [
-            match.group().decode("utf-8", errors="ignore").rstrip(")]}'\"`,.;")
-            for match in BARE_NETWORK_URL_TOKEN_PATTERN.finditer(fenced_code)
+            match.group().decode("utf-8", errors="ignore").rstrip("`.")
+            for match in DOCUMENTATION_FENCED_BARE_URL_TOKEN_PATTERN.finditer(fenced_code)
         ]
         if any(not cls._documentation_fenced_bare_url_is_informational(url) for url in bare_urls):
             return False
         if any(cls._documentation_loopback_api_url_is_informational(url) for url in bare_urls):
             return True
-        return bool(call_target_urls) and all(
-            cls._documentation_fenced_passive_media_url_is_informational(url) for url in call_target_urls
+        return bool(call_target_urls or direct_call_urls) and all(
+            cls._documentation_fenced_passive_media_url_is_informational(url)
+            for url in (*call_target_urls, *direct_call_urls)
         )
 
     @classmethod
