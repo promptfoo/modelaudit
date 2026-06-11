@@ -1,5 +1,6 @@
 """Tests for HuggingFace URL handling."""
 
+import gzip
 import importlib
 import os
 import pickle
@@ -2651,32 +2652,32 @@ class TestModelDownloadStreaming:
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
         return_value=(
-            ["payload.pkl", "model-00001-of-00002.safetensors"],
+            ["MODEL.UBJ", "model-00001-of-00002.safetensors"],
             _HF_TEST_REVISION,
             None,
         ),
     )
     @patch("requests.get")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_selected_pickle_skips_detected_safetensors_shard_after_probe(
+    def test_download_model_streaming_selected_non_overlap_skips_detected_safetensors_shard_after_probe(
         self,
         mock_hf_hub_download: MagicMock,
         mock_requests_get: MagicMock,
         _mock_list_repo_files: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """Detected SafeTensors shards excluded by selection must stay bounded and undispatched."""
-        policy = resolve_scanner_selection_policy(scanners=["pickle"])
+        """Detected SafeTensors shards excluded by non-overlap selection must stay bounded and undispatched."""
+        policy = resolve_scanner_selection_policy(scanners=["xgboost"])
         extensions = selected_scanner_extensions(policy, conservative=True)
         assert extensions is not None
-        assert ".pkl" in extensions
+        assert ".ubj" in extensions
         assert ".safetensors" not in extensions
         safetensors_header = b'{"__metadata__":{"format":"pt"}}'
         safetensors_shard = struct.pack("<Q", len(safetensors_header)) + safetensors_header + (b"\x00" * 16)
         mock_requests_get.return_value = _FakeRangeResponse(safetensors_shard)
 
         def download_side_effect(*, filename: str, **_kwargs: object) -> str:
-            assert filename == "payload.pkl"
+            assert filename == "MODEL.UBJ"
             path = tmp_path / filename
             path.write_bytes(b"downloaded")
             return str(path)
@@ -2692,12 +2693,57 @@ class TestModelDownloadStreaming:
             )
         )
 
-        assert results == [(tmp_path / "payload.pkl", True)]
+        assert results == [(tmp_path / "MODEL.UBJ", True)]
         mock_requests_get.assert_called_once()
         assert mock_requests_get.call_args.kwargs["headers"]["Range"] == "bytes=0-8191"
         mock_hf_hub_download.assert_called_once_with(
             repo_id="test/model",
-            filename="payload.pkl",
+            filename="MODEL.UBJ",
+            revision=_HF_TEST_REVISION,
+        )
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["model-00001-of-00002.safetensors"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_selected_compressed_preserves_safetensors_shard_overlap_route(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Detected SafeTensors shards must still download when a selected overlap scanner can claim them."""
+        policy = resolve_scanner_selection_policy(scanners=["compressed"])
+        safetensors_header = b'{"__metadata__":{"format":"pt"}}'
+        safetensors_shard = (
+            struct.pack("<Q", len(safetensors_header)) + safetensors_header + gzip.compress(b"print('payload')")
+        )
+        mock_requests_get.return_value = _FakeRangeResponse(safetensors_shard)
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / filename
+            path.write_bytes(safetensors_shard)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                scannable_extensions=set(),
+                scannable_filenames=set(),
+                scannable_scanner_ids=policy.enabled_scanner_ids,
+            )
+        )
+
+        assert results == [(tmp_path / "model-00001-of-00002.safetensors", True)]
+        assert mock_requests_get.call_count == 1
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="model-00001-of-00002.safetensors",
             revision=_HF_TEST_REVISION,
         )
 

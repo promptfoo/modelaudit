@@ -915,11 +915,16 @@ def _hf_detected_safetensors_shard_excluded_by_selection(
     selected_route_scanner_ids: set[str] | None,
 ) -> bool:
     """Return whether scanner selection excludes a detected shard-shaped SafeTensors artifact."""
-    if selected_route_scanner_ids is None or detected_format != "safetensors":
+    if (
+        selected_route_scanner_ids is None
+        or detected_format != "safetensors"
+        or _HF_SAFETENSORS_SHARD_PATTERN.search(filename) is None
+    ):
         return False
-    return (
-        "safetensors" not in selected_route_scanner_ids and _HF_SAFETENSORS_SHARD_PATTERN.search(filename) is not None
-    )
+
+    from ...scanner_selection import scanner_ids_for_detected_format
+
+    return not selected_route_scanner_ids.intersection(scanner_ids_for_detected_format(detected_format))
 
 
 def _get_selected_hf_content_route_formats(
