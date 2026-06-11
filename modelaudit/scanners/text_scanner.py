@@ -654,9 +654,17 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
-    def _documentation_uses_markdown_fences(path: str) -> bool:
+    def _documentation_uses_markdown_fences(path: str, payload: bytes) -> bool:
         filename = os.path.basename(path).lower()
-        return os.path.splitext(filename)[1] != ".rst"
+        extension = os.path.splitext(filename)[1]
+        if extension == ".rst":
+            return False
+        if extension:
+            return True
+        return any(
+            match.group("marker").startswith(b"`") or bool(match.group("suffix").strip())
+            for match in DOCUMENTATION_FENCE_LINE_PATTERN.finditer(payload)
+        )
 
     @staticmethod
     def _is_passive_data_sidecar(path: str) -> bool:
@@ -1598,7 +1606,7 @@ class TextScanner(BaseScanner):
         remaining_occurrences = MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES
         documentation_sidecar = cls._is_documentation_sidecar(path)
         lowered_payload = payload.lower() if documentation_sidecar else b""
-        markdown_fences = documentation_sidecar and cls._documentation_uses_markdown_fences(path)
+        markdown_fences = documentation_sidecar and cls._documentation_uses_markdown_fences(path, payload)
         last_retargetable_index = max(
             (index for index, finding in enumerate(findings) if cls._documentation_finding_tokens(finding)),
             default=-1,

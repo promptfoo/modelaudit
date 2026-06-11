@@ -803,8 +803,9 @@ def test_text_scanner_earlier_network_library_call_is_not_hidden_by_later_prose(
     assert determine_exit_code(aggregate) == 1
 
 
-def test_text_scanner_rst_headings_do_not_hide_active_network_call(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.rst"
+@pytest.mark.parametrize("filename", ["README.rst", "README"])
+def test_text_scanner_rst_headings_do_not_hide_active_network_call(tmp_path: Path, filename: str) -> None:
+    text_path = tmp_path / filename
     text_path.write_text(
         """Heading
 ~~~~~~~
