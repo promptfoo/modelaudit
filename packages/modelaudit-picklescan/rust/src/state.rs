@@ -7049,8 +7049,10 @@ impl<'a> ScanState<'a> {
             invocation.reference.module.clone(),
             invocation.reference.name.clone(),
             invocation.op_name.to_string(),
-            Some(invocation.reference.position),
-            Some(invocation.opcode_position),
+            is_builtin_getattr_reference(&invocation.reference)
+                .then_some(invocation.reference.position),
+            is_builtin_getattr_reference(&invocation.reference)
+                .then_some(invocation.opcode_position),
             invocation.positional_arg_count,
             invocation.build_uses_slot_state,
             invocation.keyword_arg_names.clone(),
@@ -8060,8 +8062,18 @@ impl<'a> ScanState<'a> {
             return None;
         }
         let opcode = detail_string(details, "opcode")?;
-        let global_position = detail_usize(details, "global_position");
-        let opcode_position = detail_usize(details, "opcode_position");
+        let global_position = matches!(
+            (module.as_str(), name.as_str()),
+            ("builtins" | "__builtin__" | "__builtins__", "getattr")
+        )
+        .then(|| detail_usize(details, "global_position"))
+        .flatten();
+        let opcode_position = matches!(
+            (module.as_str(), name.as_str()),
+            ("builtins" | "__builtin__" | "__builtins__", "getattr")
+        )
+        .then(|| detail_usize(details, "opcode_position"))
+        .flatten();
         let positional_arg_count = detail_usize(details, "positional_arg_count");
         let build_uses_slot_state = details.iter().find_map(|(key, value)| {
             if key != "build_uses_slot_state" {
@@ -10562,7 +10574,7 @@ mod tests {
         scan.push_callable_invocation(&second);
         scan.push_callable_invocation(&duplicate_reduce);
 
-        assert_eq!(scan.callable_invocations.len(), 3);
+        assert_eq!(scan.callable_invocations.len(), 2);
         assert!(!scan.callable_invocations_truncated);
     }
 
