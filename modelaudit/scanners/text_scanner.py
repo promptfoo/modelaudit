@@ -1,6 +1,7 @@
 """Scanner for text-based ML files like README.md and vocab.txt."""
 
 import ast
+import bisect
 import io
 import keyword
 import os
@@ -1850,44 +1851,70 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
-    def _documentation_python_string_contains_absolute_position(source: bytes, position: int) -> bool:
-        if position < 0 or position > len(source):
-            return False
+    def _documentation_python_string_absolute_spans(source: bytes) -> tuple[tuple[int, int, str, bool], ...]:
         text = source.decode("utf-8", errors="replace")
-        character_position = len(source[:position].decode("utf-8", errors="replace"))
-        line_offsets = [0]
+        text_lines = text.splitlines(keepends=True)
+        byte_line_offsets = [0]
         cursor = 0
-        for line in text.splitlines(keepends=True):
+        for line in source.splitlines(keepends=True):
             cursor += len(line)
-            line_offsets.append(cursor)
+            byte_line_offsets.append(cursor)
 
-        def absolute_position(token_position: tuple[int, int]) -> int:
+        def byte_position(token_position: tuple[int, int]) -> int:
             line_number, column = token_position
             line_index = line_number - 1
             if line_index < 0:
                 return column
-            if line_index >= len(line_offsets):
-                return len(text)
-            return min(line_offsets[line_index] + column, len(text))
+            if line_index >= len(byte_line_offsets) - 1:
+                return len(source)
+            text_line = text_lines[line_index] if line_index < len(text_lines) else ""
+            byte_column = len(text_line[:column].encode("utf-8", errors="replace"))
+            return min(byte_line_offsets[line_index] + byte_column, byte_line_offsets[line_index + 1])
 
+        spans: list[tuple[int, int, str, bool]] = []
         try:
             for current in tokenize.generate_tokens(io.StringIO(text).readline):
-                token_start = absolute_position(current.start)
-                token_end = absolute_position(current.end)
-                if not (token_start <= character_position < token_end):
+                is_fstring_middle = current.type == FSTRING_MIDDLE_TOKEN_TYPE
+                if current.type != token.STRING and not is_fstring_middle:
                     continue
-                if current.type == FSTRING_MIDDLE_TOKEN_TYPE:
-                    return True
-                if current.type != token.STRING:
-                    continue
-                local_position = character_position - token_start
-                return not TextScanner._documentation_f_string_expression_contains_position(
-                    current.string,
-                    local_position,
-                )
+                token_start = byte_position(current.start)
+                token_end = byte_position(current.end)
+                if token_start < token_end:
+                    spans.append((token_start, token_end, current.string, is_fstring_middle))
         except (IndentationError, tokenize.TokenError):
+            return ()
+        return tuple(spans)
+
+    @staticmethod
+    def _documentation_python_string_spans_contain_absolute_position(
+        source: bytes,
+        position: int,
+        string_spans: tuple[tuple[int, int, str, bool], ...],
+        string_span_starts: tuple[int, ...],
+    ) -> bool:
+        if position < 0 or position > len(source) or not string_spans:
             return False
-        return False
+        span_index = bisect.bisect_right(string_span_starts, position) - 1
+        if span_index < 0:
+            return False
+        token_start, token_end, token_text, is_fstring_middle = string_spans[span_index]
+        if not (token_start <= position < token_end):
+            return False
+        if is_fstring_middle:
+            return True
+        local_position = len(source[token_start:position].decode("utf-8", errors="replace"))
+        return not TextScanner._documentation_f_string_expression_contains_position(token_text, local_position)
+
+    @classmethod
+    def _documentation_python_string_contains_absolute_position(cls, source: bytes, position: int) -> bool:
+        string_spans = cls._documentation_python_string_absolute_spans(source)
+        string_span_starts = tuple(span[0] for span in string_spans)
+        return cls._documentation_python_string_spans_contain_absolute_position(
+            source,
+            position,
+            string_spans,
+            string_span_starts,
+        )
 
     @staticmethod
     def _span_overlaps_any(start: int, end: int, spans: tuple[tuple[int, int], ...]) -> bool:
@@ -1917,7 +1944,12 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
-    def _documentation_fenced_has_imported_network_call(cls, fenced_code: bytes) -> bool:
+    def _documentation_fenced_has_imported_network_call(
+        cls,
+        fenced_code: bytes,
+        string_spans: tuple[tuple[int, int, str, bool], ...],
+        string_span_starts: tuple[int, ...],
+    ) -> bool:
         imported_targets: dict[bytes, list[int]] = {}
         network_names = {b"get", b"head", b"post", b"put", b"patch", b"delete", b"request", b"urlopen", b"urlretrieve"}
         for pattern in (
@@ -1928,7 +1960,12 @@ class TextScanner(BaseScanner):
                 if cls._documentation_fenced_match_is_line_comment(
                     fenced_code,
                     match.start(),
-                ) or cls._documentation_python_string_contains_absolute_position(fenced_code, match.start()):
+                ) or cls._documentation_python_string_spans_contain_absolute_position(
+                    fenced_code,
+                    match.start(),
+                    string_spans,
+                    string_span_starts,
+                ):
                     continue
                 for name_part in cls._documentation_fenced_import_parts(match.group("imports")):
                     alias_parts = re.split(rb"\s+as\s+", name_part, maxsplit=1, flags=re.IGNORECASE)
@@ -1945,14 +1982,24 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
-    def _documentation_fenced_has_module_alias_network_call(cls, fenced_code: bytes) -> bool:
+    def _documentation_fenced_has_module_alias_network_call(
+        cls,
+        fenced_code: bytes,
+        string_spans: tuple[tuple[int, int, str, bool], ...],
+        string_span_starts: tuple[int, ...],
+    ) -> bool:
         imported_targets: dict[bytes, list[int]] = {}
         network_modules = {b"requests", b"urllib.request"}
         for match in DOCUMENTATION_FENCED_NETWORK_MODULE_IMPORT_PATTERN.finditer(fenced_code):
             if cls._documentation_fenced_match_is_line_comment(
                 fenced_code,
                 match.start(),
-            ) or cls._documentation_python_string_contains_absolute_position(fenced_code, match.start()):
+            ) or cls._documentation_python_string_spans_contain_absolute_position(
+                fenced_code,
+                match.start(),
+                string_spans,
+                string_span_starts,
+            ):
                 continue
             for name_part in cls._documentation_fenced_import_parts(match.group("imports")):
                 alias_parts = re.split(rb"\s+as\s+", name_part, maxsplit=1, flags=re.IGNORECASE)
@@ -1970,13 +2017,23 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
-    def _documentation_fenced_has_executed_fetch_response(cls, fenced_code: bytes) -> bool:
+    def _documentation_fenced_has_executed_fetch_response(
+        cls,
+        fenced_code: bytes,
+        string_spans: tuple[tuple[int, int, str, bool], ...],
+        string_span_starts: tuple[int, ...],
+    ) -> bool:
         response_assignments: dict[bytes, list[int]] = {}
         for match in DOCUMENTATION_FENCED_FETCH_RESPONSE_ASSIGNMENT_PATTERN.finditer(fenced_code):
             if cls._documentation_fenced_match_is_line_comment(
                 fenced_code,
                 match.start(),
-            ) or cls._documentation_python_string_contains_absolute_position(fenced_code, match.start()):
+            ) or cls._documentation_python_string_spans_contain_absolute_position(
+                fenced_code,
+                match.start(),
+                string_spans,
+                string_span_starts,
+            ):
                 continue
             response_assignments.setdefault(match.group("target"), []).append(match.start())
 
@@ -2015,15 +2072,17 @@ class TextScanner(BaseScanner):
 
     @classmethod
     def _documentation_fenced_passive_network_example_is_informational(cls, fenced_code: bytes) -> bool:
+        string_spans = cls._documentation_python_string_absolute_spans(fenced_code)
+        string_span_starts = tuple(span[0] for span in string_spans)
         if (
             DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN.search(fenced_code)
             or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(fenced_code)
             or DOCUMENTATION_FENCED_PROCESS_SUBSTITUTION_EXECUTION_PATTERN.search(fenced_code)
             or DOCUMENTATION_FENCED_SESSION_HTTP_CALL_PATTERN.search(fenced_code)
             or DOCUMENTATION_FENCED_EXECUTED_FETCH_PATTERN.search(fenced_code)
-            or cls._documentation_fenced_has_imported_network_call(fenced_code)
-            or cls._documentation_fenced_has_module_alias_network_call(fenced_code)
-            or cls._documentation_fenced_has_executed_fetch_response(fenced_code)
+            or cls._documentation_fenced_has_imported_network_call(fenced_code, string_spans, string_span_starts)
+            or cls._documentation_fenced_has_module_alias_network_call(fenced_code, string_spans, string_span_starts)
+            or cls._documentation_fenced_has_executed_fetch_response(fenced_code, string_spans, string_span_starts)
             or cls._documentation_fenced_has_bound_session_alias_call(fenced_code)
             or cls._documentation_fenced_has_call_after_assignment(
                 fenced_code,
@@ -2069,7 +2128,12 @@ class TextScanner(BaseScanner):
                 if cls._documentation_fenced_match_is_line_comment(
                     fenced_code,
                     match.start(),
-                ) or cls._documentation_python_string_contains_absolute_position(fenced_code, match.start()):
+                ) or cls._documentation_python_string_spans_contain_absolute_position(
+                    fenced_code,
+                    match.start(),
+                    string_spans,
+                    string_span_starts,
+                ):
                     continue
                 safe_assigned_urls[(match.group("target"), match.start())] = match.group("url").decode(
                     "utf-8",
@@ -2080,7 +2144,12 @@ class TextScanner(BaseScanner):
             if cls._documentation_fenced_match_is_line_comment(
                 fenced_code,
                 match.start(),
-            ) or cls._documentation_python_string_contains_absolute_position(fenced_code, match.start()):
+            ) or cls._documentation_python_string_spans_contain_absolute_position(
+                fenced_code,
+                match.start(),
+                string_spans,
+                string_span_starts,
+            ):
                 continue
             assignment_positions.setdefault(match.group("target"), []).append(match.start())
         call_target_urls: list[str] = []

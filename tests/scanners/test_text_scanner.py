@@ -4429,6 +4429,29 @@ def test_text_scanner_documentation_fence_ranges_are_precomputed_once(monkeypatc
     assert all(finding["severity"] == "INFO" for finding in classified)
 
 
+def test_text_scanner_fenced_documentation_string_spans_are_precomputed_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assignments = "\n".join(f'value_{index} = "local_{index}.txt"' for index in range(800))
+    fenced_code = (
+        assignments + '\nurl = "http://images.cocodataset.org/val2017/000000039769.jpg"\nrequests.get(url)\n'
+    ).encode()
+    calls = 0
+    original = TextScanner._documentation_python_string_absolute_spans
+
+    def count_spans(
+        source: bytes,
+    ) -> tuple[tuple[int, int, str, bool], ...]:
+        nonlocal calls
+        calls += 1
+        return original(source)
+
+    monkeypatch.setattr(TextScanner, "_documentation_python_string_absolute_spans", staticmethod(count_spans))
+
+    assert TextScanner._documentation_fenced_passive_network_example_is_informational(fenced_code)
+    assert calls == 1
+
+
 def test_text_scanner_documentation_classification_exact_limit_ignores_passive_followups() -> None:
     payload = b"No malware is present.\n" * 1_024
     findings = [
