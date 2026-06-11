@@ -532,12 +532,12 @@ DOCUMENTATION_FENCED_SESSION_ASSIGNMENT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_NETWORK_FUNCTION_ALIAS_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*=\s*"
     rb"(?:requests\.(?:get|head|post|put|patch|delete|request)|urllib\.request\.urlopen|urlopen)\b(?!\s*\()",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_BOUND_NETWORK_METHOD_ALIAS_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*=\s*"
     rb"(?P<receiver>(?:requests\.)?Session\s*\([^)]*\)|[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*"
     rb"(?:get|head|post|put|patch|delete|request)\b(?!\s*\()",
     re.IGNORECASE,
@@ -597,12 +597,18 @@ DOCUMENTATION_FENCED_EXECUTED_IMPORTED_FETCH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_FETCH_RESPONSE_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:\(\s*){0,8}"
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*=\s*(?:\(\s*){0,8}"
     rb"(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
     re.IGNORECASE,
 )
+DOCUMENTATION_FENCED_IMPORTED_FETCH_RESPONSE_ASSIGNMENT_PATTERN = re.compile(
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*=\s*(?:\(\s*){0,8}"
+    rb"(?P<fetch>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
+    re.IGNORECASE,
+)
 DOCUMENTATION_FENCED_RESPONSE_CONTENT_ALIAS_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<source>[A-Za-z_][A-Za-z0-9_]*)"
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*=\s*"
+    rb"(?P<source>[A-Za-z_][A-Za-z0-9_]*)"
     rb"(?:\s*\.\s*(?:text|content)|\s*\.\s*read\s*\(\s*\))",
     re.IGNORECASE,
 )
@@ -1665,7 +1671,7 @@ class TextScanner(BaseScanner):
                 prefix
                 + rb"(?:python(?:[0-9.]+)?|py)\s+(?:-[A-Za-z0-9_.=\-]+\s+){0,8}"
                 + rb"(?:setup\.py|[A-Za-z0-9_./\-]+\.py)(?:\s|$)",
-                prefix + rb"(?:python(?:[0-9.]+)?|py)\s+(?:-[A-Za-z0-9_.=\-]+\s+){0,8}-m\s+(?:pip|uv)\b",
+                prefix + rb"(?:python(?:[0-9.]+)?|py)\s+(?:-[A-Za-z0-9_.=\-]+\s+){0,8}-m\s+[A-Za-z_][A-Za-z0-9_.\-]*\b",
                 prefix + rb"(?:bash|sh|zsh|node|ruby|perl)\s+" + rb"[A-Za-z0-9_./\-]+\.(?:sh|js|rb|pl)(?:\s|$)",
                 prefix + rb"(?:make|cmake|npm|yarn|pnpm|pip(?:[0-9.]+)?|uv)\b",
             )
@@ -2170,6 +2176,11 @@ class TextScanner(BaseScanner):
         string_span_starts: tuple[int, ...],
     ) -> bool:
         response_assignments: dict[bytes, list[int]] = {}
+        imported_targets = cls._documentation_fenced_imported_network_targets(
+            fenced_code,
+            string_spans,
+            string_span_starts,
+        )
         for match in DOCUMENTATION_FENCED_FETCH_RESPONSE_ASSIGNMENT_PATTERN.finditer(fenced_code):
             if cls._documentation_fenced_match_is_line_comment(
                 fenced_code,
@@ -2182,6 +2193,22 @@ class TextScanner(BaseScanner):
             ):
                 continue
             response_assignments.setdefault(match.group("target"), []).append(match.start())
+
+        for match in DOCUMENTATION_FENCED_IMPORTED_FETCH_RESPONSE_ASSIGNMENT_PATTERN.finditer(fenced_code):
+            if cls._documentation_fenced_match_is_line_comment(
+                fenced_code,
+                match.start(),
+            ) or cls._documentation_python_string_spans_contain_absolute_position(
+                fenced_code,
+                match.start(),
+                string_spans,
+                string_span_starts,
+            ):
+                continue
+            if any(
+                position < match.start() for position, _imported_name in imported_targets.get(match.group("fetch"), [])
+            ):
+                response_assignments.setdefault(match.group("target"), []).append(match.start())
 
         for match in DOCUMENTATION_FENCED_RESPONSE_CONTENT_ALIAS_ASSIGNMENT_PATTERN.finditer(fenced_code):
             if cls._documentation_fenced_match_is_line_comment(
