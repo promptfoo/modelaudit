@@ -100,6 +100,66 @@ _TRUSTED_FRAMEWORK_REDUCE_REFERENCES = frozenset(
         ("transformers.training_args", "OptimizerNames"),
     }
 )
+_SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES = frozenset(
+    {
+        ("accelerate.state", "PartialState"),
+        ("accelerate.utils.dataclasses", "DeepSpeedPlugin"),
+        ("accelerate.utils.dataclasses", "DistributedType"),
+        ("joblib.numpy_pickle", "NumpyArrayWrapper"),
+        ("numpy", "dtype"),
+        ("numpy", "ndarray"),
+        ("numpy._core.multiarray", "_reconstruct"),
+        ("numpy._core.multiarray", "scalar"),
+        ("numpy.core.multiarray", "_reconstruct"),
+        ("numpy.core.multiarray", "scalar"),
+        ("torch", "BFloat16Storage"),
+        ("torch", "BoolStorage"),
+        ("torch", "ByteStorage"),
+        ("torch", "CharStorage"),
+        ("torch", "ComplexDoubleStorage"),
+        ("torch", "ComplexFloatStorage"),
+        ("torch", "DoubleStorage"),
+        ("torch", "FloatStorage"),
+        ("torch", "HalfStorage"),
+        ("torch", "IntStorage"),
+        ("torch", "LongStorage"),
+        ("torch", "QInt32Storage"),
+        ("torch", "QInt8Storage"),
+        ("torch", "QUInt2x4Storage"),
+        ("torch", "QUInt4x2Storage"),
+        ("torch", "QUInt8Storage"),
+        ("torch", "ShortStorage"),
+        ("torch", "Size"),
+        ("torch", "Storage"),
+        ("torch", "UntypedStorage"),
+        ("torch", "_rebuild_tensor"),
+        ("torch", "_rebuild_tensor_v2"),
+        ("torch", "bfloat16"),
+        ("torch", "device"),
+        ("torch._tensor", "_rebuild_from_type_v2"),
+        ("torch._utils", "_rebuild_device_tensor_from_numpy"),
+        ("torch._utils", "_rebuild_meta_tensor_no_storage"),
+        ("torch._utils", "_rebuild_nested_tensor"),
+        ("torch._utils", "_rebuild_parameter"),
+        ("torch._utils", "_rebuild_parameter_with_state"),
+        ("torch._utils", "_rebuild_qtensor"),
+        ("torch._utils", "_rebuild_sparse_tensor"),
+        ("torch._utils", "_rebuild_tensor"),
+        ("torch._utils", "_rebuild_tensor_v2"),
+        ("torch._utils", "_rebuild_tensor_v3"),
+        ("torch._utils", "_rebuild_wrapper_subclass"),
+        ("torch.serialization", "_get_layout"),
+        ("transformers.integrations.deepspeed", "HfDeepSpeedConfig"),
+        ("transformers.integrations.deepspeed", "HfTrainerDeepSpeedConfig"),
+        ("transformers.trainer_pt_utils", "AcceleratorConfig"),
+        ("transformers.trainer_utils", "HubStrategy"),
+        ("transformers.trainer_utils", "IntervalStrategy"),
+        ("transformers.trainer_utils", "SaveStrategy"),
+        ("transformers.trainer_utils", "SchedulerType"),
+        ("transformers.training_args", "OptimizerNames"),
+        ("transformers.training_args", "TrainingArguments"),
+    }
+)
 _TRUSTED_REDUCE_REFERENCES = (
     frozenset(
         {
@@ -1602,6 +1662,14 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
         except Exception as error:
             enrichment_errors.append(("python_import_allowlist_origin", error))
         try:
+            report = _with_untrusted_invoked_allowlisted_import_findings(
+                report,
+                import_references,
+                invocation_classification[0] if invocation_classification is not None else frozenset(),
+            )
+        except Exception as error:
+            enrichment_errors.append(("python_import_allowlist_loaded_identity", error))
+        try:
             call_graph_findings = find_dangerous_call_graphs(import_references, callable_invocations)
         except _CallGraphAnalysisLimitError as error:
             call_graph_findings = error.partial_findings
@@ -1824,6 +1892,77 @@ def _with_untrusted_allowlisted_import_findings(
                 why=(
                     "Allowlisted modules are safe only when they resolve from the standard library or installed "
                     "site-packages; a project-local shadow module can execute arbitrary import-time code."
+                ),
+            )
+        )
+        existing_references.add(key)
+    if not additional_findings:
+        return report
+    return PickleReport(
+        source=report.source,
+        status=report.status,
+        verdict=SafetyVerdict.MALICIOUS if report.verdict == SafetyVerdict.MALICIOUS else SafetyVerdict.SUSPICIOUS,
+        findings=(*report.findings, *additional_findings),
+        notices=report.notices,
+        errors=report.errors,
+        coverage=report.coverage,
+        metadata=report.to_dict()["metadata"],
+        duration_s=report.duration_s,
+    )
+
+
+def _with_untrusted_invoked_allowlisted_import_findings(
+    report: PickleReport,
+    import_references: object,
+    invoked_global_positions: frozenset[int],
+) -> PickleReport:
+    if not invoked_global_positions:
+        return report
+    existing_references = {
+        (
+            str(finding.details.get("import_reference", "")),
+            finding.details.get("position"),
+        )
+        for finding in report.findings
+    }
+    additional_findings: list[Finding] = []
+    for raw_reference in _sequence(import_references):
+        reference = _mapping(raw_reference)
+        module = str(reference.get("module", ""))
+        name = str(reference.get("name", ""))
+        import_reference = str(reference.get("import_reference", ""))
+        position = _optional_int(reference.get("position"))
+        key = (import_reference, position)
+        if (
+            not module
+            or not name
+            or not import_reference
+            or position is None
+            or position not in invoked_global_positions
+            or bool(reference.get("is_dangerous"))
+            or not bool(reference.get("requires_origin_verification"))
+            or (module, name) not in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES
+            or key in existing_references
+            or import_only_reference_is_proven_trusted(module, name)
+        ):
+            continue
+        additional_findings.append(
+            Finding(
+                message=f"Found invoked allowlisted global without trusted loaded implementation: {import_reference}",
+                severity=Severity.WARNING,
+                location=f"{report.source} (pos {position})",
+                rule_code="NON_ALLOWLISTED_GLOBAL",
+                details={
+                    "opcode": str(reference.get("opcode", "")),
+                    "module": module,
+                    "name": name,
+                    "import_reference": import_reference,
+                    "position": position,
+                    "invoked": True,
+                },
+                why=(
+                    "Allowlisted callable globals are suppressible only when the loaded implementation can be "
+                    "tied back to trusted inspected source or an approved extension owner."
                 ),
             )
         )

@@ -2243,11 +2243,16 @@ def _loaded_site_package_reference_owner_matches(module_name: str, name: str, va
         return False
     if isinstance(value, FunctionType):
         return _function_owner_matches_trusted_source(value)
-    if type(value) is type:
-        class_module = type.__getattribute__(value, "__module__")
+    if _runtime_value_is_class(value):
+        class_ = cast(type[object], value)
+        class_module = type.__getattribute__(class_, "__module__")
         if type(class_module) is not str or _trusted_python_module_source_path(class_module) is None:
             return False
-        return _class_pickle_executable_members_match_trusted_source(value)
+        return (
+            _class_metaclass_call_matches_trusted_source(class_)
+            and _class_pickle_executable_members_match_trusted_source(class_)
+            and _class_pickle_data_descriptors_match_trusted_source(class_)
+        )
     functions = _pickle_executable_functions(value)
     if functions:
         return all(_function_owner_matches_trusted_source(function) for function in functions)
@@ -2265,6 +2270,54 @@ def _class_pickle_executable_members_match_trusted_source(class_: type[object]) 
             ):
                 return False
     return True
+
+
+def _class_metaclass_call_matches_trusted_source(class_: type[object]) -> bool:
+    metaclass = type(class_)
+    for base in type.__getattribute__(metaclass, "__mro__"):
+        namespace = type.__getattribute__(base, "__dict__")
+        if "__call__" in namespace:
+            return _pickle_executable_member_matches_trusted_source(base, "__call__", namespace["__call__"])
+    return True
+
+
+def _class_pickle_data_descriptors_match_trusted_source(class_: type[object]) -> bool:
+    for base in type.__getattribute__(class_, "__mro__"):
+        namespace = type.__getattribute__(base, "__dict__")
+        for member_name, member in namespace.items():
+            if _runtime_type_member_is_data_descriptor(member) and not _data_descriptor_matches_trusted_source(
+                base,
+                member_name,
+                member,
+            ):
+                return False
+    return True
+
+
+def _data_descriptor_matches_trusted_source(owner: type[object], name: str, member: object) -> bool:
+    if not _pickle_executable_member_matches_trusted_source(owner, name, member):
+        return False
+    descriptor_type = type(member)
+    for method_name in ("__set__", "__delete__"):
+        for base in type.__getattribute__(descriptor_type, "__mro__"):
+            namespace = type.__getattribute__(base, "__dict__")
+            if method_name in namespace:
+                if not _pickle_executable_member_matches_trusted_source(base, method_name, namespace[method_name]):
+                    return False
+                break
+    return True
+
+
+def _runtime_type_member_is_data_descriptor(value: object) -> bool:
+    return any(
+        "__set__" in type.__getattribute__(class_, "__dict__")
+        or "__delete__" in type.__getattribute__(class_, "__dict__")
+        for class_ in type.__getattribute__(type(value), "__mro__")
+    )
+
+
+def _runtime_value_is_class(value: object) -> bool:
+    return type in type.__getattribute__(type(value), "__mro__")
 
 
 def _pickle_executable_member_matches_trusted_source(owner: type[object], name: str, member: object) -> bool:
@@ -2329,8 +2382,9 @@ def _pickle_executable_functions(value: object) -> tuple[FunctionType, ...]:
             )
 
     add_functions(value)
-    if type(value) is type:
-        for base in type.__getattribute__(value, "__mro__"):
+    if _runtime_value_is_class(value):
+        class_ = cast(type[object], value)
+        for base in type.__getattribute__(class_, "__mro__"):
             namespace = type.__getattribute__(base, "__dict__")
             for member_name in (
                 "__new__",
@@ -2359,7 +2413,31 @@ def _function_owner_matches_trusted_source(function: FunctionType) -> bool:
         code_path = Path(function.__code__.co_filename).resolve()
     except (OSError, RuntimeError, ValueError):
         return False
-    return code_path == source_path
+    return code_path == source_path and _function_code_matches_trusted_source(function, source_path)
+
+
+def _function_code_matches_trusted_source(function: FunctionType, source_path: Path) -> bool:
+    code = function.__code__
+    return any(candidate == code for candidate in _trusted_source_code_objects(str(source_path)))
+
+
+@_register_source_sensitive_cache
+@lru_cache(maxsize=1024)
+def _trusted_source_code_objects(source_path: str) -> tuple[CodeType, ...]:
+    path = Path(source_path)
+    try:
+        source = _read_bounded_source_text(path)
+        module_code = compile(source, source_path, "exec", dont_inherit=True, optimize=sys.flags.optimize)
+    except Exception:
+        return ()
+    return tuple(_iter_code_objects(module_code))
+
+
+def _iter_code_objects(code: CodeType) -> Iterator[CodeType]:
+    yield code
+    for constant in code.co_consts:
+        if isinstance(constant, CodeType):
+            yield from _iter_code_objects(constant)
 
 
 def _trusted_python_module_source_path(module_name: str) -> Path | None:
