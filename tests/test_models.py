@@ -396,7 +396,7 @@ class TestFileMetadataModel:
         metadata.set_file_hashes({"sha256": "a" * 64})
         assert metadata.file_hashes is not None
 
-    def test_set_file_hashes_preserves_sha256_prefix(self):
+    def test_set_file_hashes_preserves_sha256_prefix(self) -> None:
         """Test setting bounded prefix hashes."""
         metadata = FileMetadataModel()
         metadata.set_file_hashes({"sha256_prefix": "a" * 64})

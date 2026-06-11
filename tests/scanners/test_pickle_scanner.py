@@ -1963,6 +1963,32 @@ def test_large_non_seekable_legacy_pytorch_stream_uses_stream_budget_not_file_ca
     assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
 
 
+def test_large_non_seekable_legacy_preamble_without_layout_keeps_file_size_limit() -> None:
+    partial_legacy = pickle.dumps(pickle_scanner._PYTORCH_LEGACY_MAGIC_NUMBER, protocol=2) + pickle.dumps(
+        pickle_scanner._PYTORCH_LEGACY_PROTOCOL_VERSION,
+        protocol=2,
+    )
+    payload = partial_legacy + (b"A" * 4096)
+    stream = NonSeekableBytesIO(payload)
+
+    result = PickleScanner(
+        config={
+            "max_file_read_size": 64,
+            "max_known_stream_read_bytes": len(payload),
+        }
+    ).scan_stream(
+        stream,
+        len(payload),
+        source="legacy-preamble-only.pt",
+    )
+
+    assert result.success is False
+    assert "scan_outcome" not in result.metadata
+    assert "legacy_pytorch_control_layout_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert any(check.name == "File Size Limit" and check.rule_code == "S904" for check in result.checks)
+    assert stream.tell() == min(len(payload), pickle_scanner._PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES)
+
+
 def test_large_non_seekable_legacy_pytorch_stream_budget_exhaustion_is_inconclusive() -> None:
     payload, pickle_end = _make_legacy_pytorch_container(b"A" * 512)
 
