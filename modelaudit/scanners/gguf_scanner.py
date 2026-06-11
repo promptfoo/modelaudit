@@ -9,6 +9,8 @@ from collections.abc import Iterable
 from typing import Any, BinaryIO, ClassVar, NamedTuple
 from urllib.parse import unquote
 
+from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
+
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 # Map ggml_type enum to (block_size, type_size) for comprehensive validation
@@ -55,7 +57,8 @@ _GGUF_METADATA_COMMAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "shell_command",
         re.compile(
-            r"(?i)(?:^|[;&|`$()]\s*)(?:bash|sh|zsh|fish|cmd(?:\.exe)?|powershell|pwsh|python(?:3)?|perl|ruby|node)\s+-[ce]\b",
+            r"(?i)(?:^|[;&|`$()]\s*)(?:(?:[a-z]:)?[\\/](?:[^\\/\s]+[\\/])*)?"
+            r"(?:bash|sh|zsh|fish|cmd(?:\.exe)?|powershell|pwsh|python(?:3)?|perl|ruby|node)\s+(?:-[ce]|/c)\b",
         ),
     ),
     ("backtick_command", re.compile(r"(?i)`\s*(?:rm|curl|wget|bash|sh|python(?:3)?|powershell|pwsh|cmd(?:\.exe)?)\b")),
@@ -88,6 +91,8 @@ _GGUF_FETCH_OPTIONS_WITH_VALUE = frozenset(
         "--proxy",
         "-u",
         "--user",
+        "-x",
+        "--request",
         "--url",
         "-uri",
         "-outfile",
@@ -101,6 +106,21 @@ _GGUF_METADATA_NETWORK_APIS = (
     "urllib.request.urlopen",
     "urlopen",
     "fetch",
+)
+_GGUF_NETWORK_URL_ASSIGNMENT_PATTERN = re.compile(
+    r"""(?is)\b(?P<name>[a-z_][a-z0-9_]*)\s*=\s*(?:[rubf]{0,2})?(?P<quote>['"])(?:https?|ftp)://[^'"\s<>]+(?P=quote)""",
+)
+_GGUF_DEFAULT_MAX_TEMPLATE_SIZE = 50000
+_GGUF_CHAT_TEMPLATE_METADATA_PATTERN_TYPES = (
+    "critical_injection",
+    "object_traversal",
+    "global_access",
+    "environment_access",
+)
+_GGUF_CHAT_TEMPLATE_METADATA_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (pattern_type, re.compile(pattern, re.IGNORECASE | re.MULTILINE))
+    for pattern_type in _GGUF_CHAT_TEMPLATE_METADATA_PATTERN_TYPES
+    for pattern in JINJA2_SSTI_PATTERNS.get(pattern_type, [])
 )
 _GGUF_REMOTE_URL_SCHEMES = ("http://", "https://", "ftp://")
 _GGUF_SHELL_SEGMENT_SEPARATORS = ";&|`$()"
@@ -404,7 +424,15 @@ class GgufScanner(BaseScanner):
                 metadata[key] = value
 
                 # Security check for suspicious values
-                metadata_evidence = self._metadata_value_security_evidence(key, value) if isinstance(value, str) else []
+                metadata_evidence = (
+                    self._metadata_value_security_evidence(
+                        key,
+                        value,
+                        max_template_size=self.config.get("max_template_size", _GGUF_DEFAULT_MAX_TEMPLATE_SIZE),
+                    )
+                    if isinstance(value, str)
+                    else []
+                )
                 for evidence in metadata_evidence:
                     result.add_check(
                         name="Metadata Value Security Check",
@@ -1121,14 +1149,38 @@ class GgufScanner(BaseScanner):
             return False
         return not (after and (after.isalnum() or after in "._-"))
 
-    @classmethod
-    def _api_argument_window_has_remote_url(cls, value: str, after_position: int) -> bool:
+    @staticmethod
+    def _api_argument_window(value: str, after_position: int) -> str | None:
         open_position = value.find("(", after_position, after_position + 128)
         if open_position == -1:
-            return False
+            return None
         close_position = value.find(")", open_position + 1, open_position + 2049)
         end_position = close_position if close_position != -1 else open_position + 2048
-        return cls._has_remote_url(value[open_position:end_position])
+        return value[open_position:end_position]
+
+    @classmethod
+    def _api_argument_window_has_remote_url(cls, value: str, after_position: int) -> bool:
+        argument_window = cls._api_argument_window(value, after_position)
+        return argument_window is not None and cls._has_remote_url(argument_window)
+
+    @staticmethod
+    def _remote_url_variable_names_before(value: str, position: int) -> set[str]:
+        names: set[str] = set()
+        for match in _GGUF_NETWORK_URL_ASSIGNMENT_PATTERN.finditer(value, 0, position):
+            names.add(match.group("name"))
+            if len(names) >= 64:
+                break
+        return names
+
+    @classmethod
+    def _argument_window_uses_variable(cls, argument_window: str, names: set[str]) -> bool:
+        for name in names:
+            if not name:
+                continue
+            for position in cls._iter_substring_positions(argument_window, name):
+                if cls._has_token_boundary(argument_window, position, name):
+                    return True
+        return False
 
     @classmethod
     def _shell_remote_fetch_pattern(cls, value: str) -> str | None:
@@ -1158,14 +1210,35 @@ class GgufScanner(BaseScanner):
                 if not cls._has_token_boundary(value_lower, api_position, api_name):
                     continue
                 after_position = api_position + len(api_name)
-                if cls._api_argument_window_has_remote_url(value_lower, after_position):
+                argument_window = cls._api_argument_window(value_lower, after_position)
+                if argument_window is None:
+                    continue
+                if cls._has_remote_url(argument_window):
+                    return "network_api"
+                remote_url_variables = cls._remote_url_variable_names_before(value_lower, api_position)
+                if remote_url_variables and cls._argument_window_uses_variable(argument_window, remote_url_variables):
                     return "network_api"
         return None
 
     @classmethod
-    def _metadata_value_security_evidence(cls, key: str, value: str) -> list[dict[str, str]]:
+    def _oversized_chat_template_security_evidence(cls, value: str) -> list[dict[str, str]]:
+        for pattern_type, pattern in _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS:
+            if pattern.search(value):
+                return [{"evidence_type": "template_injection", "pattern": f"jinja2_{pattern_type}"}]
+        return []
+
+    @classmethod
+    def _metadata_value_security_evidence(
+        cls,
+        key: str,
+        value: str,
+        *,
+        max_template_size: int = _GGUF_DEFAULT_MAX_TEMPLATE_SIZE,
+    ) -> list[dict[str, str]]:
         if cls._is_chat_template_key(key):
-            return []
+            if len(value) <= max_template_size:
+                return []
+            return cls._oversized_chat_template_security_evidence(value)
 
         evidence: list[dict[str, str]] = []
         if cls._contains_path_traversal(value):

