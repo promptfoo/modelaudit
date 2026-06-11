@@ -90,7 +90,7 @@ _PROTO_GROUP_MAX_ROUTING_FIELDS = 512
 _PROTO_GROUP_MAX_ROUTING_DEPTH = 8
 _COREML_PROTO_SIGNATURE_READ_BYTES = 1024 * 1024
 _SENTENCEPIECE_MODEL_PROTO_READ_BYTES = 64 * 1024
-_SENTENCEPIECE_MODEL_MAX_FIELDS = 4096
+_SENTENCEPIECE_MODEL_MAX_FIELDS = 16384
 _SENTENCEPIECE_MIN_STRONG_PIECES = 8
 _SENTENCEPIECE_MAX_PIECE_FIELDS = 16
 _SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES = 4096
@@ -6001,6 +6001,9 @@ def detect_format_from_magic_bytes(
         if xgboost_route is not None:
             return xgboost_route
 
+    if file_path is not None and file_path.suffix.lower() == ".model" and is_sentencepiece_model_proto_file(file_path):
+        return "unknown"
+
     renamed_tensorflow_format = "unknown"
     if file_path is not None:
         renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(
@@ -6175,6 +6178,9 @@ def detect_file_format_from_magic(path: str) -> str:
             if _could_be_content_routed_flax_msgpack(file_path):
                 return "flax_msgpack"
 
+            if file_path.suffix.lower() == ".model" and is_sentencepiece_model_proto_file(file_path):
+                return "unknown"
+
             renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
             if renamed_tensorflow_format != "unknown":
                 return renamed_tensorflow_format
@@ -6326,6 +6332,9 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             xgboost_route = _detect_extensionless_xgboost_ubjson_route(prefix[:xgboost_probe_size])
             if xgboost_route is not None:
                 return xgboost_route
+
+        if file_path.suffix.lower() == ".model" and is_sentencepiece_model_proto_file(file_path):
+            return "unknown"
 
         if (
             _allows_renamed_binary_content_route(file_path)
@@ -6531,6 +6540,9 @@ def detect_file_format(path: str) -> str:
         )
         if xgboost_route is not None:
             return xgboost_route
+
+    if ext == ".model" and is_sentencepiece_model_proto_file(file_path):
+        return "unknown"
 
     renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(
         file_path,

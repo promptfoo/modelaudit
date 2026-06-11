@@ -34,6 +34,11 @@ from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, Iss
 from modelaudit.scanners.tar_scanner import TarScanner
 from modelaudit.scanners.xgboost_scanner import XGBOOST_JSON_ROUTING_CHUNK_BYTES, XGBoostScanner
 from modelaudit.scanners.zip_scanner import ZipScanner
+from modelaudit.utils.file.detection import (
+    detect_file_format,
+    detect_file_format_for_skip_filter,
+    detect_file_format_from_magic,
+)
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from tests.cli_output import parse_click_json_output
 
@@ -90,6 +95,23 @@ def _sentencepiece_model_proto() -> bytes:
         ("<0x03>", 6),
         ("<0x04>", 6),
     ]
+    return b"".join(_sentencepiece_piece(piece, piece_type) for piece, piece_type in pieces)
+
+
+def _large_real_sentencepiece_model_proto_shape() -> bytes:
+    """Mirror large uMT5-style spiece.model prefixes without committing a large fixture."""
+    pieces = [
+        ("<pad>", 3),
+        ("</s>", 3),
+        ("<s>", 3),
+        ("<unk>", 2),
+        ("[eod]", 4),
+        ("[web]", 4),
+        ("[wiki]", 4),
+        ("[translate]", 4),
+    ]
+    pieces.extend((f"<0x{byte:02X}>", 6) for byte in range(256))
+    pieces.extend((f"t{index}", 1) for index in range(7000))
     return b"".join(_sentencepiece_piece(piece, piece_type) for piece, piece_type in pieces)
 
 
@@ -1792,6 +1814,41 @@ class TestXGBoostFailClosedEndToEnd:
         assert "xgboost" not in aggregate.scanner_names
         assert determine_exit_code(aggregate) == 0
         assert not any(issue.rule_code == "S1004" for issue in aggregate.issues)
+
+    def test_large_real_sentencepiece_model_shape_is_not_tensorflow_or_xgboost_false_positive(
+        self, tmp_path: Path
+    ) -> None:
+        # Mirrors baidu/NAVA@16c20287... Wan2.2-TI2V-5B/google/umt5-xxl/spiece.model:
+        # a large SentencePiece ModelProto whose bounded prefix has thousands of small piece fields.
+        tokenizer_model = tmp_path / "spiece.model"
+        tokenizer_model.write_bytes(_large_real_sentencepiece_model_proto_shape())
+
+        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+        streaming = scan_model_streaming(
+            file_generator=iterate_files_streaming(tmp_path),
+            scan_root=str(tmp_path),
+            delete_after_scan=False,
+            cache_enabled=False,
+            skip_file_types=True,
+        )
+        cli_result = CliRunner().invoke(
+            cli,
+            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
+            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+        )
+        cli_payload = parse_click_json_output(cli_result.output)
+
+        assert detect_file_format(str(tokenizer_model)) == "unknown"
+        assert detect_file_format_from_magic(str(tokenizer_model)) == "unknown"
+        assert detect_file_format_for_skip_filter(str(tokenizer_model)) == "unknown"
+        assert direct.success is True
+        assert direct.scanner_name == "unknown"
+        _assert_no_xgboost_s1004(aggregate)
+        _assert_no_xgboost_s1004(streaming)
+        assert cli_result.exit_code == 0
+        assert "xgboost" not in cli_payload.get("scanner_names", [])
+        assert not any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
 
     @pytest.mark.parametrize("fixture_name", _SENTENCEPIECE_OFFICIAL_FIXTURES)
     def test_dependency_sentencepiece_model_with_disabled_specials_is_not_xgboost_false_positive(
