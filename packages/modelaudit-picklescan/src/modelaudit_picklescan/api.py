@@ -86,25 +86,9 @@ _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES = 512 * 1024 * 1024
 _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES = 512 * 1024 * 1024
 _RUST_EXTENSION_MODULE = "modelaudit_picklescan._rust"
 _MAX_INERT_INITIALIZATION_MODULES = 32
+_SAFE_NUMPY_RECONSTRUCT_MAX_PAYLOAD_BYTES = 10 * 1024 * 1024
+_SAFE_NUMPY_RECONSTRUCT_MAX_OPCODES = 100_000
 _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES = frozenset({"BUILD", "NEWOBJ", "NEWOBJ_EX"})
-_TRUSTED_FRAMEWORK_IMPORT_ONLY_METADATA_REFERENCES = frozenset(
-    {
-        ("accelerate.state", "PartialState"),
-        ("accelerate.utils.dataclasses", "DeepSpeedPlugin"),
-        ("accelerate.utils.dataclasses", "DistributedType"),
-        ("torch", "bfloat16"),
-        ("torch", "device"),
-        ("transformers.integrations.deepspeed", "HfDeepSpeedConfig"),
-        ("transformers.integrations.deepspeed", "HfTrainerDeepSpeedConfig"),
-        ("transformers.trainer_pt_utils", "AcceleratorConfig"),
-        ("transformers.trainer_utils", "HubStrategy"),
-        ("transformers.trainer_utils", "IntervalStrategy"),
-        ("transformers.trainer_utils", "SaveStrategy"),
-        ("transformers.trainer_utils", "SchedulerType"),
-        ("transformers.training_args", "OptimizerNames"),
-        ("transformers.training_args", "TrainingArguments"),
-    }
-)
 _TRUSTED_FRAMEWORK_REDUCE_REFERENCES = frozenset(
     {
         ("accelerate.utils.dataclasses", "DistributedType"),
@@ -1672,11 +1656,7 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
         and callable_invocations_complete
         and non_allowlisted_global_imports_complete
         and invocation_classification is not None
-        and (
-            inert_initialization_modules
-            or trusted_import_references
-            or _has_trusted_framework_import_only_metadata_findings(report)
-        )
+        and (inert_initialization_modules or trusted_import_references)
     ):
         (
             invoked_global_positions,
@@ -1878,18 +1858,6 @@ def _proven_trusted_import_references(report: PickleReport) -> frozenset[tuple[s
     return frozenset(references)
 
 
-def _has_trusted_framework_import_only_metadata_findings(report: PickleReport) -> bool:
-    return any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and (
-            str(finding.details.get("module", "")),
-            str(finding.details.get("name", "")),
-        )
-        in _TRUSTED_FRAMEWORK_IMPORT_ONLY_METADATA_REFERENCES
-        for finding in report.findings
-    )
-
-
 def _without_proven_safe_import_findings(
     report: PickleReport,
     inert_initialization_modules: frozenset[str],
@@ -1972,15 +1940,8 @@ def _non_allowlisted_import_finding_is_proven_safe(
     trusted_reference_is_proven_safe = position is not None and (
         not finding_is_invoked or invocation_is_analyzed or invocation_is_trusted_reconstruction
     )
-    framework_import_only_metadata_is_proven_safe = (
-        position is not None
-        and not finding_is_invoked
-        and reference in _TRUSTED_FRAMEWORK_IMPORT_ONLY_METADATA_REFERENCES
-    )
-    return (
-        framework_import_only_metadata_is_proven_safe
-        or (trusted_reference_is_proven_safe and (module, name) in trusted_import_references)
-        or (inert_reference_is_proven_safe and module in inert_initialization_modules)
+    return (trusted_reference_is_proven_safe and (module, name) in trusted_import_references) or (
+        inert_reference_is_proven_safe and module in inert_initialization_modules
     )
 
 
@@ -2080,6 +2041,7 @@ def _call_graph_finding_is_safe_numpy_reconstruction_noise(
     return (
         suppress_safe_numpy_reconstruct
         and (finding.module, finding.name) in _NUMPY_RECONSTRUCT_REFERENCES
+        and import_only_reference_is_proven_trusted(finding.module, finding.name)
         and finding.sink == "builtins.__import__"
         and finding.invocation_opcode in {None, "BUILD", "REDUCE"}
         and (
@@ -2095,6 +2057,8 @@ def _call_graph_finding_is_safe_numpy_reconstruction_noise(
 
 def _pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload: bytes | None) -> bool:
     if not payload:
+        return False
+    if len(payload) > _SAFE_NUMPY_RECONSTRUCT_MAX_PAYLOAD_BYTES:
         return False
 
     stack: list[object] = []
@@ -2125,165 +2089,165 @@ def _pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload: bytes | 
         return None
 
     try:
-        opcodes = tuple(pickletools.genops(payload))
+        for opcode_count, (opcode, arg, _pos) in enumerate(pickletools.genops(payload), start=1):
+            if opcode_count > _SAFE_NUMPY_RECONSTRUCT_MAX_OPCODES:
+                return False
+            opcode_name = opcode.name
+            if opcode_name in {"EXT1", "EXT2", "EXT4", "NEXT_BUFFER", "READONLY_BUFFER"}:
+                return False
+            if opcode_name in {"PROTO", "FRAME"}:
+                continue
+            if opcode_name == "STOP":
+                break
+            if opcode_name == "MARK":
+                stack.append(_ABSTRACT_MARK)
+            elif opcode_name == "GLOBAL":
+                module, name = _pickle_global_arg_parts(arg)
+                stack.append(_AbstractGlobal(module, name) if module and name else _ABSTRACT_UNKNOWN)
+            elif opcode_name == "STACK_GLOBAL":
+                stack_name = pop_value()
+                stack_module = pop_value()
+                stack.append(
+                    _AbstractGlobal(stack_module, stack_name)
+                    if isinstance(stack_module, str) and isinstance(stack_name, str)
+                    else _ABSTRACT_UNKNOWN
+                )
+            elif opcode_name in {
+                "BINUNICODE",
+                "SHORT_BINUNICODE",
+                "BINUNICODE8",
+                "UNICODE",
+                "STRING",
+                "BINSTRING",
+                "SHORT_BINSTRING",
+            }:
+                stack.append(str(arg))
+            elif opcode_name in {"BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"}:
+                stack.append(_AbstractBytes())
+            elif opcode_name in {
+                "BININT",
+                "BININT1",
+                "BININT2",
+                "LONG",
+                "LONG1",
+                "LONG4",
+                "INT",
+                "FLOAT",
+                "BINFLOAT",
+            }:
+                stack.append(arg)
+            elif opcode_name == "NONE":
+                stack.append(None)
+            elif opcode_name == "NEWTRUE":
+                stack.append(True)
+            elif opcode_name == "NEWFALSE":
+                stack.append(False)
+            elif opcode_name == "EMPTY_TUPLE":
+                stack.append(())
+            elif opcode_name == "EMPTY_LIST":
+                stack.append([])
+            elif opcode_name == "EMPTY_DICT":
+                stack.append({})
+            elif opcode_name == "TUPLE":
+                items = pop_marked_items()
+                stack.append(tuple(items) if items is not None else _ABSTRACT_UNKNOWN)
+            elif opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
+                tuple_size = int(opcode_name[-1])
+                if len(stack) < tuple_size:
+                    stack.append(_ABSTRACT_UNKNOWN)
+                    continue
+                items = stack[-tuple_size:]
+                del stack[-tuple_size:]
+                stack.append(tuple(items))
+            elif opcode_name == "LIST":
+                items = pop_marked_items()
+                stack.append(items if items is not None else _ABSTRACT_UNKNOWN)
+            elif opcode_name == "APPEND":
+                value = pop_value()
+                if stack and isinstance(stack[-1], list):
+                    stack[-1].append(value)
+                else:
+                    stack.append(_ABSTRACT_UNKNOWN)
+            elif opcode_name == "APPENDS":
+                items = pop_marked_items()
+                if items is not None and stack and isinstance(stack[-1], list):
+                    stack[-1].extend(items)
+                else:
+                    stack.append(_ABSTRACT_UNKNOWN)
+            elif opcode_name == "DICT":
+                items = pop_marked_items()
+                stack.append(_abstract_dict_from_items(items) if items is not None else _ABSTRACT_UNKNOWN)
+            elif opcode_name == "SETITEM":
+                value = pop_value()
+                key = pop_value()
+                if stack and isinstance(stack[-1], dict):
+                    stack[-1][key] = value
+                else:
+                    stack.append(_ABSTRACT_UNKNOWN)
+            elif opcode_name == "SETITEMS":
+                items = pop_marked_items()
+                if items is not None and stack and isinstance(stack[-1], dict):
+                    stack[-1].update(_abstract_dict_from_items(items))
+                else:
+                    stack.append(_ABSTRACT_UNKNOWN)
+            elif opcode_name in {"BINPUT", "LONG_BINPUT", "PUT"}:
+                key = memo_key(arg)
+                if key is not None and stack:
+                    memo[key] = stack[-1]
+            elif opcode_name == "MEMOIZE":
+                if stack:
+                    memo[len(memo)] = stack[-1]
+            elif opcode_name in {"BINGET", "LONG_BINGET", "GET"}:
+                key = memo_key(arg)
+                stack.append(memo.get(key, _ABSTRACT_UNKNOWN) if key is not None else _ABSTRACT_UNKNOWN)
+            elif opcode_name == "REDUCE":
+                args = pop_value()
+                function = pop_value()
+                if _abstract_global_is(function, _CODECS_ENCODE_REFERENCES):
+                    stack.append(
+                        _AbstractBytes() if _codecs_encode_args_are_safe(args) else _AbstractCallResult(function, args)
+                    )
+                elif _abstract_global_is(function, _NUMPY_DTYPE_REFERENCES):
+                    stack.append(
+                        _AbstractNumpyDType()
+                        if _numpy_dtype_reduce_args_are_safe(args)
+                        else _AbstractCallResult(function, args)
+                    )
+                elif _abstract_global_is(function, _NUMPY_RECONSTRUCT_REFERENCES):
+                    saw_numpy_reconstruct = True
+                    if _numpy_reconstruct_args_are_safe(args):
+                        stack.append(_AbstractNumpyArraySeed())
+                    else:
+                        unsafe_numpy_reconstruct = True
+                        stack.append(_AbstractCallResult(function, args))
+                else:
+                    stack.append(_AbstractCallResult(function, args))
+            elif opcode_name == "BUILD":
+                state = pop_value()
+                obj = pop_value()
+                if isinstance(obj, _AbstractNumpyArraySeed):
+                    if _numpy_ndarray_build_state_is_safe(state):
+                        stack.append(_AbstractNumpyArray())
+                    else:
+                        unsafe_numpy_reconstruct = True
+                        stack.append(_ABSTRACT_UNKNOWN)
+                elif isinstance(obj, _AbstractNumpyDType):
+                    stack.append(obj if _numpy_dtype_build_state_is_safe(state) else _ABSTRACT_UNKNOWN)
+                else:
+                    stack.append(obj)
+            elif opcode_name == "POP":
+                if stack:
+                    stack.pop()
+            elif opcode_name == "POP_MARK":
+                pop_marked_items()
+            elif opcode_name == "DUP":
+                stack.append(stack[-1] if stack else _ABSTRACT_UNKNOWN)
+            elif opcode_name in {"PERSID", "BINPERSID"}:
+                stack.append(_ABSTRACT_UNKNOWN)
+            else:
+                stack.append(_ABSTRACT_UNKNOWN)
     except Exception:
         return False
-
-    for opcode, arg, _pos in opcodes:
-        opcode_name = opcode.name
-        if opcode_name in {"EXT1", "EXT2", "EXT4", "NEXT_BUFFER", "READONLY_BUFFER"}:
-            return False
-        if opcode_name in {"PROTO", "FRAME"}:
-            continue
-        if opcode_name == "STOP":
-            break
-        if opcode_name == "MARK":
-            stack.append(_ABSTRACT_MARK)
-        elif opcode_name == "GLOBAL":
-            module, name = _pickle_global_arg_parts(arg)
-            stack.append(_AbstractGlobal(module, name) if module and name else _ABSTRACT_UNKNOWN)
-        elif opcode_name == "STACK_GLOBAL":
-            stack_name = pop_value()
-            stack_module = pop_value()
-            stack.append(
-                _AbstractGlobal(stack_module, stack_name)
-                if isinstance(stack_module, str) and isinstance(stack_name, str)
-                else _ABSTRACT_UNKNOWN
-            )
-        elif opcode_name in {
-            "BINUNICODE",
-            "SHORT_BINUNICODE",
-            "BINUNICODE8",
-            "UNICODE",
-            "STRING",
-            "BINSTRING",
-            "SHORT_BINSTRING",
-        }:
-            stack.append(str(arg))
-        elif opcode_name in {"BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"}:
-            stack.append(_AbstractBytes())
-        elif opcode_name in {
-            "BININT",
-            "BININT1",
-            "BININT2",
-            "LONG",
-            "LONG1",
-            "LONG4",
-            "INT",
-            "FLOAT",
-            "BINFLOAT",
-        }:
-            stack.append(arg)
-        elif opcode_name == "NONE":
-            stack.append(None)
-        elif opcode_name == "NEWTRUE":
-            stack.append(True)
-        elif opcode_name == "NEWFALSE":
-            stack.append(False)
-        elif opcode_name == "EMPTY_TUPLE":
-            stack.append(())
-        elif opcode_name == "EMPTY_LIST":
-            stack.append([])
-        elif opcode_name == "EMPTY_DICT":
-            stack.append({})
-        elif opcode_name == "TUPLE":
-            items = pop_marked_items()
-            stack.append(tuple(items) if items is not None else _ABSTRACT_UNKNOWN)
-        elif opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
-            tuple_size = int(opcode_name[-1])
-            if len(stack) < tuple_size:
-                stack.append(_ABSTRACT_UNKNOWN)
-                continue
-            items = stack[-tuple_size:]
-            del stack[-tuple_size:]
-            stack.append(tuple(items))
-        elif opcode_name == "LIST":
-            items = pop_marked_items()
-            stack.append(items if items is not None else _ABSTRACT_UNKNOWN)
-        elif opcode_name == "APPEND":
-            value = pop_value()
-            if stack and isinstance(stack[-1], list):
-                stack[-1].append(value)
-            else:
-                stack.append(_ABSTRACT_UNKNOWN)
-        elif opcode_name == "APPENDS":
-            items = pop_marked_items()
-            if items is not None and stack and isinstance(stack[-1], list):
-                stack[-1].extend(items)
-            else:
-                stack.append(_ABSTRACT_UNKNOWN)
-        elif opcode_name == "DICT":
-            items = pop_marked_items()
-            stack.append(_abstract_dict_from_items(items) if items is not None else _ABSTRACT_UNKNOWN)
-        elif opcode_name == "SETITEM":
-            value = pop_value()
-            key = pop_value()
-            if stack and isinstance(stack[-1], dict):
-                stack[-1][key] = value
-            else:
-                stack.append(_ABSTRACT_UNKNOWN)
-        elif opcode_name == "SETITEMS":
-            items = pop_marked_items()
-            if items is not None and stack and isinstance(stack[-1], dict):
-                stack[-1].update(_abstract_dict_from_items(items))
-            else:
-                stack.append(_ABSTRACT_UNKNOWN)
-        elif opcode_name in {"BINPUT", "LONG_BINPUT", "PUT"}:
-            key = memo_key(arg)
-            if key is not None and stack:
-                memo[key] = stack[-1]
-        elif opcode_name == "MEMOIZE":
-            if stack:
-                memo[len(memo)] = stack[-1]
-        elif opcode_name in {"BINGET", "LONG_BINGET", "GET"}:
-            key = memo_key(arg)
-            stack.append(memo.get(key, _ABSTRACT_UNKNOWN) if key is not None else _ABSTRACT_UNKNOWN)
-        elif opcode_name == "REDUCE":
-            args = pop_value()
-            function = pop_value()
-            if _abstract_global_is(function, _CODECS_ENCODE_REFERENCES):
-                stack.append(
-                    _AbstractBytes() if _codecs_encode_args_are_safe(args) else _AbstractCallResult(function, args)
-                )
-            elif _abstract_global_is(function, _NUMPY_DTYPE_REFERENCES):
-                stack.append(
-                    _AbstractNumpyDType()
-                    if _numpy_dtype_reduce_args_are_safe(args)
-                    else _AbstractCallResult(function, args)
-                )
-            elif _abstract_global_is(function, _NUMPY_RECONSTRUCT_REFERENCES):
-                saw_numpy_reconstruct = True
-                if _numpy_reconstruct_args_are_safe(args):
-                    stack.append(_AbstractNumpyArraySeed())
-                else:
-                    unsafe_numpy_reconstruct = True
-                    stack.append(_AbstractCallResult(function, args))
-            else:
-                stack.append(_AbstractCallResult(function, args))
-        elif opcode_name == "BUILD":
-            state = pop_value()
-            obj = pop_value()
-            if isinstance(obj, _AbstractNumpyArraySeed):
-                if _numpy_ndarray_build_state_is_safe(state):
-                    stack.append(_AbstractNumpyArray())
-                else:
-                    unsafe_numpy_reconstruct = True
-                    stack.append(_ABSTRACT_UNKNOWN)
-            elif isinstance(obj, _AbstractNumpyDType):
-                stack.append(obj if _numpy_dtype_build_state_is_safe(state) else _ABSTRACT_UNKNOWN)
-            else:
-                stack.append(obj)
-        elif opcode_name == "POP":
-            if stack:
-                stack.pop()
-        elif opcode_name == "POP_MARK":
-            pop_marked_items()
-        elif opcode_name == "DUP":
-            stack.append(stack[-1] if stack else _ABSTRACT_UNKNOWN)
-        elif opcode_name in {"PERSID", "BINPERSID"}:
-            stack.append(_ABSTRACT_UNKNOWN)
-        else:
-            stack.append(_ABSTRACT_UNKNOWN)
 
     return saw_numpy_reconstruct and not unsafe_numpy_reconstruct
 

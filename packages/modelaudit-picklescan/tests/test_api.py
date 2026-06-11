@@ -6155,7 +6155,7 @@ def test_scan_bytes_warns_on_unresolved_hf_training_args_framework_metadata(
     assert any(notice.code == "call_graph_source_unavailable" for notice in report.notices)
 
 
-def test_scan_bytes_suppresses_inert_import_only_hf_training_args_metadata(
+def test_scan_bytes_warns_on_unresolved_import_only_hf_training_args_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _force_framework_metadata_unresolved(monkeypatch)
@@ -6164,6 +6164,33 @@ def test_scan_bytes_suppresses_inert_import_only_hf_training_args_metadata(
         report = scan_bytes(
             _hf_training_args_import_only_metadata_payload(),
             source="hf-training-args-import-only-framework-metadata.pkl",
+        )
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _import_reference_pairs(report) >= _HF_TRAINING_ARGS_METADATA_REFERENCES
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "transformers.training_args.TrainingArguments"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_suppresses_import_only_hf_training_args_metadata_with_trusted_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_framework_metadata_unresolved(monkeypatch)
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_reference_is_proven_trusted",
+        lambda module, name: (module, name) in _HF_TRAINING_ARGS_METADATA_REFERENCES,
+    )
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_bytes(
+            _hf_training_args_import_only_metadata_payload(),
+            source="trusted-hf-training-args-import-only-framework-metadata.pkl",
         )
     finally:
         _clear_source_sensitive_caches()
@@ -6311,6 +6338,54 @@ def test_scan_bytes_suppresses_safe_numpy_ndarray_reconstruct_call_graph_noise()
     assert not any(finding.severity == Severity.CRITICAL for finding in report.findings)
 
 
+def test_safe_numpy_ndarray_reconstruct_dataflow_fails_closed_after_opcode_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert package_api._pickle_payload_has_only_safe_numpy_ndarray_reconstruction(
+        _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD
+    )
+
+    monkeypatch.setattr(package_api, "_SAFE_NUMPY_RECONSTRUCT_MAX_OPCODES", 4)
+
+    assert not package_api._pickle_payload_has_only_safe_numpy_ndarray_reconstruction(
+        _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD
+    )
+
+
+def test_safe_numpy_reconstruct_call_graph_suppression_requires_trusted_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finding = CallGraphFinding(
+        module="numpy.core.multiarray",
+        name="_reconstruct",
+        import_reference="numpy.core.multiarray._reconstruct",
+        sink="builtins.__import__",
+        call_path=("numpy.core.multiarray.__getattr__",),
+        invocation_opcode="REDUCE",
+    )
+    monkeypatch.setattr(
+        package_api,
+        "import_only_reference_is_proven_trusted",
+        lambda _module, _name: False,
+    )
+
+    assert not package_api._call_graph_finding_is_safe_numpy_reconstruction_noise(
+        finding,
+        suppress_safe_numpy_reconstruct=True,
+    )
+
+    monkeypatch.setattr(
+        package_api,
+        "import_only_reference_is_proven_trusted",
+        lambda _module, _name: True,
+    )
+
+    assert package_api._call_graph_finding_is_safe_numpy_reconstruction_noise(
+        finding,
+        suppress_safe_numpy_reconstruct=True,
+    )
+
+
 def test_scan_bytes_keeps_numpy_reconstruct_critical_when_class_argument_is_attacker_controlled() -> None:
     payload = _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD.replace(
         b"cnumpy._core.multiarray\n_reconstruct\n",
@@ -6336,6 +6411,129 @@ def test_scan_bytes_keeps_numpy_reconstruct_critical_when_class_argument_is_atta
         finding.rule_code == "DANGEROUS_GLOBAL" and finding.details.get("import_reference") == "builtins.eval"
         for finding in critical_findings
     )
+
+
+def test_scan_bytes_warns_when_hf_import_only_metadata_resolves_to_shadow_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "shadowed-training-args-import-marker"
+    package_dir = tmp_path / "transformers"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        f"open({str(marker)!r}, 'w').write('imported')\nclass TrainingArguments:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "transformers.training_args", raising=False)
+    monkeypatch.delitem(sys.modules, "transformers", raising=False)
+    _clear_source_sensitive_caches()
+    payload = _reference_global("transformers.training_args", "TrainingArguments") + b"."
+    try:
+        report = scan_bytes(payload, source="shadowed-hf-training-args-import-only.pkl")
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert marker.exists() is False
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "transformers.training_args.TrainingArguments"
+        for finding in report.findings
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (f"import pickle, sys; sys.path.insert(0, {str(tmp_path)!r}); pickle.loads({payload!r})"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert marker.read_text(encoding="utf-8") == "imported"
+
+
+def test_scan_bytes_warns_when_numpy_reconstruct_resolves_to_shadow_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "shadowed-numpy-reconstruct-marker"
+    numpy_dir = tmp_path / "numpy"
+    core_dir = numpy_dir / "core"
+    core_dir.mkdir(parents=True)
+    (numpy_dir / "__init__.py").write_text(
+        "class ndarray:\n    pass\n\ndef dtype(*_args):\n    return object()\n",
+        encoding="utf-8",
+    )
+    (core_dir / "__init__.py").write_text("", encoding="utf-8")
+    (core_dir / "multiarray.py").write_text(
+        "\n".join(
+            [
+                "def __getattr__(name):",
+                "    import os",
+                f"    open({str(marker)!r}, 'w').write(name)",
+                "    def _reconstruct(*_args):",
+                "        return object()",
+                "    return _reconstruct",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for module_name in (
+        "numpy.core.multiarray",
+        "numpy.core",
+        "numpy._core.multiarray",
+        "numpy._core",
+        "numpy",
+    ):
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+    _clear_source_sensitive_caches()
+    payload = _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD.replace(
+        b"cnumpy._core.multiarray\n_reconstruct\n",
+        b"cnumpy.core.multiarray\n_reconstruct\n",
+    )
+    try:
+        report = scan_bytes(payload, source="shadowed-numpy-reconstruct.pkl")
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert marker.exists() is False
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "numpy.core.multiarray._reconstruct"
+        for finding in report.findings
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "\n".join(
+                [
+                    "import pickle, sys",
+                    f"sys.path.insert(0, {str(tmp_path)!r})",
+                    "try:",
+                    f"    pickle.loads({payload!r})",
+                    "except Exception:",
+                    "    pass",
+                    "",
+                ]
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert marker.read_text(encoding="utf-8") == "_reconstruct"
 
 
 def test_scan_bytes_warns_when_hf_metadata_constructor_resolves_to_shadow_module(

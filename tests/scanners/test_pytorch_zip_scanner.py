@@ -553,7 +553,7 @@ def test_pytorch_zip_training_args_unresolved_framework_metadata_refs_warn(
     )
 
 
-def test_pytorch_zip_suppresses_inert_import_only_training_args_metadata_refs(
+def test_pytorch_zip_warns_on_unresolved_import_only_training_args_metadata_refs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -568,17 +568,12 @@ def test_pytorch_zip_suppresses_inert_import_only_training_args_metadata_refs(
         _clear_source_sensitive_caches()
 
     assert result.success is True
-    assert not any(issue.rule_code == "NON_ALLOWLISTED_GLOBAL" for issue in result.issues)
-    assert (
-        sum(
-            check.name == "Standalone Pickle Import"
-            and check.status == CheckStatus.PASSED
-            and check.details.get("pickle_filename") == "training_args/data.pkl"
-            for check in result.checks
-        )
-        == 10
+    assert any(
+        issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and issue.details.get("import_reference") == "transformers.training_args.TrainingArguments"
+        for issue in result.issues
     )
-    assert not any(
+    assert any(
         check.name == "CVE-2025-32434 Pickle Format Security Analysis" and check.status == CheckStatus.FAILED
         for check in result.checks
     )
