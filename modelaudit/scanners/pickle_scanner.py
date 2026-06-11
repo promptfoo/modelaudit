@@ -271,7 +271,7 @@ _NETWORK_SCAN_SEEDS: tuple[bytes, ...] = (
     b"websocket",
     b"zombie",
 )
-_PICKLE_LITERAL_URL_RE = re.compile(rb"(?i)https?://[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+")
+_PICKLE_LITERAL_URL_RE = re.compile(rb"(?i)https?://[A-Za-z0-9\-._~:/?#@!$*+=%-]+")
 _EXECUTABLE_NETWORK_LITERAL_SEEDS: tuple[bytes, ...] = (
     b"__import__",
     b"cloudpickle.load",
@@ -1187,18 +1187,34 @@ def _pickle_literal_has_executable_network_context(literal: bytes) -> bool:
     return _EXECUTABLE_NETWORK_LITERAL_COMMAND_RE.search(context) is not None
 
 
-def _network_finding_is_inert_pickle_literal_url(
+def _position_is_within_pickle_literal_url_span(data: bytes, record: _PickleLiteralRecord, position: int) -> bool:
+    return any(
+        match.start() <= position < match.end()
+        for match in _PICKLE_LITERAL_URL_RE.finditer(data, record.start, record.end)
+    )
+
+
+def _network_finding_is_inert_pickle_literal_network_evidence(
     finding: dict[str, Any],
     literal_records: tuple[_PickleLiteralRecord, ...],
+    data: bytes,
 ) -> bool:
-    if finding.get("type") != "explicit_network_pattern" or finding.get("pattern_type") != "url":
+    finding_type = finding.get("type")
+    if finding_type == "explicit_network_pattern":
+        if finding.get("pattern_type") != "url":
+            return False
+    elif finding_type != "network_function":
         return False
     position = finding.get("position")
     if not isinstance(position, int):
         return False
     for record in literal_records:
         if record.start <= position < record.end:
-            return not _pickle_literal_has_executable_network_context(record.literal)
+            if _pickle_literal_has_executable_network_context(record.literal):
+                return False
+            if finding_type == "network_function":
+                return _position_is_within_pickle_literal_url_span(data, record, position)
+            return True
     return False
 
 
@@ -1213,7 +1229,9 @@ def filter_inert_pickle_literal_network_findings(
     if not literal_records:
         return findings
     return [
-        finding for finding in findings if not _network_finding_is_inert_pickle_literal_url(finding, literal_records)
+        finding
+        for finding in findings
+        if not _network_finding_is_inert_pickle_literal_network_evidence(finding, literal_records, data)
     ]
 
 
