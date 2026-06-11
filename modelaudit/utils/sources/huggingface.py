@@ -42,6 +42,8 @@ _MAX_HF_STREAMING_EXTENSIONLESS_FILES = 128
 _MAX_HF_STREAMING_UNFILTERED_FILES = 128
 _HF_SAFETENSORS_STRICT_RANGE_REDIRECTS = 5
 _HF_SAFETENSORS_RANGE_ATTEMPTS = 3
+_MAX_HF_SAFETENSORS_INDEX_BYTES = 32 * 1024 * 1024
+_MAX_HF_SAFETENSORS_INDEX_TOTAL_BYTES = 64 * 1024 * 1024
 _HF_DOWNLOAD_WORKER_RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
 _POSIX_TERMINATE_SIGNAL = getattr(signal, "SIGTERM", 15)
 _POSIX_KILL_SIGNAL = getattr(signal, "SIGKILL", 9)
@@ -521,10 +523,10 @@ def _scan_remote_huggingface_safetensors_header(
     raise AssertionError("unreachable SafeTensors range retry state")
 
 
-def _remote_safetensors_shard_details_by_file(
+def _remote_safetensors_filename_shard_details_by_file(
     model_files: list[str], repo_files: list[str]
 ) -> dict[str, dict[str, Any]]:
-    """Return per-shard remote coverage details derived from the immutable repository listing."""
+    """Return per-shard filename coverage details derived from the immutable repository listing."""
     from modelaudit.utils.file.handlers import ShardedModelDetector
 
     grouped: dict[tuple[str, str, int], dict[str, Any]] = {}
@@ -569,6 +571,7 @@ def _remote_safetensors_shard_details_by_file(
         )
         group_details: dict[str, Any] = {
             "complete": complete,
+            "filename_pattern_complete": complete,
             "message": message,
             "pattern": pattern,
             "expected_total_shards": expected_total,
@@ -586,6 +589,307 @@ def _remote_safetensors_shard_details_by_file(
             if filename in selected:
                 details_by_file[filename] = dict(group_details)
     return details_by_file
+
+
+def _is_safetensors_index_file(filename: str) -> bool:
+    return PurePosixPath(filename).name.lower().endswith(".safetensors.index.json")
+
+
+def _remote_index_parent_prefix(index_filename: str) -> str:
+    parent = PurePosixPath(index_filename).parent
+    return "" if parent.as_posix() == "." else f"{parent.as_posix().rstrip('/')}/"
+
+
+def _normalize_safetensors_index_shard_path(index_filename: str, shard_name: object) -> tuple[str | None, str | None]:
+    if not isinstance(shard_name, str) or not shard_name:
+        return None, "non-string or empty shard reference"
+    if "\\" in shard_name:
+        return None, "backslash in shard reference"
+    shard_path = PurePosixPath(shard_name)
+    if shard_path.is_absolute() or any(part in {"", ".", ".."} for part in shard_path.parts):
+        return None, "unsafe shard reference path"
+    parent_prefix = _remote_index_parent_prefix(index_filename)
+    return f"{parent_prefix}{shard_path.as_posix()}" if parent_prefix else shard_path.as_posix(), None
+
+
+def _loads_json_without_duplicate_keys(raw: bytes) -> tuple[Any | None, list[str], str | None]:
+    duplicate_keys: list[str] = []
+
+    def object_pairs_hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        obj: dict[str, Any] = {}
+        seen: set[str] = set()
+        for key, value in pairs:
+            if key in seen:
+                duplicate_keys.append(key)
+            seen.add(key)
+            obj[key] = value
+        return obj
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return None, [], f"invalid UTF-8: {exc}"
+    try:
+        parsed = json.loads(text, object_pairs_hook=object_pairs_hook)
+    except json.JSONDecodeError as exc:
+        return None, [], f"invalid JSON: {exc}"
+    return parsed, sorted(set(duplicate_keys)), None
+
+
+def _index_failure_details(
+    index_filename: str,
+    reason: str,
+    *,
+    bytes_transferred: int = 0,
+    index_size: int | None = None,
+    error: BaseException | None = None,
+) -> dict[str, Any]:
+    details: dict[str, Any] = {
+        "complete": False,
+        "index_complete": False,
+        "index_manifest": index_filename,
+        "index_bytes_transferred": bytes_transferred,
+        "index_declared_size": index_size,
+        "index_incomplete_reason": reason,
+        "message": "Remote SafeTensors index coverage is incomplete.",
+    }
+    if error is not None:
+        details["index_error_type"] = type(error).__name__
+        details["index_error"] = redact_huggingface_urls_in_text(str(error))
+    return details
+
+
+def _remote_safetensors_index_details_by_file(
+    repo_id: str,
+    model_files: list[str],
+    repo_files: list[str],
+    revision: str,
+    path_sizes: dict[str, int | None],
+    *,
+    deadline: float | None,
+    max_transferred_bytes: int | None,
+) -> tuple[dict[str, dict[str, Any]], int]:
+    """Return per-shard details from bounded SafeTensors index manifests."""
+    selected_files = set(model_files)
+    repo_file_set = set(repo_files)
+    selected_safetensors = {
+        filename for filename in selected_files if PurePosixPath(filename).suffix.lower() == ".safetensors"
+    }
+    if not selected_safetensors:
+        return {}, 0
+
+    details_by_file: dict[str, dict[str, Any]] = {}
+    total_index_bytes = 0
+    for index_filename in sorted(filename for filename in repo_files if _is_safetensors_index_file(filename)):
+        parent_prefix = _remote_index_parent_prefix(index_filename)
+        selected_under_index = sorted(
+            filename for filename in selected_safetensors if not parent_prefix or filename.startswith(parent_prefix)
+        )
+        if not selected_under_index:
+            continue
+
+        index_size = path_sizes.get(index_filename)
+        if index_size is None:
+            failure = _index_failure_details(index_filename, "missing_index_size")
+            for filename in selected_under_index:
+                details_by_file[filename] = dict(failure)
+            continue
+        if index_size > _MAX_HF_SAFETENSORS_INDEX_BYTES:
+            failure = _index_failure_details(index_filename, "index_exceeds_limit", index_size=index_size)
+            for filename in selected_under_index:
+                details_by_file[filename] = dict(failure)
+            continue
+        if total_index_bytes + index_size > _MAX_HF_SAFETENSORS_INDEX_TOTAL_BYTES:
+            failure = _index_failure_details(
+                index_filename, "aggregate_index_bytes_exceed_limit", index_size=index_size
+            )
+            for filename in selected_under_index:
+                details_by_file[filename] = dict(failure)
+            continue
+        if max_transferred_bytes is not None and total_index_bytes + index_size > max_transferred_bytes:
+            failure = _index_failure_details(index_filename, "index_exceeds_max_size_budget", index_size=index_size)
+            for filename in selected_under_index:
+                details_by_file[filename] = dict(failure)
+            continue
+
+        index_bytes_transferred = 0
+        try:
+            index_range = _read_huggingface_strict_range(
+                repo_id,
+                index_filename,
+                revision,
+                index_size,
+                expected_size=index_size,
+                deadline=deadline,
+            )
+            index_bytes_transferred = index_range.bytes_transferred
+            total_index_bytes += index_range.bytes_transferred
+            parsed, duplicate_keys, parse_error = _loads_json_without_duplicate_keys(index_range.data)
+            if parse_error is not None:
+                raise ValueError(parse_error)
+            if not isinstance(parsed, dict):
+                raise ValueError("SafeTensors index root is not a JSON object")
+            metadata = parsed.get("metadata")
+            weight_map = parsed.get("weight_map")
+            if metadata is not None and not isinstance(metadata, dict):
+                raise ValueError("SafeTensors index metadata is not a JSON object")
+            if not isinstance(weight_map, dict):
+                raise ValueError("SafeTensors index weight_map is not a JSON object")
+        except Exception as exc:
+            failure = _index_failure_details(
+                index_filename,
+                "index_read_or_parse_failed",
+                bytes_transferred=index_bytes_transferred,
+                index_size=index_size,
+                error=exc,
+            )
+            for filename in selected_under_index:
+                details_by_file[filename] = dict(failure)
+            continue
+
+        referenced_by_file: dict[str, list[str]] = {}
+        invalid_entries: list[str] = []
+        for tensor_name, shard_name in weight_map.items():
+            if not isinstance(tensor_name, str) or not tensor_name:
+                invalid_entries.append("<invalid tensor key>")
+                continue
+            normalized_path, invalid_reason = _normalize_safetensors_index_shard_path(index_filename, shard_name)
+            if normalized_path is None:
+                invalid_entries.append(f"{tensor_name}: {invalid_reason}")
+                continue
+            referenced_by_file.setdefault(normalized_path, []).append(tensor_name)
+
+        referenced_files = set(referenced_by_file)
+        missing_files = sorted(referenced_files - repo_file_set)
+        unselected_files = sorted((referenced_files & repo_file_set) - selected_files)
+        selected_referenced = sorted(referenced_files & selected_files)
+
+        metadata_total_size = metadata.get("total_size") if isinstance(metadata, dict) else None
+        invalid_total_size = False
+        if metadata_total_size is not None:
+            if (
+                not isinstance(metadata_total_size, int)
+                or isinstance(metadata_total_size, bool)
+                or metadata_total_size < 0
+            ):
+                invalid_total_size = True
+            else:
+                known_capacity = 0
+                for filename in referenced_files:
+                    file_size = path_sizes.get(filename)
+                    if isinstance(file_size, int) and not isinstance(file_size, bool):
+                        known_capacity += max(0, file_size - 8)
+                if known_capacity > 0 and metadata_total_size > known_capacity:
+                    invalid_total_size = True
+
+        index_complete = (
+            not duplicate_keys
+            and not invalid_entries
+            and not missing_files
+            and not unselected_files
+            and not invalid_total_size
+            and bool(selected_referenced)
+        )
+        common_details: dict[str, Any] = {
+            "complete": index_complete,
+            "index_complete": index_complete,
+            "index_manifest": index_filename,
+            "index_declared_size": index_size,
+            "index_bytes_transferred": index_range.bytes_transferred,
+            "index_object_validator": index_range.validator,
+            "index_final_host": urlparse(index_range.final_url).hostname,
+            "index_weight_map_tensor_count": len(weight_map),
+            "index_referenced_shard_count": len(referenced_files),
+            "index_missing_shard_count": len(missing_files),
+            "index_missing_shards": missing_files[:20],
+            "index_missing_shards_truncated": len(missing_files) > 20,
+            "index_unselected_shard_count": len(unselected_files),
+            "index_unselected_shards": unselected_files[:20],
+            "index_unselected_shards_truncated": len(unselected_files) > 20,
+            "index_invalid_entry_count": len(invalid_entries),
+            "index_invalid_entries": invalid_entries[:20],
+            "index_invalid_entries_truncated": len(invalid_entries) > 20,
+            "index_duplicate_json_key_count": len(duplicate_keys),
+            "index_duplicate_json_keys": duplicate_keys[:20],
+            "index_duplicate_json_keys_truncated": len(duplicate_keys) > 20,
+            "index_metadata_total_size": metadata_total_size,
+            "index_metadata_total_size_valid": not invalid_total_size,
+            "message": (
+                "SafeTensors index relationships are complete for this shard."
+                if index_complete
+                else "Remote SafeTensors index coverage is incomplete."
+            ),
+        }
+        attach_filenames = (
+            selected_under_index
+            if duplicate_keys or invalid_entries or invalid_total_size or not selected_referenced
+            else selected_referenced
+        )
+        for filename in attach_filenames:
+            details = dict(common_details)
+            tensors = referenced_by_file.get(filename, [])
+            details["index_referenced_by_manifest"] = filename in referenced_by_file
+            details["index_tensor_count_for_shard"] = len(tensors)
+            details["index_tensor_names_for_shard"] = tensors[:20]
+            details["index_tensor_names_for_shard_truncated"] = len(tensors) > 20
+            details_by_file[filename] = details
+
+    return details_by_file, total_index_bytes
+
+
+def _combine_remote_safetensors_shard_details(
+    filename_details: dict[str, dict[str, Any]],
+    index_details: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    details_by_file: dict[str, dict[str, Any]] = {}
+    for filename in sorted(set(filename_details) | set(index_details)):
+        filename_detail = filename_details.get(filename)
+        index_detail = index_details.get(filename)
+        if filename_detail is None:
+            details_by_file[filename] = dict(index_detail or {})
+            continue
+        if index_detail is None:
+            details_by_file[filename] = dict(filename_detail)
+            continue
+
+        combined = dict(filename_detail)
+        combined.update(index_detail)
+        filename_complete = bool(filename_detail.get("complete"))
+        index_complete = bool(index_detail.get("complete"))
+        combined["filename_pattern_complete"] = filename_complete
+        combined["index_complete"] = index_complete
+        combined["complete"] = filename_complete and index_complete
+        combined["message"] = (
+            "Remote SafeTensors shard filename and index coverage are complete."
+            if combined["complete"]
+            else "Remote SafeTensors shard coverage is incomplete."
+        )
+        details_by_file[filename] = combined
+    return details_by_file
+
+
+def _remote_safetensors_shard_details_by_file(
+    repo_id: str,
+    model_files: list[str],
+    repo_files: list[str],
+    revision: str,
+    path_sizes: dict[str, int | None],
+    *,
+    deadline: float | None,
+    max_transferred_bytes: int | None,
+) -> tuple[dict[str, dict[str, Any]], int]:
+    """Return per-shard remote coverage details from filenames and index manifests."""
+    filename_details = _remote_safetensors_filename_shard_details_by_file(model_files, repo_files)
+    index_details, index_bytes = _remote_safetensors_index_details_by_file(
+        repo_id,
+        model_files,
+        repo_files,
+        revision,
+        path_sizes,
+        deadline=deadline,
+        max_transferred_bytes=max_transferred_bytes,
+    )
+    return _combine_remote_safetensors_shard_details(filename_details, index_details), index_bytes
 
 
 def _parse_huggingface_response_file_size(response: Any, bytes_read: int, max_bytes: int) -> int | None:
@@ -2370,11 +2674,27 @@ def download_model_streaming(
         safetensors_header_files = {
             filename for filename in model_files if PurePosixPath(filename).suffix.lower() == ".safetensors"
         }
+        safetensors_index_files = (
+            {
+                filename
+                for filename in repo_files
+                if _is_safetensors_index_file(filename)
+                and any(
+                    not _remote_index_parent_prefix(filename)
+                    or selected_file.startswith(_remote_index_parent_prefix(filename))
+                    for selected_file in safetensors_header_files
+                )
+            }
+            if safetensors_header_files
+            else set()
+        )
         selected_sizes: dict[str, int] = {}
+        path_sizes: dict[str, int | None] = {}
         if size_limit is not None or safetensors_header_files:
+            size_lookup_files = sorted(set(model_files).union(safetensors_index_files))
             path_sizes, metadata_revision = _get_huggingface_path_sizes(
                 repo_id,
-                model_files,
+                size_lookup_files,
                 requested_revision=requested_revision,
                 resolved_revision=repo_revision,
                 deadline=deadline,
@@ -2392,7 +2712,15 @@ def download_model_streaming(
                     raise Exception(f"Cannot stream {repo_id}: unknown size for selected file {filename}")
                 selected_sizes[filename] = file_size
         download_revision = repo_revision
-        shard_details_by_file = _remote_safetensors_shard_details_by_file(model_files, repo_files)
+        shard_details_by_file, remote_index_bytes_transferred = _remote_safetensors_shard_details_by_file(
+            repo_id,
+            model_files,
+            repo_files,
+            repo_revision,
+            path_sizes,
+            deadline=deadline,
+            max_transferred_bytes=size_limit,
+        )
 
         # Setup cache directory
         download_path = None
@@ -2402,7 +2730,7 @@ def download_model_streaming(
 
         # Download each file one at a time
         total_files = len(model_files)
-        downloaded_total_size = 0
+        downloaded_total_size = remote_index_bytes_transferred
         for idx, filename in enumerate(model_files):
             is_last = idx == total_files - 1
 

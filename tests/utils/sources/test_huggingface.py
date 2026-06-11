@@ -118,6 +118,19 @@ def _make_safetensors_frame(header: dict[str, object], data: bytes) -> tuple[byt
     return struct.pack("<Q", len(header_bytes)) + header_bytes + data, len(header_bytes)
 
 
+def _strict_range_response(payload: bytes, total_size: int, *, url: str | None = None) -> _FakeRangeResponse:
+    return _FakeRangeResponse(
+        payload,
+        headers={
+            "Content-Range": f"bytes 0-{len(payload) - 1}/{total_size}",
+            "Content-Length": str(len(payload)),
+            "ETag": '"stable"',
+        },
+        status_code=206,
+        url=url or "https://huggingface.co/test/model/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/model.bin",
+    )
+
+
 def _fake_remote_safetensors_scan(filename: str, declared_size: int = 500) -> Any:
     from modelaudit.scanner_results import ScanResult
 
@@ -2907,6 +2920,237 @@ class TestModelDownloadStreaming:
             "bytes=0-7",
             f"bytes=0-{7 + header_len}",
         ]
+
+    @patch("huggingface_hub.hf_hub_download")
+    @patch("huggingface_hub.utils.build_hf_headers", return_value={})
+    @patch("huggingface_hub.hf_hub_url")
+    @patch("requests.get")
+    def test_download_model_streaming_uses_safetensors_index_for_nonstandard_shards(
+        self,
+        mock_requests_get: MagicMock,
+        mock_hf_hub_url: MagicMock,
+        mock_build_headers: MagicMock,
+        mock_hf_hub_download: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A SafeTensors index should prove relationships for nonstandard shard names."""
+        index_name = "model.safetensors.index.json"
+        shard_a = "experts/alpha.safetensors"
+        shard_b = "experts/beta.safetensors"
+        frame_a, header_len_a = _make_safetensors_frame(
+            {"alpha": {"dtype": "U8", "shape": [4], "data_offsets": [0, 4]}},
+            b"\x00" * 4,
+        )
+        frame_b, header_len_b = _make_safetensors_frame(
+            {"beta": {"dtype": "U8", "shape": [6], "data_offsets": [0, 6]}},
+            b"\x00" * 6,
+        )
+        index_payload = json.dumps(
+            {
+                "metadata": {"total_size": 10},
+                "weight_map": {
+                    "layers.0.weight": shard_a,
+                    "layers.1.weight": shard_b,
+                },
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            lambda *_args, **_kwargs: ([index_name, shard_a, shard_b], _HF_TEST_REVISION, None),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: (
+                {
+                    index_name: len(index_payload),
+                    shard_a: len(frame_a),
+                    shard_b: len(frame_b),
+                },
+                _HF_TEST_REVISION,
+            ),
+        )
+        mock_hf_hub_url.side_effect = lambda *, repo_id, filename, revision: (
+            f"https://huggingface.co/{repo_id}/resolve/{revision}/{filename}"
+        )
+        mock_build_headers.side_effect = lambda *, token=None, headers=None: headers or {}
+        mock_requests_get.side_effect = [
+            _strict_range_response(index_payload, len(index_payload)),
+            _strict_range_response(frame_a[:8], len(frame_a)),
+            _strict_range_response(frame_a[: 8 + header_len_a], len(frame_a)),
+            _strict_range_response(frame_b[:8], len(frame_b)),
+            _strict_range_response(frame_b[: 8 + header_len_b], len(frame_b)),
+        ]
+
+        results = list(
+            download_model_streaming(
+                f"hf://test/model?revision={_HF_TEST_REVISION}",
+                max_size=4096,
+                scannable_extensions={".safetensors"},
+                scannable_scanner_ids={"safetensors"},
+            )
+        )
+
+        assert [str(result[0]) for result in results] == [shard_a, shard_b]
+        for streamed in results:
+            _path, _is_last, scan_result = cast(tuple[Path, bool, Any], streamed)
+            shard_family = scan_result.metadata["remote_shard_family"]
+            assert scan_result.success is True
+            assert shard_family["index_complete"] is True
+            assert shard_family["index_manifest"] == index_name
+            assert shard_family["index_referenced_by_manifest"] is True
+            assert shard_family["index_bytes_transferred"] == len(index_payload)
+            assert "pattern" not in shard_family
+        mock_hf_hub_download.assert_not_called()
+        assert mock_requests_get.call_args_list[0].kwargs["headers"]["Range"] == f"bytes=0-{len(index_payload) - 1}"
+
+    @patch("huggingface_hub.hf_hub_download")
+    @patch("huggingface_hub.utils.build_hf_headers", return_value={})
+    @patch("huggingface_hub.hf_hub_url")
+    @patch("requests.get")
+    def test_download_model_streaming_fails_closed_for_missing_safetensors_index_shard(
+        self,
+        mock_requests_get: MagicMock,
+        mock_hf_hub_url: MagicMock,
+        mock_build_headers: MagicMock,
+        mock_hf_hub_download: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Missing files referenced by an index should make header coverage inconclusive."""
+        index_name = "model.safetensors.index.json"
+        present_shard = "experts/alpha.safetensors"
+        missing_shard = "experts/beta.safetensors"
+        frame, header_len = _make_safetensors_frame(
+            {"alpha": {"dtype": "U8", "shape": [4], "data_offsets": [0, 4]}},
+            b"\x00" * 4,
+        )
+        index_payload = json.dumps(
+            {
+                "metadata": {"total_size": 10},
+                "weight_map": {
+                    "layers.0.weight": present_shard,
+                    "layers.1.weight": missing_shard,
+                },
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            lambda *_args, **_kwargs: ([index_name, present_shard], _HF_TEST_REVISION, None),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: (
+                {
+                    index_name: len(index_payload),
+                    present_shard: len(frame),
+                },
+                _HF_TEST_REVISION,
+            ),
+        )
+        mock_hf_hub_url.side_effect = lambda *, repo_id, filename, revision: (
+            f"https://huggingface.co/{repo_id}/resolve/{revision}/{filename}"
+        )
+        mock_build_headers.side_effect = lambda *, token=None, headers=None: headers or {}
+        mock_requests_get.side_effect = [
+            _strict_range_response(index_payload, len(index_payload)),
+            _strict_range_response(frame[:8], len(frame)),
+            _strict_range_response(frame[: 8 + header_len], len(frame)),
+        ]
+
+        results = list(
+            download_model_streaming(
+                f"hf://test/model?revision={_HF_TEST_REVISION}",
+                max_size=4096,
+                scannable_extensions={".safetensors"},
+                scannable_scanner_ids={"safetensors"},
+            )
+        )
+
+        _path, _is_last, scan_result = cast(tuple[Path, bool, Any], results[0])
+        shard_family = scan_result.metadata["remote_shard_family"]
+        assert scan_result.success is False
+        assert "remote_safetensors_shard_coverage_incomplete" in scan_result.metadata["scan_outcome_reasons"]
+        assert shard_family["index_complete"] is False
+        assert shard_family["index_missing_shard_count"] == 1
+        assert shard_family["index_missing_shards"] == [missing_shard]
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("huggingface_hub.hf_hub_download")
+    @patch("huggingface_hub.utils.build_hf_headers", return_value={})
+    @patch("huggingface_hub.hf_hub_url")
+    @patch("requests.get")
+    def test_download_model_streaming_fails_closed_for_duplicate_safetensors_index_keys(
+        self,
+        mock_requests_get: MagicMock,
+        mock_hf_hub_url: MagicMock,
+        mock_build_headers: MagicMock,
+        mock_hf_hub_download: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Duplicate tensor keys in an index should not be collapsed into clean coverage."""
+        index_name = "model.safetensors.index.json"
+        shard_a = "experts/alpha.safetensors"
+        shard_b = "experts/beta.safetensors"
+        frame_a, header_len_a = _make_safetensors_frame(
+            {"alpha": {"dtype": "U8", "shape": [4], "data_offsets": [0, 4]}},
+            b"\x00" * 4,
+        )
+        frame_b, header_len_b = _make_safetensors_frame(
+            {"beta": {"dtype": "U8", "shape": [6], "data_offsets": [0, 6]}},
+            b"\x00" * 6,
+        )
+        index_payload = (
+            b'{"metadata":{"total_size":10},"weight_map":{'
+            b'"layers.0.weight":"experts/alpha.safetensors",'
+            b'"layers.0.weight":"experts/beta.safetensors"}}'
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            lambda *_args, **_kwargs: ([index_name, shard_a, shard_b], _HF_TEST_REVISION, None),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: (
+                {
+                    index_name: len(index_payload),
+                    shard_a: len(frame_a),
+                    shard_b: len(frame_b),
+                },
+                _HF_TEST_REVISION,
+            ),
+        )
+        mock_hf_hub_url.side_effect = lambda *, repo_id, filename, revision: (
+            f"https://huggingface.co/{repo_id}/resolve/{revision}/{filename}"
+        )
+        mock_build_headers.side_effect = lambda *, token=None, headers=None: headers or {}
+        mock_requests_get.side_effect = [
+            _strict_range_response(index_payload, len(index_payload)),
+            _strict_range_response(frame_a[:8], len(frame_a)),
+            _strict_range_response(frame_a[: 8 + header_len_a], len(frame_a)),
+            _strict_range_response(frame_b[:8], len(frame_b)),
+            _strict_range_response(frame_b[: 8 + header_len_b], len(frame_b)),
+        ]
+
+        results = list(
+            download_model_streaming(
+                f"hf://test/model?revision={_HF_TEST_REVISION}",
+                max_size=4096,
+                scannable_extensions={".safetensors"},
+                scannable_scanner_ids={"safetensors"},
+            )
+        )
+
+        assert len(results) == 2
+        for streamed in results:
+            _path, _is_last, scan_result = cast(tuple[Path, bool, Any], streamed)
+            shard_family = scan_result.metadata["remote_shard_family"]
+            assert scan_result.success is False
+            assert "remote_safetensors_shard_coverage_incomplete" in scan_result.metadata["scan_outcome_reasons"]
+            assert shard_family["index_complete"] is False
+            assert shard_family["index_duplicate_json_key_count"] == 1
+            assert shard_family["index_duplicate_json_keys"] == ["layers.0.weight"]
+        mock_hf_hub_download.assert_not_called()
 
     @patch("huggingface_hub.hf_hub_download")
     @patch("huggingface_hub.utils.build_hf_headers", return_value={"Authorization": "Bearer hf_secret"})
