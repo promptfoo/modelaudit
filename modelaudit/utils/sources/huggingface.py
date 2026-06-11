@@ -1339,9 +1339,13 @@ def _hf_safetensors_shard_excluded_by_selection(
     filename: str,
     selected_route_scanner_ids: set[str] | None,
     selected_route_formats: set[str] | None,
+    *,
+    complete_safetensors_shard_files: Collection[str] | None = None,
 ) -> bool:
     """Return whether no selected scanner can claim a declared SafeTensors shard."""
     if _parse_hf_safetensors_shard(filename) is None:
+        return False
+    if complete_safetensors_shard_files is not None and filename not in complete_safetensors_shard_files:
         return False
 
     # SafeTensors content routes intentionally include overlap-capable scanners
@@ -1370,6 +1374,27 @@ def _parse_hf_safetensors_shard(filename: str) -> tuple[str, int, int] | None:
 
 def _has_hf_safetensors_shard_shape(filename: str) -> bool:
     return _HF_SAFETENSORS_SHARD_SHAPE_PATTERN.fullmatch(filename) is not None
+
+
+def _complete_hf_safetensors_shard_files(repo_files: Collection[str]) -> frozenset[str]:
+    """Return canonical SafeTensors shards whose directory-scoped family is complete."""
+    families: dict[tuple[str, int], dict[int, set[str]]] = {}
+    for filename in repo_files:
+        parsed = _parse_hf_safetensors_shard(filename)
+        if parsed is None:
+            continue
+        stem, index, total = parsed
+        families.setdefault((stem, total), {}).setdefault(index, set()).add(filename)
+
+    complete_files: set[str] = set()
+    for (_stem, total), indexed_files in families.items():
+        if len(indexed_files) != total:
+            continue
+        if any(index not in indexed_files or len(indexed_files[index]) != 1 for index in range(1, total + 1)):
+            continue
+        for filenames in indexed_files.values():
+            complete_files.update(filenames)
+    return frozenset(complete_files)
 
 
 def _hf_detected_format_excluded_by_selected_route_formats(
@@ -1557,6 +1582,8 @@ def _select_streamable_hf_files(
             deadline=deadline,
         )
         processed_files = set(model_files)
+        complete_safetensors_shard_files = _complete_hf_safetensors_shard_files(repo_files)
+        unskippable_detected_safetensors_shards: list[str] = []
         for file_name in repo_files:
             if file_name in processed_files:
                 continue
@@ -1567,6 +1594,7 @@ def _select_streamable_hf_files(
                 file_name,
                 selected_route_scanner_ids,
                 selected_route_formats,
+                complete_safetensors_shard_files=complete_safetensors_shard_files,
             )
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
@@ -1583,13 +1611,26 @@ def _select_streamable_hf_files(
                 from ...scanner_selection import scanner_ids_for_detected_format
 
                 if not selected_route_scanner_ids.intersection(scanner_ids_for_detected_format(detected_format)):
+                    if detected_format == "safetensors" and _has_hf_safetensors_shard_shape(file_name):
+                        unskippable_detected_safetensors_shards.append(file_name)
                     continue
             elif selected_route_formats is not None and _hf_detected_format_excluded_by_selected_route_formats(
                 detected_format,
                 selected_route_formats,
             ):
+                if detected_format == "safetensors" and _has_hf_safetensors_shard_shape(file_name):
+                    unskippable_detected_safetensors_shards.append(file_name)
                 continue
             model_files.append(file_name)
+        if unskippable_detected_safetensors_shards:
+            preview = ", ".join(unskippable_detected_safetensors_shards[:3])
+            if len(unskippable_detected_safetensors_shards) > 3:
+                preview = f"{preview}, ..."
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: detected SafeTensors shard candidates "
+                f"that do not form a complete canonical shard family for {repo_id}: {preview}; "
+                "streaming coverage is incomplete"
+            )
 
     if not model_files:
         _raise_no_scannable_hf_files(repo_id)

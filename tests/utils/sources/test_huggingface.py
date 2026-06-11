@@ -41,6 +41,7 @@ from modelaudit.utils.sources.huggingface import (
     _list_repo_files_with_timeout,
     _read_huggingface_prefix,
     _run_huggingface_download_with_deadline,
+    _select_streamable_hf_files,
     _terminate_huggingface_download_process,
     download_file_from_hf,
     download_model,
@@ -3403,18 +3404,26 @@ class TestModelDownloadStreaming:
 
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
-        return_value=(["MODEL.UBJ", "model-00001-of-00002.safetensors"], _HF_TEST_REVISION, None),
+        return_value=(
+            [
+                "MODEL.UBJ",
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+            ],
+            _HF_TEST_REVISION,
+            None,
+        ),
     )
     @patch("requests.get")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_selected_non_overlap_skips_detected_safetensors_shard_within_cap(
+    def test_download_model_streaming_selected_non_overlap_skips_complete_detected_safetensors_shards_within_cap(
         self,
         mock_hf_hub_download: MagicMock,
         mock_requests_get: MagicMock,
         _mock_list_repo_files: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """A proven SafeTensors shard remains skipped when no selected scanner can consume it."""
+        """A proven complete SafeTensors shard family remains skipped when no selected scanner can consume it."""
         policy = resolve_scanner_selection_policy(scanners=["xgboost"])
         extensions = selected_scanner_extensions(policy, conservative=True)
         assert extensions is not None
@@ -3440,11 +3449,32 @@ class TestModelDownloadStreaming:
         )
 
         assert results == [(tmp_path / "MODEL.UBJ", True)]
-        assert mock_requests_get.call_count == 1
+        assert mock_requests_get.call_count == 2
         mock_hf_hub_download.assert_called_once_with(
             repo_id="test/model",
             filename="MODEL.UBJ",
             revision=_HF_TEST_REVISION,
+        )
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value="safetensors")
+    def test_select_streamable_hf_files_selected_non_overlap_incomplete_safetensors_shard_fails_closed(
+        self,
+        mock_detect_content: MagicMock,
+    ) -> None:
+        """Incomplete shard families under the sniff cap must not be silently selection-skipped."""
+        with pytest.raises(ValueError, match="detected SafeTensors shard candidates"):
+            _select_streamable_hf_files(
+                "test/model",
+                ["MODEL.UBJ", "orphan-00001-of-00002.safetensors"],
+                _HF_TEST_REVISION,
+                scannable_extensions={".ubj"},
+            )
+
+        mock_detect_content.assert_called_once_with(
+            "test/model",
+            "orphan-00001-of-00002.safetensors",
+            _HF_TEST_REVISION,
+            ANY,
         )
 
     @patch(
@@ -3636,6 +3666,7 @@ class TestModelDownloadStreaming:
             "MODEL.UBJ",
             *(f"model-{index:05d}-of-{shard_count:05d}.safetensors" for index in range(1, shard_count + 1)),
             "nested/model-00001-of-00002.safetensors",
+            "nested/model-00002-of-00002.safetensors",
             "model-00001-of-00002.safetensors",
             "model-00001-of-00002.safetensors",
             "hidden.payload",
@@ -3669,6 +3700,7 @@ class TestModelDownloadStreaming:
             "model-00001-of-00002.safetensors",
             "model-00002-of-00002.safetensors",
             "nested/model-00001-of-00002.safetensors",
+            "nested/model-00002-of-00002.safetensors",
             "hidden.payload",
         ]
         assert mock_detect_content.call_args_list[-1].args[:3] == ("test/model", "hidden.payload", _HF_TEST_REVISION)
@@ -3679,11 +3711,10 @@ class TestModelDownloadStreaming:
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_non_overlap_shard_families_are_directory_scoped(
+    def test_download_model_streaming_non_overlap_cross_directory_incomplete_shards_fail_closed(
         self,
         mock_hf_hub_download: MagicMock,
         mock_detect_content: MagicMock,
-        tmp_path: Path,
     ) -> None:
         """Shard-family completeness must not merge same-stem shards from different directories."""
         repo_files = [
@@ -3695,37 +3726,25 @@ class TestModelDownloadStreaming:
             "xgboost" if filename.startswith("b/") else "safetensors"
         )
 
-        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
-            path = tmp_path / filename
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"downloaded")
-            return str(path)
-
-        mock_hf_hub_download.side_effect = download_side_effect
-
-        with patch(
-            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
-            return_value=(repo_files, _HF_TEST_REVISION, None),
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            pytest.raises(Exception, match=r"selective filtering incomplete.*a/model-00001-of-00002\.safetensors"),
         ):
-            results = list(
+            list(
                 download_model_streaming(
                     "https://huggingface.co/test/model",
                     scannable_extensions={".ubj"},
                 )
             )
 
-        assert results == [
-            (tmp_path / "MODEL.UBJ", False),
-            (tmp_path / "b/model-00002-of-00002.safetensors", True),
-        ]
         assert [call.args[1] for call in mock_detect_content.call_args_list] == [
             "a/model-00001-of-00002.safetensors",
             "b/model-00002-of-00002.safetensors",
         ]
-        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
-            "MODEL.UBJ",
-            "b/model-00002-of-00002.safetensors",
-        ]
+        mock_hf_hub_download.assert_not_called()
 
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
