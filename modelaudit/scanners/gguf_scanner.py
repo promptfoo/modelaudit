@@ -7,7 +7,7 @@ import re
 import struct
 from collections.abc import Iterable
 from typing import Any, BinaryIO, ClassVar, NamedTuple
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
 
@@ -59,7 +59,11 @@ _GGUF_METADATA_COMMAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "shell_command",
         re.compile(
-            r"(?i)(?:^|[;&|`$()]\s*)(?:(?:[a-z]:)?[\\/](?:[^\\/\s]+[\\/])*)?"
+            r"(?i)(?:^|[;&|`$()]\s*)"
+            r"(?:(?:(?:[a-z]:)?[\\/](?:[^\\/\s]+[\\/])*)?"
+            r"(?:sudo|doas|command|env|nohup|nice|setsid)\s+"
+            r"(?:(?:[a-z_][a-z0-9_]*=\S+|-\S+)\s+)*)*"
+            r"(?:(?:[a-z]:)?[\\/](?:[^\\/\s]+[\\/])*)?"
             r"(?:bash|sh|zsh|fish|cmd(?:\.exe)?|powershell|pwsh|python(?:3)?|perl|ruby|node)\s+(?:-[ce]|/c)\b",
         ),
     ),
@@ -131,9 +135,22 @@ _GGUF_METADATA_NETWORK_APIS = (
     "urlretrieve",
     "fetch",
 )
+_GGUF_NETWORK_CLIENT_ALIAS_METHODS = {
+    "httpx": ("get", "post", "put", "patch", "delete", "head", "options", "request", "stream"),
+    "requests": ("get", "post", "put", "patch", "delete", "head", "options", "request"),
+    "urllib.request": ("urlopen", "urlretrieve"),
+}
+_GGUF_NETWORK_CLIENT_ALIAS_PATTERN = re.compile(
+    r"(?is)\bimport\s+(?P<module>requests|httpx|urllib\.request)\s+as\s+(?P<alias>[a-z_][a-z0-9_]*)",
+)
+_GGUF_URLLIB_REQUEST_ALIAS_PATTERN = re.compile(
+    r"(?is)\bfrom\s+urllib\s+import\s+request\s+as\s+(?P<alias>[a-z_][a-z0-9_]*)",
+)
 _GGUF_NETWORK_URL_ASSIGNMENT_PATTERN = re.compile(
     r"""(?is)\b(?P<name>[a-z_][a-z0-9_]*)\s*=\s*(?:[rubf]{0,2})?(?P<quote>['"])(?:https?|ftp)://[^'"\s<>]+(?P=quote)""",
 )
+_GGUF_REMOTE_URL_PATTERN = re.compile(r"(?i)\b(?:https?|ftp)://[^\s'\"<>)\]}]+")
+_GGUF_DOCUMENTATION_URL_HOSTS = frozenset({"hf.co", "huggingface.co", "www.huggingface.co"})
 _GGUF_SHELL_IFS_PATTERN = re.compile(r"(?i)\$\{ifs(?:[^}]*)?\}|\$ifs\b")
 _GGUF_SHELL_VARIABLE_NAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_]*$")
 _GGUF_DEFAULT_MAX_TEMPLATE_SIZE = 50000
@@ -1049,21 +1066,42 @@ class GgufScanner(BaseScanner):
 
         doc_lines = 0
         in_fence = False
+        fenced_lines: list[str] = []
         for line in lines:
             lowered = line.lower()
             if lowered.startswith(("```", "~~~")):
+                if in_fence:
+                    fenced_text = "\n".join(fenced_lines)
+                    if cls._text_contains_actionable_fenced_evidence(fenced_text):
+                        return False
+                    doc_lines += len(fenced_lines)
+                    fenced_lines = []
                 in_fence = not in_fence
                 doc_lines += 1
                 continue
             if in_fence:
-                doc_lines += 1
+                fenced_lines.append(line)
                 continue
             if lowered.startswith(("#", "//", "*", "-", ">")) or cls._line_looks_like_documentation(lowered):
                 if cls._line_contains_security_evidence(line):
+                    if cls._text_contains_only_benign_documentation_fetch(line):
+                        doc_lines += 1
                     continue
                 doc_lines += 1
 
+        if in_fence:
+            fenced_text = "\n".join(fenced_lines)
+            if cls._text_contains_actionable_fenced_evidence(fenced_text):
+                return False
+            doc_lines += len(fenced_lines)
+
         return doc_lines > len(lines) / 2
+
+    @classmethod
+    def _text_contains_actionable_fenced_evidence(cls, text: str) -> bool:
+        if not cls._line_contains_security_evidence(text):
+            return False
+        return not cls._text_contains_only_benign_documentation_fetch(text)
 
     @classmethod
     def _line_contains_security_evidence(cls, line: str) -> bool:
@@ -1074,6 +1112,33 @@ class GgufScanner(BaseScanner):
             or cls._network_api_remote_fetch_pattern(line) is not None
             or any(pattern.search(line) for _pattern_name, pattern in _GGUF_METADATA_COMMAND_PATTERNS)
         )
+
+    @classmethod
+    def _text_contains_only_benign_documentation_fetch(cls, text: str) -> bool:
+        if (
+            cls._contains_path_traversal(text)
+            or cls._destructive_rm_pattern(text)
+            or any(pattern.search(text) for _pattern_name, pattern in _GGUF_METADATA_COMMAND_PATTERNS)
+        ):
+            return False
+        if cls._shell_remote_fetch_pattern(text) is None and cls._network_api_remote_fetch_pattern(text) is None:
+            return False
+        urls = cls._remote_urls_in_text(text)
+        return bool(urls) and all(cls._is_documentation_reference_url(url) for url in urls)
+
+    @staticmethod
+    def _remote_urls_in_text(text: str) -> tuple[str, ...]:
+        urls: list[str] = []
+        for match in _GGUF_REMOTE_URL_PATTERN.finditer(text):
+            urls.append(match.group(0).rstrip(".,;:"))
+            if len(urls) >= 64:
+                break
+        return tuple(urls)
+
+    @staticmethod
+    def _is_documentation_reference_url(url: str) -> bool:
+        hostname = urlparse(url).hostname
+        return hostname in _GGUF_DOCUMENTATION_URL_HOSTS
 
     @staticmethod
     def _line_looks_like_documentation(lowered_line: str) -> bool:
@@ -1364,6 +1429,25 @@ class GgufScanner(BaseScanner):
                     return True
         return False
 
+    @staticmethod
+    def _network_api_alias_tokens(value: str) -> tuple[str, ...]:
+        tokens: list[str] = []
+        for match in _GGUF_NETWORK_CLIENT_ALIAS_PATTERN.finditer(value):
+            module = match.group("module")
+            alias = match.group("alias")
+            for method in _GGUF_NETWORK_CLIENT_ALIAS_METHODS[module]:
+                tokens.append(f"{alias}.{method}")
+            if len(tokens) >= 64:
+                return tuple(tokens[:64])
+
+        for match in _GGUF_URLLIB_REQUEST_ALIAS_PATTERN.finditer(value):
+            alias = match.group("alias")
+            for method in _GGUF_NETWORK_CLIENT_ALIAS_METHODS["urllib.request"]:
+                tokens.append(f"{alias}.{method}")
+            if len(tokens) >= 64:
+                return tuple(tokens[:64])
+        return tuple(tokens)
+
     @classmethod
     def _shell_remote_fetch_pattern(cls, value: str) -> str | None:
         value_lower = value.lower()
@@ -1388,7 +1472,7 @@ class GgufScanner(BaseScanner):
             return None
 
         remote_url_assignments = cls._remote_url_variable_assignments(value_lower)
-        for api_name in _GGUF_METADATA_NETWORK_APIS:
+        for api_name in (*_GGUF_METADATA_NETWORK_APIS, *cls._network_api_alias_tokens(value_lower)):
             for api_position in cls._iter_substring_positions(value_lower, api_name):
                 if not cls._has_network_api_boundary(value_lower, api_position, api_name):
                     continue
