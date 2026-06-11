@@ -815,7 +815,7 @@ class JaxCheckpointScanner(BaseScanner):
     def _is_link_like_entry(path_stat: os.stat_result) -> bool:
         """Return whether an entry is a symlink or Windows reparse point."""
         reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-        file_attributes = getattr(path_stat, "st_file_attributes", 0)
+        file_attributes = getattr(path_stat, "st_file_attributes", 0) or 0
         return stat.S_ISLNK(path_stat.st_mode) or bool(reparse_flag and file_attributes & reparse_flag)
 
     @classmethod

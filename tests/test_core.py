@@ -194,6 +194,31 @@ def test_directory_owner_snapshot_ignores_directory_link_count_drift() -> None:
     )
 
 
+def test_windows_reparse_attribute_none_is_treated_as_absent() -> None:
+    plain_directory_stat = cast(
+        os.stat_result,
+        SimpleNamespace(
+            st_dev=1,
+            st_ino=2,
+            st_mode=stat.S_IFDIR | 0o755,
+            st_size=3,
+            st_mtime_ns=4,
+            st_ctime_ns=5,
+            st_nlink=1,
+            st_file_attributes=None,
+        ),
+    )
+
+    entry = core_module._directory_owner_snapshot_entry(
+        Path("plain-directory"),
+        (),
+        entry_stat=plain_directory_stat,
+    )
+
+    assert entry.entry_type == "directory"
+    assert not tf_savedmodel_scanner._is_link_like(plain_directory_stat)
+
+
 def _mock_weight_distribution_scanner_availability(monkeypatch: pytest.MonkeyPatch) -> None:
     original_loader = core_module._registry.load_scanner_by_id
 

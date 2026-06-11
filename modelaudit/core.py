@@ -405,7 +405,7 @@ def _directory_owner_snapshot_entry(
     if entry_stat is None:
         entry_stat = entry_path.lstat()
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-    file_attributes = getattr(entry_stat, "st_file_attributes", 0)
+    file_attributes = getattr(entry_stat, "st_file_attributes", 0) or 0
     is_link = stat.S_ISLNK(entry_stat.st_mode) or bool(reparse_flag and file_attributes & reparse_flag)
     if is_link:
         entry_type = "link"
@@ -562,7 +562,7 @@ def _capture_directory_owner_namespace_by_descriptor(
             relative_parts = (*parent_parts, lexical_entry.name)
             entry_stat = lexical_entry.stat(follow_symlinks=False)
             reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-            file_attributes = getattr(entry_stat, "st_file_attributes", 0)
+            file_attributes = getattr(entry_stat, "st_file_attributes", 0) or 0
             is_link = stat.S_ISLNK(entry_stat.st_mode) or bool(reparse_flag and file_attributes & reparse_flag)
             raw_link_target: str | None = None
             if is_link and os.readlink in os.supports_dir_fd:
@@ -650,7 +650,7 @@ def _capture_directory_owner_namespace(
                 entry_path = root_path.joinpath(*relative_parts)
                 entry_stat = entry_path.lstat()
                 reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-                file_attributes = getattr(entry_stat, "st_file_attributes", 0)
+                file_attributes = getattr(entry_stat, "st_file_attributes", 0) or 0
                 is_link = stat.S_ISLNK(entry_stat.st_mode) or bool(reparse_flag and file_attributes & reparse_flag)
                 if stat.S_ISDIR(entry_stat.st_mode) and not is_link:
                     child_directories.append((entry_path, relative_parts, entry_stat))
@@ -2366,8 +2366,9 @@ def _is_directory_link(path: Path) -> bool:
                 return True
 
     with suppress(OSError):
-        file_attributes = getattr(path.lstat(), "st_file_attributes", 0)
-        return bool(file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        file_attributes = getattr(path.lstat(), "st_file_attributes", 0) or 0
+        return bool(reparse_flag and file_attributes & reparse_flag)
     return False
 
 

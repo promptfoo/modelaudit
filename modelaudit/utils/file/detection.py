@@ -5069,7 +5069,7 @@ def _read_jax_json_checkpoint_prefix(file_path: Path) -> tuple[int, bytes] | Lit
 
     try:
         reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-        file_attributes = getattr(expected_stat, "st_file_attributes", 0)
+        file_attributes = getattr(expected_stat, "st_file_attributes", 0) or 0
         if (
             not stat.S_ISREG(expected_stat.st_mode)
             or stat.S_ISLNK(expected_stat.st_mode)

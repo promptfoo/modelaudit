@@ -200,7 +200,7 @@ def _regular_file_identity(file_stat: os.stat_result) -> tuple[int, int, int, in
 
 def _is_link_like(file_stat: os.stat_result) -> bool:
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-    file_attributes = getattr(file_stat, "st_file_attributes", 0)
+    file_attributes = getattr(file_stat, "st_file_attributes", 0) or 0
     return stat.S_ISLNK(file_stat.st_mode) or bool(reparse_flag and file_attributes & reparse_flag)
 
 

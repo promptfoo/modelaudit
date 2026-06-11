@@ -201,7 +201,7 @@ def _is_link_like_path(path: Path) -> bool:
         return True
 
     reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-    file_attributes = getattr(path_stat, "st_file_attributes", 0)
+    file_attributes = getattr(path_stat, "st_file_attributes", 0) or 0
     if not reparse_attribute or not file_attributes & reparse_attribute:
         return False
 
@@ -470,7 +470,7 @@ def _open_windows_output_parent_lock(output_path: str, absolute_path: Path, pare
 def _windows_output_is_encrypted(fd: int) -> bool:
     """Return whether a pinned Windows output handle uses EFS encryption."""
     file_attribute_encrypted = getattr(stat, "FILE_ATTRIBUTE_ENCRYPTED", 0x00004000)
-    return bool(getattr(os.fstat(fd), "st_file_attributes", 0) & file_attribute_encrypted)
+    return bool((getattr(os.fstat(fd), "st_file_attributes", 0) or 0) & file_attribute_encrypted)
 
 
 def _reject_windows_encrypted_output(output_path: str, fd: int) -> None:
