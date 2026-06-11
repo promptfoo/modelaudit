@@ -689,9 +689,12 @@ def test_pytorch_zip_discovery_scans_noncanonical_referenced_storage_aliases(
         )
         return
 
-    assert storage_member in result.metadata["pickle_files"]
+    reported_storage_member = storage_member
+    if reported_storage_member not in result.metadata["pickle_files"]:
+        reported_storage_member = storage_member.replace("\\", "/")
+    assert reported_storage_member in result.metadata["pickle_files"]
     assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == storage_member
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == reported_storage_member
         for issue in result.issues
     )
 

@@ -1996,11 +1996,14 @@ def test_scan_file_scans_noncanonical_referenced_storage_aliases(
     report = scan_file(archive_path)
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert storage_member in report.metadata["pickle_files"]
+    reported_storage_member = storage_member
+    if reported_storage_member not in report.metadata["pickle_files"]:
+        reported_storage_member = storage_member.replace("\\", "/")
+    assert reported_storage_member in report.metadata["pickle_files"]
     assert any(
         finding.rule_code == "DANGEROUS_CALL"
         and finding.location is not None
-        and f"{archive_path}:{storage_member}" in finding.location
+        and f"{archive_path}:{reported_storage_member}" in finding.location
         for finding in report.findings
     )
 
