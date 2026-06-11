@@ -2100,6 +2100,56 @@ def test_scan_model_streaming_onnx_external_data_counts_toward_max_total_size(tm
     assert any("Total scan size limit exceeded" in issue.message for issue in result.issues)
 
 
+def test_scan_model_streaming_onnx_external_data_over_total_cap_skips_sidecar_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Oversized ONNX external_data context must not be read for aggregate hashing."""
+    model_path = tmp_path / "model.onnx"
+    sidecar_path = tmp_path / "model.onnx_data"
+    sidecar_size = 64
+    model_path.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_path.write_bytes(b"\x00" * sidecar_size)
+    max_total_size = model_path.stat().st_size + sidecar_size - 1
+    hashed_paths: list[Path] = []
+
+    def track_hash(path: Path) -> str:
+        hashed_paths.append(path)
+        if path == sidecar_path:
+            pytest.fail("streaming ONNX external_data sidecar must not be hashed past max_total_size")
+        return "a" * 64
+
+    monkeypatch.setattr("modelaudit.utils.helpers.file_hash.compute_sha256_hash", track_hash)
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+        max_total_size=max_total_size,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert model_path in hashed_paths
+    assert sidecar_path not in hashed_paths
+    assert result.bytes_scanned > max_total_size
+    assert result.content_hash is None
+    assert any("Total scan size limit exceeded" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "External Data Reference Check"
+        and check.status.value == "passed"
+        and check.details.get("file") == "model.onnx_data"
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "External Data Reference Check"
+        and check.status.value == "failed"
+        and check.details.get("file") == "model.onnx_data"
+        for check in result.checks
+    )
+
+
 def test_scan_model_streaming_hashes_reused_path_file_instances(tmp_path: Path) -> None:
     """A streaming source may reuse one staging path for multiple distinct files."""
     stage_path = tmp_path / "stage.txt"

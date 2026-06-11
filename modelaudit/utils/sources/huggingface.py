@@ -19,6 +19,7 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
+from ..file.detection import detect_file_format_for_skip_filter
 from ..helpers.disk_space import check_disk_space
 from .huggingface_paths import (
     extract_model_id_from_path,
@@ -2576,9 +2577,26 @@ def download_model_streaming(
                 raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
 
             onnx_external_data_cleanup_paths: list[Path] = []
+            content_route_format = selection.content_route_formats.get(filename)
+            if (
+                onnx_external_data_enabled
+                and content_route_format is None
+                and include_all_files
+                and PurePosixPath(filename).suffix.lower() != ".onnx"
+            ):
+                try:
+                    detected_format = detect_file_format_for_skip_filter(str(downloaded_file))
+                except Exception:
+                    logger.debug(
+                        "Unable to sniff selected Hugging Face file %s for ONNX sidecars", filename, exc_info=True
+                    )
+                else:
+                    if detected_format == "onnx":
+                        content_route_format = detected_format
+                        selection.content_route_formats[filename] = detected_format
             if onnx_external_data_enabled and _is_hf_streaming_onnx_candidate(
                 filename,
-                content_route_format=selection.content_route_formats.get(filename),
+                content_route_format=content_route_format,
             ):
                 external_data_files = _discover_hf_onnx_external_data_files(
                     downloaded_file,

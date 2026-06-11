@@ -5591,10 +5591,22 @@ def scan_model_streaming(
                         external_data_key = Path(os.path.abspath(onnx_external_data_path))
                         external_data_was_stream_source = external_data_key in hashed_stream_source_hashes_by_path
                         external_data_identity = _snapshot_file_identity(onnx_external_data_path)
+                        external_data_already_hashed = (
+                            external_data_identity is not None
+                            and (external_data_key, external_data_identity) in hashed_stream_file_instances
+                        )
                         if external_data_identity is not None:
                             onnx_external_data_pre_scan_identities[onnx_external_data_path] = external_data_identity
                             if not external_data_was_stream_source:
                                 onnx_external_data_bytes_scanned += _snapshot_file_size(external_data_identity)
+                        if not external_data_was_stream_source and not external_data_already_hashed:
+                            if external_data_identity is None:
+                                aggregate_hash_complete = False
+                                continue
+                            external_data_size = _snapshot_file_size(external_data_identity)
+                            if max_total_size > 0 and top_level_hashed_bytes + external_data_size > max_total_size:
+                                aggregate_hash_complete = False
+                                continue
                         append_streamed_file_hash(
                             onnx_external_data_path,
                             scan_config,

@@ -3104,6 +3104,74 @@ class TestModelDownloadStreaming:
         with pytest.raises(StopIteration):
             next(generator)
 
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["onnx/model.bin", "onnx/model.onnx_data"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_include_all_sniffs_renamed_onnx_before_sidecar_staging(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Include-all renamed ONNX files should stage declared sidecars before parent scans."""
+        payload = _make_external_onnx_payload(tmp_path)
+        sidecar_bytes = struct.pack("f", 1.0)
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload if filename == "onnx/model.bin" else sidecar_bytes)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        generator = download_model_streaming(
+            "https://huggingface.co/test/model",
+            cache_dir=tmp_path / "cache",
+            scannable_extensions={".onnx"},
+            scannable_scanner_ids={"onnx"},
+            include_all_files=True,
+        )
+        staged_before_parent_scan = False
+
+        def assert_sidecar_staged_generator() -> Iterator[tuple[Path, bool]]:
+            nonlocal staged_before_parent_scan
+            for path, is_last in generator:
+                if path.name == "model.bin":
+                    staged_before_parent_scan = (path.parent / "model.onnx_data").is_file()
+                yield path, is_last
+
+        result = scan_model_streaming(
+            assert_sidecar_staged_generator(),
+            timeout=30,
+            delete_after_scan=False,
+            cache_enabled=False,
+            scanners=["onnx"],
+            skip_file_types=False,
+        )
+
+        assert staged_before_parent_scan
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "onnx/model.bin",
+            "onnx/model.onnx_data",
+        ]
+        assert any(
+            check.name == "External Data Reference Check"
+            and check.status.value == "passed"
+            and check.details.get("file") == "model.onnx_data"
+            for check in result.checks
+        )
+        assert not any(
+            check.name == "External Data Reference Check"
+            and check.status.value == "failed"
+            and check.details.get("file") == "model.onnx_data"
+            for check in result.checks
+        )
+
     def test_scan_model_directory_hf_cache_content_routed_renamed_onnx_uses_snapshot_alias(
         self,
         tmp_path: Path,
