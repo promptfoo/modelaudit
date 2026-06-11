@@ -2560,11 +2560,32 @@ def test_detect_file_format_routes_complete_legal_text_sidecars_to_text(
     assert detect_file_format_for_skip_filter(str(payload)) == "text"
 
 
+def test_detect_file_format_does_not_treat_license_prose_as_encoded_payload_budget(tmp_path: Path) -> None:
+    def alpha_word(index: int) -> str:
+        letters = []
+        value = index
+        for _ in range(3):
+            letters.append(chr(ord("a") + (value % 26)))
+            value //= 26
+        return "documentation" + "".join(letters)
+
+    path = tmp_path / "LICENSE"
+    path.write_text(
+        "Apache License\nCopyright 2026 Example\n" + " ".join(alpha_word(index) for index in range(96)),
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(path)) == "text"
+    assert detect_file_format_from_magic(str(path)) == "text"
+    assert detect_file_format_for_skip_filter(str(path)) == "text"
+
+
 @pytest.mark.parametrize(
     ("filename", "payload"),
     [
         ("LICENSE", b'cposix\nsystem\n(S"echo pwned"\ntR.'),
         ("NOTICE", b"\x80\x04cposix\nsystem\n(S'id'\ntR."),
+        ("LICENSE", b"csocket\nsocket\n(S'MIT License'\ntR."),
         ("LICENSE", pickle.dumps({"safe": True}, protocol=0) + b'cposix\nsystem\n(S"echo pwned"\ntR.'),
         ("NOTICE", base64.b64encode(b"os.system('id')")),
         ("LICENSE", b"os.system('id')".hex().encode("ascii")),

@@ -324,6 +324,7 @@ _LEGAL_TEXT_SIGNAL_RE = re.compile(
 )
 _LEGAL_TEXT_BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{10,}={0,2}(?![A-Za-z0-9+/=])")
 _LEGAL_TEXT_HEX_TOKEN_RE = re.compile(rb"(?<![A-Fa-f0-9])[A-Fa-f0-9]{20,}(?![A-Fa-f0-9])")
+_LEGAL_TEXT_MAX_ENCODED_CANDIDATES = 4096
 _LEGAL_TEXT_MAX_ENCODED_TOKENS = 64
 _LEGAL_TEXT_MAX_DECODED_BYTES = 1024 * 1024
 _LEGAL_TEXT_ENCODED_EXECUTION_PATTERNS = (
@@ -343,6 +344,7 @@ _LEGAL_TEXT_EMBEDDED_PICKLE_SEEDS = (
     b"exec",
     b"os\n",
     b"posix",
+    b"socket",
     b"subprocess",
     b"system",
 )
@@ -3213,9 +3215,14 @@ def _decode_base64_route_token(token: bytes) -> bytes:
     return base64.b64decode(token + padding, validate=True)
 
 
+def _is_plain_alphabetic_base64_word(token: bytes) -> bool:
+    return b"=" not in token and token.isalpha()
+
+
 def _encoded_pickle_route(payload: bytes) -> str | None:
     decoded_budget = _LEGAL_TEXT_MAX_DECODED_BYTES
     seen_tokens: set[tuple[str, bytes]] = set()
+    candidate_count = 0
     token_count = 0
 
     for decoder_name, token_re, decoder in (
@@ -3223,26 +3230,29 @@ def _encoded_pickle_route(payload: bytes) -> str | None:
         ("hex", _LEGAL_TEXT_HEX_TOKEN_RE, binascii.unhexlify),
     ):
         for match in token_re.finditer(payload):
-            if token_count >= _LEGAL_TEXT_MAX_ENCODED_TOKENS or decoded_budget <= 0:
+            candidate_count += 1
+            if candidate_count > _LEGAL_TEXT_MAX_ENCODED_CANDIDATES:
                 return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
             token = match.group(0)
             token_key = (decoder_name, token)
             if token_key in seen_tokens:
                 continue
             seen_tokens.add(token_key)
-            token_count += 1
             try:
                 decoded = decoder(token)
             except (binascii.Error, ValueError):
                 continue
             if not decoded:
                 continue
-            if len(decoded) > decoded_budget:
-                return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-            decoded_budget -= len(decoded)
             route = _decoded_token_pickle_route(decoded)
             if route is not None:
                 return route
+            if decoder_name == "base64" and _is_plain_alphabetic_base64_word(token):
+                continue
+            if token_count >= _LEGAL_TEXT_MAX_ENCODED_TOKENS or len(decoded) > decoded_budget:
+                return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+            token_count += 1
+            decoded_budget -= len(decoded)
     return None
 
 
