@@ -786,14 +786,15 @@ class JaxCheckpointScanner(BaseScanner):
 
         # Handle file-based checkpoints
         if os.path.isfile(path):
-            if is_huggingface_tokenizer_json_file(path):
+            tokenizer_jax_evidence = huggingface_tokenizer_json_has_jax_route_evidence(path)
+            if is_huggingface_tokenizer_json_file(path) and not tokenizer_jax_evidence:
                 return False
             tokenizer_template_evidence = huggingface_tokenizer_json_has_template_route_evidence(path)
-            if tokenizer_template_evidence and not huggingface_tokenizer_json_has_jax_route_evidence(path):
+            if tokenizer_template_evidence and not tokenizer_jax_evidence:
                 return False
             ext = os.path.splitext(path)[1].lower()
             if ext == ".json":
-                return is_jax_json_checkpoint_file(path)
+                return tokenizer_jax_evidence or is_jax_json_checkpoint_file(path)
             if ext in cls.supported_extensions:
                 return cls._is_likely_jax_file(path) or is_jax_json_checkpoint_file(path)
             return is_jax_json_checkpoint_file(path)

@@ -369,6 +369,7 @@ MXNET_SYMBOL_SIGNATURE_READ_BYTES = 10 * 1024 * 1024
 MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT = "mxnet_symbol_routing_inconclusive"
 TOKENIZER_JSON_ROUTING_READ_BYTES = 16 * 1024 * 1024
 TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES = 64 * 1024 * 1024
+TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES = 64 * 1024 * 1024
 _HF_TOKENIZER_STREAM_CHUNK_BYTES = 1024 * 1024
 _HF_TOKENIZER_STREAM_MAX_KEY_BYTES = 4096
 _UTF8_BOM = b"\xef\xbb\xbf"
@@ -397,6 +398,8 @@ _HF_TOKENIZER_JSON_ROUTE_FILENAMES = frozenset(
 _HF_TOKENIZER_STREAM_DECODED_TAIL_CHARS = 64
 _HF_TOKENIZER_ROOT_KEYS = frozenset({"version", "added_tokens"})
 _HF_TOKENIZER_MODEL_TYPES = frozenset({"BPE", "Unigram", "WordPiece", "WordLevel"})
+_HF_TOKENIZER_ROOT_TOKEN_DATA_KEYS = frozenset({"added_tokens"})
+_HF_TOKENIZER_MODEL_TOKEN_DATA_KEYS = frozenset({"merges", "vocab"})
 _HF_TOKENIZER_TEMPLATE_KEYS = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
 _JSON_PROBE_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
 _JSON_PROBE_ESCAPED_TEMPLATE_INDICATOR_RE = re.compile(
@@ -1020,10 +1023,11 @@ def _hf_tokenizer_probe_model_object(
             model_type = _json_probe_decode_string(probe, value_offset, value_end)
             model_type_value = model_type in _HF_TOKENIZER_MODEL_TYPES
 
-        if key == "vocab":
+        if key in _HF_TOKENIZER_MODEL_TOKEN_DATA_KEYS:
             if probe[value_offset] not in {ord("{"), ord("[")}:
                 raise _JSONProbeInvalid
-            saw_vocab = True
+            if key == "vocab":
+                saw_vocab = True
             try:
                 next_offset = _json_probe_skip_value_with_template_scan(
                     probe,
@@ -1155,7 +1159,9 @@ def _hf_tokenizer_suffix_has_structural_route_key(
 
 
 def _hf_tokenizer_stream_path_skips_templates(path: tuple[str, ...]) -> bool:
-    return len(path) >= 2 and path[0] == "model" and path[1] == "vocab"
+    return (len(path) >= 1 and path[0] in _HF_TOKENIZER_ROOT_TOKEN_DATA_KEYS) or (
+        len(path) >= 2 and path[0] == "model" and path[1] in _HF_TOKENIZER_MODEL_TOKEN_DATA_KEYS
+    )
 
 
 def _hf_tokenizer_stream_has_structural_route_key(
@@ -1325,10 +1331,13 @@ def _hf_tokenizer_stream_has_structural_route_key(
     try:
         with file_path.open("rb") as stream:
             first_chunk = True
-            while True:
-                chunk = stream.read(_HF_TOKENIZER_STREAM_CHUNK_BYTES)
+            bytes_read = 0
+            while bytes_read < TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES:
+                remaining = TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES - bytes_read
+                chunk = stream.read(min(_HF_TOKENIZER_STREAM_CHUNK_BYTES, remaining))
                 if not chunk:
                     return False
+                bytes_read += len(chunk)
                 if first_chunk:
                     first_chunk = False
                     if chunk.startswith(_UTF8_BOM):
@@ -1453,6 +1462,9 @@ def _hf_tokenizer_stream_has_structural_route_key(
                         continue
 
                     handle_structural_byte(byte)
+            return not (
+                scan_template_values and (string_skip_templates or any(context.skip_templates for context in stack))
+            )
     except OSError:
         return False
 
@@ -1541,6 +1553,7 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
                         value_offset,
                         state,
                         depth=1,
+                        scan_string_template_indicators=key not in _HF_TOKENIZER_ROOT_TOKEN_DATA_KEYS,
                     )
             except (_JSONProbeIncomplete, _JSONProbeInvalid):
                 model_member_key = state.incomplete_model_member_key if key == "model" else None
@@ -1678,6 +1691,7 @@ def _malformed_hf_tokenizer_json_has_schema_evidence(path: str | Path) -> bool:
                     value_offset,
                     state,
                     depth=1,
+                    scan_string_template_indicators=key not in _HF_TOKENIZER_ROOT_TOKEN_DATA_KEYS,
                 )
             except (_JSONProbeIncomplete, _JSONProbeInvalid):
                 return has_tokenizer_root_evidence()
@@ -1811,6 +1825,7 @@ def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
                     value_offset,
                     state,
                     depth=1,
+                    scan_string_template_indicators=key not in _HF_TOKENIZER_ROOT_TOKEN_DATA_KEYS,
                 )
             except _JSONProbeIncomplete:
                 return False

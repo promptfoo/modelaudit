@@ -32,6 +32,7 @@ from typing import Any, ClassVar, cast
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from ..utils.file.detection import (
     has_jax_json_checkpoint_structure,
+    huggingface_tokenizer_json_has_jax_route_evidence,
     is_huggingface_tokenizer_json_file,
     is_sentencepiece_model_proto_file,
 )
@@ -753,11 +754,12 @@ class XGBoostScanner(BaseScanner):
         from .manifest_scanner import ManifestScanner
 
         scanner_selection = policy_from_config(self.config)
-        if (
-            self.config.get(XGBOOST_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY) is not True
-            and parsed_payload is not None
-            and has_jax_json_checkpoint_structure(parsed_payload)
-        ):
+        jax_overlap_handled = False
+        has_jax_overlap = parsed_payload is not None and has_jax_json_checkpoint_structure(parsed_payload)
+        if parsed_payload is None:
+            has_jax_overlap = huggingface_tokenizer_json_has_jax_route_evidence(path)
+        if self.config.get(XGBOOST_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY) is not True and has_jax_overlap:
+            jax_overlap_handled = True
             if scanner_selection.allows("jax_checkpoint"):
                 jax_config = dict(self.config)
                 jax_config[JAX_SKIP_JINJA_JSON_OVERLAP_CONFIG_KEY] = True
@@ -792,7 +794,10 @@ class XGBoostScanner(BaseScanner):
         ):
             if scanner_selection.allows("jinja2_template"):
                 jinja_config = dict(self.config)
-                jinja_config[JINJA_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY] = True
+                if jax_overlap_handled:
+                    jinja_config[JINJA_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY] = True
+                else:
+                    jinja_config[JAX_SKIP_XGBOOST_JSON_OVERLAP_CONFIG_KEY] = True
                 self._merge_filename_owned_result(result, Jinja2TemplateScanner(config=jinja_config).scan(path))
             elif scanner_selection.active:
                 add_scanner_selection_skip_check(
