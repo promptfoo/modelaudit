@@ -6929,6 +6929,7 @@ def test_scan_bytes_suppresses_safe_numpy_ndarray_reconstruct_call_graph_noise()
 
 
 def test_scan_bytes_warns_on_malformed_numpy_reconstruct_before_and_after_numpy_import() -> None:
+    pytest.importorskip("numpy")
     script = f"""
 import json
 import sys

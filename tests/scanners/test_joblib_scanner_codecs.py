@@ -106,6 +106,14 @@ def _scan_payload(
             ),
             patch("modelaudit_picklescan.api.import_only_reference_is_proven_trusted", trust_embedded_pickle_reference),
             patch("modelaudit_picklescan.api.import_only_module_requires_origin_review", requires_origin_review),
+            patch(
+                "modelaudit_picklescan.call_graph.import_only_reference_is_proven_trusted",
+                trust_embedded_pickle_reference,
+            ),
+            patch(
+                "modelaudit_picklescan.call_graph.import_only_module_requires_origin_review",
+                requires_origin_review,
+            ),
         ):
             return JoblibScanner().scan(str(path))
     finally:
