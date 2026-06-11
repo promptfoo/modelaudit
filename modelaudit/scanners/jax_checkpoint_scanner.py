@@ -1846,6 +1846,10 @@ class JaxCheckpointScanner(BaseScanner):
             "generation_config.json",
         }:
             return
+        if Path(path).name.lower() == "tokenizer.json" and not huggingface_tokenizer_json_has_template_route_evidence(
+            path
+        ):
+            return
 
         from .jinja2_template_scanner import JINJA_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY, Jinja2TemplateScanner
 
