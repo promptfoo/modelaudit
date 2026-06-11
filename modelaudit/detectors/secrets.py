@@ -368,8 +368,12 @@ BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN = re.compile(
     r")\s*\(\s*\\?[\"']\s*(?:proxy-authorization|authorization)\s*\\?[\"']\s*,\s*\\?[\"']?\s*$",
     re.IGNORECASE,
 )
-BASIC_AUTH_HEADERS_CONSTRUCTOR_PREFIX_PATTERN = re.compile(
-    r"(?:^|[^\w$])(?:new\s+)?Headers\s*\(\s*\[\s*\[\s*\\?[\"']\s*"
+BASIC_AUTH_HEADERS_CONSTRUCTOR_START_PATTERN = re.compile(
+    r"(?:^|[^\w$])(?:new\s+)?Headers\s*\(\s*\[",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADERS_CONSTRUCTOR_TUPLE_PREFIX_PATTERN = re.compile(
+    r"\[\s*\\?[\"']\s*"
     r"(?:proxy-authorization|authorization)\s*\\?[\"']\s*,\s*\\?[\"']?\s*$",
     re.IGNORECASE,
 )
@@ -631,10 +635,9 @@ class SecretsDetector:
         if BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(line_prefix) is not None:
             return True
         bounded_prefix = text[search_start:position]
-        if (
-            BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(bounded_prefix) is not None
-            or BASIC_AUTH_HEADERS_CONSTRUCTOR_PREFIX_PATTERN.search(bounded_prefix) is not None
-        ):
+        if BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(bounded_prefix) is not None:
+            return True
+        if SecretsDetector._basic_auth_prefix_has_headers_constructor_context(bounded_prefix):
             return True
         if BASIC_AUTH_CONTINUATION_PREFIX_PATTERN.fullmatch(line_prefix) is None:
             return False
@@ -659,6 +662,53 @@ class SecretsDetector:
             BASIC_AUTH_HEADER_PREFIX_PATTERN.search(previous_line) is not None
             or BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(previous_line) is not None
         )
+
+    @staticmethod
+    def _basic_auth_prefix_has_headers_constructor_context(prefix: str) -> bool:
+        tuple_match = BASIC_AUTH_HEADERS_CONSTRUCTOR_TUPLE_PREFIX_PATTERN.search(prefix)
+        if tuple_match is None:
+            return False
+
+        for constructor_match in BASIC_AUTH_HEADERS_CONSTRUCTOR_START_PATTERN.finditer(prefix[: tuple_match.start()]):
+            if SecretsDetector._basic_auth_headers_constructor_remains_open(
+                prefix[constructor_match.end() : tuple_match.start()]
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _basic_auth_headers_constructor_remains_open(value: str) -> bool:
+        paren_depth = 1
+        bracket_depth = 1
+        quote: str | None = None
+        escaped = False
+
+        for character in value:
+            if escaped:
+                escaped = False
+                continue
+            if quote is not None:
+                if character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                continue
+            if character in {"'", '"', "`"}:
+                quote = character
+            elif character == "(":
+                paren_depth += 1
+            elif character == ")":
+                paren_depth -= 1
+                if paren_depth <= 0:
+                    return False
+            elif character == "[":
+                bracket_depth += 1
+            elif character == "]":
+                bracket_depth -= 1
+                if bracket_depth <= 0:
+                    return False
+
+        return paren_depth > 0 and bracket_depth > 0
 
     @staticmethod
     def _basic_auth_token_decodes_to_credentials(token: str) -> bool:

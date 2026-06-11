@@ -288,6 +288,16 @@ class TestSecretsDetector:
                 _basic_auth_token(b"headers-constructor:pass"),
             ),
             (
+                'new Headers([["Accept", "application/json"], '
+                f'["Authorization", "Basic {_basic_auth_token(b"headers-constructor-nonfirst:pass")}"]])',
+                _basic_auth_token(b"headers-constructor-nonfirst:pass"),
+            ),
+            (
+                'new Headers([["Accept", "application/json"], '
+                f'["Proxy-Authorization", "Basic {_basic_auth_token(b"headers-constructor-proxy:pass")}"]])',
+                _basic_auth_token(b"headers-constructor-proxy:pass"),
+            ),
+            (
                 f"Authorization: Basic {_basic_auth_token(bytes.fromhex('ceb4cebfcebaceb9cebcceae3a70c3a47373'))}",
                 _basic_auth_token(bytes.fromhex("ceb4cebfcebaceb9cebcceae3a70c3a47373")),
             ),
