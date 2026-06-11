@@ -33,7 +33,19 @@ logger = logging.getLogger(__name__)
 _HF_CONTENT_SNIFF_BYTES = 8 * 1024
 _HF_CONTENT_SNIFF_MAX_FILES = 256
 _HF_CONTENT_SNIFF_MAX_TOTAL_BYTES = 64 * 1024 * 1024
-_HF_TEXT_ROUTE_DECLARED_FILENAMES = frozenset({"readme", "model_card", "requirements.txt"})
+_HF_TEXT_ROUTE_DECLARED_FILENAMES = frozenset(
+    {
+        "readme",
+        "model_card",
+        "requirements.txt",
+        "vocab.txt",
+        "vocabulary.txt",
+        "tokens.txt",
+        "tokenizer.txt",
+        "labels.txt",
+        "classes.txt",
+    }
+)
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
 _MAX_HF_STREAMING_EXTENSIONLESS_FILES = 128

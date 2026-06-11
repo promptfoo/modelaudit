@@ -811,14 +811,26 @@ def test_remote_prefilters_preserve_selected_extensionless_content_routed_filena
     )
 
 
-def test_remote_prefilters_preserve_text_scanner_extensionless_documentation() -> None:
+def test_remote_prefilters_preserve_text_scanner_content_routed_filenames() -> None:
     policy = resolve_scanner_selection_policy(scanners=["text"])
     extensions = selected_scanner_extensions(policy, conservative=True)
     filenames = selected_scanner_filenames(policy, conservative=True)
 
     assert extensions is not None
     assert "" not in extensions
-    assert filenames == frozenset({"readme", "model_card", "requirements.txt"})
+    assert filenames == frozenset(
+        {
+            "readme",
+            "model_card",
+            "requirements.txt",
+            "vocab.txt",
+            "vocabulary.txt",
+            "tokens.txt",
+            "tokenizer.txt",
+            "labels.txt",
+            "classes.txt",
+        }
+    )
 
 
 def test_remote_prefilters_do_not_download_extensionless_xgboost_candidates() -> None:

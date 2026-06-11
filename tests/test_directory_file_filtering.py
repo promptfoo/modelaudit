@@ -84,6 +84,13 @@ def _printable_unknown_proto_prefix(min_bytes: int) -> bytes:
     return field * ((min_bytes // len(field)) + 1)
 
 
+def _bert_vocab_text() -> str:
+    tokens = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
+    tokens.extend(f"[unused{index}]" for index in range(2048))
+    tokens.extend(f"token_{index}" for index in range(2048))
+    return "\n".join(tokens) + "\n"
+
+
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
     """Patch a ZIP member CRC so full scanning sees a malformed entry."""
     with zipfile.ZipFile(path) as archive:
@@ -545,6 +552,20 @@ class TestDirectoryFileFiltering:
 
         assert results["files_scanned"] == 0
         assert "flax_msgpack" not in results.scanner_names
+
+    def test_direct_vocabulary_text_stays_on_text_route(self, tmp_path: Path) -> None:
+        vocab = tmp_path / "vocab.txt"
+        vocab.write_text(_bert_vocab_text(), encoding="utf-8")
+
+        results = scan_model_directory_or_file(str(vocab), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["text"]
+        assert determine_exit_code(results) == 0
+        metadata = results.file_metadata[str(vocab)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["text"]
+        assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
+        assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
 
     def test_large_json_array_under_skipped_suffix_is_scanned_fail_closed(self, tmp_path: Path) -> None:
         json_array = tmp_path / "metadata.jpg"

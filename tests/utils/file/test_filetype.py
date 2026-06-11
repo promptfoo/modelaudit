@@ -190,6 +190,15 @@ def _printable_unknown_proto_prefix(min_bytes: int) -> bytes:
     return field * ((min_bytes // len(field)) + 1)
 
 
+def _bert_vocab_payload(min_bytes: int = 16 * 1024) -> bytes:
+    tokens = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
+    tokens.extend(f"[unused{index}]" for index in range(2048))
+    tokens.extend(f"token_{index}" for index in range(2048))
+    payload = ("\n".join(tokens) + "\n").encode("utf-8")
+    assert len(payload) > min_bytes
+    return payload
+
+
 def test_detect_file_format_directory(tmp_path):
     """Test detecting a directory format."""
     # Create a regular directory
@@ -409,6 +418,17 @@ def test_detect_small_plain_skipped_suffix_does_not_route_as_flax(tmp_path: Path
     assert detect_file_format_from_magic(str(document)) == "unknown"
     assert detect_file_format_for_skip_filter(str(document)) == "unknown"
     assert detect_file_format(str(document)) == "unknown"
+
+
+def test_detect_bert_vocabulary_text_does_not_route_as_flax(tmp_path: Path) -> None:
+    vocab = tmp_path / "vocab.txt"
+    payload = _bert_vocab_payload()
+    vocab.write_bytes(payload)
+
+    assert file_detection._is_complete_bounded_text_payload(payload) is True
+    assert detect_file_format_from_magic(str(vocab)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(vocab)) == "unknown"
+    assert detect_file_format(str(vocab)) == "unknown"
 
 
 def test_detect_multilingual_readme_does_not_route_as_flax(tmp_path: Path) -> None:
