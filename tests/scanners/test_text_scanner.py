@@ -247,7 +247,7 @@ git clone https://github.com/SandAI-org/MagiAttention.git
 ```yaml
 api_url: http://127.0.0.1:8080/v1/chat/completions
 artifact_url: s3://model-bucket/path/model.bin
-beacon_url: https://c2.example/payload
+c2_research_reference: https://c2.example/payload
 ```
 """,
         encoding="utf-8",
@@ -409,6 +409,44 @@ curl http://localhost:8080/v1/embeddings \\
         and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         for check in result.checks
     )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_config_url_assignment_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+callback_url = "https://evil.example/exfil"
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == "https://evil.example/exfil"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize("content", ['status = "backdoor"\n', "PORT=4444\n"])
+def test_text_scanner_fenced_documentation_cc_and_port_assignments_remain_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(f"```python\n{content}```\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     assert determine_exit_code(aggregate) == 1
 
 

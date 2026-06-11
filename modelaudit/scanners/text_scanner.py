@@ -55,6 +55,7 @@ DOCUMENTATION_FENCED_PASSIVE_MEDIA_URL_SUFFIXES = (".gif", ".jpeg", ".jpg", ".pn
 DOCUMENTATION_FENCED_PASSIVE_NETWORK_FINDING_TYPES = PASSIVE_NETWORK_FINDING_TYPES | {
     "network_function",
     "network_library",
+    "suspicious_port",
 }
 PASSIVE_DATA_TEXT_FILENAMES = frozenset({"classes.txt"})
 PASSIVE_DATA_TEXT_PREFIXES = ("label", "token", "vocab")
@@ -1295,6 +1296,12 @@ class TextScanner(BaseScanner):
         if line_parts is None:
             return True
         line, position = line_parts
+        if cls._documentation_fenced_git_clone_reference_is_informational(line):
+            return True
+        if cls._documentation_fenced_package_version_is_informational(line, position, finding):
+            return True
+        if cls._documentation_finding_is_actionable(payload, finding):
+            return False
         if finding.get("type") in {
             "cloud_storage_url",
             "url_detected",
@@ -1316,6 +1323,30 @@ class TextScanner(BaseScanner):
                 DOCUMENTATION_SSH_COMMAND_PATTERN,
                 DOCUMENTATION_POWERSHELL_COMMAND_PATTERN,
             )
+        )
+
+    @staticmethod
+    def _documentation_fenced_git_clone_reference_is_informational(line: bytes) -> bool:
+        return (
+            DOCUMENTATION_GIT_CLONE_COMMAND_PATTERN.match(line) is not None and b"https://github.com/" in line.lower()
+        )
+
+    @staticmethod
+    def _documentation_fenced_package_version_is_informational(
+        line: bytes,
+        position: int,
+        finding: dict[str, Any],
+    ) -> bool:
+        if finding.get("type") != "ipv4_address" or DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(line.lstrip()) is None:
+            return False
+        ip = finding.get("ip")
+        if not isinstance(ip, str):
+            return False
+        ip_bytes = ip.encode()
+        return (
+            b"://" not in line
+            and line[position - 2 : position] == b"=="
+            and line[position : position + len(ip_bytes)] == ip_bytes
         )
 
     @staticmethod
@@ -1428,7 +1459,10 @@ class TextScanner(BaseScanner):
         return finding_type in {
             "cc_pattern",
             "suspicious_port",
-        }
+        } and not cls._documentation_finding_is_actionable(
+            payload,
+            finding,
+        )
 
     @staticmethod
     def _documentation_finding_tokens(finding: dict[str, Any]) -> tuple[bytes, ...]:
