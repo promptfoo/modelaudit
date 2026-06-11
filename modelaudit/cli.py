@@ -219,8 +219,10 @@ def _huggingface_preview_file_size(item: dict[str, Any]) -> int | None:
 
 def _huggingface_preview_size_limit(max_size: int | None) -> int | None:
     """Normalize Hugging Face preview size caps to match download semantics."""
-    if max_size is None or max_size <= 0:
+    if max_size is None or max_size == 0:
         return None
+    if max_size < 0:
+        raise ValueError("Maximum download size must be non-negative")
     return max_size
 
 
@@ -548,8 +550,8 @@ def _preview_huggingface_file_source(
 def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", *, err: bool = False) -> None:
     """Print a no-download preview for a Hugging Face repository URL."""
     display_path = _display_path(path)
-    metadata = get_model_info(path, timeout_seconds=runtime.timeout)
     max_download_bytes = _huggingface_preview_size_limit(runtime.max_download_bytes)
+    metadata = get_model_info(path, timeout_seconds=runtime.timeout)
     if max_download_bytes is not None:
         _require_huggingface_preview_immutable_revision(metadata)
     files = metadata.get("files", [])

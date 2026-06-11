@@ -940,6 +940,20 @@ def test_hf_stream_dry_run_max_size_budgets_unselected_content_route_candidates(
     mock_scan.assert_not_called()
 
 
+def test_hf_repo_dry_run_preview_rejects_negative_max_size_without_metadata_lookup() -> None:
+    runner = CliRunner()
+
+    with _mock_hf_model_info(return_value={}) as mock_get_model_info:
+        result = runner.invoke(
+            cli,
+            ["scan", "--dry-run", "--format", "json", "--max-size=-1B", "hf://test/model"],
+        )
+
+    assert result.exit_code == 2
+    assert "Maximum download size must be non-negative" in result.output
+    mock_get_model_info.assert_not_called()
+
+
 def test_hf_file_dry_run_preview_does_not_download_or_scan() -> None:
     url = "https://huggingface.co/test/model/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.json"
     runner = CliRunner()
@@ -970,6 +984,18 @@ def test_hf_file_dry_run_preview_does_not_download_or_scan() -> None:
     mock_get_file_info.assert_called_once_with(url, max_size=None, timeout_seconds=3600)
     mock_download_file.assert_not_called()
     mock_scan.assert_not_called()
+
+
+def test_hf_file_dry_run_preview_rejects_negative_max_size_without_metadata_lookup() -> None:
+    url = "https://huggingface.co/test/model/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.json"
+    runner = CliRunner()
+
+    with patch("modelaudit.cli.get_huggingface_file_info") as mock_get_file_info:
+        result = runner.invoke(cli, ["scan", "--dry-run", "--format", "json", "--max-size=-1B", url])
+
+    assert result.exit_code == 2
+    assert "Maximum download size must be non-negative" in result.output
+    mock_get_file_info.assert_not_called()
 
 
 def test_hf_file_dry_run_preview_allows_exact_zip_scanner_file() -> None:
