@@ -153,10 +153,13 @@ DOCUMENTATION_CODE_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^
 DOCUMENTATION_MARKDOWN_LINK_URL_PREFIX_PATTERN = re.compile(rb"!?\[[^\]\r\n]{0,4096}\]\($")
 DOCUMENTATION_BIBLIOGRAPHY_ENTRY_START_PATTERN = re.compile(rb"(?im)^\s*@[A-Za-z][A-Za-z0-9_-]*\s*\{")
 DOCUMENTATION_BIBLIOGRAPHY_FIELD_PREFIX_PATTERN = re.compile(
-    rb"\s*(?P<field>[A-Za-z][A-Za-z0-9_-]*)\s*=\s*[{\"']?[^,\r\n]{0,4096}$",
+    rb"(?:^|[,{])\s*(?P<field>[A-Za-z][A-Za-z0-9_-]*)\s*=\s*(?P<delimiter>[{\"']?)[^,\r\n]{0,4096}$",
     re.IGNORECASE,
 )
-DOCUMENTATION_BIBLIOGRAPHY_URL_FIELD_PREFIX_PATTERN = re.compile(rb"\s*url\s*=\s*\{?\s*$", re.IGNORECASE)
+DOCUMENTATION_BIBLIOGRAPHY_URL_FIELD_PREFIX_PATTERN = re.compile(
+    rb"(?:^|[,{])\s*url\s*=\s*(?P<delimiter>[{\"']?)\s*$",
+    re.IGNORECASE,
+)
 DOCUMENTATION_PASSIVE_BIBLIOGRAPHY_FIELDS = frozenset(
     {
         b"abstract",
@@ -198,6 +201,14 @@ DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
     + rb"[\"']|"
     + DOCUMENTATION_CONFIG_NETWORK_KEY
     + rb")\s*:\s*(?:\[\s*)?(?:(?:\r?\n|\r)[ \t]*(?:[-*+]\s+)?)?[\"']?$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_CONFIG_MAPPING_PREFIX_PATTERN = re.compile(
+    rb"(?:^|[\s{[(,;])(?:[\"']"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb"[\"']|"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb")\s*:\s*(?:\[\s*)?[\"']?$",
     re.IGNORECASE,
 )
 DOCUMENTATION_NESTED_CONFIG_OBJECT_PATTERN = re.compile(
@@ -1721,9 +1732,14 @@ class TextScanner(BaseScanner):
         return True
 
     @staticmethod
-    def _documentation_position_is_in_bibliography_entry(payload: bytes, line_start: int) -> bool:
-        context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
-        context = payload[context_start:line_start]
+    def _documentation_position_is_in_bibliography_entry(
+        payload: bytes,
+        line_start: int,
+        position: int | None = None,
+    ) -> bool:
+        context_end = line_start if position is None else min(max(position, 0), len(payload))
+        context_start = max(0, context_end - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        context = payload[context_start:context_end]
         entry_start = None
         for match in DOCUMENTATION_BIBLIOGRAPHY_ENTRY_START_PATTERN.finditer(context):
             entry_start = match.start()
@@ -1732,6 +1748,21 @@ class TextScanner(BaseScanner):
         entry_context = context[entry_start:]
         return entry_context.count(b"{") > entry_context.count(b"}")
 
+    @staticmethod
+    def _documentation_bibliography_entry_closes_after_position(payload: bytes, position: int) -> bool:
+        position = min(max(position, 0), len(payload))
+        context_start = max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        context_end = min(len(payload), position + MAX_TEXT_FINDING_CONTEXT_BYTES)
+        context = payload[context_start:context_end]
+        relative_position = position - context_start
+        entry_start = None
+        for match in DOCUMENTATION_BIBLIOGRAPHY_ENTRY_START_PATTERN.finditer(context[:relative_position]):
+            entry_start = match.start()
+        if entry_start is None:
+            return False
+        entry_context = context[entry_start:]
+        return entry_context.count(b"{") <= entry_context.count(b"}")
+
     @classmethod
     def _documentation_position_is_in_passive_bibliography_field(cls, payload: bytes, position: int) -> bool:
         position = min(max(position, 0), len(payload))
@@ -1739,16 +1770,20 @@ class TextScanner(BaseScanner):
         line_end = payload.find(b"\n", position)
         if line_end < 0:
             line_end = len(payload)
-        if not cls._documentation_position_is_in_bibliography_entry(payload, line_start):
+        if not cls._documentation_position_is_in_bibliography_entry(payload, line_start, position):
             return False
         line = payload[line_start:line_end]
         line_position = position - line_start
-        field_match = DOCUMENTATION_BIBLIOGRAPHY_FIELD_PREFIX_PATTERN.fullmatch(line[:line_position])
+        field_match = DOCUMENTATION_BIBLIOGRAPHY_FIELD_PREFIX_PATTERN.search(line[:line_position])
         if field_match is None:
             return False
         field = field_match.group("field").lower()
         if field == b"url":
-            return DOCUMENTATION_BIBLIOGRAPHY_URL_FIELD_PREFIX_PATTERN.fullmatch(line[:line_position]) is not None
+            delimiter = field_match.group("delimiter")
+            return delimiter not in {b'"', b"'"} or cls._documentation_bibliography_entry_closes_after_position(
+                payload,
+                position,
+            )
         return field in DOCUMENTATION_PASSIVE_BIBLIOGRAPHY_FIELDS
 
     @classmethod
@@ -1759,9 +1794,18 @@ class TextScanner(BaseScanner):
         line: bytes,
         position: int,
     ) -> bool:
-        return DOCUMENTATION_BIBLIOGRAPHY_URL_FIELD_PREFIX_PATTERN.fullmatch(
-            line[:position]
-        ) is not None and cls._documentation_position_is_in_bibliography_entry(payload, line_start)
+        url_match = DOCUMENTATION_BIBLIOGRAPHY_URL_FIELD_PREFIX_PATTERN.search(line[:position])
+        if url_match is None or not cls._documentation_position_is_in_bibliography_entry(
+            payload,
+            line_start,
+            line_start + position,
+        ):
+            return False
+        delimiter = url_match.group("delimiter")
+        return delimiter not in {b'"', b"'"} or cls._documentation_bibliography_entry_closes_after_position(
+            payload,
+            line_start + position,
+        )
 
     @classmethod
     def _documentation_network_token_lines_are_passive(cls, payload: bytes) -> bool:
@@ -1806,8 +1850,13 @@ class TextScanner(BaseScanner):
                             continue
                         before = line[match.start() - 1 : match.start()] if match.start() > 0 else b""
                         after = line[match.end() : match.end() + 1]
+                        if before in {b".", b"_"} or after in {b".", b"_"}:
+                            continue
+                        absolute_position = line_start + match.start()
                         tld = match.group().rsplit(b".", 1)[-1].decode("utf-8", errors="ignore").casefold()
-                        if before in {b".", b"_"} or after in {b".", b"_"} or tld not in DOCUMENTATION_BARE_DOMAIN_TLDS:
+                        if tld not in DOCUMENTATION_BARE_DOMAIN_TLDS:
+                            if DOCUMENTATION_CONFIG_MAPPING_PREFIX_PATTERN.search(line[: match.start()]) is not None:
+                                return False
                             continue
                     absolute_position = line_start + match.start()
                     if (
