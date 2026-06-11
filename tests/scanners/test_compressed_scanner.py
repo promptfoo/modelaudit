@@ -188,14 +188,18 @@ def test_compound_tar_wrappers_route_to_tar_scanner(
     assert scanner.name == "tar"
 
 
-def test_truncated_compound_tar_wrapper_routes_to_compressed_scanner(tmp_path: Path) -> None:
+def test_truncated_compound_tar_wrapper_routes_to_tar_scanner_incomplete(tmp_path: Path) -> None:
     archive_path = tmp_path / "truncated.tar.gz"
     archive_path.write_bytes(b"\x1f\x8b\x08\x00\x00\x00\x00\x00")
 
     scanner = get_scanner_for_file(str(archive_path))
 
     assert scanner is not None
-    assert scanner.name == "compressed"
+    assert scanner.name == "tar"
+    result = scanner.scan(str(archive_path))
+    assert result.success is False
+    assert "tar_scan_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "TAR File Scan" for check in result.checks)
 
 
 @pytest.mark.parametrize(

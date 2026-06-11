@@ -216,6 +216,8 @@ _KERAS_CONFIG_PREFIX_HINT_RE = re.compile(
 _NEMO_CONFIG_ENTRIES = frozenset({"model_config.yaml", "model_config.yml"})
 _NEMO_ROUTE_MAX_ENTRIES = 10_000
 _NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS = 100_000
+_NEMO_ROUTE_MAX_BODY_SKIP_BYTES = 64 * 1024
+_NEMO_ROUTE_MAX_METADATA_BYTES = 64 * 1024
 _PYTORCH_ZIP_METADATA_MAX_BYTES = 64
 _SKOPS_SCHEMA_ENTRIES = frozenset({"schema", "schema.json"})
 _SKOPS_SCHEMA_MAX_BYTES = 4 * 1024 * 1024
@@ -3660,6 +3662,27 @@ class _NemoRouteResolutionLimitExceeded(Exception):
     """Raised when bounded NeMo TAR link routing cannot safely continue."""
 
 
+class _NemoRouteProbeBudgetExceeded(Exception):
+    """Raised when bounded NeMo TAR routing would need too much stream data."""
+
+
+class _NemoRouteTarInfo(tarfile.TarInfo):
+    """TarInfo variant that bounds extension header bodies during routing probes."""
+
+    def _check_extension_header_size(self, header_kind: str) -> None:
+        padded_size = ((max(self.size, 0) + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
+        if padded_size > _NEMO_ROUTE_MAX_METADATA_BYTES:
+            raise _NemoRouteProbeBudgetExceeded(f"TAR {header_kind} extension header exceeds route metadata limit")
+
+    def _proc_pax(self, tar_file: tarfile.TarFile) -> tarfile.TarInfo:
+        self._check_extension_header_size("PAX")
+        return cast(tarfile.TarInfo, cast(Any, super())._proc_pax(tar_file))
+
+    def _proc_gnulong(self, tar_file: tarfile.TarFile) -> tarfile.TarInfo:
+        self._check_extension_header_size("GNU long-name")
+        return cast(tarfile.TarInfo, cast(Any, super())._proc_gnulong(tar_file))
+
+
 def _consume_nemo_route_link_visit(member_visit_budget: list[int]) -> None:
     if member_visit_budget[0] <= 0:
         raise _NemoRouteResolutionLimitExceeded
@@ -3800,13 +3823,14 @@ def _detect_tar_route(path: str) -> str | None:
         return None
 
     try:
-        with tarfile.open(file_path, "r:*") as archive:
+        with tarfile.open(file_path, "r|*", tarinfo=_NemoRouteTarInfo) as archive:
             if file_path.suffix.lower() == ".nemo":
                 return "tar"
             members_by_normalized_name: dict[str, list[tarfile.TarInfo]] = {}
             root_config_links: list[tarfile.TarInfo] = []
             symlink_targets: dict[str, str] = {}
             occupied_names: set[str] = set()
+            body_skip_budget = _NEMO_ROUTE_MAX_BODY_SKIP_BYTES
             link_resolution_budget = [_NEMO_ROUTE_MAX_LINK_RESOLUTION_VISITS]
             for entry_count, member in enumerate(archive, start=1):
                 if entry_count > _NEMO_ROUTE_MAX_ENTRIES:
@@ -3836,6 +3860,10 @@ def _detect_tar_route(path: str) -> str | None:
                     )
                     if physical_destination is not None:
                         occupied_names.add(physical_destination)
+                    member_size = max(member.size, 0)
+                    if member_size > body_skip_budget:
+                        return "tar"
+                    body_skip_budget -= member_size
                 elif member.issym():
                     destination_name = _resolve_safe_tar_path_through_symlinks(
                         member.name,
@@ -3920,6 +3948,8 @@ def _detect_tar_route(path: str) -> str | None:
                         root_config_links.append(member)
     except _NemoRouteResolutionLimitExceeded:
         return NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    except _NemoRouteProbeBudgetExceeded:
+        return "tar"
     except (EOFError, OSError, tarfile.TarError):
         return None
 

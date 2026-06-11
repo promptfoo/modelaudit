@@ -1473,6 +1473,194 @@ class TestTarScanner:
         assert "decompressed size exceeded" in limit_checks[0].message.lower()
         assert "max_file_read_size_exceeded" not in result.metadata["scan_outcome_reasons"]
 
+    def test_core_routes_compound_tar_gz_to_tar_scanner(self, tmp_path: Path) -> None:
+        """Core routing should hand compound TAR wrappers to TAR scanner semantics."""
+        archive_path = tmp_path / "compound.tar.gz"
+        payload = b"safe"
+
+        with tarfile.open(archive_path, "w:gz") as archive:
+            info = tarfile.TarInfo("metadata.txt")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = core.scan_file(
+            str(archive_path),
+            config={
+                "cache_enabled": False,
+                "compressed_max_decompressed_bytes": 64 * 1024,
+                "compressed_max_decompression_ratio": 10_000.0,
+            },
+        )
+
+        assert result.scanner_name == "tar"
+        assert result.success is True
+        assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
+    def test_compound_tar_gz_total_budget_stops_before_member_body_reads(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Aggregate TAR budget should stop extraction without decompressing oversized member bodies."""
+        archive_path = tmp_path / "bounded-body.tar.gz"
+        payload = b"\0" * (32 * 1024 * 1024)
+        gzip_read_bytes = 0
+        original_read = gzip.GzipFile.read
+
+        with tarfile.open(archive_path, "w:gz") as archive:
+            info = tarfile.TarInfo("huge.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        def tracked_read(self: gzip.GzipFile, size: int = -1) -> bytes:
+            nonlocal gzip_read_bytes
+            data = original_read(self, size)
+            gzip_read_bytes += len(data)
+            return data
+
+        monkeypatch.setattr(gzip.GzipFile, "read", tracked_read)
+
+        result = core.scan_file(
+            str(archive_path),
+            config={
+                "cache_enabled": False,
+                "max_total_size": 64 * 1024,
+                "max_entry_size": 64 * 1024 * 1024,
+                "compressed_max_decompressed_bytes": 64 * 1024,
+                "compressed_max_decompression_ratio": 10_000.0,
+            },
+        )
+
+        aggregate_checks = [check for check in result.checks if check.name == "TAR Aggregate Size Limit Check"]
+        assert result.success is False
+        assert gzip_read_bytes <= 64 * 1024
+        assert any(check.status == CheckStatus.FAILED for check in aggregate_checks)
+        assert "tar_total_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert "max_file_read_size_exceeded" not in result.metadata["scan_outcome_reasons"]
+
+    def test_gzip_tar_oversized_pax_header_is_bounded_before_materialization(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Large extension headers should fail closed before tarfile allocates their content."""
+        archive_path = tmp_path / "oversized-pax.tar.gz"
+        long_name = "pax-" + ("a" * (8 * 1024 * 1024))
+        gzip_read_bytes = 0
+        original_read = gzip.GzipFile.read
+
+        with tarfile.open(archive_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
+            info = tarfile.TarInfo(long_name)
+            info.size = 0
+            archive.addfile(info, tarfile.io.BytesIO(b""))  # type: ignore[attr-defined]
+
+        def tracked_read(self: gzip.GzipFile, size: int = -1) -> bytes:
+            nonlocal gzip_read_bytes
+            data = original_read(self, size)
+            gzip_read_bytes += len(data)
+            return data
+
+        monkeypatch.setattr(gzip.GzipFile, "read", tracked_read)
+
+        result = TarScanner(
+            config={
+                "max_total_size": 64 * 1024,
+                "max_tar_metadata_bytes": 64 * 1024,
+                "compressed_max_decompressed_bytes": 64 * 1024,
+                "compressed_max_decompression_ratio": 10_000.0,
+            }
+        ).scan(str(archive_path))
+
+        stream_checks = [check for check in result.checks if check.name == "TAR Stream Budget"]
+        assert result.success is False
+        assert gzip_read_bytes <= 64 * 1024
+        assert len(stream_checks) == 1
+        assert stream_checks[0].status == CheckStatus.FAILED
+        assert stream_checks[0].details["scan_outcome_reason"] == "tar_metadata_read_limit_exceeded"
+        assert "tar_metadata_read_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+    def test_max_total_size_stops_before_extracting_later_members(self, tmp_path: Path) -> None:
+        """The aggregate TAR budget should be enforced before dispatching the next member."""
+        archive_path = tmp_path / "aggregate-budget.tar"
+        payload = b"A" * (32 * 1024)
+        malicious_payload = b'cos\nsystem\n(S"echo pwned"\ntR.' + (b"B" * (32 * 1024))
+        dispatched_paths: list[Path] = []
+
+        with tarfile.open(archive_path, "w") as archive:
+            for index in range(2):
+                info = tarfile.TarInfo(f"benign-{index}.bin")
+                info.size = len(payload)
+                archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+            info = tarfile.TarInfo("over-budget-payload.pkl")
+            info.size = len(malicious_payload)
+            archive.addfile(info, tarfile.io.BytesIO(malicious_payload))  # type: ignore[attr-defined]
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            dispatched_paths.append(Path(path))
+            nested_result = ScanResult(scanner_name="unknown")
+            nested_result.finish(success=True)
+            return nested_result
+
+        result = TarScanner(
+            config={
+                NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan,
+                "max_total_size": len(payload) * 2,
+                "max_entry_size": len(malicious_payload),
+            }
+        ).scan(str(archive_path))
+
+        assert result.success is False
+        assert len(dispatched_paths) == 2
+        assert "tar_total_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "TAR Aggregate Size Limit Check"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("entry") == "over-budget-payload.pkl"
+            for check in result.checks
+        )
+        assert not any(
+            issue.severity == IssueSeverity.CRITICAL and issue.location == f"{archive_path}:over-budget-payload.pkl"
+            for issue in result.issues
+        )
+        assert any(
+            entry["path"] == f"{archive_path}:over-budget-payload.pkl"
+            and entry["scan_status"] == "incomplete"
+            and entry["scan_outcome_reason"] == "tar_total_size_limit_exceeded"
+            for entry in result.metadata["contents"]
+        )
+
+    def test_nested_tar_shares_total_budget_with_parent(self, tmp_path: Path) -> None:
+        """Nested TAR dispatch must consume the same aggregate member budget as its parent."""
+        inner_path = tmp_path / "inner.tar"
+        outer_path = tmp_path / "outer.tar"
+        payload = b"C" * (32 * 1024)
+
+        with tarfile.open(inner_path, "w") as archive:
+            for index in range(2):
+                info = tarfile.TarInfo(f"inner-{index}.bin")
+                info.size = len(payload)
+                archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        inner_bytes = inner_path.read_bytes()
+        with tarfile.open(outer_path, "w") as archive:
+            info = tarfile.TarInfo("inner.tar")
+            info.size = len(inner_bytes)
+            archive.addfile(info, tarfile.io.BytesIO(inner_bytes))  # type: ignore[attr-defined]
+
+        result = TarScanner(
+            config={
+                "max_total_size": len(inner_bytes) + len(payload),
+                "max_entry_size": len(inner_bytes),
+            }
+        ).scan(str(outer_path))
+
+        aggregate_checks = [
+            check
+            for check in result.checks
+            if check.name == "TAR Aggregate Size Limit Check" and check.status == CheckStatus.FAILED
+        ]
+        assert result.success is False
+        assert len(aggregate_checks) == 1
+        assert aggregate_checks[0].location == f"{outer_path}:inner.tar:inner-1.bin"
+        assert "tar_total_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
     def test_core_max_file_size_still_rejects_oversized_tar_before_tar_scan(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1838,7 +2026,6 @@ class TestTarScanner:
             "can_handle",
             classmethod(lambda _cls, path: path == str(archive_path)),
         )
-        monkeypatch.setattr(TarScanner, "_preflight_tar_archive", lambda _self, _path, _result: True)
         original_member_risk_scan = tar_scanner_module.scan_archive_member_for_known_risks
         original_next = tarfile.TarFile.next
         malicious_member_scanned = False
@@ -1850,11 +2037,7 @@ class TestTarScanner:
                 malicious_member_scanned = True
 
         def fail_after_detected_member(archive: tarfile.TarFile) -> tarfile.TarInfo | None:
-            if (
-                malicious_member_scanned
-                and archive.name is not None
-                and Path(os.fsdecode(archive.name)) == archive_path
-            ):
+            if malicious_member_scanned:
                 raise OSError("later TAR traversal unavailable")
             return original_next(archive)
 
