@@ -12,9 +12,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
+from ..scanner_results import SUPPRESSED_FAILED_CHECKS_METADATA_KEY, VALIDATED_FORMAT_METADATA_KEY
 from ..utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
 from ._evidence_redaction import redact_untrusted_error_message
-from .base import FORMAT_VALIDATION_CONFIG_KEY, INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
+from .base import (
+    FORMAT_VALIDATION_CONFIG_KEY,
+    INCONCLUSIVE_SCAN_OUTCOME,
+    BaseScanner,
+    CheckStatus,
+    IssueSeverity,
+    ScanResult,
+)
 
 logger = logging.getLogger("modelaudit.scanners")
 
@@ -76,10 +84,20 @@ _LOW_NOISE_ONNX_RUNTIME_OPERATORS: dict[str, dict[str, frozenset[int]]] = {
     },
 }
 ONNX_STRUCTURE_INCONCLUSIVE_REASON = "onnx_structure_validation_failed"
+ONNX_SCHEMA_INCONCLUSIVE_REASON = "onnx_schema_validation_failed"
 ONNX_RAW_DETECTION_INCONCLUSIVE_REASON = "onnx_raw_detection_analysis_incomplete"
 ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON = "onnx_weight_distribution_analysis_incomplete"
 ONNX_TENTATIVE_CANDIDATE_UNAVAILABLE_REASON = "onnx_tentative_candidate_analysis_unavailable"
 ONNX_TENTATIVE_CANDIDATE_PARSE_INCOMPLETE_REASON = "onnx_tentative_candidate_parse_incomplete"
+_ONNX_FORMAT_INTEGRITY_CHECK_NAMES: frozenset[str] = frozenset(
+    {
+        "ONNX Structure Validation",
+        "ONNX Schema Validation",
+        "Tensor Size Validation",
+        "Tensor Validation",
+        "External Data Size Validation",
+    }
+)
 _PYTHON_OPERATOR_TYPES: frozenset[str] = frozenset(
     {
         "pyfunc",
@@ -552,6 +570,15 @@ def _iter_model_external_data_tensor_groups(model: Any) -> Any:
     for function in getattr(model, "functions", []):
         for attribute in getattr(function, "attribute_proto", []):
             yield _iter_attribute_external_data_tensors(attribute)
+
+
+def _model_has_external_data(model: Any) -> bool:
+    """Return True when an ONNX model declares tensors stored in external_data."""
+    for tensors in _iter_model_external_data_tensor_groups(model):
+        for tensor in tensors:
+            if int(getattr(tensor, "data_location", 0)) == 1:
+                return True
+    return False
 
 
 def _model_declares_python_operator(model: Any) -> bool:
@@ -2576,6 +2603,50 @@ def _finish_scan_result(result: ScanResult) -> None:
     result.finish(success=success)
 
 
+def _onnx_format_integrity_validated(result: ScanResult) -> bool:
+    """Return True once ONNX ownership is structurally validated."""
+    if result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
+        return False
+    if _suppressed_onnx_format_integrity_failure(result):
+        return False
+    return not any(
+        check.status == CheckStatus.FAILED and check.name in _ONNX_FORMAT_INTEGRITY_CHECK_NAMES
+        for check in result.checks
+    )
+
+
+def _suppressed_onnx_format_integrity_failure(result: ScanResult) -> bool:
+    suppressed_checks = result._private_metadata.get(SUPPRESSED_FAILED_CHECKS_METADATA_KEY)
+    if not isinstance(suppressed_checks, list):
+        return False
+    return any(
+        isinstance(check, dict) and check.get("name") in _ONNX_FORMAT_INTEGRITY_CHECK_NAMES
+        for check in suppressed_checks
+    )
+
+
+def _mark_onnx_schema_incomplete(
+    result: ScanResult,
+    path: str,
+    *,
+    message: str,
+    details: dict[str, Any],
+) -> None:
+    _mark_inconclusive_scan_result(result, ONNX_SCHEMA_INCONCLUSIVE_REASON)
+    result.add_check(
+        name="ONNX Schema Validation",
+        passed=False,
+        message=message,
+        severity=IssueSeverity.INFO,
+        location=path,
+        rule_code="S902",
+        details={
+            "schema_validation_reason": ONNX_SCHEMA_INCONCLUSIVE_REASON,
+            **details,
+        },
+    )
+
+
 class OnnxScanner(BaseScanner):
     """Scanner for ONNX model files."""
 
@@ -2737,6 +2808,53 @@ class OnnxScanner(BaseScanner):
                 },
             )
 
+        if model.ir_version > 0 and has_graph:
+            checker = getattr(onnx, "checker", None)
+            check_model = getattr(checker, "check_model", None)
+            if not callable(check_model):
+                _mark_onnx_schema_incomplete(
+                    result,
+                    path,
+                    message="ONNX schema checker is unavailable; analysis incomplete",
+                    details={"checker_available": False},
+                )
+            elif _model_has_external_data(model):
+                _mark_onnx_schema_incomplete(
+                    result,
+                    path,
+                    message="ONNX schema validation skipped for external-data model; analysis incomplete",
+                    details={
+                        "checker_available": True,
+                        "external_data_present": True,
+                    },
+                )
+            else:
+                try:
+                    self.check_interrupted()
+                    check_model(model)
+                    self.check_interrupted()
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    redacted_error = redact_untrusted_error_message(e)
+                    _mark_onnx_schema_incomplete(
+                        result,
+                        path,
+                        message=f"ONNX schema validation failed; analysis incomplete: {redacted_error}",
+                        details={
+                            "checker_available": True,
+                            "exception": redacted_error,
+                            "exception_type": type(e).__name__,
+                        },
+                    )
+                else:
+                    result.add_check(
+                        name="ONNX Schema Validation",
+                        passed=True,
+                        message="ONNX schema validation passed",
+                        location=path,
+                    )
+
         result.metadata.update(
             {
                 "ir_version": model.ir_version,
@@ -2807,6 +2925,8 @@ class OnnxScanner(BaseScanner):
         self._check_custom_ops(model, path, result)
         self._check_external_data(model, path, result)
         self._check_tensor_sizes(model, path, result)
+        if _onnx_format_integrity_validated(result):
+            result.metadata[VALIDATED_FORMAT_METADATA_KEY] = self.name
         self._check_weight_distribution(model, path, result)
 
         _finish_scan_result(result)
