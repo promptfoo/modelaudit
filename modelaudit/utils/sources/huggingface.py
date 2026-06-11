@@ -839,11 +839,14 @@ def _validate_remote_safetensors_indexes(
             PurePosixPath(selected_file).parent == index_parent and selected_file.endswith(".safetensors")
             for selected_file in selected_files
         )
-        if index_file not in selected_files and not index_sibling_selected:
+        index_descendant_selected = any(
+            selected_file.endswith(".safetensors")
+            and (str(index_parent) == "." or PurePosixPath(selected_file).is_relative_to(index_parent))
+            for selected_file in selected_files
+        )
+        index_selected = index_file in selected_files
+        if not index_selected and not index_sibling_selected and not index_descendant_selected:
             continue
-        if index_file not in selected_files:
-            updated_model_files.append(index_file)
-            selected_files.add(index_file)
 
         index_prefix = _read_huggingface_prefix(
             repo_id,
@@ -881,12 +884,6 @@ def _validate_remote_safetensors_indexes(
                 f"SafeTensors index {repo_id}/{index_file} has non-string shard targets"
             )
         target_files = sorted({_safe_remote_safetensors_index_target(index_file, target) for target in raw_targets})
-        missing_targets = [target for target in target_files if target not in repo_file_set]
-        if missing_targets:
-            raise ValueError(
-                "Hugging Face selective filtering incomplete: "
-                f"SafeTensors index {repo_id}/{index_file} references missing model shard(s)"
-            )
 
         target_indices: set[int] = set()
         expected_total: int | None = None
@@ -915,6 +912,44 @@ def _validate_remote_safetensors_indexes(
                 )
             target_indices.add(shard_index)
             target_families.setdefault((target_path.parent.as_posix(), shard_total), set()).add(target_file)
+
+        selected_target_overlap = any(target_file in selected_files for target_file in target_files)
+        selected_family_sibling_overlap = False
+        for (target_parent, target_total), referenced_targets in target_families.items():
+            for selected_file in selected_files:
+                if selected_file in referenced_targets:
+                    continue
+                selected_path = PurePosixPath(selected_file)
+                if selected_path.parent.as_posix() != target_parent:
+                    continue
+                selected_match = re.fullmatch(SAFETENSORS_SHARD_PATTERN, selected_path.name)
+                if selected_match is None or (selected_match.lastindex or 0) < 2:
+                    continue
+                try:
+                    selected_total = int(selected_match.group(2))
+                except (IndexError, ValueError):
+                    continue
+                if selected_total == target_total:
+                    selected_family_sibling_overlap = True
+                    break
+            if selected_family_sibling_overlap:
+                break
+
+        index_relevant = (
+            index_selected or index_sibling_selected or selected_target_overlap or selected_family_sibling_overlap
+        )
+        if not index_relevant:
+            continue
+        if not index_selected:
+            updated_model_files.append(index_file)
+            selected_files.add(index_file)
+
+        missing_targets = [target for target in target_files if target not in repo_file_set]
+        if missing_targets:
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: "
+                f"SafeTensors index {repo_id}/{index_file} references missing model shard(s)"
+            )
 
         if expected_total is None or len(target_files) != expected_total or len(target_indices) != expected_total:
             raise ValueError(

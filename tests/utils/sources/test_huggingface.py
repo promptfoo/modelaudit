@@ -694,6 +694,47 @@ class TestModelDownload:
 
         mock_snapshot_download.assert_not_called()
 
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            [
+                "model.safetensors.index.json",
+                "shards/model-00001-of-00002.safetensors",
+                "shards/model-00002-of-00002.safetensors",
+            ],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_rejects_parent_index_missing_nested_target_with_substitute(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+    ) -> None:
+        """A root index must govern nested selected shards before snapshot download."""
+        mock_requests_get.return_value = _FakeRangeResponse(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "a": "shards/model-00000-of-00002.safetensors",
+                        "b": "shards/model-00001-of-00002.safetensors",
+                    }
+                }
+            ).encode()
+        )
+
+        with pytest.raises(Exception, match="references missing model shard"):
+            download_model("https://huggingface.co/test/model")
+
+        mock_snapshot_download.assert_not_called()
+
     @pytest.mark.parametrize(
         ("foreign_target", "model_extensions"),
         [
@@ -2366,6 +2407,47 @@ class TestModelDownloadStreaming:
                     "weight_map": {
                         "a": "model-00000-of-00002.safetensors",
                         "b": "model-00001-of-00002.safetensors",
+                    }
+                }
+            ).encode()
+        )
+
+        with pytest.raises(Exception, match="references missing model shard"):
+            list(download_model_streaming("https://huggingface.co/test/model"))
+
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            [
+                "model.safetensors.index.json",
+                "shards/model-00001-of-00002.safetensors",
+                "shards/model-00002-of-00002.safetensors",
+            ],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_rejects_parent_index_missing_nested_target_with_substitute(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+    ) -> None:
+        """Streaming must validate root indexes that govern nested selected shards."""
+        mock_requests_get.return_value = _FakeRangeResponse(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "a": "shards/model-00000-of-00002.safetensors",
+                        "b": "shards/model-00001-of-00002.safetensors",
                     }
                 }
             ).encode()

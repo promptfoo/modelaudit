@@ -413,6 +413,35 @@ class TestShardedModelDetector:
         assert result.success is False
         assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
 
+    def test_detect_safetensors_unrelated_ancestor_index_does_not_poison_nested_family(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """An ancestor index for a different shard family should not govern nested shards."""
+        _write_safetensors_index(
+            tmp_path,
+            [f"model-{index:05d}-of-00008.safetensors" for index in range(1, 9)],
+        )
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        adapter_shards = [
+            adapter_dir / "model-00001-of-00002.safetensors",
+            adapter_dir / "model-00002-of-00002.safetensors",
+        ]
+        for shard in adapter_shards:
+            shard.write_bytes(shard.name.encode())
+
+        shard_info = ShardedModelDetector.detect_shards(str(adapter_shards[0]))
+        result = AdvancedFileHandler(str(adapter_shards[0]), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert "safetensors_index_path" not in shard_info
+        assert "safetensors_index_error" not in shard_info
+        assert "unvalidated_shards" not in shard_info
+        assert shard_info["shard_index_base"] == "one"
+        assert shard_info["shards"] == [str(shard) for shard in adapter_shards]
+        assert result.success is True
+
     def test_complete_single_safetensors_header_scan_is_platform_independent_when_pin_unavailable(
         self,
         tmp_path: Path,

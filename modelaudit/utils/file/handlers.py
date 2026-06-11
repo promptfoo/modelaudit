@@ -621,7 +621,7 @@ class ShardedModelDetector:
         index_dir: Path,
         index_path: Path,
         pattern: str,
-        expected_total: int,
+        expected_total: int | None,
     ) -> _SafetensorsShardIndexInventory:
         """Parse one SafeTensors index into an authoritative shard inventory."""
         try:
@@ -660,6 +660,7 @@ class ShardedModelDetector:
 
             expected_paths: set[str] = set()
             target_indices: set[int] = set()
+            index_expected_total: int | None = expected_total
             raw_targets = list(weight_map.values())
             if not all(isinstance(target, str) for target in raw_targets):
                 raise ValueError("safetensors index weight_map targets must be strings")
@@ -673,16 +674,20 @@ class ShardedModelDetector:
                 target_total = target_match["expected_total_shards"]
                 if not isinstance(target_index, int) or not isinstance(target_total, int):
                     raise ValueError("safetensors index target does not match shard filename pattern")
-                if target_total != expected_total:
+                if index_expected_total is None:
+                    index_expected_total = target_total
+                elif target_total != index_expected_total:
                     raise ValueError("safetensors index target total does not match selected shard total")
                 expected_paths.add(_normalized_absolute_path(target_file))
                 target_indices.add(target_index)
 
-            if len(expected_paths) != expected_total or len(target_indices) != expected_total:
+            if index_expected_total is None:
+                raise ValueError("safetensors index shard count does not match selected shard total")
+            if len(expected_paths) != index_expected_total or len(target_indices) != index_expected_total:
                 raise ValueError("safetensors index shard count does not match selected shard total")
 
-            zero_based = cls._expected_index_range(expected_total, zero_based=True)
-            one_based = cls._expected_index_range(expected_total, zero_based=False)
+            zero_based = cls._expected_index_range(index_expected_total, zero_based=True)
+            one_based = cls._expected_index_range(index_expected_total, zero_based=False)
             if target_indices == set(zero_based):
                 return _SafetensorsShardIndexInventory(
                     index_path=index_path,
@@ -702,7 +707,7 @@ class ShardedModelDetector:
             return _SafetensorsShardIndexInventory(
                 index_path=index_path,
                 expected_source_paths=frozenset(),
-                expected_indices=cls._expected_index_range(expected_total, zero_based=False),
+                expected_indices=cls._expected_index_range(expected_total or 1, zero_based=False),
                 index_base="invalid",
                 error=str(exc),
             )
@@ -747,7 +752,8 @@ class ShardedModelDetector:
             index_path = index_dir / SAFETENSORS_INDEX_NAME
             if not (index_path.exists() or index_path.is_symlink()):
                 continue
-            inventory = cls._read_safetensors_index_inventory(index_dir, index_path, pattern, expected_total)
+            inventory_total = expected_total if index_dir == dir_path else None
+            inventory = cls._read_safetensors_index_inventory(index_dir, index_path, pattern, inventory_total)
             if index_dir == dir_path:
                 return inventory
             if inventory.error is not None:
