@@ -164,6 +164,154 @@ def _display_error(error: object, path: str) -> str:
     return _escape_terminal_text(display_error)
 
 
+def _preview_size_text(size_bytes: object) -> str:
+    """Return a stable human-readable byte size for dry-run previews."""
+    if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes <= 0:
+        return "Unknown size"
+    if size_bytes >= 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+    if size_bytes >= 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.2f} MB"
+    if size_bytes >= 1024:
+        return f"{size_bytes / 1024:.2f} KB"
+    return f"{size_bytes} bytes"
+
+
+def _build_huggingface_dry_run_preview(
+    path: str,
+    runtime: "_ScanRuntimeConfig",
+    *,
+    source_kind: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a compact dry-run preview that is not a scan result payload."""
+    preview: dict[str, Any] = {
+        "dry_run": True,
+        "source": "huggingface",
+        "source_kind": source_kind,
+        "target": _display_scan_path(path),
+        "mode": "streaming" if runtime.scan_and_delete else "standard",
+        "artifact_downloads": 0,
+        "scanner_execution": False,
+    }
+    preview.update(metadata)
+    if runtime.scanner_selection_metadata is not None:
+        preview["scanner_selection"] = dict(runtime.scanner_selection_metadata)
+    return preview
+
+
+def _format_huggingface_dry_run_preview_text(preview: dict[str, Any]) -> str:
+    """Render one Hugging Face dry-run preview for human-readable output."""
+    target = _escape_terminal_text(preview.get("target", ""))
+    source_kind = _escape_terminal_text(str(preview.get("source_kind", "source")).replace("_", " "))
+    lines = [
+        f"📊 Dry run preview for {style_text(target, fg='cyan')}:",
+        f"   Source: Hugging Face {source_kind}",
+    ]
+    if model_id := preview.get("model_id"):
+        lines.append(f"   Model: {_escape_terminal_text(model_id)}")
+    if filename := preview.get("filename"):
+        lines.append(f"   File: {_escape_terminal_text(filename)}")
+    if revision := preview.get("revision"):
+        lines.append(f"   Revision: {_escape_terminal_text(revision)}")
+    if resolved_revision := preview.get("resolved_revision"):
+        lines.append(f"   Resolved revision: {_escape_terminal_text(resolved_revision)}")
+    if "file_count" in preview:
+        lines.append(f"   Files: {_escape_terminal_text(preview['file_count'])}")
+    if "total_size_bytes" in preview or "size_bytes" in preview:
+        lines.append(f"   Size: {_escape_terminal_text(preview.get('human_size', 'Unknown size'))}")
+    lines.append(f"   Mode: {'Streaming dry run' if preview.get('mode') == 'streaming' else 'Dry run'}")
+    lines.append("   Artifact downloads: 0")
+    lines.append("   Scanner execution: none")
+    return "\n".join(lines)
+
+
+def _format_huggingface_dry_run_previews(previews: list[dict[str, Any]], output_format: str) -> str:
+    """Render collected Hugging Face dry-run previews."""
+    if output_format == "json":
+        payload: Any
+        payload = previews[0] if len(previews) == 1 else {"dry_run": True, "previews": previews}
+        return json.dumps(_JSON_VALUE_ADAPTER.dump_python(payload, mode="json"), indent=2)
+    return "\n\n".join(_format_huggingface_dry_run_preview_text(preview) for preview in previews)
+
+
+def _is_huggingface_dry_run_preview_path(path: str) -> bool:
+    """Return whether a path is handled by the Hugging Face dry-run preview planner."""
+    return is_huggingface_file_url(path) or is_huggingface_url(path)
+
+
+def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeConfig") -> dict[str, Any]:
+    """Preview a Hugging Face repository scan without artifact downloads or scanners."""
+    from .utils.sources.huggingface import get_model_info
+
+    model_info = get_model_info(path)
+    total_size = model_info.get("total_size")
+    return _build_huggingface_dry_run_preview(
+        path,
+        runtime,
+        source_kind="model",
+        metadata={
+            "model_id": model_info.get("model_id") or model_info.get("repo_id") or _display_scan_path(path),
+            "file_count": model_info.get("file_count", 0),
+            "total_size_bytes": total_size
+            if isinstance(total_size, int) and not isinstance(total_size, bool)
+            else None,
+            "human_size": _preview_size_text(total_size),
+            "metadata_only": True,
+        },
+    )
+
+
+def _get_huggingface_file_metadata(repo_id: str, revision: str, filename: str) -> dict[str, Any]:
+    """Fetch direct Hugging Face file metadata without downloading file content."""
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as exc:
+        raise ImportError(
+            "huggingface-hub package is required for HuggingFace URL support. "
+            "Install with 'pip install modelaudit[huggingface]'"
+        ) from exc
+
+    api = HfApi()
+    repo_info = api.repo_info(repo_id, revision=revision, files_metadata=False)
+    resolved_revision = getattr(repo_info, "sha", None)
+    metadata_revision = resolved_revision if isinstance(resolved_revision, str) and resolved_revision else revision
+    paths_info = api.get_paths_info(repo_id, [filename], revision=metadata_revision)
+    file_info = next((item for item in paths_info if getattr(item, "path", None) == filename), None)
+    if file_info is None:
+        raise FileNotFoundError(f"Hugging Face file metadata unavailable for {repo_id}/{filename} at {revision}")
+
+    raw_size = getattr(file_info, "size", None)
+    size_bytes = raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
+    metadata: dict[str, Any] = {"size_bytes": size_bytes}
+    if isinstance(resolved_revision, str) and resolved_revision and resolved_revision != revision:
+        metadata["resolved_revision"] = resolved_revision
+    return metadata
+
+
+def _build_huggingface_file_dry_run_preview(path: str, runtime: "_ScanRuntimeConfig") -> dict[str, Any]:
+    """Preview a direct Hugging Face file scan without downloading it."""
+    from .utils.sources.huggingface import parse_huggingface_file_url
+
+    repo_id, revision, filename = parse_huggingface_file_url(path)
+    file_metadata = _get_huggingface_file_metadata(repo_id, revision, filename)
+    size_bytes = file_metadata.get("size_bytes")
+    return _build_huggingface_dry_run_preview(
+        path,
+        runtime,
+        source_kind="file",
+        metadata={
+            "model_id": repo_id,
+            "revision": revision,
+            "filename": filename,
+            "total_size_bytes": size_bytes,
+            "human_size": _preview_size_text(size_bytes),
+            "metadata_only": True,
+            **file_metadata,
+        },
+    )
+
+
 class _OutputWriteError(click.ClickException):
     """Report output failures using the scan command's documented error code."""
 
@@ -1354,6 +1502,7 @@ class _ScanPathState:
     """Bookkeeping for scanned artifacts and deferred cleanup."""
 
     collect_dvc_coverage: bool = False
+    dry_run_previews: list[dict[str, Any]] = field(default_factory=list)
     scanned_paths: list[str] = field(default_factory=list)
     temp_cleanup_entries: list[tuple[str, bool]] = field(default_factory=list)
     sbom_paths_resolved: bool = False
@@ -1367,6 +1516,21 @@ class _ScanPathState:
         """Record an aggregate error that shard reconciliation does not own."""
         self.has_errors_outside_reconciled_shards = True
         audit_result.has_errors = True
+
+    def record_dry_run_preview(self, preview: dict[str, Any]) -> None:
+        """Record a source that was previewed without scanning."""
+        self.dry_run_previews.append(preview)
+
+    def has_no_scan_content(self, audit_result: ModelAuditResultModel) -> bool:
+        """Return whether no scanner populated the aggregate result."""
+        return (
+            audit_result.files_scanned == 0
+            and audit_result.bytes_scanned == 0
+            and not audit_result.issues
+            and not audit_result.checks
+            and not audit_result.assets
+            and not audit_result.scanner_names
+        )
 
     def record_non_shard_result_errors(self, scan_result: ModelAuditResultModel) -> None:
         """Preserve errors from results that cannot join final CLI shard reconciliation."""
@@ -2099,6 +2263,9 @@ def _configure_scan_logging(verbose: bool) -> None:
     logging.getLogger("modelaudit.core").setLevel(logging.WARNING)
     logging.getLogger("modelaudit.utils.helpers.secure_hasher").setLevel(logging.WARNING)
     logging.getLogger("modelaudit.cache.cache_manager").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("huggingface_hub.utils._http").setLevel(logging.WARNING)
 
 
 def _initialize_progress_tracking(
@@ -2265,6 +2432,23 @@ def _emit_scan_output(
                     click.echo(f"Found {len(visible_issues)} informational issue(s)")
             else:
                 click.echo("No security issues found")
+        return
+
+    if output_format == "text":
+        click.echo("\n" + "─" * 80)
+    click.echo(output_text)
+
+
+def _emit_huggingface_dry_run_output(
+    output_text: str,
+    *,
+    output: str | None,
+    output_format: str,
+) -> None:
+    """Write dry-run preview output without scan-result summaries."""
+    if output:
+        _write_output_text_file(output, output_text)
+        click.echo(f"Preview written to {_display_path(output)}")
         return
 
     if output_format == "text":
@@ -2645,6 +2829,24 @@ def _resolve_scan_source_for_path(
 
     if is_huggingface_file_url(path):
         display_path = _display_path(path)
+        if dry_run:
+            try:
+                preview = _build_huggingface_file_dry_run_preview(path, runtime)
+                source_model_id, source_model_source = extract_model_id_from_path(path)
+                path_state.record_dry_run_preview(preview)
+                return _SourceDispatchResult(
+                    actual_path=path,
+                    local_scan_required=False,
+                    source_model_id=source_model_id,
+                    source_model_source=source_model_source,
+                )
+            except Exception as exc:
+                error_msg = _display_error(exc, path)
+                logger.error(f"Failed to preview Hugging Face file {display_path}: {error_msg}")
+                click.echo(f"Error previewing file from {display_path}: {error_msg}", err=True)
+                path_state.mark_non_shard_error(audit_result)
+                return None
+
         download_spinner = None
         temp_dir = None
         if runtime.show_styled_output and should_show_spinner():
@@ -2706,6 +2908,24 @@ def _resolve_scan_source_for_path(
 
     if is_huggingface_url(path):
         display_path = _display_path(path)
+        if dry_run:
+            try:
+                preview = _build_huggingface_model_dry_run_preview(path, runtime)
+                source_model_id, source_model_source = extract_model_id_from_path(path)
+                path_state.record_dry_run_preview(preview)
+                return _SourceDispatchResult(
+                    actual_path=path,
+                    local_scan_required=False,
+                    source_model_id=source_model_id,
+                    source_model_source=source_model_source,
+                )
+            except Exception as exc:
+                error_msg = _display_error(exc, path)
+                logger.error(f"Failed to preview Hugging Face model {display_path}: {error_msg}")
+                click.echo(f"Error previewing model from {display_path}: {error_msg}", err=True)
+                path_state.mark_non_shard_error(audit_result)
+                return None
+
         if runtime.show_styled_output:
             click.echo(f"\n📥 Preparing to download from {style_text(display_path, fg='cyan')}")
 
@@ -3916,6 +4136,22 @@ def scan_command(
     record_scan_started(list(paths), telemetry_options)
 
     expanded_paths = _resolve_scan_paths(paths, scan_start_time)
+    huggingface_preview_paths: list[str] = []
+    if dry_run:
+        huggingface_preview_paths = [path for path in expanded_paths if _is_huggingface_dry_run_preview_path(path)]
+        if huggingface_preview_paths and len(huggingface_preview_paths) != len(expanded_paths):
+            non_preview_paths = [
+                _display_path(path) for path in expanded_paths if not _is_huggingface_dry_run_preview_path(path)
+            ]
+            click.echo(
+                "Error: Hugging Face dry-run previews cannot be combined with paths that require scanning: "
+                f"{', '.join(non_preview_paths)}",
+                err=True,
+            )
+            record_scan_failed(time.time() - scan_start_time, "Mixed Hugging Face dry-run preview inputs")
+            flush_telemetry()
+            sys.exit(2)
+
     runtime = _resolve_scan_runtime_config(
         expanded_paths,
         format=format,
@@ -4041,6 +4277,32 @@ def scan_command(
     )
     audit_result.finalize_statistics()
     audit_result.deduplicate_issues()
+
+    if dry_run and huggingface_preview_paths and path_state.has_no_scan_content(audit_result):
+        try:
+            try:
+                if path_state.dry_run_previews:
+                    output_text = _format_huggingface_dry_run_previews(
+                        path_state.dry_run_previews, runtime.output_format
+                    )
+                    _emit_huggingface_dry_run_output(
+                        output_text,
+                        output=output,
+                        output_format=runtime.output_format,
+                    )
+            finally:
+                _cleanup_temp_artifacts(path_state.temp_cleanup_entries, verbose=verbose)
+        except _OutputWriteError:
+            record_scan_failed(time.time() - scan_start_time, "Unable to write scan output")
+            flush_telemetry()
+            raise
+        if audit_result.has_errors:
+            record_scan_failed(time.time() - scan_start_time, "Dry-run preview completed with errors")
+            flush_telemetry()
+            sys.exit(2)
+        record_scan_completed(time.time() - scan_start_time, {"dry_run": True, "previews": path_state.dry_run_previews})
+        flush_telemetry()
+        sys.exit(0)
 
     try:
         try:
