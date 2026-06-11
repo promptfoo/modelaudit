@@ -10832,6 +10832,30 @@ class TestZipScanner:
         assert result.success is False
         assert any(issue.rule_code == "S201" and issue.details.get("zip_entry") == "LICENSE" for issue in result.issues)
 
+    def test_scan_zip_keeps_webbrowser_pickle_named_notice_on_pickle_route(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "webbrowser_notice_member.zip"
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("NOTICE", b"cwebbrowser\nopen\n(S'http://example.com'\ntR.")
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert any(issue.rule_code == "S201" and issue.details.get("zip_entry") == "NOTICE" for issue in result.issues)
+
+    def test_scan_zip_does_not_text_route_invalid_legal_member(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "invalid_legal_member.zip"
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("LICENSE", b"MIT License\nCopyright\x00")
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert not any(
+            check.name == "File Type Identification"
+            and check.details.get("file_type") == "license"
+            and check.details.get("zip_entry") == "LICENSE"
+            for check in result.checks
+        )
+
     def test_scan_npz_with_object_member_recurses_into_pickle(self, tmp_path: Path) -> None:
         import numpy as np
 

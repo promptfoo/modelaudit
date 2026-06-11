@@ -106,6 +106,27 @@ def test_text_scanner_does_not_claim_misleading_pickle_suffix(tmp_path: Path) ->
     assert not TextScanner.can_handle(str(payload))
 
 
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [
+        ("LICENSE", b"MIT License\nCopyright \xe2\x82"),
+        ("NOTICE", b"NOTICE\nCopyright\x00"),
+    ],
+)
+def test_text_scanner_does_not_claim_invalid_legal_sidecar_fallback(
+    tmp_path: Path,
+    filename: str,
+    payload: bytes,
+) -> None:
+    path = tmp_path / filename
+    path.write_bytes(payload)
+
+    result = scan_file(str(path), config={"cache_enabled": False})
+
+    assert not TextScanner.can_handle(str(path))
+    assert result.scanner_name != "text"
+
+
 def test_directory_scan_routes_legal_sidecar_to_text_before_pickle_probe(tmp_path: Path) -> None:
     license_path = tmp_path / "LICENSE"
     license_path.write_text(

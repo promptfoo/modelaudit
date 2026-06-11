@@ -334,20 +334,7 @@ _LEGAL_TEXT_ENCODED_EXECUTION_PATTERNS = (
     b"subprocess",
     b"__import__",
 )
-_LEGAL_TEXT_EMBEDDED_PICKLE_GLOBAL_RE = re.compile(
-    rb"(?=[#()\]\}lpt0FGIJKLMNPSTUVX]{0,256}[ci][^\n\r]{1,128}\n[^\n\r]{1,128}\n)"
-)
-_LEGAL_TEXT_EMBEDDED_PICKLE_SEEDS = (
-    b"__builtin__",
-    b"builtins",
-    b"eval",
-    b"exec",
-    b"os\n",
-    b"posix",
-    b"socket",
-    b"subprocess",
-    b"system",
-)
+_LEGAL_TEXT_PROTO0_GLOBAL_RE = re.compile(rb"(?=#?[ci][A-Za-z_][A-Za-z0-9_.]{0,127}\n[A-Za-z_][A-Za-z0-9_.]{0,127}\n)")
 _LEGAL_TEXT_MAX_EMBEDDED_PICKLE_CANDIDATES = 4096
 
 
@@ -3207,7 +3194,9 @@ def _decoded_token_pickle_route(decoded: bytes) -> str | None:
     lowered = decoded.lower()
     if any(pattern in lowered for pattern in _LEGAL_TEXT_ENCODED_EXECUTION_PATTERNS):
         return "pickle"
-    return _classify_pickle_security_payload(decoded)
+    if _looks_like_binary_pickle_protocol(decoded[:4]):
+        return _classify_pickle_security_payload(decoded)
+    return _structural_legal_text_pickle_route(decoded)
 
 
 def _decode_base64_route_token(token: bytes) -> bytes:
@@ -3217,6 +3206,50 @@ def _decode_base64_route_token(token: bytes) -> bytes:
 
 def _is_plain_alphabetic_base64_word(token: bytes) -> bool:
     return b"=" not in token and token.isalpha()
+
+
+def _validated_pickle_prefix_opcode_names(candidate: bytes) -> frozenset[str] | None:
+    opcode_names: set[str] = set()
+    try:
+        for opcode_count, (opcode, _arg, position) in enumerate(pickletools.genops(candidate), start=1):
+            opcode_names.add(opcode.name)
+            if opcode.name == "STOP":
+                stop_position = 0 if position is None else position
+                pickletools.dis(candidate[: stop_position + 1], out=StringIO())
+                return frozenset(opcode_names)
+            if opcode_count >= PROTO0_1_MAX_PROBE_OPCODES:
+                return None
+    except (UnicodeError, ValueError):
+        return None
+    except (MemoryError, RecursionError):
+        return None
+    except Exception:
+        return None
+    return None
+
+
+def _structural_legal_text_pickle_route(payload: bytes) -> str | None:
+    initial_opcodes = _validated_pickle_prefix_opcode_names(payload[:PROTO0_1_MAX_PROBE_BYTES])
+    if initial_opcodes is not None and any(
+        opcode != "STOP" and opcode not in PROTO0_1_TRIVIAL_LEADING_OPCODES for opcode in initial_opcodes
+    ):
+        return "pickle"
+
+    for candidate_count, match in enumerate(_LEGAL_TEXT_PROTO0_GLOBAL_RE.finditer(payload), start=1):
+        if candidate_count > _LEGAL_TEXT_MAX_EMBEDDED_PICKLE_CANDIDATES:
+            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        offset = match.start()
+        parse_offset = offset + 1 if payload[offset : offset + 1] == b"#" else offset
+        candidate = payload[parse_offset : parse_offset + PROTO0_1_MAX_PROBE_BYTES]
+        opcodes = _validated_pickle_prefix_opcode_names(candidate)
+        if opcodes is None:
+            continue
+        if "GLOBAL" not in opcodes and "INST" not in opcodes:
+            continue
+        has_invocation = bool(opcodes & _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES.difference({"GLOBAL"}))
+        if has_invocation or parse_offset == 0:
+            return "pickle" if offset == 0 else PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    return None
 
 
 def _encoded_pickle_route(payload: bytes) -> str | None:
@@ -3263,25 +3296,7 @@ def _embedded_raw_pickle_route(payload: bytes) -> str | None:
             return "pickle" if binary_offset == 0 else PICKLE_ROUTING_INCONCLUSIVE_FORMAT
         binary_offset = payload.find(b"\x80", binary_offset + 1)
 
-    lowered = payload.lower()
-    if not any(seed in lowered for seed in _LEGAL_TEXT_EMBEDDED_PICKLE_SEEDS):
-        return None
-
-    for candidate_count, match in enumerate(_LEGAL_TEXT_EMBEDDED_PICKLE_GLOBAL_RE.finditer(payload), start=1):
-        if candidate_count > _LEGAL_TEXT_MAX_EMBEDDED_PICKLE_CANDIDATES:
-            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-        offset = match.start()
-        suffix = payload[offset : offset + PROTO0_1_MAX_PROBE_BYTES]
-        state = _classify_initial_pickle_security_signal(
-            suffix,
-            sample_is_prefix=len(payload) - offset > len(suffix),
-            available_stream_length=len(payload) - offset,
-        )
-        if state is True:
-            return "pickle"
-        if state is None:
-            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-    return None
+    return _structural_legal_text_pickle_route(payload)
 
 
 def _legal_text_sidecar_route_from_bytes(

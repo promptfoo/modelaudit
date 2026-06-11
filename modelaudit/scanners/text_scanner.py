@@ -7,6 +7,7 @@ import os
 import re
 import token
 import tokenize
+from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import parse_qsl, urlsplit
 
@@ -601,6 +602,17 @@ class TextScanner(BaseScanner):
         stem = filename[: -len(ext)]
         return stem in {"license", "notice"} and ext in cls.supported_extensions
 
+    @classmethod
+    def _is_valid_legal_documentation_file(cls, path: str) -> bool:
+        file_path = Path(path)
+        try:
+            size = file_path.stat().st_size
+        except OSError:
+            return False
+        from modelaudit.utils.file.detection import _detect_legal_text_sidecar_route
+
+        return _detect_legal_text_sidecar_route(file_path, size) == "text"
+
     def _routed_filename(self, path: str) -> str:
         logical_name = self.config.get(LOGICAL_SCAN_PATH_CONFIG_KEY)
         if isinstance(logical_name, str) and logical_name:
@@ -611,12 +623,10 @@ class TextScanner(BaseScanner):
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given file."""
         filename = os.path.basename(path).lower()
-        if (
-            cls._is_model_card_documentation_filename(filename)
-            or cls._is_readme_documentation_filename(filename)
-            or cls._is_legal_documentation_filename(filename)
-        ):
+        if cls._is_model_card_documentation_filename(filename) or cls._is_readme_documentation_filename(filename):
             return True
+        if cls._is_legal_documentation_filename(filename):
+            return cls._is_valid_legal_documentation_file(path)
 
         ext = os.path.splitext(path)[1].lower()
         if ext not in cls.supported_extensions:
