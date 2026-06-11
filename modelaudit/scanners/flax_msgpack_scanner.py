@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import codecs
+import hashlib
 import os
 import re
 import struct
@@ -35,9 +36,43 @@ _STREAM_MARKER_CHUNK_BYTES = 64 * 1024
 _STREAM_TEXT_CHUNK_BYTES = 64 * 1024
 _STREAM_TEXT_OVERLAP_CHARS = 4096
 _DEFAULT_MAX_STREAM_KEY_LENGTH = 1024 * 1024
+_DEFAULT_MAX_DUPLICATE_KEY_TRACKING_BYTES = 4 * 1024 * 1024
 _UNBOUNDED_GETATTR_PATTERN = r"getattr\s*\(\s*.*\s*,\s*['\"]__.*__['\"]"
 _WHITESPACE_RUN_PATTERN = re.compile(r"\s+")
 _JAX_TRANSFORM_DEDUP_METADATA_KEY = "flax_msgpack_jax_transform_findings"
+_FLAX_NDARRAY_DTYPE_ITEM_SIZES = {
+    "?": 1,
+    "bool": 1,
+    "bool_": 1,
+    "byte": 1,
+    "int8": 1,
+    "uint8": 1,
+    "i1": 1,
+    "u1": 1,
+    "float16": 2,
+    "bfloat16": 2,
+    "int16": 2,
+    "uint16": 2,
+    "f2": 2,
+    "i2": 2,
+    "u2": 2,
+    "float32": 4,
+    "int32": 4,
+    "uint32": 4,
+    "f4": 4,
+    "i4": 4,
+    "u4": 4,
+    "float64": 8,
+    "int64": 8,
+    "uint64": 8,
+    "complex64": 8,
+    "f8": 8,
+    "i8": 8,
+    "u8": 8,
+    "c8": 8,
+    "complex128": 16,
+    "c16": 16,
+}
 
 
 class _StreamCoverageStopped(Exception):
@@ -597,6 +632,7 @@ class FlaxMsgpackScanner(BaseScanner):
     DECODE_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "flax_msgpack_decode_limit_exceeded"
     BINARY_PATTERN_INCONCLUSIVE_REASON: ClassVar[str] = "flax_msgpack_binary_pattern_coverage_incomplete"
     TRUNCATED_STREAM_INCONCLUSIVE_REASON: ClassVar[str] = "flax_msgpack_truncated_stream"
+    DUPLICATE_KEY_TRACKING_INCONCLUSIVE_REASON: ClassVar[str] = "flax_msgpack_duplicate_key_tracking_incomplete"
     DEFAULT_MAX_STRUCTURE_NODES: ClassVar[int] = 200_000
     DEFAULT_MAX_BOUNDED_TEXT_CHARS: ClassVar[int] = 1_000_000
     DEFAULT_MAX_MSGPACK_DECODE_BYTES: ClassVar[int] = 512 * 1024 * 1024
@@ -630,6 +666,10 @@ class FlaxMsgpackScanner(BaseScanner):
         self.max_stream_key_length = self._positive_int_config(
             "max_msgpack_key_length",
             _DEFAULT_MAX_STREAM_KEY_LENGTH,
+        )
+        self.max_duplicate_key_tracking_bytes = self._positive_int_config(
+            "max_msgpack_duplicate_key_tracking_bytes",
+            _DEFAULT_MAX_DUPLICATE_KEY_TRACKING_BYTES,
         )
         self.max_bounded_text_chars = self._positive_int_config(
             "max_msgpack_bounded_text_chars",
@@ -2557,6 +2597,43 @@ class FlaxMsgpackScanner(BaseScanner):
             return cursor.read_uint(4)
         raise _MsgpackStreamFormatError(f"expected binary tensor payload, found marker 0x{marker:02x}")
 
+    @staticmethod
+    def _flax_ndarray_dtype_item_size(dtype: str) -> int:
+        normalized = dtype.strip().lower()
+        if normalized.startswith("numpy."):
+            normalized = normalized.removeprefix("numpy.")
+        if len(normalized) > 1 and normalized[0] in "<>|=":
+            normalized = normalized[1:]
+        item_size = _FLAX_NDARRAY_DTYPE_ITEM_SIZES.get(normalized)
+        if item_size is None:
+            raise _MsgpackStreamFormatError(f"unsupported Flax ndarray dtype metadata: {dtype!r}")
+        return item_size
+
+    def _validate_flax_ndarray_payload_length(
+        self,
+        shape_values: list[int],
+        dtype: str,
+        data_length: int,
+    ) -> None:
+        item_size = self._flax_ndarray_dtype_item_size(dtype)
+        if data_length % item_size != 0:
+            raise _MsgpackStreamFormatError("Flax ndarray tensor byte length is not aligned to dtype item size")
+
+        max_elements = data_length // item_size
+        element_count = 1
+        for index, dimension in enumerate(shape_values):
+            if dimension < 0:
+                raise _MsgpackStreamFormatError(f"Flax ndarray shape dimension {index} is negative")
+            if dimension == 0:
+                element_count = 0
+                break
+            if element_count > max_elements // dimension:
+                raise _MsgpackStreamFormatError("Flax ndarray shape and dtype exceed declared tensor byte length")
+            element_count *= dimension
+
+        if element_count != max_elements:
+            raise _MsgpackStreamFormatError("Flax ndarray shape and dtype do not match declared tensor byte length")
+
     def _check_stream_shape_values(self, shape_values: list[int], location: str, result: ScanResult) -> None:
         shape_summary = _StreamSequenceSummary(
             item_count=len(shape_values),
@@ -2640,6 +2717,7 @@ class FlaxMsgpackScanner(BaseScanner):
         data_length = self._read_stream_binary_header(cursor)
         if cursor.tell() + data_length > body_end:
             raise OutOfData
+        self._validate_flax_ndarray_payload_length(shape_values, dtype, data_length)
 
         value_location = f"{location}[2]"
         self._record_stream_tensor_size(data_length, value_location, summary)
@@ -2648,9 +2726,8 @@ class FlaxMsgpackScanner(BaseScanner):
         remaining = data_length - sample_size
         self._analyze_streamed_binary_chunks(sample, cursor, remaining, data_length, value_location, result)
 
-        if cursor.tell() > body_end:
-            raise _MsgpackStreamFormatError("Flax ndarray extension consumed beyond declared length")
-        cursor.skip(body_end - cursor.tell())
+        if cursor.tell() != body_end:
+            raise _MsgpackStreamFormatError("Flax ndarray extension contains trailing bytes after tensor payload")
         return _StreamValue("ExtType", value=None)
 
     def _read_stream_string_scalar(
@@ -2956,16 +3033,24 @@ class FlaxMsgpackScanner(BaseScanner):
         return key_str, location_key
 
     @staticmethod
-    def _stream_key_identity(key: Any) -> tuple[Any, ...]:
+    def _stream_key_digest_identity(kind: str, value: bytes) -> tuple[Any, ...]:
+        digest = hashlib.blake2b(value, digest_size=16).hexdigest()
+        return (kind, len(value), digest)
+
+    def _stream_key_identity(self, key: Any) -> tuple[tuple[Any, ...], int]:
         if HAS_MSGPACK and isinstance(key, msgpack.ExtType):
-            return ("ext", key.code, key.data)
+            return (self._stream_key_digest_identity(f"ext:{key.code}", key.data), len(key.data))
         if isinstance(key, bytes | bytearray):
-            return ("bin", bytes(key))
+            raw_key = bytes(key)
+            return (self._stream_key_digest_identity("bin", raw_key), len(raw_key))
         if isinstance(key, str):
-            return ("str", key)
+            raw_key = key.encode("utf-8", errors="surrogatepass")
+            return (self._stream_key_digest_identity("str", raw_key), len(raw_key))
         if key is None or isinstance(key, bool | int | float):
-            return (type(key).__name__, repr(key))
-        return (type(key).__name__, _stringify_evidence_fragment(key))
+            identity = (type(key).__name__, repr(key))
+            return (identity, len(identity[1]))
+        fallback_key = _stringify_evidence_fragment(key)
+        return ((type(key).__name__, fallback_key), len(fallback_key))
 
     @staticmethod
     def _add_duplicate_map_key_check(result: ScanResult, key: Any, location: str) -> None:
@@ -2977,6 +3062,31 @@ class FlaxMsgpackScanner(BaseScanner):
             location=_redact_evidence_location(location),
             details={"key": _redact_evidence_key(key)},
             rule_code="S902",
+        )
+
+    def _add_duplicate_key_tracking_budget_check(
+        self,
+        result: ScanResult,
+        summary: _FlaxStreamSummary,
+        *,
+        location: str,
+        tracked_key_bytes: int,
+        next_key_bytes: int,
+        seen_key_count: int,
+    ) -> None:
+        summary.analysis_complete = False
+        self._add_incomplete_check(
+            result,
+            reason=self.DUPLICATE_KEY_TRACKING_INCONCLUSIVE_REASON,
+            name="MessagePack Duplicate Key Tracking Budget",
+            message="Duplicate-key tracking exceeded bounded aggregate key budget",
+            location=location,
+            details={
+                "tracked_key_bytes": tracked_key_bytes,
+                "next_key_bytes": next_key_bytes,
+                "seen_key_count": seen_key_count,
+                "max_msgpack_duplicate_key_tracking_bytes": self.max_duplicate_key_tracking_bytes,
+            },
         )
 
     @staticmethod
@@ -3138,6 +3248,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 summary.top_level_key_count = map_length
             direct_string_keys: set[str] = set()
             seen_keys: set[tuple[Any, ...]] = set()
+            tracked_key_bytes = 0
             duplicate_key_reports = 0
             has_jax_array = False
             visible_items = min(map_length, self.max_items_per_container)
@@ -3221,11 +3332,22 @@ class FlaxMsgpackScanner(BaseScanner):
                     )
                     raise _StreamCoverageStopped
                 key_str, safe_key_str = self._analyze_stream_key(key, location, result, summary)
-                key_identity = self._stream_key_identity(key)
+                key_identity, key_identity_bytes = self._stream_key_identity(key)
+                if tracked_key_bytes + key_identity_bytes > self.max_duplicate_key_tracking_bytes:
+                    self._add_duplicate_key_tracking_budget_check(
+                        result,
+                        summary,
+                        location=location,
+                        tracked_key_bytes=tracked_key_bytes,
+                        next_key_bytes=key_identity_bytes,
+                        seen_key_count=len(seen_keys),
+                    )
+                    raise _StreamCoverageStopped
                 if key_identity in seen_keys and duplicate_key_reports < 16:
                     duplicate_key_reports += 1
                     self._add_duplicate_map_key_check(result, key, location)
                 seen_keys.add(key_identity)
+                tracked_key_bytes += key_identity_bytes
                 key_text = _text_for_security_matching(key)
                 key_location = f"{location}/{safe_key_str}" if location else safe_key_str
                 if key_text is not None and key_text in transformer_keys:

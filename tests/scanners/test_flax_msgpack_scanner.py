@@ -113,9 +113,10 @@ def _write_sparse_large_flax_ndarray_ext(
     *,
     dtype: str = "float32",
     body_prefix: bytes = b"",
+    trailing_body: bytes = b"",
 ) -> None:
     metadata_size = 1 + 1 + _msgpack_uint_size(tensor_size // 4) + _msgpack_str_size(dtype) + 5
-    ext_size = metadata_size + tensor_size
+    ext_size = metadata_size + tensor_size + len(trailing_body)
     with path.open("wb") as output:
         output.write(b"\x81")
         _write_msgpack_str(output, "params")
@@ -134,6 +135,7 @@ def _write_sparse_large_flax_ndarray_ext(
         if remaining:
             output.seek(remaining - 1, os.SEEK_CUR)
             output.write(b"\0")
+        output.write(trailing_body)
 
 
 def _assert_inconclusive_aggregate_not_cached(
@@ -1511,6 +1513,40 @@ def test_flax_msgpack_large_flax_ndarray_ext_scans_dtype_metadata(tmp_path: Path
     )
 
 
+def test_flax_msgpack_flax_ndarray_ext_rejects_trailing_body_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "trailing_body_ndarray_ext.msgpack"
+    tensor_size = (64 * 1024) + 4
+    _write_sparse_large_flax_ndarray_ext(path, tensor_size, trailing_body=msgpack.packb("eval('x')", use_bin_type=True))
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    parse_check = next(check for check in result.checks if check.name == "Msgpack Parse Check")
+    assert "Flax ndarray extension contains trailing bytes" in parse_check.details["parse_error"]
+
+
+def test_flax_msgpack_flax_ndarray_ext_rejects_unsupported_dtype(tmp_path: Path) -> None:
+    path = tmp_path / "unsupported_dtype_ndarray_ext.msgpack"
+    _write_sparse_large_flax_ndarray_ext(path, (64 * 1024) + 4, dtype="object")
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    parse_check = next(check for check in result.checks if check.name == "Msgpack Parse Check")
+    assert "unsupported Flax ndarray dtype metadata" in parse_check.details["parse_error"]
+
+
+def test_flax_msgpack_flax_ndarray_ext_rejects_shape_dtype_length_mismatch(tmp_path: Path) -> None:
+    path = tmp_path / "shape_dtype_mismatch_ndarray_ext.msgpack"
+    _write_sparse_large_flax_ndarray_ext(path, 64 * 1024, dtype="float64")
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    parse_check = next(check for check in result.checks if check.name == "Msgpack Parse Check")
+    assert "Flax ndarray shape and dtype" in parse_check.details["parse_error"]
+
+
 def test_flax_msgpack_non_text_tensor_like_raw_bin_with_hidden_text_tail_is_incomplete(tmp_path: Path) -> None:
     path = tmp_path / "hidden_tail_tensor_like_bin.msgpack"
     payload = (b"\0" * (64 * 1024)) + b"eval('x')" + (b"\0" * 3)
@@ -1527,17 +1563,21 @@ def test_flax_msgpack_non_text_tensor_like_raw_bin_with_hidden_text_tail_is_inco
     )
 
 
-def test_flax_msgpack_over_budget_tensor_like_raw_bin_probe_is_incomplete(tmp_path: Path) -> None:
+@pytest.mark.parametrize("payload_size", [64 * 1024 - 4, 64 * 1024])
+def test_flax_msgpack_over_budget_tensor_like_raw_bin_probe_is_incomplete(
+    tmp_path: Path,
+    payload_size: int,
+) -> None:
     path = tmp_path / "over_budget_probe_tensor_like_bin.msgpack"
-    create_msgpack_file(path, {"params": {"blob": b"\0" * 1024}})
+    create_msgpack_file(path, {"params": {"blob": b"\0" * payload_size}})
 
     result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
 
     assert result.success is False
     assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON]
     coverage = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
-    assert coverage.details["binary_size"] == 1024
-    assert coverage.details["sampled_bytes"] == 1024
+    assert coverage.details["binary_size"] == payload_size
+    assert coverage.details["sampled_bytes"] == payload_size
     assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
 
 
@@ -1587,6 +1627,20 @@ def test_flax_msgpack_duplicate_keys_are_reported_and_values_scanned(tmp_path: P
         and issue.location == "root/params/__reduce__"
         for issue in result.issues
     )
+
+
+def test_flax_msgpack_duplicate_key_tracking_budget_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate_key_tracking_budget.msgpack"
+    create_msgpack_file(path, {"aaaa": 1, "bbbb": 2, "cccc": 3})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_duplicate_key_tracking_bytes": 8}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.DUPLICATE_KEY_TRACKING_INCONCLUSIVE_REASON]
+    budget_check = next(check for check in result.checks if check.name == "MessagePack Duplicate Key Tracking Budget")
+    assert budget_check.details["tracked_key_bytes"] == 8
+    assert budget_check.details["next_key_bytes"] == 4
+    assert budget_check.details["seen_key_count"] == 2
 
 
 @pytest.mark.parametrize(
