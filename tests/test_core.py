@@ -28,7 +28,7 @@ from modelaudit.analysis.unified_context import UnifiedMLContext
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import normalize_material_scan_config
 from modelaudit.config import ModelAuditConfig, set_config
-from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file, scan_model_streaming
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.rules import Severity
 from modelaudit.scanners import (
@@ -733,6 +733,10 @@ def test_savedmodel_supplemental_sources_are_rechecked_after_owner_dispatch(
     assert determine_exit_code(result) == 2
 
 
+@pytest.mark.skipif(
+    not _DESCRIPTOR_BOUND_DIRECTORY_OWNER_PATH_AVAILABLE,
+    reason="descriptor-bound directory owner path is unavailable",
+)
 def test_savedmodel_owner_snapshot_does_not_rehash_opaque_variable_shards(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -8474,6 +8478,129 @@ def test_scan_file_routes_malicious_renamed_jax_json_without_routing_ajax_near_m
     )
     assert near_match_result.scanner_name == "unknown"
     assert near_match_result.success is True
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"cache_scan_results": False},
+        {"cache_scan_results": False, "scanners": ["jax_checkpoint"]},
+    ],
+)
+def test_scan_file_routes_confirmed_jax_state_json(tmp_path: Path, config: dict[str, Any]) -> None:
+    model_path = tmp_path / "state.json"
+    model_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "serialization": "orbax",
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(model_path), config=config)
+
+    assert result.scanner_name == "jax_checkpoint"
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_directory_scan_routes_confirmed_jax_state_json(tmp_path: Path) -> None:
+    model_dir = tmp_path / "jax-directory"
+    model_dir.mkdir()
+    state_path = model_dir / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "serialization": "orbax",
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    assert "jax_checkpoint" in result.scanner_names
+    assert any(issue.rule_code == "S902" and issue.location == str(state_path) for issue in result.issues)
+    assert determine_exit_code(result) == 1
+
+
+@pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+def test_scan_file_routes_nested_confirmed_jax_state_json(tmp_path: Path, archive_kind: str) -> None:
+    payload = json.dumps(
+        {
+            "framework": "jax",
+            "serialization": "orbax",
+            "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+        }
+    ).encode("utf-8")
+    archive_path = tmp_path / f"jax-state.{archive_kind}"
+    if archive_kind == "zip":
+        _create_misnamed_zip(archive_path, {"state.json": payload})
+    else:
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("state.json")
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+    result = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
+
+    assert archive_kind in result.scanner_names
+    assert any(
+        issue.rule_code == "S902" and issue.location is not None and "state.json" in issue.location
+        for issue in result.issues
+    )
+    assert determine_exit_code(result) == 1
+
+
+def test_scan_model_streaming_routes_confirmed_jax_state_json(tmp_path: Path) -> None:
+    model_path = tmp_path / "state.json"
+    model_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "serialization": "orbax",
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_model_streaming(iter([(model_path, True)]), delete_after_scan=False, cache_scan_results=False)
+
+    assert "jax_checkpoint" in result.scanner_names
+    assert any(issue.rule_code == "S902" and issue.location == str(model_path) for issue in result.issues)
+    assert determine_exit_code(result) == 1
+
+
+def test_scan_file_malformed_jax_state_json_fails_closed(tmp_path: Path) -> None:
+    model_path = tmp_path / "state.json"
+    model_path.write_text('{"framework":"jax"', encoding="utf-8")
+
+    result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    metadata = result.file_metadata[str(model_path)]
+
+    assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_json_parse_failed" in metadata["scan_outcome_reasons"]
+    assert determine_exit_code(result) == 2
+
+
+def test_scan_file_keeps_benign_tokenizer_json_out_of_jax(tmp_path: Path) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(
+        json.dumps({"model": {"type": "WordPiece", "vocab": {"hello": 0}}}),
+        encoding="utf-8",
+    )
+
+    result = scan_model_directory_or_file(str(tokenizer_path), cache_scan_results=False)
+
+    assert "jax_checkpoint" not in result.scanner_names
+    assert determine_exit_code(result) == 0
 
 
 def test_scan_file_composes_jax_analysis_for_mxnet_shaped_json(tmp_path: Path) -> None:

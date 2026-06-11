@@ -17,8 +17,11 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils.file.detection import (
+    _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE,
+    _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS,
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
-    _probe_jax_json_checkpoint_file,
+    _probe_jax_json_checkpoint_file_state,
+    _read_jax_json_checkpoint_prefix,
     has_jax_json_checkpoint_structure,
     is_confirmed_jax_json_checkpoint_file,
     is_jax_json_checkpoint_file,
@@ -88,6 +91,7 @@ class JaxCheckpointScanner(BaseScanner):
         "device_array",
     )
     _NON_JAX_NEAR_MATCH_PREFIXES: ClassVar[frozenset[str]] = frozenset({"a"})
+    _BOUNDED_ORBAX_RESTORE_FN_KEY_RE: ClassVar[re.Pattern[bytes]] = re.compile(rb'"restore_fn"\s*:')
     _DOCUMENTATION_CONTEXT_HINTS: ClassVar[frozenset[str]] = frozenset(
         {
             "description",
@@ -829,6 +833,15 @@ class JaxCheckpointScanner(BaseScanner):
                 return True
         return False
 
+    @classmethod
+    def _ambiguous_bare_metadata_requires_owner_dispatch(cls, path: Path) -> bool:
+        """Fail closed only when bounded bare metadata still exposes Orbax-specific risk."""
+        snapshot = _read_jax_json_checkpoint_prefix(path)
+        if snapshot == _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE or snapshot is None:
+            return True
+        _file_size, prefix = snapshot
+        return cls._BOUNDED_ORBAX_RESTORE_FN_KEY_RE.search(prefix) is not None
+
     @staticmethod
     def _regular_file_matches_snapshot(current_stat: os.stat_result, expected_stat: os.stat_result) -> bool:
         return stat.S_ISREG(current_stat.st_mode) and all(
@@ -982,14 +995,19 @@ class JaxCheckpointScanner(BaseScanner):
         if metadata_stat is not None:
             if not stat.S_ISREG(metadata_stat.st_mode):
                 return True
-            metadata_probe = _probe_jax_json_checkpoint_file(metadata_path, unavailable_is_ambiguous=True)
+            metadata_probe = _probe_jax_json_checkpoint_file_state(metadata_path)
             try:
                 final_metadata_stat = metadata_path.lstat()
             except OSError:
                 return True
             if not cls._regular_file_matches_snapshot(final_metadata_stat, metadata_stat):
                 return True
-            if metadata_probe is not False:
+            if metadata_probe in {True, _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE, None}:
+                return True
+            if (
+                metadata_probe == _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
+                and cls._ambiguous_bare_metadata_requires_owner_dispatch(metadata_path)
+            ):
                 return True
 
         # Keep routing bounded without treating entry count alone as a JAX

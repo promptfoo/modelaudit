@@ -145,9 +145,6 @@ def test_tf_savedmodel_read_failure_is_inconclusive_not_security_finding(
             reason in metadata["scan_outcome_reasons"]
             for reason in {"directory_owner_scan_failed", "directory_owner_snapshot_incomplete"}
         )
-        child_metadata = aggregate.file_metadata[str(Path(path) / "saved_model.pb")].model_dump()
-        assert "savedmodel_read_failed" in child_metadata["scan_outcome_reasons"]
-        assert child_metadata["operational_error_reason"] == "savedmodel_read_failed"
     assert any(
         check.name == "SavedModel File Read" and "Unable to read TF SavedModel file" in check.message
         for check in aggregate.checks

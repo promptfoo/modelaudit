@@ -5042,6 +5042,8 @@ def _same_regular_file_identity(current: os.stat_result, expected: os.stat_resul
 
 
 _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE: Literal["unavailable"] = "unavailable"
+_JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS: Literal["ambiguous"] = "ambiguous"
+_JaxJsonCheckpointProbeState = bool | Literal["unavailable", "ambiguous"] | None
 
 
 def _jax_json_checkpoint_prefix_failure_result(
@@ -5106,11 +5108,11 @@ def _read_jax_json_checkpoint_prefix(file_path: Path) -> tuple[int, bytes] | Lit
     return expected_stat.st_size, b"".join(chunks)
 
 
-def _probe_jax_json_checkpoint_file(file_path: Path, *, unavailable_is_ambiguous: bool = False) -> bool | None:
-    """Return True for JAX JSON, None for bounded ambiguity or retargets, else False."""
+def _probe_jax_json_checkpoint_file_state(file_path: Path) -> _JaxJsonCheckpointProbeState:
+    """Return bounded JAX JSON routing state without flattening refusal causes."""
     snapshot = _read_jax_json_checkpoint_prefix(file_path)
     if snapshot == _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE:
-        return None if unavailable_is_ambiguous else False
+        return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
     if snapshot is None:
         return None
     file_size, prefix = snapshot
@@ -5120,7 +5122,7 @@ def _probe_jax_json_checkpoint_file(file_path: Path, *, unavailable_is_ambiguous
         if normalized_prefix.startswith(b"\xef\xbb\xbf"):
             normalized_prefix = normalized_prefix[3:].lstrip()
         if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES and not normalized_prefix:
-            return None
+            return _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
         return False
 
     try:
@@ -5131,13 +5133,13 @@ def _probe_jax_json_checkpoint_file(file_path: Path, *, unavailable_is_ambiguous
         if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES:
             # A visible non-JAX value cannot prove the unseen tail has no later
             # JAX identity field; preserve bounded ambiguity instead of skipping.
-            return None
+            return _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
         return False
     except UnicodeDecodeError:
         if _has_jax_json_checkpoint_prefix_identity(prefix):
             return True
         if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES:
-            return None
+            return _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
         return False
     except (ValueError, RecursionError):
         if _has_jax_json_checkpoint_prefix_identity(prefix):
@@ -5145,8 +5147,18 @@ def _probe_jax_json_checkpoint_file(file_path: Path, *, unavailable_is_ambiguous
         # Python parser limits can reject otherwise valid JSON (for example an
         # oversized integer). That is not evidence that the file lacks a later
         # JAX identity field, so retain it as a bounded ambiguous candidate.
-        return None
+        return _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS
     return has_jax_json_checkpoint_structure(payload)
+
+
+def _probe_jax_json_checkpoint_file(file_path: Path, *, unavailable_is_ambiguous: bool = False) -> bool | None:
+    """Return True for JAX JSON, None for bounded ambiguity or retargets, else False."""
+    probe_state = _probe_jax_json_checkpoint_file_state(file_path)
+    if probe_state == _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE:
+        return None if unavailable_is_ambiguous else False
+    if probe_state == _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS:
+        return None
+    return probe_state
 
 
 def is_jax_json_checkpoint_file(path: str | Path) -> bool:
