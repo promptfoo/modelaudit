@@ -1,5 +1,6 @@
 """Scanner for ONNX model files (.onnx)."""
 
+import hashlib
 import logging
 import math
 import ntpath
@@ -420,6 +421,14 @@ def _bounded_custom_operator_value(value: Any) -> str:
 
 def _custom_operator_identity_display(value: str) -> str:
     return _bounded_custom_operator_value(value) if value else "<default>"
+
+
+def _custom_operator_identity_hash(domain: str, op_type: str, overload: str) -> str:
+    digest = hashlib.sha256()
+    for value in (domain, op_type, overload):
+        digest.update(value.encode("utf-8", errors="surrogatepass"))
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
 
 
 @dataclass
@@ -2964,9 +2973,8 @@ class OnnxScanner(BaseScanner):
             domain_display = _custom_operator_identity_display(domain)
             op_type_display = _bounded_custom_operator_value(op_type)
             overload_display = _custom_operator_identity_display(overload)
-            check_consolidation_key = (
-                f"onnx_custom_operator_identity:{domain_display}:{op_type_display}:{overload_display}"
-            )
+            identity_hash = _custom_operator_identity_hash(domain, op_type, overload)
+            check_consolidation_key = f"onnx_custom_operator_identity:{identity_hash}"
             details = finding.details(
                 domain=domain,
                 security_note=custom_operator_security_note,
@@ -2976,6 +2984,7 @@ class OnnxScanner(BaseScanner):
                 {
                     "op_type": op_type,
                     "overload": overload,
+                    "operator_identity_hash": identity_hash,
                     "operator_identity": {
                         "domain": domain,
                         "op_type": op_type,
@@ -2988,8 +2997,9 @@ class OnnxScanner(BaseScanner):
                 passed=False,
                 message=(
                     f"Model references custom operator '{op_type_display}' in ONNX domain '{domain_display}' "
-                    f"with overload '{overload_display}' in {finding.occurrence_count} node(s). Ensure its "
-                    "implementation is from a trusted source before installation."
+                    f"with overload '{overload_display}' (identity {identity_hash}) in "
+                    f"{finding.occurrence_count} node(s). Ensure its implementation is from a trusted source "
+                    "before installation."
                 ),
                 severity=IssueSeverity.INFO,
                 location=path,

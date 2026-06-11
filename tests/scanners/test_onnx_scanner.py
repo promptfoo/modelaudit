@@ -3859,6 +3859,52 @@ def test_onnx_scanner_explicit_custom_op_identity_survives_json_and_sarif_serial
     } == expected_identities
 
 
+def test_onnx_scanner_long_explicit_custom_op_names_survive_json_and_sarif_dedup(
+    tmp_path: Path,
+) -> None:
+    shared_display_prefix = "custom_op_" + ("a" * 280)
+    custom_nodes = [
+        ("", f"{shared_display_prefix}_float", "", "long_float"),
+        ("", f"{shared_display_prefix}_int", "", "long_int"),
+    ]
+    model_path = create_onnx_model_with_explicit_custom_operator_identities(tmp_path, custom_nodes)
+
+    result = scan_model_directory_or_file(
+        str(model_path),
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    json_payload = result.model_dump(mode="json")
+    json_custom_issues = [
+        issue
+        for issue in json_payload["issues"]
+        if issue.get("rule_code") == "S1111"
+        and issue.get("details", {}).get("operator_identity", {}).get("op_type", "").startswith(shared_display_prefix)
+    ]
+
+    assert len(json_custom_issues) == len(custom_nodes)
+    assert {issue["details"]["operator_identity"]["op_type"] for issue in json_custom_issues} == {
+        op_type for _domain, op_type, _overload, _node_name in custom_nodes
+    }
+    assert len({issue["details"]["operator_identity_hash"] for issue in json_custom_issues}) == len(custom_nodes)
+    assert len({issue["message"] for issue in json_custom_issues}) == len(custom_nodes)
+
+    sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+    sarif_results = [
+        item
+        for item in sarif_payload["runs"][0]["results"]
+        if item["ruleId"] == "S1111"
+        and item.get("properties", {}).get("operator_identity", {}).get("op_type", "").startswith(shared_display_prefix)
+    ]
+
+    assert len(sarif_results) == len(custom_nodes)
+    assert len({item["properties"]["operator_identity_hash"] for item in sarif_results}) == len(custom_nodes)
+    assert len({item["partialFingerprints"]["primaryLocationLineHash"] for item in sarif_results}) == len(custom_nodes)
+
+
 def test_onnx_scanner_real_pyop_node_still_flagged_despite_weight_bytes(tmp_path: Path) -> None:
     """A genuine PyOp node stays CRITICAL even when weight bytes also spell 'PyOp'."""
     pyop_node = helper.make_node("PyOp", ["Y"], ["Z"], name="evil", domain="com.attacker")
