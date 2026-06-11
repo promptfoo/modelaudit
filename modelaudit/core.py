@@ -5345,6 +5345,9 @@ def scan_model_streaming(
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
     is_hf_cache = base_dir is not None and hf_cache_root is not None
+    scanner_selection_skip_extensions = (
+        None if is_hf_cache and scanner_selection.active else scanner_selection_extensions
+    )
     stream_started = False
 
     try:
@@ -5492,9 +5495,9 @@ def scan_model_streaming(
                     and should_skip_file(
                         str(source_path),
                         metadata_scanner_available=metadata_scanner_available,
-                        scanner_selection_extensions=scanner_selection_extensions,
+                        scanner_selection_extensions=scanner_selection_skip_extensions,
                     )
-                    and not _preserve_hf_download_sidecar_asset(str(source_path), scanner_selection_extensions)
+                    and not _preserve_hf_download_sidecar_asset(str(source_path), scanner_selection_skip_extensions)
                 ):
                     filename_lower = source_path.name.lower()
                     if filename_lower in LICENSE_FILES:

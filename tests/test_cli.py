@@ -71,6 +71,12 @@ def test_local_txt_zip_prefilter_uses_bounded_zip_probe(
 _HF_TEST_REVISION = "a" * 40
 
 
+def _minimal_safetensors_bytes() -> bytes:
+    header = {"weights": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    return struct.pack("<Q", len(header_bytes)) + header_bytes + b"\x00\x00\x00\x00"
+
+
 class _FakeRangeResponse:
     def __init__(self, payload: bytes) -> None:
         self.payload = payload
@@ -5473,26 +5479,41 @@ def test_scan_huggingface_streaming_routes_unknown_suffix_by_content(
     mock_run_download.assert_called_once()
 
 
-@patch("modelaudit.utils.sources.huggingface._run_huggingface_download_with_deadline")
-@patch(
-    "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
-    return_value=(["model-00001-of-00002.safetensors"], _HF_TEST_REVISION, None),
+@pytest.mark.parametrize(
+    ("repo_filename", "payload", "expected_exit_code", "expect_failed_check"),
+    [
+        ("model.safetensors", _minimal_safetensors_bytes(), 0, False),
+        ("model-00001-of-00002.safetensors", b"cos\nsystem\n(S'echo shard pwn'\ntR.", 1, True),
+    ],
 )
+@patch("modelaudit.utils.sources.huggingface._run_huggingface_download_with_deadline")
+@patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout")
 @patch("requests.get")
 @patch("huggingface_hub.hf_hub_download")
 def test_scan_huggingface_streaming_selected_pickle_scans_shard_shaped_renamed_pickle(
     mock_hf_hub_download: MagicMock,
     mock_requests_get: MagicMock,
-    _mock_list_repo_files: MagicMock,
+    mock_list_repo_files: MagicMock,
     mock_run_download: MagicMock,
     tmp_path: Path,
+    repo_filename: str,
+    payload: bytes,
+    expected_exit_code: int,
+    expect_failed_check: bool,
 ) -> None:
     """Pickle-only streaming must scan pickle bytes hidden behind shard-shaped names."""
-    malicious_pickle = b"cos\nsystem\n(S'echo shard pwn'\ntR."
-    model_path = tmp_path / "model-00001-of-00002.safetensors"
-    model_path.write_bytes(malicious_pickle)
-    mock_requests_get.return_value = _FakeRangeResponse(malicious_pickle)
-    mock_hf_hub_download.return_value = str(model_path)
+    mock_list_repo_files.return_value = ([repo_filename], _HF_TEST_REVISION, None)
+    model_path = tmp_path / repo_filename
+    model_path.write_bytes(payload)
+    mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+    def fake_hf_hub_download(**download_kwargs: Any) -> str:
+        local_path = Path(download_kwargs["local_dir"]) / str(download_kwargs["filename"])
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(model_path.read_bytes())
+        return str(local_path)
+
+    mock_hf_hub_download.side_effect = fake_hf_hub_download
     mock_run_download.side_effect = lambda _operation, download_kwargs, _deadline, _repo_id, *, direct_download: str(
         direct_download(**download_kwargs)
     )
@@ -5503,14 +5524,18 @@ def test_scan_huggingface_streaming_selected_pickle_scans_shard_shaped_renamed_p
     )
 
     parsed = parse_click_json_output(result.output)
-    assert result.exit_code == 1
+    assert result.exit_code == expected_exit_code
     assert parsed["has_errors"] is False
     assert parsed["files_scanned"] == 1
-    assert parsed["failed_checks"] > 0
-    assert any("pickle" in scanner_name for scanner_name in parsed["scanner_names"])
+    assert (parsed["failed_checks"] > 0) is expect_failed_check
+    if expect_failed_check:
+        assert any("pickle" in scanner_name for scanner_name in parsed["scanner_names"])
+    else:
+        assert not parsed["issues"]
+        assert not any("pickle" in scanner_name for scanner_name in parsed["scanner_names"])
     mock_requests_get.assert_called_once()
     mock_hf_hub_download.assert_called_once()
-    assert mock_hf_hub_download.call_args.kwargs["filename"] == "model-00001-of-00002.safetensors"
+    assert mock_hf_hub_download.call_args.kwargs["filename"] == repo_filename
 
 
 @patch("modelaudit.cli.is_huggingface_url")
