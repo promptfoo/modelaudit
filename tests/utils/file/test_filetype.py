@@ -421,7 +421,7 @@ def test_detect_printable_utf8_text_suffix_protobuf_candidate_fails_closed(
 
 
 @pytest.mark.parametrize("suffix", [".txt", ".conf"])
-def test_detect_printable_ascii_text_suffix_protobuf_candidate_fails_closed(
+def test_detect_printable_ascii_text_suffix_protobuf_tag_near_match_stays_unknown(
     tmp_path: Path,
     suffix: str,
 ) -> None:
@@ -429,9 +429,9 @@ def test_detect_printable_ascii_text_suffix_protobuf_candidate_fails_closed(
     document = tmp_path / f"ascii{suffix}"
     document.write_bytes((b"B" + bytes([len(field_payload)]) + field_payload) * 4097)
 
-    assert detect_file_format_from_magic(str(document)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
-    assert detect_file_format_for_skip_filter(str(document)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
-    assert detect_file_format(str(document)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(document)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(document)) == "unknown"
+    assert detect_file_format(str(document)) == "unknown"
 
 
 @pytest.mark.parametrize("suffix", [".txt", ".conf"])

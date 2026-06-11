@@ -5213,10 +5213,8 @@ def test_scan_file_fails_closed_for_space_prefixed_text_suffix_messagepack_candi
     [
         ("ambiguous.txt", _build_printable_utf8_protobuf_candidate_route),
         ("settings.conf", _build_printable_utf8_protobuf_candidate_route),
-        ("ascii.txt", _build_printable_ascii_protobuf_candidate_route),
-        ("ascii.conf", _build_printable_ascii_protobuf_candidate_route),
     ],
-    ids=["utf8-txt", "utf8-conf", "ascii-txt", "ascii-conf"],
+    ids=["utf8-txt", "utf8-conf"],
 )
 def test_scan_file_fails_closed_for_printable_text_suffix_protobuf_candidate(
     tmp_path: Path,
@@ -5246,6 +5244,28 @@ def test_scan_file_fails_closed_for_printable_text_suffix_protobuf_candidate(
         for reason in result.metadata["scan_outcome_reasons"]
     )
     assert core_module.determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.parametrize("filename", ["ascii.txt", "ascii.conf"])
+def test_scan_file_keeps_printable_ascii_text_suffix_protobuf_tag_near_match_out_of_protobuf_candidate(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    payload = _build_printable_ascii_protobuf_candidate_route()
+    candidate = tmp_path / filename
+    candidate.write_bytes(payload)
+
+    assert file_detection.detect_file_format(str(candidate)) == "unknown"
+    assert file_detection.detect_file_format_from_magic(str(candidate)) == "unknown"
+    assert file_detection.detect_file_format_for_skip_filter(str(candidate)) == "unknown"
+
+    result = scan_file(str(candidate), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(candidate), cache_scan_results=False)
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") is None
+    assert core_module.determine_exit_code(aggregate) == 0
 
 
 def test_scan_file_fails_closed_for_large_printable_utf8_non_text_suffix_binary_candidate(tmp_path: Path) -> None:

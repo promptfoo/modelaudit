@@ -5368,6 +5368,127 @@ def _has_content_route_text_owner_structure(text: str) -> bool:
     return any(char in _CONTENT_ROUTE_TEXT_OWNER_STRUCTURE_CHARS for char in text)
 
 
+def _looks_like_onnx_opset_import_proto_prefix(data: bytes) -> bool:
+    """Return whether a value resembles ONNX OperatorSetIdProto."""
+    offset = 0
+    fields_seen = 0
+    while offset < len(data) and fields_seen < 16:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            return False
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 1 and wire_type == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return False
+            length, _value_start, _value_end, actual_value_end = bounds
+            return 0 < length <= _ONNX_MAX_ROUTING_TEXT_BYTES and actual_value_end <= len(data)
+        if field_number == 2 and wire_type == 0:
+            value_result = _read_proto_varint(data, value_offset)
+            return value_result is not None and 0 < value_result[0] <= 10000
+
+        next_offset = _skip_proto_value(data, value_offset, wire_type)
+        if next_offset is None:
+            return False
+        offset = next_offset
+        fields_seen += 1
+    return False
+
+
+def _looks_like_onnx_string_entry_proto_prefix(data: bytes) -> bool:
+    """Return whether a value resembles ONNX StringStringEntryProto."""
+    offset = 0
+    fields_seen = 0
+    while offset < len(data) and fields_seen < 16:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            return False
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number in {1, 2} and wire_type == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return False
+            length, _value_start, _value_end, actual_value_end = bounds
+            return 0 < length <= _ONNX_MAX_ROUTING_TEXT_BYTES and actual_value_end <= len(data)
+
+        next_offset = _skip_proto_value(data, value_offset, wire_type)
+        if next_offset is None:
+            return False
+        offset = next_offset
+        fields_seen += 1
+    return False
+
+
+def _has_bounded_onnx_model_text_candidate_field_signal(
+    payload: bytes,
+    field_number: int,
+    wire_type: int,
+    value_offset: int,
+) -> bool:
+    """Return whether a known ONNX field has a model-like value."""
+    expected_wire_type = _ONNX_MODEL_FIELD_WIRE_TYPES.get(field_number)
+    if expected_wire_type != wire_type:
+        return False
+    if wire_type == 0:
+        value_result = _read_proto_varint(payload, value_offset)
+        return value_result is not None and field_number in {1, 5} and 0 < value_result[0] <= 10000
+    if wire_type != 2:
+        return _skip_proto_value(payload, value_offset, wire_type) is not None
+
+    bounds = _read_length_delimited_proto_value(payload, value_offset)
+    if bounds is None:
+        return False
+    length, value_start, value_end, actual_value_end = bounds
+    if length <= 0 or actual_value_end > len(payload):
+        return False
+    value = payload[value_start:value_end]
+    if field_number == 7:
+        graph_status = _looks_like_onnx_graph_proto_stream(
+            BytesIO(value),
+            len(value),
+            [_ONNX_GRAPH_MAX_ROUTING_FIELDS],
+        )
+        return graph_status is not False
+    if field_number == 8:
+        return _looks_like_onnx_opset_import_proto_prefix(value)
+    if field_number == 14:
+        return _looks_like_onnx_string_entry_proto_prefix(value)
+    if field_number in {20, 25, 26}:
+        return _looks_like_proto_message_prefix(value) and bool(
+            value.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES)
+        )
+    return False
+
+
+def _has_bounded_coreml_model_text_candidate_field_signal(
+    payload: bytes,
+    field_number: int,
+    wire_type: int,
+    value_offset: int,
+) -> bool:
+    """Return whether a known CoreML field has a model-like value."""
+    if field_number == 1 and wire_type == 0:
+        value_result = _read_proto_varint(payload, value_offset)
+        return value_result is not None and 0 < value_result[0] <= 10000
+    if not ((field_number == 2 or field_number in _COREML_MODEL_TYPE_FIELDS) and wire_type == 2):
+        return False
+
+    bounds = _read_length_delimited_proto_value(payload, value_offset)
+    if bounds is None:
+        return False
+    length, value_start, value_end, actual_value_end = bounds
+    if length <= 0 or actual_value_end > len(payload):
+        return False
+    value = payload[value_start:value_end]
+    if field_number == 2:
+        return _looks_like_coreml_description_proto_prefix(value) is not False
+    return _looks_like_proto_message_prefix(value) and bool(value.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES))
+
+
 def _has_bounded_protobuf_model_text_candidate_signal(file_path: Path, file_size: int) -> bool:
     """Return whether a text-like protobuf prefix uses known model fields."""
     try:
@@ -5387,12 +5508,9 @@ def _has_bounded_protobuf_model_text_candidate_signal(file_path: Path, file_size
         if field_number == 0:
             return False
 
-        expected_wire_type = _ONNX_MODEL_FIELD_WIRE_TYPES.get(field_number)
-        if expected_wire_type == wire_type:
+        if _has_bounded_onnx_model_text_candidate_field_signal(payload, field_number, wire_type, value_offset):
             return True
-        if (field_number == 1 and wire_type == 0) or (
-            (field_number == 2 or field_number in _COREML_MODEL_TYPE_FIELDS) and wire_type == 2
-        ):
+        if _has_bounded_coreml_model_text_candidate_field_signal(payload, field_number, wire_type, value_offset):
             return True
 
         next_offset = _skip_proto_value(payload, value_offset, wire_type)
