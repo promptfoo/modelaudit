@@ -7,6 +7,8 @@ import pickle
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pickle_scanner import ML_SAFE_GLOBALS, PickleScanner, _is_legitimate_serialization_file
 
@@ -46,9 +48,24 @@ def test_joblib_policy_export_remains_narrow() -> None:
     assert "dill" not in ML_SAFE_GLOBALS
 
 
-def test_legitimate_joblib_like_pickle_is_accepted(tmp_path: Path) -> None:
+def test_legitimate_joblib_like_pickle_is_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     joblib_file = tmp_path / "numpy_arrays.joblib"
     _write_joblib_like_pickle(joblib_file, padding=16)
+
+    def trusted_joblib_wrapper(module: str, name: str) -> bool:
+        return (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper")
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
+        trusted_joblib_wrapper,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_reference_is_proven_trusted",
+        trusted_joblib_wrapper,
+    )
 
     result = PickleScanner().scan(str(joblib_file))
 

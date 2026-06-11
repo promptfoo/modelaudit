@@ -212,6 +212,24 @@ def _hf_training_args_metadata_payload() -> bytes:
     return b"\x80\x02](" + b"".join(items) + b"e."
 
 
+def _hf_training_args_import_only_metadata_payload() -> bytes:
+    return (
+        b"\x80\x02]("
+        + b"".join(_reference_global(module, name) for module, name in sorted(_HF_TRAINING_ARGS_METADATA_REFERENCES))
+        + b"e."
+    )
+
+
+_SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD = (
+    b"\x80\x02cnumpy._core.multiarray\n_reconstruct\nq\x00cnumpy\nndarray\nq\x01K\x00\x85q\x02"
+    b"c_codecs\nencode\nq\x03X\x01\x00\x00\x00bq\x04X\x06\x00\x00\x00latin1q\x05\x86q\x06"
+    b"Rq\x07\x87q\x08Rq\t(K\x01K\x03\x85q\ncnumpy\ndtype\nq\x0bX\x02\x00\x00\x00u4q\x0c"
+    b"\x89\x88\x87q\rRq\x0e(K\x03X\x01\x00\x00\x00<q\x0fNNNJ\xff\xff\xff\xffJ\xff\xff\xff\xff"
+    b"K\x00tq\x10b\x89h\x03X\x0c\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00"
+    b"q\x11h\x05\x86q\x12Rq\x13tq\x14b."
+)
+
+
 def _force_framework_metadata_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "modelaudit_picklescan.call_graph._trusted_module_origin_kind",
@@ -6137,6 +6155,25 @@ def test_scan_bytes_warns_on_unresolved_hf_training_args_framework_metadata(
     assert any(notice.code == "call_graph_source_unavailable" for notice in report.notices)
 
 
+def test_scan_bytes_suppresses_inert_import_only_hf_training_args_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_framework_metadata_unresolved(monkeypatch)
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_bytes(
+            _hf_training_args_import_only_metadata_payload(),
+            source="hf-training-args-import-only-framework-metadata.pkl",
+        )
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert _import_reference_pairs(report) >= _HF_TRAINING_ARGS_METADATA_REFERENCES
+    assert not any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
+
+
 @pytest.mark.parametrize(
     ("case_name", "payload", "mode", "extension_code"),
     _shadow_framework_divergence_cases(),
@@ -6254,6 +6291,43 @@ def test_scan_bytes_keeps_malicious_reduce_and_extension_controls_detected(
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert any(finding.rule_code == expected_rule for finding in report.findings)
+
+
+def test_scan_bytes_suppresses_safe_numpy_ndarray_reconstruct_call_graph_noise() -> None:
+    payload = _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD.replace(
+        b"cnumpy._core.multiarray\n_reconstruct\n",
+        b"cnumpy.core.multiarray\n_reconstruct\n",
+    )
+    report = scan_bytes(
+        payload,
+        source="safe-numpy-ndarray-reconstruct.pkl",
+    )
+
+    assert not any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.details.get("import_reference") == "numpy.core.multiarray._reconstruct"
+        for finding in report.findings
+    )
+    assert not any(finding.severity == Severity.CRITICAL for finding in report.findings)
+
+
+def test_scan_bytes_keeps_numpy_reconstruct_critical_when_class_argument_is_attacker_controlled() -> None:
+    payload = _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD.replace(
+        b"cnumpy._core.multiarray\n_reconstruct\n",
+        b"cnumpy.core.multiarray\n_reconstruct\n",
+    ).replace(
+        b"cnumpy\nndarray\n",
+        b"cbuiltins\neval\n",
+    )
+
+    report = scan_bytes(payload, source="attacker-controlled-numpy-reconstruct.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.details.get("import_reference") == "numpy.core.multiarray._reconstruct"
+        for finding in report.findings
+    )
 
 
 def test_scan_bytes_warns_when_hf_metadata_constructor_resolves_to_shadow_module(

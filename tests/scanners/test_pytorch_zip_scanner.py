@@ -37,6 +37,15 @@ _HF_T10_REVISION = "272068e81a31e88a48ea03c20a09decba2b62ed6"
 _HF_T10_FILENAME = "training_args.bin"
 _HF_T10_SHA256 = "995b5f0a2fe72453ddc8ce97e1a93747554ec3ec0ac92d86e82a57050db51b85"
 _HF_T10_MAX_BYTES = 10 * 1024 * 1024
+_HF_SUPRA_REPO_ID = "SupraLabs/Supra-50M-Reasoning"
+_HF_SUPRA_REVISION = "8042578a94719b754b970ee4c348939e2596108f"
+_HF_SUPRA_TRAINING_ARGS_SHA256 = "459235485346f0d977349a1bd9dd23917485416c223235fb6ef3d8620d0346b3"
+_HF_FAIRFACE_REPO_ID = "dima806/fairface_age_image_detection"
+_HF_FAIRFACE_REVISION = "4e02ab8057ea7fd74b1670940995c5dfda3e6ec0"
+_HF_FAIRFACE_TRAINING_ARGS = "checkpoint-32/training_args.bin"
+_HF_FAIRFACE_TRAINING_ARGS_SHA256 = "28ebf2b6dbb08045128c07625eb89924fd949f0c3794edd35784a5c320305df8"
+_HF_FAIRFACE_RNG_STATE = "checkpoint-32/rng_state.pth"
+_HF_FAIRFACE_RNG_STATE_SHA256 = "6b3ee827a7a00012c0a116546df467feee35e70376d81a7a85b1a70eb90414d3"
 _HF_TORCHSCRIPT_QA_REPO_ID = "google-bert/bert-large-uncased"
 _HF_TORCHSCRIPT_QA_REVISION = "6da4b6a26a1877e173fca3225479512db81a5e5b"
 _HF_TORCHSCRIPT_ST_QA_REPO_ID = "sentence-transformers/all-MiniLM-L12-v2"
@@ -115,6 +124,32 @@ def _hf_training_args_metadata_payload() -> bytes:
         _metadata_newobj_build_payload("transformers.integrations.deepspeed", "HfDeepSpeedConfig"),
     ]
     return b"\x80\x02](" + b"".join(items) + b"e."
+
+
+def _hf_training_args_import_only_metadata_payload() -> bytes:
+    references = (
+        ("accelerate.state", "PartialState"),
+        ("accelerate.utils.dataclasses", "DistributedType"),
+        ("torch", "device"),
+        ("transformers.trainer_pt_utils", "AcceleratorConfig"),
+        ("transformers.trainer_utils", "HubStrategy"),
+        ("transformers.trainer_utils", "IntervalStrategy"),
+        ("transformers.trainer_utils", "SaveStrategy"),
+        ("transformers.trainer_utils", "SchedulerType"),
+        ("transformers.training_args", "OptimizerNames"),
+        ("transformers.training_args", "TrainingArguments"),
+    )
+    return b"\x80\x02](" + b"".join(_pickle_global(module, name) for module, name in references) + b"e."
+
+
+_SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD = (
+    b"\x80\x02cnumpy._core.multiarray\n_reconstruct\nq\x00cnumpy\nndarray\nq\x01K\x00\x85q\x02"
+    b"c_codecs\nencode\nq\x03X\x01\x00\x00\x00bq\x04X\x06\x00\x00\x00latin1q\x05\x86q\x06"
+    b"Rq\x07\x87q\x08Rq\t(K\x01K\x03\x85q\ncnumpy\ndtype\nq\x0bX\x02\x00\x00\x00u4q\x0c"
+    b"\x89\x88\x87q\rRq\x0e(K\x03X\x01\x00\x00\x00<q\x0fNNNJ\xff\xff\xff\xffJ\xff\xff\xff\xff"
+    b"K\x00tq\x10b\x89h\x03X\x0c\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00"
+    b"q\x11h\x05\x86q\x12Rq\x13tq\x14b."
+)
 
 
 def _write_training_args_bin(path: Path, payload: bytes) -> None:
@@ -273,16 +308,34 @@ def _assert_shadow_framework_unpickle_executes(
     assert marker.exists()
 
 
-def _download_pinned_training_args(tmp_path: Path) -> Path:
-    url = f"https://huggingface.co/{_HF_T10_REPO_ID}/resolve/{_HF_T10_REVISION}/{_HF_T10_FILENAME}"
+def _download_hf_file(
+    tmp_path: Path,
+    *,
+    repo_id: str,
+    revision: str,
+    filename: str,
+    sha256: str,
+    max_bytes: int = _HF_T10_MAX_BYTES,
+) -> Path:
+    url = f"https://huggingface.co/{repo_id}/resolve/{revision}/{filename}"
     request = urllib.request.Request(url, headers={"User-Agent": "modelaudit-test"})
     with urllib.request.urlopen(request, timeout=60) as response:
-        payload = response.read(_HF_T10_MAX_BYTES + 1)
-    assert len(payload) <= _HF_T10_MAX_BYTES
-    assert hashlib.sha256(payload).hexdigest() == _HF_T10_SHA256
-    path = tmp_path / _HF_T10_FILENAME
+        payload = response.read(max_bytes + 1)
+    assert len(payload) <= max_bytes
+    assert hashlib.sha256(payload).hexdigest() == sha256
+    path = tmp_path / filename.replace("/", "__")
     path.write_bytes(payload)
     return path
+
+
+def _download_pinned_training_args(tmp_path: Path) -> Path:
+    return _download_hf_file(
+        tmp_path,
+        repo_id=_HF_T10_REPO_ID,
+        revision=_HF_T10_REVISION,
+        filename=_HF_T10_FILENAME,
+        sha256=_HF_T10_SHA256,
+    )
 
 
 class _NewObjExImportGadget:
@@ -500,6 +553,82 @@ def test_pytorch_zip_training_args_unresolved_framework_metadata_refs_warn(
     )
 
 
+def test_pytorch_zip_suppresses_inert_import_only_training_args_metadata_refs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "training_args.bin"
+    _write_training_args_bin(model_path, _hf_training_args_import_only_metadata_payload())
+    _force_framework_metadata_unresolved(monkeypatch)
+    _clear_source_sensitive_caches()
+
+    try:
+        result = PyTorchZipScanner().scan(str(model_path))
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert result.success is True
+    assert not any(issue.rule_code == "NON_ALLOWLISTED_GLOBAL" for issue in result.issues)
+    assert (
+        sum(
+            check.name == "Standalone Pickle Import"
+            and check.status == CheckStatus.PASSED
+            and check.details.get("pickle_filename") == "training_args/data.pkl"
+            for check in result.checks
+        )
+        == 10
+    )
+    assert not any(
+        check.name == "CVE-2025-32434 Pickle Format Security Analysis" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_suppresses_safe_numpy_rng_state_reconstruct_call_graph_noise(tmp_path: Path) -> None:
+    model_path = tmp_path / "rng_state.pth"
+    payload = _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD.replace(
+        b"cnumpy._core.multiarray\n_reconstruct\n",
+        b"cnumpy.core.multiarray\n_reconstruct\n",
+    )
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("rng_state/version", "3")
+        zip_file.writestr("rng_state/byteorder", "little")
+        zip_file.writestr("rng_state/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert not any(
+        issue.rule_code == "DANGEROUS_CALL_GRAPH"
+        and issue.details.get("import_reference") == "numpy.core.multiarray._reconstruct"
+        for issue in result.issues
+    )
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_pytorch_zip_keeps_numpy_rng_state_reconstruct_critical_for_attacker_class(tmp_path: Path) -> None:
+    model_path = tmp_path / "rng_state_attacker_class.pth"
+    payload = _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD.replace(
+        b"cnumpy._core.multiarray\n_reconstruct\n",
+        b"cnumpy.core.multiarray\n_reconstruct\n",
+    ).replace(
+        b"cnumpy\nndarray\n",
+        b"cbuiltins\neval\n",
+    )
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("rng_state/version", "3")
+        zip_file.writestr("rng_state/byteorder", "little")
+        zip_file.writestr("rng_state/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        issue.rule_code == "DANGEROUS_CALL_GRAPH"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("import_reference") == "numpy.core.multiarray._reconstruct"
+        for issue in result.issues
+    )
+
+
 @pytest.mark.parametrize(
     ("case_name", "payload", "mode", "extension_code"),
     _shadow_framework_divergence_cases(),
@@ -553,6 +682,94 @@ def test_real_huggingface_locateanything_training_args_metadata_clean(
     assert determine_exit_code(result) == 0
     assert result.files_scanned == 1
     assert not [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}]
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("MODELAUDIT_RUN_HF_REAL_MODEL_TESTS") != "1",
+    reason="Set MODELAUDIT_RUN_HF_REAL_MODEL_TESTS=1 to download the pinned Hugging Face fixture.",
+)
+@pytest.mark.parametrize(
+    ("repo_id", "revision", "filename", "sha256"),
+    [
+        (
+            _HF_SUPRA_REPO_ID,
+            _HF_SUPRA_REVISION,
+            _HF_T10_FILENAME,
+            _HF_SUPRA_TRAINING_ARGS_SHA256,
+        ),
+        (
+            _HF_FAIRFACE_REPO_ID,
+            _HF_FAIRFACE_REVISION,
+            _HF_FAIRFACE_TRAINING_ARGS,
+            _HF_FAIRFACE_TRAINING_ARGS_SHA256,
+        ),
+    ],
+)
+def test_real_huggingface_training_args_executable_metadata_refs_stay_suspicious(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    repo_id: str,
+    revision: str,
+    filename: str,
+    sha256: str,
+) -> None:
+    monkeypatch.setenv("PROMPTFOO_DISABLE_TELEMETRY", "1")
+    monkeypatch.setenv("HF_HUB_DISABLE_TELEMETRY", "1")
+    model_path = _download_hf_file(
+        tmp_path,
+        repo_id=repo_id,
+        revision=revision,
+        filename=filename,
+        sha256=sha256,
+    )
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        issue.rule_code == "S201"
+        and issue.severity == IssueSeverity.WARNING
+        and issue.details.get("pickle_filename") == "training_args/data.pkl"
+        and issue.details.get("opcode_counts", {}).get("REDUCE", 0) > 0
+        for issue in result.issues
+    )
+    assert any(
+        issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and issue.severity == IssueSeverity.WARNING
+        and issue.details.get("invoked") is True
+        and issue.details.get("pickle_filename") == "training_args/data.pkl"
+        for issue in result.issues
+    )
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("MODELAUDIT_RUN_HF_REAL_MODEL_TESTS") != "1",
+    reason="Set MODELAUDIT_RUN_HF_REAL_MODEL_TESTS=1 to download the pinned Hugging Face fixture.",
+)
+def test_real_huggingface_fairface_rng_state_numpy_reconstruct_not_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PROMPTFOO_DISABLE_TELEMETRY", "1")
+    monkeypatch.setenv("HF_HUB_DISABLE_TELEMETRY", "1")
+    model_path = _download_hf_file(
+        tmp_path,
+        repo_id=_HF_FAIRFACE_REPO_ID,
+        revision=_HF_FAIRFACE_REVISION,
+        filename=_HF_FAIRFACE_RNG_STATE,
+        sha256=_HF_FAIRFACE_RNG_STATE_SHA256,
+    )
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert not any(
+        issue.rule_code == "DANGEROUS_CALL_GRAPH"
+        and issue.details.get("import_reference") == "numpy.core.multiarray._reconstruct"
+        for issue in result.issues
+    )
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 @pytest.mark.parametrize("suffix", [".ckpt", ".pkl", ".bin"])
