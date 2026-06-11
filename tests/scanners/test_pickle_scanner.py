@@ -814,6 +814,23 @@ def test_expensive_raw_prefilters_preserve_bare_ipv4_network_findings(tmp_path: 
     assert not result.metadata.get("pickle_network_raw_detector_skipped")
 
 
+@pytest.mark.parametrize("term", ["trojan", "zombie"])
+def test_expensive_raw_prefilters_preserve_serialized_cc_terms(tmp_path: Path, term: str) -> None:
+    path = tmp_path / "serialized-cc.pkl"
+    path.write_bytes(pickle.dumps({"payload": f"{term} c2_server=https://evil.example/payload"}, protocol=4))
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        issue.rule_code == "S310"
+        and issue.details.get("type") == "cc_pattern"
+        and issue.details.get("pattern") == term
+        and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
+    assert not result.metadata.get("pickle_network_raw_detector_skipped")
+
+
 def test_scan_malicious_pickle_reports_rust_finding(tmp_path: Path) -> None:
     path = tmp_path / "evil.pkl"
     path.write_bytes(pickle.dumps(MaliciousPayload(), protocol=4))
