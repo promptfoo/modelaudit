@@ -247,13 +247,20 @@ def _should_defer_hash_for_legacy_pytorch_read_limit(
     file_path: str,
     config: dict[str, Any],
     file_size: int,
+    max_file_read_size: int,
 ) -> bool:
     try:
         from ...scanners.pickle_scanner import PickleScanner
 
         scanner = PickleScanner(config=config)
+        control_probe_size = min(
+            scanner._legacy_pytorch_control_probe_size(file_size),
+            max_file_read_size,
+        )
+        if control_probe_size <= 0:
+            return False
         with open(file_path, "rb") as handle:
-            control_probe = handle.read(scanner._legacy_pytorch_control_probe_size(file_size))
+            control_probe = handle.read(control_probe_size)
 
             def read_at(local_offset: int, size: int) -> bytes:
                 handle.seek(local_offset)
@@ -298,7 +305,12 @@ def should_defer_hash_for_pytorch_read_limit(
         except Exception:
             return True
 
-    return _should_defer_hash_for_legacy_pytorch_read_limit(file_path, config, resolved_file_size)
+    return _should_defer_hash_for_legacy_pytorch_read_limit(
+        file_path,
+        config,
+        resolved_file_size,
+        max_file_read_size,
+    )
 
 
 def _known_uncacheable_scan_result(result: Any) -> bool:

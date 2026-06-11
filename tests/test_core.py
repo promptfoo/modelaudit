@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import builtins
 import errno
 import gzip
 import importlib
@@ -214,6 +215,60 @@ def _build_malicious_pickle(*, protocol: int | None = None) -> bytes:
             return (os_module.system, ("echo core-dispatch-test",))
 
     return pickle.dumps(DangerousPayload(), protocol=protocol)
+
+
+def _core_binunicode(data: bytes) -> bytes:
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def _core_legacy_pytorch_object_stream(
+    storage_keys: tuple[str, ...],
+    storage_size: int,
+    *,
+    malicious_object: bool = False,
+) -> bytes:
+    object_stream = bytearray(b"\x80\x02]")
+    for key in storage_keys:
+        encoded_key = key.encode("ascii")
+        object_stream += b"(" + _core_binunicode(b"storage")
+        object_stream += b"ctorch\nByteStorage\n"
+        object_stream += _core_binunicode(encoded_key) + _core_binunicode(b"cpu")
+        object_stream += pickle.dumps(storage_size, protocol=2)[2:-1]
+        object_stream += b"NtQa"
+    if malicious_object:
+        malicious_pickle = _build_malicious_pickle(protocol=2)
+        object_stream += malicious_pickle[2:-1] + b"a"
+    object_stream += b"."
+    return bytes(object_stream)
+
+
+def _make_core_legacy_pytorch_container(
+    storage_payload: bytes,
+    *,
+    malicious_object: bool = False,
+    storage_keys: tuple[str, ...] = ("0",),
+) -> bytes:
+    storage_size = len(storage_payload)
+    control_streams = (
+        pickle.dumps(0x1950A86A20F9469CFC6C, protocol=2),
+        pickle.dumps(1001, protocol=2),
+        pickle.dumps(
+            {
+                "protocol_version": 1001,
+                "little_endian": True,
+                "type_sizes": {"short": 2, "int": 4, "long": 8},
+            },
+            protocol=2,
+        ),
+        _core_legacy_pytorch_object_stream(
+            storage_keys,
+            storage_size,
+            malicious_object=malicious_object,
+        ),
+        pickle.dumps(list(storage_keys), protocol=2),
+    )
+    storage_record = b"".join(storage_size.to_bytes(8, "little") + storage_payload for _key in storage_keys)
+    return b"".join(control_streams) + storage_record
 
 
 def test_scan_file_padded_media_pickle_polyglot_fails_closed(tmp_path: Path) -> None:
@@ -12004,6 +12059,111 @@ def test_scan_file_bypasses_cache_hash_for_bounded_pytorch_zip_read_limit(
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
+
+
+def test_scan_file_bypasses_cache_hash_for_bounded_legacy_pytorch_read_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "legacy-large.pt"
+    model_path.write_bytes(
+        _make_core_legacy_pytorch_container(
+            b"A" * 2048,
+            malicious_object=True,
+        )
+    )
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+        "max_cache_file_size": 10_000,
+        "max_file_read_size": 512,
+    }
+    assert cache_decorator.should_defer_hash_for_pytorch_read_limit(
+        str(model_path),
+        config,
+        model_path.stat().st_size,
+    )
+    monkeypatch.setattr(
+        SecureFileHasher,
+        "hash_file",
+        lambda _self, _path: pytest.fail("bounded legacy PyTorch scans must bypass cache-key hashing"),
+    )
+    monkeypatch.setattr(
+        SecureFileHasher,
+        "hash_file_with_stat",
+        lambda _self, _path, _stat: pytest.fail("bounded legacy PyTorch scans must bypass cache validation hashing"),
+    )
+
+    reset_cache_manager()
+    try:
+        result = scan_file(str(model_path), config=config)
+
+        assert result.success is False
+        assert result.metadata["legacy_pytorch_bounded_analysis"] is True
+        assert result.metadata["legacy_pytorch_storage_payload_skipped"] is True
+        assert result.metadata["file_hashes"]["sha256_prefix"]
+        assert "sha256" not in result.metadata["file_hashes"]
+        assert any(issue.details.get("associated_global") in _SYSTEM_GLOBAL_NAMES for issue in result.issues)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+@pytest.mark.parametrize("suffix", [".pt", ".bin"])
+def test_pytorch_legacy_cache_probe_respects_max_file_read_size_for_near_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+) -> None:
+    max_file_read_size = 64
+    near_match = tmp_path / f"not-legacy{suffix}"
+    legacy_preamble = pickle.dumps(0x1950A86A20F9469CFC6C, protocol=2) + pickle.dumps(1001, protocol=2)
+    near_match.write_bytes(legacy_preamble + b"\x80\x02X" + (4096).to_bytes(4, "little") + (b"A" * 4096))
+    real_open = builtins.open
+    read_sizes: list[int] = []
+
+    class ReadSizeGuard:
+        def __init__(self, handle: Any) -> None:
+            self._handle = handle
+
+        def __enter__(self) -> ReadSizeGuard:
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *args: Any) -> Any:
+            return self._handle.__exit__(*args)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._handle, name)
+
+        def read(self, size: int = -1) -> bytes:
+            if size < 0 or size > max_file_read_size:
+                pytest.fail(f"legacy cache probe read {size} bytes before proving layout")
+            read_sizes.append(size)
+            return cast(bytes, self._handle.read(size))
+
+    def guarded_open(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        handle = real_open(file, mode, *args, **kwargs)
+        try:
+            candidate = Path(file)
+        except TypeError:
+            return handle
+        if candidate == near_match and "r" in mode and "b" in mode:
+            return ReadSizeGuard(handle)
+        return handle
+
+    monkeypatch.setattr(builtins, "open", guarded_open)
+
+    should_defer = cache_decorator.should_defer_hash_for_pytorch_read_limit(
+        str(near_match),
+        {"max_file_read_size": max_file_read_size},
+        near_match.stat().st_size,
+    )
+
+    assert should_defer is False
+    assert read_sizes == [4, max_file_read_size]
 
 
 def test_scan_file_ignores_benign_onnx_token_near_match(tmp_path: Path) -> None:
