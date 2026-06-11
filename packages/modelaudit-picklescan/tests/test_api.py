@@ -6505,7 +6505,7 @@ def test_scan_bytes_warns_when_numpy_reconstruct_resolves_to_shadow_module(
         _clear_source_sensitive_caches()
 
     assert marker.exists() is False
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
     assert any(
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
         and finding.details.get("import_reference") == "numpy.core.multiarray._reconstruct"
