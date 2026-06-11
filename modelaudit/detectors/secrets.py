@@ -365,6 +365,10 @@ BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS = 256
 BASIC_AUTH_HEADER_NAMES = {
     "authorization": "Authorization",
     "proxyauthorization": "Proxy-Authorization",
+    "basicauth": "Authorization",
+    "authheader": "Authorization",
+    "authorizationheader": "Authorization",
+    "proxyauthheader": "Proxy-Authorization",
 }
 BASIC_AUTH_CONTINUATION_PREFIX_PATTERN = re.compile(r"^\s*(?:-\s*)?[\"']?$")
 BASIC_AUTH_VALUE_PREFIX_PATTERN = re.compile(r"^\s*Basic\s+", re.IGNORECASE)
@@ -604,12 +608,7 @@ class SecretsDetector:
     def _basic_auth_match_has_header_context(text: str, position: int) -> bool:
         search_start = max(0, position - BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS)
         last_newline = max(text.rfind("\n", search_start, position), text.rfind("\r", search_start, position))
-        if last_newline == -1:
-            if search_start > 0:
-                return False
-            line_start = 0
-        else:
-            line_start = last_newline + 1
+        line_start = search_start if last_newline == -1 else last_newline + 1
 
         line_prefix = text[line_start:position]
         if len(line_prefix) > BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS:
@@ -630,12 +629,7 @@ class SecretsDetector:
             text.rfind("\n", previous_search_start, previous_end),
             text.rfind("\r", previous_search_start, previous_end),
         )
-        if previous_break == -1:
-            if previous_search_start > 0:
-                return False
-            previous_start = 0
-        else:
-            previous_start = previous_break + 1
+        previous_start = previous_search_start if previous_break == -1 else previous_break + 1
 
         previous_line = text[previous_start:previous_end]
         if len(previous_line) > BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS:

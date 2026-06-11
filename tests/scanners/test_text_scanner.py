@@ -137,6 +137,7 @@ def test_text_scanner_detects_valid_authorization_basic_credentials(tmp_path: Pa
         ("prod.env", "BASIC_AUTH=Basic cHJvZC1lbnY6cGFzcw==\n"),
         ("README.md", 'BASIC_AUTH="Basic YmFzaWMtZW52OnBhc3M="\n'),
         ("README.md", 'auth_header = "Basic YXV0aC1oZWFkZXI6cGFzcw=="\n'),
+        ("README.md", ("x" * 1000) + " Authorization: Basic bG9uZy1saW5lOnBhc3M=\n"),
         ("model_card.md", 'payload = "{\\"Authorization\\": \\"Basic ZXNjYXBlZC1jcmxmOnBhc3M=\\r\\n\\"}"\n'),
         ("model_card.md", "Use `Authorization: Basic c2VudGVuY2U6cGFzcw==.` for the endpoint.\n"),
     ],

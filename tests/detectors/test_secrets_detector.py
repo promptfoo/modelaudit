@@ -158,6 +158,10 @@ class TestSecretsDetector:
                 f"Authorization: Basic {_basic_auth_token(b'escaped-crlf:pass')}\\r\\n",
                 _basic_auth_token(b"escaped-crlf:pass"),
             ),
+            (
+                ("x" * 1000) + f" Authorization: Basic {_basic_auth_token(b'long-line:pass')}",
+                _basic_auth_token(b"long-line:pass"),
+            ),
             (f"HTTP_AUTHORIZATION=Basic {_basic_auth_token(b'env-user:pass')}", _basic_auth_token(b"env-user:pass")),
             (
                 f"HTTP_PROXY_AUTHORIZATION=Basic {_basic_auth_token(b'proxy-env:pass')}",
@@ -308,6 +312,9 @@ class TestSecretsDetector:
         [
             "Authorization",
             "HTTP_AUTHORIZATION",
+            "BASIC_AUTH",
+            "auth_header",
+            "authorization_header",
             "proxy_authorization",
             "proxyAuthorization",
             "HTTP_PROXY_AUTHORIZATION",
