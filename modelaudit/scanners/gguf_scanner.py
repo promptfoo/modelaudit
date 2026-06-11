@@ -57,22 +57,24 @@ _GGUF_METADATA_COMMAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"(?i)(?:^|[;&|`$()]\s*)(?:bash|sh|zsh|fish|cmd(?:\.exe)?|powershell|pwsh|python(?:3)?|perl|ruby|node)\s+-[ce]\b",
         ),
     ),
-    ("destructive_rm", re.compile(r"(?i)(?:^|[;&|`$()]\s*)rm\s+-[a-z]*[rf][a-z]*\s+(?:/|~|\$|\.\.)")),
     ("backtick_command", re.compile(r"(?i)`\s*(?:rm|curl|wget|bash|sh|python(?:3)?|powershell|pwsh|cmd(?:\.exe)?)\b")),
 )
+_GGUF_DESTRUCTIVE_COMMAND_PREFIXES = ("sudo", "doas", "command", "env", "nohup", "nice", "setsid", "timeout")
 _GGUF_METADATA_SHELL_FETCH_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("shell_download", ("curl", "wget")),
     ("powershell_download", ("invoke-webrequest", "iwr")),
 )
-_GGUF_REMOTE_URL_SCHEMES = ("http://", "https://", "ftp://")
-_GGUF_METADATA_REMOTE_FETCH_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    (
-        "network_api",
-        re.compile(
-            r"(?i)\b(?:requests\.(?:get|post|put|request)|urllib\.request\.urlopen|urlopen|fetch)\s*\(\s*[\"'](?:https?|ftp)://",
-        ),
-    ),
+_GGUF_METADATA_NETWORK_APIS = (
+    "requests.get",
+    "requests.post",
+    "requests.put",
+    "requests.request",
+    "urllib.request.urlopen",
+    "urlopen",
+    "fetch",
 )
+_GGUF_REMOTE_URL_SCHEMES = ("http://", "https://", "ftp://")
+_GGUF_SHELL_SEGMENT_SEPARATORS = ";&|`$()"
 
 
 class _GgufMetadataLimitExceeded(ValueError):
@@ -916,6 +918,71 @@ class GgufScanner(BaseScanner):
         return False
 
     @staticmethod
+    def _shell_command_segments(value: str) -> list[list[str]]:
+        segments: list[list[str]] = []
+        current_segment: list[str] = []
+        current_word: list[str] = []
+
+        for character in value.lower():
+            if character.isspace():
+                if current_word:
+                    current_segment.append("".join(current_word))
+                    current_word = []
+                continue
+            if character in _GGUF_SHELL_SEGMENT_SEPARATORS:
+                if current_word:
+                    current_segment.append("".join(current_word))
+                    current_word = []
+                if current_segment:
+                    segments.append(current_segment)
+                    current_segment = []
+                continue
+            current_word.append(character)
+
+        if current_word:
+            current_segment.append("".join(current_word))
+        if current_segment:
+            segments.append(current_segment)
+        return segments
+
+    @staticmethod
+    def _destructive_rm_segment(words: list[str]) -> bool:
+        index = 0
+        while index < len(words):
+            word = words[index]
+            if word in _GGUF_DESTRUCTIVE_COMMAND_PREFIXES:
+                index += 1
+                while index < len(words) and words[index].startswith("-"):
+                    index += 1
+                while index < len(words) and "=" in words[index] and not words[index].startswith("-"):
+                    index += 1
+                continue
+            if "=" in word and not word.startswith("-"):
+                index += 1
+                continue
+            break
+
+        if index >= len(words) or words[index] != "rm":
+            return False
+
+        has_recursive_force = False
+        index += 1
+        while index < len(words) and words[index].startswith("-"):
+            option = words[index].lower()
+            has_recursive_force = has_recursive_force or ("r" in option and "f" in option)
+            index += 1
+
+        if not has_recursive_force or index >= len(words):
+            return False
+
+        target = words[index].replace("\\", "/")
+        return target.startswith(("/", "~", "$", "..")) or "/.." in target
+
+    @classmethod
+    def _destructive_rm_pattern(cls, value: str) -> bool:
+        return any(cls._destructive_rm_segment(segment) for segment in cls._shell_command_segments(value))
+
+    @staticmethod
     def _substring_positions(value: str, needle: str) -> list[int]:
         positions: list[int] = []
         start = 0
@@ -957,6 +1024,35 @@ class GgufScanner(BaseScanner):
         return None
 
     @classmethod
+    def _network_api_remote_fetch_pattern(cls, value: str) -> str | None:
+        value_lower = value.lower()
+        url_positions = [
+            position
+            for scheme in _GGUF_REMOTE_URL_SCHEMES
+            for position in cls._substring_positions(value_lower, scheme)
+        ]
+        if not url_positions:
+            return None
+
+        for api_name in _GGUF_METADATA_NETWORK_APIS:
+            for api_position in cls._substring_positions(value_lower, api_name):
+                before = value_lower[api_position - 1] if api_position else ""
+                after_position = api_position + len(api_name)
+                after = value_lower[after_position] if after_position < len(value_lower) else ""
+                if before and (before.isalnum() or before in "._-"):
+                    continue
+                if after and (after.isalnum() or after in "._-"):
+                    continue
+                open_position = value_lower.find("(", after_position, after_position + 128)
+                if open_position == -1:
+                    continue
+                close_position = value_lower.find(")", open_position + 1, open_position + 2049)
+                end_position = close_position if close_position != -1 else open_position + 2048
+                if any(open_position < url_position < end_position for url_position in url_positions):
+                    return "network_api"
+        return None
+
+    @classmethod
     def _metadata_value_security_evidence(cls, key: str, value: str) -> list[dict[str, str]]:
         if cls._is_chat_template_key(key):
             return []
@@ -965,20 +1061,22 @@ class GgufScanner(BaseScanner):
         if cls._contains_path_traversal(value):
             evidence.append({"evidence_type": "path_traversal", "pattern": "dot_dot_path_segment"})
 
-        for pattern_name, pattern in _GGUF_METADATA_COMMAND_PATTERNS:
-            if pattern.search(value):
-                evidence.append({"evidence_type": "command_execution", "pattern": pattern_name})
-                break
+        if cls._destructive_rm_pattern(value):
+            evidence.append({"evidence_type": "command_execution", "pattern": "destructive_rm"})
+        else:
+            for pattern_name, pattern in _GGUF_METADATA_COMMAND_PATTERNS:
+                if pattern.search(value):
+                    evidence.append({"evidence_type": "command_execution", "pattern": pattern_name})
+                    break
 
         shell_remote_fetch_pattern = cls._shell_remote_fetch_pattern(value)
         if shell_remote_fetch_pattern is not None:
             evidence.append({"evidence_type": "remote_fetch", "pattern": shell_remote_fetch_pattern})
             return evidence
 
-        for pattern_name, pattern in _GGUF_METADATA_REMOTE_FETCH_PATTERNS:
-            if pattern.search(value):
-                evidence.append({"evidence_type": "remote_fetch", "pattern": pattern_name})
-                break
+        network_remote_fetch_pattern = cls._network_api_remote_fetch_pattern(value)
+        if network_remote_fetch_pattern is not None:
+            evidence.append({"evidence_type": "remote_fetch", "pattern": network_remote_fetch_pattern})
 
         return evidence
 

