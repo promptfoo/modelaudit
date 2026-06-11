@@ -198,6 +198,14 @@ def _format_preview_size(size_bytes: object) -> str:
     return f"{size:.2f} PB"
 
 
+def _huggingface_preview_file_size(item: dict[str, Any]) -> int | None:
+    """Return a trusted preview size, or None when Hugging Face metadata is inconclusive."""
+    size = item.get("size")
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        return None
+    return size
+
+
 def _selected_huggingface_preview_files(files: object, runtime: "_ScanRuntimeConfig") -> list[dict[str, Any]]:
     """Return filename-selected Hugging Face preview entries without probing file content."""
     if not isinstance(files, list):
@@ -248,7 +256,10 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
     files = metadata.get("files", [])
     selected_files = _selected_huggingface_preview_files(files, runtime)
     total_size = metadata.get("total_size")
-    selected_size = sum(item.get("size", 0) for item in selected_files if isinstance(item.get("size", 0), int))
+    selected_sizes = [_huggingface_preview_file_size(item) for item in selected_files]
+    selected_size = sum(size for size in selected_sizes if size is not None)
+    if runtime.max_download_bytes is not None and any(size is None for size in selected_sizes):
+        raise ValueError("Selected Hugging Face file sizes are unknown; refusing dry-run with max size")
     if runtime.max_download_bytes is not None and selected_size > runtime.max_download_bytes:
         raise ValueError(
             f"Selected Hugging Face files total {selected_size} bytes exceeds max size "

@@ -291,6 +291,42 @@ def test_hf_repo_dry_run_preview_enforces_max_size() -> None:
     mock_scan.assert_not_called()
 
 
+def test_hf_repo_dry_run_preview_rejects_unknown_selected_size_with_max_size() -> None:
+    runner = CliRunner()
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "total_size": 0,
+        "file_count": 1,
+        "files": [{"name": "model.safetensors", "size": 0}],
+    }
+
+    with (
+        patch("modelaudit.cli.get_model_info", return_value=metadata),
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--format",
+                "json",
+                "--max-size",
+                "10B",
+                "--scanners",
+                "safetensors",
+                "hf://test/model",
+            ],
+        )
+
+    assert result.exit_code == 2
+    assert "Selected Hugging Face file sizes are unknown; refusing dry-run with max size" in result.output
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
 def test_hf_file_dry_run_preview_does_not_download_or_scan() -> None:
     url = "https://huggingface.co/test/model/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.json"
     runner = CliRunner()
