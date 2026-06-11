@@ -12,6 +12,8 @@ pub(crate) struct GlobalRef {
     pub(crate) name: String,
     pub(crate) position: usize,
     pub(crate) malformed: bool,
+    pub(crate) memo_index: Option<i64>,
+    pub(crate) memo_read: bool,
 }
 
 impl GlobalRef {

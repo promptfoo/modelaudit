@@ -145,6 +145,61 @@ def _binunicode(data: bytes) -> bytes:
     return b"X" + len(data).to_bytes(4, "little") + data
 
 
+def _static_getattr_reduce_payload(
+    *,
+    builtin_module: bytes = b"__builtin__",
+    target_module: bytes = b"ultralytics.nn.modules.head",
+    target_name: bytes = b"Detect",
+    attribute: bytes = b"forward",
+    invoke_result: bool = False,
+) -> bytes:
+    payload = (
+        b"\x80\x04"
+        + _global(builtin_module, b"getattr")
+        + _global(target_module, target_name)
+        + _binunicode(attribute)
+        + b"\x86R"
+    )
+    if invoke_result:
+        payload += b")R"
+    return payload + b"."
+
+
+def _static_getattr_with_opaque_target_payload() -> bytes:
+    return b"\x80\x04" + _global(b"__builtin__", b"getattr") + b"}" + _binunicode(b"forward") + b"\x86R."
+
+
+def _static_getattr_with_non_literal_attribute_payload() -> bytes:
+    return (
+        b"\x80\x04"
+        + _global(b"__builtin__", b"getattr")
+        + _global(b"ultralytics.nn.modules.head", b"Detect")
+        + b"K\x01\x86R."
+    )
+
+
+def _static_getattr_with_memo_alias_payload(*, alias_callable: bool = False, alias_target: bool = False) -> bytes:
+    payload = b"\x80\x04"
+    if alias_callable:
+        payload += _global(b"__builtin__", b"getattr") + b"q\x000h\x00"
+    else:
+        payload += _global(b"__builtin__", b"getattr")
+    if alias_target:
+        payload += _global(b"ultralytics.nn.modules.head", b"Detect") + b"q\x010h\x01"
+    else:
+        payload += _global(b"ultralytics.nn.modules.head", b"Detect")
+    return payload + _binunicode(b"forward") + b"\x86R."
+
+
+def _dangerous_getattr_findings(report: PickleReport) -> tuple[Finding, ...]:
+    return tuple(
+        finding
+        for finding in report.findings
+        if finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("import_reference") in {"builtins.getattr", "__builtin__.getattr"}
+    )
+
+
 def _binunicode8(data: bytes) -> bytes:
     return b"\x8d" + len(data).to_bytes(8, "little") + data
 
@@ -163,6 +218,60 @@ def _pathlib_method_reduce_payload(target: Path, method: str) -> bytes:
         + f"cpathlib\n{class_name}.{method}\n".encode("ascii")
         + b"h\x00\x85R."
     )
+
+
+def test_scan_bytes_suppresses_static_ultralytics_getattr_forward_reconstruction() -> None:
+    report = scan_bytes(
+        _static_getattr_reduce_payload(),
+        source="ultralytics-detect-forward-getattr.pkl",
+    )
+
+    assert not _dangerous_getattr_findings(report)
+    getattr_invocations = [
+        invocation
+        for invocation in report.metadata["callable_invocations"]
+        if invocation.get("import_reference") == "__builtin__.getattr"
+    ]
+    assert len(getattr_invocations) == 1
+    invocation = getattr_invocations[0]
+    assert invocation["getattr_reconstruction"] is True
+    assert invocation["getattr_target_import_reference"] == "ultralytics.nn.modules.head.Detect"
+    assert invocation["getattr_attribute_name"] == "forward"
+    assert invocation["getattr_callable_is_direct"] is True
+    assert invocation["getattr_target_is_direct"] is True
+    assert invocation["getattr_resolved_import_reference"] == "ultralytics.nn.modules.head.Detect.forward"
+
+
+def test_scan_bytes_tracks_static_getattr_reconstructed_result_invocation() -> None:
+    report = scan_bytes(
+        _static_getattr_reduce_payload(invoke_result=True),
+        source="ultralytics-detect-forward-getattr-invoked.pkl",
+    )
+
+    assert not _dangerous_getattr_findings(report)
+    assert any(
+        invocation.get("import_reference") == "ultralytics.nn.modules.head.Detect.forward"
+        and invocation.get("opcode") == "REDUCE"
+        for invocation in report.metadata["callable_invocations"]
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _static_getattr_reduce_payload(attribute=b"__dict__"),
+        _static_getattr_with_opaque_target_payload(),
+        _static_getattr_with_non_literal_attribute_payload(),
+        _static_getattr_with_memo_alias_payload(alias_callable=True),
+        _static_getattr_with_memo_alias_payload(alias_target=True),
+    ],
+)
+def test_scan_bytes_static_getattr_unsafe_context_stays_critical(payload: bytes) -> None:
+    report = scan_bytes(payload, source="unsafe-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
 
 
 def _file_mode_reduce_payload(module: bytes, name: bytes, target: Path, mode: bytes) -> bytes:

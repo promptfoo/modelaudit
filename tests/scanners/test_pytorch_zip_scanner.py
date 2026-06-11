@@ -8020,8 +8020,87 @@ def _pickle_result_with_reduce(import_reference: str | None = None) -> ScanResul
     return result
 
 
+def _pickle_global(module: bytes, name: bytes) -> bytes:
+    return b"c" + module + b"\n" + name + b"\n"
+
+
+def _pickle_binunicode(data: bytes) -> bytes:
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def _static_getattr_reduce_payload(
+    *,
+    attribute: bytes = b"forward",
+    opaque_target: bool = False,
+    non_literal_attribute: bool = False,
+    alias_callable: bool = False,
+    alias_target: bool = False,
+) -> bytes:
+    payload = b"\x80\x04"
+    if alias_callable:
+        payload += _pickle_global(b"__builtin__", b"getattr") + b"q\x000h\x00"
+    else:
+        payload += _pickle_global(b"__builtin__", b"getattr")
+    if opaque_target:
+        payload += b"}"
+    elif alias_target:
+        payload += _pickle_global(b"ultralytics.nn.modules.head", b"Detect") + b"q\x010h\x01"
+    else:
+        payload += _pickle_global(b"ultralytics.nn.modules.head", b"Detect")
+    if non_literal_attribute:
+        payload += b"K\x01"
+    else:
+        payload += _pickle_binunicode(attribute)
+    return payload + b"\x86R."
+
+
+def _write_getattr_reconstruction_zip(tmp_path: Path, payload: bytes) -> Path:
+    model_path = tmp_path / "getattr_reconstruction.pt"
+    create_mock_pytorch_zip(model_path, with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+    return model_path
+
+
+def _critical_s115_getattr_issues(result: ScanResult) -> list[Any]:
+    return [
+        issue
+        for issue in result.issues
+        if issue.rule_code == "S115"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("import_reference") == "__builtin__.getattr"
+    ]
+
+
 def _weights_only_analysis_check(result: ScanResult) -> Check:
     return next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
+
+
+def test_pytorch_zip_static_getattr_framework_reconstruction_does_not_emit_s115(tmp_path: Path) -> None:
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not _critical_s115_getattr_issues(result)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _static_getattr_reduce_payload(attribute=b"__dict__"),
+        _static_getattr_reduce_payload(opaque_target=True),
+        _static_getattr_reduce_payload(non_literal_attribute=True),
+        _static_getattr_reduce_payload(alias_callable=True),
+        _static_getattr_reduce_payload(alias_target=True),
+    ],
+)
+def test_pytorch_zip_static_getattr_unsafe_context_keeps_s115(tmp_path: Path, payload: bytes) -> None:
+    model_path = _write_getattr_reconstruction_zip(tmp_path, payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
 
 
 def _legacy_s207_pickle_result(opcode_counts: dict[str, int]) -> ScanResult:
