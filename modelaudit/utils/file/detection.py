@@ -299,6 +299,7 @@ _HF_TOKENIZER_JSON_FILENAMES = frozenset({"tokenizer.json"})
 _HF_TOKENIZER_ROOT_KEYS = frozenset({"version", "added_tokens"})
 _HF_TOKENIZER_MODEL_TYPES = frozenset({"BPE", "Unigram", "WordPiece", "WordLevel"})
 _HF_TOKENIZER_TEMPLATE_KEYS = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
+_JSON_PROBE_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
 LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT = "llamafile_routing_inconclusive"
 NEMO_ROUTING_INCONCLUSIVE_FORMAT = "nemo_routing_inconclusive"
 XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT = "xgboost_ubjson_routing_inconclusive"
@@ -648,11 +649,156 @@ def _json_probe_has_only_trailing_whitespace(probe: bytes, offset: int) -> bool:
     return _json_probe_skip_whitespace(probe, offset) == len(probe)
 
 
-def _hf_tokenizer_model_object_has_schema(probe: bytes, offset: int) -> bool:
-    """Return whether a bounded direct model-object probe proves tokenizer schema."""
+class _JSONProbeIncomplete(Exception):
+    """Raised when a bounded JSON probe ends before the current value does."""
+
+
+class _JSONProbeInvalid(Exception):
+    """Raised when a bounded JSON probe sees invalid JSON structure."""
+
+
+@dataclass
+class _HFTokenizerJSONProbeState:
+    has_template_evidence: bool = False
+
+
+def _json_probe_string_has_template_indicator(probe: bytes, start: int, end: int) -> bool:
+    raw_value = probe[start:end]
+    for indicator in _JSON_PROBE_TEMPLATE_INDICATORS:
+        if indicator.encode("utf-8") in raw_value:
+            return True
+
+    value = _json_probe_decode_string(probe, start, end)
+    return bool(value and any(indicator in value for indicator in _JSON_PROBE_TEMPLATE_INDICATORS))
+
+
+def _json_probe_skip_string_or_raise(probe: bytes, offset: int) -> int:
+    end = _json_probe_skip_string(probe, offset)
+    if end is None:
+        raise _JSONProbeIncomplete
+    return end
+
+
+def _json_probe_skip_value_with_template_scan(
+    probe: bytes,
+    offset: int,
+    state: _HFTokenizerJSONProbeState,
+    *,
+    depth: int = 0,
+) -> int:
+    if depth > 64:
+        raise _JSONProbeInvalid
+
+    offset = _json_probe_skip_whitespace(probe, offset)
+    if offset >= len(probe):
+        raise _JSONProbeIncomplete
+
+    first = probe[offset]
+    if first == ord('"'):
+        end = _json_probe_skip_string_or_raise(probe, offset)
+        if _json_probe_string_has_template_indicator(probe, offset, end):
+            state.has_template_evidence = True
+        return end
+
+    if first == ord("{"):
+        return _json_probe_skip_object_with_template_scan(probe, offset, state, depth=depth + 1)
+    if first == ord("["):
+        return _json_probe_skip_array_with_template_scan(probe, offset, state, depth=depth + 1)
+
+    next_offset = _json_probe_skip_value(probe, offset)
+    if next_offset is None:
+        raise _JSONProbeIncomplete
+    return next_offset
+
+
+def _json_probe_skip_array_with_template_scan(
+    probe: bytes,
+    offset: int,
+    state: _HFTokenizerJSONProbeState,
+    *,
+    depth: int,
+) -> int:
+    if depth > 64:
+        raise _JSONProbeInvalid
+
+    offset = _json_probe_skip_whitespace(probe, offset + 1)
+    if offset >= len(probe):
+        raise _JSONProbeIncomplete
+    if probe[offset] == ord("]"):
+        return offset + 1
+
+    while True:
+        offset = _json_probe_skip_value_with_template_scan(probe, offset, state, depth=depth + 1)
+        offset = _json_probe_skip_whitespace(probe, offset)
+        if offset >= len(probe):
+            raise _JSONProbeIncomplete
+        if probe[offset] == ord("]"):
+            return offset + 1
+        if probe[offset] != ord(","):
+            raise _JSONProbeInvalid
+        offset = _json_probe_skip_whitespace(probe, offset + 1)
+        if offset >= len(probe):
+            raise _JSONProbeIncomplete
+
+
+def _json_probe_skip_object_with_template_scan(
+    probe: bytes,
+    offset: int,
+    state: _HFTokenizerJSONProbeState,
+    *,
+    depth: int,
+) -> int:
+    if depth > 64:
+        raise _JSONProbeInvalid
+
+    offset = _json_probe_skip_whitespace(probe, offset + 1)
+    if offset >= len(probe):
+        raise _JSONProbeIncomplete
+    if probe[offset] == ord("}"):
+        return offset + 1
+
+    while True:
+        key_start = offset
+        key_end = _json_probe_skip_string_or_raise(probe, offset)
+        key = _json_probe_decode_string(probe, key_start, key_end)
+        if key is None:
+            raise _JSONProbeInvalid
+        if key in _HF_TOKENIZER_TEMPLATE_KEYS:
+            state.has_template_evidence = True
+
+        offset = _json_probe_skip_whitespace(probe, key_end)
+        if offset >= len(probe):
+            raise _JSONProbeIncomplete
+        if probe[offset] != ord(":"):
+            raise _JSONProbeInvalid
+
+        offset = _json_probe_skip_value_with_template_scan(
+            probe,
+            offset + 1,
+            state,
+            depth=depth + 1,
+        )
+        offset = _json_probe_skip_whitespace(probe, offset)
+        if offset >= len(probe):
+            raise _JSONProbeIncomplete
+        if probe[offset] == ord("}"):
+            return offset + 1
+        if probe[offset] != ord(","):
+            raise _JSONProbeInvalid
+        offset = _json_probe_skip_whitespace(probe, offset + 1)
+        if offset >= len(probe):
+            raise _JSONProbeIncomplete
+
+
+def _hf_tokenizer_probe_model_object(
+    probe: bytes,
+    offset: int,
+    state: _HFTokenizerJSONProbeState,
+) -> tuple[int | None, bool]:
+    """Return the model-object end offset when complete plus schema evidence."""
     offset = _json_probe_skip_whitespace(probe, offset)
     if offset >= len(probe) or probe[offset] != ord("{"):
-        return False
+        raise _JSONProbeInvalid
 
     saw_model_type = False
     saw_vocab = False
@@ -660,55 +806,56 @@ def _hf_tokenizer_model_object_has_schema(probe: bytes, offset: int) -> bool:
     while offset < len(probe):
         offset = _json_probe_skip_whitespace(probe, offset)
         if offset >= len(probe):
-            return False
+            return None, saw_model_type and saw_vocab
         if probe[offset] == ord("}"):
-            return False
+            return offset + 1, saw_model_type and saw_vocab
         if probe[offset] != ord('"'):
-            return False
+            raise _JSONProbeInvalid
 
         key_start = offset
-        key_end = _json_probe_skip_string(probe, offset)
-        if key_end is None:
-            return False
+        key_end = _json_probe_skip_string_or_raise(probe, offset)
         key = _json_probe_decode_string(probe, key_start, key_end)
         if key is None:
-            return False
+            raise _JSONProbeInvalid
+        if key in _HF_TOKENIZER_TEMPLATE_KEYS:
+            state.has_template_evidence = True
 
         offset = _json_probe_skip_whitespace(probe, key_end)
         if offset >= len(probe) or probe[offset] != ord(":"):
-            return False
+            raise _JSONProbeInvalid
         value_offset = _json_probe_skip_whitespace(probe, offset + 1)
         if value_offset >= len(probe):
-            return False
-
-        next_offset = _json_probe_skip_value(probe, value_offset)
-        if next_offset is None:
-            return False
+            return None, saw_model_type and saw_vocab
 
         if key == "type" and probe[value_offset] == ord('"'):
-            value_end = _json_probe_skip_string(probe, value_offset)
-            if value_end is None:
-                return False
+            value_end = _json_probe_skip_string_or_raise(probe, value_offset)
             model_type = _json_probe_decode_string(probe, value_offset, value_end)
             saw_model_type = model_type in _HF_TOKENIZER_MODEL_TYPES
-        elif key == "vocab":
+        if key == "vocab":
             saw_vocab = True
 
-        if saw_model_type and saw_vocab:
-            return True
+        try:
+            next_offset = _json_probe_skip_value_with_template_scan(
+                probe,
+                value_offset,
+                state,
+                depth=1,
+            )
+        except _JSONProbeIncomplete:
+            return None, saw_model_type and saw_vocab
 
         offset = next_offset
         offset = _json_probe_skip_whitespace(probe, offset)
         if offset >= len(probe):
-            return False
+            return None, saw_model_type and saw_vocab
         if probe[offset] == ord(","):
             offset += 1
             continue
         if probe[offset] == ord("}"):
-            return False
-        return False
+            return offset + 1, saw_model_type and saw_vocab
+        raise _JSONProbeInvalid
 
-    return False
+    return None, saw_model_type and saw_vocab
 
 
 def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
@@ -720,12 +867,14 @@ def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
         if not file_path.is_file():
             return False
         file_size = file_path.stat().st_size
-        if file_size < 4 or file_size > TOKENIZER_JSON_ROUTING_READ_BYTES:
+        if file_size < 4:
             return False
-        probe = read_magic_bytes(str(file_path), file_size)
+        read_size = min(file_size, TOKENIZER_JSON_ROUTING_READ_BYTES)
+        probe = read_magic_bytes(str(file_path), read_size)
     except OSError:
         return False
 
+    sample_is_prefix = file_size > len(probe)
     probe = probe[len(_UTF8_BOM) :] if probe.startswith(_UTF8_BOM) else probe
     offset = _json_probe_skip_whitespace(probe, 0)
     if offset >= len(probe) or probe[offset] != ord("{"):
@@ -733,15 +882,22 @@ def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
 
     root_keys: set[str] = set()
     saw_model_schema = False
+    state = _HFTokenizerJSONProbeState()
     offset += 1
     while offset < len(probe):
         offset = _json_probe_skip_whitespace(probe, offset)
         if offset >= len(probe):
-            return False
+            return (
+                sample_is_prefix
+                and root_keys >= _HF_TOKENIZER_ROOT_KEYS
+                and saw_model_schema
+                and not state.has_template_evidence
+            )
         if probe[offset] == ord("}"):
             return (
                 root_keys >= _HF_TOKENIZER_ROOT_KEYS
                 and saw_model_schema
+                and not state.has_template_evidence
                 and _json_probe_has_only_trailing_whitespace(
                     probe,
                     offset + 1,
@@ -770,14 +926,43 @@ def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
         if key in _HF_TOKENIZER_ROOT_KEYS:
             root_keys.add(key)
         if key == "model":
-            saw_model_schema = _hf_tokenizer_model_object_has_schema(probe, value_offset)
+            try:
+                next_offset, model_schema = _hf_tokenizer_probe_model_object(probe, value_offset, state)
+            except (_JSONProbeIncomplete, _JSONProbeInvalid):
+                return False
+            saw_model_schema = saw_model_schema or model_schema
+            if state.has_template_evidence:
+                return False
+            if next_offset is None:
+                return sample_is_prefix and root_keys >= _HF_TOKENIZER_ROOT_KEYS and saw_model_schema
+        else:
+            try:
+                next_offset = _json_probe_skip_value_with_template_scan(
+                    probe,
+                    value_offset,
+                    state,
+                    depth=1,
+                )
+            except _JSONProbeIncomplete:
+                return (
+                    sample_is_prefix
+                    and root_keys >= _HF_TOKENIZER_ROOT_KEYS
+                    and saw_model_schema
+                    and not state.has_template_evidence
+                )
+            except _JSONProbeInvalid:
+                return False
+            if state.has_template_evidence:
+                return False
 
-        next_offset = _json_probe_skip_value(probe, value_offset)
-        if next_offset is None:
-            return False
         offset = _json_probe_skip_whitespace(probe, next_offset)
         if offset >= len(probe):
-            return False
+            return (
+                sample_is_prefix
+                and root_keys >= _HF_TOKENIZER_ROOT_KEYS
+                and saw_model_schema
+                and not state.has_template_evidence
+            )
         if probe[offset] == ord(","):
             offset += 1
             continue
@@ -785,6 +970,7 @@ def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
             return (
                 root_keys >= _HF_TOKENIZER_ROOT_KEYS
                 and saw_model_schema
+                and not state.has_template_evidence
                 and _json_probe_has_only_trailing_whitespace(
                     probe,
                     offset + 1,
@@ -4633,6 +4819,8 @@ def _detect_renamed_tensorflow_protobuf(
 ) -> str:
     """Recognize renamed MetaGraph/SavedModel protobufs after bounded field discovery."""
     suffix = file_path.suffix.lower()
+    if is_huggingface_tokenizer_json_file(file_path):
+        return "unknown"
     if _is_complete_bounded_printable_text(file_path, file_size):
         return "unknown"
     route = _classify_bounded_tensorflow_protobuf(file_path, file_size)
@@ -5580,6 +5768,8 @@ def _is_complete_bounded_printable_text(file_path: Path, file_size: int) -> bool
 def _preserve_inconclusive_protobuf_model_routing(file_path: Path, file_size: int) -> bool:
     """Keep ambiguous binary model protobufs scannable without claiming proven text."""
     if file_path.suffix.lower() in {".py", ".pyw"} and not _has_bounded_non_source_control_signal(file_path, file_size):
+        return False
+    if is_huggingface_tokenizer_json_file(file_path):
         return False
     return not _is_complete_structured_json_content_owner(
         file_path, file_size

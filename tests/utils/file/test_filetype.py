@@ -1461,7 +1461,40 @@ def test_hf_tokenizer_json_does_not_hide_late_security_root_keys(
     assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
 
 
-def test_hf_tokenizer_json_over_routing_budget_is_not_claimed(
+@pytest.mark.parametrize(
+    "extra_fields",
+    [
+        {
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+                "special_tokens": [{"id": "[SEP]", "ids": [102], "tokens": ["[SEP]"]}],
+            }
+        },
+        {
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "template": "$A:0 [SEP]:0",
+                "single": "$A:0 [SEP]:0",
+                "pair": "$A:0 [SEP]:0 $B:1 [SEP]:1",
+                "special_tokens": [{"id": "[SEP]", "ids": [102], "tokens": ["[SEP]"]}],
+            },
+            "decoder": {"type": "Replace", "pattern": "</w>", "content": " "},
+            "normalizer": {"type": "Sequence", "normalizers": [{"type": "Replace", "pattern": "x", "content": "y"}]},
+        },
+    ],
+)
+def test_hf_tokenizer_json_nested_template_evidence_is_not_claimed(
+    tmp_path: Path,
+    extra_fields: dict[str, Any],
+) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(tmp_path / "tokenizer.json", extra_fields)
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+
+
+def test_hf_tokenizer_json_over_routing_budget_is_claimed_after_schema_probe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1471,7 +1504,8 @@ def test_hf_tokenizer_json_over_routing_budget_is_not_claimed(
         {"padding": "x" * 256},
     )
 
-    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
 
 
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
