@@ -1296,7 +1296,7 @@ class TextScanner(BaseScanner):
         if line_parts is None:
             return True
         line, position = line_parts
-        if cls._documentation_fenced_git_clone_reference_is_informational(line):
+        if cls._documentation_fenced_git_clone_reference_is_informational(line, finding):
             return True
         if cls._documentation_fenced_package_version_is_informational(line, position, finding):
             return True
@@ -1326,9 +1326,29 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
-    def _documentation_fenced_git_clone_reference_is_informational(line: bytes) -> bool:
+    def _documentation_fenced_git_clone_reference_is_informational(line: bytes, finding: dict[str, Any]) -> bool:
+        if DOCUMENTATION_GIT_CLONE_COMMAND_PATTERN.match(line) is None:
+            return False
+        finding_type = finding.get("type")
+        if finding_type in {"domain", "domain_name"}:
+            domain = finding.get("domain")
+            return isinstance(domain, str) and domain.casefold() == "github.com"
+        if finding_type != "url_detected":
+            return False
+        url = finding.get("url")
+        if not isinstance(url, str):
+            return False
+        try:
+            parsed_url = urlsplit(url)
+            raw_port = parsed_url.port
+        except ValueError:
+            return False
+        hostname = parsed_url.hostname
         return (
-            DOCUMENTATION_GIT_CLONE_COMMAND_PATTERN.match(line) is not None and b"https://github.com/" in line.lower()
+            parsed_url.scheme.casefold() == "https"
+            and isinstance(hostname, str)
+            and hostname.casefold() == "github.com"
+            and raw_port in {None, 443}
         )
 
     @staticmethod
@@ -1378,6 +1398,12 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
+    def _documentation_fenced_passive_assigned_url_is_informational(cls, url: str) -> bool:
+        return cls._documentation_loopback_api_url_is_informational(
+            url
+        ) or cls._documentation_fenced_passive_media_url_is_informational(url)
+
+    @classmethod
     def _documentation_fenced_passive_network_example_is_informational(cls, fenced_code: bytes) -> bool:
         if DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN.search(fenced_code):
             return False
@@ -1388,17 +1414,27 @@ class TextScanner(BaseScanner):
             for match in DOCUMENTATION_FENCED_DIRECT_URL_CALL_PATTERN.finditer(fenced_code)
         ):
             return False
+        assigned_urls = {
+            match.group("target"): match.group("url").decode("utf-8", errors="ignore")
+            for match in DOCUMENTATION_FENCED_URL_ASSIGNMENT_PATTERN.finditer(fenced_code)
+        }
+        if any(
+            target in assigned_urls
+            and not cls._documentation_fenced_passive_assigned_url_is_informational(assigned_urls[target])
+            for target in (
+                match.group("target") for match in DOCUMENTATION_FENCED_URL_VARIABLE_CALL_PATTERN.finditer(fenced_code)
+            )
+        ):
+            return False
         if any(
             cls._documentation_loopback_api_url_is_informational(match.group().decode("utf-8", errors="ignore"))
             for match in BARE_NETWORK_URL_TOKEN_PATTERN.finditer(fenced_code)
         ):
             return True
         passive_targets = {
-            match.group("target")
-            for match in DOCUMENTATION_FENCED_URL_ASSIGNMENT_PATTERN.finditer(fenced_code)
-            if cls._documentation_fenced_passive_media_url_is_informational(
-                match.group("url").decode("utf-8", errors="ignore")
-            )
+            target
+            for target, url in assigned_urls.items()
+            if cls._documentation_fenced_passive_media_url_is_informational(url)
         }
         call_targets = [
             match.group("target") for match in DOCUMENTATION_FENCED_URL_VARIABLE_CALL_PATTERN.finditer(fenced_code)

