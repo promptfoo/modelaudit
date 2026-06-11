@@ -10957,7 +10957,9 @@ class TestZipScanner:
         assert result.success is False
         assert failed_secret_checks
         assert failed_secret_checks[0].rule_code == "S702"
-        assert failed_secret_checks[0].details.get("zip_entry") == "docs\\README"
+        zip_entry = failed_secret_checks[0].details.get("zip_entry")
+        assert isinstance(zip_entry, str)
+        assert zip_entry.replace("\\", "/") == "docs/README"
 
     def test_scan_nested_zip_text_member_detects_valid_basic_auth_header(self, tmp_path: Path) -> None:
         inner_payload = io.BytesIO()
