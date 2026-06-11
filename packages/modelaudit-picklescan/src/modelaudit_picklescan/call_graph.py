@@ -37,12 +37,16 @@ from importlib.util import MAGIC_NUMBER, cache_from_source, source_hash
 from pathlib import Path
 from types import (
     BuiltinFunctionType,
+    ClassMethodDescriptorType,
     CodeType,
     FunctionType,
     GetSetDescriptorType,
     MappingProxyType,
+    MemberDescriptorType,
+    MethodDescriptorType,
     MethodType,
     ModuleType,
+    WrapperDescriptorType,
 )
 from typing import Any, Protocol, TypeVar, cast
 from zipimport import zipimporter
@@ -2217,13 +2221,13 @@ def _loaded_trusted_reference_matches_baseline(module_name: str, name: str) -> b
         return False
 
     expected = _TRUSTED_LOADED_REFERENCE_BASELINES.get((module_name, name))
+    origin_kind = _trusted_module_origin_kind(module_name)
+    if origin_kind == "site_packages":
+        if not _loaded_site_package_reference_owner_matches(module_name, name, reference_state[1]):
+            return False
+        if expected is None and (module_name, name) in _TRUSTED_FRAMEWORK_METADATA_REFERENCES:
+            return True
     if expected is None:
-        return False
-    if _trusted_module_origin_kind(module_name) == "site_packages" and not _loaded_site_package_reference_owner_matches(
-        module_name,
-        name,
-        reference_state[1],
-    ):
         return False
     return (
         _loaded_interpreter_states_match(module_state, expected[0])
@@ -2243,11 +2247,71 @@ def _loaded_site_package_reference_owner_matches(module_name: str, name: str, va
         class_module = type.__getattribute__(value, "__module__")
         if type(class_module) is not str or _trusted_python_module_source_path(class_module) is None:
             return False
-        return all(_function_owner_matches_trusted_source(function) for function in _pickle_executable_functions(value))
+        return _class_pickle_executable_members_match_trusted_source(value)
     functions = _pickle_executable_functions(value)
     if functions:
         return all(_function_owner_matches_trusted_source(function) for function in functions)
     return not callable(value)
+
+
+def _class_pickle_executable_members_match_trusted_source(class_: type[object]) -> bool:
+    for base in type.__getattribute__(class_, "__mro__"):
+        namespace = type.__getattribute__(base, "__dict__")
+        for member_name in _PICKLE_ENTERED_IMPORT_EXECUTION_METHODS:
+            if member_name in namespace and not _pickle_executable_member_matches_trusted_source(
+                base,
+                member_name,
+                namespace[member_name],
+            ):
+                return False
+    return True
+
+
+def _pickle_executable_member_matches_trusted_source(owner: type[object], name: str, member: object) -> bool:
+    if isinstance(member, classmethod | staticmethod):
+        member = member.__func__
+    if isinstance(member, FunctionType):
+        return _function_owner_matches_trusted_source(member)
+    if type(member) is property:
+        functions = tuple(
+            function for function in (member.fget, member.fset, member.fdel) if isinstance(function, FunctionType)
+        )
+        return bool(functions) and all(_function_owner_matches_trusted_source(function) for function in functions)
+    if _trusted_owner_bound_builtin_descriptor_matches(owner, name, member):
+        return True
+    return not _runtime_type_member_is_executable(member)
+
+
+def _trusted_owner_bound_builtin_descriptor_matches(owner: type[object], name: str, member: object) -> bool:
+    member_type = type(member)
+    if member_type is BuiltinFunctionType:
+        try:
+            member_name = BuiltinFunctionType.__getattribute__(member, "__name__")
+            bound_owner = BuiltinFunctionType.__getattribute__(member, "__self__")
+        except AttributeError:
+            return False
+        return member_name == name and bound_owner is owner and _trusted_runtime_class_owner(owner)
+    if member_type in {
+        ClassMethodDescriptorType,
+        GetSetDescriptorType,
+        MemberDescriptorType,
+        MethodDescriptorType,
+        WrapperDescriptorType,
+    }:
+        try:
+            member_name = member_type.__getattribute__(member, "__name__")
+            bound_owner = member_type.__getattribute__(member, "__objclass__")
+        except AttributeError:
+            return False
+        return member_name == name and bound_owner is owner and _trusted_runtime_class_owner(owner)
+    return False
+
+
+def _trusted_runtime_class_owner(owner: type[object]) -> bool:
+    module_name = type.__getattribute__(owner, "__module__")
+    return type(module_name) is str and (
+        module_name == "builtins" or _trusted_module_origin_kind(module_name) in {"stdlib", "site_packages"}
+    )
 
 
 def _pickle_executable_functions(value: object) -> tuple[FunctionType, ...]:

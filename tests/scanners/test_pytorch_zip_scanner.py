@@ -785,6 +785,121 @@ def test_pytorch_zip_warns_when_trusted_framework_reference_is_rebound_before_sc
     )
 
 
+def test_pytorch_zip_trusts_source_backed_framework_reference_imported_after_scanner_startup(
+    tmp_path: Path,
+) -> None:
+    payload = _shadow_newobj_build_payload()
+    model_path = tmp_path / "poststartup_training_args.bin"
+    _write_training_args_bin(model_path, payload)
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_rebindable_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner\n"
+        "import transformers.training_args\n"
+        "model_path = Path(sys.argv[1])\n"
+        "result = PyTorchZipScanner().scan(str(model_path))\n"
+        "print(json.dumps({\n"
+        "    'success': result.success,\n"
+        "    'pickle_verdict': result.metadata.get('pickle_verdict'),\n"
+        "    'issues': [\n"
+        "        {\n"
+        "            'rule_code': issue.rule_code,\n"
+        "            'import_reference': (issue.details or {}).get('import_reference'),\n"
+        "        }\n"
+        "        for issue in result.issues\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(model_path)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["success"] is True
+    assert output["pickle_verdict"] == "clean"
+    assert not any(
+        issue["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and issue["import_reference"] == "transformers.training_args.TrainingArguments"
+        for issue in output["issues"]
+    )
+
+
+def test_pytorch_zip_warns_when_rebound_framework_class_uses_descriptor_new_before_scanner_import(
+    tmp_path: Path,
+) -> None:
+    payload = _shadow_newobj_build_payload()
+    model_path = tmp_path / "preimport_rebound_descriptor_training_args.bin"
+    _write_training_args_bin(model_path, payload)
+    marker = tmp_path / "preimport-rebound-descriptor-root.marker"
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_rebindable_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, pickle, sys, zipfile\n"
+        "from pathlib import Path\n"
+        "import transformers.training_args as training_args\n"
+        "model_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "class DescriptorNew:\n"
+        "    def __get__(self, instance, owner):\n"
+        "        marker.write_text('descriptor-new', encoding='utf-8')\n"
+        "        return lambda cls: object.__new__(cls)\n"
+        "class ReboundTrainingArguments:\n"
+        "    __new__ = DescriptorNew()\n"
+        "ReboundTrainingArguments.__module__ = 'transformers.training_args'\n"
+        "ReboundTrainingArguments.__qualname__ = 'TrainingArguments'\n"
+        "training_args.TrainingArguments = ReboundTrainingArguments\n"
+        "from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner\n"
+        "result = PyTorchZipScanner().scan(str(model_path))\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "with zipfile.ZipFile(model_path) as zip_file:\n"
+        "    pickle.loads(zip_file.read('training_args/data.pkl'))\n"
+        "print(json.dumps({\n"
+        "    'success': result.success,\n"
+        "    'pickle_verdict': result.metadata.get('pickle_verdict'),\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'issues': [\n"
+        "        {\n"
+        "            'rule_code': issue.rule_code,\n"
+        "            'severity': issue.severity.value,\n"
+        "            'import_reference': (issue.details or {}).get('import_reference'),\n"
+        "        }\n"
+        "        for issue in result.issues\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(model_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert output["pickle_verdict"] in {"suspicious", "malicious"}
+    assert not (output["success"] is True and output["pickle_verdict"] == "clean" and not output["issues"])
+    assert any(
+        issue["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and issue["import_reference"] == "transformers.training_args.TrainingArguments"
+        for issue in output["issues"]
+    )
+
+
 @pytest.mark.integration
 @pytest.mark.skipif(
     os.environ.get("MODELAUDIT_RUN_HF_REAL_MODEL_TESTS") != "1",
