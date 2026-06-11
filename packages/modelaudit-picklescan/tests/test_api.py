@@ -171,6 +171,12 @@ def _pytorch_storage_protocol0_persistent_id_payload(
     return f"(dp0\nVx\np1\nP('storage', <class '{storage_qualname}'>, '{key}', 'cpu', {size})\ns.".encode("ascii")
 
 
+def _pytorch_storage_then_arbitrary_protocol0_persistent_id_payload(key: str) -> bytes:
+    payload = _pytorch_storage_protocol0_persistent_id_payload(key)
+    assert payload.endswith(b".")
+    return payload[:-1] + b"Parbitrary-storage-key\n0."
+
+
 def _pytorch_storage_persistent_id_payload_with_extra_field(key: str) -> bytes:
     payload = _pytorch_storage_persistent_id_payload(key)
     assert payload.endswith(b"tQ.")
@@ -1951,6 +1957,97 @@ def test_scan_file_routes_protocol0_storage_blob_as_raw_storage(tmp_path: Path) 
     assert report.status == ScanStatus.COMPLETE
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
     assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
+
+
+def test_scan_file_trusts_protocol0_storage_persid_in_data_pkl(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _pytorch_storage_protocol0_persistent_id_payload("0"))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", b"\x00" * 8)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert not any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+    assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
+
+
+def test_scan_file_keeps_arbitrary_protocol0_persid_warning_in_data_pkl(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    payload = b"Parbitrary-storage-key\n0" + _pytorch_storage_protocol0_persistent_id_payload("0")
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", b"\x00" * 8)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert any(
+        finding.rule_code == "PERSISTENT_ID"
+        and finding.details.get("opcode") == "PERSID"
+        and finding.details.get("persistent_id_preview") == 'str:"arbitrary-storage-key"'
+        for finding in report.findings
+    )
+    assert not any(
+        finding.rule_code == "PERSISTENT_ID"
+        and finding.details.get("persistent_id_preview")
+        == "str:\"('storage', <class 'torch.FloatStorage'>, '0', 'cpu', 1)\""
+        for finding in report.findings
+    )
+
+
+def test_scan_file_keeps_storage_first_mixed_protocol0_persid_warning_in_data_pkl(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    payload = _pytorch_storage_then_arbitrary_protocol0_persistent_id_payload("0")
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", b"\x00" * 8)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert any(
+        finding.rule_code == "PERSISTENT_ID"
+        and finding.details.get("opcode") == "PERSID"
+        and finding.details.get("persistent_id_preview")
+        == "str:\"('storage', <class 'torch.FloatStorage'>, '0', 'cpu', 1)\""
+        for finding in report.findings
+    )
+
+
+def test_scan_file_keeps_noncanonical_protocol0_storage_persid_warning_in_data_pkl(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "archive/data.pkl",
+            _pytorch_storage_protocol0_persistent_id_payload("0", storage_qualname="torch.FakeStorage"),
+        )
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", b"\x00" * 8)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "PERSISTENT_ID"
+        and finding.details.get("opcode") == "PERSID"
+        and "torch.FakeStorage" in str(finding.details.get("persistent_id_preview"))
+        for finding in report.findings
+    )
 
 
 def test_scan_file_routes_torch_storage_untyped_storage_blob_as_raw_storage(tmp_path: Path) -> None:

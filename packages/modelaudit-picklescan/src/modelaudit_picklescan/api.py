@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import pickletools
 import tempfile
@@ -164,6 +165,13 @@ class _PytorchZipDeadlineExceeded(TimeoutError):
 class _PickleGlobalRef:
     module: str
     name: str
+
+
+@dataclass(frozen=True)
+class _PytorchStorageReferenceParse:
+    referenced_keys: set[str]
+    parse_complete: bool
+    all_persistent_ids_are_pytorch_storage: bool
 
 
 class PickleScanner:
@@ -348,12 +356,14 @@ class PickleScanner:
                 if not _has_pytorch_zip_metadata(entries):
                     return None
 
-                pickle_entries, discovery_notices = _discover_pytorch_zip_pickle_entries(
-                    archive,
-                    entries,
-                    source=source,
-                    options=self.options,
-                    deadline=deadline,
+                pickle_entries, discovery_notices, trusted_storage_keys_by_data_pkl = (
+                    _discover_pytorch_zip_pickle_entries(
+                        archive,
+                        entries,
+                        source=source,
+                        options=self.options,
+                        deadline=deadline,
+                    )
                 )
                 probe_budget_exhausted = any(
                     notice.code == "pytorch_zip_pickle_discovery_probe_budget" for notice in discovery_notices
@@ -422,14 +432,19 @@ class PickleScanner:
                     scanned_pickle_member_bytes += entry.file_size
                     try:
                         with archive.open(entry, "r") as member_stream:
-                            reports.append(
-                                self.scan_stream(
-                                    cast(BinaryIO, member_stream),
-                                    source=member_source,
-                                    size=entry.file_size,
-                                    enrich_call_graph=enrich_call_graph,
-                                )
+                            member_report = self.scan_stream(
+                                cast(BinaryIO, member_stream),
+                                source=member_source,
+                                size=entry.file_size,
+                                enrich_call_graph=enrich_call_graph,
                             )
+                        trusted_storage_keys = trusted_storage_keys_by_data_pkl.get(member_name)
+                        if trusted_storage_keys:
+                            member_report = _without_trusted_pytorch_storage_persistent_id_findings(
+                                member_report,
+                                trusted_storage_keys,
+                            )
+                        reports.append(member_report)
                     except Exception as error:
                         reports.append(
                             _io_error_report(
@@ -627,7 +642,7 @@ def _discover_pytorch_zip_pickle_entries(
     source: str,
     options: ScanOptions,
     deadline: float,
-) -> tuple[list[zipfile.ZipInfo], tuple[Notice, ...]]:
+) -> tuple[list[zipfile.ZipInfo], tuple[Notice, ...], dict[str, set[str]]]:
     pickle_entries: list[zipfile.ZipInfo] = []
     notices: list[Notice] = []
     seen_entries: set[int] = set()
@@ -648,7 +663,7 @@ def _discover_pytorch_zip_pickle_entries(
         if _is_data_pickle_member(lowered) or lowered.endswith(_PICKLE_MEMBER_SUFFIXES):
             add_entry(entry)
 
-    trusted_storage_entry_ids, storage_notices = _validated_pytorch_storage_entry_ids(
+    trusted_storage_entry_ids, trusted_storage_keys_by_data_pkl, storage_notices = _validated_pytorch_storage_entry_ids(
         archive,
         entries,
         source=source,
@@ -692,7 +707,7 @@ def _discover_pytorch_zip_pickle_entries(
         except Exception as error:
             notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
 
-    return pickle_entries, tuple(notices)
+    return pickle_entries, tuple(notices), trusted_storage_keys_by_data_pkl
 
 
 def _validated_pytorch_storage_entry_ids(
@@ -702,7 +717,7 @@ def _validated_pytorch_storage_entry_ids(
     source: str,
     options: ScanOptions,
     deadline: float,
-) -> tuple[set[int], tuple[Notice, ...]]:
+) -> tuple[set[int], dict[str, set[str]], tuple[Notice, ...]]:
     members = [
         (entry.filename, entry)
         for entry in entries
@@ -713,6 +728,7 @@ def _validated_pytorch_storage_entry_ids(
         entries_by_name.setdefault(name, []).append(entry)
 
     trusted_entry_ids: set[int] = set()
+    trusted_storage_keys_by_data_pkl: dict[str, set[str]] = {}
     notices: list[Notice] = []
     storage_reference_bytes_read = 0
     storage_reference_opcodes_remaining = [min(_PYTORCH_STORAGE_TRUST_MAX_OPCODES, options.max_opcodes)]
@@ -790,12 +806,12 @@ def _validated_pytorch_storage_entry_ids(
             )
             continue
 
-        referenced_storage_keys, parse_complete = _pytorch_storage_keys_from_pickle_bytes(
+        reference_parse = _pytorch_storage_keys_from_pickle_bytes(
             pickle_data,
             opcode_budget_remaining=storage_reference_opcodes_remaining,
             deadline=deadline,
         )
-        if not parse_complete:
+        if not reference_parse.parse_complete:
             notices.append(
                 _pytorch_zip_storage_reference_validation_notice(
                     source=source,
@@ -807,6 +823,7 @@ def _validated_pytorch_storage_entry_ids(
             )
             continue
 
+        referenced_storage_keys = reference_parse.referenced_keys
         existing_storage_keys = set(storage_entries_by_key)
         missing_storage_keys = referenced_storage_keys - existing_storage_keys
         if missing_storage_keys:
@@ -823,10 +840,13 @@ def _validated_pytorch_storage_entry_ids(
                 )
             )
 
-        for storage_key in referenced_storage_keys & existing_storage_keys:
+        trusted_storage_keys = referenced_storage_keys & existing_storage_keys
+        if trusted_storage_keys and not missing_storage_keys and reference_parse.all_persistent_ids_are_pytorch_storage:
+            trusted_storage_keys_by_data_pkl[data_pkl_name] = trusted_storage_keys
+        for storage_key in trusted_storage_keys:
             trusted_entry_ids.add(id(storage_entries_by_key[storage_key]))
 
-    return trusted_entry_ids, tuple(notices)
+    return trusted_entry_ids, trusted_storage_keys_by_data_pkl, tuple(notices)
 
 
 def _read_zip_entry_probe(
@@ -1153,16 +1173,145 @@ def _coerce_pickle_string_arg(value: Any) -> str | None:
     return None
 
 
+def _split_protocol0_persid_fields(text: str) -> list[str] | None:
+    if not text.startswith("(") or not text.endswith(")"):
+        return None
+    fields: list[str] = []
+    start = 1
+    in_quote: str | None = None
+    escaped = False
+    for index, char in enumerate(text[1:-1], start=1):
+        if escaped:
+            escaped = False
+            continue
+        if in_quote is not None:
+            if char == "\\":
+                escaped = True
+            elif char == in_quote:
+                in_quote = None
+            continue
+        if char in {"'", '"'}:
+            in_quote = char
+        elif char == ",":
+            fields.append(text[start:index].strip())
+            start = index + 1
+    if in_quote is not None:
+        return None
+    fields.append(text[start:-1].strip())
+    return fields
+
+
+def _quoted_protocol0_field_value(field: str) -> str | None:
+    if len(field) < 2 or field[0] not in {"'", '"'} or field[-1] != field[0]:
+        return None
+    value = field[1:-1]
+    return None if "\\" in value else value
+
+
+def _storage_key_from_protocol0_persid_text(
+    pid_text: Any,
+    trusted_storage_keys: set[str] | None = None,
+) -> str | None:
+    text = _coerce_pickle_string_arg(pid_text)
+    if text is None:
+        return None
+    fields = _split_protocol0_persid_fields(text)
+    if fields is None or len(fields) != 5:
+        return None
+    if _quoted_protocol0_field_value(fields[0]) != "storage":
+        return None
+    storage_type_field = fields[1]
+    if not storage_type_field.startswith("<class '") or not storage_type_field.endswith("'>"):
+        return None
+    module, separator, name = storage_type_field[len("<class '") : -len("'>")].rpartition(".")
+    if not separator or (module, name) not in _PYTORCH_STORAGE_GLOBALS:
+        return None
+    storage_key = _quoted_protocol0_field_value(fields[2])
+    if storage_key is None or not _is_ascii_decimal_digits(storage_key):
+        return None
+    if trusted_storage_keys is not None and storage_key not in trusted_storage_keys:
+        return None
+    if _quoted_protocol0_field_value(fields[3]) is None:
+        return None
+    storage_size = fields[4]
+    if not storage_size.isascii() or not storage_size.isdecimal():
+        return None
+    return storage_key
+
+
+def _protocol0_persid_text_from_preview(preview: Any) -> str | None:
+    if not isinstance(preview, str) or not preview.startswith("str:") or len(preview) > 4096:
+        return None
+    try:
+        value = ast.literal_eval(preview[len("str:") :])
+    except (SyntaxError, TypeError, ValueError):
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _is_trusted_pytorch_storage_persistent_id_finding(
+    finding: Finding,
+    trusted_storage_keys: set[str],
+) -> bool:
+    if finding.rule_code != "PERSISTENT_ID":
+        return False
+    details = finding.details
+    storage_key = details.get("pytorch_storage_key")
+    if (
+        details.get("opcode") == "BINPERSID"
+        and details.get("pytorch_storage_persistent_id") is True
+        and isinstance(storage_key, str)
+    ):
+        return storage_key in trusted_storage_keys
+
+    if details.get("opcode") != "PERSID":
+        return False
+    if details.get("pytorch_storage_persistent_id") is True and isinstance(storage_key, str):
+        return storage_key in trusted_storage_keys
+
+    persid_text = _protocol0_persid_text_from_preview(details.get("persistent_id_preview"))
+    return _storage_key_from_protocol0_persid_text(persid_text, trusted_storage_keys) is not None
+
+
+def _without_trusted_pytorch_storage_persistent_id_findings(
+    report: PickleReport,
+    trusted_storage_keys: set[str],
+) -> PickleReport:
+    findings = tuple(
+        finding
+        for finding in report.findings
+        if not _is_trusted_pytorch_storage_persistent_id_finding(finding, trusted_storage_keys)
+    )
+    if len(findings) == len(report.findings):
+        return report
+    verdict = report.verdict if findings else SafetyVerdict.CLEAN
+    if not findings and report.status != ScanStatus.COMPLETE:
+        verdict = SafetyVerdict.UNKNOWN
+    return PickleReport(
+        source=report.source,
+        status=report.status,
+        verdict=verdict,
+        findings=findings,
+        notices=report.notices,
+        errors=report.errors,
+        coverage=report.coverage,
+        metadata=report.metadata,
+        private_metadata=report.private_metadata,
+        duration_s=report.duration_s,
+    )
+
+
 def _pytorch_storage_keys_from_pickle_bytes(
     pickle_data: bytes,
     *,
     opcode_budget_remaining: list[int] | None = None,
     deadline: float | None = None,
-) -> tuple[set[str], bool]:
+) -> _PytorchStorageReferenceParse:
     marker = object()
     memo: dict[int, Any] = {}
     stack: list[Any] = []
     referenced_keys: set[str] = set()
+    all_persistent_ids_are_pytorch_storage = True
 
     def pop_marked_tuple() -> tuple[Any, ...] | None:
         items: list[Any] = []
@@ -1209,74 +1358,16 @@ def _pytorch_storage_keys_from_pickle_bytes(
             return None
         return storage_key
 
-    def split_protocol0_persid_fields(text: str) -> list[str] | None:
-        if not text.startswith("(") or not text.endswith(")"):
-            return None
-        fields: list[str] = []
-        start = 1
-        in_quote: str | None = None
-        escaped = False
-        for index, char in enumerate(text[1:-1], start=1):
-            if escaped:
-                escaped = False
-                continue
-            if in_quote is not None:
-                if char == "\\":
-                    escaped = True
-                elif char == in_quote:
-                    in_quote = None
-                continue
-            if char in {"'", '"'}:
-                in_quote = char
-            elif char == ",":
-                fields.append(text[start:index].strip())
-                start = index + 1
-        if in_quote is not None:
-            return None
-        fields.append(text[start:-1].strip())
-        return fields
-
-    def quoted_protocol0_field_value(field: str) -> str | None:
-        if len(field) < 2 or field[0] not in {"'", '"'} or field[-1] != field[0]:
-            return None
-        value = field[1:-1]
-        return None if "\\" in value else value
-
-    def storage_key_from_protocol0_persid(pid_text: Any) -> str | None:
-        text = _coerce_pickle_string_arg(pid_text)
-        if text is None:
-            return None
-        fields = split_protocol0_persid_fields(text)
-        if fields is None or len(fields) != 5:
-            return None
-        if quoted_protocol0_field_value(fields[0]) != "storage":
-            return None
-        storage_type_field = fields[1]
-        if not storage_type_field.startswith("<class '") or not storage_type_field.endswith("'>"):
-            return None
-        module, separator, name = storage_type_field[len("<class '") : -len("'>")].rpartition(".")
-        if not separator or (module, name) not in _PYTORCH_STORAGE_GLOBALS:
-            return None
-        storage_key = quoted_protocol0_field_value(fields[2])
-        if storage_key is None or not _is_ascii_decimal_digits(storage_key):
-            return None
-        if quoted_protocol0_field_value(fields[3]) is None:
-            return None
-        storage_size = fields[4]
-        if not storage_size.isascii() or not storage_size.isdecimal():
-            return None
-        return storage_key
-
     try:
         for opcode_count, (opcode, arg, _pos) in enumerate(pickletools.genops(pickle_data), start=1):
             if deadline is not None and opcode_count % 1024 == 0:
                 _check_pytorch_zip_deadline(deadline)
             if opcode_budget_remaining is not None:
                 if opcode_budget_remaining[0] <= 0:
-                    return set(), False
+                    return _PytorchStorageReferenceParse(set(), False, False)
                 opcode_budget_remaining[0] -= 1
             if opcode_count > _PYTORCH_STORAGE_TRUST_MAX_OPCODES:
-                return set(), False
+                return _PytorchStorageReferenceParse(set(), False, False)
             opcode_name = opcode.name
             if opcode_name in {"PROTO", "FRAME", "STOP"}:
                 continue
@@ -1353,19 +1444,27 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 storage_key = storage_key_from_pid(pid)
                 if storage_key is not None:
                     referenced_keys.add(storage_key)
+                else:
+                    all_persistent_ids_are_pytorch_storage = False
                 stack.append(None)
             elif opcode_name == "PERSID":
-                storage_key = storage_key_from_protocol0_persid(arg)
+                storage_key = _storage_key_from_protocol0_persid_text(arg)
                 if storage_key is not None:
                     referenced_keys.add(storage_key)
+                else:
+                    all_persistent_ids_are_pytorch_storage = False
                 stack.append(None)
             else:
                 stack.clear()
             if not within_limits():
-                return set(), False
+                return _PytorchStorageReferenceParse(set(), False, False)
     except Exception:
-        return set(), False
-    return referenced_keys, True
+        return _PytorchStorageReferenceParse(set(), False, False)
+    return _PytorchStorageReferenceParse(
+        referenced_keys=referenced_keys,
+        parse_complete=True,
+        all_persistent_ids_are_pytorch_storage=all_persistent_ids_are_pytorch_storage,
+    )
 
 
 def _pytorch_zip_storage_reference_validation_notice(

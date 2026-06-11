@@ -85,6 +85,19 @@ class _PickleGlobalRef:
     name: str
 
 
+@dataclass(frozen=True)
+class _PytorchStorageReferenceParse:
+    referenced_keys: set[str]
+    parse_complete: bool
+    all_persistent_ids_are_pytorch_storage: bool
+
+
+@dataclass(frozen=True)
+class _ValidatedPytorchStorageDataPklMembers:
+    storage_keys_by_data_pkl: dict[str, set[str]]
+    persistent_id_downgrade_keys_by_data_pkl: dict[str, set[str]]
+
+
 _TORCHSCRIPT_FORBIDDEN_AST_NAMES: frozenset[str] = frozenset(
     {
         "__builtins__",
@@ -463,7 +476,9 @@ class PyTorchZipScanner(BaseScanner):
                     zip_file,
                     safe_entries,
                     result,
-                    trusted_pytorch_storage_data_pkl_members=validated_storage_data_pkl_members,
+                    trusted_pytorch_storage_data_pkl_members=(
+                        validated_storage_data_pkl_members.storage_keys_by_data_pkl
+                    ),
                 )
 
                 # Extract version info and check for CVE vulnerabilities
@@ -475,7 +490,9 @@ class PyTorchZipScanner(BaseScanner):
                     pickle_files,
                     result,
                     path,
-                    trusted_pytorch_storage_data_pkl_members=validated_storage_data_pkl_members,
+                    trusted_pytorch_storage_persistent_id_data_pkl_members=(
+                        validated_storage_data_pkl_members.persistent_id_downgrade_keys_by_data_pkl
+                    ),
                 )
                 self._scan_nested_zip_members(zip_file, safe_entries, result, path)
                 self._check_timeout()  # Check timeout after pickle scanning
@@ -492,7 +509,9 @@ class PyTorchZipScanner(BaseScanner):
                     safe_entries,
                     result,
                     path,
-                    trusted_pytorch_storage_data_pkl_members=validated_storage_data_pkl_members,
+                    trusted_pytorch_storage_data_pkl_members=(
+                        validated_storage_data_pkl_members.storage_keys_by_data_pkl
+                    ),
                 )
 
                 # Validate PyTorch model structure
@@ -1328,7 +1347,7 @@ class PyTorchZipScanner(BaseScanner):
                     zip_file,
                     safe_entries,
                     result,
-                )
+                ).storage_keys_by_data_pkl
             )
         trusted_storage_blob_members = self._storage_blob_members_from_data_pkl_members(
             trusted_pytorch_storage_data_pkl_members
@@ -1916,7 +1935,7 @@ class PyTorchZipScanner(BaseScanner):
         result: ScanResult,
         path: str,
         *,
-        trusted_pytorch_storage_data_pkl_members: dict[str, set[str]],
+        trusted_pytorch_storage_persistent_id_data_pkl_members: dict[str, set[str]],
     ) -> int:
         """Scan all discovered pickle files for malicious content"""
         bytes_scanned = 0
@@ -1939,7 +1958,7 @@ class PyTorchZipScanner(BaseScanner):
 
             if self.pickle_scanner is None:
                 bytes_scanned += pickle_data_size
-                trusted_storage_keys = trusted_pytorch_storage_data_pkl_members.get(name)
+                trusted_storage_keys = trusted_pytorch_storage_persistent_id_data_pkl_members.get(name)
                 if trusted_storage_keys is not None:
                     self._record_trusted_storage_persistent_ids_without_pickle_scanner(
                         zip_file,
@@ -1996,7 +2015,7 @@ class PyTorchZipScanner(BaseScanner):
                     )
             sub_result.metadata.setdefault("archive_file_size", original_file_size)
             apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
-            trusted_storage_keys = trusted_pytorch_storage_data_pkl_members.get(name)
+            trusted_storage_keys = trusted_pytorch_storage_persistent_id_data_pkl_members.get(name)
             if trusted_storage_keys is not None:
                 self._downgrade_trusted_storage_persistent_ids(sub_result, trusted_storage_keys)
 
@@ -2093,7 +2112,7 @@ class PyTorchZipScanner(BaseScanner):
                 zip_file,
                 safe_entries,
                 result,
-            )
+            ).storage_keys_by_data_pkl
         )
 
     def _validated_pytorch_storage_data_pkl_members_from_data_pickle(
@@ -2101,7 +2120,7 @@ class PyTorchZipScanner(BaseScanner):
         zip_file: zipfile.ZipFile,
         safe_entries: list[zipfile.ZipInfo],
         result: ScanResult,
-    ) -> dict[str, set[str]]:
+    ) -> _ValidatedPytorchStorageDataPklMembers:
         """Return validated same-prefix PyTorch storage keys referenced by each data.pkl."""
         members = [
             (self._get_zip_member_name(entry), entry)
@@ -2113,6 +2132,7 @@ class PyTorchZipScanner(BaseScanner):
             entries_by_name.setdefault(name, []).append(entry)
 
         trusted_members: dict[str, set[str]] = {}
+        persistent_id_downgrade_members: dict[str, set[str]] = {}
         storage_reference_bytes_read = 0
         storage_reference_opcodes_remaining = [_PYTORCH_STORAGE_TRUST_MAX_OPCODES]
         for data_pkl_member, data_pkl_entries in entries_by_name.items():
@@ -2187,11 +2207,11 @@ class PyTorchZipScanner(BaseScanner):
                 )
                 continue
 
-            referenced_keys, parse_complete = self._trusted_storage_keys_from_pickle_bytes(
+            reference_parse = self._trusted_storage_keys_from_pickle_bytes(
                 pickle_data,
                 opcode_budget_remaining=storage_reference_opcodes_remaining,
             )
-            if not parse_complete:
+            if not reference_parse.parse_complete:
                 self._record_storage_reference_validation_incomplete(
                     result,
                     data_pkl_member=data_pkl_member,
@@ -2201,6 +2221,7 @@ class PyTorchZipScanner(BaseScanner):
                 )
                 continue
 
+            referenced_keys = reference_parse.referenced_keys
             existing_storage_keys = set(storage_entries_by_key)
             missing_storage_keys = referenced_keys - existing_storage_keys
             if missing_storage_keys:
@@ -2218,8 +2239,17 @@ class PyTorchZipScanner(BaseScanner):
             trusted_storage_keys = referenced_keys & existing_storage_keys
             if trusted_storage_keys:
                 trusted_members[data_pkl_member] = trusted_storage_keys
+            if (
+                trusted_storage_keys
+                and not missing_storage_keys
+                and reference_parse.all_persistent_ids_are_pytorch_storage
+            ):
+                persistent_id_downgrade_members[data_pkl_member] = trusted_storage_keys
 
-        return trusted_members
+        return _ValidatedPytorchStorageDataPklMembers(
+            storage_keys_by_data_pkl=trusted_members,
+            persistent_id_downgrade_keys_by_data_pkl=persistent_id_downgrade_members,
+        )
 
     def _record_storage_reference_validation_incomplete(
         self,
@@ -2257,6 +2287,73 @@ class PyTorchZipScanner(BaseScanner):
         return None
 
     @staticmethod
+    def _split_protocol0_persid_fields(text: str) -> list[str] | None:
+        if not text.startswith("(") or not text.endswith(")"):
+            return None
+        fields: list[str] = []
+        start = 1
+        in_quote: str | None = None
+        escaped = False
+        for index, char in enumerate(text[1:-1], start=1):
+            if escaped:
+                escaped = False
+                continue
+            if in_quote is not None:
+                if char == "\\":
+                    escaped = True
+                elif char == in_quote:
+                    in_quote = None
+                continue
+            if char in {"'", '"'}:
+                in_quote = char
+            elif char == ",":
+                fields.append(text[start:index].strip())
+                start = index + 1
+        if in_quote is not None:
+            return None
+        fields.append(text[start:-1].strip())
+        return fields
+
+    @staticmethod
+    def _quoted_protocol0_field_value(field: str) -> str | None:
+        if len(field) < 2 or field[0] not in {"'", '"'} or field[-1] != field[0]:
+            return None
+        value = field[1:-1]
+        return None if "\\" in value else value
+
+    @classmethod
+    def _storage_key_from_protocol0_persid_text(
+        cls,
+        pid_text: Any,
+        trusted_storage_keys: set[str] | None = None,
+    ) -> str | None:
+        text = cls._coerce_pickle_string_arg(pid_text)
+        if text is None:
+            return None
+        fields = cls._split_protocol0_persid_fields(text)
+        if fields is None or len(fields) != 5:
+            return None
+        if cls._quoted_protocol0_field_value(fields[0]) != "storage":
+            return None
+        storage_type_field = fields[1]
+        if not storage_type_field.startswith("<class '") or not storage_type_field.endswith("'>"):
+            return None
+        module, separator, name = storage_type_field[len("<class '") : -len("'>")].rpartition(".")
+        if not separator or (module, name) not in _PYTORCH_STORAGE_GLOBALS:
+            return None
+        storage_key = cls._quoted_protocol0_field_value(fields[2])
+        if storage_key is None or not cls._is_ascii_decimal_digits(storage_key):
+            return None
+        if trusted_storage_keys is not None and storage_key not in trusted_storage_keys:
+            return None
+        if cls._quoted_protocol0_field_value(fields[3]) is None:
+            return None
+        storage_size = fields[4]
+        if not storage_size.isascii() or not storage_size.isdecimal():
+            return None
+        return storage_key
+
+    @staticmethod
     def _is_canonical_pytorch_zip_member_name(name: str) -> bool:
         if not name or "\\" in name or name.startswith("/"):
             return False
@@ -2269,12 +2366,13 @@ class PyTorchZipScanner(BaseScanner):
         pickle_data: bytes,
         trusted_storage_keys: set[str] | None = None,
         opcode_budget_remaining: list[int] | None = None,
-    ) -> tuple[set[str], bool]:
+    ) -> _PytorchStorageReferenceParse:
         """Extract validated PyTorch storage keys without running the embedded pickle scanner."""
         marker = object()
         memo: dict[int, Any] = {}
         stack: list[Any] = []
         referenced_keys: set[str] = set()
+        all_persistent_ids_are_pytorch_storage = True
 
         def pop_marked_tuple() -> tuple[Any, ...] | None:
             items: list[Any] = []
@@ -2323,74 +2421,14 @@ class PyTorchZipScanner(BaseScanner):
                 return None
             return storage_key
 
-        def split_protocol0_persid_fields(text: str) -> list[str] | None:
-            if not text.startswith("(") or not text.endswith(")"):
-                return None
-            fields: list[str] = []
-            start = 1
-            in_quote: str | None = None
-            escaped = False
-            for index, char in enumerate(text[1:-1], start=1):
-                if escaped:
-                    escaped = False
-                    continue
-                if in_quote is not None:
-                    if char == "\\":
-                        escaped = True
-                    elif char == in_quote:
-                        in_quote = None
-                    continue
-                if char in {"'", '"'}:
-                    in_quote = char
-                elif char == ",":
-                    fields.append(text[start:index].strip())
-                    start = index + 1
-            if in_quote is not None:
-                return None
-            fields.append(text[start:-1].strip())
-            return fields
-
-        def quoted_protocol0_field_value(field: str) -> str | None:
-            if len(field) < 2 or field[0] not in {"'", '"'} or field[-1] != field[0]:
-                return None
-            value = field[1:-1]
-            return None if "\\" in value else value
-
-        def storage_key_from_protocol0_persid(pid_text: Any) -> str | None:
-            text = cls._coerce_pickle_string_arg(pid_text)
-            if text is None:
-                return None
-            fields = split_protocol0_persid_fields(text)
-            if fields is None or len(fields) != 5:
-                return None
-            if quoted_protocol0_field_value(fields[0]) != "storage":
-                return None
-            storage_type_field = fields[1]
-            if not storage_type_field.startswith("<class '") or not storage_type_field.endswith("'>"):
-                return None
-            module, separator, name = storage_type_field[len("<class '") : -len("'>")].rpartition(".")
-            if not separator or (module, name) not in _PYTORCH_STORAGE_GLOBALS:
-                return None
-            storage_key = quoted_protocol0_field_value(fields[2])
-            if storage_key is None or not cls._is_ascii_decimal_digits(storage_key):
-                return None
-            if trusted_storage_keys is not None and storage_key not in trusted_storage_keys:
-                return None
-            if quoted_protocol0_field_value(fields[3]) is None:
-                return None
-            storage_size = fields[4]
-            if not storage_size.isascii() or not storage_size.isdecimal():
-                return None
-            return storage_key
-
         try:
             for opcode_count, (opcode, arg, _pos) in enumerate(pickletools.genops(pickle_data), start=1):
                 if opcode_budget_remaining is not None:
                     if opcode_budget_remaining[0] <= 0:
-                        return set(), False
+                        return _PytorchStorageReferenceParse(set(), False, False)
                     opcode_budget_remaining[0] -= 1
                 if opcode_count > _PYTORCH_STORAGE_TRUST_MAX_OPCODES:
-                    return set(), False
+                    return _PytorchStorageReferenceParse(set(), False, False)
                 opcode_name = opcode.name
                 if opcode_name in {"PROTO", "FRAME", "STOP"}:
                     continue
@@ -2467,19 +2505,27 @@ class PyTorchZipScanner(BaseScanner):
                     storage_key = storage_key_from_pid(pid)
                     if storage_key is not None:
                         referenced_keys.add(storage_key)
+                    else:
+                        all_persistent_ids_are_pytorch_storage = False
                     stack.append(None)
                 elif opcode_name == "PERSID":
-                    storage_key = storage_key_from_protocol0_persid(arg)
+                    storage_key = cls._storage_key_from_protocol0_persid_text(arg, trusted_storage_keys)
                     if storage_key is not None:
                         referenced_keys.add(storage_key)
+                    else:
+                        all_persistent_ids_are_pytorch_storage = False
                     stack.append(None)
                 else:
                     stack.clear()
                 if not within_limits():
-                    return set(), False
+                    return _PytorchStorageReferenceParse(set(), False, False)
         except Exception:
-            return set(), False
-        return referenced_keys, True
+            return _PytorchStorageReferenceParse(set(), False, False)
+        return _PytorchStorageReferenceParse(
+            referenced_keys=referenced_keys,
+            parse_complete=True,
+            all_persistent_ids_are_pytorch_storage=all_persistent_ids_are_pytorch_storage,
+        )
 
     def _record_trusted_storage_persistent_ids_without_pickle_scanner(
         self,
@@ -2513,14 +2559,14 @@ class PyTorchZipScanner(BaseScanner):
             logger.debug("Unable to inspect PyTorch storage persistent IDs for %s: %s", pickle_name, exc)
             return
 
-        referenced_storage_keys, parse_complete = self._trusted_storage_keys_from_pickle_bytes(
+        reference_parse = self._trusted_storage_keys_from_pickle_bytes(
             pickle_data,
             trusted_storage_keys,
             opcode_budget_remaining=opcode_budget_remaining,
         )
-        if not parse_complete:
+        if not reference_parse.parse_complete or not reference_parse.all_persistent_ids_are_pytorch_storage:
             return
-        for storage_key in sorted(referenced_storage_keys):
+        for storage_key in sorted(reference_parse.referenced_keys):
             result.add_check(
                 name="PyTorch Storage Persistent ID Trust",
                 passed=True,
@@ -2542,15 +2588,39 @@ class PyTorchZipScanner(BaseScanner):
         return value.isascii() and value.isdecimal()
 
     @staticmethod
-    def _is_pytorch_storage_persistent_id_record(details: dict[str, Any], trusted_storage_keys: set[str]) -> bool:
+    def _protocol0_persid_text_from_preview(preview: Any) -> str | None:
+        if not isinstance(preview, str) or not preview.startswith("str:") or len(preview) > 4096:
+            return None
+        try:
+            value = ast.literal_eval(preview[len("str:") :])
+        except (SyntaxError, TypeError, ValueError):
+            return None
+        return value if isinstance(value, str) else None
+
+    @classmethod
+    def _is_pytorch_storage_persistent_id_record(cls, details: dict[str, Any], trusted_storage_keys: set[str]) -> bool:
+        if details.get("pickle_rule_code") != "PERSISTENT_ID":
+            return False
         storage_key = details.get("pytorch_storage_key")
-        return (
-            details.get("pickle_rule_code") == "PERSISTENT_ID"
-            and details.get("opcode") == "BINPERSID"
+        if (
+            details.get("opcode") == "BINPERSID"
             and details.get("pytorch_storage_persistent_id") is True
             and isinstance(storage_key, str)
-            and storage_key in trusted_storage_keys
-        )
+        ):
+            return storage_key in trusted_storage_keys
+
+        if details.get("opcode") != "PERSID":
+            return False
+        if details.get("pytorch_storage_persistent_id") is True and isinstance(storage_key, str):
+            return storage_key in trusted_storage_keys
+
+        persid_text = cls._protocol0_persid_text_from_preview(details.get("persistent_id_preview"))
+        storage_key = cls._storage_key_from_protocol0_persid_text(persid_text, trusted_storage_keys)
+        if storage_key is None:
+            return False
+        details["pytorch_storage_persistent_id"] = True
+        details["pytorch_storage_key"] = storage_key
+        return True
 
     @classmethod
     def _downgrade_trusted_storage_persistent_ids(cls, result: ScanResult, trusted_storage_keys: set[str]) -> None:

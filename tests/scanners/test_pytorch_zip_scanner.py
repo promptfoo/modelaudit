@@ -168,6 +168,12 @@ def _pytorch_storage_protocol0_persistent_id_payload(
     return f"(dp0\nVx\np1\nP('storage', <class '{storage_qualname}'>, '{key}', 'cpu', {size})\ns.".encode("ascii")
 
 
+def _pytorch_storage_then_arbitrary_protocol0_persistent_id_payload(key: str) -> bytes:
+    payload = _pytorch_storage_protocol0_persistent_id_payload(key)
+    assert payload.endswith(b".")
+    return payload[:-1] + b"Parbitrary-storage-key\n0."
+
+
 def _pytorch_storage_persistent_id_sequence_payload(keys: list[str]) -> bytes:
     payload = b"\x80\x04]("
     for key in keys:
@@ -7250,6 +7256,116 @@ def test_pytorch_zip_scanner_trusts_storage_persistent_ids_in_data_pkl(tmp_path:
     assert trusted_checks
     assert all(check.status == CheckStatus.PASSED for check in trusted_checks)
     assert all(check.severity == IssueSeverity.INFO for check in trusted_checks)
+
+
+def test_pytorch_zip_scanner_trusts_protocol0_storage_persid_in_data_pkl(tmp_path: Path) -> None:
+    payload = _pytorch_storage_protocol0_persistent_id_payload("0")
+    model_path = create_mock_pytorch_zip(
+        tmp_path / "protocol0_storage_persistent_id.pt",
+        with_pickle=False,
+        prefix="archive",
+    )
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+        zipf.writestr("archive/data/0", b"\x00" * 8)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    persistent_id_checks = [
+        check for check in result.checks if check.details.get("pickle_rule_code") == "PERSISTENT_ID"
+    ]
+    assert result.success is True
+    assert not any(issue.rule_code == "S212" for issue in result.issues)
+    assert persistent_id_checks
+    assert not any(check.rule_code == "S212" and check.status == CheckStatus.FAILED for check in persistent_id_checks)
+    assert any(
+        check.status == CheckStatus.PASSED
+        and check.severity == IssueSeverity.INFO
+        and check.details.get("opcode") == "PERSID"
+        and check.details.get("pytorch_storage_key") == "0"
+        and check.details.get("trusted_pytorch_archive_context") is True
+        for check in persistent_id_checks
+    )
+
+
+def test_pytorch_zip_scanner_does_not_downgrade_arbitrary_protocol0_persid(
+    tmp_path: Path,
+) -> None:
+    payload = b"Parbitrary-storage-key\n0" + _pytorch_storage_protocol0_persistent_id_payload("0")
+    model_path = create_mock_pytorch_zip(
+        tmp_path / "arbitrary_protocol0_persistent_id.pt",
+        with_pickle=False,
+        prefix="archive",
+    )
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+        zipf.writestr("archive/data/0", b"\x00" * 8)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        issue.rule_code == "S212"
+        and issue.details.get("opcode") == "PERSID"
+        and issue.details.get("persistent_id_preview") == 'str:"arbitrary-storage-key"'
+        for issue in result.issues
+    )
+    assert any(
+        check.rule_code == "S212"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("persistent_id_preview") == 'str:"arbitrary-storage-key"'
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_does_not_downgrade_protocol0_storage_persid_when_arbitrary_persid_follows(
+    tmp_path: Path,
+) -> None:
+    payload = _pytorch_storage_then_arbitrary_protocol0_persistent_id_payload("0")
+    model_path = create_mock_pytorch_zip(
+        tmp_path / "storage_then_arbitrary_protocol0_persistent_id.pt",
+        with_pickle=False,
+        prefix="archive",
+    )
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+        zipf.writestr("archive/data/0", b"\x00" * 8)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        issue.rule_code == "S212"
+        and issue.details.get("opcode") == "PERSID"
+        and issue.details.get("persistent_id_preview")
+        == "str:\"('storage', <class 'torch.FloatStorage'>, '0', 'cpu', 1)\""
+        for issue in result.issues
+    )
+    assert any(
+        check.rule_code == "S212" and check.status == CheckStatus.FAILED and check.details.get("opcode") == "PERSID"
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_scanner_does_not_trust_noncanonical_protocol0_storage_persid(
+    tmp_path: Path,
+) -> None:
+    payload = _pytorch_storage_protocol0_persistent_id_payload("0", storage_qualname="torch.FakeStorage")
+    model_path = create_mock_pytorch_zip(
+        tmp_path / "fake_protocol0_storage_persistent_id.pt",
+        with_pickle=False,
+        prefix="archive",
+    )
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+        zipf.writestr("archive/data/0", b"\x00" * 8)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(issue.rule_code == "S212" and issue.details.get("opcode") == "PERSID" for issue in result.issues)
+    assert any(check.rule_code == "S212" and check.status == CheckStatus.FAILED for check in result.checks)
+    assert not any(
+        check.details.get("opcode") == "PERSID" and check.details.get("trusted_pytorch_archive_context") is True
+        for check in result.checks
+    )
 
 
 def test_pytorch_zip_scanner_trusts_storage_persistent_ids_with_utf8_byte_key(tmp_path: Path) -> None:
