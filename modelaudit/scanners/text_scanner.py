@@ -50,6 +50,12 @@ PASSIVE_NETWORK_FINDING_TYPES = frozenset(
         "url_detected",
     }
 )
+DOCUMENTATION_FENCED_LOOPBACK_API_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+DOCUMENTATION_FENCED_PASSIVE_MEDIA_URL_SUFFIXES = (".gif", ".jpeg", ".jpg", ".png", ".webp")
+DOCUMENTATION_FENCED_PASSIVE_NETWORK_FINDING_TYPES = PASSIVE_NETWORK_FINDING_TYPES | {
+    "network_function",
+    "network_library",
+}
 PASSIVE_DATA_TEXT_FILENAMES = frozenset({"classes.txt"})
 PASSIVE_DATA_TEXT_PREFIXES = ("label", "token", "vocab")
 BARE_NETWORK_URL_TOKEN_PATTERN = re.compile(rb"[A-Za-z][A-Za-z0-9+.-]*://\S+")
@@ -417,6 +423,27 @@ DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN = re.compile(
 DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN = re.compile(
     rb"(?:\$\(|`)\s*" + DOCUMENTATION_SHELL_WRAPPED_COMMAND + DOCUMENTATION_DOWNLOADER_COMMAND + rb"\b\s+"
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\]|$)",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN = re.compile(
+    rb"\|\s*(?:bash|sh|zsh|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh)\b",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_ACTIONABLE_URL_TOKEN_PATTERN = re.compile(
+    rb"(?:beacon|c2|cmd|download|evil|exec|exfil|payload|shell)",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_URL_ASSIGNMENT_PATTERN = re.compile(
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*[rubfRUBF]*[\"'](?P<url>https?://[^\"'\s]+)[\"']",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_URL_VARIABLE_CALL_PATTERN = re.compile(
+    rb"\b(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(\s*(?P<target>[A-Za-z_][A-Za-z0-9_]*)\b",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_DIRECT_URL_CALL_PATTERN = re.compile(
+    rb"\b(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(\s*[rubfRUBF]*[\"']"
+    rb"(?P<url>https?://[^\"'\s)]+)",
     re.IGNORECASE,
 )
 DOCUMENTATION_PIP_OPTION_WITH_ARGUMENT = (
@@ -1292,6 +1319,87 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
+    def _documentation_loopback_api_url_is_informational(url: str) -> bool:
+        try:
+            parsed_url = urlsplit(url)
+        except ValueError:
+            return False
+        hostname = parsed_url.hostname
+        path = parsed_url.path.rstrip("/")
+        return (
+            parsed_url.scheme.casefold() in {"http", "https"}
+            and isinstance(hostname, str)
+            and hostname.casefold() in DOCUMENTATION_FENCED_LOOPBACK_API_HOSTS
+            and (path == "/v1" or path.startswith("/v1/"))
+        )
+
+    @staticmethod
+    def _documentation_fenced_passive_media_url_is_informational(url: str) -> bool:
+        try:
+            parsed_url = urlsplit(url)
+        except ValueError:
+            return False
+        return (
+            parsed_url.scheme.casefold() in {"http", "https"}
+            and parsed_url.hostname is not None
+            and DOCUMENTATION_FENCED_ACTIONABLE_URL_TOKEN_PATTERN.search(url.encode()) is None
+            and parsed_url.path.casefold().endswith(DOCUMENTATION_FENCED_PASSIVE_MEDIA_URL_SUFFIXES)
+        )
+
+    @classmethod
+    def _documentation_fenced_passive_network_example_is_informational(cls, fenced_code: bytes) -> bool:
+        if DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN.search(fenced_code):
+            return False
+        if any(
+            not cls._documentation_loopback_api_url_is_informational(
+                match.group("url").decode("utf-8", errors="ignore")
+            )
+            for match in DOCUMENTATION_FENCED_DIRECT_URL_CALL_PATTERN.finditer(fenced_code)
+        ):
+            return False
+        if any(
+            cls._documentation_loopback_api_url_is_informational(match.group().decode("utf-8", errors="ignore"))
+            for match in BARE_NETWORK_URL_TOKEN_PATTERN.finditer(fenced_code)
+        ):
+            return True
+        passive_targets = {
+            match.group("target")
+            for match in DOCUMENTATION_FENCED_URL_ASSIGNMENT_PATTERN.finditer(fenced_code)
+            if cls._documentation_fenced_passive_media_url_is_informational(
+                match.group("url").decode("utf-8", errors="ignore")
+            )
+        }
+        call_targets = [
+            match.group("target") for match in DOCUMENTATION_FENCED_URL_VARIABLE_CALL_PATTERN.finditer(fenced_code)
+        ]
+        return bool(call_targets) and all(target in passive_targets for target in call_targets)
+
+    @classmethod
+    def _documentation_fenced_passive_network_example_ranges(
+        cls,
+        payload: bytes,
+        fenced_code_ranges: tuple[tuple[int, int], ...],
+    ) -> tuple[tuple[int, int], ...]:
+        return tuple(
+            (range_start, range_end)
+            for range_start, range_end in fenced_code_ranges
+            if cls._documentation_fenced_passive_network_example_is_informational(payload[range_start:range_end])
+        )
+
+    @classmethod
+    def _documentation_fenced_passive_network_example_contains_finding(
+        cls,
+        finding: dict[str, Any],
+        fenced_passive_network_example_ranges: tuple[tuple[int, int], ...],
+    ) -> bool:
+        finding_position = finding.get("position")
+        return (
+            finding.get("type") in DOCUMENTATION_FENCED_PASSIVE_NETWORK_FINDING_TYPES
+            and isinstance(finding_position, int)
+            and cls._documentation_position_is_fenced_code(fenced_passive_network_example_ranges, finding_position)
+        )
+
+    @staticmethod
     def _documentation_fenced_network_command_is_informational(finding: dict[str, Any]) -> bool:
         if finding.get("command_type") != "git_clone":
             return False
@@ -1301,7 +1409,17 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
-    def _documentation_fenced_finding_is_informational(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+    def _documentation_fenced_finding_is_informational(
+        cls,
+        payload: bytes,
+        finding: dict[str, Any],
+        fenced_passive_network_example_ranges: tuple[tuple[int, int], ...],
+    ) -> bool:
+        if cls._documentation_fenced_passive_network_example_contains_finding(
+            finding,
+            fenced_passive_network_example_ranges,
+        ):
+            return True
         finding_type = finding.get("type")
         if finding_type == "network_command":
             return cls._documentation_fenced_network_command_is_informational(finding)
@@ -1355,6 +1473,7 @@ class TextScanner(BaseScanner):
         lowered_payload: bytes,
         finding: dict[str, Any],
         fenced_code_ranges: tuple[tuple[int, int], ...],
+        fenced_passive_network_example_ranges: tuple[tuple[int, int], ...],
         remaining_occurrences: int,
         allow_exhaustion_probe: bool,
     ) -> tuple[dict[str, Any], bool, int]:
@@ -1395,7 +1514,11 @@ class TextScanner(BaseScanner):
             if cls._documentation_comment_contains_position(payload, position) or (
                 fenced_code_ranges
                 and cls._documentation_position_is_fenced_code(fenced_code_ranges, position)
-                and cls._documentation_fenced_finding_is_informational(payload, candidate)
+                and cls._documentation_fenced_finding_is_informational(
+                    payload,
+                    candidate,
+                    fenced_passive_network_example_ranges,
+                )
             ):
                 actionable = False
             elif finding_type == "network_function":
@@ -1631,6 +1754,7 @@ class TextScanner(BaseScanner):
         payload: bytes,
         finding: dict[str, Any],
         fenced_code_ranges: tuple[tuple[int, int], ...] = (),
+        fenced_passive_network_example_ranges: tuple[tuple[int, int], ...] = (),
     ) -> bool:
         if cls._is_documentation_sidecar(path):
             finding_type = finding.get("type")
@@ -1641,7 +1765,11 @@ class TextScanner(BaseScanner):
                 isinstance(position, int)
                 and fenced_code_ranges
                 and cls._documentation_position_is_fenced_code(fenced_code_ranges, position)
-                and cls._documentation_fenced_finding_is_informational(payload, finding)
+                and cls._documentation_fenced_finding_is_informational(
+                    payload,
+                    finding,
+                    fenced_passive_network_example_ranges,
+                )
             ):
                 return True
             return (
@@ -1684,9 +1812,14 @@ class TextScanner(BaseScanner):
         lowered_payload = payload.lower() if documentation_sidecar else b""
         markdown_fences = documentation_sidecar and cls._documentation_uses_markdown_fences(path, payload)
         fenced_code_ranges: tuple[tuple[int, int], ...] = ()
+        fenced_passive_network_example_ranges: tuple[tuple[int, int], ...] = ()
         if markdown_fences:
             fenced_code_ranges, fence_classification_incomplete = cls._documentation_fenced_code_ranges(payload)
             classification_incomplete = classification_incomplete or fence_classification_incomplete
+            fenced_passive_network_example_ranges = cls._documentation_fenced_passive_network_example_ranges(
+                payload,
+                fenced_code_ranges,
+            )
         last_retargetable_index = max(
             (index for index, finding in enumerate(findings) if cls._documentation_finding_tokens(finding)),
             default=-1,
@@ -1699,6 +1832,7 @@ class TextScanner(BaseScanner):
                     lowered_payload,
                     finding,
                     fenced_code_ranges,
+                    fenced_passive_network_example_ranges,
                     remaining_occurrences,
                     index == last_retargetable_index,
                 )
@@ -1708,6 +1842,7 @@ class TextScanner(BaseScanner):
                 payload,
                 finding,
                 fenced_code_ranges,
+                fenced_passive_network_example_ranges,
             ):
                 finding = {**finding, "severity": "INFO"}
             classified_findings.append(finding)

