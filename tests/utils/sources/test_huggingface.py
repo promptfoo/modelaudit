@@ -18,6 +18,11 @@ from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
+from modelaudit.scanner_selection import (
+    resolve_scanner_selection_policy,
+    selected_scanner_extensions,
+    selected_scanner_filenames,
+)
 from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
 from modelaudit.utils.sources._huggingface_download_worker import _run_operation as _run_huggingface_worker_operation
 from modelaudit.utils.sources.huggingface import (
@@ -2642,6 +2647,98 @@ class TestModelDownloadStreaming:
             revision=_HF_TEST_REVISION,
         )
         mock_detect_content.assert_called_once_with("test/model", "llama", _HF_TEST_REVISION, ANY)
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            ["payload.pkl", "model-00001-of-00002.safetensors"],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_selected_pickle_skips_safetensors_shard_without_probe(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Declared suffixes owned by disabled scanners must not be body-sniffed."""
+        policy = resolve_scanner_selection_policy(scanners=["pickle"])
+        extensions = selected_scanner_extensions(policy, conservative=True)
+        assert extensions is not None
+        assert ".pkl" in extensions
+        assert ".safetensors" not in extensions
+        mock_requests_get.side_effect = AssertionError("excluded safetensors shard must not be probed")
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            assert filename == "payload.pkl"
+            path = tmp_path / filename
+            path.write_bytes(b"downloaded")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                scannable_extensions=extensions,
+                scannable_filenames=selected_scanner_filenames(policy, conservative=True),
+                scannable_scanner_ids=policy.enabled_scanner_ids,
+            )
+        )
+
+        assert results == [(tmp_path / "payload.pkl", True)]
+        mock_requests_get.assert_not_called()
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="payload.pkl",
+            revision=_HF_TEST_REVISION,
+        )
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["renamed.weights"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_selected_pickle_preserves_renamed_malicious_control(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Unknown-suffix candidates should still be probed for selected malicious pickles."""
+        policy = resolve_scanner_selection_policy(scanners=["pickle"])
+        malicious_pickle = b"cos\nsystem\n(S'echo pwn'\ntR."
+        mock_requests_get.return_value = _FakeRangeResponse(malicious_pickle)
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / filename
+            path.write_bytes(malicious_pickle)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                scannable_extensions=selected_scanner_extensions(policy, conservative=True),
+                scannable_filenames=selected_scanner_filenames(policy, conservative=True),
+                scannable_scanner_ids=policy.enabled_scanner_ids,
+            )
+        )
+
+        assert results == [(tmp_path / "renamed.weights", True)]
+        assert mock_requests_get.call_count == 1
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="renamed.weights",
+            revision=_HF_TEST_REVISION,
+        )
 
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
