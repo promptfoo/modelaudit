@@ -318,7 +318,7 @@ _BASE64_LICENSE_WRAP_MAX_LINES = 128
 _BASE64_LICENSE_WRAP_MAX_CHARS = 8192
 _BASE64_LICENSE_WRAP_MAX_DECODED_BYTES = 6144
 _BASE64_LICENSE_WRAP_MAX_SEPARATOR_LINES = 4
-_BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO = 0.25
+_BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO = 0.15
 _BASE64_LICENSE_WRAP_LINE_PATTERN = re.compile(r"^[A-Za-z0-9+/_-]+={0,2}$")
 _BASE64_LICENSE_WRAP_TOKEN_PATTERN = re.compile(
     rf"\b[A-Za-z0-9+/_-]{{{_BASE64_LICENSE_WRAP_TOKEN_MIN_CHARS},}}={{0,2}}\b"
@@ -544,12 +544,13 @@ class SafeTensorsScanner(BaseScanner):
             token = match.group(0)
             before = stripped[: match.start()]
             after = stripped[match.end() :]
-            if before.strip() and after.strip():
-                continue
             if len(token) / nonspace_len < _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO:
                 continue
-            annotation = before if before.strip() else after
-            if not SafeTensorsScanner._license_document_annotation_looks_documentary(annotation):
+            annotations = [annotation for annotation in (before, after) if annotation.strip()]
+            if not all(
+                SafeTensorsScanner._license_document_annotation_looks_documentary(annotation)
+                for annotation in annotations
+            ):
                 continue
             fragments.append(token)
         return fragments
@@ -686,6 +687,13 @@ class SafeTensorsScanner(BaseScanner):
         )
 
     @classmethod
+    def _url_path_has_embedded_url(cls, path: str) -> bool:
+        normalized_path, has_residual_encoding = cls._normalize_url_path(path)
+        if has_residual_encoding:
+            return True
+        return "://" in normalized_path or "http:/" in normalized_path or "https:/" in normalized_path
+
+    @classmethod
     def _url_path_looks_like_license_reference(cls, hostname: str, path: str) -> bool:
         segments, has_residual_encoding = cls._url_path_segments(path)
         if has_residual_encoding:
@@ -722,6 +730,8 @@ class SafeTensorsScanner(BaseScanner):
 
         lowered_url = cleaned_url.lower()
         if any(marker in lowered_url for marker in _SUSPICIOUS_LICENSE_URL_MARKERS):
+            return False
+        if cls._url_path_has_embedded_url(parsed.path):
             return False
         if cls._url_path_has_suspicious_target(parsed.path):
             return False

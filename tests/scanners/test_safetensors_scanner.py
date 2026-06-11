@@ -464,6 +464,15 @@ def test_license_document_reconstructs_quantum_annotated_wrapped_base64_tail() -
     assert not SafeTensorsScanner._looks_like_ordinary_license_document(payload)
 
 
+def test_license_document_reconstructs_infix_annotated_wrapped_base64_tail() -> None:
+    license_text = ordinary_license_text_with_url()
+    tail = "\n".join(f"License grant {line} under terms" for line in executable_wrapped_base64_lines((4,)))
+    payload = f"{license_text}\n{tail}"
+
+    assert SafeTensorsScanner._looks_like_ordinary_license_document(license_text)
+    assert not SafeTensorsScanner._looks_like_ordinary_license_document(payload)
+
+
 def test_license_url_residual_encoding_fails_closed() -> None:
     encoded_prefix = encode_url_path("/releases/download/v1", passes=5)
 
@@ -487,6 +496,12 @@ def test_license_url_residual_encoding_fails_closed() -> None:
     )
     assert not SafeTensorsScanner._url_looks_like_license_reference(
         "https://github.com/Lightricks/LTX-2/%5Creleases%5Cdownload%5Cv1/license"
+    )
+    assert not SafeTensorsScanner._url_looks_like_license_reference(
+        "https://opensource.org/licenses/MIT,https://evil.example/x"
+    )
+    assert not SafeTensorsScanner._url_looks_like_license_reference(
+        "https://opensource.org/licenses/MIT,https%3A%2F%2Fevil.example%2Fx"
     )
 
 
@@ -548,6 +563,7 @@ def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -
         "https://github.com/Lightricks/LTX-2;payload",
         "https://github.com/Lightricks/LTX-2/blob/main/license.py%00.txt",
         "https://github.com/Lightricks/LTX-2/%5Creleases%5Cdownload%5Cv1/license",
+        "https://opensource.org/licenses/MIT,https://evil.example/x",
         "https://opensource.org/licenses/MIT?u=https://evil.example/x",
         "https://[",
     ],
@@ -741,6 +757,10 @@ def test_license_metadata_standard_wrapped_base64_tail_keeps_length_and_s905(tmp
         (
             "\n".join(f"License grant {line}" for line in executable_wrapped_base64_lines((4,))),
             "quantum_prefixed",
+        ),
+        (
+            "\n".join(f"License grant {line} under terms" for line in executable_wrapped_base64_lines((4,))),
+            "infix_prefixed",
         ),
         (
             "\nThis license paragraph continues under applicable law.\n".join(executable_wrapped_base64_lines((76,))),
