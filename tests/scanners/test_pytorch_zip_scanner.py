@@ -8842,7 +8842,7 @@ def test_pytorch_zip_entry_limit_is_exit1_and_not_cached(tmp_path: Path) -> None
         zip_path,
         tmp_path / "entry-limit-cache",
         "pytorch_zip_entry_limit",
-        expected_success=True,
+        expected_success=False,
         expected_exit_code=1,
         max_archive_entries=max_archive_entries,
     )
@@ -8878,7 +8878,7 @@ def test_pytorch_zip_tensor_metadata_parse_failure_is_exit1_and_not_cached(tmp_p
         zip_path,
         tmp_path / "parse-failure-cache",
         "pytorch_zip_tensor_metadata_validation_failed",
-        expected_success=True,
+        expected_success=False,
         expected_exit_code=1,
     )
 
@@ -8905,7 +8905,7 @@ def test_pytorch_zip_tensor_metadata_truncation_preserves_origin_warning_precede
         zip_path,
         tmp_path / "truncation-cache",
         "pytorch_zip_tensor_metadata_validation_truncated",
-        expected_success=requires_origin_review,
+        expected_success=False,
         expected_exit_code=1 if requires_origin_review else 2,
     )
 

@@ -524,6 +524,51 @@ class TestModelAuditResultModel:
         assert result.file_metadata["trailing.npy"]["scan_outcome"] == "inconclusive"
         assert determine_exit_code(result) == 2
 
+    def test_aggregate_scan_result_analysis_incomplete_metadata_fails_closed(self) -> None:
+        """Dict aggregation should not require scan_outcome when coverage is incomplete."""
+        result = create_initial_audit_result()
+        result.aggregate_scan_result(
+            {
+                "success": True,
+                "files_scanned": 1,
+                "file_metadata": {"model.bin": {"analysis_incomplete": True}},
+                "issues": [],
+                "checks": [],
+                "assets": [],
+            }
+        )
+
+        assert result.has_errors is False
+        assert result.success is False
+        assert result.file_metadata["model.bin"]["analysis_incomplete"] is True
+        assert determine_exit_code(result) == 2
+
+    def test_aggregate_scan_result_incomplete_reason_with_finding_fails_coverage_success(self) -> None:
+        """Security findings keep exit 1 while incomplete coverage makes success false."""
+        result = create_initial_audit_result()
+        result.aggregate_scan_result(
+            {
+                "success": True,
+                "files_scanned": 1,
+                "file_metadata": {"model.bin": {"scan_outcome_reasons": ["bounded_probe_exhausted"]}},
+                "issues": [
+                    {
+                        "message": "Dangerous reference found beyond bounded coverage",
+                        "severity": "warning",
+                        "location": "model.bin",
+                        "timestamp": 0.0,
+                    }
+                ],
+                "checks": [],
+                "assets": [],
+            }
+        )
+
+        assert result.has_errors is False
+        assert result.success is False
+        assert result.file_metadata["model.bin"]["scan_outcome_reasons"] == ["bounded_probe_exhausted"]
+        assert determine_exit_code(result) == 1
+
     def test_aggregate_scanner_names_wraps_scalar_strings(self) -> None:
         """Scalar scanner fields should not be split into characters."""
         result = create_initial_audit_result()

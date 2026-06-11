@@ -2,7 +2,11 @@
 
 from typing import Any
 
-from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, SCANNER_DEPENDENCY_IDS_METADATA_KEY
+from modelaudit.scanner_results import (
+    INCONCLUSIVE_SCAN_OUTCOME,
+    SCAN_OUTCOME_REASONS_METADATA_KEY,
+    SCANNER_DEPENDENCY_IDS_METADATA_KEY,
+)
 
 _OPERATIONAL_ERROR_INDICATORS = (
     "error during scan",
@@ -44,6 +48,7 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
         bool(metadata.get("operational_error"))
         or bool(metadata.get("analysis_incomplete"))
         or metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        or _has_incomplete_coverage_reasons(metadata)
     ):
         return False
 
@@ -63,6 +68,20 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
                 return False
 
     return True
+
+
+def _has_incomplete_coverage_reasons(metadata: dict[str, Any]) -> bool:
+    reason = metadata.get("scan_outcome_reason")
+    if isinstance(reason, str) and reason:
+        return True
+
+    reasons = metadata.get(SCAN_OUTCOME_REASONS_METADATA_KEY)
+    if isinstance(reasons, str):
+        return bool(reasons)
+    if isinstance(reasons, (list, tuple, set, frozenset)):
+        return any(bool(item) for item in reasons)
+
+    return False
 
 
 def cached_scan_result_dependencies_available(scan_result: dict[str, Any]) -> bool:

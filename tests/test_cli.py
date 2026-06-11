@@ -1012,6 +1012,32 @@ def test_scan_json_output(tmp_path):
         pytest.fail("Output is not valid JSON")
 
 
+def test_strict_json_incomplete_coverage_exits_2(tmp_path: Path) -> None:
+    """Strict JSON should expose incomplete coverage and terminate truthfully."""
+    test_file = tmp_path / "model.bin"
+    test_file.write_bytes(b"bounded coverage")
+    scan_result = create_mock_scan_result(
+        success=False,
+        files_scanned=1,
+        file_metadata={
+            str(test_file): {
+                "analysis_incomplete": True,
+                "scan_outcome_reasons": ["bounded_probe_exhausted"],
+            }
+        },
+    )
+
+    with patch("modelaudit.cli.scan_model_directory_or_file", return_value=scan_result):
+        result = CliRunner().invoke(cli, ["scan", str(test_file), "--strict", "--format", "json"])
+
+    assert result.exit_code == 2, result.output
+    payload = parse_click_json_output(result.output)
+    assert payload["success"] is False
+    assert payload["has_errors"] is False
+    assert payload["file_metadata"][str(test_file)]["analysis_incomplete"] is True
+    assert payload["file_metadata"][str(test_file)]["scan_outcome_reasons"] == ["bounded_probe_exhausted"]
+
+
 def test_scan_output_file(tmp_path: Path) -> None:
     """Test scanning with output to a file."""
     test_file = tmp_path / "test_file.dat"

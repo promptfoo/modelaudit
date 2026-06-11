@@ -39,11 +39,46 @@ def _metadata_has_scan_outcome(metadata: Any, outcome: str) -> bool:
     return getattr(metadata, "scan_outcome", None) == outcome
 
 
-def _file_metadata_has_scan_outcome(file_metadata: Any, outcome: str) -> bool:
-    """Return True when any file metadata entry reports a scan outcome."""
+def _metadata_value(metadata: Any, key: str) -> Any:
+    if metadata is None:
+        return None
+    if isinstance(metadata, dict):
+        return metadata.get(key)
+
+    getter = getattr(metadata, "get", None)
+    if callable(getter):
+        try:
+            return getter(key)
+        except Exception:
+            return None
+
+    return getattr(metadata, key, None)
+
+
+def _metadata_has_incomplete_coverage(metadata: Any) -> bool:
+    """Return True when metadata identifies incomplete scan coverage."""
+    if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
+        return True
+    if _metadata_value(metadata, "analysis_incomplete") is True:
+        return True
+    reason = _metadata_value(metadata, "scan_outcome_reason")
+    if isinstance(reason, str):
+        return bool(reason)
+
+    reasons = _metadata_value(metadata, "scan_outcome_reasons")
+    if isinstance(reasons, str):
+        return bool(reasons)
+    if isinstance(reasons, (list, tuple, set, frozenset)):
+        return any(bool(reason) for reason in reasons)
+
+    return False
+
+
+def _file_metadata_has_incomplete_coverage(file_metadata: Any) -> bool:
+    """Return True when any file metadata entry reports incomplete scan coverage."""
     if not isinstance(file_metadata, dict):
         return False
-    return any(_metadata_has_scan_outcome(metadata, outcome) for metadata in file_metadata.values())
+    return any(_metadata_has_incomplete_coverage(metadata) for metadata in file_metadata.values())
 
 
 def _issues_have_security_findings(issues: list[Any]) -> bool:
@@ -466,15 +501,20 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         incoming_has_security_findings = (
             _issues_have_security_findings(incoming_issues) if isinstance(incoming_issues, list) else False
         )
-        incoming_has_inconclusive_outcome = _metadata_has_scan_outcome(
-            results_dict.get("metadata"), INCONCLUSIVE_SCAN_OUTCOME
-        ) or _file_metadata_has_scan_outcome(results_dict.get("file_metadata"), INCONCLUSIVE_SCAN_OUTCOME)
+        incoming_has_incomplete_coverage = _metadata_has_incomplete_coverage(
+            results_dict.get("metadata")
+        ) or _file_metadata_has_incomplete_coverage(results_dict.get("file_metadata"))
 
-        # Update success status for operational/inconclusive scan failures.
+        # Update success status for operational/incomplete scan failures.
         # Security findings should drive exit code 1 without becoming an
-        # operationally unsuccessful scan by themselves.
-        incoming_unsuccessful = results_dict.get("success", True) is False or incoming_has_inconclusive_outcome
-        if results_dict.get("has_errors", False) or (incoming_unsuccessful and not incoming_has_security_findings):
+        # operationally unsuccessful scan by themselves, but incomplete
+        # coverage is always an unsuccessful aggregate security coverage result.
+        incoming_unsuccessful = results_dict.get("success", True) is False
+        if (
+            results_dict.get("has_errors", False)
+            or incoming_has_incomplete_coverage
+            or (incoming_unsuccessful and not incoming_has_security_findings)
+        ):
             self.success = False
 
         # Convert and extend issues
@@ -543,8 +583,8 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         if bool(metadata.get("operational_error")):
             self.has_errors = True
 
-        # Update success status - only set to False for operational errors
-        if bool(metadata.get("operational_error")) or metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
+        # Update success status for operational errors or incomplete coverage.
+        if bool(metadata.get("operational_error")) or _metadata_has_incomplete_coverage(metadata):
             self.success = False
 
         if metadata:

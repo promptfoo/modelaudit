@@ -267,6 +267,33 @@ def test_exit_code_inconclusive_pickle_with_security_findings() -> None:
     assert determine_exit_code(results) == 1
 
 
+def test_exit_code_analysis_incomplete_metadata_without_scan_outcome() -> None:
+    """Incomplete coverage metadata should fail closed even before scan_outcome normalization."""
+    results = _create_result_model(
+        file_metadata={"model.bin": {"analysis_incomplete": True}},
+    )
+
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_incomplete_coverage_reason_without_scan_outcome() -> None:
+    """Incomplete coverage reasons should be enough to drive aggregate exit semantics."""
+    results = _create_result_model(
+        file_metadata={"model.bin": {"scan_outcome_reasons": ["bounded_probe_exhausted"]}},
+    )
+
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_empty_coverage_reason_placeholder_remains_clean() -> None:
+    """Empty reason placeholders should not become incomplete coverage by themselves."""
+    results = _create_result_model(
+        file_metadata={"model.bin": {"scan_outcome_reason": "", "scan_outcome_reasons": []}},
+    )
+
+    assert determine_exit_code(results) == 0
+
+
 def test_exit_code_empty_results():
     """Test exit code with minimal results structure."""
     results = _create_result_model(files_scanned=0)
@@ -358,7 +385,7 @@ def test_exit_code_file_scan_failure(tmp_path: Path) -> None:
 
 
 def test_scan_result_warning_message_without_operational_flag_keeps_exit_code_1(tmp_path: Path) -> None:
-    """Warning findings should not become exit code 2 just because the message looks like a parse error."""
+    """Warning findings keep exit 1 even when a bare failed scan is normalized as incomplete."""
     test_file = tmp_path / "malicious.pkl"
     test_file.write_bytes(b"payload")
 
@@ -384,7 +411,7 @@ def test_scan_result_warning_message_without_operational_flag_keeps_exit_code_1(
         results = scan_model_directory_or_file(str(test_file))
 
     assert results.has_errors is False
-    assert results.success is True
+    assert results.success is False
     assert determine_exit_code(results) == 1
 
 
@@ -438,7 +465,7 @@ def test_scan_result_info_only_failed_scan_without_outcome_fails_closed(tmp_path
 
 
 def test_scan_result_inconclusive_with_security_finding_keeps_exit_code_1(tmp_path: Path) -> None:
-    """Security findings should outrank inconclusive metadata in aggregate scan results."""
+    """Security findings should outrank incomplete coverage for exit code, not aggregate success."""
     test_file = tmp_path / "budget-danger.pkl"
     test_file.write_bytes(b"payload")
 
@@ -458,7 +485,7 @@ def test_scan_result_inconclusive_with_security_finding_keeps_exit_code_1(tmp_pa
         results = scan_model_directory_or_file(str(test_file))
 
     assert results.has_errors is False
-    assert results.success is True
+    assert results.success is False
     assert determine_exit_code(results) == 1
 
 

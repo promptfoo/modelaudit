@@ -994,7 +994,7 @@ def test_compressed_scanner_depth_limit_preserves_exit1_and_is_not_cached(tmp_pa
 
         for aggregate in (first, second):
             metadata = aggregate.file_metadata[str(path)]
-            assert aggregate.success is True
+            assert aggregate.success is False
             assert determine_exit_code(aggregate) == 1
             assert metadata["scan_outcome"] == "inconclusive"
             assert metadata["scan_outcome_reasons"] == ["compressed_depth_limit_exceeded"]
@@ -1027,7 +1027,7 @@ def test_compressed_scanner_decompression_limit_preserves_exit1_and_is_not_cache
 
         for aggregate in (first, second):
             metadata = aggregate.file_metadata[str(path)]
-            assert aggregate.success is True
+            assert aggregate.success is False
             assert determine_exit_code(aggregate) == 1
             assert metadata["scan_outcome"] == "inconclusive"
             assert metadata["scan_outcome_reasons"] == ["compressed_decompression_limit_exceeded"]
@@ -1058,7 +1058,7 @@ def test_compressed_scanner_corrupt_stream_preserves_exit1_and_is_not_cached(tmp
 
         for aggregate in (first, second):
             metadata = aggregate.file_metadata[str(path)]
-            assert aggregate.success is True
+            assert aggregate.success is False
             assert determine_exit_code(aggregate) == 1
             assert metadata["scan_outcome"] == "inconclusive"
             assert metadata["scan_outcome_reasons"] == ["compressed_stream_decode_failed"]

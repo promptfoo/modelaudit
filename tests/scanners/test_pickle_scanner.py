@@ -774,7 +774,7 @@ def test_nested_probe_limit_operational_semantics_and_cache_policy(tmp_path: Pat
         )
         metadata = aggregate_result.file_metadata[str(path)]
 
-        assert aggregate_result.success is True
+        assert aggregate_result.success is False
         assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert metadata["scan_outcome_reasons"] == ["nested_probe_limit"]
         assert determine_exit_code(aggregate_result) == 1

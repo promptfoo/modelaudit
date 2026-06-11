@@ -25,7 +25,10 @@ logger = logging.getLogger("modelaudit.core.results")
 
 OPERATIONAL_ERROR_METADATA_KEY = "operational_error"
 OPERATIONAL_ERROR_REASON_METADATA_KEY = "operational_error_reason"
+ANALYSIS_INCOMPLETE_METADATA_KEY = "analysis_incomplete"
 SCAN_OUTCOME_METADATA_KEY = "scan_outcome"
+SCAN_OUTCOME_REASON_METADATA_KEY = "scan_outcome_reason"
+SCAN_OUTCOME_REASONS_METADATA_KEY = "scan_outcome_reasons"
 
 
 def mark_operational_scan_error(scan_result: ScanResult, reason: str) -> None:
@@ -78,12 +81,44 @@ def _metadata_has_scan_outcome(metadata: Any, outcome: str) -> bool:
     return getattr(metadata, SCAN_OUTCOME_METADATA_KEY, None) == outcome
 
 
+def _metadata_value(metadata: Any, key: str) -> Any:
+    if metadata is None:
+        return None
+    if isinstance(metadata, dict):
+        return metadata.get(key)
+
+    getter = getattr(metadata, "get", None)
+    if callable(getter):
+        try:
+            return getter(key)
+        except Exception:
+            return None
+
+    return getattr(metadata, key, None)
+
+
+def metadata_has_incomplete_coverage(metadata: Any) -> bool:
+    """Return True when metadata identifies incomplete scan coverage."""
+    if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
+        return True
+    if _metadata_value(metadata, ANALYSIS_INCOMPLETE_METADATA_KEY) is True:
+        return True
+    reason = _metadata_value(metadata, SCAN_OUTCOME_REASON_METADATA_KEY)
+    if isinstance(reason, str):
+        return bool(reason)
+
+    reasons = _metadata_value(metadata, SCAN_OUTCOME_REASONS_METADATA_KEY)
+    if isinstance(reasons, str):
+        return bool(reasons)
+    if isinstance(reasons, (list, tuple, set, frozenset)):
+        return any(bool(reason) for reason in reasons)
+
+    return False
+
+
 def results_have_inconclusive_outcome(results: ModelAuditResultModel) -> bool:
-    """Return True when any scanned file completed with an explicit inconclusive outcome."""
-    return any(
-        _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME)
-        for metadata in (results.file_metadata or {}).values()
-    )
+    """Return True when any scanned file has incomplete coverage."""
+    return any(metadata_has_incomplete_coverage(metadata) for metadata in (results.file_metadata or {}).values())
 
 
 def results_have_security_findings(results: ModelAuditResultModel) -> bool:
@@ -99,7 +134,7 @@ def results_should_be_unsuccessful(results: ModelAuditResultModel) -> bool:
     if results_have_operational_error(results):
         return True
 
-    return results_have_inconclusive_outcome(results) and not results_have_security_findings(results)
+    return results_have_inconclusive_outcome(results)
 
 
 def to_telemetry_severity(severity: Any) -> str:

@@ -6328,7 +6328,7 @@ class TestCVE202523304HydraTarget:
             )
             metadata = aggregate.file_metadata[str(path)]
 
-            assert aggregate.success is True
+            assert aggregate.success is False
             assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
             assert metadata["scan_outcome_reasons"] == ["nemo_config_size_limit"]
             assert determine_exit_code(aggregate) == 1

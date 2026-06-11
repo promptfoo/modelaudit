@@ -2488,6 +2488,8 @@ def test_cached_scan_skips_persisting_operational_failures_from_checks(tmp_path:
     [
         {"scan_outcome": INCONCLUSIVE_SCAN_OUTCOME},
         {"analysis_incomplete": True},
+        {"scan_outcome_reason": "bounded_probe_exhausted"},
+        {"scan_outcome_reasons": ["bounded_probe_exhausted"]},
         {"operational_error": True},
     ],
 )
