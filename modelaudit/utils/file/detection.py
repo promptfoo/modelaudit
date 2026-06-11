@@ -6465,9 +6465,12 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
                 return False
             return header_format == expected_codec
 
-        # NeMo files are TAR archives with a dedicated or structurally recognized route.
-        if ext_format == "nemo" and header_format in {"tar", "nemo"}:
-            return True
+        # NeMo files are TAR archives, commonly carried in gzip-compressed TAR wrappers.
+        if ext_format == "nemo":
+            if header_format in {"tar", "nemo"}:
+                return True
+            if header_format == "gzip":
+                return _is_tar_archive(path)
 
         # ExecuTorch files may be ZIP archives or valid FlatBuffers binaries.
         if ext_format == "executorch":

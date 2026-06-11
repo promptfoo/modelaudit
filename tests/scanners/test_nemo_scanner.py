@@ -1,11 +1,12 @@
 """Tests for CVE-2025-23304: NVIDIA NeMo Hydra _target_ injection."""
 
+import gzip
 import io
 import pickle
 import tarfile
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -24,6 +25,7 @@ from modelaudit.scanners.nemo_scanner import NemoScanner, _get_nested_scanner_fo
 from modelaudit.utils.file import detection as file_detection
 
 _TMP_PATH_MARKER = "__MODELAUDIT_TMP__/"
+_NemoTarWriteMode = Literal["w", "w:gz"]
 
 
 def _create_nemo_file_from_bytes(
@@ -31,10 +33,11 @@ def _create_nemo_file_from_bytes(
     config_bytes: bytes,
     filename: str = "model.nemo",
     config_name: str = "model_config.yaml",
+    mode: _NemoTarWriteMode = "w",
 ) -> Path:
     """Helper to create a .nemo tar file with the given YAML config."""
     nemo_path = tmp_path / filename
-    with tarfile.open(nemo_path, "w") as tar:
+    with tarfile.open(nemo_path, mode) as tar:
         info = tarfile.TarInfo(name=config_name)
         info.size = len(config_bytes)
         tar.addfile(info, io.BytesIO(config_bytes))
@@ -46,16 +49,17 @@ def _create_nemo_file(
     config_dict: dict[str, Any] | None,
     filename: str = "model.nemo",
     config_name: str = "model_config.yaml",
+    mode: _NemoTarWriteMode = "w",
 ) -> Path:
     """Helper to create a .nemo tar file with the given YAML config."""
     if config_dict is None:
         nemo_path = tmp_path / filename
-        with tarfile.open(nemo_path, "w"):
+        with tarfile.open(nemo_path, mode):
             pass
         return nemo_path
 
     config_bytes = yaml.safe_dump(config_dict).encode() if HAS_YAML else b"{}"
-    return _create_nemo_file_from_bytes(tmp_path, config_bytes, filename=filename, config_name=config_name)
+    return _create_nemo_file_from_bytes(tmp_path, config_bytes, filename=filename, config_name=config_name, mode=mode)
 
 
 def _add_tar_bytes(tar: tarfile.TarFile, name: str, payload: bytes) -> None:
@@ -124,6 +128,48 @@ class TestNemoScannerBasic:
         ]
         assert len(mismatch_checks) == 0
 
+    def test_gzip_framed_nemo_does_not_trigger_s901(self, tmp_path: Path) -> None:
+        """Valid gzip-compressed .nemo tar archives should not be flagged as spoofed."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": "nemo.Model"}}, mode="w:gz")
+
+        direct_result = NemoScanner().scan(str(path))
+        aggregate_result = scan_file(str(path), config={"cache_scan_results": False})
+
+        direct_s901 = [check for check in direct_result.checks if check.rule_code == "S901"]
+        aggregate_s901 = [check for check in aggregate_result.checks if check.rule_code == "S901"]
+
+        assert direct_s901 == []
+        assert aggregate_s901 == []
+        assert aggregate_result.scanner_name == "nemo"
+
+    def test_malformed_gzip_nemo_still_reports_s901(self, tmp_path: Path) -> None:
+        """A .nemo suffix plus gzip magic is not enough unless it is a valid TAR."""
+        path = tmp_path / "model.nemo"
+        path.write_bytes(b"\x1f\x8b\x08\x00truncated")
+
+        result = scan_file(str(path), config={"cache_scan_results": False})
+
+        s901_checks = [check for check in result.checks if check.rule_code == "S901"]
+        assert s901_checks
+        assert any(
+            check.details.get("extension_format") == "nemo" and check.details.get("header_format") == "gzip"
+            for check in s901_checks
+        )
+
+    def test_gzip_non_tar_nemo_still_reports_s901(self, tmp_path: Path) -> None:
+        """A valid gzip stream with non-TAR content is still a spoofed .nemo container."""
+        path = tmp_path / "model.nemo"
+        path.write_bytes(gzip.compress(b"not a tar archive"))
+
+        result = scan_file(str(path), config={"cache_scan_results": False})
+
+        s901_checks = [check for check in result.checks if check.rule_code == "S901"]
+        assert s901_checks
+        assert any(
+            check.details.get("extension_format") == "nemo" and check.details.get("header_format") == "gzip"
+            for check in s901_checks
+        )
+
     def test_missing_yaml_dependency_is_reported_as_warning(self, tmp_path, monkeypatch):
         """Missing PyYAML should be a non-passing warning, not a pass."""
         path = _create_nemo_file(tmp_path, {"model": "test"})
@@ -177,6 +223,19 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert details["cwe"] == "CWE-23"
         assert "remediation" in details
 
+    def test_gzip_framed_member_path_traversal_still_detected(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "traversal.nemo"
+        with tarfile.open(nemo_path, "w:gz") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "../../evil.txt", b"overwrite")
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert not [check for check in result.checks if check.rule_code == "S901"]
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23360"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+
     def test_absolute_member_path_traversal_detects_cve_2025_23250(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "absolute.nemo"
         with tarfile.open(nemo_path, "w") as tar:
@@ -202,6 +261,23 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23360"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].details["entry"] == "weights_link"
+        assert cve_checks[0].details["target"] == "../../outside_weights.ckpt"
+
+    def test_gzip_framed_symlink_escape_still_detected(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "symlink.nemo"
+        with tarfile.open(nemo_path, "w:gz") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            link_info = tarfile.TarInfo(name="weights_link")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = "../../outside_weights.ckpt"
+            tar.addfile(link_info)
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert not [check for check in result.checks if check.rule_code == "S901"]
         cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23360"]
         assert len(cve_checks) == 1
         assert cve_checks[0].details["entry"] == "weights_link"
@@ -234,6 +310,19 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert details["cwe"] == "CWE-502"
         assert "CVE-2026-24157" in details["related_cves"]
         assert details["nested_scanner"] == "pickle"
+
+    def test_gzip_framed_malicious_checkpoint_still_detected(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "checkpoint-rce.nemo"
+        with tarfile.open(nemo_path, "w:gz") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "model_weights.ckpt", _build_malicious_pickle())
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert not [check for check in result.checks if check.rule_code == "S901"]
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
 
     def test_torch7_checkpoint_with_pt_suffix_detects_nemo_deserialization_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "torch7-checkpoint-rce.nemo"
@@ -6455,6 +6544,20 @@ class TestCVE202523304HydraTarget:
 
         suspicious = [c for c in result.checks if "Suspicious File" in c.name]
         assert len(suspicious) > 0, "Should detect executable in archive"
+
+    def test_gzip_framed_executable_file_in_archive_flagged(self, tmp_path: Path) -> None:
+        """Executable archive member checks still run after accepting gzip framing."""
+        nemo_path = tmp_path / "model.nemo"
+        with tarfile.open(nemo_path, "w:gz") as tar:
+            config_bytes = yaml.dump({"model": {"_target_": "nemo.Model"}}).encode()
+            _add_tar_bytes(tar, "config.yaml", config_bytes)
+            _add_tar_bytes(tar, "exploit.sh", b"#!/bin/bash\nrm -rf /")
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert not [check for check in result.checks if check.rule_code == "S901"]
+        suspicious = [check for check in result.checks if "Suspicious File" in check.name]
+        assert len(suspicious) > 0
 
     def test_no_yaml_configs_fail_closed_as_inconclusive(self, tmp_path: Path) -> None:
         """Archives with no YAML should not report a clean complete scan."""

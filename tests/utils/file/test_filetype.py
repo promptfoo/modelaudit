@@ -3641,6 +3641,22 @@ def test_validate_file_type(tmp_path):
         tar.addfile(info, io.BytesIO(content))
     assert validate_file_type(str(nemo_path)) is True
 
+    gzip_nemo_path = tmp_path / "compressed.nemo"
+    with tarfile.open(gzip_nemo_path, "w:gz") as tar:
+        info = tarfile.TarInfo(name="model_config.yaml")
+        content = b"model: test\n"
+        info.size = len(content)
+        tar.addfile(info, io.BytesIO(content))
+    assert validate_file_type(str(gzip_nemo_path)) is True
+
+    malformed_gzip_nemo_path = tmp_path / "malformed.nemo"
+    malformed_gzip_nemo_path.write_bytes(b"\x1f\x8b\x08\x00truncated")
+    assert validate_file_type(str(malformed_gzip_nemo_path)) is False
+
+    gzip_non_tar_nemo_path = tmp_path / "gzip-non-tar.nemo"
+    gzip_non_tar_nemo_path.write_bytes(gzip.compress(b"not a tar archive"))
+    assert validate_file_type(str(gzip_non_tar_nemo_path)) is False
+
     # Small file should be valid (can't determine magic bytes)
     small_file = tmp_path / "small.h5"
     small_file.write_bytes(b"hi")
