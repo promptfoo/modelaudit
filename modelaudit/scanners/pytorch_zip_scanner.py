@@ -3058,8 +3058,8 @@ class PyTorchZipScanner(BaseScanner):
                 continue
             try:
                 distributions = metadata.distributions(path=[str(trusted_root)])
-            except Exception as exc:
-                logger.debug("Unable to inspect trusted Python package root %s: %s", trusted_root, exc)
+            except Exception:
+                logger.debug("Unable to inspect trusted Python package root during torch metadata lookup")
                 continue
             for distribution in distributions:
                 try:
