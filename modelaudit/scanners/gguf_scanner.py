@@ -71,6 +71,9 @@ _GGUF_METADATA_COMMAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("backtick_command", re.compile(r"(?i)`\s*(?:rm|curl|wget|bash|sh|python(?:3)?|powershell|pwsh|cmd(?:\.exe)?)\b")),
 )
 _GGUF_DESTRUCTIVE_COMMAND_PREFIXES = ("sudo", "doas", "command", "env", "nohup", "nice", "setsid", "timeout")
+_GGUF_PREFIX_OPTIONS_WITH_VALUE = frozenset(
+    {"-c", "--close-from", "-g", "--group", "-h", "--host", "-p", "--prompt", "-t", "--command-timeout", "-u", "--user"}
+)
 _GGUF_METADATA_SHELL_FETCH_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("shell_download", ("curl", "wget")),
     ("powershell_download", ("invoke-webrequest", "iwr")),
@@ -149,6 +152,9 @@ _GGUF_NETWORK_CLIENT_ALIAS_PATTERN = re.compile(
 )
 _GGUF_URLLIB_REQUEST_ALIAS_PATTERN = re.compile(
     r"(?is)\bfrom\s+urllib\s+import\s+request\s+as\s+(?P<alias>[a-z_][a-z0-9_]*)",
+)
+_GGUF_NETWORK_FUNCTION_IMPORT_PATTERN = re.compile(
+    r"(?is)\bfrom\s+(?P<module>requests|httpx|urllib\.request)\s+import\s+(?P<imports>[^;\n]+)",
 )
 _GGUF_NETWORK_URL_ASSIGNMENT_PATTERN = re.compile(
     r"""(?is)\b(?P<name>[a-z_][a-z0-9_]*)\s*=\s*(?:[rubf]{0,2})?(?P<quote>['"])(?:https?|ftp)://[^'"\s<>]+(?P=quote)""",
@@ -1022,6 +1028,14 @@ class GgufScanner(BaseScanner):
             if character in {"'", '"'}:
                 quote = character
                 continue
+            if character in "\r\n":
+                if current_word:
+                    current_segment.append("".join(current_word))
+                    current_word = []
+                if current_segment:
+                    segments.append(current_segment)
+                    current_segment = []
+                continue
             if character.isspace():
                 if current_word:
                     current_segment.append("".join(current_word))
@@ -1116,6 +1130,7 @@ class GgufScanner(BaseScanner):
             marker in lowered_line
             for marker in (
                 "..",
+                "rm ",
                 "curl",
                 "wget",
                 "invoke-webrequest",
@@ -1249,6 +1264,23 @@ class GgufScanner(BaseScanner):
             return index
         return index
 
+    @staticmethod
+    def _skip_command_prefix_arguments(command_name: str, words: list[str], index: int) -> int:
+        while index < len(words):
+            word = words[index]
+            option = word.split("=", 1)[0]
+            if word.startswith("-"):
+                if command_name in {"sudo", "doas"} and option in _GGUF_PREFIX_OPTIONS_WITH_VALUE:
+                    index += 1 if "=" in word else 2
+                    continue
+                index += 1
+                continue
+            if "=" in word:
+                index += 1
+                continue
+            break
+        return index
+
     @classmethod
     def _destructive_rm_segment(cls, words: list[str]) -> bool:
         index = 0
@@ -1260,10 +1292,7 @@ class GgufScanner(BaseScanner):
                 if command_name == "timeout":
                     index = cls._skip_timeout_prefix_arguments(words, index)
                     continue
-                while index < len(words) and words[index].startswith("-"):
-                    index += 1
-                while index < len(words) and "=" in words[index] and not words[index].startswith("-"):
-                    index += 1
+                index = cls._skip_command_prefix_arguments(command_name, words, index)
                 continue
             if "=" in word and not word.startswith("-"):
                 index += 1
@@ -1517,6 +1546,20 @@ class GgufScanner(BaseScanner):
             alias = match.group("alias")
             for method in _GGUF_NETWORK_CLIENT_ALIAS_METHODS["urllib.request"]:
                 tokens.append(f"{alias}.{method}")
+            if len(tokens) >= 64:
+                return tuple(tokens[:64])
+
+        for match in _GGUF_NETWORK_FUNCTION_IMPORT_PATTERN.finditer(value):
+            module = match.group("module")
+            methods = _GGUF_NETWORK_CLIENT_ALIAS_METHODS[module]
+            for imported_name in match.group("imports").split(","):
+                parts = imported_name.strip().split()
+                if not parts:
+                    continue
+                function_name = parts[0]
+                alias = parts[2] if len(parts) >= 3 and parts[1] == "as" else function_name
+                if function_name in methods and _GGUF_SHELL_VARIABLE_NAME_PATTERN.fullmatch(alias):
+                    tokens.append(alias)
             if len(tokens) >= 64:
                 return tuple(tokens[:64])
         return tuple(tokens)

