@@ -238,6 +238,27 @@ class SafeTensorsScanner(BaseScanner):
         return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
 
     @staticmethod
+    def _is_file_type_validation_record(record: Any) -> bool:
+        details = getattr(record, "details", None)
+        return getattr(record, "name", None) == "File Type Validation" or (
+            isinstance(details, dict) and details.get("security_check") == "file_type_validation"
+        )
+
+    def _suppress_remote_stub_file_type_validation(self) -> None:
+        validation_result = self._path_validation_result
+        if validation_result is None:
+            return
+
+        validation_result.checks = [
+            check for check in validation_result.checks if not self._is_file_type_validation_record(check)
+        ]
+        validation_result.issues = [
+            issue for issue in validation_result.issues if not self._is_file_type_validation_record(issue)
+        ]
+        if not validation_result.checks and not validation_result.issues:
+            self._path_validation_result = None
+
+    @staticmethod
     def _json_duplicate_key_hook(duplicate_keys: list[str]) -> Any:
         def hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             parsed: dict[str, Any] = {}
@@ -423,6 +444,7 @@ class SafeTensorsScanner(BaseScanner):
             return path_check_result
 
         if remote_header_only:
+            self._suppress_remote_stub_file_type_validation()
             if self._path_validation_result is None:
                 self._path_validation_result = ScanResult(scanner_name=self.name, scanner=self)
             self._path_validation_result.metadata["file_size"] = self.get_file_size(path)

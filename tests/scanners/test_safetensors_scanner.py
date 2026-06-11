@@ -17,7 +17,13 @@ from safetensors.numpy import load_file, save_file
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
-from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanners.base import (
+    DEFAULT_MAX_FILE_READ_SIZE,
+    FORMAT_VALIDATION_CONFIG_KEY,
+    INCONCLUSIVE_SCAN_OUTCOME,
+    CheckStatus,
+    IssueSeverity,
+)
 from modelaudit.scanners.safetensors_scanner import (
     _REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY,
     _REMOTE_HEADER_INTEGRITY_CONFIG_KEY,
@@ -119,6 +125,52 @@ def test_remote_invalid_header_length_does_not_hash_sparse_stub(
     assert result.metadata["remote_header_only"] is True
     integrity_check = next(check for check in result.checks if check.name == "Remote SafeTensors Header Integrity")
     assert integrity_check.status == CheckStatus.PASSED
+
+
+def test_remote_header_only_suppresses_sparse_stub_file_type_validation(tmp_path: Path) -> None:
+    file_path = tmp_path / "remote-header.safetensors"
+    header = {"tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    file_path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + b"\0")
+    format_validation = {
+        "path": os.path.abspath(file_path),
+        "file_type_valid": False,
+        "header_format": "pickle_routing_inconclusive",
+        "extension_format": "safetensors",
+    }
+
+    result = SafeTensorsScanner(
+        config={
+            FORMAT_VALIDATION_CONFIG_KEY: format_validation,
+            _REMOTE_HEADER_ONLY_CONFIG_KEY: True,
+            _REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY: 8 + len(header_bytes),
+            _REMOTE_HEADER_INTEGRITY_CONFIG_KEY: {"range_semantics": "strict_206_content_range"},
+        }
+    ).scan(str(file_path))
+
+    assert result.success is True
+    assert result.issues == []
+    assert not any(check.name == "File Type Validation" for check in result.checks)
+    assert result.metadata["remote_header_only"] is True
+
+
+def test_local_safetensors_keeps_file_type_validation_warning(tmp_path: Path) -> None:
+    file_path = tmp_path / "local.safetensors"
+    write_raw_safetensors(file_path, {"tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}}, b"\0")
+    format_validation = {
+        "path": os.path.abspath(file_path),
+        "file_type_valid": False,
+        "header_format": "pickle_routing_inconclusive",
+        "extension_format": "safetensors",
+    }
+
+    result = SafeTensorsScanner(config={FORMAT_VALIDATION_CONFIG_KEY: format_validation}).scan(str(file_path))
+
+    assert result.success is True
+    assert any(
+        isinstance(issue.details, dict) and issue.details.get("security_check") == "file_type_validation"
+        for issue in result.issues
+    )
 
 
 @pytest.mark.parametrize(
