@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - tolerate picklescan reports that omit private metadata
 - stream bounded Llamafile runtime coverage across preview gaps and report incomplete runtime reads or bounds
+- restrict Jinja SSTI indicators to executable template spans so prose mentions of request handling do not produce critical findings
 - treat canonical storage persistent IDs as informational only after legacy PyTorch framing, storage tuples, and storage payloads validate completely
 - prefer validated SafeTensors framing over invalid pickle and weak-magic collisions while retaining security-bearing pickle overlaps
 - recognize current GGUF IQ3_S, IQ4_XS, and BF16 tensor types while preserving bounded inconclusive handling for unsupported or malformed tensor metadata
