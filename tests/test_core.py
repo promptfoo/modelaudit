@@ -89,14 +89,32 @@ def _stat_result_with(
     nlink: int | None = None,
     ctime: float | None = None,
 ) -> os.stat_result:
-    values = list(source)
+    values: dict[str, Any] = {
+        "st_mode": source.st_mode,
+        "st_ino": source.st_ino,
+        "st_dev": source.st_dev,
+        "st_nlink": source.st_nlink,
+        "st_uid": source.st_uid,
+        "st_gid": source.st_gid,
+        "st_size": source.st_size,
+        "st_atime": source.st_atime,
+        "st_mtime": source.st_mtime,
+        "st_ctime": source.st_ctime,
+        "st_atime_ns": source.st_atime_ns,
+        "st_mtime_ns": source.st_mtime_ns,
+        "st_ctime_ns": source.st_ctime_ns,
+    }
+    for attribute in ("st_file_attributes", "st_reparse_tag"):
+        if hasattr(source, attribute):
+            values[attribute] = getattr(source, attribute)
     if nlink is not None:
-        values[3] = nlink
+        values["st_nlink"] = nlink
     if size is not None:
-        values[6] = size
+        values["st_size"] = size
     if ctime is not None:
-        values[9] = ctime
-    return os.stat_result(values)
+        values["st_ctime"] = ctime
+        values["st_ctime_ns"] = int(ctime * 1_000_000_000)
+    return cast(os.stat_result, SimpleNamespace(**values))
 
 
 def _install_stale_directory_scandir_stats(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -831,7 +849,7 @@ def test_directory_scan_invokes_savedmodel_directory_owner_once(
     not _DESCRIPTOR_BOUND_DIRECTORY_OWNER_PATH_AVAILABLE,
     reason="descriptor-bound directory owner path is unavailable",
 )
-def test_large_savedmodel_root_sibling_does_not_block_owner_dispatch(tmp_path: Path) -> None:
+def test_large_savedmodel_root_sibling_blocks_owner_dispatch_when_over_budget(tmp_path: Path) -> None:
     _require_tf_protos()
     model_dir = tmp_path / "saved-model"
     model_dir.mkdir()
@@ -848,11 +866,9 @@ def test_large_savedmodel_root_sibling_does_not_block_owner_dispatch(tmp_path: P
 
     owner_metadata = result.file_metadata[str(model_dir)]
     assert readme_path.stat().st_size > saved_model_path.stat().st_size
-    assert owner_metadata["directory_owner_scan"] is True
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and "PyFunc operation detected" in issue.message
-        for issue in result.issues
-    )
+    assert owner_metadata["directory_owner_scan"] is False
+    assert "directory_owner_max_file_size" in owner_metadata["scan_outcome_reasons"]
+    assert determine_exit_code(result) == 2
 
 
 @pytest.mark.skipif(
@@ -1765,37 +1781,19 @@ def test_staged_savedmodel_owner_hash_survives_temp_cleanup_error(
     asset_path = assets_dir / "notes.txt"
     asset_path.write_bytes(b"benign asset")
     _force_staged_directory_owner_scan(monkeypatch)
-    real_temporary_directory: Any = core_module.tempfile.TemporaryDirectory
-    cleanup_modes: list[bool] = []
+    real_rmtree = core_module.shutil.rmtree
+    cleanup_paths: list[Path] = []
 
-    class CleanupSensitiveTemporaryDirectory:
-        def __init__(self, *args: Any, ignore_cleanup_errors: bool = False, **kwargs: Any) -> None:
-            cleanup_modes.append(ignore_cleanup_errors)
-            self._ignore_cleanup_errors = ignore_cleanup_errors
-            self._temporary_directory = real_temporary_directory(
-                *args,
-                ignore_cleanup_errors=ignore_cleanup_errors,
-                **kwargs,
-            )
+    def cleanup_then_fail(path: str | Path, *args: Any, **kwargs: Any) -> None:
+        cleanup_paths.append(Path(path))
+        real_rmtree(path, *args, **kwargs)
+        raise TypeError("unsupported operand type(s) for &: 'NoneType' and 'int'")
 
-        def __enter__(self) -> str:
-            return cast(str, self._temporary_directory.__enter__())
-
-        def __exit__(
-            self,
-            exc_type: type[BaseException] | None,
-            exc: BaseException | None,
-            traceback: object | None,
-        ) -> None:
-            self._temporary_directory.__exit__(exc_type, exc, traceback)
-            if not self._ignore_cleanup_errors:
-                raise OSError("unable to remove staged directory")
-
-    monkeypatch.setattr(core_module.tempfile, "TemporaryDirectory", CleanupSensitiveTemporaryDirectory)
+    monkeypatch.setattr(core_module.shutil, "rmtree", cleanup_then_fail)
 
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
 
-    assert cleanup_modes == [True]
+    assert len(cleanup_paths) == 1
     assert result.content_hash is not None
     assert result.files_scanned == 2
     assert result.bytes_scanned == saved_model_path.stat().st_size + asset_path.stat().st_size
@@ -1871,6 +1869,39 @@ def test_savedmodel_owner_and_child_sources_share_total_size_budget(tmp_path: Pa
     assert owner_metadata["directory_owner_scan"] is False
     assert "directory_owner_max_total_size" in owner_metadata["scan_outcome_reasons"]
     assert result.files_scanned == 0
+    assert result.content_hash is None
+    assert determine_exit_code(result) == 2
+
+
+def test_savedmodel_owner_supplemental_root_file_honors_max_file_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
+
+    _require_tf_protos()
+    model_dir = tmp_path / "saved-model"
+    model_dir.mkdir()
+    _write_safe_savedmodel(model_dir / "saved_model.pb")
+    readme_path = model_dir / "README.md"
+    readme_path.write_bytes(b"A" * 1024)
+    _force_staged_directory_owner_scan(monkeypatch)
+
+    def fail_owner_scan(scanner: TensorFlowSavedModelScanner, owner_path: str) -> ScanResult:
+        del scanner, owner_path
+        raise AssertionError("owner scan must not bypass supplemental source budgets")
+
+    monkeypatch.setattr(TensorFlowSavedModelScanner, "scan", fail_owner_scan)
+
+    result = scan_model_directory_or_file(
+        str(model_dir),
+        cache_scan_results=False,
+        max_file_size=2,
+    )
+
+    owner_metadata = result.file_metadata[str(model_dir)]
+    assert owner_metadata["directory_owner_scan"] is False
+    assert "directory_owner_max_file_size" in owner_metadata["scan_outcome_reasons"]
     assert result.content_hash is None
     assert determine_exit_code(result) == 2
 
@@ -2443,6 +2474,61 @@ def test_directory_scan_rejects_shard_siblings_outside_scan_root(
         for issue in result.issues
     )
     assert sum(issue.message == "Path traversal outside scanned directory" for issue in result.issues) == 1
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_savedmodel_owner_dispatches_trusted_hf_snapshot_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_tf_protos()
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--savedmodel"
+    snapshot = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs_dir.mkdir()
+    blob_path = blobs_dir / "savedmodel-blob"
+    _write_safe_savedmodel(blob_path)
+    alias = snapshot / "saved_model.pb"
+    alias.symlink_to(Path("../../blobs") / blob_path.name)
+
+    result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
+
+    owner_metadata = result.file_metadata[str(snapshot)]
+    assert owner_metadata["directory_owner_scan"] is True
+    assert result.content_hash is not None
+    assert determine_exit_code(result) == 0
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_orbax_owner_dispatches_trusted_hf_snapshot_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--orbax"
+    snapshot = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs_dir.mkdir()
+    blob_path = blobs_dir / "metadata-blob"
+    blob_path.write_text('{"version":1,"format":"orbax","restore_fn":"os.system"}', encoding="utf-8")
+    alias = snapshot / "metadata.json"
+    alias.symlink_to(Path("../../blobs") / blob_path.name)
+
+    result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
+
+    owner_metadata = result.file_metadata[str(snapshot)]
+    assert owner_metadata["directory_owner_scan"] is True
+    assert result.content_hash is not None
+    assert determine_exit_code(result) == 1
+    assert any(
+        check.name == "Orbax Restore Function Check" and check.details["restore_fn"] == "os.system"
+        for check in result.checks
+    )
 
 
 @pytest.mark.usefixtures("requires_symlinks")

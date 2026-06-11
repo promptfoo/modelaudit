@@ -2298,12 +2298,11 @@ def _staged_directory_owner_scan_path(
     *,
     config: dict[str, Any],
     deadline: float,
+    source_paths_by_owner_path: dict[str, str] | None = None,
 ) -> Iterator[str]:
     """Yield a copied owner snapshot when descriptor-backed paths are unavailable."""
-    with tempfile.TemporaryDirectory(
-        prefix="modelaudit-directory-owner-",
-        ignore_cleanup_errors=True,
-    ) as temporary_directory:
+    temporary_directory = tempfile.mkdtemp(prefix="modelaudit-directory-owner-")
+    try:
         staged_root = Path(temporary_directory) / (root_path.name or "owner-root")
         staged_root.mkdir()
         for owner_entry in owner_snapshot:
@@ -2312,10 +2311,11 @@ def _staged_directory_owner_scan_path(
 
         staged_source_by_original: dict[str, str] = {}
         for source_path in owner_hashes:
+            content_source_path = (source_paths_by_owner_path or {}).get(source_path, source_path)
             relative_parts = Path(os.path.relpath(source_path, root_path)).parts
             staged_source = staged_root.joinpath(*relative_parts)
             staged_source.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source_path, staged_source, follow_symlinks=False)
+            shutil.copyfile(content_source_path, staged_source, follow_symlinks=False)
             staged_source_by_original[source_path] = str(staged_source)
 
         staged_hashes = _hash_files_by_path(
@@ -2331,6 +2331,9 @@ def _staged_directory_owner_scan_path(
             raise OSError("Directory owner staged snapshot did not match pre-dispatch hashes")
 
         yield str(staged_root)
+    finally:
+        with suppress(Exception):
+            shutil.rmtree(temporary_directory)
 
 
 @contextmanager
@@ -2341,12 +2344,26 @@ def _directory_owner_scan_path(
     *,
     config: dict[str, Any],
     deadline: float,
+    force_staged: bool = False,
+    source_paths_by_owner_path: dict[str, str] | None = None,
 ) -> Iterator[str]:
     """Yield a bound or hash-verified copied path for logical directory-owner scanning."""
     with ExitStack() as scan_path_stack:
-        try:
-            owner_scan_path = scan_path_stack.enter_context(_bound_directory_owner_scan_path(root_path))
-        except OSError:
+        if not force_staged:
+            try:
+                owner_scan_path = scan_path_stack.enter_context(_bound_directory_owner_scan_path(root_path))
+            except OSError:
+                owner_scan_path = scan_path_stack.enter_context(
+                    _staged_directory_owner_scan_path(
+                        root_path,
+                        owner_snapshot,
+                        owner_hashes,
+                        config=config,
+                        deadline=deadline,
+                        source_paths_by_owner_path=source_paths_by_owner_path,
+                    ),
+                )
+        else:
             owner_scan_path = scan_path_stack.enter_context(
                 _staged_directory_owner_scan_path(
                     root_path,
@@ -2354,6 +2371,7 @@ def _directory_owner_scan_path(
                     owner_hashes,
                     config=config,
                     deadline=deadline,
+                    source_paths_by_owner_path=source_paths_by_owner_path,
                 ),
             )
         yield owner_scan_path
@@ -2704,6 +2722,7 @@ def scan_model_directory_or_file(
             directory_owner_snapshot_failure_details: dict[str, Any] = {}
             directory_owner_snapshot_failure_allows_child_walk = False
             directory_owner_budget_source_paths: set[str] = set()
+            directory_owner_content_source_paths: dict[str, str] = {}
 
             def directory_owner_snapshot_failure(error: Exception) -> tuple[str, dict[str, Any]]:
                 if isinstance(error, _DirectoryOwnerSnapshotLimitError):
@@ -2817,6 +2836,26 @@ def scan_model_directory_or_file(
             dvc_directory_output_owners: list[tuple[Path, str]] = []
             pending_dvc_output_limit_checks: list[tuple[str, DvcResolution]] = []
             directory_coverage_gaps: dict[tuple[str, str], set[str]] = {}
+
+            def trusted_hf_owner_source_target(owner_source: Path) -> Path | None:
+                if (
+                    not is_hf_cache
+                    or hf_cache_root is None
+                    or trusted_hf_blobs_root is None
+                    or not owner_source.is_symlink()
+                    or not _path_has_part(owner_source, "snapshots")
+                ):
+                    return None
+                try:
+                    resolved_target = owner_source.resolve(strict=True)
+                    target_stat = os.stat(resolved_target, follow_symlinks=False)
+                except (OSError, RuntimeError):
+                    return None
+                if not is_within_directory(str(trusted_hf_blobs_root), str(resolved_target)):
+                    return None
+                if not stat.S_ISREG(target_stat.st_mode):
+                    return None
+                return resolved_target
 
             def get_dvc_directory_roots_by_file() -> dict[str, set[Path]]:
                 roots_by_file: dict[str, set[Path]] = {}
@@ -2943,7 +2982,16 @@ def scan_model_directory_or_file(
                             ):
                                 directory_owner_budget_source_paths.add(owner_source)
                         elif owner_entry.entry_type != "directory":
-                            directory_owner_non_regular_sources.add(owner_source)
+                            trusted_target = trusted_hf_owner_source_target(Path(owner_source))
+                            if trusted_target is None:
+                                directory_owner_non_regular_sources.add(owner_source)
+                            else:
+                                directory_owner_source_paths.add(owner_source)
+                                directory_owner_content_source_paths[owner_source] = str(trusted_target)
+                                if directory_owner_class.directory_owner_source_counts_toward_limits(
+                                    owner_entry.relative_parts,
+                                ):
+                                    directory_owner_budget_source_paths.add(owner_source)
 
             initial_owner_entries = {entry.relative_parts: entry for entry in directory_owner_initial_snapshot}
             directory_walk = (
@@ -2987,6 +3035,7 @@ def scan_model_directory_or_file(
                         is_directory_owner_source
                         and initial_owner_entry is not None
                         and initial_owner_entry.entry_type != "file"
+                        and str(Path(os.path.abspath(file_path_obj))) not in directory_owner_content_source_paths
                     ):
                         if not record_dvc_directory_special_file(file_path_obj):
                             record_non_regular_directory_entry(file_path_obj)
@@ -3308,6 +3357,19 @@ def scan_model_directory_or_file(
 
             owner_sources = sorted(directory_owner_source_paths)
             owner_budget_sources = sorted(directory_owner_budget_source_paths)
+
+            def owner_content_source(owner_source: str) -> str:
+                return directory_owner_content_source_paths.get(owner_source, owner_source)
+
+            def owner_hash_for_source(hashes: dict[str, str], owner_source: str) -> str | None:
+                return hashes.get(owner_source) or hashes.get(owner_content_source(owner_source))
+
+            def owner_hash_missing_or_deferred(hashes: dict[str, str], owner_source: str) -> bool:
+                hash_value = owner_hash_for_source(hashes, owner_source)
+                return hash_value is None or hash_value.startswith(
+                    ("unhashable_max_file_size_", "unhashable_max_total_size_"),
+                )
+
             owner_block_reason: str | None = None
             owner_block_details: dict[str, Any] = {}
             owner_sizes: dict[str, int] = {}
@@ -3335,7 +3397,7 @@ def scan_model_directory_or_file(
                 else:
                     try:
                         for source in owner_sources:
-                            source_stat = os.stat(source, follow_symlinks=False)
+                            source_stat = os.stat(owner_content_source(source), follow_symlinks=False)
                             if not stat.S_ISREG(source_stat.st_mode):
                                 raise OSError(f"Directory owner source is not a regular file: {source}")
                             owner_sizes[source] = source_stat.st_size
@@ -3434,7 +3496,11 @@ def scan_model_directory_or_file(
                     and owner_block_reason is None
                     and max_total_size > 0
                 ):
-                    union_sources = list(dict.fromkeys([*hash_sources, *owner_budget_sources]))
+                    union_sources = list(
+                        dict.fromkeys(
+                            [*hash_sources, *(owner_content_source(source) for source in owner_budget_sources)]
+                        )
+                    )
                     try:
                         union_source_bytes = sum(
                             os.stat(source, follow_symlinks=False).st_size for source in union_sources
@@ -3494,20 +3560,23 @@ def scan_model_directory_or_file(
                     ]
 
                     if owner_block_reason is None:
+                        owner_source_by_content_source = {
+                            owner_content_source(source): source for source in owner_sources
+                        }
                         unhashed_owner_sources = [
-                            source
+                            owner_content_source(source)
                             for source in owner_sources
-                            if source not in hashes_by_source
-                            or hashes_by_source[source].startswith(
-                                ("unhashable_max_file_size_", "unhashable_max_total_size_"),
-                            )
+                            if owner_hash_missing_or_deferred(hashes_by_source, source)
                         ]
                         owner_hash_identities: dict[str, dict[str, int]] = {}
                         hashes_by_source.update(
                             _hash_files_by_path(
                                 unhashed_owner_sources,
                                 config=owner_hash_config,
-                                routing_paths={source: source for source in unhashed_owner_sources},
+                                routing_paths={
+                                    source: owner_source_by_content_source.get(source, source)
+                                    for source in unhashed_owner_sources
+                                },
                                 hashed_identities=owner_hash_identities,
                                 deadline=start_time + timeout,
                             )
@@ -3515,7 +3584,8 @@ def scan_model_directory_or_file(
                         hashed_identities_by_source.update(owner_hash_identities)
 
                     owner_hashes_before = {
-                        source: hashes_by_source.get(source, f"unhashable_{id(source)}") for source in owner_sources
+                        source: owner_hash_for_source(hashes_by_source, source) or f"unhashable_{id(source)}"
+                        for source in owner_sources
                     }
                     if owner_block_reason is None and any(
                         hash_value.startswith("unhashable_") for hash_value in owner_hashes_before.values()
@@ -3589,6 +3659,8 @@ def scan_model_directory_or_file(
                                 owner_hashes_before,
                                 config=owner_hash_config,
                                 deadline=start_time + timeout,
+                                force_staged=bool(directory_owner_content_source_paths),
+                                source_paths_by_owner_path=directory_owner_content_source_paths,
                             ) as directory_owner_scan_path:
                                 owner_scan_started = True
                                 directory_owner_result = directory_owner_class(config=owner_config).scan(
@@ -3653,15 +3725,27 @@ def scan_model_directory_or_file(
                                 }
 
                         post_owner_identities: dict[str, dict[str, int]] = {}
-                        owner_hashes_after = _hash_files_by_path(
-                            owner_sources,
+                        owner_content_sources = [owner_content_source(source) for source in owner_sources]
+                        owner_hashes_after_by_content_source = _hash_files_by_path(
+                            owner_content_sources,
                             config=owner_hash_config,
-                            routing_paths={source: source for source in owner_sources},
+                            routing_paths={
+                                owner_content_source(source): source
+                                for source in owner_sources
+                                if owner_content_source(source) in owner_content_sources
+                            },
                             hashed_identities=post_owner_identities,
                             deadline=start_time + timeout,
                         )
-                        hashes_by_source.update(owner_hashes_after)
+                        hashes_by_source.update(owner_hashes_after_by_content_source)
                         hashed_identities_by_source.update(post_owner_identities)
+                        owner_hashes_after = {
+                            source: owner_hashes_after_by_content_source.get(
+                                owner_content_source(source),
+                                f"unhashable_{id(source)}",
+                            )
+                            for source in owner_sources
+                        }
                         changed_owner_sources = [
                             source
                             for source in owner_sources
