@@ -9816,6 +9816,93 @@ def test_scan_file_oversized_tokenizer_json_late_chat_template_preserves_jinja_d
     )
 
 
+def test_scan_file_tokenizer_json_escaped_chat_template_preserves_jinja_detection(tmp_path: Path) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    malicious_template = "{{ ''.__class__.__mro__[1].__subclasses__() }}"
+    tokenizer_path.write_text(
+        (
+            '{"version":"1.0","added_tokens":[],'
+            '"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},'
+            f'"chat\\u005ftemplate":{json.dumps(malicious_template)}}}'
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_mxnet_root_preempts_template_evidence(tmp_path: Path) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "template": "{{ harmless_user_name }}",
+                "special_tokens": [{"id": "[SEP]", "ids": [102], "tokens": ["[SEP]"]}],
+            },
+            "nodes": [{"op": "Custom", "name": "load", "attrs": {"library": "../../tmp/libevil.so"}}],
+            "arg_nodes": [0],
+            "heads": [[0, 0, 0]],
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
+def test_scan_file_oversized_tokenizer_template_preempts_selected_jax(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "model": {
+                "type": "Unigram",
+                "vocab": [[f"piece_{index}", -float(index)] for index in range(80)],
+            },
+            "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+            "framework": "jax",
+        },
+    )
+
+    result = scan_file(
+        str(tokenizer_path),
+        config={"cache_scan_results": False, "scanners": ["jax_checkpoint", "jinja2_template"]},
+    )
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_selected_jax_requires_positive_json_evidence(tmp_path: Path) -> None:
+    generic_path = tmp_path / "generic.json"
+    generic_path.write_text(
+        json.dumps({"padding": "x" * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 16)}),
+        encoding="utf-8",
+    )
+
+    result = scan_file(
+        str(generic_path),
+        config={"cache_scan_results": False, "scanners": ["jax_checkpoint"]},
+    )
+
+    assert result.scanner_name != "jax_checkpoint"
+    assert "jax_json_checkpoint_analysis_size_limit" not in result.metadata.get("scan_outcome_reasons", [])
+
+
 def test_scan_file_oversized_tokenizer_json_late_mxnet_root_preserves_mxnet_detection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -10098,13 +10185,16 @@ def test_scan_file_tokenizer_json_late_xgboost_jax_overlap_after_structure_budge
 
     result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
 
-    assert result.scanner_name == "jax_checkpoint"
+    assert result.scanner_name == "xgboost"
     assert result.success is False
     assert set(result.metadata["scanner_dependency_ids"]) >= {"jax_checkpoint", "xgboost"}
     assert any(
         check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
     )
-    assert any(check.name == "JSON Content Analysis" and check.status == CheckStatus.FAILED for check in result.checks)
+    assert (
+        sum(check.name == "JSON Content Analysis" and check.status == CheckStatus.FAILED for check in result.checks)
+        == 1
+    )
 
 
 def test_scan_file_tokenizer_json_jax_identity_preserves_jax_checkpoint_analysis(tmp_path: Path) -> None:

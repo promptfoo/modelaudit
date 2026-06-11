@@ -92,9 +92,10 @@ from modelaudit.utils.file.detection import (
     detect_mxnet_symbol_content_route,
     detect_pytorch_binary_supplemental_format,
     detect_xgboost_ubjson_content_route,
+    huggingface_tokenizer_json_has_template_route_evidence,
+    is_confirmed_jax_json_checkpoint_file,
     is_executorch_archive,
     is_huggingface_tokenizer_json_file,
-    is_jax_json_checkpoint_file,
     is_keras_zip_archive,
     is_pytorch_zip_archive,
     is_skops_archive,
@@ -1243,7 +1244,8 @@ def _select_non_hdf5_preferred_scanner_id(
         and header_format == "unknown"
         and policy_from_config(config).allows("jax_checkpoint")
         and not is_huggingface_tokenizer_json_file(path)
-        and is_jax_json_checkpoint_file(path)
+        and not huggingface_tokenizer_json_has_template_route_evidence(path)
+        and is_confirmed_jax_json_checkpoint_file(path)
     ):
         return "jax_checkpoint"
 

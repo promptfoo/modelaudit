@@ -738,7 +738,7 @@ class XGBoostScanner(BaseScanner):
         parsed_payload: object | None = None,
     ) -> None:
         """Preserve additional JSON analyses for XGBoost-shaped content."""
-        from .jax_checkpoint_scanner import JaxCheckpointScanner
+        from .jax_checkpoint_scanner import JAX_SKIP_XGBOOST_JSON_OVERLAP_CONFIG_KEY, JaxCheckpointScanner
         from .jinja2_template_scanner import Jinja2TemplateScanner
         from .manifest_scanner import ManifestScanner
 
@@ -749,7 +749,9 @@ class XGBoostScanner(BaseScanner):
             and has_jax_json_checkpoint_structure(parsed_payload)
         ):
             if scanner_selection.allows("jax_checkpoint"):
-                self._merge_filename_owned_result(result, JaxCheckpointScanner(config=self.config).scan(path))
+                jax_config = dict(self.config)
+                jax_config[JAX_SKIP_XGBOOST_JSON_OVERLAP_CONFIG_KEY] = True
+                self._merge_filename_owned_result(result, JaxCheckpointScanner(config=jax_config).scan(path))
             elif scanner_selection.active:
                 add_scanner_selection_skip_check(
                     result,

@@ -18,12 +18,15 @@ from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from ..utils.file.detection import (
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
+    huggingface_tokenizer_json_has_template_route_evidence,
     is_confirmed_jax_json_checkpoint_file,
     is_huggingface_tokenizer_json_file,
     is_jax_json_checkpoint_file,
 )
 from ._evidence_redaction import redact_evidence_string
 from .base import BaseScanner, IssueSeverity, ScanResult
+
+JAX_SKIP_XGBOOST_JSON_OVERLAP_CONFIG_KEY = "_jax_skip_xgboost_json_overlap"
 
 try:
     import numpy as np
@@ -782,7 +785,7 @@ class JaxCheckpointScanner(BaseScanner):
 
         # Handle file-based checkpoints
         if os.path.isfile(path):
-            if is_huggingface_tokenizer_json_file(path):
+            if is_huggingface_tokenizer_json_file(path) or huggingface_tokenizer_json_has_template_route_evidence(path):
                 return False
             ext = os.path.splitext(path)[1].lower()
             if ext == ".json":
@@ -1854,6 +1857,8 @@ class JaxCheckpointScanner(BaseScanner):
 
     def _scan_xgboost_json_overlap(self, path: str, result: ScanResult) -> None:
         """Preserve XGBoost JSON analysis when JAX evidence overlaps."""
+        if self.config.get(JAX_SKIP_XGBOOST_JSON_OVERLAP_CONFIG_KEY) is True:
+            return
         if Path(path).suffix.lower() != ".json":
             return
 
