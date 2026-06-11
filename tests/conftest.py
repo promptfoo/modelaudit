@@ -103,6 +103,7 @@ def pytest_runtest_setup(item):
             "test_scanner_selection.py",  # Scanner selection policy and routing tests
             "test_lazy_loading.py",  # Lazy scanner descriptor/catalog tests
             "test_graceful_degradation.py",  # Scanner dependency degradation tests
+            "test_onnx_dependency_handling.py",  # ONNX optional dependency capability outcomes
             "test_joblib_scanner_codecs.py",  # Joblib raw/compressed pickle fallback regression tests
             "test_base_scanner.py",
             "test_core.py",
