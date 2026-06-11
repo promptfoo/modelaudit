@@ -1439,7 +1439,26 @@ class TestModelDownload:
         with pytest.raises(RuntimeError, match="stop after model-size lookup"):
             download_model("https://huggingface.co/test/model", timeout_seconds=1)
 
-        mock_get_model_size.assert_called_once_with("test/model", 101.0)
+        mock_get_model_size.assert_called_once_with("test/model", 101.0, requested_revision=None)
+
+    @patch("modelaudit.utils.sources.huggingface.time.monotonic", return_value=100.0)
+    @patch("modelaudit.utils.sources.huggingface._get_model_size_with_deadline")
+    def test_download_model_passes_requested_revision_to_model_size_lookup(
+        self,
+        mock_get_model_size: MagicMock,
+        _mock_monotonic: MagicMock,
+    ) -> None:
+        """Disk preflight should size the same pinned revision that will be downloaded."""
+        mock_get_model_size.side_effect = RuntimeError("stop after model-size lookup")
+
+        with pytest.raises(RuntimeError, match="stop after model-size lookup"):
+            download_model(f"hf://test/model?revision={_HF_TEST_REVISION}", timeout_seconds=1)
+
+        mock_get_model_size.assert_called_once_with(
+            "test/model",
+            101.0,
+            requested_revision=_HF_TEST_REVISION,
+        )
 
     @patch("modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline")
     def test_huggingface_path_sizes_use_terminable_deadline_worker(
@@ -3501,6 +3520,41 @@ class TestModelDownloadStreaming:
         mock_hf_hub_download.assert_not_called()
         mock_detect_content.assert_not_called()
 
+    def test_download_model_streaming_honors_safetensors_scanner_exclusion(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A selected suffix must not run a scanner excluded by explicit policy."""
+        downloaded_path = tmp_path / "model.safetensors"
+        downloaded_path.write_bytes(b"downloaded")
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(["model.safetensors"], _HF_TEST_REVISION, None),
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface._scan_remote_huggingface_safetensors_header",
+                side_effect=AssertionError("excluded SafeTensors scanner should not run"),
+            ) as mock_scan_header,
+            patch("huggingface_hub.hf_hub_download", return_value=str(downloaded_path)) as mock_hf_hub_download,
+        ):
+            results = list(
+                download_model_streaming(
+                    "https://huggingface.co/test/model",
+                    scannable_extensions={".safetensors"},
+                    scannable_scanner_ids={"metadata"},
+                )
+            )
+
+        assert results == [(downloaded_path, True)]
+        mock_scan_header.assert_not_called()
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="model.safetensors",
+            revision=_HF_TEST_REVISION,
+        )
+
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch("huggingface_hub.hf_hub_download")
     def test_download_model_streaming_known_suffix_does_not_hide_extensionless_overflow(
@@ -3662,6 +3716,52 @@ class TestModelSizeAndDiskSpace:
 
         size = get_model_size("test/model")
         assert size == 3 * 1024 * 1024  # 3 MB total
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_size_uses_requested_revision(self, mock_hf_api_class: MagicMock) -> None:
+        """Model-size preflight should inspect the caller-requested revision."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_file = MagicMock()
+        mock_file.size = 1024
+        mock_model_info = MagicMock()
+        mock_model_info.siblings = [mock_file]
+        mock_api.model_info.return_value = mock_model_info
+
+        size = get_model_size("test/model", revision=_HF_TEST_REVISION)
+
+        assert size == 1024
+        mock_api.model_info.assert_called_once_with("test/model", revision=_HF_TEST_REVISION)
+
+    @patch("huggingface_hub.HfApi")
+    def test_huggingface_worker_model_size_uses_requested_revision(
+        self,
+        mock_hf_api_class: MagicMock,
+    ) -> None:
+        """Deadline worker model-size lookups should preserve pinned identity."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_file = MagicMock()
+        mock_file.size = 1024
+        mock_model_info = MagicMock()
+        mock_model_info.siblings = [mock_file]
+        mock_api.model_info.return_value = mock_model_info
+
+        result = _run_huggingface_worker_operation(
+            "get_model_size",
+            {
+                "repo_id": "test/model",
+                "request_timeout": 3.0,
+                "requested_revision": _HF_TEST_REVISION,
+            },
+        )
+
+        assert result == {"value": 1024}
+        mock_api.model_info.assert_called_once_with(
+            "test/model",
+            timeout=3.0,
+            revision=_HF_TEST_REVISION,
+        )
 
     @patch("huggingface_hub.HfApi")
     def test_get_model_size_no_siblings(self, mock_hf_api_class):

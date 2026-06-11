@@ -1792,6 +1792,45 @@ def test_scan_model_streaming_with_deletion(temp_test_files: list[Path]) -> None
     assert result.content_hash is not None
 
 
+def test_scan_model_streaming_precomputed_remote_result_does_not_delete_local_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Precomputed remote scans must not unlink same-named local files."""
+    monkeypatch.chdir(tmp_path)
+    local_match = Path("model.safetensors")
+    local_match.write_bytes(b"local file that was never streamed")
+    remote_path = "hf://test/model@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/model.safetensors"
+    precomputed = ScanResult(scanner_name="safetensors")
+    precomputed.bytes_scanned = 32
+    precomputed.metadata.update(
+        {
+            "remote_header_only": True,
+            "remote_source_path": remote_path,
+            "source_path": remote_path,
+        }
+    )
+    precomputed.add_check(
+        name="Remote SafeTensors Header Integrity",
+        passed=True,
+        message="Remote SafeTensors header was scanned with bounded range reads",
+        severity=IssueSeverity.INFO,
+        location=remote_path,
+    )
+    precomputed.finish(success=True)
+
+    result = scan_model_streaming(
+        file_generator=iter([(local_match, True, precomputed)]),
+        timeout=30,
+        delete_after_scan=True,
+    )
+
+    assert local_match.exists()
+    assert result.files_scanned == 1
+    assert result.file_metadata[remote_path].model_dump()["remote_header_only"] is True
+    assert result.assets
+
+
 def test_scan_model_streaming_critical_findings_do_not_set_operational_errors(
     temp_test_files: list[Path],
 ) -> None:

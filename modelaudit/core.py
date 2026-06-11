@@ -4369,6 +4369,7 @@ def scan_model_streaming(
             else:
                 file_path, _is_last = streamed_item
             source_path = Path(file_path)
+            is_precomputed_streamed_result = precomputed_result is not None
             scan_path = source_path
             report_path = str(source_path)
             pinned_scan_context: Any | None = None
@@ -4377,7 +4378,8 @@ def scan_model_streaming(
             try:
                 check_interrupted()
             except KeyboardInterrupt:
-                delete_streamed_source(source_path, "after streaming interruption")
+                if not is_precomputed_streamed_result:
+                    delete_streamed_source(source_path, "after streaming interruption")
                 raise
 
             # Check timeout
@@ -4386,7 +4388,8 @@ def scan_model_streaming(
                 preserve_shard_reconciliation_errors = True
                 aggregate_hash_complete = False
                 logger.error(f"Streaming scan timeout after {timeout}s")
-                delete_streamed_source(source_path, "after streaming timeout")
+                if not is_precomputed_streamed_result:
+                    delete_streamed_source(source_path, "after streaming timeout")
                 break
 
             try:
@@ -4664,8 +4667,10 @@ def scan_model_streaming(
             finally:
                 if pinned_scan_context is not None:
                     pinned_scan_context.__exit__(None, None, None)
-                # Delete file after scanning if requested
-                delete_streamed_source(source_path, "after scanning")
+                # Precomputed source-native results may report a repo-relative path
+                # that was never downloaded locally.
+                if not is_precomputed_streamed_result:
+                    delete_streamed_source(source_path, "after scanning")
 
         _reconcile_cross_directory_shard_coverage(
             results,

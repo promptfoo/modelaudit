@@ -2327,11 +2327,13 @@ def get_model_info(url: str) -> dict:
         raise Exception(f"Failed to get model info for {display_url}: {redact_huggingface_urls_in_text(str(e))}") from e
 
 
-def get_model_size(repo_id: str, timeout_seconds: float | None = None) -> int | None:
+def get_model_size(repo_id: str, timeout_seconds: float | None = None, *, revision: str | None = None) -> int | None:
     """Get the total size of a HuggingFace model repository.
 
     Args:
         repo_id: Repository ID (e.g., "namespace/model-name")
+        timeout_seconds: Optional request timeout
+        revision: Optional branch, tag, or commit to size
 
     Returns:
         Total size in bytes, or None if size cannot be determined
@@ -2343,6 +2345,8 @@ def get_model_size(repo_id: str, timeout_seconds: float | None = None) -> int | 
         model_info_kwargs: dict[str, Any] = {}
         if timeout_seconds is not None:
             model_info_kwargs["timeout"] = timeout_seconds
+        if revision is not None:
+            model_info_kwargs["revision"] = revision
         model_info = api.model_info(repo_id, **model_info_kwargs)
 
         # Calculate total size from all files
@@ -2358,17 +2362,26 @@ def get_model_size(repo_id: str, timeout_seconds: float | None = None) -> int | 
         return None
 
 
-def _get_model_size_with_deadline(repo_id: str, deadline: float | None) -> int | None:
+def _get_model_size_with_deadline(
+    repo_id: str,
+    deadline: float | None,
+    *,
+    requested_revision: str | None = None,
+) -> int | None:
     """Return model size without allowing the optional lookup to outlive acquisition."""
     if deadline is None:
-        return get_model_size(repo_id)
+        return get_model_size(repo_id, revision=requested_revision)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
     try:
         worker_result = _run_huggingface_worker_with_deadline(
             "get_model_size",
-            {"repo_id": repo_id, "request_timeout": min(30.0, remaining)},
+            {
+                "repo_id": repo_id,
+                "request_timeout": min(30.0, remaining),
+                "requested_revision": requested_revision,
+            },
             deadline,
             repo_id,
         )
@@ -2419,7 +2432,11 @@ def download_model(
     deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
     # Disk space check and path setup
-    model_size = _get_model_size_with_deadline(repo_id, deadline)
+    model_size = _get_model_size_with_deadline(
+        repo_id,
+        deadline,
+        requested_revision=requested_revision,
+    )
     download_path = None  # Will be set only if cache_dir is provided
     disk_check_path = None
     download_path_preexisting = False
@@ -2671,9 +2688,14 @@ def download_model_streaming(
             include_all_files=include_all_files,
             deadline=deadline,
         )
-        safetensors_header_files = {
-            filename for filename in model_files if PurePosixPath(filename).suffix.lower() == ".safetensors"
+        safetensors_header_streaming_allowed = scannable_scanner_ids is None or "safetensors" in {
+            str(scanner_id).lower() for scanner_id in scannable_scanner_ids
         }
+        safetensors_header_files = (
+            {filename for filename in model_files if PurePosixPath(filename).suffix.lower() == ".safetensors"}
+            if safetensors_header_streaming_allowed
+            else set()
+        )
         safetensors_index_files = (
             {
                 filename
