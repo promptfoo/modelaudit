@@ -318,6 +318,7 @@ class NumPyScanner(BaseScanner):
         result: ScanResult,
         *,
         safe_numpy_reconstruct_payload: bool,
+        validated_position_limit: int | None = None,
     ) -> None:
         def is_validated_numpy_object_reconstruction(item: Check | Issue) -> bool:
             if (
@@ -325,6 +326,10 @@ class NumPyScanner(BaseScanner):
                 or item.details.get("import_reference") not in _VALIDATED_NUMPY_OBJECT_DTYPE_RECONSTRUCTION_REFERENCES
             ):
                 return False
+            if validated_position_limit is not None:
+                position = item.details.get("position")
+                if not isinstance(position, int) or position >= validated_position_limit:
+                    return False
             if (
                 item.details.get("import_reference") in _VALIDATED_NUMPY_OBJECT_DTYPE_RECONSTRUCT_REFERENCES
                 and not safe_numpy_reconstruct_payload
@@ -581,6 +586,13 @@ class NumPyScanner(BaseScanner):
 
                             pickle_end_offset = embedded_result.metadata.get("first_pickle_end_pos")
                             if isinstance(pickle_end_offset, int) and pickle_end_offset < file_size:
+                                first_stream_safe_numpy_reconstruct_payload = False
+                                if data_offset <= pickle_end_offset <= data_offset + len(embedded_payload_proof):
+                                    first_stream_safe_numpy_reconstruct_payload = (
+                                        _numpy_object_payload_has_safe_reconstruct_proof(
+                                            embedded_payload_proof[: pickle_end_offset - data_offset]
+                                        )
+                                    )
                                 trailing_bytes = file_size - pickle_end_offset
                                 result.issues.extend(
                                     issue
@@ -594,7 +606,8 @@ class NumPyScanner(BaseScanner):
                                 )
                                 self._remove_validated_numpy_object_reconstruction_findings(
                                     result,
-                                    safe_numpy_reconstruct_payload=safe_numpy_reconstruct_payload,
+                                    safe_numpy_reconstruct_payload=first_stream_safe_numpy_reconstruct_payload,
+                                    validated_position_limit=pickle_end_offset,
                                 )
                                 result.add_check(
                                     name="File Integrity Check",

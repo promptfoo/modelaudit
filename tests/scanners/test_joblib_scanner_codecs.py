@@ -66,7 +66,13 @@ def _scan_payload(
     if picklescan_trust_numpy_dtype is None:
         picklescan_trust_numpy_dtype = trust_numpy_dtype
 
-    def trust_embedded_pickle_reference(module: str, name: str) -> bool:
+    def trust_embedded_pickle_reference(
+        module: str,
+        name: str,
+        *,
+        pickle_entrypoint_methods: tuple[str, ...] | None = None,
+        pickle_invokes_metaclass_call: bool | None = None,
+    ) -> bool:
         if (module, name) in {
             ("joblib.numpy_pickle", "NumpyArrayWrapper"),
             ("numpy", "memmap"),
@@ -76,7 +82,12 @@ def _scan_payload(
             return trust_numpy_array_wrapper
         if (module, name) == ("numpy", "dtype"):
             return picklescan_trust_numpy_dtype
-        return original_reference_is_trusted(module, name)
+        return original_reference_is_trusted(
+            module,
+            name,
+            pickle_entrypoint_methods=pickle_entrypoint_methods,
+            pickle_invokes_metaclass_call=pickle_invokes_metaclass_call,
+        )
 
     def trust_joblib_validated_reference(module: str, name: str) -> bool:
         if (module, name) in {
