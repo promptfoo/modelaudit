@@ -3822,6 +3822,11 @@ def _path_claims_tar_container(file_path: Path) -> bool:
     return file_path.name.lower().endswith(_TAR_FORMAT_SUFFIXES)
 
 
+def _has_supported_tar_compression_wrapper(file_path: Path) -> bool:
+    prefix = read_magic_bytes(str(file_path), len(_XZ_MAGIC))
+    return prefix.startswith((_GZIP_MAGIC, _BZIP2_MAGIC, _XZ_MAGIC))
+
+
 def _detect_tar_route(path: str, *, allow_incomplete_generic_tar_route: bool = False) -> str | None:
     """Return the safe content route for a valid TAR-backed artifact."""
     file_path = Path(path)
@@ -3829,7 +3834,9 @@ def _detect_tar_route(path: str, *, allow_incomplete_generic_tar_route: bool = F
         return None
 
     try:
-        seekable_raw_tar_route = file_path.suffix.lower() == ".tar"
+        seekable_raw_tar_route = file_path.suffix.lower() == ".tar" and not _has_supported_tar_compression_wrapper(
+            file_path
+        )
         tar_mode: Literal["r:", "r|*"] = "r:" if seekable_raw_tar_route else "r|*"
         with tarfile.open(file_path, tar_mode, tarinfo=_NemoRouteTarInfo) as archive:
             if file_path.suffix.lower() == ".nemo":
@@ -6186,7 +6193,10 @@ def detect_file_format(path: str) -> str:
             or "tar"
         )
     if compression_format:
-        tar_route = _detect_tar_route(path)
+        tar_route = _detect_tar_route(
+            path,
+            allow_incomplete_generic_tar_route=_path_claims_tar_container(file_path),
+        )
         if tar_route is not None:
             return tar_route
         return compression_format

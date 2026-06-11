@@ -1565,6 +1565,32 @@ class TestTarScanner:
         assert any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
+    def test_compressed_tar_raw_suffix_truncated_nemo_route_scans_reachable_root_config(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_BODY_SKIP_BYTES", 64)
+        archive_path = tmp_path / "large-archive.tar"
+
+        with tarfile.open(archive_path, "w:gz") as archive:
+            first_payload = b"x" * 128
+            first_info = tarfile.TarInfo("large-weights.bin")
+            first_info.size = len(first_payload)
+            archive.addfile(first_info, tarfile.io.BytesIO(first_payload))  # type: ignore[attr-defined]
+
+            config_payload = b"model:\n  _target_: os.system\n"
+            config_info = tarfile.TarInfo("model_config.yaml")
+            config_info.size = len(config_payload)
+            archive.addfile(config_info, tarfile.io.BytesIO(config_payload))  # type: ignore[attr-defined]
+
+        result = core.scan_file(str(archive_path), config={"cache_enabled": False})
+
+        assert result.scanner_name == "tar"
+        assert result.success is False
+        assert any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
     def test_compressed_tar_truncated_nemo_route_allows_benign_root_config(
         self,
         tmp_path: Path,

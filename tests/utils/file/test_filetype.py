@@ -11,7 +11,7 @@ import zipfile
 import zlib
 from collections.abc import Callable
 from pathlib import Path
-from typing import IO, Any, cast
+from typing import IO, Any, Literal, cast
 
 import pytest
 
@@ -3378,6 +3378,23 @@ def test_detect_file_format_compressed_canonical_tar_body_skip_budget_hands_to_t
         config_info = tarfile.TarInfo("model_config.yaml")
         config_info.size = len(config_payload)
         archive.addfile(config_info, io.BytesIO(config_payload))
+
+    assert detect_file_format(str(archive_path)) == "tar"
+    assert detect_file_format_from_magic(str(archive_path)) == "tar"
+    assert detect_file_format_for_skip_filter(str(archive_path)) == "tar"
+
+
+@pytest.mark.parametrize("mode", ["w:gz", "w:bz2", "w:xz"])
+def test_detect_file_format_compressed_tar_content_with_raw_tar_suffix_routes_tar(
+    tmp_path: Path,
+    mode: Literal["w:gz", "w:bz2", "w:xz"],
+) -> None:
+    archive_path = tmp_path / "compressed-content.tar"
+    with tarfile.open(archive_path, mode) as archive:
+        payload = b"metadata"
+        info = tarfile.TarInfo("metadata.txt")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
 
     assert detect_file_format(str(archive_path)) == "tar"
     assert detect_file_format_from_magic(str(archive_path)) == "tar"
