@@ -34,6 +34,7 @@ from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
+from modelaudit.utils.sources.huggingface import download_model_streaming
 
 
 @pytest.fixture
@@ -59,6 +60,29 @@ def create_mock_scan_result(bytes_scanned: int = 1024, with_critical_issue: bool
     if with_critical_issue:
         result.add_issue("Detected malicious behavior", severity=IssueSeverity.CRITICAL, location="test.pkl")
     return result
+
+
+def create_external_onnx_payload(tmp_path: Path, external_path: str = "model.onnx_data") -> bytes:
+    onnx = pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+    from onnx.onnx_ml_pb2 import StringStringEntryProto
+
+    tensor = helper.make_tensor("W", TensorProto.FLOAT, [1], vals=[1.0])
+    tensor.data_location = onnx.TensorProto.EXTERNAL
+    entry = StringStringEntryProto()
+    entry.key = "location"
+    entry.value = external_path
+    tensor.external_data.append(entry)
+    graph = helper.make_graph(
+        [helper.make_node("Relu", ["input"], ["output"], name="relu")],
+        "streaming_external_data_graph",
+        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])],
+        initializer=[tensor],
+    )
+    model_path = tmp_path / "fixture.onnx"
+    onnx.save(helper.make_model(graph), str(model_path))
+    return model_path.read_bytes()
 
 
 def create_mock_location_scan_result(
@@ -581,6 +605,175 @@ def test_scan_model_streaming_basic(temp_test_files: list[Path]) -> None:
         assert result.has_errors is False
         assert result.content_hash is not None
         assert len(result.content_hash) == 64  # SHA256 hex string
+
+
+@patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+@patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+@patch(
+    "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+    return_value=(["onnx/model.onnx", "onnx/model.onnx_data"], "a" * 40, None),
+)
+@patch("huggingface_hub.hf_hub_download")
+def test_scan_model_streaming_hf_onnx_external_data_sidecar_matches_local_directory(
+    mock_hf_hub_download: Any,
+    _mock_list_repo_files: Any,
+    _mock_get_extensions: Any,
+    _mock_detect_content: Any,
+    tmp_path: Path,
+) -> None:
+    """HF streaming should preserve declared ONNX sidecars for the parent scan."""
+    payload = create_external_onnx_payload(tmp_path)
+    sidecar_bytes = struct.pack("f", 1.0)
+
+    def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+        assert local_dir is not None
+        path = Path(local_dir) / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload if filename == "onnx/model.onnx" else sidecar_bytes)
+        return str(path)
+
+    mock_hf_hub_download.side_effect = download_side_effect
+    generator = download_model_streaming(
+        "https://huggingface.co/test/model",
+        cache_dir=tmp_path / "cache",
+        scannable_extensions={".onnx"},
+        scannable_scanner_ids={"onnx"},
+    )
+
+    result = scan_model_streaming(
+        generator,
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    failed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status.value == "failed"
+    ]
+    passed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status.value == "passed"
+    ]
+    assert failed_external == []
+    assert passed_external
+    assert determine_exit_code(result) == 0
+    assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+        "onnx/model.onnx",
+        "onnx/model.onnx_data",
+    ]
+
+
+@patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+@patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+@patch(
+    "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+    return_value=(["onnx/model.onnx"], "a" * 40, None),
+)
+@patch("huggingface_hub.hf_hub_download")
+def test_scan_model_streaming_hf_onnx_missing_external_data_still_warns(
+    mock_hf_hub_download: Any,
+    _mock_list_repo_files: Any,
+    _mock_get_extensions: Any,
+    _mock_detect_content: Any,
+    tmp_path: Path,
+) -> None:
+    """Missing declared sidecars should remain visible instead of being suppressed."""
+    payload = create_external_onnx_payload(tmp_path)
+
+    def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+        assert filename == "onnx/model.onnx"
+        assert local_dir is not None
+        path = Path(local_dir) / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        return str(path)
+
+    mock_hf_hub_download.side_effect = download_side_effect
+    generator = download_model_streaming(
+        "https://huggingface.co/test/model",
+        cache_dir=tmp_path / "cache",
+        scannable_extensions={".onnx"},
+        scannable_scanner_ids={"onnx"},
+    )
+
+    result = scan_model_streaming(
+        generator,
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    missing_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status.value == "failed"
+    ]
+    assert len(missing_external) == 1
+    assert missing_external[0].details["file"] == "model.onnx_data"
+    assert determine_exit_code(result) == 1
+    assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == ["onnx/model.onnx"]
+
+
+@patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+@patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+@patch(
+    "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+    return_value=(["onnx/model.onnx", "secret.bin"], "a" * 40, None),
+)
+@patch("huggingface_hub.hf_hub_download")
+def test_scan_model_streaming_hf_onnx_escaping_external_data_remains_cve(
+    mock_hf_hub_download: Any,
+    _mock_list_repo_files: Any,
+    _mock_get_extensions: Any,
+    _mock_detect_content: Any,
+    tmp_path: Path,
+) -> None:
+    """Escaping sidecars must not be downloaded and made to look safe."""
+    payload = create_external_onnx_payload(tmp_path, external_path="../secret.bin")
+
+    def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+        assert filename == "onnx/model.onnx"
+        assert local_dir is not None
+        path = Path(local_dir) / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        return str(path)
+
+    mock_hf_hub_download.side_effect = download_side_effect
+    generator = download_model_streaming(
+        "https://huggingface.co/test/model",
+        cache_dir=tmp_path / "cache",
+        scannable_extensions={".onnx"},
+        scannable_scanner_ids={"onnx"},
+    )
+
+    result = scan_model_streaming(
+        generator,
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert any("CVE-2022-25882" in check.name for check in result.checks)
+    assert all(
+        not (
+            check.name == "External Data Reference Check"
+            and check.status.value == "failed"
+            and check.details.get("file") == "../secret.bin"
+        )
+        for check in result.checks
+    )
+    assert determine_exit_code(result) == 1
+    assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == ["onnx/model.onnx"]
 
 
 @pytest.mark.parametrize("delete_after_scan", [False, True])
