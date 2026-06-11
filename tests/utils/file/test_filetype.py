@@ -1763,6 +1763,24 @@ def test_hf_tokenizer_json_jax_identity_is_not_claimed(tmp_path: Path) -> None:
     assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
 
 
+def test_hf_tokenizer_json_jax_identity_values_are_value_sensitive(tmp_path: Path) -> None:
+    jax_dir = tmp_path / "jax"
+    non_jax_dir = tmp_path / "non-jax"
+    jax_dir.mkdir()
+    non_jax_dir.mkdir()
+    jax_path = _write_ordered_hf_tokenizer_json(
+        jax_dir / "tokenizer.json",
+        late_fields=',"chat_template":"{{ user_name }}","library":"jax"',
+    )
+    non_jax_path = _write_ordered_hf_tokenizer_json(
+        non_jax_dir / "tokenizer.json",
+        late_fields=',"chat_template":"{{ user_name }}","framework":"tensorflow"',
+    )
+
+    assert file_detection.huggingface_tokenizer_json_has_jax_route_evidence(jax_path) is True
+    assert file_detection.huggingface_tokenizer_json_has_jax_route_evidence(non_jax_path) is False
+
+
 def test_hf_tokenizer_json_vocab_template_token_is_claimed(tmp_path: Path) -> None:
     tokenizer_path = _write_ordered_hf_tokenizer_json(
         tmp_path / "tokenizer.json",

@@ -322,6 +322,15 @@ class ScannerRegistry:
                 content_routed_extensions = scanner_info.get("content_routed_extensions", [])
                 if candidate_extension not in extensions and candidate_extension not in content_routed_extensions:
                     continue
+                if (
+                    scanner_selection is None
+                    and scanner_id == "jax_checkpoint"
+                    and candidate_extension in content_routed_extensions
+                ):
+                    from modelaudit.utils.file.detection import is_confirmed_jax_json_checkpoint_file
+
+                    if not is_confirmed_jax_json_checkpoint_file(path):
+                        continue
 
                 scanner_class = self._load_scanner(scanner_id)
                 unreadable_extension_owner = (

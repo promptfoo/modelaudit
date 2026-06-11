@@ -11,7 +11,7 @@ import sys
 import tarfile
 import zipfile
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from io import BytesIO, StringIO
 from pathlib import Path, PurePosixPath
@@ -304,15 +304,7 @@ _HF_TOKENIZER_ROOT_KEYS = frozenset({"version", "added_tokens"})
 _HF_TOKENIZER_MODEL_TYPES = frozenset({"BPE", "Unigram", "WordPiece", "WordLevel"})
 _HF_TOKENIZER_TEMPLATE_KEYS = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
 _JSON_PROBE_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
-_HF_TOKENIZER_JAX_ROUTE_KEYS = frozenset(
-    {
-        "framework",
-        "backend",
-        "serialization",
-        "checkpoint_type",
-    }
-    | _JAX_JSON_CHECKPOINT_MARKER_KEYS
-)
+_HF_TOKENIZER_JAX_ROUTE_KEYS = _JAX_JSON_CHECKPOINT_IDENTITY_KEYS | _JAX_JSON_CHECKPOINT_MARKER_KEYS
 _HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_KEYS = (
     _HF_TOKENIZER_TEMPLATE_KEYS | _MXNET_SYMBOL_ROOT_KEYS | {"learner"} | _HF_TOKENIZER_JAX_ROUTE_KEYS
 )
@@ -729,6 +721,12 @@ def _json_probe_root_string_value_has_jax_identity(probe: bytes, key: str, value
     return bool(value and _JAX_JSON_CHECKPOINT_IDENTITY_RE.search(value))
 
 
+def _json_probe_value_has_jax_route_evidence(probe: bytes, key: str, value_offset: int) -> bool:
+    if key in _JAX_JSON_CHECKPOINT_MARKER_KEYS:
+        return True
+    return _json_probe_root_string_value_has_jax_identity(probe, key, value_offset)
+
+
 def _json_probe_skip_string_or_raise(probe: bytes, offset: int) -> int:
     end = _json_probe_skip_string(probe, offset)
     if end is None:
@@ -966,6 +964,7 @@ def _hf_tokenizer_suffix_has_structural_route_key(
     keys: frozenset[str],
     *,
     allow_after_any_value: bool = False,
+    value_predicate: Callable[[bytes, str, int], bool] | None = None,
 ) -> bool:
     """Return whether a bounded suffix exposes a key after a completed value."""
     if file_size <= TOKENIZER_JSON_ROUTING_READ_BYTES:
@@ -998,7 +997,12 @@ def _hf_tokenizer_suffix_has_structural_route_key(
         if key not in keys:
             continue
         offset = _json_probe_skip_whitespace(suffix, key_end)
-        if offset < len(suffix) and suffix[offset] == ord(":"):
+        if offset >= len(suffix) or suffix[offset] != ord(":"):
+            continue
+        value_offset = _json_probe_skip_whitespace(suffix, offset + 1)
+        if value_offset >= len(suffix):
+            continue
+        if value_predicate is None or value_predicate(suffix, key, value_offset):
             return True
     return False
 
@@ -1008,6 +1012,7 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
     keys: frozenset[str],
     *,
     scan_nested_templates: bool = False,
+    value_predicate: Callable[[bytes, str, int], bool] | None = None,
 ) -> bool:
     """Return whether bounded tokenizer JSON exposes decoded route-key evidence."""
     file_path = Path(path)
@@ -1044,12 +1049,15 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
         key_start = offset
         key_end = _json_probe_skip_string(probe, offset)
         if key_end is None:
-            return _hf_tokenizer_suffix_has_structural_route_key(file_path, file_size, keys)
+            return _hf_tokenizer_suffix_has_structural_route_key(
+                file_path,
+                file_size,
+                keys,
+                value_predicate=value_predicate,
+            )
         key = _json_probe_decode_string(probe, key_start, key_end)
         if key is None:
             return False
-        if key in keys:
-            return True
 
         offset = _json_probe_skip_whitespace(probe, key_end)
         if offset >= len(probe) or probe[offset] != ord(":"):
@@ -1061,7 +1069,10 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
                 file_size,
                 keys,
                 allow_after_any_value=key != "model",
+                value_predicate=value_predicate,
             )
+        if key in keys and (value_predicate is None or value_predicate(probe, key, value_offset)):
+            return True
 
         if scan_nested_templates:
             state = _HFTokenizerJSONProbeState()
@@ -1081,6 +1092,7 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
                     file_size,
                     keys,
                     allow_after_any_value=key != "model",
+                    value_predicate=value_predicate,
                 )
             if state.has_template_evidence:
                 return True
@@ -1090,6 +1102,7 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
                     file_size,
                     keys,
                     allow_after_any_value=key != "model",
+                    value_predicate=value_predicate,
                 )
         else:
             next_offset = _json_probe_skip_value(probe, value_offset)
@@ -1099,6 +1112,7 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
                     file_size,
                     keys,
                     allow_after_any_value=key != "model",
+                    value_predicate=value_predicate,
                 )
 
         offset = _json_probe_skip_whitespace(probe, next_offset)
@@ -1129,7 +1143,11 @@ def huggingface_tokenizer_json_has_jax_route_evidence(path: str | Path) -> bool:
     """Return whether bounded tokenizer JSON evidence should route to JAX scanning."""
     if is_huggingface_tokenizer_json_file(path):
         return False
-    return _hf_tokenizer_json_has_decoded_route_evidence(path, _HF_TOKENIZER_JAX_ROUTE_KEYS)
+    return _hf_tokenizer_json_has_decoded_route_evidence(
+        path,
+        _HF_TOKENIZER_JAX_ROUTE_KEYS,
+        value_predicate=_json_probe_value_has_jax_route_evidence,
+    )
 
 
 def huggingface_tokenizer_json_has_mxnet_or_xgboost_route_evidence(path: str | Path) -> bool:
