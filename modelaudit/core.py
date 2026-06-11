@@ -6050,6 +6050,7 @@ def scan_model_streaming(
             openvino_scan_companion_key: Path | None = None
             openvino_companion_pre_scan_identity: _FileIdentitySnapshot | None = None
             openvino_companion_bytes_scanned = 0
+            openvino_sidecar_needs_independent_scan = False
             independent_openvino_sidecar_result: ScanResult | None = None
             independent_openvino_sidecar_path: Path | None = None
 
@@ -6217,7 +6218,15 @@ def scan_model_streaming(
                     str(scan_path),
                     config=scan_config,
                 )
-                scan_result.bytes_scanned += openvino_companion_bytes_scanned
+                openvino_sidecar_needs_independent_scan = (
+                    openvino_scan_companion_path is not None
+                    and _openvino_weights_sidecar_needs_independent_scan(
+                        openvino_scan_companion_path,
+                        scanner_selection,
+                    )
+                )
+                if not openvino_sidecar_needs_independent_scan:
+                    scan_result.bytes_scanned += openvino_companion_bytes_scanned
                 if (
                     openvino_scan_companion_path is not None
                     and openvino_companion_pre_scan_identity is not None
@@ -6230,10 +6239,7 @@ def scan_model_streaming(
                     )
                     preserve_shard_reconciliation_errors = True
                     aggregate_hash_complete = False
-                if openvino_scan_companion_path is not None and _openvino_weights_sidecar_needs_independent_scan(
-                    openvino_scan_companion_path,
-                    scanner_selection,
-                ):
+                if openvino_sidecar_needs_independent_scan and openvino_scan_companion_path is not None:
                     independent_openvino_sidecar_path = openvino_scan_companion_path
                     independent_openvino_sidecar_result = scan_file(
                         str(openvino_scan_companion_path),

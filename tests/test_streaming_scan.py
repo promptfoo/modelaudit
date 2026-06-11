@@ -1448,6 +1448,31 @@ def test_scan_model_streaming_preserves_executable_openvino_bin_sidecar_route(tm
     )
 
 
+def test_scan_model_streaming_executable_openvino_sidecar_counts_once_for_max_total_size(tmp_path: Path) -> None:
+    """Independently routed OpenVINO .bin sidecars must not be double-counted by XML accounting."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+    create_mock_pytorch_zip(bin_path, malicious=False)
+    max_total_size = xml_path.stat().st_size + bin_path.stat().st_size
+
+    result = scan_model_streaming(
+        file_generator=iter([(bin_path, False), (xml_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+        skip_file_types=True,
+        max_total_size=max_total_size,
+    )
+
+    assert determine_exit_code(result) == 0
+    assert result.success is True
+    assert result.files_scanned == 2
+    assert "openvino" in result.scanner_names
+    assert "pytorch_zip" in result.scanner_names
+    assert result.bytes_scanned <= max_total_size
+    assert result.file_metadata[str(xml_path)]["bin_size"] == bin_path.stat().st_size
+    assert not any("Total scan size limit exceeded" in issue.message for issue in result.issues)
+
+
 def test_scan_model_streaming_keeps_benign_openvino_sidecar_accounting(tmp_path: Path) -> None:
     """Benign OpenVINO weights remain accounted without standalone .bin scanner routing."""
     xml_path, bin_path = _write_openvino_pair(tmp_path)
