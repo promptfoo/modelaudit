@@ -1611,7 +1611,8 @@ class TextScanner(BaseScanner):
         if not stripped or stripped.startswith(b"#"):
             return None
         match = re.match(
-            cls._documentation_fenced_shell_command_prefix_pattern() + rb"cd\s+(?P<target>[^\s;&|]+)\s*(?:$|[;&|])",
+            cls._documentation_fenced_shell_command_prefix_pattern()
+            + rb"(?:cd|pushd)\s+(?P<target>[^\s;&|]+)\s*(?:$|[;&|])",
             stripped,
             flags=re.IGNORECASE,
         )
@@ -1621,6 +1622,20 @@ class TextScanner(BaseScanner):
         while target.startswith(b"./"):
             target = target[2:]
         return target or b"."
+
+    @classmethod
+    def _documentation_fenced_line_pops_directory_stack(cls, line: bytes) -> bool:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(b"#"):
+            return False
+        return (
+            re.match(
+                cls._documentation_fenced_shell_command_prefix_pattern() + rb"popd\s*(?:$|[;&|])",
+                stripped,
+                flags=re.IGNORECASE,
+            )
+            is not None
+        )
 
     @classmethod
     def _documentation_fenced_line_executes_relative_checkout_path(cls, line: bytes) -> bool:
@@ -1653,7 +1668,7 @@ class TextScanner(BaseScanner):
                 + rb"(?:setup\.py|[A-Za-z0-9_./\-]+\.py)(?:\s|$)",
                 prefix + rb"(?:python(?:[0-9.]+)?|py)\s+(?:-[A-Za-z0-9_.=\-]+\s+){0,8}-m\s+(?:pip|uv)\b",
                 prefix + rb"(?:bash|sh|zsh|node|ruby|perl)\s+" + rb"[A-Za-z0-9_./\-]+\.(?:sh|js|rb|pl)(?:\s|$)",
-                prefix + rb"(?:make|cmake|npm|yarn|pnpm|pip|uv)\b",
+                prefix + rb"(?:make|cmake|npm|yarn|pnpm|pip(?:[0-9.]+)?|uv)\b",
             )
         )
 
@@ -1674,7 +1689,10 @@ class TextScanner(BaseScanner):
                 + rb"(?:bash|sh|zsh|python(?:[0-9.]+)?|py|node|ruby|perl|source|\.)\s+"
                 + path_reference
                 + rb"/[A-Za-z0-9_./\-]{1,4096}(?:\s|$)",
-                prefix + rb"cd\s+" + path_reference + rb"\s*(?:&&|;)\s*(?:\./)?[A-Za-z0-9_./\-]{1,4096}(?:\s|$)",
+                prefix
+                + rb"(?:cd|pushd)\s+"
+                + path_reference
+                + rb"\s*(?:&&|;)\s*(?:\./)?[A-Za-z0-9_./\-]{1,4096}(?:\s|$)",
                 prefix + rb"make\s+-C\s+" + path_reference + rb"(?:\s|$)",
             )
         )
@@ -1708,6 +1726,9 @@ class TextScanner(BaseScanner):
         for raw_line in payload[line_end + 1 : range_end].splitlines():
             if cls._documentation_fenced_line_executes_clone_checkout(raw_line, checkout_path):
                 return True
+            if cls._documentation_fenced_line_pops_directory_stack(raw_line):
+                inside_checkout = False
+                continue
             cd_target = cls._documentation_fenced_line_cd_target(raw_line)
             if cd_target is not None:
                 inside_checkout = cls._documentation_fenced_line_enters_clone_checkout(raw_line, checkout_path)
