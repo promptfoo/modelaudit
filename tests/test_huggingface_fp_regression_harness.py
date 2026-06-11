@@ -897,6 +897,50 @@ def test_hf_stream_dry_run_openvino_budget_includes_bin_companion() -> None:
     mock_scan.assert_not_called()
 
 
+def test_hf_stream_dry_run_does_not_select_unverified_openvino_companion() -> None:
+    runner = CliRunner()
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": "a" * 40,
+        "total_size": 110,
+        "file_count": 2,
+        "files": [
+            {"name": "model.xml", "size": 10},
+            {"name": "model.bin", "size": 100},
+        ],
+    }
+
+    with (
+        _mock_hf_model_info(return_value=metadata),
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+        patch("modelaudit.utils.sources.huggingface._read_huggingface_prefix") as mock_read_prefix,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--stream",
+                "--format",
+                "json",
+                "--scanners",
+                "openvino",
+                "hf://test/model",
+            ],
+        )
+
+    parsed = parse_click_json_output(result.stdout)
+    assert result.exit_code == 0, result.output
+    assert parsed["files_scanned"] == 0
+    assert "Scannable files: 1 of 2" in result.stderr
+    assert "Scannable size: 10 B" in result.stderr
+    mock_read_prefix.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
 def test_hf_stream_dry_run_max_size_budgets_unselected_content_route_candidates() -> None:
     runner = CliRunner()
     metadata = {

@@ -390,14 +390,6 @@ def _huggingface_preview_stream_files(metadata: dict[str, Any], runtime: "_ScanR
         **stream_kwargs,
         sniff_content=False,
     )
-    include_openvino_companions = runtime.scannable_scanner_ids is None or "openvino" in {
-        str(scanner_id).lower() for scanner_id in runtime.scannable_scanner_ids
-    }
-    selected_names = _huggingface_preview_include_openvino_companions(
-        file_names,
-        selected_names,
-        include_openvino_companions=include_openvino_companions,
-    )
     return _huggingface_preview_files_by_name(files, selected_names)
 
 
