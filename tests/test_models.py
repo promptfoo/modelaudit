@@ -396,6 +396,14 @@ class TestFileMetadataModel:
         metadata.set_file_hashes({"sha256": "a" * 64})
         assert metadata.file_hashes is not None
 
+    def test_set_file_hashes_preserves_sha256_prefix(self):
+        """Test setting bounded prefix hashes."""
+        metadata = FileMetadataModel()
+        metadata.set_file_hashes({"sha256_prefix": "a" * 64})
+        assert metadata.file_hashes is not None
+        assert metadata.file_hashes.sha256_prefix == "a" * 64
+        assert metadata.file_hashes.get_strongest_hash() == ("sha256_prefix", "a" * 64)
+
     def test_calculate_risk_score(self):
         """Test risk score calculation."""
         metadata = FileMetadataModel(suspicious_count=5)
