@@ -56,7 +56,7 @@ _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES = 10 * 1024 * 1024
 _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES = b"\t\n\r" + bytes(range(0x20, 0x7F))
 _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS = frozenset({"\t", "\n", "\r", "\f"})
 _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES = frozenset({".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".conf"})
-_CONTENT_ROUTE_TEXT_OWNER_STRUCTURE_CHARS = frozenset({" ", "\t", "\n", "\r", "\f", "=", ":", "#", "[", "{"})
+_CONTENT_ROUTE_TEXT_OWNER_STRUCTURE_CHARS = frozenset({"\t", "\n", "\r", "\f", "=", ":", "#", "[", "{"})
 _CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES = (
     bytes(byte for byte in range(0x20) if byte not in {0x09, 0x0A, 0x0C, 0x0D}) + b"\x7f"
 )
@@ -5368,6 +5368,41 @@ def _has_content_route_text_owner_structure(text: str) -> bool:
     return any(char in _CONTENT_ROUTE_TEXT_OWNER_STRUCTURE_CHARS for char in text)
 
 
+def _has_bounded_protobuf_model_text_candidate_signal(file_path: Path, file_size: int) -> bool:
+    """Return whether a text-like protobuf prefix uses known model fields."""
+    try:
+        payload = read_magic_bytes(str(file_path), min(file_size, _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES))
+    except OSError:
+        return False
+
+    offset = 0
+    fields_seen = 0
+    while offset < len(payload) and fields_seen < 64:
+        tag_result = _read_proto_varint(payload, offset)
+        if tag_result is None:
+            return False
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+
+        expected_wire_type = _ONNX_MODEL_FIELD_WIRE_TYPES.get(field_number)
+        if expected_wire_type == wire_type:
+            return True
+        if (field_number == 1 and wire_type == 0) or (
+            (field_number == 2 or field_number in _COREML_MODEL_TYPE_FIELDS) and wire_type == 2
+        ):
+            return True
+
+        next_offset = _skip_proto_value(payload, value_offset, wire_type)
+        if next_offset is None:
+            return False
+        offset = next_offset
+        fields_seen += 1
+    return False
+
+
 def _is_complete_bounded_printable_text_content_owner(file_path: Path, file_size: int) -> bool:
     """Return whether printable text can safely own this complete file."""
     suffix = file_path.suffix.lower()
@@ -5416,9 +5451,14 @@ def _preserve_inconclusive_protobuf_model_routing(file_path: Path, file_size: in
     """Keep ambiguous binary model protobufs scannable without claiming proven text."""
     if file_path.suffix.lower() in {".py", ".pyw"} and not _has_bounded_non_source_control_signal(file_path, file_size):
         return False
-    return not _is_complete_structured_json_content_owner(
-        file_path, file_size
-    ) and not _is_complete_bounded_ascii_printable_text_content_owner(file_path, file_size)
+    if _is_complete_structured_json_content_owner(file_path, file_size):
+        return False
+    if (
+        file_path.suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        and _has_bounded_protobuf_model_text_candidate_signal(file_path, file_size)
+    ):
+        return True
+    return not _is_complete_bounded_ascii_printable_text_content_owner(file_path, file_size)
 
 
 def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:

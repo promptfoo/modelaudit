@@ -420,6 +420,33 @@ def test_detect_printable_utf8_text_suffix_protobuf_candidate_fails_closed(
     assert detect_file_format(str(document)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
 
 
+@pytest.mark.parametrize("suffix", [".txt", ".conf"])
+def test_detect_printable_ascii_text_suffix_protobuf_candidate_fails_closed(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    field_payload = b"x" * 58
+    document = tmp_path / f"ascii{suffix}"
+    document.write_bytes((b"B" + bytes([len(field_payload)]) + field_payload) * 4097)
+
+    assert detect_file_format_from_magic(str(document)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(document)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format(str(document)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+
+@pytest.mark.parametrize("suffix", [".txt", ".conf"])
+def test_detect_space_prefixed_text_suffix_messagepack_candidate_fails_closed(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    document = tmp_path / f"ambiguous{suffix}"
+    document.write_bytes(b" " + (b'""' + ("é" * 17).encode("utf-8")) * 4097)
+
+    assert detect_file_format_from_magic(str(document)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(document)) == "flax_msgpack"
+    assert detect_file_format(str(document)) == "flax_msgpack"
+
+
 @pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".conf"])
 def test_detect_oversized_ambiguous_skipped_suffix_fails_closed_as_flax(tmp_path: Path, suffix: str) -> None:
     document = tmp_path / f"notes{suffix}"

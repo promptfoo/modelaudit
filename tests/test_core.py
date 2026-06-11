@@ -235,6 +235,12 @@ def _build_printable_utf8_protobuf_candidate_route() -> bytes:
     return (b"B" + bytes([len(field_payload)]) + field_payload) * 4097
 
 
+def _build_printable_ascii_protobuf_candidate_route() -> bytes:
+    """Build printable ASCII protobuf fields that exhaust bounded model routing."""
+    field_payload = b"x" * 58
+    return (b"B" + bytes([len(field_payload)]) + field_payload) * 4097
+
+
 def _build_large_text_owner_text(line: str = "Ġtoken token\n") -> str:
     """Build deterministic text above the binary-routing fast path."""
     repeat_count = (3 * 1024 * 1024) // len(line.encode("utf-8")) + 1
@@ -5172,11 +5178,44 @@ def test_scan_file_fails_closed_for_printable_utf8_text_suffix_binary_candidate(
 
 
 @pytest.mark.parametrize("filename", ["ambiguous.txt", "settings.conf"])
-def test_scan_file_fails_closed_for_printable_utf8_text_suffix_protobuf_candidate(
+def test_scan_file_fails_closed_for_space_prefixed_text_suffix_messagepack_candidate(
     tmp_path: Path,
     filename: str,
 ) -> None:
-    payload = _build_printable_utf8_protobuf_candidate_route()
+    payload = b" " + _build_printable_utf8_ambiguous_binary_route()
+    candidate = tmp_path / filename
+    candidate.write_bytes(payload)
+
+    assert file_detection.detect_file_format(str(candidate)) == "flax_msgpack"
+    assert file_detection.detect_file_format_from_magic(str(candidate)) == "flax_msgpack"
+    assert file_detection.detect_file_format_for_skip_filter(str(candidate)) == "flax_msgpack"
+
+    result = scan_file(str(candidate), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(candidate), cache_scan_results=False)
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "flax_msgpack_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload_factory"),
+    [
+        ("ambiguous.txt", _build_printable_utf8_protobuf_candidate_route),
+        ("settings.conf", _build_printable_utf8_protobuf_candidate_route),
+        ("ascii.txt", _build_printable_ascii_protobuf_candidate_route),
+        ("ascii.conf", _build_printable_ascii_protobuf_candidate_route),
+    ],
+    ids=["utf8-txt", "utf8-conf", "ascii-txt", "ascii-conf"],
+)
+def test_scan_file_fails_closed_for_printable_text_suffix_protobuf_candidate(
+    tmp_path: Path,
+    filename: str,
+    payload_factory: Callable[[], bytes],
+) -> None:
+    payload = payload_factory()
     candidate = tmp_path / filename
     candidate.write_bytes(payload)
 
