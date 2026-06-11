@@ -97,16 +97,31 @@ _TRUSTED_FRAMEWORK_METADATA_RECONSTRUCTION_REFERENCES = frozenset(
         ("transformers.training_args", "TrainingArguments"),
     }
 )
-_TRUSTED_REDUCE_REFERENCES = frozenset(
+_TRUSTED_FRAMEWORK_REDUCE_REFERENCES = frozenset(
     {
         ("accelerate.utils.dataclasses", "DistributedType"),
         ("torch", "device"),
-        ("string", "Formatter"),
         ("transformers.trainer_utils", "HubStrategy"),
         ("transformers.trainer_utils", "IntervalStrategy"),
         ("transformers.trainer_utils", "SaveStrategy"),
         ("transformers.trainer_utils", "SchedulerType"),
         ("transformers.training_args", "OptimizerNames"),
+    }
+)
+_TRUSTED_REDUCE_REFERENCES = (
+    frozenset(
+        {
+            ("string", "Formatter"),
+            ("weakref", "proxy"),
+            ("weakref", "ref"),
+        }
+    )
+    | _TRUSTED_FRAMEWORK_REDUCE_REFERENCES
+)
+_TRUSTED_RECONSTRUCTION_WITHOUT_SOURCE_ANALYSIS_REFERENCES = frozenset(
+    {
+        ("_frozen_importlib", "ModuleSpec"),
+        ("string", "Formatter"),
         ("weakref", "proxy"),
         ("weakref", "ref"),
     }
@@ -114,15 +129,9 @@ _TRUSTED_REDUCE_REFERENCES = frozenset(
 _TRUSTED_RECONSTRUCTION_REFERENCES = (
     _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES
     | _TRUSTED_FRAMEWORK_METADATA_RECONSTRUCTION_REFERENCES
-    | frozenset(
-        {
-            ("_frozen_importlib", "ModuleSpec"),
-            ("string", "Formatter"),
-            ("weakref", "proxy"),
-            ("weakref", "ref"),
-        }
-    )
+    | _TRUSTED_RECONSTRUCTION_WITHOUT_SOURCE_ANALYSIS_REFERENCES
 )
+_TRUSTED_REDUCE_WITHOUT_SOURCE_ANALYSIS_REFERENCES = _TRUSTED_REDUCE_REFERENCES - _TRUSTED_FRAMEWORK_REDUCE_REFERENCES
 _ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
 _ZIP_EOCD_MIN_SIZE = 22
 _ZIP_MAX_COMMENT_SIZE = 0xFFFF
@@ -1885,8 +1894,15 @@ def _non_allowlisted_import_finding_is_proven_safe(
         if position is not None
         else reference in analyzed_invocation_references
     )
+    invocation_is_trusted_reconstruction = (
+        position in trusted_reconstruction_global_positions
+        if position is not None
+        else reference in trusted_reconstruction_references
+    )
     inert_reference_is_proven_safe = position is not None and not finding_is_invoked
-    trusted_reference_is_proven_safe = position is not None and (not finding_is_invoked or invocation_is_analyzed)
+    trusted_reference_is_proven_safe = position is not None and (
+        not finding_is_invoked or invocation_is_analyzed or invocation_is_trusted_reconstruction
+    )
     return (trusted_reference_is_proven_safe and (module, name) in trusted_import_references) or (
         inert_reference_is_proven_safe and module in inert_initialization_modules
     )
@@ -1946,12 +1962,12 @@ def _trusted_reconstruction_global_positions(callable_invocations: object) -> fr
             (
                 opcodes <= _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES
                 and references_by_position.get(position)
-                and references_by_position[position] <= _TRUSTED_RECONSTRUCTION_REFERENCES
+                and references_by_position[position] <= _TRUSTED_RECONSTRUCTION_WITHOUT_SOURCE_ANALYSIS_REFERENCES
             )
             or (
                 opcodes <= {"REDUCE"}
                 and references_by_position.get(position)
-                and references_by_position[position] <= _TRUSTED_REDUCE_REFERENCES
+                and references_by_position[position] <= _TRUSTED_REDUCE_WITHOUT_SOURCE_ANALYSIS_REFERENCES
             )
         )
     )
@@ -1971,8 +1987,11 @@ def _trusted_reconstruction_references(callable_invocations: object) -> frozense
         for reference, opcodes in opcodes_by_reference.items()
         if opcodes
         and (
-            (opcodes <= _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES and reference in _TRUSTED_RECONSTRUCTION_REFERENCES)
-            or (opcodes <= {"REDUCE"} and reference in _TRUSTED_REDUCE_REFERENCES)
+            (
+                opcodes <= _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES
+                and reference in _TRUSTED_RECONSTRUCTION_WITHOUT_SOURCE_ANALYSIS_REFERENCES
+            )
+            or (opcodes <= {"REDUCE"} and reference in _TRUSTED_REDUCE_WITHOUT_SOURCE_ANALYSIS_REFERENCES)
         )
     )
 
