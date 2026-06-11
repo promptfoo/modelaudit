@@ -185,6 +185,7 @@ _add_scan_result_to_model = core_results.add_scan_result_to_model
 _consolidate_checks = core_results.consolidate_checks
 _mark_inconclusive_scan_outcome = core_results.mark_inconclusive_scan_outcome
 _mark_operational_scan_error = core_results.mark_operational_scan_error
+_details_match_shard_family_paths = core_results.details_match_shard_family_paths
 _metadata_has_incomplete_coverage = core_results.metadata_has_incomplete_coverage
 _record_details_have_incomplete_coverage = core_results.record_details_have_incomplete_coverage
 _records_have_incomplete_coverage_for_path = core_results.records_have_incomplete_coverage_for_path
@@ -325,13 +326,38 @@ _INCOMPLETE_SHARD_CHECK_NAMES = frozenset(
 )
 
 
-def _shard_family_has_incomplete_coverage(records: Iterable[Any], shard_paths: set[str]) -> bool:
+def _path_matches_shard_family(candidate_path: str | None, shard_paths: set[str]) -> bool:
+    if not isinstance(candidate_path, str):
+        return False
+    try:
+        resolved_candidate = Path(candidate_path).resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    resolved_candidate_str = str(resolved_candidate)
+    if resolved_candidate_str in shard_paths:
+        return True
+    if not resolved_candidate.is_dir():
+        return False
+    return any(Path(shard_path).is_relative_to(resolved_candidate) for shard_path in shard_paths)
+
+
+def _shard_family_has_incomplete_coverage(
+    records: Iterable[Any],
+    shard_paths: set[str],
+    *,
+    only_detected_shard_family: bool = True,
+) -> bool:
     for record in records:
         if not _record_details_have_incomplete_coverage(record):
             continue
-        if getattr(record, "name", None) in _INCOMPLETE_SHARD_CHECK_NAMES:
+        if _path_matches_shard_family(getattr(record, "location", None), shard_paths):
             return True
-        if any(_records_have_incomplete_coverage_for_path((record,), shard_path) for shard_path in shard_paths):
+        details = getattr(record, "details", None)
+        if _details_match_shard_family_paths(
+            details, lambda candidate: _path_matches_shard_family(candidate, shard_paths)
+        ):
+            return True
+        if only_detected_shard_family and getattr(record, "name", None) in _INCOMPLETE_SHARD_CHECK_NAMES:
             return True
     return False
 
@@ -3493,18 +3519,27 @@ def scan_model_directory_or_file(
                 ):
                     scanned_dvc_paths.add(resolved_target)
                     internally_scanned_dvc_paths.add(resolved_target)
+                    sharded_detection_families: list[set[str]] = []
                     for check in file_result.checks:
                         shard_paths = check.details.get("shards") if isinstance(check.details, dict) else None
                         if check.name == "Sharded Model Detection" and isinstance(shard_paths, list):
-                            resolved_shard_paths = {
-                                str(Path(shard_path).resolve())
-                                for shard_path in shard_paths
-                                if isinstance(shard_path, str)
-                            }
-                            if _shard_family_has_incomplete_coverage(file_records, resolved_shard_paths):
-                                continue
-                            scanned_dvc_paths.update(resolved_shard_paths)
-                            internally_scanned_dvc_paths.update(resolved_shard_paths)
+                            sharded_detection_families.append(
+                                {
+                                    str(Path(shard_path).resolve())
+                                    for shard_path in shard_paths
+                                    if isinstance(shard_path, str)
+                                }
+                            )
+                    only_detected_shard_family = len(sharded_detection_families) <= 1
+                    for resolved_shard_paths in sharded_detection_families:
+                        if _shard_family_has_incomplete_coverage(
+                            file_records,
+                            resolved_shard_paths,
+                            only_detected_shard_family=only_detected_shard_family,
+                        ):
+                            continue
+                        scanned_dvc_paths.update(resolved_shard_paths)
+                        internally_scanned_dvc_paths.update(resolved_shard_paths)
                 _finish_phase_timing(phase_timings, "result_merge", result_merge_started_at)
 
                 # Collect and apply license metadata for all files

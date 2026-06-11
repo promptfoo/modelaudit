@@ -48,6 +48,7 @@ from .core import (
 )
 from .core_results import (
     details_have_incomplete_coverage,
+    details_match_shard_family_paths,
     metadata_has_incomplete_coverage,
     records_have_incomplete_coverage_for_path,
     results_have_inconclusive_outcome,
@@ -1489,7 +1490,11 @@ class _ScanPathState:
                 return any(shard_path.is_relative_to(resolved_candidate) for shard_path in shard_paths)
             return False
 
-        def shard_family_has_incomplete_coverage(shard_paths: set[Path]) -> bool:
+        def shard_family_has_incomplete_coverage(
+            shard_paths: set[Path],
+            *,
+            only_detected_shard_family: bool,
+        ) -> bool:
             for metadata_path, metadata in scan_result.file_metadata.items():
                 if not (metadata.get("operational_error") is True or metadata_has_incomplete_coverage(metadata)):
                     continue
@@ -1511,7 +1516,12 @@ class _ScanPathState:
                     continue
                 if path_matches_shard_family(getattr(record, "location", None), shard_paths):
                     return True
-                if getattr(record, "name", None) in incomplete_shard_checks:
+                if details_match_shard_family_paths(
+                    details,
+                    lambda candidate: path_matches_shard_family(candidate, shard_paths),
+                ):
+                    return True
+                if only_detected_shard_family and getattr(record, "name", None) in incomplete_shard_checks:
                     return True
 
             return False
@@ -1528,6 +1538,7 @@ class _ScanPathState:
                 continue
             record_covered_file(asset.path)
 
+        sharded_detection_families: list[tuple[list[Any], set[Path]]] = []
         for check in scan_result.checks:
             shard_paths = check.details.get("shards") if isinstance(check.details, dict) else None
             if check.name != "Sharded Model Detection" or not isinstance(shard_paths, list):
@@ -1537,7 +1548,13 @@ class _ScanPathState:
                 for shard_path in shard_paths
                 if isinstance(shard_path, str) and (resolved_path := resolve_coverage_path(shard_path)) is not None
             }
-            if shard_family_has_incomplete_coverage(resolved_shard_paths):
+            sharded_detection_families.append((shard_paths, resolved_shard_paths))
+        only_detected_shard_family = len(sharded_detection_families) <= 1
+        for shard_paths, resolved_shard_paths in sharded_detection_families:
+            if shard_family_has_incomplete_coverage(
+                resolved_shard_paths,
+                only_detected_shard_family=only_detected_shard_family,
+            ):
                 continue
             for shard_path in shard_paths:
                 if isinstance(shard_path, str):

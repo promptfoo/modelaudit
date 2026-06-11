@@ -6,7 +6,7 @@ import logging
 import os
 import time
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,23 @@ ANALYSIS_INCOMPLETE_METADATA_KEY = "analysis_incomplete"
 SCAN_OUTCOME_METADATA_KEY = "scan_outcome"
 SCAN_OUTCOME_REASON_METADATA_KEY = "scan_outcome_reason"
 SCAN_OUTCOME_REASONS_METADATA_KEY = "scan_outcome_reasons"
+_SHARD_FAMILY_PATH_DETAIL_KEYS = frozenset(
+    {
+        "duplicate_shards",
+        "location",
+        "missing_shards",
+        "out_of_scope_shards",
+        "path",
+        "paths",
+        "shard",
+        "shard_path",
+        "shard_paths",
+        "shards",
+        "unreadable_shards",
+        "unvalidated_shards",
+    }
+)
+_SHARD_FAMILY_NESTED_DETAIL_KEYS = frozenset({"details", "findings"})
 
 
 def mark_operational_scan_error(scan_result: ScanResult, reason: str) -> None:
@@ -136,6 +153,30 @@ def details_have_incomplete_coverage(details: Any, *, _depth: int = 0) -> bool:
             if nested_details is not finding and details_have_incomplete_coverage(nested_details, _depth=_depth + 1):
                 return True
 
+    return False
+
+
+def details_match_shard_family_paths(
+    details: Any,
+    path_matches: Callable[[str], bool],
+    *,
+    _depth: int = 0,
+) -> bool:
+    """Return True when shard/path detail fields match a shard family."""
+    if details is None or _depth >= 4:
+        return False
+    if isinstance(details, str):
+        return path_matches(details)
+    if isinstance(details, (list, tuple, set, frozenset)):
+        return any(details_match_shard_family_paths(item, path_matches, _depth=_depth + 1) for item in details)
+    if not isinstance(details, dict):
+        return False
+
+    for key, value in details.items():
+        if (
+            key in _SHARD_FAMILY_PATH_DETAIL_KEYS or key in _SHARD_FAMILY_NESTED_DETAIL_KEYS
+        ) and details_match_shard_family_paths(value, path_matches, _depth=_depth + 1):
+            return True
     return False
 
 

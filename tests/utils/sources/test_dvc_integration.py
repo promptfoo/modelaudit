@@ -1895,6 +1895,125 @@ class TestDvcSecurity:
 
         assert path_state.dvc_covered_paths == {str(first_shard), str(second_shard)}
 
+    def test_core_incomplete_shard_family_matching_is_family_scoped(self, tmp_path: Path) -> None:
+        """Incomplete shard records should not poison unrelated detected families."""
+        complete_first = tmp_path / "complete-00001-of-00002.safetensors"
+        complete_second = tmp_path / "complete-00002-of-00002.safetensors"
+        failed_first = tmp_path / "failed-00001-of-00002.safetensors"
+        failed_second = tmp_path / "failed-00002-of-00002.safetensors"
+        for shard_path in (complete_first, complete_second, failed_first, failed_second):
+            shard_path.write_bytes(b"shard")
+
+        incomplete_record = Check(
+            name="Shard Scan",
+            status=CheckStatus.FAILED,
+            message="Error scanning shard",
+            location=str(failed_second),
+            details={
+                "analysis_incomplete": True,
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reason": "shard_scan_error",
+            },
+        )
+        complete_family = {str(complete_first.resolve()), str(complete_second.resolve())}
+        failed_family = {str(failed_first.resolve()), str(failed_second.resolve())}
+
+        assert (
+            core_module._shard_family_has_incomplete_coverage(
+                (incomplete_record,),
+                complete_family,
+                only_detected_shard_family=False,
+            )
+            is False
+        )
+        assert (
+            core_module._shard_family_has_incomplete_coverage(
+                (incomplete_record,),
+                failed_family,
+                only_detected_shard_family=False,
+            )
+            is True
+        )
+        ambiguous_record = Check(
+            name="Shard Scan",
+            status=CheckStatus.FAILED,
+            message="Error scanning shard without a retained path",
+            details={
+                "analysis_incomplete": True,
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reason": "shard_scan_error",
+            },
+        )
+        assert (
+            core_module._shard_family_has_incomplete_coverage(
+                (ambiguous_record,),
+                complete_family,
+                only_detected_shard_family=True,
+            )
+            is True
+        )
+        assert (
+            core_module._shard_family_has_incomplete_coverage(
+                (ambiguous_record,),
+                complete_family,
+                only_detected_shard_family=False,
+            )
+            is False
+        )
+
+    def test_cli_incomplete_shard_family_does_not_block_complete_sibling_family(self, tmp_path: Path) -> None:
+        """A failed shard scan should only suppress DVC coverage for its own family."""
+        from modelaudit.cli import _ScanPathState
+        from modelaudit.models import AssetModel, create_initial_audit_result
+
+        complete_first = tmp_path / "complete-00001-of-00002.safetensors"
+        complete_second = tmp_path / "complete-00002-of-00002.safetensors"
+        failed_first = tmp_path / "failed-00001-of-00002.safetensors"
+        failed_second = tmp_path / "failed-00002-of-00002.safetensors"
+        for shard_path in (complete_first, complete_second, failed_first, failed_second):
+            shard_path.write_bytes(b"shard")
+
+        shard_result = create_initial_audit_result()
+        shard_result.success = False
+        shard_result.assets.append(AssetModel(path=str(complete_first), type="safetensors"))
+        shard_result.assets.append(AssetModel(path=str(failed_first), type="safetensors"))
+        shard_result.checks.extend(
+            [
+                Check(
+                    name="Sharded Model Detection",
+                    status=CheckStatus.PASSED,
+                    message="Detected complete sharded model",
+                    details={"shards": [str(complete_first), str(complete_second)]},
+                ),
+                Check(
+                    name="Sharded Model Detection",
+                    status=CheckStatus.PASSED,
+                    message="Detected incomplete sharded model",
+                    details={"shards": [str(failed_first), str(failed_second)]},
+                ),
+                Check(
+                    name="Shard Scan",
+                    status=CheckStatus.FAILED,
+                    message="Error scanning shard",
+                    location=str(failed_second),
+                    details={
+                        "analysis_incomplete": True,
+                        "scan_outcome": "inconclusive",
+                        "scan_outcome_reason": "shard_scan_error",
+                    },
+                ),
+            ]
+        )
+        path_state = _ScanPathState(collect_dvc_coverage=True)
+
+        path_state.record_dvc_coverage(str(tmp_path), shard_result)
+
+        assert path_state.dvc_covered_paths == {
+            str(complete_first),
+            str(complete_second),
+            str(failed_first),
+        }
+
     def test_cli_incomplete_shard_check_paths_do_not_count_as_dvc_coverage(self, tmp_path: Path) -> None:
         """Incomplete shard-family scans must not discharge omitted DVC shard outputs."""
         from modelaudit.cli import _ScanPathState
