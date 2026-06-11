@@ -1155,6 +1155,17 @@ def _is_within_directory(base_dir: Path, target: Path) -> bool:
     return target_path.is_relative_to(base_path)
 
 
+def _is_huggingface_cache_blob_target(downloaded_path: Path, target: Path) -> bool:
+    """Return True when target is a Hub cache blob for the snapshot path."""
+    target_path = target.resolve()
+    current_path = downloaded_path.resolve()
+    for candidate in [current_path, *current_path.parents]:
+        if candidate.parent.name == "snapshots":
+            blob_dir = candidate.parent.parent / "blobs"
+            return _is_within_directory(blob_dir, target_path)
+    return False
+
+
 def _build_huggingface_download_path(cache_dir: Path, namespace: str, repo_name: str) -> Path:
     """Build and containment-check the local HuggingFace download path."""
     cache_root = (cache_dir / "huggingface").resolve()
@@ -1547,9 +1558,24 @@ def _verify_huggingface_selection_within_max_size(
 
     total_size = initial_size
     for filename in dict.fromkeys(filenames):
-        file_path = (downloaded_path / filename).resolve()
-        if not _is_within_directory(downloaded_path, file_path):
+        _validate_huggingface_repo_filename(repo_id, filename)
+        file_path = downloaded_path / filename
+        parent_path = file_path.parent.resolve()
+        if not _is_within_directory(downloaded_path, parent_path):
             raise ValueError(f"Cannot verify max-size for {repo_id}: downloaded selected file path escaped: {filename}")
+        if file_path.is_symlink():
+            try:
+                symlink_target = file_path.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise ValueError(
+                    f"Cannot verify max-size for {repo_id}: downloaded selected file missing: {filename}"
+                ) from exc
+            if not _is_within_directory(downloaded_path, symlink_target) and not _is_huggingface_cache_blob_target(
+                downloaded_path, symlink_target
+            ):
+                raise ValueError(
+                    f"Cannot verify max-size for {repo_id}: downloaded selected file symlink target escaped: {filename}"
+                )
         if not file_path.is_file():
             raise ValueError(f"Cannot verify max-size for {repo_id}: downloaded selected file missing: {filename}")
         try:

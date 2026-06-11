@@ -2020,6 +2020,38 @@ class TestModelDownload:
     )
     @patch("huggingface_hub.HfApi.get_paths_info")
     @patch("huggingface_hub.snapshot_download")
+    def test_download_model_max_size_allows_hf_cache_blob_symlink(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Capped default-cache snapshots should allow normal Hub blob symlinks."""
+        repo_cache = tmp_path / "hf-cache" / "hub" / "models--test--model"
+        download_path = repo_cache / "snapshots" / _HF_TEST_REVISION
+        blob_path = repo_cache / "blobs" / "abc123"
+        download_path.mkdir(parents=True)
+        blob_path.parent.mkdir(parents=True)
+        blob_path.write_bytes(b"weights")
+        (download_path / "pytorch_model.bin").symlink_to(Path("..") / ".." / "blobs" / blob_path.name)
+        mock_snapshot_download.return_value = str(download_path)
+        mock_get_paths_info.return_value = [SimpleNamespace(path="pytorch_model.bin", size=7)]
+
+        download_model("https://huggingface.co/test/model", max_size=1000)
+
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["pytorch_model.bin"]
+        assert mock_snapshot_download.call_args.kwargs["revision"] == _HF_TEST_REVISION
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.snapshot_download")
     def test_download_model_max_size_rejects_underreported_snapshot(
         self,
         mock_snapshot_download: MagicMock,
@@ -2037,6 +2069,34 @@ class TestModelDownload:
 
         with pytest.raises(Exception, match="downloaded selected Hugging Face files total 9 bytes exceeds max size 4"):
             download_model("https://huggingface.co/test/model", max_size=4)
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_max_size_rejects_symlink_escape_after_transfer(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Capped downloads should not accept arbitrary selected-file symlink escapes."""
+        download_path = tmp_path / "download"
+        escaped_target = tmp_path / "outside.bin"
+        download_path.mkdir()
+        escaped_target.write_bytes(b"weights")
+        (download_path / "pytorch_model.bin").symlink_to(escaped_target)
+        mock_snapshot_download.return_value = str(download_path)
+        mock_get_paths_info.return_value = [SimpleNamespace(path="pytorch_model.bin", size=7)]
+
+        with pytest.raises(Exception, match="downloaded selected file symlink target escaped: pytorch_model\\.bin"):
+            download_model("https://huggingface.co/test/model", max_size=1000)
 
     @patch("modelaudit.utils.sources.huggingface.get_model_size", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
