@@ -32,7 +32,19 @@ from modelaudit.integrations.license_checker import (
     collect_license_metadata,
 )
 from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
-from modelaudit.scanner_results import Check, Issue, IssueSeverity, ScanResult
+from modelaudit.scanner_results import (
+    ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
+    INCONCLUSIVE_SCAN_OUTCOME,
+    OPERATIONAL_ERROR_METADATA_KEY,
+    SCAN_OUTCOME_METADATA_KEY,
+    SCAN_OUTCOME_REASONS_METADATA_KEY,
+    SUPPRESSED_FAILED_CHECKS_METADATA_KEY,
+    VALIDATED_FORMAT_METADATA_KEY,
+    Check,
+    Issue,
+    IssueSeverity,
+    ScanResult,
+)
 from modelaudit.scanner_selection import (
     SCANNER_SELECTION_PREFERRED_KIND,
     ScannerSelectionPolicy,
@@ -82,9 +94,11 @@ from modelaudit.utils.file.detection import (
     ONNX_ROUTING_INCONCLUSIVE_FORMAT,
     PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
     PROTOBUF_MODEL_CANDIDATE_FORMAT,
+    SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
+    _is_malformed_sentencepiece_model_proto_candidate_file,
     detect_file_format,
     detect_file_format_from_magic,
     detect_flax_msgpack_overlap_routes,
@@ -96,6 +110,7 @@ from modelaudit.utils.file.detection import (
     is_executorch_archive,
     is_keras_zip_archive,
     is_pytorch_zip_archive,
+    is_sentencepiece_model_proto_file,
     is_skops_archive,
     is_torchserve_mar_archive,
     should_defer_safetensors_header_limit_hash,
@@ -151,6 +166,7 @@ _add_asset_to_results = core_results.add_asset_to_results
 _add_error_asset_to_results = core_results.add_error_asset_to_results
 _DIRECTORY_PRECOUNT_CHILD_LIMIT = 1000
 _COMPRESSED_TAR_STREAM_INCOMPLETE_REASON = "tar_compressed_stream_incomplete"
+_STREAMING_SOURCE_INTERRUPTED_REASON = "streaming_source_interrupted"
 
 
 def _count_immediate_children_up_to(path: Path, limit: int) -> int:
@@ -273,10 +289,14 @@ _COMPRESSED_HEADER_FORMATS = frozenset({"compressed", "gzip", "bzip2", "xz", "lz
 _R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
 _XGBOOST_BINARY_EXTENSIONS = frozenset({".bst"})
 _XGBOOST_PICKLE_SPOOF_REASON = "xgboost_binary_pickle_spoof"
+_ALTERNATE_VALIDATED_FORMAT_ALLOWED_INCONCLUSIVE_REASONS = {
+    "onnx": frozenset({"onnx_weight_distribution_analysis_incomplete"}),
+}
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
 _FORMAT_DETECTION_READ_FAILED_REASON = "format_detection_read_failed"
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON = "protobuf_model_routing_incomplete"
+_SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON = "sentencepiece_model_proto_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
 _PICKLE_ROUTING_INCOMPLETE_REASON = "pickle_routing_incomplete"
@@ -1538,6 +1558,65 @@ def _preferred_scanner_can_handle(
     return False
 
 
+def _has_only_allowed_alternate_format_inconclusive_reasons(result: ScanResult, validated_format: str) -> bool:
+    allowed_reasons = _ALTERNATE_VALIDATED_FORMAT_ALLOWED_INCONCLUSIVE_REASONS.get(validated_format, frozenset())
+    reasons = result.metadata.get(SCAN_OUTCOME_REASONS_METADATA_KEY)
+    if not isinstance(reasons, list):
+        return bool(result.success)
+    return bool(reasons) and all(isinstance(reason, str) and reason in allowed_reasons for reason in reasons)
+
+
+def _has_private_actionable_scanner_evidence(result: ScanResult) -> bool:
+    for metadata_key in (ACTIONABLE_FAILED_CHECKS_METADATA_KEY, SUPPRESSED_FAILED_CHECKS_METADATA_KEY):
+        private_checks = result._private_metadata.get(metadata_key)
+        if _private_checks_contain_actionable_evidence(private_checks):
+            return True
+    return False
+
+
+def _private_checks_contain_actionable_evidence(private_checks: Any) -> bool:
+    if not isinstance(private_checks, list):
+        return False
+    for private_check in private_checks:
+        if not isinstance(private_check, dict):
+            continue
+        if private_check.get("severity") in {IssueSeverity.WARNING.value, IssueSeverity.CRITICAL.value}:
+            return True
+    return False
+
+
+def _validated_alternate_format_for_mismatch(
+    result: ScanResult,
+    *,
+    header_format: str,
+    magic_format: str,
+) -> str | None:
+    """Return a validated alternate format that can demote extension mismatch."""
+    validated_format = result.metadata.get(VALIDATED_FORMAT_METADATA_KEY)
+    if not isinstance(validated_format, str):
+        return None
+    if validated_format != result.scanner_name:
+        return None
+    if validated_format not in _ALTERNATE_VALIDATED_FORMAT_ALLOWED_INCONCLUSIVE_REASONS:
+        return None
+    if header_format not in {validated_format, PROTOBUF_MODEL_CANDIDATE_FORMAT} and magic_format not in {
+        validated_format,
+        PROTOBUF_MODEL_CANDIDATE_FORMAT,
+    }:
+        return None
+    if result.has_errors or result.has_warnings or _has_private_actionable_scanner_evidence(result):
+        return None
+    if result.metadata.get(OPERATIONAL_ERROR_METADATA_KEY) is True:
+        return None
+    if (
+        result.success is False
+        or result.metadata.get(SCAN_OUTCOME_METADATA_KEY) == INCONCLUSIVE_SCAN_OUTCOME
+        or result.metadata.get("analysis_incomplete") is True
+    ) and not _has_only_allowed_alternate_format_inconclusive_reasons(result, validated_format):
+        return None
+    return validated_format
+
+
 def _mark_xgboost_pickle_extension_spoof(result: ScanResult, path: str, ext: str) -> None:
     """Preserve pickle analysis while flagging XGBoost extension spoofing."""
     existing_reasons = result.metadata.get("scan_outcome_reasons")
@@ -1639,6 +1718,26 @@ def _make_incomplete_protobuf_model_result(path: str) -> ScanResult:
     )
     _mark_inconclusive_scan_outcome(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
     _mark_operational_scan_error(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_sentencepiece_model_proto_result(path: str) -> ScanResult:
+    """Fail closed when a SentencePiece-like protobuf fails ownership validation."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="SentencePiece ModelProto Routing",
+        passed=False,
+        message=(
+            "SentencePiece ModelProto routing was inconclusive because the payload "
+            "looked like a tokenizer protobuf but failed ownership validation"
+        ),
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON)
     result.finish(success=False)
     return result
 
@@ -3868,6 +3967,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         format_probe_error is None
         and header_format in {"unknown", "pytorch_binary"}
         and pytorch_binary_supplemental_scanner_id is None
+        and not (ext == ".model" and _is_malformed_sentencepiece_model_proto_candidate_file(path))
         and scanner_selection.allows("zip")
         and ZipScanner.can_handle(path)
     ):
@@ -3941,6 +4041,13 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             if nested_xgboost_route == "xgboost":
                 config[XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY] = True
     is_xgboost_pickle_spoof = ext in _XGBOOST_BINARY_EXTENSIONS and header_format == "pickle"
+    sentencepiece_model_proto_owned = (
+        format_probe_error is None
+        and ext == ".model"
+        and header_format == "unknown"
+        and magic_format == "unknown"
+        and is_sentencepiece_model_proto_file(path)
+    )
     # Record telemetry for file type detection
     detected_format = header_format if header_format != "unknown" else ext_format
     record_file_type_detected(path, detected_format)
@@ -3983,6 +4090,14 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         return sr
     if header_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT or magic_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT:
         sr = _make_incomplete_onnx_routing_result(path)
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
+    if (
+        header_format == SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+        or magic_format == SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+    ):
+        sr = _make_incomplete_sentencepiece_model_proto_result(path)
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
@@ -4060,19 +4175,22 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             f"File type validation failed: extension indicates {ext_format} but magic bytes "
             f"indicate {magic_format}. This could indicate file spoofing or corruption."
         )
-        logger.warning(discrepancy_msg)
-    elif header_format != ext_format and header_format != "unknown" and ext_format != "unknown":
-        # Suppress expected container-vs-extension differences for known wrapper formats.
-        if not (
+    elif (
+        header_format != ext_format
+        and header_format != "unknown"
+        and ext_format != "unknown"
+        and not (
             (ext_format == "pytorch_binary" and header_format in ["zip", "pickle"] and ext == ".bin")
             or (ext_format == "pytorch_binary" and header_format == "pickle" and ext in [".pt", ".pth"])
             or (ext_format == "pickle" and header_format == "jax_checkpoint" and ext in [".ckpt", ".pickle"])
             or (ext_format == "keras" and header_format in ["zip", "hdf5"])
             or (ext_format == "protobuf" and header_format == "onnx" and ext == ".pb")
             or (ext_format == "skops" and header_format == "zip" and ext == ".skops")
-        ):
-            discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
-            logger.debug(discrepancy_msg)
+        )
+    ):
+        # Suppress expected container-vs-extension differences for known wrapper formats.
+        discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
+        logger.debug(discrepancy_msg)
 
     # Prefer scanners based on trusted structure rather than the filename alone.
     preferred_scanner: type[BaseScanner] | None = None
@@ -4204,7 +4322,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 and scanner_selection.allows(fallback_scanner_id)
             ):
                 scanner_class = _registry.load_scanner_by_id(fallback_scanner_id)
-        elif scanner_class is None:
+        elif scanner_class is None and not sentencepiece_model_proto_owned:
             scanner_class = _registry.get_scanner_for_path(
                 path,
                 scanner_selection=scanner_selection if scanner_selection.active else None,
@@ -4280,7 +4398,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     kind=SCANNER_SELECTION_PREFERRED_KIND,
                 )
         else:
-            if unavailable_preferred_scanner_id is None and scanner_selection.active:
+            if (
+                unavailable_preferred_scanner_id is None
+                and scanner_selection.active
+                and not sentencepiece_model_proto_owned
+            ):
                 candidate_scanner_id = skipped_preferred_scanner_id
                 if candidate_scanner_id is None:
                     candidate_scanner_class = _registry.get_scanner_for_path(path)
@@ -4340,6 +4462,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 sr = _make_incomplete_xgboost_ubjson_routing_result(path)
             elif magic_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_onnx_routing_result(path)
+            elif magic_format == SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_sentencepiece_model_proto_result(path)
             elif magic_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_pickle_routing_result(path)
             elif magic_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
@@ -4476,22 +4600,59 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         )
 
     if discrepancy_msg:
-        # Determine severity based on whether it's a validation failure or just a discrepancy
-        severity = IssueSeverity.WARNING if not file_type_valid else IssueSeverity.DEBUG
-        # For validation failures, use the actual magic format
-        detail_header_format = magic_format if not file_type_valid else header_format
+        validated_alternate_format = (
+            _validated_alternate_format_for_mismatch(
+                result,
+                header_format=header_format,
+                magic_format=magic_format,
+            )
+            if not file_type_valid
+            else None
+        )
+        if validated_alternate_format is not None:
+            severity = IssueSeverity.INFO
+            rule_code = None
+            file_type_validation_failed = False
+            detail_header_format = magic_format
+            check_message = (
+                f"File extension indicates {ext_format} but {validated_alternate_format} scanner validated "
+                f"content indicated by {magic_format}. Filename and content disagree; using validated "
+                "alternate-format analysis."
+            )
+        else:
+            # Determine severity based on whether it's a validation failure or just a discrepancy
+            severity = IssueSeverity.WARNING if not file_type_valid else IssueSeverity.DEBUG
+            rule_code = "S901" if not file_type_valid else None
+            file_type_validation_failed = not file_type_valid
+            # For validation failures, use the actual magic format
+            detail_header_format = magic_format if not file_type_valid else header_format
+            check_message = discrepancy_msg + " Using header-based detection."
+        details = {
+            "extension_format": ext_format,
+            "header_format": detail_header_format,
+            "file_type_validation_failed": file_type_validation_failed,
+        }
+        if validated_alternate_format is not None:
+            details.update(
+                {
+                    "alternate_format_validated": True,
+                    "original_file_type_validation_failed": True,
+                    "validated_format": validated_alternate_format,
+                }
+            )
+            logger.info(check_message)
+        elif not file_type_valid:
+            logger.warning(discrepancy_msg)
+        else:
+            logger.debug(discrepancy_msg)
         result.add_check(
             name="Format Validation",
             passed=False,
-            message=discrepancy_msg + " Using header-based detection.",
+            message=check_message,
             severity=severity,
             location=path,
-            details={
-                "extension_format": ext_format,
-                "header_format": detail_header_format,
-                "file_type_validation_failed": not file_type_valid,
-            },
-            rule_code="S901" if not file_type_valid else None,
+            details=details,
+            rule_code=rule_code,
         )
 
     # Ensure bytes_scanned reflects the actual file size even when a scanner
@@ -4724,6 +4885,7 @@ def scan_model_streaming(
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
     is_hf_cache = base_dir is not None and hf_cache_root is not None
+    stream_started = False
 
     try:
         file_iterator = iter(file_generator)
@@ -4731,11 +4893,40 @@ def scan_model_streaming(
         while True:
             try:
                 file_path, _is_last = next(file_iterator)
+                stream_started = True
             except StopIteration:
                 if not scanning_deferred_openvino_sidecars and deferred_openvino_sidecars:
                     file_iterator = iter((sidecar_path, True) for sidecar_path in deferred_openvino_sidecars.values())
                     scanning_deferred_openvino_sidecars = True
                     continue
+                break
+            except Exception as e:
+                if not stream_started:
+                    raise
+                logger.error(f"Streaming source interrupted after partial scan: {e}")
+                results.has_errors = True
+                results.success = False
+                preserve_shard_reconciliation_errors = True
+                aggregate_hash_complete = False
+                _add_issue_to_model(
+                    results,
+                    (
+                        "Streaming source interrupted before all artifacts could be scanned; "
+                        "partial results were preserved."
+                    ),
+                    severity=IssueSeverity.INFO.value,
+                    details={
+                        "analysis_incomplete": True,
+                        "operational_error": True,
+                        "operational_error_reason": _STREAMING_SOURCE_INTERRUPTED_REASON,
+                        "exception_type": type(e).__name__,
+                        "files_scanned_before_failure": results.files_scanned,
+                        "scan_outcome": "inconclusive",
+                        "scan_outcome_reason": _STREAMING_SOURCE_INTERRUPTED_REASON,
+                        "scan_outcome_reasons": [_STREAMING_SOURCE_INTERRUPTED_REASON],
+                    },
+                    issue_type=_STREAMING_SOURCE_INTERRUPTED_REASON,
+                )
                 break
 
             source_path = Path(file_path)
