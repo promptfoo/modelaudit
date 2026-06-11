@@ -1,17 +1,150 @@
 """Tests for content hash generation in regular scan mode."""
 
+import builtins
 import hashlib
 import os
 import pickle
 import zipfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import TracebackType
+from typing import Any, BinaryIO, cast
 
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from tests.helpers import create_mock_pytorch_zip
+
+_PYTORCH_LEGACY_MAGIC_NUMBER = 0x1950A86A20F9469CFC6C
+_PYTORCH_LEGACY_PROTOCOL_VERSION = 1001
+
+
+def _binunicode(value: bytes) -> bytes:
+    return b"X" + len(value).to_bytes(4, "little") + value
+
+
+def _legacy_pytorch_object_stream(
+    storage_keys: tuple[str, ...],
+    storage_size: int,
+    *,
+    object_padding: int = 0,
+) -> bytes:
+    object_stream = bytearray(b"\x80\x02]")
+    for key in storage_keys:
+        encoded_key = key.encode("ascii")
+        object_stream += b"(" + _binunicode(b"storage")
+        object_stream += b"ctorch\nByteStorage\n"
+        object_stream += _binunicode(encoded_key) + _binunicode(b"cpu")
+        object_stream += pickle.dumps(storage_size, protocol=2)[2:-1]
+        object_stream += b"NtQa"
+    if object_padding:
+        object_stream += pickle.dumps("A" * object_padding, protocol=2)[2:-1] + b"a"
+    object_stream += b"."
+    return bytes(object_stream)
+
+
+def _make_legacy_pytorch_container(
+    storage_payload: bytes,
+    *,
+    sys_info_padding: int = 0,
+    object_padding: int = 0,
+) -> tuple[bytes, dict[str, int]]:
+    sys_info: dict[str, object] = {
+        "protocol_version": _PYTORCH_LEGACY_PROTOCOL_VERSION,
+        "little_endian": True,
+        "type_sizes": {"short": 2, "int": 4, "long": 8},
+    }
+    if sys_info_padding:
+        sys_info["padding"] = "A" * sys_info_padding
+
+    storage_keys = ("0",)
+    control_streams = {
+        "magic": pickle.dumps(_PYTORCH_LEGACY_MAGIC_NUMBER, protocol=2),
+        "protocol": pickle.dumps(_PYTORCH_LEGACY_PROTOCOL_VERSION, protocol=2),
+        "sys_info": pickle.dumps(sys_info, protocol=2),
+        "object": _legacy_pytorch_object_stream(
+            storage_keys,
+            len(storage_payload),
+            object_padding=object_padding,
+        ),
+        "storage_keys": pickle.dumps(list(storage_keys), protocol=2),
+    }
+    offsets: dict[str, int] = {}
+    cursor = 0
+    for name, stream in control_streams.items():
+        offsets[f"{name}_start"] = cursor
+        cursor += len(stream)
+        offsets[f"{name}_end"] = cursor
+    offsets["storage_start"] = cursor
+    storage_record = len(storage_payload).to_bytes(8, "little") + storage_payload
+    return b"".join(control_streams.values()) + storage_record, offsets
+
+
+def _make_malformed_legacy_pytorch_near_match() -> tuple[bytes, dict[str, int]]:
+    control_streams = {
+        "magic": pickle.dumps(_PYTORCH_LEGACY_MAGIC_NUMBER, protocol=2),
+        "protocol": pickle.dumps(_PYTORCH_LEGACY_PROTOCOL_VERSION, protocol=2),
+        "sys_info": pickle.dumps(
+            {"protocol_version": _PYTORCH_LEGACY_PROTOCOL_VERSION, "little_endian": True},
+            protocol=2,
+        ),
+    }
+    offsets: dict[str, int] = {}
+    cursor = 0
+    for name, stream in control_streams.items():
+        offsets[f"{name}_start"] = cursor
+        cursor += len(stream)
+        offsets[f"{name}_end"] = cursor
+    offsets["object_start"] = cursor
+    return b"".join(control_streams.values()) + b"\x80\x02]" + (b"A" * 2048), offsets
+
+
+class _TrackingBinaryFile:
+    def __init__(self, raw: BinaryIO) -> None:
+        self._raw = raw
+        self.max_position = 0
+
+    def __enter__(self) -> "_TrackingBinaryFile":
+        self._raw.__enter__()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool | None:
+        return self._raw.__exit__(exc_type, exc, traceback)
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._raw.read(size)
+        self.max_position = max(self.max_position, self._raw.tell())
+        return data
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        position = self._raw.seek(offset, whence)
+        self.max_position = max(self.max_position, position)
+        return position
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._raw, name)
+
+
+def _track_binary_reads_for_path(monkeypatch: pytest.MonkeyPatch, path: Path) -> list[_TrackingBinaryFile]:
+    original_open = cast(Any, builtins.open)
+    trackers: list[_TrackingBinaryFile] = []
+
+    def tracking_open(file: object, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        opened = original_open(file, mode, *args, **kwargs)
+        if isinstance(file, (str, os.PathLike)) and Path(file) == path and "b" in mode:
+            tracker = _TrackingBinaryFile(cast(BinaryIO, opened))
+            trackers.append(tracker)
+            return tracker
+        return opened
+
+    monkeypatch.setattr(builtins, "open", tracking_open)
+    return trackers
 
 
 class TestRegularScanContentHash:
@@ -491,6 +624,177 @@ class TestHashGenerationEdgeCases:
 
         assert hashed_paths == [str(zip_path)]
         assert content_hashes[str(zip_path)] == original_hash(str(zip_path))
+
+    @pytest.mark.parametrize(
+        ("padding_target", "read_limit_offset"),
+        [
+            ("sys_info", "sys_info_start"),
+            ("object", "object_start"),
+        ],
+    )
+    def test_hash_files_by_path_defers_valid_long_legacy_pytorch_control_metadata(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        padding_target: str,
+        read_limit_offset: str,
+    ) -> None:
+        """Valid incomplete legacy PyTorch control metadata must not be full-hashed."""
+        from modelaudit import core
+
+        payload, offsets = _make_legacy_pytorch_container(
+            b"A" * 256,
+            sys_info_padding=1024 if padding_target == "sys_info" else 0,
+            object_padding=1024 if padding_target == "object" else 0,
+        )
+        legacy_path = tmp_path / f"long-{padding_target}.pt"
+        legacy_path.write_bytes(payload)
+        read_limit = offsets[read_limit_offset] + 8
+
+        def fail_hash(path: str) -> str:
+            if path == str(legacy_path):
+                pytest.fail("valid long legacy PyTorch control metadata was content-hashed")
+            return "a" * 64
+
+        monkeypatch.setattr(core, "_calculate_file_hash", fail_hash)
+
+        content_hashes = core._hash_files_by_path(
+            [str(legacy_path)],
+            config={"max_file_read_size": read_limit},
+        )
+
+        assert content_hashes[str(legacy_path)].startswith("unhashable_pytorch_zip_read_limit_")
+
+    def test_single_file_scan_bypasses_cache_hash_for_valid_long_legacy_pytorch_control(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cache lookup must not full-hash a bounded valid legacy PyTorch control."""
+        from modelaudit import core
+        from modelaudit.cache import reset_cache_manager
+        from modelaudit.utils.helpers.secure_hasher import SecureFileHasher
+
+        payload, offsets = _make_legacy_pytorch_container(b"A" * 256, sys_info_padding=1024)
+        legacy_path = tmp_path / "long-control-cache.pt"
+        legacy_path.write_bytes(payload)
+        read_limit = offsets["sys_info_start"] + 8
+
+        def fail_cache_hash(self: SecureFileHasher, path: str) -> str:
+            if path == str(legacy_path):
+                pytest.fail("valid long legacy PyTorch control was cache-hashed")
+            return "a" * 64
+
+        monkeypatch.setattr(SecureFileHasher, "hash_file", fail_cache_hash)
+        monkeypatch.setattr(
+            SecureFileHasher,
+            "hash_file_with_stat",
+            lambda self, path, _stat: fail_cache_hash(self, path),
+        )
+
+        reset_cache_manager()
+        try:
+            result = core.scan_file(
+                str(legacy_path),
+                config={
+                    "cache_enabled": True,
+                    "cache_dir": str(tmp_path / "cache"),
+                    "min_cache_file_size": 0,
+                    "max_cache_file_size": 10_000_000,
+                    "max_file_read_size": read_limit,
+                },
+            )
+        finally:
+            reset_cache_manager()
+
+        assert result.metadata["file_size"] == len(payload)
+
+    def test_directory_scan_omits_content_hash_for_valid_long_legacy_pytorch_deferral(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Aggregate content hashes must be omitted when a legacy PyTorch hash is deferred."""
+        from modelaudit import core
+        from modelaudit.scanner_results import ScanResult
+
+        legacy_payload, offsets = _make_legacy_pytorch_container(b"A" * 256, object_padding=1024)
+        legacy_path = tmp_path / "long-control.pt"
+        legacy_path.write_bytes(legacy_payload)
+        safe_path = tmp_path / "safe.pkl"
+        safe_path.write_bytes(pickle.dumps({"safe": True}, protocol=4))
+        read_limit = offsets["object_start"] + 8
+        original_hash = core._calculate_file_hash
+        hashed_paths: list[str] = []
+
+        def track_hash(path: str) -> str:
+            hashed_paths.append(path)
+            if path == str(legacy_path):
+                pytest.fail("deferred legacy PyTorch file was included in aggregate content hashing")
+            return original_hash(path)
+
+        def successful_scan(path: str, _config: dict[str, object]) -> ScanResult:
+            scan_result = ScanResult(scanner_name="bounded_test")
+            scan_result.bytes_scanned = Path(path).stat().st_size
+            scan_result.finish(success=True)
+            return scan_result
+
+        monkeypatch.setattr(core, "_calculate_file_hash", track_hash)
+        monkeypatch.setattr(core, "scan_file", successful_scan)
+
+        result = scan_model_directory_or_file(
+            str(tmp_path),
+            max_file_read_size=read_limit,
+            cache_enabled=False,
+        )
+
+        assert str(safe_path) in hashed_paths
+        assert str(legacy_path) not in hashed_paths
+        assert result.success is True
+        assert result.content_hash is None
+
+    def test_legacy_pytorch_hash_deferral_does_not_read_beyond_configured_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A complete valid control probe should defer without reading storage headers past the cap."""
+        from modelaudit.scanners.pickle_scanner import PickleScanner
+        from modelaudit.utils.helpers.cache_decorator import should_defer_hash_for_pytorch_read_limit
+
+        PickleScanner()
+        payload, offsets = _make_legacy_pytorch_container(b"A" * 256)
+        legacy_path = tmp_path / "bounded-control.pt"
+        legacy_path.write_bytes(payload)
+        read_limit = offsets["storage_start"]
+        trackers = _track_binary_reads_for_path(monkeypatch, legacy_path)
+
+        assert should_defer_hash_for_pytorch_read_limit(
+            str(legacy_path),
+            {"max_file_read_size": read_limit},
+            file_size=len(payload),
+        )
+        assert trackers
+        assert max(tracker.max_position for tracker in trackers) <= read_limit
+
+    def test_malformed_legacy_pytorch_near_match_does_not_defer_or_overread(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Malformed preamble near-matches must not bypass full hashing or exceed the read cap."""
+        from modelaudit.scanners.pickle_scanner import PickleScanner
+        from modelaudit.utils.helpers.cache_decorator import should_defer_hash_for_pytorch_read_limit
+
+        PickleScanner()
+        payload, offsets = _make_malformed_legacy_pytorch_near_match()
+        malformed_path = tmp_path / "malformed-near-match.pt"
+        malformed_path.write_bytes(payload)
+        read_limit = offsets["object_start"] + 8
+        trackers = _track_binary_reads_for_path(monkeypatch, malformed_path)
+
+        assert (
+            should_defer_hash_for_pytorch_read_limit(
+                str(malformed_path),
+                {"max_file_read_size": read_limit},
+                file_size=len(payload),
+            )
+            is False
+        )
+        assert trackers
+        assert max(tracker.max_position for tracker in trackers) <= read_limit
 
     def test_single_file_scan_defers_oversized_pytorch_zip_content_hash(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

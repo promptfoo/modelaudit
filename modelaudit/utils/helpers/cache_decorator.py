@@ -250,7 +250,11 @@ def _should_defer_hash_for_legacy_pytorch_read_limit(
     max_file_read_size: int,
 ) -> bool:
     try:
-        from ...scanners.pickle_scanner import PickleScanner
+        from ...scanners.pickle_scanner import (
+            PickleScanner,
+            _legacy_pytorch_incomplete_sys_info_needs_more_bytes,
+            _legacy_pytorch_object_probe_needs_more_bytes,
+        )
 
         scanner = PickleScanner(config=config)
         control_probe_size = min(
@@ -262,18 +266,17 @@ def _should_defer_hash_for_legacy_pytorch_read_limit(
         with open(file_path, "rb") as handle:
             control_probe = handle.read(control_probe_size)
 
-            def read_at(local_offset: int, size: int) -> bytes:
-                handle.seek(local_offset)
-                return handle.read(size)
-
             legacy_layout, _legacy_storage_valid = scanner._legacy_pytorch_layout_for_scan(
                 control_probe,
                 total_size=file_size,
-                read_at=read_at,
             )
     except Exception:
         return False
-    return legacy_layout is not None
+    if legacy_layout is not None:
+        return True
+    return _legacy_pytorch_incomplete_sys_info_needs_more_bytes(
+        control_probe
+    ) or _legacy_pytorch_object_probe_needs_more_bytes(control_probe)
 
 
 def should_defer_hash_for_pytorch_read_limit(
