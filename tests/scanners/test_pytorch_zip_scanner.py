@@ -8171,6 +8171,30 @@ def test_pytorch_zip_static_getattr_framework_reconstruction_does_not_emit_s115(
     assert not _critical_s115_getattr_issues(result)
 
 
+@pytest.mark.parametrize("method_name", ["__getattr__", "__getattribute__"])
+def test_pytorch_zip_static_getattr_ignores_instance_attribute_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "import os\n\n"
+        "class Detect:\n"
+        f"    def {method_name}(self, name):\n"
+        "        os.system('id')\n"
+        "        return super().__getattribute__(name)\n\n"
+        "    def forward(self):\n"
+        "        return None\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert not _critical_s115_getattr_issues(result)
+
+
 def test_pytorch_zip_static_getattr_protocol0_reconstruction_does_not_emit_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -8407,6 +8431,22 @@ def test_pytorch_zip_static_getattr_dynamic_metaclass_keyword_lookup_keeps_s115(
         "class Detect(**{'metaclass': DetectMeta}):\n"
         "    def forward(self):\n"
         "        return None\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
+def test_pytorch_zip_static_getattr_unresolved_base_lookup_keeps_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect(ExternalBase):\n    def forward(self):\n        return None\n",
     )
     model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
 

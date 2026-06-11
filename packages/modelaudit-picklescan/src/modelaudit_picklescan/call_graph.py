@@ -4919,12 +4919,12 @@ def _class_lookup_has_source_backed_plain_metaclass(
     if _class_definition_has_dynamic_lookup_context(context.class_node):
         return False
     next_visited = visited | {class_key}
-    for base in _class_base_targets(
-        context.class_node,
-        context.module_name,
-        context.aliases,
-        context.local_defs,
-    ):
+    base_targets = _class_base_targets_for_static_lookup(
+        context.class_node, context.module_name, context.aliases, context.local_defs
+    )
+    if base_targets is None:
+        return False
+    for base in base_targets:
         base_context = _class_source_context_for_target(
             base,
             context.module_name,
@@ -4936,6 +4936,23 @@ def _class_lookup_has_source_backed_plain_metaclass(
         if base_context is None or not _class_lookup_has_source_backed_plain_metaclass(base_context, next_visited):
             return False
     return True
+
+
+def _class_base_targets_for_static_lookup(
+    class_node: ast.ClassDef,
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+) -> tuple[str, ...] | None:
+    targets: list[str] = []
+    for base in class_node.bases:
+        resolved = _resolve_expr(base, module_name, aliases, local_defs)
+        if resolved in {"object", "builtins.object"}:
+            continue
+        if resolved is None or "." not in resolved:
+            return None
+        targets.append(resolved)
+    return tuple(targets)
 
 
 def _class_body_statement_binds_name(statement: ast.stmt, name: str) -> bool:

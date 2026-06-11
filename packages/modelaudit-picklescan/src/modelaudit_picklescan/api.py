@@ -99,7 +99,6 @@ _TRUSTED_STATIC_GETATTR_RECONSTRUCTIONS = frozenset(
         ("ultralytics.nn.modules.head", "Detect", "forward"),
     }
 )
-_GETATTR_LOOKUP_SOURCE_PROOF_POSITION = -10_001
 _GETATTR_RESOLVED_SOURCE_PROOF_POSITION = -10_002
 _ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
 _ZIP_EOCD_MIN_SIZE = 22
@@ -1755,33 +1754,22 @@ def _getattr_reconstruction_has_source_backed_proof(invocation: Mapping[str, obj
     attribute_name = str(invocation.get("getattr_attribute_name", ""))
     if not class_static_attribute_lookup_is_proven_source_backed(target_module, target_name, attribute_name):
         return False
-    _lookup_invocation, resolved_invocation = _getattr_reconstruction_source_proof_invocations(invocation)
+    resolved_invocation = _getattr_reconstruction_resolved_source_proof_invocation(invocation)
     analyzed_positions = find_analyzed_callable_call_graph_global_positions((resolved_invocation,))
     return _GETATTR_RESOLVED_SOURCE_PROOF_POSITION in analyzed_positions
 
 
 def _getattr_reconstruction_reaches_dangerous_call_graph(invocation: Mapping[str, object]) -> bool:
-    lookup_invocation, resolved_invocation = _getattr_reconstruction_source_proof_invocations(invocation)
-    return bool(find_dangerous_call_graphs((), (lookup_invocation, resolved_invocation)))
+    resolved_invocation = _getattr_reconstruction_resolved_source_proof_invocation(invocation)
+    return bool(find_dangerous_call_graphs((), (resolved_invocation,)))
 
 
-def _getattr_reconstruction_source_proof_invocations(
+def _getattr_reconstruction_resolved_source_proof_invocation(
     invocation: Mapping[str, object],
-) -> tuple[dict[str, object], dict[str, object]]:
-    target_module = str(invocation.get("getattr_target_module", ""))
-    target_name = str(invocation.get("getattr_target_name", ""))
+) -> dict[str, object]:
     resolved_module = str(invocation.get("getattr_resolved_module", ""))
     resolved_name = str(invocation.get("getattr_resolved_name", ""))
-    lookup_invocation = {
-        "opcode": "BUILD",
-        "module": target_module,
-        "name": target_name,
-        "import_reference": f"{target_module}.{target_name}",
-        "positional_arg_count": 1,
-        "global_position": _GETATTR_LOOKUP_SOURCE_PROOF_POSITION,
-        "opcode_position": invocation.get("opcode_position"),
-    }
-    resolved_invocation = {
+    return {
         "opcode": "REDUCE",
         "module": resolved_module,
         "name": resolved_name,
@@ -1790,7 +1778,6 @@ def _getattr_reconstruction_source_proof_invocations(
         "global_position": _GETATTR_RESOLVED_SOURCE_PROOF_POSITION,
         "opcode_position": invocation.get("opcode_position"),
     }
-    return lookup_invocation, resolved_invocation
 
 
 def _without_proven_safe_getattr_reconstruction_findings(

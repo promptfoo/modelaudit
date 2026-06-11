@@ -328,6 +328,32 @@ def test_scan_bytes_suppresses_static_ultralytics_getattr_forward_reconstruction
     assert invocation["getattr_resolved_import_reference"] == "ultralytics.nn.modules.head.Detect.forward"
 
 
+@pytest.mark.parametrize("method_name", ["__getattr__", "__getattribute__"])
+def test_scan_bytes_static_getattr_ignores_instance_attribute_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "import os\n\n"
+        "class Detect:\n"
+        f"    def {method_name}(self, name):\n"
+        "        os.system('id')\n"
+        "        return super().__getattribute__(name)\n\n"
+        "    def forward(self):\n"
+        "        return None\n",
+    )
+
+    report = scan_bytes(
+        _static_getattr_reduce_payload(),
+        source=f"instance-{method_name}-static-getattr.pkl",
+    )
+
+    assert not _dangerous_getattr_findings(report)
+
+
 def test_scan_bytes_tracks_static_getattr_reconstructed_result_invocation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -690,6 +716,23 @@ def test_scan_bytes_static_getattr_dynamic_metaclass_keyword_lookup_stays_critic
     )
 
     report = scan_bytes(_static_getattr_reduce_payload(), source="dynamic-metaclass-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_unresolved_base_lookup_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect(ExternalBase):\n    def forward(self):\n        return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="unresolved-base-static-getattr.pkl")
 
     findings = _dangerous_getattr_findings(report)
     assert findings
