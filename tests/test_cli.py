@@ -75,6 +75,12 @@ def strip_ansi(text: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*m", "", text)
 
 
+def _make_trusted_shard_parent(path: Path, *, parents: bool = False) -> None:
+    """Create a shard parent without inheriting group-write test umasks."""
+    path.mkdir(parents=parents)
+    path.chmod(0o755)
+
+
 def create_mock_scan_result(**kwargs: Any) -> ModelAuditResultModel:
     """Create a mock ModelAuditResultModel for testing."""
     result = create_initial_audit_result()
@@ -713,7 +719,7 @@ def test_scan_multiple_cross_directory_shards_reconciles_complete_family(tmp_pat
     shard_paths: list[str] = []
     for shard_index in range(1, 4):
         shard_dir = tmp_path / f"part-{shard_index}"
-        shard_dir.mkdir()
+        _make_trusted_shard_parent(shard_dir)
         shard_path = shard_dir / f"model-{shard_index:05d}-of-00003.safetensors"
         shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
         shard_paths.append(str(shard_path))
@@ -744,7 +750,7 @@ def test_scan_cross_directory_shards_ignores_duplicate_explicit_argument(tmp_pat
     shard_paths: list[str] = []
     for shard_index in range(1, 3):
         shard_dir = tmp_path / f"part-{shard_index}"
-        shard_dir.mkdir()
+        _make_trusted_shard_parent(shard_dir)
         shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
         shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
         shard_paths.append(str(shard_path))
@@ -779,7 +785,7 @@ def test_scan_cross_directory_shards_preserves_nonexistent_path_error(tmp_path: 
     shard_paths: list[str] = []
     for shard_index in range(1, 3):
         shard_dir = tmp_path / f"part-{shard_index}"
-        shard_dir.mkdir()
+        _make_trusted_shard_parent(shard_dir)
         shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
         shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
         shard_paths.append(str(shard_path))
@@ -821,7 +827,7 @@ def test_scan_multiple_cross_directory_shards_reconciles_independent_families(tm
     for family_name in ("model-a", "model-b"):
         for shard_index, shard_directory_name in ((1, "left"), (2, "right")):
             shard_dir = tmp_path / family_name / shard_directory_name
-            shard_dir.mkdir(parents=True)
+            _make_trusted_shard_parent(shard_dir, parents=True)
             shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
             shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
             shard_paths.append(str(shard_path))
@@ -858,7 +864,7 @@ def test_scan_cross_directory_shards_keeps_ambiguous_incomplete_families(tmp_pat
         ("incomplete-b", "right", 2),
     ):
         shard_dir = tmp_path / family_name / shard_directory_name
-        shard_dir.mkdir(parents=True)
+        _make_trusted_shard_parent(shard_dir, parents=True)
         shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
         shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
         shard_paths.append(str(shard_path))
@@ -4127,10 +4133,11 @@ def test_scan_huggingface_cached_stream_reconciles_snapshot_alias_shards(
     mock_is_hf_url.return_value = True
     header = b'{"__metadata__":{"format":"pt"}}'
     cache_root = tmp_path / "persistent-cache"
+    _make_trusted_shard_parent(cache_root / "huggingface", parents=True)
     snapshot_dir = cache_root / "huggingface" / "models--test--model" / "snapshots" / _HF_TEST_REVISION
-    snapshot_dir.mkdir(parents=True)
+    _make_trusted_shard_parent(snapshot_dir, parents=True)
     alias_root = cache_root / "huggingface" / "test" / "model"
-    alias_root.mkdir(parents=True)
+    _make_trusted_shard_parent(alias_root, parents=True)
     first_alias = alias_root / "cache-a"
     second_alias = alias_root / "cache-b"
     first_alias.symlink_to(snapshot_dir, target_is_directory=True)
