@@ -229,6 +229,12 @@ def _build_printable_utf8_ambiguous_binary_route() -> bytes:
     return (b'""' + ("é" * 17).encode("utf-8")) * 4097
 
 
+def _build_printable_utf8_protobuf_candidate_route() -> bytes:
+    """Build printable UTF-8 protobuf fields that exhaust bounded model routing."""
+    field_payload = ("é" * 60).encode("utf-8") + b" x:12"
+    return (b"B" + bytes([len(field_payload)]) + field_payload) * 4097
+
+
 def _build_large_text_owner_text(line: str = "Ġtoken token\n") -> str:
     """Build deterministic text above the binary-routing fast path."""
     repeat_count = (3 * 1024 * 1024) // len(line.encode("utf-8")) + 1
@@ -5165,6 +5171,36 @@ def test_scan_file_fails_closed_for_printable_utf8_text_suffix_binary_candidate(
     assert core_module.determine_exit_code(aggregate) == 2
 
 
+@pytest.mark.parametrize("filename", ["ambiguous.txt", "settings.conf"])
+def test_scan_file_fails_closed_for_printable_utf8_text_suffix_protobuf_candidate(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    payload = _build_printable_utf8_protobuf_candidate_route()
+    candidate = tmp_path / filename
+    candidate.write_bytes(payload)
+
+    assert file_detection.detect_file_format(str(candidate)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert file_detection.detect_file_format_from_magic(str(candidate)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert file_detection.detect_file_format_for_skip_filter(str(candidate)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+    result = scan_file(str(candidate), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(candidate), cache_scan_results=False)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert any(
+        reason
+        in {
+            "onnx_tentative_candidate_analysis_unavailable",
+            "onnx_tentative_candidate_parse_incomplete",
+            "coreml_analysis_incomplete",
+        }
+        for reason in result.metadata["scan_outcome_reasons"]
+    )
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
 def test_scan_file_fails_closed_for_large_printable_utf8_non_text_suffix_binary_candidate(tmp_path: Path) -> None:
     unit = _build_printable_utf8_ambiguous_binary_route()
     payload = unit * ((2 * 1024 * 1024) // len(unit) + 1)
@@ -5206,6 +5242,33 @@ def test_scan_file_fails_closed_for_nested_printable_utf8_non_text_suffix_binary
     )
     assert result.metadata["contents"] == [
         {"path": f"{archive}:payload.jpg", "type": "flax_msgpack", "size": len(payload)}
+    ]
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_fails_closed_for_nested_printable_utf8_text_suffix_protobuf_candidate(tmp_path: Path) -> None:
+    payload = _build_printable_utf8_protobuf_candidate_route()
+    archive = tmp_path / "protobuf-text-bundle.zip"
+    _create_misnamed_zip(archive, {"models/ambiguous.txt": payload})
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        reason
+        in {
+            "onnx_tentative_candidate_analysis_unavailable",
+            "onnx_tentative_candidate_parse_incomplete",
+            "coreml_analysis_incomplete",
+        }
+        for reason in result.metadata["scan_outcome_reasons"]
+    )
+    assert result.metadata["contents"] == [
+        {"path": f"{archive}:models/ambiguous.txt", "type": "unknown", "size": len(payload)}
     ]
     assert core_module.determine_exit_code(aggregate) == 2
 
