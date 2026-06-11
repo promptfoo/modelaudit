@@ -146,9 +146,39 @@ _PICKLE_BINARY_PROTOCOL_PREFIXES: tuple[bytes, ...] = (
 _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
 _TRUSTED_STORAGE_PICKLE_PROBE_BYTES = 4 * 1024
 _PICKLE_FRAME_OPCODE_BYTES = 9
+_PYTORCH_STORAGE_TRUST_MAX_OPCODES = 100_000
+_PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH = 1024
+_PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES = 100_000
+_PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH = 64
+_PYTORCH_STORAGE_TRUST_MAX_REFERENCED_KEYS = 10_000
 _JIT_SCAN_MEMBER_MAX_BYTES = 32 * 1024 * 1024
 _PICKLE_DISCOVERY_LONG_PROBE_BYTES = PROTO0_1_MAX_PROBE_BYTES
 _NESTED_ZIP_HEADER_PROBE_BYTES = 4
+_PYTORCH_STORAGE_GLOBAL_NAMES = frozenset(
+    {
+        "BFloat16Storage",
+        "BoolStorage",
+        "ByteStorage",
+        "CharStorage",
+        "ComplexDoubleStorage",
+        "ComplexFloatStorage",
+        "DoubleStorage",
+        "FloatStorage",
+        "HalfStorage",
+        "IntStorage",
+        "LongStorage",
+        "QInt32Storage",
+        "QInt8Storage",
+        "QUInt8Storage",
+        "QUInt4x2Storage",
+        "QUInt2x4Storage",
+        "ShortStorage",
+        "UntypedStorage",
+    }
+)
+_PYTORCH_STORAGE_GLOBALS = frozenset(
+    (module, name) for module in ("torch", "torch.storage") for name in _PYTORCH_STORAGE_GLOBAL_NAMES
+)
 _ZIP_LOCAL_FILE_SIGNATURES: tuple[bytes, ...] = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 CRITICAL_SYSTEM_PATHS: tuple[str, ...] = (
     "/etc",
@@ -1280,11 +1310,11 @@ class PyTorchZipScanner(BaseScanner):
         # checks list with one INFO finding apiece.
         probe_failures: list[dict[str, Any]] = []
         for entry in safe_entries:
-            normalized_name = self._get_zip_member_name(entry).replace("\\", "/").lstrip("/")
+            name = self._get_zip_member_name(entry)
             if id(entry) in seen_entries or entry.is_dir():
                 continue
             try:
-                if normalized_name in trusted_storage_blob_members:
+                if name in trusted_storage_blob_members:
                     looks_like_pickle = self._trusted_storage_entry_looks_like_pickle(zip_file, entry, result)
                 else:
                     looks_like_pickle = self._entry_looks_like_pickle(zip_file, entry, result)
@@ -1771,8 +1801,7 @@ class PyTorchZipScanner(BaseScanner):
 
             if self.pickle_scanner is None:
                 bytes_scanned += pickle_data_size
-                normalized_name = name.replace("\\", "/").lstrip("/")
-                trusted_storage_keys = trusted_pytorch_storage_data_pkl_members.get(normalized_name)
+                trusted_storage_keys = trusted_pytorch_storage_data_pkl_members.get(name)
                 if trusted_storage_keys is not None:
                     self._record_trusted_storage_persistent_ids_without_pickle_scanner(
                         zip_file,
@@ -1828,8 +1857,7 @@ class PyTorchZipScanner(BaseScanner):
                     )
             sub_result.metadata.setdefault("archive_file_size", original_file_size)
             apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
-            normalized_name = name.replace("\\", "/").lstrip("/")
-            trusted_storage_keys = trusted_pytorch_storage_data_pkl_members.get(normalized_name)
+            trusted_storage_keys = trusted_pytorch_storage_data_pkl_members.get(name)
             if trusted_storage_keys is not None:
                 self._downgrade_trusted_storage_persistent_ids(sub_result, trusted_storage_keys)
 
@@ -1842,22 +1870,30 @@ class PyTorchZipScanner(BaseScanner):
     @classmethod
     def _trusted_pytorch_storage_data_pkl_members(cls, safe_entries: list[zipfile.ZipInfo]) -> dict[str, set[str]]:
         """Return data.pkl members with PyTorch ZIP storage keys under the same prefix."""
-        members = [(cls._get_zip_member_name(entry).replace("\\", "/").lstrip("/"), entry) for entry in safe_entries]
-        names = {name for name, _entry in members}
+        members = [
+            (cls._get_zip_member_name(entry), entry)
+            for entry in safe_entries
+            if not entry.is_dir() and cls._is_canonical_pytorch_zip_member_name(cls._get_zip_member_name(entry))
+        ]
+        entries_by_name: dict[str, list[zipfile.ZipInfo]] = {}
+        for name, entry in members:
+            entries_by_name.setdefault(name, []).append(entry)
         trusted_members: dict[str, set[str]] = {}
-        for name in names:
+        for name, data_pkl_entries in entries_by_name.items():
             if name.rsplit("/", 1)[-1] != "data.pkl":
                 continue
+            if len(data_pkl_entries) != 1:
+                continue
             prefix = name[: -len("data.pkl")]
-            if f"{prefix}version" not in names:
+            if f"{prefix}version" not in entries_by_name:
                 continue
             data_prefix = f"{prefix}data/"
             storage_keys = {
                 candidate[len(data_prefix) :]
-                for candidate, entry in members
+                for candidate, candidate_entries in entries_by_name.items()
                 if candidate.startswith(data_prefix)
                 and cls._is_ascii_decimal_digits(candidate[len(data_prefix) :])
-                and not entry.is_dir()
+                and len(candidate_entries) == 1
             }
             if storage_keys:
                 trusted_members[name] = storage_keys
@@ -1906,9 +1942,9 @@ class PyTorchZipScanner(BaseScanner):
     ) -> set[str]:
         """Return tensor storage blobs referenced by same-prefix ``data.pkl`` before pickle discovery."""
         members = [
-            (self._get_zip_member_name(entry).replace("\\", "/").lstrip("/"), entry)
+            (self._get_zip_member_name(entry), entry)
             for entry in safe_entries
-            if not entry.is_dir()
+            if not entry.is_dir() and self._is_canonical_pytorch_zip_member_name(self._get_zip_member_name(entry))
         ]
         entries_by_name: dict[str, list[zipfile.ZipInfo]] = {}
         for name, entry in members:
@@ -2032,6 +2068,13 @@ class PyTorchZipScanner(BaseScanner):
                 return None
         return None
 
+    @staticmethod
+    def _is_canonical_pytorch_zip_member_name(name: str) -> bool:
+        if not name or "\\" in name or name.startswith("/"):
+            return False
+        parts = name.split("/")
+        return all(part and part not in {".", ".."} for part in parts)
+
     @classmethod
     def _trusted_storage_keys_from_pickle_bytes(
         cls,
@@ -2039,11 +2082,6 @@ class PyTorchZipScanner(BaseScanner):
         trusted_storage_keys: set[str] | None = None,
     ) -> tuple[set[str], bool]:
         """Extract validated PyTorch storage keys without running the embedded pickle scanner."""
-        try:
-            opcodes = list(pickletools.genops(pickle_data))
-        except Exception:
-            return set(), False
-
         marker = object()
         memo: dict[int, Any] = {}
         stack: list[Any] = []
@@ -2056,7 +2094,16 @@ class PyTorchZipScanner(BaseScanner):
                 if item is marker:
                     return tuple(reversed(items))
                 items.append(item)
+                if len(items) > _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH:
+                    raise ValueError("PyTorch storage persistent ID tuple exceeded trust parser width")
             return None
+
+        def within_limits() -> bool:
+            return (
+                len(stack) <= _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH
+                and len(memo) <= _PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES
+                and len(referenced_keys) <= _PYTORCH_STORAGE_TRUST_MAX_REFERENCED_KEYS
+            )
 
         def memo_key(value: Any) -> int | None:
             try:
@@ -2065,106 +2112,115 @@ class PyTorchZipScanner(BaseScanner):
                 return None
 
         def storage_key_from_pid(pid: Any) -> str | None:
-            if not isinstance(pid, tuple) or len(pid) < 3:
+            if not isinstance(pid, tuple) or len(pid) != 5:
                 return None
             if pid[0] != "storage":
                 return None
             storage_type = pid[1]
             if not (
                 isinstance(storage_type, _PickleGlobalRef)
-                and storage_type.module == "torch"
-                and storage_type.name.endswith("Storage")
+                and (storage_type.module, storage_type.name) in _PYTORCH_STORAGE_GLOBALS
             ):
                 return None
             storage_key = cls._coerce_pickle_string_arg(pid[2])
-            if (
-                storage_key is not None
-                and cls._is_ascii_decimal_digits(storage_key)
-                and (trusted_storage_keys is None or storage_key in trusted_storage_keys)
-            ):
-                return storage_key
-            return None
+            if storage_key is None or not cls._is_ascii_decimal_digits(storage_key):
+                return None
+            if trusted_storage_keys is not None and storage_key not in trusted_storage_keys:
+                return None
+            if cls._coerce_pickle_string_arg(pid[3]) is None:
+                return None
+            storage_size = pid[4]
+            if not isinstance(storage_size, int) or isinstance(storage_size, bool) or storage_size < 0:
+                return None
+            return storage_key
 
-        for opcode, arg, _pos in opcodes:
-            opcode_name = opcode.name
-            if opcode_name in {"PROTO", "FRAME", "STOP"}:
-                continue
-            if opcode_name == "MARK":
-                stack.append(marker)
-            elif opcode_name in {
-                "BINSTRING",
-                "SHORT_BINSTRING",
-                "BINUNICODE",
-                "SHORT_BINUNICODE",
-                "UNICODE",
-                "BINBYTES",
-                "SHORT_BINBYTES",
-            }:
-                stack.append(cls._coerce_pickle_string_arg(arg))
-            elif opcode_name == "GLOBAL":
-                global_name = cls._coerce_pickle_string_arg(arg)
-                if global_name is None:
+        try:
+            for opcode_count, (opcode, arg, _pos) in enumerate(pickletools.genops(pickle_data), start=1):
+                if opcode_count > _PYTORCH_STORAGE_TRUST_MAX_OPCODES:
+                    return set(), False
+                opcode_name = opcode.name
+                if opcode_name in {"PROTO", "FRAME", "STOP"}:
+                    continue
+                if opcode_name == "MARK":
+                    stack.append(marker)
+                elif opcode_name in {
+                    "BINSTRING",
+                    "SHORT_BINSTRING",
+                    "BINUNICODE",
+                    "SHORT_BINUNICODE",
+                    "UNICODE",
+                    "BINBYTES",
+                    "SHORT_BINBYTES",
+                }:
+                    stack.append(cls._coerce_pickle_string_arg(arg))
+                elif opcode_name == "GLOBAL":
+                    global_name = cls._coerce_pickle_string_arg(arg)
+                    if global_name is None:
+                        stack.append(None)
+                    else:
+                        parts = global_name.split()
+                        stack.append(_PickleGlobalRef(parts[0], parts[1]) if len(parts) == 2 else None)
+                elif opcode_name == "STACK_GLOBAL":
+                    if len(stack) < 2:
+                        stack.clear()
+                        continue
+                    name = cls._coerce_pickle_string_arg(stack.pop())
+                    module = cls._coerce_pickle_string_arg(stack.pop())
+                    stack.append(_PickleGlobalRef(module, name) if module is not None and name is not None else None)
+                elif opcode_name == "EMPTY_TUPLE":
+                    stack.append(())
+                elif opcode_name == "TUPLE":
+                    tuple_value = pop_marked_tuple()
+                    if tuple_value is None:
+                        stack.clear()
+                    else:
+                        stack.append(tuple_value)
+                elif opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
+                    tuple_size = int(opcode_name[-1])
+                    if len(stack) < tuple_size:
+                        stack.clear()
+                        continue
+                    items = stack[-tuple_size:]
+                    del stack[-tuple_size:]
+                    stack.append(tuple(items))
+                elif opcode_name in {"BININT", "BININT1", "BININT2", "LONG", "LONG1", "LONG4", "INT"}:
+                    stack.append(arg)
+                elif opcode_name == "NONE":
                     stack.append(None)
-                    continue
-                parts = global_name.split()
-                stack.append(_PickleGlobalRef(parts[0], parts[1]) if len(parts) == 2 else None)
-            elif opcode_name == "STACK_GLOBAL":
-                if len(stack) < 2:
-                    stack.clear()
-                    continue
-                name = cls._coerce_pickle_string_arg(stack.pop())
-                module = cls._coerce_pickle_string_arg(stack.pop())
-                stack.append(_PickleGlobalRef(module, name) if module is not None and name is not None else None)
-            elif opcode_name == "EMPTY_TUPLE":
-                stack.append(())
-            elif opcode_name == "TUPLE":
-                tuple_value = pop_marked_tuple()
-                if tuple_value is None:
-                    stack.clear()
+                elif opcode_name == "NEWTRUE":
+                    stack.append(True)
+                elif opcode_name == "NEWFALSE":
+                    stack.append(False)
+                elif opcode_name in {"BINPUT", "LONG_BINPUT", "PUT"}:
+                    key = memo_key(arg)
+                    if key is not None and stack:
+                        memo[key] = stack[-1]
+                elif opcode_name == "MEMOIZE":
+                    if stack:
+                        memo[len(memo)] = stack[-1]
+                elif opcode_name in {"BINGET", "LONG_BINGET", "GET"}:
+                    key = memo_key(arg)
+                    stack.append(memo.get(key) if key is not None else None)
+                elif opcode_name == "POP":
+                    if stack:
+                        stack.pop()
+                elif opcode_name == "POP_MARK":
+                    pop_marked_tuple()
+                elif opcode_name == "DUP":
+                    if stack:
+                        stack.append(stack[-1])
+                elif opcode_name == "BINPERSID":
+                    pid = stack.pop() if stack else None
+                    storage_key = storage_key_from_pid(pid)
+                    if storage_key is not None:
+                        referenced_keys.add(storage_key)
+                    stack.append(None)
                 else:
-                    stack.append(tuple_value)
-            elif opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
-                tuple_size = int(opcode_name[-1])
-                if len(stack) < tuple_size:
                     stack.clear()
-                    continue
-                items = stack[-tuple_size:]
-                del stack[-tuple_size:]
-                stack.append(tuple(items))
-            elif opcode_name in {"BININT", "BININT1", "BININT2", "LONG", "LONG1", "LONG4", "INT"}:
-                stack.append(arg)
-            elif opcode_name == "NONE":
-                stack.append(None)
-            elif opcode_name == "NEWTRUE":
-                stack.append(True)
-            elif opcode_name == "NEWFALSE":
-                stack.append(False)
-            elif opcode_name in {"BINPUT", "LONG_BINPUT", "PUT"}:
-                key = memo_key(arg)
-                if key is not None and stack:
-                    memo[key] = stack[-1]
-            elif opcode_name == "MEMOIZE":
-                if stack:
-                    memo[len(memo)] = stack[-1]
-            elif opcode_name in {"BINGET", "LONG_BINGET", "GET"}:
-                key = memo_key(arg)
-                stack.append(memo.get(key) if key is not None else None)
-            elif opcode_name == "POP":
-                if stack:
-                    stack.pop()
-            elif opcode_name == "POP_MARK":
-                pop_marked_tuple()
-            elif opcode_name == "DUP":
-                if stack:
-                    stack.append(stack[-1])
-            elif opcode_name == "BINPERSID":
-                pid = stack.pop() if stack else None
-                storage_key = storage_key_from_pid(pid)
-                if storage_key is not None:
-                    referenced_keys.add(storage_key)
-                stack.append(None)
-            else:
-                stack.clear()
+                if not within_limits():
+                    return set(), False
+        except Exception:
+            return set(), False
         return referenced_keys, True
 
     def _record_trusted_storage_persistent_ids_without_pickle_scanner(
@@ -2197,7 +2253,6 @@ class PyTorchZipScanner(BaseScanner):
             logger.debug("Unable to inspect PyTorch storage persistent IDs for %s: %s", pickle_name, exc)
             return
 
-        normalized_name = pickle_name.replace("\\", "/").lstrip("/")
         referenced_storage_keys, parse_complete = self._trusted_storage_keys_from_pickle_bytes(
             pickle_data,
             trusted_storage_keys,
@@ -2214,7 +2269,7 @@ class PyTorchZipScanner(BaseScanner):
                 details={
                     "pickle_rule_code": "PERSISTENT_ID",
                     "opcode": "BINPERSID",
-                    "pickle_filename": normalized_name,
+                    "pickle_filename": pickle_name,
                     "pytorch_storage_key": storage_key,
                     "pytorch_storage_persistent_id": True,
                     "trusted_pytorch_archive_context": True,
@@ -2289,7 +2344,7 @@ class PyTorchZipScanner(BaseScanner):
                     continue
                 # Skip numeric tensor data files to support different versions of PyTorch ZIP files
                 # These are binary weight files that cause performance issues when scanned
-                if normalized_name in trusted_storage_blob_members:
+                if name in trusted_storage_blob_members:
                     continue
                 if entry.file_size > self.max_jit_scan_member_bytes:
                     safe_name = redact_evidence_string(name, max_chars=500)
@@ -2454,7 +2509,7 @@ class PyTorchZipScanner(BaseScanner):
             # A referenced raw tensor storage member is arbitrary bytes rather
             # than a loadable sidecar, so signature bytes are not evidence of
             # an executable. Unreferenced lookalikes must still be inspected.
-            if executable_rule_code is None and normalized_name not in trusted_storage_blob_members:
+            if executable_rule_code is None and name not in trusted_storage_blob_members:
                 try:
                     executable_rule_code, probe_failure = self._executable_member_content_rule_code(
                         zip_file,
@@ -3389,9 +3444,8 @@ class PyTorchZipScanner(BaseScanner):
         trusted_storage_blob_members = self._pytorch_storage_layout_blob_members(safe_entries)
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
-            normalized_name = name.replace("\\", "/").lstrip("/")
-            if normalized_name in trusted_storage_blob_members:
-                data_blob_sizes[normalized_name] = entry.file_size
+            if name in trusted_storage_blob_members:
+                data_blob_sizes[name] = entry.file_size
 
         if not data_blob_sizes:
             return  # No tensor blobs to validate
@@ -3402,8 +3456,7 @@ class PyTorchZipScanner(BaseScanner):
         trusted_storage_data_pkl_members = self._trusted_pytorch_storage_data_pkl_members(safe_entries)
         for pkl_info in pickle_files:
             pkl_name = self._get_zip_member_name(pkl_info)
-            normalized_name = pkl_name.replace("\\", "/").lstrip("/")
-            is_trusted_storage_data_pkl = normalized_name in trusted_storage_data_pkl_members
+            is_trusted_storage_data_pkl = pkl_name in trusted_storage_data_pkl_members
             try:
                 if pkl_info.file_size > max_pkl_read:
                     if is_trusted_storage_data_pkl:

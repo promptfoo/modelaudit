@@ -141,18 +141,31 @@ def _global(module: bytes, name: bytes) -> bytes:
     return b"c" + module + b"\n" + name + b"\n"
 
 
-def _pytorch_storage_persistent_id_payload(key: str) -> bytes:
+def _pytorch_storage_persistent_id_payload(
+    key: str,
+    *,
+    storage_module: str = "torch",
+    storage_name: str = "FloatStorage",
+    size_opcode: bytes = b"K\x01",
+) -> bytes:
     key_bytes = key.encode("ascii")
     return (
         b"\x80\x04("
         + _short_binunicode(b"storage")
-        + _short_binunicode(b"torch")
-        + _short_binunicode(b"FloatStorage")
+        + _short_binunicode(storage_module.encode("ascii"))
+        + _short_binunicode(storage_name.encode("ascii"))
         + b"\x93"
         + _short_binunicode(key_bytes)
         + _short_binunicode(b"cpu")
-        + b"K\x01tQ."
+        + size_opcode
+        + b"tQ."
     )
+
+
+def _pytorch_storage_persistent_id_payload_with_extra_field(key: str) -> bytes:
+    payload = _pytorch_storage_persistent_id_payload(key)
+    assert payload.endswith(b"tQ.")
+    return payload[:-3] + _short_binunicode(b"evil") + b"tQ."
 
 
 def _fake_byte_storage_persistent_id_payload(key: str) -> bytes:
@@ -1377,7 +1390,27 @@ def test_scan_bytes_marks_each_pytorch_storage_persistent_id_import_reference() 
             + terminator
         )
 
-    storage_names = [f"Synthetic{index}Storage" for index in range(33)]
+    storage_names = [
+        "BFloat16Storage",
+        "BoolStorage",
+        "ByteStorage",
+        "CharStorage",
+        "ComplexDoubleStorage",
+        "ComplexFloatStorage",
+        "DoubleStorage",
+        "FloatStorage",
+        "HalfStorage",
+        "IntStorage",
+        "LongStorage",
+        "QInt32Storage",
+        "QInt8Storage",
+        "QUInt8Storage",
+        "QUInt4x2Storage",
+        "QUInt2x4Storage",
+        "ShortStorage",
+        "UntypedStorage",
+    ]
+    storage_names = [storage_names[index % len(storage_names)] for index in range(33)]
     payload = b"\x80\x04" + b"".join(
         storage_persistent_id(name, str(index), b"." if index == len(storage_names) - 1 else b"0")
         for index, name in enumerate(storage_names)
@@ -1395,6 +1428,23 @@ def test_scan_bytes_marks_each_pytorch_storage_persistent_id_import_reference() 
     ]
     assert len(storage_references) == len(storage_names)
     assert all(reference.get("pytorch_storage_persistent_id") is True for reference in storage_references)
+
+
+def test_scan_bytes_does_not_mark_synthetic_torch_storage_name_as_storage_persistent_id() -> None:
+    payload = _pytorch_storage_persistent_id_payload("0", storage_name="SyntheticStorage")
+
+    report = scan_bytes(payload, source="synthetic-storage-name.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    persistent_id_findings = [finding for finding in report.findings if finding.rule_code == "PERSISTENT_ID"]
+    assert persistent_id_findings
+    assert not any(finding.details.get("pytorch_storage_persistent_id") is True for finding in persistent_id_findings)
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "torch.SyntheticStorage"
+        for finding in report.findings
+    )
 
 
 def test_scan_bytes_flags_noncanonical_pytorch_storage_persistent_ids() -> None:
@@ -1813,6 +1863,29 @@ def test_scan_file_does_not_route_benign_storage_blob_as_hidden_pickle(tmp_path:
     assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
 
 
+def test_scan_file_routes_torch_storage_untyped_storage_blob_as_raw_storage(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "archive/data.pkl",
+            _pytorch_storage_persistent_id_payload(
+                "0",
+                storage_module="torch.storage",
+                storage_name="UntypedStorage",
+            ),
+        )
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", _pickleish_tensor_storage_bytes())
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -1836,6 +1909,30 @@ def test_scan_file_scans_referenced_storage_blob_when_it_is_a_pickle(payload: by
         finding.rule_code == "DANGEROUS_CALL"
         and finding.location is not None
         and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("storage_member", [r"archive\data\0", "/archive/data/0"])
+def test_scan_file_scans_noncanonical_referenced_storage_aliases(
+    storage_member: str,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr(storage_member, b"cposix\nsystem\n(S'echo hidden'\ntR.")
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert storage_member in report.metadata["pickle_files"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:{storage_member}" in finding.location
         for finding in report.findings
     )
 
@@ -1868,6 +1965,9 @@ def test_scan_file_keeps_unreferenced_storage_lookalike_on_hidden_pickle_path(tm
     [
         (_pytorch_storage_persistent_id_payload("1"), True, "pytorch_zip_storage_reference_missing_members"),
         (_fake_byte_storage_persistent_id_payload("0"), True, None),
+        (_pytorch_storage_persistent_id_payload("0", storage_name="FakeStorage"), True, None),
+        (_pytorch_storage_persistent_id_payload("0", size_opcode=b"\x88"), True, None),
+        (_pytorch_storage_persistent_id_payload_with_extra_field("0"), True, None),
         (_pytorch_storage_persistent_id_payload("0")[:-1], True, "pytorch_zip_storage_reference_validation_failed"),
         (_pytorch_storage_persistent_id_payload("0"), False, None),
     ],
@@ -1899,6 +1999,33 @@ def test_scan_file_keeps_untrusted_storage_lookalikes_on_hidden_pickle_path(
     )
     if expected_notice_code is not None:
         assert any(notice.code == expected_notice_code for notice in report.notices)
+
+
+def test_scan_file_marks_storage_reference_opcode_budget_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(package_api, "_PYTORCH_STORAGE_TRUST_MAX_OPCODES", 4)
+    archive_path = tmp_path / "model.pt"
+    data_pkl_payload = b"\x80\x04" + (b"N" * 8) + _pytorch_storage_persistent_id_payload("0")[2:]
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl_payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", b"cposix\nsystem\n(S'echo hidden'\ntR.")
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert "archive/data/0" in report.metadata["pickle_files"]
+    assert any(notice.code == "pytorch_zip_storage_reference_validation_failed" for notice in report.notices)
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
 
 
 def test_scan_file_does_not_route_large_trivial_proto0_text_as_hidden_pickle(tmp_path: Path) -> None:

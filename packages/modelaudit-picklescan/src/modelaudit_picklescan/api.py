@@ -86,9 +86,39 @@ _MAX_PYTORCH_ZIP_PICKLE_MEMBERS = 256
 _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES = 512 * 1024 * 1024
 _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES = 512 * 1024 * 1024
 _MAX_PYTORCH_ZIP_STORAGE_REFERENCE_DATA_PICKLE_BYTES = 10 * 1024 * 1024
+_PYTORCH_STORAGE_TRUST_MAX_OPCODES = 100_000
+_PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH = 1024
+_PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES = 100_000
+_PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH = 64
+_PYTORCH_STORAGE_TRUST_MAX_REFERENCED_KEYS = 10_000
 _RUST_EXTENSION_MODULE = "modelaudit_picklescan._rust"
 _MAX_INERT_INITIALIZATION_MODULES = 32
 _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES = frozenset({"BUILD", "NEWOBJ", "NEWOBJ_EX"})
+_PYTORCH_STORAGE_GLOBAL_NAMES = frozenset(
+    {
+        "BFloat16Storage",
+        "BoolStorage",
+        "ByteStorage",
+        "CharStorage",
+        "ComplexDoubleStorage",
+        "ComplexFloatStorage",
+        "DoubleStorage",
+        "FloatStorage",
+        "HalfStorage",
+        "IntStorage",
+        "LongStorage",
+        "QInt32Storage",
+        "QInt8Storage",
+        "QUInt8Storage",
+        "QUInt4x2Storage",
+        "QUInt2x4Storage",
+        "ShortStorage",
+        "UntypedStorage",
+    }
+)
+_PYTORCH_STORAGE_GLOBALS = frozenset(
+    (module, name) for module in ("torch", "torch.storage") for name in _PYTORCH_STORAGE_GLOBAL_NAMES
+)
 _TRUSTED_REDUCE_REFERENCES = frozenset(
     {
         ("string", "Formatter"),
@@ -628,7 +658,11 @@ def _validated_pytorch_storage_entry_ids(
     *,
     source: str,
 ) -> tuple[set[int], tuple[Notice, ...]]:
-    members = [(_normalize_zip_member_name(entry.filename), entry) for entry in entries if not entry.is_dir()]
+    members = [
+        (entry.filename, entry)
+        for entry in entries
+        if not entry.is_dir() and _is_canonical_pytorch_zip_member_name(entry.filename)
+    ]
     entries_by_name: dict[str, list[zipfile.ZipInfo]] = {}
     for name, entry in members:
         entries_by_name.setdefault(name, []).append(entry)
@@ -915,6 +949,13 @@ def _normalize_zip_member_name(name: str) -> str:
     return name.replace("\\", "/").lstrip("/")
 
 
+def _is_canonical_pytorch_zip_member_name(name: str) -> bool:
+    if not name or "\\" in name or name.startswith("/"):
+        return False
+    parts = name.split("/")
+    return all(part and part not in {".", ".."} for part in parts)
+
+
 def _is_ascii_decimal_digits(value: str) -> bool:
     return value.isascii() and value.isdecimal()
 
@@ -931,11 +972,6 @@ def _coerce_pickle_string_arg(value: Any) -> str | None:
 
 
 def _pytorch_storage_keys_from_pickle_bytes(pickle_data: bytes) -> tuple[set[str], bool]:
-    try:
-        opcodes = list(pickletools.genops(pickle_data))
-    except Exception:
-        return set(), False
-
     marker = object()
     memo: dict[int, Any] = {}
     stack: list[Any] = []
@@ -948,7 +984,16 @@ def _pytorch_storage_keys_from_pickle_bytes(pickle_data: bytes) -> tuple[set[str
             if item is marker:
                 return tuple(reversed(items))
             items.append(item)
+            if len(items) > _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH:
+                raise ValueError("PyTorch storage persistent ID tuple exceeded trust parser width")
         return None
+
+    def within_limits() -> bool:
+        return (
+            len(stack) <= _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH
+            and len(memo) <= _PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES
+            and len(referenced_keys) <= _PYTORCH_STORAGE_TRUST_MAX_REFERENCED_KEYS
+        )
 
     def memo_key(value: Any) -> int | None:
         try:
@@ -957,102 +1002,113 @@ def _pytorch_storage_keys_from_pickle_bytes(pickle_data: bytes) -> tuple[set[str
             return None
 
     def storage_key_from_pid(pid: Any) -> str | None:
-        if not isinstance(pid, tuple) or len(pid) < 3:
+        if not isinstance(pid, tuple) or len(pid) != 5:
             return None
         if pid[0] != "storage":
             return None
         storage_type = pid[1]
         if not (
             isinstance(storage_type, _PickleGlobalRef)
-            and storage_type.module == "torch"
-            and storage_type.name.endswith("Storage")
+            and (storage_type.module, storage_type.name) in _PYTORCH_STORAGE_GLOBALS
         ):
             return None
         storage_key = _coerce_pickle_string_arg(pid[2])
-        if storage_key is not None and _is_ascii_decimal_digits(storage_key):
-            return storage_key
-        return None
+        if storage_key is None or not _is_ascii_decimal_digits(storage_key):
+            return None
+        if _coerce_pickle_string_arg(pid[3]) is None:
+            return None
+        storage_size = pid[4]
+        if not isinstance(storage_size, int) or isinstance(storage_size, bool) or storage_size < 0:
+            return None
+        return storage_key
 
-    for opcode, arg, _pos in opcodes:
-        opcode_name = opcode.name
-        if opcode_name in {"PROTO", "FRAME", "STOP"}:
-            continue
-        if opcode_name == "MARK":
-            stack.append(marker)
-        elif opcode_name in {
-            "BINSTRING",
-            "SHORT_BINSTRING",
-            "BINUNICODE",
-            "SHORT_BINUNICODE",
-            "UNICODE",
-            "BINBYTES",
-            "SHORT_BINBYTES",
-        }:
-            stack.append(_coerce_pickle_string_arg(arg))
-        elif opcode_name == "GLOBAL":
-            global_name = _coerce_pickle_string_arg(arg)
-            if global_name is None:
+    try:
+        for opcode_count, (opcode, arg, _pos) in enumerate(pickletools.genops(pickle_data), start=1):
+            if opcode_count > _PYTORCH_STORAGE_TRUST_MAX_OPCODES:
+                return set(), False
+            opcode_name = opcode.name
+            if opcode_name in {"PROTO", "FRAME", "STOP"}:
+                continue
+            if opcode_name == "MARK":
+                stack.append(marker)
+            elif opcode_name in {
+                "BINSTRING",
+                "SHORT_BINSTRING",
+                "BINUNICODE",
+                "SHORT_BINUNICODE",
+                "UNICODE",
+                "BINBYTES",
+                "SHORT_BINBYTES",
+            }:
+                stack.append(_coerce_pickle_string_arg(arg))
+            elif opcode_name == "GLOBAL":
+                global_name = _coerce_pickle_string_arg(arg)
+                if global_name is None:
+                    stack.append(None)
+                else:
+                    parts = global_name.split()
+                    stack.append(_PickleGlobalRef(parts[0], parts[1]) if len(parts) == 2 else None)
+            elif opcode_name == "STACK_GLOBAL":
+                if len(stack) < 2:
+                    stack.clear()
+                    continue
+                name = _coerce_pickle_string_arg(stack.pop())
+                module = _coerce_pickle_string_arg(stack.pop())
+                stack.append(_PickleGlobalRef(module, name) if module is not None and name is not None else None)
+            elif opcode_name == "EMPTY_TUPLE":
+                stack.append(())
+            elif opcode_name == "TUPLE":
+                tuple_value = pop_marked_tuple()
+                if tuple_value is None:
+                    stack.clear()
+                else:
+                    stack.append(tuple_value)
+            elif opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
+                tuple_size = int(opcode_name[-1])
+                if len(stack) < tuple_size:
+                    stack.clear()
+                    continue
+                items = stack[-tuple_size:]
+                del stack[-tuple_size:]
+                stack.append(tuple(items))
+            elif opcode_name in {"BININT", "BININT1", "BININT2", "LONG", "LONG1", "LONG4", "INT"}:
+                stack.append(arg)
+            elif opcode_name == "NONE":
                 stack.append(None)
-                continue
-            parts = global_name.split()
-            stack.append(_PickleGlobalRef(parts[0], parts[1]) if len(parts) == 2 else None)
-        elif opcode_name == "STACK_GLOBAL":
-            if len(stack) < 2:
-                stack.clear()
-                continue
-            name = _coerce_pickle_string_arg(stack.pop())
-            module = _coerce_pickle_string_arg(stack.pop())
-            stack.append(_PickleGlobalRef(module, name) if module is not None and name is not None else None)
-        elif opcode_name == "EMPTY_TUPLE":
-            stack.append(())
-        elif opcode_name == "TUPLE":
-            tuple_value = pop_marked_tuple()
-            if tuple_value is None:
-                stack.clear()
+            elif opcode_name == "NEWTRUE":
+                stack.append(True)
+            elif opcode_name == "NEWFALSE":
+                stack.append(False)
+            elif opcode_name in {"BINPUT", "LONG_BINPUT", "PUT"}:
+                key = memo_key(arg)
+                if key is not None and stack:
+                    memo[key] = stack[-1]
+            elif opcode_name == "MEMOIZE":
+                if stack:
+                    memo[len(memo)] = stack[-1]
+            elif opcode_name in {"BINGET", "LONG_BINGET", "GET"}:
+                key = memo_key(arg)
+                stack.append(memo.get(key) if key is not None else None)
+            elif opcode_name == "POP":
+                if stack:
+                    stack.pop()
+            elif opcode_name == "POP_MARK":
+                pop_marked_tuple()
+            elif opcode_name == "DUP":
+                if stack:
+                    stack.append(stack[-1])
+            elif opcode_name == "BINPERSID":
+                pid = stack.pop() if stack else None
+                storage_key = storage_key_from_pid(pid)
+                if storage_key is not None:
+                    referenced_keys.add(storage_key)
+                stack.append(None)
             else:
-                stack.append(tuple_value)
-        elif opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
-            tuple_size = int(opcode_name[-1])
-            if len(stack) < tuple_size:
                 stack.clear()
-                continue
-            items = stack[-tuple_size:]
-            del stack[-tuple_size:]
-            stack.append(tuple(items))
-        elif opcode_name in {"BININT", "BININT1", "BININT2", "LONG", "LONG1", "LONG4", "INT"}:
-            stack.append(arg)
-        elif opcode_name == "NONE":
-            stack.append(None)
-        elif opcode_name == "NEWTRUE":
-            stack.append(True)
-        elif opcode_name == "NEWFALSE":
-            stack.append(False)
-        elif opcode_name in {"BINPUT", "LONG_BINPUT", "PUT"}:
-            key = memo_key(arg)
-            if key is not None and stack:
-                memo[key] = stack[-1]
-        elif opcode_name == "MEMOIZE":
-            if stack:
-                memo[len(memo)] = stack[-1]
-        elif opcode_name in {"BINGET", "LONG_BINGET", "GET"}:
-            key = memo_key(arg)
-            stack.append(memo.get(key) if key is not None else None)
-        elif opcode_name == "POP":
-            if stack:
-                stack.pop()
-        elif opcode_name == "POP_MARK":
-            pop_marked_tuple()
-        elif opcode_name == "DUP":
-            if stack:
-                stack.append(stack[-1])
-        elif opcode_name == "BINPERSID":
-            pid = stack.pop() if stack else None
-            storage_key = storage_key_from_pid(pid)
-            if storage_key is not None:
-                referenced_keys.add(storage_key)
-            stack.append(None)
-        else:
-            stack.clear()
+            if not within_limits():
+                return set(), False
+    except Exception:
+        return set(), False
     return referenced_keys, True
 
 
