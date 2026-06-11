@@ -459,14 +459,15 @@ DOCUMENTATION_FENCED_URL_REQUEST_ASSIGNMENT_PATTERN = re.compile(
     rb"[rubfRUBF]*[\"'](?P<url>https?://[^\"'\s)]+)[\"']",
     re.IGNORECASE,
 )
+DOCUMENTATION_FENCED_PASSIVE_REQUEST_ARGUMENT_SUFFIX = rb"(?:\s*,\s*stream\s*=\s*True)?\s*\)"
 DOCUMENTATION_FENCED_URL_VARIABLE_CALL_PATTERN = re.compile(
     rb"\b(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(\s*"
-    rb"(?P<target>[A-Za-z_][A-Za-z0-9_]*)\b(?=\s*(?:[,)]))",
+    rb"(?P<target>[A-Za-z_][A-Za-z0-9_]*)\b" + DOCUMENTATION_FENCED_PASSIVE_REQUEST_ARGUMENT_SUFFIX,
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_DIRECT_URL_CALL_PATTERN = re.compile(
     rb"\b(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(\s*[rubfRUBF]*[\"']"
-    rb"(?P<url>https?://[^\"'\s)]+)",
+    rb"(?P<url>https?://[^\"'\s)]+)[\"']" + DOCUMENTATION_FENCED_PASSIVE_REQUEST_ARGUMENT_SUFFIX,
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_ALLOWED_NETWORK_CALL_PATTERN = re.compile(
@@ -548,6 +549,10 @@ DOCUMENTATION_PACKAGE_INSTALL_PATTERN = re.compile(
 DOCUMENTATION_PACKAGE_INSTALL_PROSE_TAIL_PATTERN = re.compile(
     rb"(?:\b(?:is|are|was|were)\s+(?:covered|described|documented|explained)\s+(?:at|in|on)"
     rb"|\b(?:docs?|documentation|guide|reference)\s+(?:at|in|on))\s*$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_PACKAGE_INDEX_URL_OPTION_PREFIX_PATTERN = re.compile(
+    rb"(?:^|\s)(?:--(?:extra-index-url|index-url|find-links)(?:=|\s+)|-[if]\s*)$",
     re.IGNORECASE,
 )
 DOCUMENTATION_COMPOUND_IMPORT_PREFIX_PATTERN = re.compile(
@@ -1364,6 +1369,8 @@ class TextScanner(BaseScanner):
             return True
         if cls._documentation_fenced_package_version_is_informational(line, position, finding):
             return True
+        if cls._documentation_fenced_package_index_url_is_informational(line, position, finding):
+            return True
         if cls._documentation_finding_is_actionable(payload, finding):
             return False
         if finding.get("type") in {
@@ -1437,6 +1444,48 @@ class TextScanner(BaseScanner):
             and line[position - 2 : position] == b"=="
             and line[position : position + len(ip_bytes)] == ip_bytes
         )
+
+    @staticmethod
+    def _trusted_package_index_url_is_informational(url: str) -> bool:
+        try:
+            parsed_url = urlsplit(url)
+            if parsed_url.username is not None or parsed_url.password is not None:
+                return False
+            if any(
+                key.casefold().replace("-", "_") in SENSITIVE_REQUIREMENTS_QUERY_KEYS
+                for key, _value in parse_qsl(parsed_url.query, keep_blank_values=True)
+            ):
+                return False
+            raw_port = parsed_url.port
+        except ValueError:
+            return False
+        return (
+            parsed_url.scheme.casefold() == "https"
+            and parsed_url.hostname is not None
+            and parsed_url.hostname.casefold() in TRUSTED_REQUIREMENTS_HOSTS
+            and raw_port in {None, 443}
+        )
+
+    @classmethod
+    def _documentation_fenced_package_index_url_is_informational(
+        cls,
+        line: bytes,
+        position: int,
+        finding: dict[str, Any],
+    ) -> bool:
+        if finding.get("type") not in {"domain", "domain_name", "url_detected"}:
+            return False
+        if DOCUMENTATION_PACKAGE_INSTALL_PATTERN.match(line.lstrip()) is None:
+            return False
+        raw_url_match = next(
+            (match for match in REQUIREMENTS_RAW_URL_PATTERN.finditer(line) if match.start() <= position < match.end()),
+            None,
+        )
+        if raw_url_match is None:
+            return False
+        if DOCUMENTATION_PACKAGE_INDEX_URL_OPTION_PREFIX_PATTERN.search(line[: raw_url_match.start()]) is None:
+            return False
+        return cls._trusted_package_index_url_is_informational(raw_url_match.group().decode("utf-8", errors="ignore"))
 
     @staticmethod
     def _documentation_loopback_api_url_is_informational(url: str) -> bool:
