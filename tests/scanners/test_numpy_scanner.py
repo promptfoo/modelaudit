@@ -804,7 +804,7 @@ def test_numpy_object_dtype_cleanup_keeps_untrusted_numpy_reconstruction_warning
         passed=False,
         message="untrusted dtype",
         severity=IssueSeverity.WARNING,
-        details={"import_reference": "numpy.dtype", "position": 209},
+        details={"import_reference": "numpy.dtype", "module": "numpy", "name": "dtype", "position": 209},
         rule_code="NON_ALLOWLISTED_GLOBAL",
     )
 
@@ -815,8 +815,15 @@ def test_numpy_object_dtype_cleanup_keeps_untrusted_numpy_reconstruction_warning
         "modelaudit.scanners.numpy_scanner.import_only_reference_is_proven_trusted",
         trust_reconstruction_origin,
     )
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._picklescan_loaded_site_package_reference_owner_matches",
+        None,
+    )
 
-    NumPyScanner._remove_validated_numpy_object_reconstruction_findings(result)
+    NumPyScanner._remove_validated_numpy_object_reconstruction_findings(
+        result,
+        safe_numpy_reconstruct_payload=True,
+    )
 
     assert [check.details.get("position") for check in result.checks] == [209]
     assert [issue.details.get("position") for issue in result.issues] == [209]

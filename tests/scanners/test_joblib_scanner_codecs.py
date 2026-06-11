@@ -775,11 +775,11 @@ def test_validated_joblib_wrapper_cleanup_preserves_untrusted_dtype_origin(
         passed=False,
         message="validated dtype",
         severity=IssueSeverity.WARNING,
-        details={"import_reference": "numpy.dtype", "position": 10},
+        details={"import_reference": "numpy.dtype", "module": "numpy", "name": "dtype", "position": 10},
         rule_code="NON_ALLOWLISTED_GLOBAL",
     )
 
-    JoblibScanner._remove_validated_numpy_array_wrapper_findings(result, frozenset({10}))
+    JoblibScanner._remove_validated_numpy_array_wrapper_findings(result, {"numpy.dtype": frozenset({1})})
 
     assert [check.details.get("position") for check in result.checks] == [10]
     assert [issue.details.get("position") for issue in result.issues] == [10]
