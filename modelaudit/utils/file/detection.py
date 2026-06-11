@@ -290,6 +290,8 @@ VALID_MEDIA_ROUTING_FORMAT = "valid_media"
 MEDIA_ROUTE_READ_BYTES = FLAX_MSGPACK_STRUCTURE_READ_BYTES
 MEDIA_ROUTE_TAIL_READ_BYTES = 64 * 1024
 _MEDIA_ROUTE_MAX_PNG_CHUNKS = 4096
+_PNG_CRC_READ_CHUNK_BYTES = 64 * 1024
+_JPEG_SCAN_READ_CHUNK_BYTES = 64 * 1024
 _MEDIA_ROUTING_SUFFIXES = frozenset({".jpeg", ".jpg", ".png"})
 _MEDIA_TRAILING_PADDING = b"\x00\t\n\r "
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -5415,10 +5417,39 @@ def _find_bounded_png_end(sample: bytes) -> int | None:
             saw_ihdr = True
         elif chunk_type == b"IHDR":
             return None
+        chunk_payload_start = offset + 8
+        chunk_payload_end = chunk_payload_start + chunk_length
+        expected_crc = int.from_bytes(sample[chunk_payload_end:chunk_end], "big")
+        actual_crc = zlib.crc32(chunk_type + sample[chunk_payload_start:chunk_payload_end]) & 0xFFFFFFFF
+        if actual_crc != expected_crc:
+            return None
         if chunk_type == _PNG_IEND_CHUNK:
             return chunk_end if chunk_length == 0 else None
         offset = chunk_end
     return None
+
+
+def _png_chunk_crc_matches_with_reader(
+    chunk_type: bytes,
+    chunk_length: int,
+    payload_offset: int,
+    read_at: Callable[[int, int], bytes],
+) -> bool:
+    checksum = zlib.crc32(chunk_type)
+    remaining = chunk_length
+    offset = payload_offset
+    while remaining > 0:
+        read_size = min(remaining, _PNG_CRC_READ_CHUNK_BYTES)
+        payload = read_at(offset, read_size)
+        if len(payload) != read_size:
+            return False
+        checksum = zlib.crc32(payload, checksum)
+        offset += read_size
+        remaining -= read_size
+    expected_crc = read_at(payload_offset + chunk_length, 4)
+    if len(expected_crc) != 4:
+        return False
+    return (checksum & 0xFFFFFFFF) == int.from_bytes(expected_crc, "big")
 
 
 def _find_png_end_with_reader(file_size: int, read_at: Callable[[int, int], bytes]) -> int | None:
@@ -5448,9 +5479,98 @@ def _find_png_end_with_reader(file_size: int, read_at: Callable[[int, int], byte
                 saw_ihdr = True
             elif chunk_type == b"IHDR":
                 return None
+            if not _png_chunk_crc_matches_with_reader(chunk_type, chunk_length, offset + 8, read_at):
+                return None
             if chunk_type == _PNG_IEND_CHUNK:
                 return chunk_end if chunk_length == 0 else None
             offset = chunk_end
+    except OSError:
+        return None
+    return None
+
+
+def _find_jpeg_end_with_reader(file_size: int, read_at: Callable[[int, int], bytes]) -> int | None:
+    """Return the first byte after a complete JPEG stream using bounded reads."""
+    if file_size < 4:
+        return None
+
+    def read_exact(offset: int, size: int) -> bytes:
+        data = read_at(offset, size)
+        if len(data) != size:
+            raise OSError("short JPEG read")
+        return data
+
+    try:
+        if read_exact(0, 2) != b"\xff\xd8":
+            return None
+
+        offset = 2
+        while offset < file_size:
+            if read_exact(offset, 1) != b"\xff":
+                return None
+            while offset < file_size and read_exact(offset, 1) == b"\xff":
+                offset += 1
+            if offset >= file_size:
+                return None
+            marker = read_exact(offset, 1)[0]
+            offset += 1
+            if marker == 0x00:
+                return None
+            if marker == 0xD9:
+                return offset
+            if marker in _JPEG_STANDALONE_MARKERS:
+                continue
+            if offset + 2 > file_size:
+                return None
+            segment_length = int.from_bytes(read_exact(offset, 2), "big")
+            if segment_length < 2:
+                return None
+            segment_end = offset + segment_length
+            if segment_end > file_size:
+                return None
+            if marker != 0xDA:
+                offset = segment_end
+                continue
+
+            offset = segment_end
+            while offset < file_size:
+                chunk = read_at(offset, min(_JPEG_SCAN_READ_CHUNK_BYTES, file_size - offset))
+                if not chunk:
+                    return None
+                index = 0
+                advanced_to_next_chunk = False
+                while True:
+                    marker_index = chunk.find(b"\xff", index)
+                    if marker_index < 0:
+                        offset += len(chunk)
+                        advanced_to_next_chunk = True
+                        break
+                    marker_offset = offset + marker_index
+                    if marker_offset + 1 >= file_size:
+                        return None
+                    marker = read_exact(marker_offset + 1, 1)[0]
+                    if marker == 0x00 or 0xD0 <= marker <= 0xD7:
+                        next_index = marker_index + 2
+                        if next_index >= len(chunk):
+                            offset = marker_offset + 2
+                            advanced_to_next_chunk = True
+                            break
+                        index = next_index
+                        continue
+                    if marker == 0xD9:
+                        return marker_offset + 2
+                    if marker == 0xFF:
+                        next_index = marker_index + 1
+                        if next_index >= len(chunk):
+                            offset = marker_offset + 1
+                            advanced_to_next_chunk = True
+                            break
+                        index = next_index
+                        continue
+                    offset = marker_offset
+                    break
+                if not advanced_to_next_chunk:
+                    break
     except OSError:
         return None
     return None
@@ -5586,7 +5706,7 @@ def _detect_bounded_media_route_from_edges(file_path: Path, prefix: bytes, tail:
         return pickle_route
     if tail[media_end:].lstrip(_MEDIA_TRAILING_PADDING):
         return None
-    return VALID_MEDIA_ROUTING_FORMAT
+    return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
 
 
 def _read_local_media_range(file_path: Path, sample: bytes, offset: int, size: int) -> bytes:
@@ -5616,6 +5736,22 @@ def _detect_seekable_png_media_route(file_path: Path, file_size: int, sample: by
     return _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=trailing_size > len(trailing))
 
 
+def _detect_seekable_jpeg_media_route(file_path: Path, file_size: int, sample: bytes) -> str | None:
+    media_end = _find_jpeg_end_with_reader(
+        file_size,
+        lambda offset, size: _read_local_media_range(file_path, sample, offset, size),
+    )
+    if media_end is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    trailing_size = file_size - media_end
+    if trailing_size <= 0:
+        return VALID_MEDIA_ROUTING_FORMAT
+    read_size = min(trailing_size, MEDIA_ROUTE_READ_BYTES + 1)
+    trailing = _read_local_media_range(file_path, sample, media_end, read_size)
+    return _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=trailing_size > len(trailing))
+
+
 def _detect_bounded_media_route(file_path: Path, file_size: int) -> str | None:
     """Inspect a bounded complete media sample before serialized fallback routing."""
     if file_path.suffix.lower() not in _MEDIA_ROUTING_SUFFIXES:
@@ -5631,12 +5767,10 @@ def _detect_bounded_media_route(file_path: Path, file_size: int) -> str | None:
     )
     if sample_route is not None:
         return sample_route
-    if (
-        file_size > len(sample)
-        and sample.startswith(_PNG_SIGNATURE)
-        and _could_start_bounded_media_route(file_path, sample)
-    ):
+    if sample.startswith(_PNG_SIGNATURE) and _could_start_bounded_media_route(file_path, sample):
         return _detect_seekable_png_media_route(file_path, file_size, sample)
+    if sample.startswith(b"\xff\xd8") and _could_start_bounded_media_route(file_path, sample):
+        return _detect_seekable_jpeg_media_route(file_path, file_size, sample)
     return None
 
 

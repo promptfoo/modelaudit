@@ -268,6 +268,26 @@ def test_padded_media_pickle_polyglot_fails_closed_past_probe_limit(tmp_path: Pa
     assert detect_file_format_for_skip_filter(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
 
 
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [
+        ("bad-crc.png", bytes(bytearray(valid_png_bytes())[:-1] + bytes([valid_png_bytes()[-1] ^ 0x01]))),
+        (
+            "forged-tail.jpg",
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00" + b"\0" * 32 + b"\xff\xd9",
+        ),
+    ],
+    ids=["png-crc", "jpeg-tail"],
+)
+def test_malformed_media_headers_fail_closed(tmp_path: Path, filename: str, payload: bytes) -> None:
+    media_path = tmp_path / filename
+    media_path.write_bytes(payload)
+
+    assert detect_file_format(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+
 def test_detect_file_format_zip(tmp_path):
     """Test detecting a ZIP file format."""
     # Create a ZIP file
