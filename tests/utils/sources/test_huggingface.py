@@ -18,7 +18,6 @@ from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
-import modelaudit.utils.sources.huggingface as hf_source
 from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
 from modelaudit.utils.sources._huggingface_download_worker import _run_operation as _run_huggingface_worker_operation
 from modelaudit.utils.sources.huggingface import (
@@ -676,7 +675,7 @@ class TestModelDownload:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Repository inventory remains explicitly bounded even when pagination succeeds."""
-        monkeypatch.setattr(hf_source, "_MAX_HF_REPOSITORY_INVENTORY_FILES", 2)
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface._MAX_HF_REPOSITORY_INVENTORY_FILES", 2)
         mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
         mock_requests_get.return_value = _FakeTreeResponse(
             [
