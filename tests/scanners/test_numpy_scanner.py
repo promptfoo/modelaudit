@@ -795,6 +795,33 @@ def test_numpy_object_dtype_benign_exit0(tmp_path: Path) -> None:
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_numpy_object_dtype_cleanup_keeps_untrusted_numpy_reconstruction_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = ScanResult("numpy")
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="untrusted dtype",
+        severity=IssueSeverity.WARNING,
+        details={"import_reference": "numpy.dtype", "position": 209},
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+    )
+
+    def trust_reconstruction_origin(module: str, name: str) -> bool:
+        return (module, name) != ("numpy", "dtype")
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner.import_only_reference_is_proven_trusted",
+        trust_reconstruction_origin,
+    )
+
+    NumPyScanner._remove_validated_numpy_object_reconstruction_findings(result)
+
+    assert [check.details.get("position") for check in result.checks] == [209]
+    assert [issue.details.get("position") for issue in result.issues] == [209]
+
+
 def test_numpy_object_dtype_malicious_exit1(tmp_path: Path) -> None:
     arr = np.array([_ExecPayload()], dtype=object)
     path = tmp_path / "malicious_object.npy"

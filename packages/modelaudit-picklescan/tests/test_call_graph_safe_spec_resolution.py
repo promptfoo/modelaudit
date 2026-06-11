@@ -465,6 +465,52 @@ def test_forged_loaded_filesystem_reference_is_not_trusted_on_first_use(
     )
 
 
+def test_loaded_site_package_reference_after_startup_uses_source_owner() -> None:
+    script = """
+import sys
+
+import modelaudit_picklescan.call_graph as call_graph
+
+if "numpy" in sys.modules:
+    raise SystemExit(98)
+try:
+    import numpy  # noqa: F401
+except ModuleNotFoundError:
+    raise SystemExit(99)
+
+for function in call_graph._SOURCE_SENSITIVE_CACHED_FUNCTIONS:
+    function.cache_clear()
+
+assert call_graph._TRUSTED_LOADED_REFERENCE_BASELINES.get(("numpy", "dtype")) is None
+assert call_graph._trusted_module_origin_kind("numpy") == "site_packages"
+assert call_graph.import_only_reference_is_proven_trusted("numpy", "dtype") is True
+
+trusted_reconstruct_modules = []
+for reconstruct_module in ("numpy._core.multiarray", "numpy.core.multiarray"):
+    try:
+        __import__(reconstruct_module, fromlist=["_reconstruct"])
+    except ModuleNotFoundError:
+        continue
+    for function in call_graph._SOURCE_SENSITIVE_CACHED_FUNCTIONS:
+        function.cache_clear()
+    if call_graph.import_only_reference_is_proven_trusted(reconstruct_module, "_reconstruct"):
+        trusted_reconstruct_modules.append(reconstruct_module)
+
+assert trusted_reconstruct_modules
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 99:
+        pytest.skip("NumPy is not installed")
+    if result.returncode == 98:
+        pytest.skip("NumPy was loaded before the call-graph trust snapshot")
+    assert result.returncode == 0, result.stderr
+
+
 def test_loaded_trusted_function_code_mutation_is_not_allowlisted() -> None:
     module = "tempfile"
     name = "gettempdir"
@@ -817,6 +863,27 @@ assert calls == []
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_trusted_reference_snapshot_matches_custom_metaclass_class() -> None:
+    class CustomMeta(type):
+        pass
+
+    class EnumStyle(metaclass=CustomMeta):
+        def __new__(cls) -> EnumStyle:
+            return object.__new__(cls)
+
+    snapshot = call_graph._trusted_reference_executable_snapshot(EnumStyle)
+
+    assert call_graph._trusted_reference_executable_matches_snapshot(EnumStyle, snapshot) is True
+
+    class HostileNewDescriptor:
+        def __get__(self, instance: object, owner: object) -> object:
+            raise AssertionError("mutated custom-metaclass class descriptor executed")
+
+    type.__setattr__(EnumStyle, "__new__", HostileNewDescriptor())
+
+    assert call_graph._trusted_reference_executable_matches_snapshot(EnumStyle, snapshot) is False
 
 
 def test_loaded_module_metadata_comparison_does_not_execute_values(
