@@ -4484,7 +4484,7 @@ def scan_model_streaming(
     start_time = time.time()
     results = create_initial_audit_result()
     file_hashes: list[str] = []
-    hashed_stream_paths: set[Path] = set()
+    hashed_stream_file_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
     aggregate_hash_complete = True
     top_level_hashed_bytes = 0
     files_processed = 0
@@ -4611,7 +4611,8 @@ def scan_model_streaming(
         nonlocal aggregate_hash_complete, top_level_hashed_bytes
 
         scan_path_key = Path(os.path.abspath(scan_path))
-        if scan_path_key in hashed_stream_paths:
+        scan_path_identity = _snapshot_file_identity(scan_path)
+        if scan_path_identity is not None and (scan_path_key, scan_path_identity) in hashed_stream_file_instances:
             return None
 
         defer_hash_for_max_total_size = _should_defer_hash_for_max_total_size(
@@ -4634,7 +4635,8 @@ def scan_model_streaming(
             top_level_hashed_bytes += scan_path.stat().st_size
         file_hash = compute_sha256_hash(scan_path)
         file_hashes.append(file_hash)
-        hashed_stream_paths.add(scan_path_key)
+        if scan_path_identity is not None:
+            hashed_stream_file_instances.add((scan_path_key, scan_path_identity))
         return file_hash
 
     def append_streamed_openvino_companion_hash(

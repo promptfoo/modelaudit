@@ -1919,15 +1919,15 @@ def download_model_streaming(
             include_all_files=include_all_files,
             deadline=deadline,
         )
+        openvino_companion_suppression_enabled = scannable_scanner_ids is None or "openvino" in {
+            str(scanner_id).lower() for scanner_id in scannable_scanner_ids
+        }
         model_files = _include_huggingface_openvino_companions(
             repo_id,
             repo_files,
             repo_revision,
             model_files,
-            include_openvino_companions=(
-                scannable_scanner_ids is None
-                or "openvino" in {str(scanner_id).lower() for scanner_id in scannable_scanner_ids}
-            ),
+            include_openvino_companions=openvino_companion_suppression_enabled,
             deadline=deadline,
         )
         revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
@@ -1946,11 +1946,15 @@ def download_model_streaming(
             download_path.mkdir(parents=True, exist_ok=True)
 
         selected_file_set = set(model_files)
-        openvino_companion_by_xml = {
-            filename: companion
-            for filename in model_files
-            if (companion := _openvino_bin_companion_name(filename, model_files)) in selected_file_set
-        }
+        openvino_companion_by_xml = (
+            {
+                filename: companion
+                for filename in model_files
+                if (companion := _openvino_bin_companion_name(filename, model_files)) in selected_file_set
+            }
+            if openvino_companion_suppression_enabled
+            else {}
+        )
         openvino_xml_by_companion = {companion: xml for xml, companion in openvino_companion_by_xml.items()}
 
         # Download each file one at a time. OpenVINO XML/BIN pairs are staged

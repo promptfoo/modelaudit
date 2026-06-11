@@ -12,6 +12,7 @@ from typing import Any, ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_STRING_PATTERNS
+from modelaudit.scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -289,8 +290,23 @@ class OpenVinoScanner(BaseScanner):
 
             from .pickle_scanner import PickleScanner
 
+            pickle_scanner, scanner_selection = embedded_pickle_scanner(
+                self.config,
+                lambda config: PickleScanner(config=config),
+            )
+            if pickle_scanner is None:
+                add_scanner_selection_skip_check(
+                    result,
+                    str(bin_path),
+                    "pickle",
+                    scanner_selection,
+                    context="OpenVINO weights sidecar",
+                )
+                result.metadata["openvino_weights_pickle_payload_skipped"] = True
+                return
+
             with bin_path.open("rb") as bin_file:
-                pickle_result = PickleScanner(config=self.config).scan_stream(
+                pickle_result = pickle_scanner.scan_stream(
                     bin_file,
                     bin_size,
                     source=str(bin_path),

@@ -95,14 +95,14 @@ def should_bypass_cache_for_sharded_model(file_path: str) -> bool:
 def should_bypass_cache_for_openvino_sidecar(file_path: str) -> bool:
     """Bypass XML-only cache keys when OpenVINO findings depend on a .bin sidecar."""
     try:
-        from ...scanners.openvino_scanner import OpenVinoScanner
+        from ...scanners.openvino_scanner import OpenVinoScanner, openvino_weights_companion_for_xml
     except Exception:
         return False
 
     if not OpenVinoScanner.can_handle(file_path):
         return False
-    weights_path = os.path.splitext(file_path)[0] + ".bin"
-    return os.path.isfile(weights_path) or os.path.islink(weights_path)
+    weights_path = openvino_weights_companion_for_xml(file_path)
+    return weights_path is not None and (weights_path.is_file() or weights_path.is_symlink())
 
 
 def _h5py_availability() -> bool:

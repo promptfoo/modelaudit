@@ -61,6 +61,26 @@ def test_openvino_scanner_matches_casefolded_unicode_weights_companion(tmp_path:
     assert not any("weights file not found" in check.message.lower() for check in result.checks)
 
 
+def test_openvino_scanner_casefolded_companion_cache_rescans_changed_weights(tmp_path: Path) -> None:
+    """Cache bypass must follow the actual normalized/casefolded OpenVINO companion."""
+    xml_path = tmp_path / "Cafe\u0301-Model.XML"
+    bin_path = tmp_path / "CAF\u00c9-model.BIN"
+    xml_path.write_text("<net version='10'></net>", encoding="utf-8")
+    bin_path.write_bytes(b"\x00" * 7)
+    cache_config = {
+        "cache_enabled": True,
+        "cache_dir": str(tmp_path / "cache"),
+        "min_cache_file_size": 0,
+    }
+
+    first_result = scan_file(str(xml_path), config=cache_config)
+    bin_path.write_bytes(b"\x01" * 33)
+    second_result = scan_file(str(xml_path), config=cache_config)
+
+    assert first_result.metadata["bin_size"] == 7
+    assert second_result.metadata["bin_size"] == 33
+
+
 def test_openvino_scanner_detects_pickle_payload_in_weights_companion(tmp_path: Path) -> None:
     """A valid OpenVINO XML must not hide pickle-formatted same-stem weights."""
     xml_path = create_basic_model(tmp_path)
@@ -77,6 +97,26 @@ def test_openvino_scanner_detects_pickle_payload_in_weights_companion(tmp_path: 
         and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
         for issue in result.issues
     )
+
+
+def test_openvino_scanner_honors_pickle_exclusion_for_weights_companion(tmp_path: Path) -> None:
+    """Embedded pickle scanning for OpenVINO weights must obey scanner selection."""
+    xml_path = create_basic_model(tmp_path)
+    bin_path = create_malicious_pickle(tmp_path / "model.bin")
+
+    result = OpenVinoScanner({"exclude_scanners": ["pickle"]}).scan(str(xml_path))
+
+    assert result.success is True
+    assert result.metadata["openvino_weights_pickle_payload_skipped"] is True
+    assert result.metadata["skipped_scanner_ids"] == ["pickle"]
+    assert any(
+        check.name == "Scanner Selection"
+        and check.location == str(bin_path)
+        and check.details.get("skipped_scanner_id") == "pickle"
+        and check.details.get("context") == "OpenVINO weights sidecar"
+        for check in result.checks
+    )
+    assert not any(issue.location == str(bin_path) for issue in result.issues)
 
 
 def test_openvino_scanner_can_handle_long_xml_prolog(tmp_path: Path) -> None:

@@ -1519,6 +1519,33 @@ def test_scan_model_streaming_openvino_prefetched_companion_changes_content_hash
     assert first_result.content_hash != second_result.content_hash
 
 
+def test_scan_model_streaming_hashes_reused_path_file_instances(tmp_path: Path) -> None:
+    """A streaming source may reuse one staging path for multiple distinct files."""
+    stage_path = tmp_path / "stage.txt"
+    first_payload = b"first streamed file"
+    second_payload = b"second streamed file"
+    stage_path.write_bytes(first_payload)
+    first_hash = compute_sha256_hash(stage_path)
+    stage_path.write_bytes(second_payload)
+    second_hash = compute_sha256_hash(stage_path)
+
+    def reused_path_generator() -> Iterator[tuple[Path, bool]]:
+        stage_path.write_bytes(first_payload)
+        yield stage_path, False
+        stage_path.write_bytes(second_payload)
+        yield stage_path, True
+
+    result = scan_model_streaming(
+        file_generator=reused_path_generator(),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+    )
+
+    assert determine_exit_code(result) == 0
+    assert result.content_hash == compute_aggregate_hash([first_hash, second_hash])
+
+
 def test_scan_model_streaming_openvino_prefetched_companion_counts_toward_max_total_size(tmp_path: Path) -> None:
     """HF-style XML-only yields must count staged OpenVINO weights against total scan caps."""
     xml_path, bin_path = _write_openvino_pair(tmp_path)

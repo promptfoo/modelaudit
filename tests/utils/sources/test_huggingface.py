@@ -2359,6 +2359,49 @@ class TestModelDownloadStreaming:
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["openvino/model.xml", "openvino/model.bin"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_yields_openvino_bin_when_openvino_not_selected(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Selected .bin files must not be consumed as OpenVINO companions when OpenVINO is excluded."""
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / "huggingface" / "test" / "model" / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if filename.endswith(".xml"):
+                path.write_text("<net version='10'></net>", encoding="utf-8")
+            else:
+                path.write_bytes(b"pickle-or-pytorch-candidate")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path,
+                scannable_extensions={".xml", ".bin"},
+                scannable_scanner_ids={"pickle"},
+            )
+        )
+
+        download_root = tmp_path / "huggingface" / "test" / "model" / "openvino"
+        assert results == [(download_root / "model.xml", False), (download_root / "model.bin", True)]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "openvino/model.xml",
+            "openvino/model.bin",
+        ]
+        mock_detect_content.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
         return_value=(["document.xml", "document.bin"], _HF_TEST_REVISION, None),
     )
     @patch("huggingface_hub.hf_hub_download")
