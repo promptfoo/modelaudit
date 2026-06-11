@@ -55,7 +55,7 @@ from modelaudit.scanners.archive_dispatch import (
     merge_inconclusive_flax_msgpack_outcome,
     merge_safetensors_overlap_analysis,
 )
-from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
+from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
 from modelaudit.scanners.mxnet_scanner import MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY
 from modelaudit.scanners.safetensors_scanner import MAX_HEADER_BYTES as SAFETENSORS_MAX_HEADER_BYTES
 from modelaudit.scanners.xgboost_scanner import (
@@ -1712,6 +1712,16 @@ def _should_defer_hash_for_safetensors_header_limit(file_path: str, config: dict
     return should_defer_safetensors_header_limit_hash(file_path, max_header_bytes)
 
 
+def _should_defer_hash_for_file_backed_hdf5(file_path: str) -> bool:
+    """Avoid pre-dispatch whole-file hashing for HDF5 scans handled through h5py metadata traversal."""
+    try:
+        file_size = os.path.getsize(file_path)
+    except OSError:
+        return False
+
+    return file_size > DEFAULT_MAX_FILE_READ_SIZE and find_hdf5_signature_offset(file_path) is not None
+
+
 def _should_defer_hash_for_max_file_size(file_path: str, config: dict[str, Any]) -> bool:
     """Avoid hashing files that regular scanning will reject on max_file_size."""
     try:
@@ -1746,7 +1756,13 @@ def _should_defer_hash_for_max_total_size(
 
 
 def _is_incomplete_aggregate_hash_placeholder(content_hash: str) -> bool:
-    return content_hash.startswith(("unhashable_max_file_size_", "unhashable_max_total_size_"))
+    return content_hash.startswith(
+        (
+            "unhashable_file_backed_hdf5_",
+            "unhashable_max_file_size_",
+            "unhashable_max_total_size_",
+        )
+    )
 
 
 def _hash_files_by_path(
@@ -1776,6 +1792,9 @@ def _hash_files_by_path(
         routing_path = routing_paths.get(file_path, file_path) if routing_paths is not None else file_path
         if _should_defer_hash_for_safetensors_header_limit(routing_path, hash_config):
             content_hashes[file_path] = f"unhashable_bounded_safetensors_{id(file_path)}"
+            continue
+        if _should_defer_hash_for_file_backed_hdf5(routing_path):
+            content_hashes[file_path] = f"unhashable_file_backed_hdf5_{id(file_path)}"
             continue
         if _should_defer_hash_for_max_file_size(routing_path, hash_config):
             content_hashes[file_path] = f"unhashable_max_file_size_{id(file_path)}"
@@ -3105,12 +3124,14 @@ def scan_model_directory_or_file(
                     hashed_bytes=top_level_hashed_bytes,
                 )
                 defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(target, config)
-                if defer_hash_for_max_total_size or defer_hash_for_max_file_size:
+                defer_hash_for_file_backed_hdf5 = _should_defer_hash_for_file_backed_hdf5(target)
+                if defer_hash_for_max_total_size or defer_hash_for_max_file_size or defer_hash_for_file_backed_hdf5:
                     aggregate_hash_complete = False
                 if (
                     not _should_defer_hash_for_safetensors_header_limit(target, config)
                     and not defer_hash_for_max_file_size
                     and not defer_hash_for_max_total_size
+                    and not defer_hash_for_file_backed_hdf5
                 ):
                     try:
                         top_level_hashing_started_at = _start_phase_timing(phase_timings)
@@ -4452,12 +4473,14 @@ def scan_model_streaming(
                     hashed_bytes=top_level_hashed_bytes,
                 )
                 defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(str(scan_path), scan_config)
-                if defer_hash_for_max_total_size or defer_hash_for_max_file_size:
+                defer_hash_for_file_backed_hdf5 = _should_defer_hash_for_file_backed_hdf5(str(scan_path))
+                if defer_hash_for_max_total_size or defer_hash_for_max_file_size or defer_hash_for_file_backed_hdf5:
                     aggregate_hash_complete = False
                 if (
                     not _should_defer_hash_for_safetensors_header_limit(str(scan_path), scan_config)
                     and not defer_hash_for_max_file_size
                     and not defer_hash_for_max_total_size
+                    and not defer_hash_for_file_backed_hdf5
                 ):
                     if progress_callback:
                         progress_callback(

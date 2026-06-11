@@ -1,6 +1,7 @@
 import base64
 import json
 import marshal
+import os
 import subprocess
 import sys
 import textwrap
@@ -15,13 +16,14 @@ pytest.importorskip("h5py")
 
 import h5py
 
+import modelaudit.core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import build_cache_version_context
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.scanners import keras_h5_scanner as keras_h5_scanner_module
 from modelaudit.scanners import keras_utils
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 from modelaudit.utils.file.hdf5 import HDF5_MAGIC, find_hdf5_signature_offset, hdf5_metadata_checksum
 from modelaudit.utils.helpers.cache_decorator import should_bypass_cache_for_missing_h5py
@@ -126,6 +128,18 @@ def create_raw_config_h5_file(
             f.attrs["training_config"] = training_config_attr
 
     return h5_path
+
+
+def inflate_h5_file_to_size(path: Path, minimum_size: int = DEFAULT_MAX_FILE_READ_SIZE + 4096) -> None:
+    """Make an HDF5 fixture appear large using sparse trailing padding."""
+    with path.open("ab") as handle:
+        handle.truncate(minimum_size)
+
+
+def assert_not_rejected_by_read_cap(result: Any) -> None:
+    reasons = result.metadata.get("scan_outcome_reasons", [])
+    assert "max_file_read_size_exceeded" not in reasons
+    assert not any(check.name == "File Size Limit" and check.status == CheckStatus.FAILED for check in result.checks)
 
 
 def create_h5_with_external_link(
@@ -556,6 +570,391 @@ def test_keras_h5_scanner_benign_model_has_no_warning_noise(tmp_path: Path) -> N
     result = scanner.scan(str(model_path))
 
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+def test_large_benign_keras_h5_scans_file_backed_without_default_read_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Valid large HDF5 Keras files should reach h5py-backed inspection."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        file_name="large_benign.h5",
+    )
+    inflate_h5_file_to_size(model_path)
+
+    def fail_hash(_self: KerasH5Scanner, _path: str) -> dict[str, str | None]:
+        pytest.fail("Keras H5 scanning must not hash/read the whole file")
+
+    monkeypatch.setattr(KerasH5Scanner, "calculate_file_hashes", fail_hash)
+    monkeypatch.setattr(
+        core_module,
+        "_calculate_file_hash",
+        lambda _path: pytest.fail("Core must not hash large HDF5 before Keras H5 dispatch"),
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+    audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+
+    assert model_path.stat().st_size > DEFAULT_MAX_FILE_READ_SIZE
+    assert result.success is True
+    assert audit_result.success is True
+    assert audit_result.content_hash is None
+    assert result.metadata["file_backed_scan"] is True
+    assert_not_rejected_by_read_cap(result)
+    assert any(check.name == "Keras H5 File-Backed Inspection" for check in result.checks)
+    assert not any(check.name == "File Integrity Hash" for check in result.checks)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+def test_large_keras_h5_directory_scan_defers_core_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    model_path = create_custom_h5_file(
+        model_dir,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        file_name="large_directory_model.h5",
+    )
+    inflate_h5_file_to_size(model_path)
+
+    monkeypatch.setattr(
+        core_module,
+        "_calculate_file_hash",
+        lambda _path: pytest.fail("Directory scan must not hash large HDF5 before Keras H5 dispatch"),
+    )
+    monkeypatch.setattr(
+        KerasH5Scanner,
+        "calculate_file_hashes",
+        lambda _self, _path: pytest.fail("Keras H5 scanner must not hash large HDF5"),
+    )
+
+    audit_result = scan_model_directory_or_file(str(model_dir), cache_enabled=False)
+    metadata = audit_result.file_metadata[str(model_path)]
+
+    assert audit_result.success is True
+    assert audit_result.files_scanned == 1
+    assert audit_result.content_hash is None
+    assert "keras_h5" in audit_result.scanner_names
+    assert "max_file_read_size_exceeded" not in (getattr(metadata, "model_extra", {}) or {}).get(
+        "scan_outcome_reasons",
+        [],
+    )
+
+
+def test_large_malicious_keras_h5_still_detects_lambda_payload(tmp_path: Path) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {"function": "lambda x: __import__('os').system('id')"},
+                    }
+                ]
+            },
+        },
+        keras_version="3.11.2",
+        file_name="large_lambda.h5",
+    )
+    inflate_h5_file_to_size(model_path)
+
+    result = KerasH5Scanner().scan(str(model_path))
+    audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+
+    assert_not_rejected_by_read_cap(result)
+    assert any(
+        check.name == "Lambda Layer Code Analysis" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(
+        issue.details.get("cve_id") == "CVE-2025-9905" and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
+    assert determine_exit_code(audit_result) == 1
+
+
+def test_large_malformed_keras_h5_fails_closed_without_size_limit(tmp_path: Path) -> None:
+    model_path = create_raw_config_h5_file(
+        tmp_path,
+        model_config_attr="{",
+        file_name="large_malformed_config.h5",
+    )
+    inflate_h5_file_to_size(model_path)
+
+    result = KerasH5Scanner().scan(str(model_path))
+    audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "keras_h5_model_config_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert_not_rejected_by_read_cap(result)
+    assert any(check.name == "Keras H5 Config Parse" and check.status == CheckStatus.FAILED for check in result.checks)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+    assert determine_exit_code(audit_result) == 2
+
+
+def test_large_hdf5_external_link_still_detected_without_target_resolution(tmp_path: Path) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        keras_version="3.13.1",
+        file_name="large_external_link.h5",
+    )
+    with h5py.File(model_path, "a") as f:
+        weights_group = f.require_group("model_weights")
+        weights_group.attrs["layer_names"] = [b"dense"]
+        dense = weights_group.create_group("dense")
+        dense.attrs["weight_names"] = [b"linked_kernel"]
+        dense["linked_kernel"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
+    inflate_h5_file_to_size(model_path)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert_not_rejected_by_read_cap(result)
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/model_weights/dense/linked_kernel",
+            "filename": "missing_external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
+def test_large_hdf5_soft_link_to_external_link_still_detected(tmp_path: Path) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        keras_version="3.13.1",
+        file_name="large_soft_external_link.h5",
+    )
+    with h5py.File(model_path, "a") as f:
+        dense = f.require_group("model_weights").create_group("dense")
+        dense.attrs["weight_names"] = [b"soft_alias"]
+        f["model_weights"].attrs["layer_names"] = [b"dense"]
+        dense["external_payload"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
+        dense["soft_alias"] = h5py.SoftLink("/model_weights/dense/external_payload")
+    inflate_h5_file_to_size(model_path)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert_not_rejected_by_read_cap(result)
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/model_weights/dense/soft_alias",
+            "filename": "missing_external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
+def test_large_hdf5_soft_link_to_external_storage_still_detected(tmp_path: Path) -> None:
+    raw_storage = tmp_path / "weights.raw"
+    raw_storage.write_bytes(b"\x00" * 8)
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        keras_version="3.13.1",
+        file_name="large_soft_external_storage.h5",
+    )
+    with h5py.File(model_path, "a") as f:
+        dense = f.require_group("model_weights").create_group("dense")
+        dense.attrs["weight_names"] = [b"soft_alias"]
+        f["model_weights"].attrs["layer_names"] = [b"dense"]
+        dense.create_dataset(
+            "external_kernel",
+            shape=(2,),
+            dtype="float32",
+            external=[(raw_storage.name, 0, 8)],
+        )
+        dense["soft_alias"] = h5py.SoftLink("/model_weights/dense/external_kernel")
+    inflate_h5_file_to_size(model_path)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert_not_rejected_by_read_cap(result)
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "external_storage",
+            "hdf5_path": "/model_weights/dense/soft_alias",
+            "segments": [{"filename": "weights.raw", "offset": 0, "size": 8}],
+        },
+    ]
+
+
+def test_large_hdf5_soft_link_cycle_fails_closed_without_size_limit(tmp_path: Path) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        file_name="large_soft_cycle.h5",
+    )
+    with h5py.File(model_path, "a") as f:
+        dense = f.require_group("model_weights").create_group("dense")
+        dense.attrs["weight_names"] = [b"cycle_a"]
+        f["model_weights"].attrs["layer_names"] = [b"dense"]
+        dense["cycle_a"] = h5py.SoftLink("/model_weights/dense/cycle_b")
+        dense["cycle_b"] = h5py.SoftLink("/model_weights/dense/cycle_a")
+    inflate_h5_file_to_size(model_path)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "keras_h5_external_reference_analysis_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert_not_rejected_by_read_cap(result)
+    assert any(
+        check.name == "HDF5 External Reference Analysis Limit"
+        and check.details["soft_link_resolution_incomplete"] is True
+        for check in result.checks
+    )
+
+
+def test_sparse_chunked_compressed_hdf5_dataset_does_not_materialize(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {"function": "lambda x: __import__('os').system('id')"},
+                    }
+                ]
+            },
+        },
+        keras_version="3.11.2",
+        file_name="sparse_compressed.h5",
+    )
+    with h5py.File(model_path, "a") as f:
+        weights_group = f.require_group("model_weights")
+        weights_group.create_dataset(
+            "huge_sparse_compressed",
+            shape=(1024 * 1024 * 1024,),
+            dtype="float32",
+            chunks=(1024,),
+            compression="gzip",
+            fillvalue=0,
+        )
+    inflate_h5_file_to_size(model_path)
+
+    def fail_dataset_read(_self: Any, _key: Any) -> Any:
+        raise AssertionError("HDF5 dataset payload was materialized")
+
+    def fail_read_direct(_self: Any, *_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("HDF5 dataset payload was materialized")
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", fail_dataset_read)
+    monkeypatch.setattr(h5py.Dataset, "read_direct", fail_read_direct)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert_not_rejected_by_read_cap(result)
+    assert any(issue.details.get("cve_id") == "CVE-2025-9905" for issue in result.issues)
+
+
+def test_keras_h5_oversized_config_attribute_fails_closed_before_json_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_raw_config_h5_file(
+        tmp_path,
+        model_config_attr=json.dumps(
+            {
+                "class_name": "Sequential",
+                "config": {"layers": [{"class_name": "Dense", "config": {"padding": "A" * 64}}]},
+            }
+        ),
+        file_name="oversized_config_attr.h5",
+    )
+    inflate_h5_file_to_size(model_path)
+    monkeypatch.setattr(KerasH5Scanner, "_MAX_HDF5_JSON_ATTRIBUTE_BYTES", 32)
+    original_attr_getitem = h5py.AttributeManager.__getitem__
+
+    def fail_model_config_materialization(self: Any, name: str) -> Any:
+        if name == "model_config":
+            raise AssertionError("oversized Keras H5 config should not be materialized")
+        return original_attr_getitem(self, name)
+
+    def fail_json_loads(_payload: Any) -> Any:
+        raise AssertionError("oversized Keras H5 config should not be parsed")
+
+    monkeypatch.setattr(h5py.AttributeManager, "__getitem__", fail_model_config_materialization)
+    monkeypatch.setattr(keras_h5_scanner_module.json, "loads", fail_json_loads)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "keras_h5_model_config_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert_not_rejected_by_read_cap(result)
+    assert any(
+        check.name == "Keras H5 Config Size Limit" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+@pytest.mark.integration
+def test_real_hf_xlm_roberta_large_h5_reaches_keras_scan_without_read_cap(tmp_path: Path) -> None:
+    if os.environ.get("MODELAUDIT_RUN_REAL_HF_H5") != "1":
+        pytest.skip("Set MODELAUDIT_RUN_REAL_HF_H5=1 to download and scan the pinned HF H5 model")
+
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    cache_dir = os.environ.get("MODELAUDIT_HF_CACHE_DIR", str(tmp_path / "hf-cache"))
+    model_path = Path(
+        huggingface_hub.hf_hub_download(
+            repo_id="FacebookAI/xlm-roberta-large",
+            filename="tf_model.h5",
+            revision="c23d21b0620b635a76227c604d44e43a9f0ee389",
+            cache_dir=cache_dir,
+        )
+    )
+
+    audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    metadata = audit_result.file_metadata[str(model_path)]
+    metadata_extra = getattr(metadata, "model_extra", {}) or {}
+
+    assert model_path.stat().st_size == 2_240_076_248
+    assert metadata.file_size == 2_240_076_248
+    assert audit_result.files_scanned == 1
+    assert "keras_h5" in audit_result.scanner_names
+    assert "max_file_read_size_exceeded" not in (metadata_extra.get("scan_outcome_reasons") or [])
+    assert any(
+        check.name == "Keras Model Format Check" and check.status == CheckStatus.PASSED for check in audit_result.checks
+    )
+    assert determine_exit_code(audit_result) == 0
 
 
 def test_missing_h5py_returns_inconclusive_exit2_without_cache(
@@ -1660,6 +2059,42 @@ def test_keras_h5_scanner_flags_keras3_weights_external_link_without_resolving_i
     ]
 
 
+@pytest.mark.parametrize("layout", ["legacy", "keras3"])
+def test_keras_h5_scanner_flags_weights_only_soft_linked_external_reference(
+    tmp_path: Path,
+    layout: str,
+) -> None:
+    """Weights-only SoftLink aliases must still route into external-reference analysis."""
+    weights_path = tmp_path / f"soft_linked_{layout}.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        if layout == "legacy":
+            f.attrs["layer_names"] = [b"dense_alias"]
+            dense = f.create_group("real_dense")
+            dense.attrs["weight_names"] = [b"kernel:0"]
+            dense["kernel:0"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
+            f["dense_alias"] = h5py.SoftLink("/real_dense")
+            expected_path = "/dense_alias/kernel:0"
+        else:
+            real_layers = f.create_group("real_layers")
+            vars_group = real_layers.create_group("dense").create_group("vars")
+            vars_group["0"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
+            f["layers"] = h5py.SoftLink("/real_layers")
+            expected_path = "/layers/dense/vars/0"
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": expected_path,
+            "filename": "missing_external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
 def test_keras_h5_scanner_legacy_h5py_traversal_flags_dangling_external_link(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1690,7 +2125,7 @@ def test_keras_h5_scanner_external_reference_collection_does_not_resolve_soft_li
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SoftLink aliases must not be dereferenced while collecting external references."""
+    """SoftLink aliases are resolved as links without dereferencing external targets."""
     weights_path = tmp_path / "soft_alias.weights.h5"
     with h5py.File(weights_path, "w") as f:
         vars_group = f.create_group("layers").create_group("dense").create_group("vars")
@@ -1720,6 +2155,12 @@ def test_keras_h5_scanner_external_reference_collection_does_not_resolve_soft_li
         {
             "kind": "ExternalLink",
             "hdf5_path": "/layers/dense/vars/external_kernel",
+            "filename": "missing_external_source.h5",
+            "path": "/payload",
+        },
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/layers/dense/vars/soft_alias",
             "filename": "missing_external_source.h5",
             "path": "/payload",
         },
