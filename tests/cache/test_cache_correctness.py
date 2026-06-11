@@ -2521,6 +2521,54 @@ def test_cached_scan_skips_persisting_incomplete_metadata(
     assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
 
 
+@pytest.mark.parametrize("collection_name", ["issues", "checks"])
+@pytest.mark.parametrize(
+    "details",
+    [
+        {"scan_outcome": INCONCLUSIVE_SCAN_OUTCOME},
+        {"analysis_incomplete": True},
+        {"scan_outcome_reason": "bounded_probe_exhausted"},
+        {"scan_outcome_reasons": ["bounded_probe_exhausted"]},
+        {"operational_error": True},
+    ],
+)
+def test_cached_scan_skips_persisting_incomplete_record_details(
+    tmp_path: Path,
+    collection_name: str,
+    details: dict[str, Any],
+) -> None:
+    """Issue/check-only incomplete coverage must be rescanned instead of replayed."""
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        record = {
+            "message": "Incomplete coverage retained only in record details",
+            "status": "failed",
+            "details": details,
+        }
+        result: dict[str, Any] = {
+            "checks": [],
+            "issues": [],
+            "success": True,
+            "scan_count": calls["count"],
+        }
+        result[collection_name] = [record]
+        return result
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
 def test_cached_scan_skips_persisting_bare_unsuccessful_results(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache_dir = tmp_path / "cache"

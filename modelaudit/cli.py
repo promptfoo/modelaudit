@@ -45,7 +45,11 @@ from .core import (
     determine_exit_code,
     scan_model_directory_or_file,
 )
-from .core_results import metadata_has_incomplete_coverage, results_have_inconclusive_outcome
+from .core_results import (
+    metadata_has_incomplete_coverage,
+    records_have_incomplete_coverage_for_path,
+    results_have_inconclusive_outcome,
+)
 from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import format_sarif_output
 from .integrations.source_redaction import redact_source_value
@@ -1509,6 +1513,8 @@ class _ScanPathState:
             if metadata is not None and (
                 metadata.get("operational_error") is True or metadata_has_incomplete_coverage(metadata)
             ):
+                continue
+            if records_have_incomplete_coverage_for_path((*scan_result.checks, *scan_result.issues), asset.path):
                 continue
             record_covered_file(asset.path)
 

@@ -168,6 +168,7 @@ _consolidate_checks = core_results.consolidate_checks
 _mark_inconclusive_scan_outcome = core_results.mark_inconclusive_scan_outcome
 _mark_operational_scan_error = core_results.mark_operational_scan_error
 _metadata_has_incomplete_coverage = core_results.metadata_has_incomplete_coverage
+_records_have_incomplete_coverage_for_path = core_results.records_have_incomplete_coverage_for_path
 _results_have_operational_error = core_results.results_have_operational_error
 _results_should_be_unsuccessful = core_results.results_should_be_unsuccessful
 _scan_result_has_operational_error = core_results.scan_result_has_operational_error
@@ -2867,6 +2868,8 @@ def scan_model_directory_or_file(
                         metadata.get("operational_error") is True or _metadata_has_incomplete_coverage(metadata)
                     ):
                         continue
+                    if _records_have_incomplete_coverage_for_path((*results.checks, *results.issues), asset.path):
+                        continue
                     if scanner_selection.active and get_scanner_for_file(asset.path, config=config) is None:
                         continue
                     actual_dvc_covered_paths.add(str(Path(asset.path).resolve()))
@@ -3010,6 +3013,10 @@ def scan_model_directory_or_file(
                                 metadata.get("operational_error") is True or _metadata_has_incomplete_coverage(metadata)
                             )
                         )
+                        and not _records_have_incomplete_coverage_for_path(
+                            (*nested_result.checks, *nested_result.issues),
+                            asset.path,
+                        )
                     }
                     scanned_dvc_paths.update(nested_scanned_paths)
                     internally_scanned_dvc_paths.update(nested_scanned_paths)
@@ -3076,10 +3083,21 @@ def scan_model_directory_or_file(
                     results.aggregate_scan_result(nested_result)
                     for asset in nested_result.assets:
                         asset_path = Path(asset.path)
-                        if asset_path.is_file():
-                            resolved_asset_path = str(asset_path.resolve())
-                            scanned_dvc_paths.add(resolved_asset_path)
-                            internally_scanned_dvc_paths.add(resolved_asset_path)
+                        if not asset_path.is_file():
+                            continue
+                        metadata = nested_result.file_metadata.get(asset.path)
+                        if metadata is not None and (
+                            metadata.get("operational_error") is True or _metadata_has_incomplete_coverage(metadata)
+                        ):
+                            continue
+                        if _records_have_incomplete_coverage_for_path(
+                            (*nested_result.checks, *nested_result.issues),
+                            asset.path,
+                        ):
+                            continue
+                        resolved_asset_path = str(asset_path.resolve())
+                        scanned_dvc_paths.add(resolved_asset_path)
+                        internally_scanned_dvc_paths.add(resolved_asset_path)
                     for root, _dirs, _files in os.walk(target, followlinks=False):
                         resolved_directory = str(Path(root).resolve())
                         dvc_scanned_directories.add(resolved_directory)

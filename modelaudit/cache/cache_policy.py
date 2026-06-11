@@ -43,13 +43,7 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
     if scan_result.get("success") is False:
         return False
 
-    metadata = scan_result.get("metadata")
-    if isinstance(metadata, dict) and (
-        bool(metadata.get("operational_error"))
-        or bool(metadata.get("analysis_incomplete"))
-        or metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-        or _has_incomplete_coverage_reasons(metadata)
-    ):
+    if _metadata_disqualifies_cache(scan_result.get("metadata")):
         return False
 
     for collection_name in ("issues", "checks"):
@@ -61,6 +55,9 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
             if not isinstance(entry, dict):
                 continue
 
+            if _metadata_disqualifies_cache(entry.get("details")):
+                return False
+
             message = entry.get("message")
             if isinstance(message, str) and any(
                 indicator in message.lower() for indicator in _OPERATIONAL_ERROR_INDICATORS
@@ -68,6 +65,17 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
                 return False
 
     return True
+
+
+def _metadata_disqualifies_cache(metadata: Any) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    return (
+        bool(metadata.get("operational_error"))
+        or bool(metadata.get("analysis_incomplete"))
+        or metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        or _has_incomplete_coverage_reasons(metadata)
+    )
 
 
 def _has_incomplete_coverage_reasons(metadata: dict[str, Any]) -> bool:

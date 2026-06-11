@@ -7,6 +7,7 @@ import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 from modelaudit.models import ModelAuditResultModel
@@ -128,6 +129,38 @@ def records_have_incomplete_coverage(records: Iterable[Any] | None) -> bool:
         return False
     try:
         return any(record_details_have_incomplete_coverage(record) for record in records)
+    except TypeError:
+        return False
+
+
+def record_has_incomplete_coverage_for_path(record: Any, file_path: str) -> bool:
+    """Return True when a retained issue/check marks a specific file's coverage incomplete."""
+    if not record_details_have_incomplete_coverage(record):
+        return False
+
+    location = _metadata_value(record, "location")
+    if not isinstance(location, str) or not location:
+        return True
+
+    file_path_str = str(file_path)
+    if location == file_path_str:
+        return True
+
+    try:
+        if Path(location).resolve(strict=False) == Path(file_path_str).resolve(strict=False):
+            return True
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+    return file_path_str in location
+
+
+def records_have_incomplete_coverage_for_path(records: Iterable[Any] | None, file_path: str) -> bool:
+    """Return True when retained issue/check details make a file unsafe to treat as covered."""
+    if records is None:
+        return False
+    try:
+        return any(record_has_incomplete_coverage_for_path(record, file_path) for record in records)
     except TypeError:
         return False
 
