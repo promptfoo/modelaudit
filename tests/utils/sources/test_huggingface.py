@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterator
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
@@ -2663,46 +2663,33 @@ class TestModelDownloadStreaming:
             None,
         ),
     )
-    @patch("requests.get")
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value="safetensors")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_selected_non_overlap_skips_declared_safetensors_shards_before_probe(
+    def test_download_model_streaming_selected_non_overlap_complete_safetensors_shards_hit_sniff_cap(
         self,
         mock_hf_hub_download: MagicMock,
-        mock_requests_get: MagicMock,
+        mock_detect_content: MagicMock,
         _mock_list_repo_files: MagicMock,
-        tmp_path: Path,
     ) -> None:
-        """Non-overlap selection must skip declared SafeTensors shards without range probes."""
+        """Complete-looking shard families remain content-routed and fail closed at the probe cap."""
         policy = resolve_scanner_selection_policy(scanners=["xgboost"])
         extensions = selected_scanner_extensions(policy, conservative=True)
         assert extensions is not None
         assert ".ubj" in extensions
         assert ".safetensors" not in extensions
 
-        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
-            assert filename == "MODEL.UBJ"
-            path = tmp_path / filename
-            path.write_bytes(b"downloaded")
-            return str(path)
-
-        mock_hf_hub_download.side_effect = download_side_effect
-
-        results = list(
-            download_model_streaming(
-                "https://huggingface.co/test/model",
-                scannable_extensions=extensions,
-                scannable_filenames=selected_scanner_filenames(policy, conservative=True),
-                scannable_scanner_ids=policy.enabled_scanner_ids,
+        with pytest.raises(Exception, match="skipped file inspection limit exceeded"):
+            list(
+                download_model_streaming(
+                    "https://huggingface.co/test/model",
+                    scannable_extensions=extensions,
+                    scannable_filenames=selected_scanner_filenames(policy, conservative=True),
+                    scannable_scanner_ids=policy.enabled_scanner_ids,
+                )
             )
-        )
 
-        assert results == [(tmp_path / "MODEL.UBJ", True)]
-        mock_requests_get.assert_not_called()
-        mock_hf_hub_download.assert_called_once_with(
-            repo_id="test/model",
-            filename="MODEL.UBJ",
-            revision=_HF_TEST_REVISION,
-        )
+        assert mock_detect_content.call_count == _HF_CONTENT_SNIFF_MAX_FILES
+        mock_hf_hub_download.assert_not_called()
 
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -2764,58 +2751,42 @@ class TestModelDownloadStreaming:
             None,
         ),
     )
-    @patch("requests.get")
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value="safetensors")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_extension_only_non_overlap_skips_declared_safetensors_shards_before_probe(
+    def test_download_model_streaming_extension_only_non_overlap_complete_safetensors_shards_hit_sniff_cap(
         self,
         mock_hf_hub_download: MagicMock,
-        mock_requests_get: MagicMock,
+        mock_detect_content: MagicMock,
         _mock_list_repo_files: MagicMock,
-        tmp_path: Path,
     ) -> None:
-        """Extension-only selection must also skip declared SafeTensors shards before probing."""
-
-        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
-            assert filename == "MODEL.UBJ"
-            path = tmp_path / filename
-            path.write_bytes(b"downloaded")
-            return str(path)
-
-        mock_hf_hub_download.side_effect = download_side_effect
-
-        results = list(
-            download_model_streaming(
-                "https://huggingface.co/test/model",
-                scannable_extensions={".ubj"},
+        """Extension-only content-route selection must fail closed instead of trusting shard names."""
+        with pytest.raises(Exception, match="skipped file inspection limit exceeded"):
+            list(
+                download_model_streaming(
+                    "https://huggingface.co/test/model",
+                    scannable_extensions={".ubj"},
+                )
             )
-        )
 
-        assert results == [(tmp_path / "MODEL.UBJ", True)]
-        mock_requests_get.assert_not_called()
-        mock_hf_hub_download.assert_called_once_with(
-            repo_id="test/model",
-            filename="MODEL.UBJ",
-            revision=_HF_TEST_REVISION,
-        )
+        assert mock_detect_content.call_count == _HF_CONTENT_SNIFF_MAX_FILES
+        mock_hf_hub_download.assert_not_called()
 
     @patch(
         "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
     )
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_extension_and_filename_non_overlap_skips_declared_safetensors_shards_without_ids(
+    def test_download_model_streaming_extension_and_filename_non_overlap_sniffs_complete_shards_without_ids(
         self,
         mock_hf_hub_download: MagicMock,
         mock_detect_content: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """Exact filename filters must not prevent non-overlap format inference from skipping shards."""
+        """Exact filename filters must preserve selected renamed payload detection without scanner IDs."""
         repo_files = [
             "README",
             "MODEL.UBJ",
-            *(
-                f"shards/model-{index:05d}-of-{_HF_CONTENT_SNIFF_MAX_FILES + 1:05d}.safetensors"
-                for index in range(1, _HF_CONTENT_SNIFF_MAX_FILES + 2)
-            ),
+            "shards/model-00001-of-00002.safetensors",
+            "shards/model-00002-of-00002.safetensors",
             "hidden.payload",
         ]
         mock_detect_content.side_effect = lambda _repo_id, filename, _revision, _budget: (
@@ -2847,7 +2818,11 @@ class TestModelDownloadStreaming:
             (tmp_path / "MODEL.UBJ", False),
             (tmp_path / "hidden.payload", True),
         ]
-        mock_detect_content.assert_called_once_with("test/model", "hidden.payload", _HF_TEST_REVISION, ANY)
+        assert [call.args[1] for call in mock_detect_content.call_args_list] == [
+            "shards/model-00001-of-00002.safetensors",
+            "shards/model-00002-of-00002.safetensors",
+            "hidden.payload",
+        ]
         assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
             "README",
             "MODEL.UBJ",
@@ -2939,14 +2914,14 @@ class TestModelDownloadStreaming:
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_filename_only_non_overlap_skips_declared_safetensors_shards_before_probe(
+    def test_download_model_streaming_filename_only_non_overlap_sniffs_complete_safetensors_shards_before_skip(
         self,
         mock_hf_hub_download: MagicMock,
         mock_detect_content: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """Exact filename suffixes skip declared shards, while ambiguous shard names stay bounded."""
-        shard_count = _HF_CONTENT_SNIFF_MAX_FILES + 2
+        """Exact filename suffixes still sniff shard-shaped candidates before skipping them."""
+        shard_count = 2
         repo_files = [
             "MODEL.UBJ",
             *(f"model-{index:05d}-of-{shard_count:05d}.safetensors" for index in range(1, shard_count + 1)),
@@ -2980,7 +2955,12 @@ class TestModelDownloadStreaming:
             )
 
         assert results == [(tmp_path / "MODEL.UBJ", False), (tmp_path / "hidden.payload", True)]
-        assert mock_detect_content.call_count == 3
+        assert [call.args[1] for call in mock_detect_content.call_args_list] == [
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+            "nested/model-00001-of-00002.safetensors",
+            "hidden.payload",
+        ]
         assert mock_detect_content.call_args_list[-1].args[:3] == ("test/model", "hidden.payload", _HF_TEST_REVISION)
         assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
             "MODEL.UBJ",
@@ -3059,7 +3039,7 @@ class TestModelDownloadStreaming:
         _mock_list_repo_files: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """Skipped detected shard families must not consume immutable-revision size checks."""
+        """Skipped detected shards must not consume immutable-revision size checks."""
         model_path = tmp_path / "MODEL.UBJ"
         model_path.write_bytes(b"ubj")
         mock_hf_hub_download.return_value = str(model_path)
@@ -3074,7 +3054,11 @@ class TestModelDownloadStreaming:
         )
 
         assert results == [(model_path, True)]
-        mock_detect_content.assert_not_called()
+        assert [call.args[1] for call in mock_detect_content.call_args_list] == [
+            "shards/model-00001-of-00003.safetensors",
+            "shards/model-00002-of-00003.safetensors",
+            "shards/model-00003-of-00003.safetensors",
+        ]
         mock_get_paths_info.assert_called_once_with("test/model", ["MODEL.UBJ"], revision=_HF_TEST_REVISION)
         mock_hf_hub_download.assert_called_once_with(
             repo_id="test/model",
@@ -3097,7 +3081,7 @@ class TestModelDownloadStreaming:
     @patch("requests.get")
     @patch("huggingface_hub.HfApi.get_paths_info")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_non_overlap_downloads_index_companion_without_shard_probes(
+    def test_download_model_streaming_non_overlap_downloads_index_companion_without_shard_inventory(
         self,
         mock_hf_hub_download: MagicMock,
         mock_get_paths_info: MagicMock,
@@ -3105,7 +3089,10 @@ class TestModelDownloadStreaming:
         _mock_list_repo_files: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """Selected companion indexes must not make excluded shard families consume probes or size budget."""
+        """Selected companion indexes stay inventoried while detected shards remain download-excluded."""
+        safetensors_header = b'{"__metadata__":{"format":"pt"}}'
+        safetensors_shard = struct.pack("<Q", len(safetensors_header)) + safetensors_header
+        mock_requests_get.return_value = _FakeRangeResponse(safetensors_shard)
         mock_get_paths_info.return_value = [
             SimpleNamespace(path="MODEL.UBJ", size=3),
             SimpleNamespace(path="model.safetensors.index.json", size=2),
@@ -3130,7 +3117,7 @@ class TestModelDownloadStreaming:
             (tmp_path / "MODEL.UBJ", False),
             (tmp_path / "model.safetensors.index.json", True),
         ]
-        mock_requests_get.assert_not_called()
+        assert mock_requests_get.call_count == 3
         mock_get_paths_info.assert_called_once_with(
             "test/model",
             ["MODEL.UBJ", "model.safetensors.index.json"],
@@ -3267,6 +3254,70 @@ class TestModelDownloadStreaming:
             filename="model-00001-of-00002.safetensors",
             revision=_HF_TEST_REVISION,
         )
+
+    @pytest.mark.parametrize(
+        "selection_kwargs",
+        [
+            pytest.param(
+                lambda policy: {
+                    "scannable_extensions": selected_scanner_extensions(policy, conservative=True),
+                    "scannable_filenames": selected_scanner_filenames(policy, conservative=True),
+                    "scannable_scanner_ids": policy.enabled_scanner_ids,
+                },
+                id="scanner-policy",
+            ),
+            pytest.param(lambda _policy: {"scannable_extensions": {".ubj"}}, id="extension-only"),
+        ],
+    )
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            [
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+            ],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_xgboost_sniffs_complete_shard_family_before_skip(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        selection_kwargs: Callable[[Any], dict[str, Any]],
+        tmp_path: Path,
+    ) -> None:
+        """Complete shard-shaped names must not hide selected XGBoost UBJSON content."""
+        policy = resolve_scanner_selection_policy(scanners=["xgboost"])
+        malicious_xgboost = _make_xgboost_ubjson_payload(malicious=True)
+        mock_requests_get.return_value = _FakeRangeResponse(malicious_xgboost)
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / filename
+            path.write_bytes(malicious_xgboost)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                **selection_kwargs(policy),
+            )
+        )
+
+        assert results == [
+            (tmp_path / "model-00001-of-00002.safetensors", False),
+            (tmp_path / "model-00002-of-00002.safetensors", True),
+        ]
+        assert mock_requests_get.call_count == 2
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ]
 
     @pytest.mark.parametrize(
         "filename",

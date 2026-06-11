@@ -971,33 +971,6 @@ def _has_hf_safetensors_shard_shape(filename: str) -> bool:
     return _HF_SAFETENSORS_SHARD_SHAPE_PATTERN.fullmatch(filename) is not None
 
 
-def _get_declared_hf_safetensors_shard_families(repo_files: Collection[str]) -> frozenset[tuple[str, int]]:
-    shard_indices_by_family: dict[tuple[str, int], set[int]] = {}
-    for filename in dict.fromkeys(repo_files):
-        parsed_shard = _parse_hf_safetensors_shard(filename)
-        if parsed_shard is None:
-            continue
-        stem, index, total = parsed_shard
-        shard_indices_by_family.setdefault((stem, total), set()).add(index)
-
-    return frozenset(
-        family_key
-        for family_key, shard_indices in shard_indices_by_family.items()
-        if len(shard_indices) == family_key[1]
-    )
-
-
-def _is_declared_hf_safetensors_shard(
-    filename: str,
-    declared_safetensors_shard_families: frozenset[tuple[str, int]],
-) -> bool:
-    parsed_shard = _parse_hf_safetensors_shard(filename)
-    if parsed_shard is None:
-        return False
-    stem, _index, total = parsed_shard
-    return (stem, total) in declared_safetensors_shard_families
-
-
 def _hf_detected_format_excluded_by_selected_route_formats(
     detected_format: str,
     selected_route_formats: set[str],
@@ -1173,7 +1146,6 @@ def _select_streamable_hf_files(
             deadline=deadline,
         )
         processed_files = set(model_files)
-        declared_safetensors_shard_families = _get_declared_hf_safetensors_shard_families(repo_files)
         for file_name in repo_files:
             if file_name in processed_files:
                 continue
@@ -1183,11 +1155,6 @@ def _select_streamable_hf_files(
                 selected_route_scanner_ids,
                 selected_route_formats,
             )
-            if may_skip_detected_safetensors_shard and _is_declared_hf_safetensors_shard(
-                file_name,
-                declared_safetensors_shard_families,
-            ):
-                continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
                     "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "
