@@ -83,12 +83,21 @@ _GGUF_FETCH_OPTIONS_WITH_VALUE = frozenset(
         "--form-string",
         "-h",
         "--header",
+        "-m",
+        "--connect-timeout",
+        "--limit-rate",
+        "--max-time",
         "-o",
         "--output",
         "--output-document",
         "--post-data",
         "--post-file",
         "--proxy",
+        "--retry",
+        "--retry-delay",
+        "--retry-max-time",
+        "--speed-limit",
+        "--speed-time",
         "-u",
         "--user",
         "-x",
@@ -111,17 +120,14 @@ _GGUF_NETWORK_URL_ASSIGNMENT_PATTERN = re.compile(
     r"""(?is)\b(?P<name>[a-z_][a-z0-9_]*)\s*=\s*(?:[rubf]{0,2})?(?P<quote>['"])(?:https?|ftp)://[^'"\s<>]+(?P=quote)""",
 )
 _GGUF_DEFAULT_MAX_TEMPLATE_SIZE = 50000
-_GGUF_CHAT_TEMPLATE_METADATA_PATTERN_TYPES = (
-    "critical_injection",
-    "object_traversal",
-    "global_access",
-    "environment_access",
-)
+_GGUF_CHAT_TEMPLATE_METADATA_PATTERN_TYPES = tuple(JINJA2_SSTI_PATTERNS)
 _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (pattern_type, re.compile(pattern, re.IGNORECASE | re.MULTILINE))
     for pattern_type in _GGUF_CHAT_TEMPLATE_METADATA_PATTERN_TYPES
     for pattern in JINJA2_SSTI_PATTERNS.get(pattern_type, [])
 )
+_GGUF_TIMEOUT_OPTIONS_WITH_VALUE = frozenset({"-k", "--kill-after"})
+_GGUF_TIMEOUT_DURATION_PATTERN = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
 _GGUF_REMOTE_URL_SCHEMES = ("http://", "https://", "ftp://")
 _GGUF_SHELL_SEGMENT_SEPARATORS = ";&|`$()"
 
@@ -1036,13 +1042,37 @@ class GgufScanner(BaseScanner):
         short_options = option.lstrip("-")
         return "r" in short_options, "f" in short_options
 
+    @staticmethod
+    def _is_timeout_duration(word: str) -> bool:
+        return bool(_GGUF_TIMEOUT_DURATION_PATTERN.fullmatch(word.strip("\"'")))
+
+    @classmethod
+    def _skip_timeout_prefix_arguments(cls, words: list[str], index: int) -> int:
+        while index < len(words):
+            word = words[index]
+            option = word.split("=", 1)[0]
+            if option in _GGUF_TIMEOUT_OPTIONS_WITH_VALUE:
+                index += 1 if "=" in word else 2
+                continue
+            if word.startswith("-"):
+                index += 1
+                continue
+            if cls._is_timeout_duration(word):
+                return index + 1
+            return index
+        return index
+
     @classmethod
     def _destructive_rm_segment(cls, words: list[str]) -> bool:
         index = 0
         while index < len(words):
             word = words[index]
-            if cls._shell_command_name(word) in _GGUF_DESTRUCTIVE_COMMAND_PREFIXES:
+            command_name = cls._shell_command_name(word)
+            if command_name in _GGUF_DESTRUCTIVE_COMMAND_PREFIXES:
                 index += 1
+                if command_name == "timeout":
+                    index = cls._skip_timeout_prefix_arguments(words, index)
+                    continue
                 while index < len(words) and words[index].startswith("-"):
                     index += 1
                 while index < len(words) and "=" in words[index] and not words[index].startswith("-"):

