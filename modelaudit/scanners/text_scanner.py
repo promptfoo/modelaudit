@@ -136,6 +136,7 @@ DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
     rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
     rb"[\s(\[{\\]{0,4096}[rubfRUBF]*[\"']?$"
 )
+DOCUMENTATION_CODE_RETURN_STRING_PATTERN = re.compile(rb"(?:^|[\r\n;{[(])[ \t]*(?:return|yield)\s+[rubfRUBF]*[\"']?$")
 DOCUMENTATION_PASSIVE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
     rb"<(?:a\b[^<>]{0,4096}\bhref|img\b[^<>]{0,4096}\bsrc)\s*=\s*[\"']?$",
     re.IGNORECASE,
@@ -890,6 +891,7 @@ class TextScanner(BaseScanner):
         code_prefix = prefix[:link_start]
         return (
             cls._documentation_assignment_is_actionable(code_prefix)
+            or DOCUMENTATION_CODE_RETURN_STRING_PATTERN.search(code_prefix) is not None
             or DOCUMENTATION_CODE_CALL_PATTERN.search(code_prefix) is not None
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(code_prefix) is not None
             or cls._documentation_nested_config_is_actionable(code_prefix)
@@ -1170,7 +1172,13 @@ class TextScanner(BaseScanner):
     def _documentation_line_is_code_shaped(cls, line: bytes, position: int) -> bool:
         prefix = line[:position]
         stripped = line.lstrip()
-        passive_markdown_link = cls._documentation_prefix_is_passive_markdown_link(prefix)
+        passive_markdown_link_match = cls._documentation_passive_markdown_link_match(prefix)
+        passive_markdown_link = passive_markdown_link_match is not None
+        markdown_link_code_context = (
+            cls._documentation_markdown_link_is_in_code_context(prefix, passive_markdown_link_match.start())
+            if passive_markdown_link_match is not None
+            else False
+        )
         shell_command_is_actionable = (
             cls._documentation_anchored_network_command_is_actionable(stripped)
             or cls._documentation_package_install_is_actionable(line, position)
@@ -1192,6 +1200,7 @@ class TextScanner(BaseScanner):
                 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN.search(prefix) is None
                 and cls._documentation_assignment_is_actionable(prefix)
             )
+            or markdown_link_code_context
             or (not passive_markdown_link and DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None)
             or (not passive_markdown_link and cls._documentation_prefix_has_enclosing_call(prefix))
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None

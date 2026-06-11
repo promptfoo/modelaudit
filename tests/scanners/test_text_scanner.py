@@ -472,6 +472,29 @@ def test_text_scanner_model_card_markdown_link_string_endpoint_remains_actionabl
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_model_card_markdown_link_return_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        'def endpoint():\n    return "[download](https://evil.example/payload.sh)"\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_model_card_bibliography_url_field_is_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "model_card.md"
     text_path.write_text(
