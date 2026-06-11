@@ -1,6 +1,7 @@
 """Tests for HuggingFace URL handling."""
 
 import importlib
+import json
 import os
 import pickle
 import signal
@@ -598,6 +599,100 @@ class TestModelDownload:
         download_model("https://huggingface.co/test/model")
 
         assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["weights[[]latest].bin"]
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            [
+                "nested/adapter/model.safetensors.index.json",
+                "nested/adapter/model-00000-of-00002.safetensors",
+                "nested/adapter/model-00001-of-00002.safetensors",
+            ],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_materializes_zero_based_safetensors_index_family(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Snapshot selection should keep nested zero-based indexed SafeTensors complete."""
+        index_payload = json.dumps(
+            {
+                "weight_map": {
+                    "a": "model-00000-of-00002.safetensors",
+                    "b": "model-00001-of-00002.safetensors",
+                }
+            }
+        ).encode()
+        download_path = tmp_path / "download"
+        nested_dir = download_path / "nested" / "adapter"
+        nested_dir.mkdir(parents=True)
+        for filename in (
+            "model.safetensors.index.json",
+            "model-00000-of-00002.safetensors",
+            "model-00001-of-00002.safetensors",
+        ):
+            (nested_dir / filename).write_bytes(b"{}" if filename.endswith(".json") else b"weights")
+        mock_requests_get.return_value = _FakeRangeResponse(index_payload)
+        mock_snapshot_download.return_value = str(download_path)
+
+        download_model("https://huggingface.co/test/model")
+
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == [
+            "nested/adapter/model-00000-of-00002.safetensors",
+            "nested/adapter/model-00001-of-00002.safetensors",
+            "nested/adapter/model.safetensors.index.json",
+        ]
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            [
+                "model.safetensors.index.json",
+                "model-00000-of-00002.safetensors",
+            ],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_rejects_incomplete_zero_based_safetensors_index_family(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+    ) -> None:
+        """An indexed shard missing from the immutable repo listing must fail closed."""
+        mock_requests_get.return_value = _FakeRangeResponse(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "a": "model-00000-of-00002.safetensors",
+                        "b": "model-00001-of-00002.safetensors",
+                    }
+                }
+            ).encode()
+        )
+
+        with pytest.raises(Exception, match="references missing model shard"):
+            download_model("https://huggingface.co/test/model")
+
+        mock_snapshot_download.assert_not_called()
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
@@ -2066,6 +2161,105 @@ class TestModelDownloadStreaming:
             cache_dir=str(tmp_path / "huggingface"),
             local_dir=str(tmp_path / "huggingface" / "test" / "model"),
         )
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            [
+                "nested/adapter/model.safetensors.index.json",
+                "nested/adapter/model-00000-of-00002.safetensors",
+                "nested/adapter/model-00001-of-00002.safetensors",
+            ],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_downloads_zero_based_safetensors_index_family(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Streaming selection should include nested zero-based shards and their index."""
+        mock_requests_get.return_value = _FakeRangeResponse(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "a": "model-00000-of-00002.safetensors",
+                        "b": "model-00001-of-00002.safetensors",
+                    }
+                }
+            ).encode()
+        )
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / "huggingface" / "test" / "model" / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"downloaded")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        results = list(download_model_streaming("https://huggingface.co/test/model", cache_dir=tmp_path))
+
+        assert [path.relative_to(tmp_path / "huggingface" / "test" / "model").as_posix() for path, _ in results] == [
+            "nested/adapter/model-00000-of-00002.safetensors",
+            "nested/adapter/model-00001-of-00002.safetensors",
+            "nested/adapter/model.safetensors.index.json",
+        ]
+        assert [is_last for _path, is_last in results] == [False, False, True]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "nested/adapter/model-00000-of-00002.safetensors",
+            "nested/adapter/model-00001-of-00002.safetensors",
+            "nested/adapter/model.safetensors.index.json",
+        ]
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            [
+                "model.safetensors.index.json",
+                "model-00000-of-00002.safetensors",
+            ],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_rejects_incomplete_zero_based_safetensors_index_family(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+    ) -> None:
+        """Streaming must not scan a partial indexed shard family."""
+        mock_requests_get.return_value = _FakeRangeResponse(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "a": "model-00000-of-00002.safetensors",
+                        "b": "model-00001-of-00002.safetensors",
+                    }
+                }
+            ).encode()
+        )
+
+        with pytest.raises(Exception, match="references missing model shard"):
+            list(download_model_streaming("https://huggingface.co/test/model"))
+
+        mock_hf_hub_download.assert_not_called()
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(

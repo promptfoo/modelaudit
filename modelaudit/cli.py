@@ -72,7 +72,7 @@ from .telemetry import (
     record_scan_started,
 )
 from .utils import resolve_dvc_file_with_metadata, should_skip_file
-from .utils.file.handlers import ShardedModelDetector, ValidatedShardTargets
+from .utils.file.handlers import ShardedModelDetector, ValidatedShardTargets, _count_expected_shard_indices
 from .utils.helpers.auto_defaults import (
     apply_auto_overrides,
     detect_ci_environment,
@@ -1683,8 +1683,7 @@ def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, str
             not isinstance(pattern, str)
             or not isinstance(shard_index, int)
             or not isinstance(expected_total, int)
-            or expected_total <= 1
-            or not 1 <= shard_index <= expected_total
+            or expected_total <= 0
         ):
             continue
         normalized_path = os.path.normcase(os.path.normpath(os.path.abspath(resolved_path)))
@@ -1696,7 +1695,7 @@ def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, str
         )
 
     groups: dict[str, str] = {}
-    for (_pattern, expected_total), records in grouped_paths.items():
+    for (pattern, expected_total), records in grouped_paths.items():
         targets_by_scope: dict[str, dict[int, list[str]]] = {}
         scopes_by_source: dict[str, set[str]] = {}
         for normalized_path, resolved_path_obj, shard_index in records:
@@ -1706,12 +1705,20 @@ def _explicit_local_shard_family_groups(paths: tuple[str, ...]) -> dict[str, str
                 source_scopes.add(normalized_scope)
                 targets_by_scope.setdefault(normalized_scope, {}).setdefault(shard_index, []).append(normalized_path)
 
-        complete_scopes = {
-            scope
-            for scope, targets_by_index in targets_by_scope.items()
-            if len(targets_by_index) == expected_total
-            and all(len(targets) == 1 for targets in targets_by_index.values())
-        }
+        complete_scopes: set[str] = set()
+        for scope, targets_by_index in targets_by_scope.items():
+            expected_indices, _index_base = ShardedModelDetector.expected_indices_for_shard_family(
+                pattern,
+                expected_total,
+                set(targets_by_index),
+            )
+            if len(targets_by_index) != _count_expected_shard_indices(expected_indices):
+                continue
+            if any(shard_index not in expected_indices for shard_index in targets_by_index):
+                continue
+            if any(len(targets) != 1 for targets in targets_by_index.values()):
+                continue
+            complete_scopes.add(scope)
         for normalized_path, _resolved_path, _shard_index in records:
             matching_scopes = scopes_by_source[normalized_path] & complete_scopes
             if matching_scopes:

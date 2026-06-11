@@ -584,14 +584,16 @@ def test_scan_model_streaming_basic(temp_test_files: list[Path]) -> None:
 
 
 @pytest.mark.parametrize("delete_after_scan", [False, True])
+@pytest.mark.parametrize("start_index", [0, 1], ids=["zero-based", "one-based"])
 def test_scan_model_streaming_reconciles_cross_directory_shard_coverage(
     delete_after_scan: bool,
+    start_index: int,
 ) -> None:
     """A complete streamed family should not fail merely because each shard has its own directory."""
     header = b'{"__metadata__":{"format":"pt"}}'
     with ExitStack() as stack:
         shards: list[Path] = []
-        for shard_index in range(1, 4):
+        for shard_index in range(start_index, start_index + 3):
             staging_root = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
             shard_dir = staging_root / "huggingface" / "models--org--repo" / "snapshots" / "revision"
             shard_dir.mkdir(parents=True)
@@ -651,7 +653,8 @@ def test_scan_model_streaming_preserves_max_total_size_failure_after_shard_recon
         assert determine_exit_code(result) == 2
 
 
-def test_scan_model_streaming_preserves_malicious_cross_directory_shard_findings() -> None:
+@pytest.mark.parametrize("start_index", [0, 1], ids=["zero-based", "one-based"])
+def test_scan_model_streaming_preserves_malicious_cross_directory_shard_findings(start_index: int) -> None:
     """Coverage reconciliation must not suppress a malicious finding from a complete family."""
     safe_header = b'{"__metadata__":{"format":"pt"}}'
     malicious_header = (
@@ -659,11 +662,11 @@ def test_scan_model_streaming_preserves_malicious_cross_directory_shard_findings
     )
     with ExitStack() as stack:
         shards: list[Path] = []
-        for shard_index in range(1, 4):
+        for offset, shard_index in enumerate(range(start_index, start_index + 3)):
             shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
             shard_path = shard_dir / f"model-{shard_index:05d}-of-00003.safetensors"
-            header = malicious_header if shard_index == 2 else safe_header
-            tensor_data = b"\x00" if shard_index == 2 else b""
+            header = malicious_header if offset == 1 else safe_header
+            tensor_data = b"\x00" if offset == 1 else b""
             shard_path.write_bytes(struct.pack("<Q", len(header)) + header + tensor_data)
             shards.append(shard_path)
 

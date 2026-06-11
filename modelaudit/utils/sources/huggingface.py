@@ -785,12 +785,148 @@ def _select_huggingface_model_files(
         model_files.append(filename)
         selected_files.add(filename)
 
+    model_files = _validate_remote_safetensors_indexes(repo_id, repo_files, revision, model_files, probe_budget)
     return model_files
 
 
 def _build_literal_allow_patterns(filenames: list[str]) -> list[str]:
     """Escape repository filenames before passing them to the Hub glob filter."""
     return [escape_glob(filename) for filename in filenames]
+
+
+def _safe_remote_safetensors_index_target(index_file: str, raw_target: str) -> str:
+    """Resolve a SafeTensors index target within its remote logical directory."""
+    if not raw_target or "\\" in raw_target:
+        raise ValueError("unsafe safetensors index target path")
+    target_path = PurePosixPath(raw_target)
+    if target_path.is_absolute() or any(part in {"", ".", ".."} for part in target_path.parts):
+        raise ValueError("unsafe safetensors index target path")
+    index_parent = PurePosixPath(index_file).parent
+    if str(index_parent) == ".":
+        return target_path.as_posix()
+    return (index_parent / target_path).as_posix()
+
+
+def _validate_remote_safetensors_indexes(
+    repo_id: str,
+    repo_files: list[str],
+    revision: str,
+    model_files: list[str],
+    probe_budget: _HuggingFaceProbeBudget,
+) -> list[str]:
+    """Validate indexed SafeTensors shard inventories against immutable repo listings."""
+    from modelaudit.utils.file.handlers import (
+        MAX_SAFETENSORS_SHARD_INDEX_BYTES,
+        SAFETENSORS_INDEX_NAME,
+        ShardedModelDetector,
+    )
+
+    repo_file_set = set(repo_files)
+    selected_files = set(model_files)
+    updated_model_files = list(model_files)
+    for index_file in repo_files:
+        if PurePosixPath(index_file).name != SAFETENSORS_INDEX_NAME:
+            continue
+
+        index_parent = PurePosixPath(index_file).parent
+        index_sibling_selected = any(
+            PurePosixPath(selected_file).parent == index_parent and selected_file.endswith(".safetensors")
+            for selected_file in selected_files
+        )
+        if index_file not in selected_files and not index_sibling_selected:
+            continue
+        if index_file not in selected_files:
+            updated_model_files.append(index_file)
+            selected_files.add(index_file)
+
+        index_prefix = _read_huggingface_prefix(
+            repo_id,
+            index_file,
+            revision,
+            probe_budget,
+            MAX_SAFETENSORS_SHARD_INDEX_BYTES + 1,
+        )
+        index_size = probe_budget.file_sizes.get(index_file)
+        if (
+            (isinstance(index_size, int) and index_size > MAX_SAFETENSORS_SHARD_INDEX_BYTES)
+            or len(index_prefix) > MAX_SAFETENSORS_SHARD_INDEX_BYTES
+            or (index_size is None and len(index_prefix) == MAX_SAFETENSORS_SHARD_INDEX_BYTES + 1)
+        ):
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: "
+                f"SafeTensors index {repo_id}/{index_file} exceeds bounded parse limit"
+            )
+        try:
+            index_doc = json.loads(index_prefix.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Hugging Face selective filtering incomplete: SafeTensors index {repo_id}/{index_file} is malformed"
+            ) from exc
+        if not isinstance(index_doc, dict) or not isinstance(index_doc.get("weight_map"), dict):
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: "
+                f"SafeTensors index {repo_id}/{index_file} has no valid weight_map"
+            )
+
+        raw_targets = list(index_doc["weight_map"].values())
+        if not all(isinstance(target, str) for target in raw_targets):
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: "
+                f"SafeTensors index {repo_id}/{index_file} has non-string shard targets"
+            )
+        target_files = sorted({_safe_remote_safetensors_index_target(index_file, target) for target in raw_targets})
+        missing_targets = [target for target in target_files if target not in repo_file_set]
+        if missing_targets:
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: "
+                f"SafeTensors index {repo_id}/{index_file} references missing model shard(s)"
+            )
+
+        target_indices: set[int] = set()
+        expected_total: int | None = None
+        for target_file in target_files:
+            shard_match = ShardedModelDetector.match_shard_filename(PurePosixPath(target_file).name)
+            if shard_match is None:
+                raise ValueError(
+                    "Hugging Face selective filtering incomplete: "
+                    f"SafeTensors index {repo_id}/{index_file} references a non-shard target"
+                )
+            shard_index = shard_match.get("current_shard_index")
+            shard_total = shard_match.get("expected_total_shards")
+            if not isinstance(shard_index, int) or not isinstance(shard_total, int) or shard_total <= 0:
+                raise ValueError(
+                    "Hugging Face selective filtering incomplete: "
+                    f"SafeTensors index {repo_id}/{index_file} references an invalid shard target"
+                )
+            if expected_total is None:
+                expected_total = shard_total
+            elif shard_total != expected_total:
+                raise ValueError(
+                    "Hugging Face selective filtering incomplete: "
+                    f"SafeTensors index {repo_id}/{index_file} has inconsistent shard totals"
+                )
+            target_indices.add(shard_index)
+
+        if expected_total is None or len(target_files) != expected_total or len(target_indices) != expected_total:
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: "
+                f"SafeTensors index {repo_id}/{index_file} shard count does not match filenames"
+            )
+        if target_indices not in (
+            set(range(0, expected_total)),
+            set(range(1, expected_total + 1)),
+        ):
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: "
+                f"SafeTensors index {repo_id}/{index_file} has ambiguous shard indices"
+            )
+
+        for target_file in target_files:
+            if target_file not in selected_files:
+                updated_model_files.append(target_file)
+                selected_files.add(target_file)
+
+    return updated_model_files
 
 
 def _extract_huggingface_repo_files(repo_info: Any) -> list[str] | None:
@@ -1046,6 +1182,7 @@ def _select_streamable_hf_files(
                 )
             model_files.append(file_name)
 
+    probe_budget: _HuggingFaceProbeBudget | None = None
     if sniff_renamed_files:
         inspected_files = 0
         probe_budget = _HuggingFaceProbeBudget(
@@ -1078,6 +1215,12 @@ def _select_streamable_hf_files(
     if not model_files:
         _raise_no_scannable_hf_files(repo_id)
 
+    if probe_budget is None:
+        probe_budget = _HuggingFaceProbeBudget(
+            remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
+            deadline=deadline,
+        )
+    model_files = _validate_remote_safetensors_indexes(repo_id, repo_files, revision, model_files, probe_budget)
     return model_files
 
 

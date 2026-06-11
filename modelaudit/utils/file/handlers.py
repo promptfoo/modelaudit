@@ -5,6 +5,7 @@ This module provides advanced utilities for scanning large model files (400B+ pa
 with bounded windowed I/O, sharded model support, and distributed scanning capabilities.
 """
 
+import json
 import logging
 import os
 import re
@@ -16,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, suppress
 from contextvars import copy_context
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from ..helpers.cache_decorator import (
@@ -46,8 +47,25 @@ MAX_PARALLEL_WORKERS = 4
 SHARD_SCAN_TIMEOUT = 600  # 10 minutes per shard
 MAX_RECORDED_MISSING_SHARD_INDICES = 1000
 _SHARD_ALREADY_PINNED_CONFIG_KEY = "_trusted_shard_already_pinned"
+SAFETENSORS_SHARD_PATTERN = r"model-(\d+)-of-(\d+)\.safetensors"
+SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
+MAX_SAFETENSORS_SHARD_INDEX_BYTES = 10 * 1024 * 1024
 
 ValidatedShardTargets = dict[str, dict[str, int | str]]
+ExpectedShardIndices = range | frozenset[int]
+
+
+def _count_expected_shard_indices(expected_indices: ExpectedShardIndices) -> int:
+    """Return range cardinality without relying on len(range(...)) for huge totals."""
+    if isinstance(expected_indices, range):
+        if expected_indices.step > 0:
+            if expected_indices.start >= expected_indices.stop:
+                return 0
+            return ((expected_indices.stop - expected_indices.start - 1) // expected_indices.step) + 1
+        if expected_indices.start <= expected_indices.stop:
+            return 0
+        return ((expected_indices.start - expected_indices.stop - 1) // abs(expected_indices.step)) + 1
+    return len(expected_indices)
 
 
 class _ShardPinUnavailableError(OSError):
@@ -60,6 +78,17 @@ class _PinnedShardScan:
 
     path: str
     changed_during_scan: bool = False
+
+
+@dataclass(frozen=True)
+class _SafetensorsShardIndexInventory:
+    """Validated shard filenames from model.safetensors.index.json."""
+
+    index_path: Path
+    expected_source_paths: frozenset[str]
+    expected_indices: ExpectedShardIndices
+    index_base: str
+    error: str | None = None
 
 
 def _validated_stat_matches_target(opened_stat: os.stat_result, target: dict[str, int | str]) -> bool:
@@ -436,27 +465,21 @@ def _mark_inconclusive_scan_outcome(result: "ScanResult", reason: str) -> None:
 
 def _summarize_missing_shard_indices(
     present_indices: set[int],
-    expected_total: int,
+    expected_indices: ExpectedShardIndices,
 ) -> tuple[list[int], int, bool]:
     """Return a bounded sample, total count, and truncation flag for missing shards."""
-    bounded_present_indices = {index for index in present_indices if 1 <= index <= expected_total}
-    missing_count = max(expected_total - len(bounded_present_indices), 0)
+    bounded_present_indices = {index for index in present_indices if index in expected_indices}
+    missing_count = max(_count_expected_shard_indices(expected_indices) - len(bounded_present_indices), 0)
     if missing_count == 0:
         return [], 0, False
 
     missing_indices: list[int] = []
-    next_candidate = 1
-    for present_index in sorted(bounded_present_indices):
-        while next_candidate < present_index and len(missing_indices) < MAX_RECORDED_MISSING_SHARD_INDICES:
-            missing_indices.append(next_candidate)
-            next_candidate += 1
+    for expected_index in expected_indices:
+        if expected_index in bounded_present_indices:
+            continue
+        missing_indices.append(expected_index)
         if len(missing_indices) >= MAX_RECORDED_MISSING_SHARD_INDICES:
             break
-        next_candidate = present_index + 1
-
-    while next_candidate <= expected_total and len(missing_indices) < MAX_RECORDED_MISSING_SHARD_INDICES:
-        missing_indices.append(next_candidate)
-        next_candidate += 1
 
     return missing_indices, missing_count, missing_count > len(missing_indices)
 
@@ -467,12 +490,47 @@ class ShardedModelDetector:
     # Common sharding patterns for large models
     SHARD_PATTERNS: ClassVar[list[str]] = [
         r"pytorch_model-(\d+)-of-(\d+)\.bin",  # HuggingFace PyTorch sharding
-        r"model-(\d+)-of-(\d+)\.safetensors",  # SafeTensors sharding
+        SAFETENSORS_SHARD_PATTERN,  # SafeTensors sharding
         r"model\.ckpt-(\d+)\.data-\d+-of-\d+",  # TensorFlow sharding
         r"model_weights_(\d+)\.h5",  # Keras sharding
         r"checkpoint_(\d+)\.pt",  # PyTorch checkpoint sharding
         r"params_shard_(\d+)\.bin",  # Custom parameter sharding
     ]
+
+    @staticmethod
+    def _expected_index_range(expected_total: int, *, zero_based: bool) -> range:
+        if expected_total <= 0:
+            return range(0)
+        return range(0, expected_total) if zero_based else range(1, expected_total + 1)
+
+    @classmethod
+    def expected_indices_for_shard_family(
+        cls,
+        pattern: str,
+        expected_total: int,
+        present_indices: set[int] | None = None,
+        authoritative_indices: ExpectedShardIndices | None = None,
+    ) -> tuple[ExpectedShardIndices, str]:
+        """Return the expected shard indices and the base policy used for a shard family."""
+        if authoritative_indices is not None:
+            zero_based = cls._expected_index_range(expected_total, zero_based=True)
+            one_based = cls._expected_index_range(expected_total, zero_based=False)
+            authoritative_set = set(authoritative_indices)
+            if authoritative_set == set(zero_based):
+                return zero_based, "zero"
+            if authoritative_set == set(one_based):
+                return one_based, "one"
+            return frozenset(authoritative_set), "custom"
+
+        one_based = cls._expected_index_range(expected_total, zero_based=False)
+        if pattern != SAFETENSORS_SHARD_PATTERN:
+            return one_based, "one"
+
+        observed_indices = present_indices or set()
+        zero_based = cls._expected_index_range(expected_total, zero_based=True)
+        if 0 in observed_indices and all(index in zero_based for index in observed_indices):
+            return zero_based, "zero"
+        return one_based, "one"
 
     @classmethod
     def match_shard_filename(cls, file_name: str) -> dict[str, int | str | None] | None:
@@ -498,6 +556,112 @@ class ShardedModelDetector:
             }
 
         return None
+
+    @staticmethod
+    def _safe_index_target_path(index_dir: Path, raw_target: str) -> Path:
+        """Return a local path for a SafeTensors index target or raise ValueError."""
+        if not raw_target or "\\" in raw_target:
+            raise ValueError("unsafe safetensors index target path")
+        target_path = PurePosixPath(raw_target)
+        if target_path.is_absolute() or any(part in {"", ".", ".."} for part in target_path.parts):
+            raise ValueError("unsafe safetensors index target path")
+        return index_dir.joinpath(*target_path.parts)
+
+    @classmethod
+    def _load_safetensors_index_inventory(
+        cls,
+        dir_path: Path,
+        pattern: str,
+        expected_total: int | None,
+    ) -> _SafetensorsShardIndexInventory | None:
+        """Parse an adjacent SafeTensors index into an authoritative shard inventory."""
+        if pattern != SAFETENSORS_SHARD_PATTERN or not isinstance(expected_total, int):
+            return None
+
+        index_path = dir_path / SAFETENSORS_INDEX_NAME
+        if not (index_path.exists() or index_path.is_symlink()):
+            return None
+
+        try:
+            resolved_index = index_path.resolve(strict=True)
+            hf_cache_root = _find_hf_cache_root(index_path.absolute())
+            trusted_hf_blobs_root = _trusted_hf_blobs_root(hf_cache_root) if hf_cache_root is not None else None
+            index_target_allowed = _is_resolved_path_within_directory(dir_path, str(resolved_index)) or (
+                trusted_hf_blobs_root is not None and resolved_index.is_relative_to(trusted_hf_blobs_root)
+            )
+            if not index_target_allowed:
+                raise ValueError("safetensors index resolves outside the model directory")
+            pre_read_stat = os.stat(resolved_index, follow_symlinks=False)
+            if not stat.S_ISREG(pre_read_stat.st_mode):
+                raise ValueError("safetensors index is not a regular file")
+            if pre_read_stat.st_size > MAX_SAFETENSORS_SHARD_INDEX_BYTES:
+                raise ValueError("safetensors index exceeds bounded parse limit")
+            with resolved_index.open("rb") as index_file:
+                opened_stat = os.fstat(index_file.fileno())
+                if not os.path.samestat(pre_read_stat, opened_stat):
+                    raise ValueError("safetensors index changed while opening")
+                index_bytes = index_file.read(MAX_SAFETENSORS_SHARD_INDEX_BYTES + 1)
+            if len(index_bytes) > MAX_SAFETENSORS_SHARD_INDEX_BYTES:
+                raise ValueError("safetensors index exceeds bounded parse limit")
+            post_read_stat = os.stat(resolved_index, follow_symlinks=False)
+            if not os.path.samestat(pre_read_stat, post_read_stat) or any(
+                getattr(pre_read_stat, field) != getattr(post_read_stat, field)
+                for field in ("st_size", "st_mtime_ns", "st_ctime_ns")
+            ):
+                raise ValueError("safetensors index changed while reading")
+            index_doc = json.loads(index_bytes.decode("utf-8"))
+            if not isinstance(index_doc, dict):
+                raise ValueError("safetensors index root must be an object")
+            weight_map = index_doc.get("weight_map")
+            if not isinstance(weight_map, dict) or not weight_map:
+                raise ValueError("safetensors index weight_map must be a non-empty object")
+
+            expected_paths: set[str] = set()
+            target_indices: set[int] = set()
+            raw_targets = list(weight_map.values())
+            if not all(isinstance(target, str) for target in raw_targets):
+                raise ValueError("safetensors index weight_map targets must be strings")
+            unique_targets = set(raw_targets)
+            for raw_target in sorted(unique_targets):
+                target_file = cls._safe_index_target_path(dir_path, raw_target)
+                target_match = re.fullmatch(pattern, target_file.name)
+                if target_match is None or (target_match.lastindex or 0) < 2:
+                    raise ValueError("safetensors index target does not match shard filename pattern")
+                target_index = int(target_match.group(1))
+                target_total = int(target_match.group(2))
+                if target_total != expected_total:
+                    raise ValueError("safetensors index target total does not match selected shard total")
+                expected_paths.add(os.path.normcase(os.path.normpath(os.path.abspath(target_file))))
+                target_indices.add(target_index)
+
+            if len(expected_paths) != expected_total or len(target_indices) != expected_total:
+                raise ValueError("safetensors index shard count does not match selected shard total")
+
+            zero_based = cls._expected_index_range(expected_total, zero_based=True)
+            one_based = cls._expected_index_range(expected_total, zero_based=False)
+            if target_indices == set(zero_based):
+                return _SafetensorsShardIndexInventory(
+                    index_path=index_path,
+                    expected_source_paths=frozenset(expected_paths),
+                    expected_indices=zero_based,
+                    index_base="zero",
+                )
+            if target_indices == set(one_based):
+                return _SafetensorsShardIndexInventory(
+                    index_path=index_path,
+                    expected_source_paths=frozenset(expected_paths),
+                    expected_indices=one_based,
+                    index_base="one",
+                )
+            raise ValueError("safetensors index shard indices are ambiguous")
+        except Exception as exc:
+            return _SafetensorsShardIndexInventory(
+                index_path=index_path,
+                expected_source_paths=frozenset(),
+                expected_indices=cls._expected_index_range(expected_total, zero_based=False),
+                index_base="invalid",
+                error=str(exc),
+            )
 
     @classmethod
     def detect_shards(
@@ -558,6 +722,17 @@ class ShardedModelDetector:
                     with suppress(IndexError, ValueError):
                         requested_expected_total = int(match.group(2))
                         expected_totals.add(requested_expected_total)
+                index_inventory = cls._load_safetensors_index_inventory(
+                    dir_path,
+                    pattern,
+                    requested_expected_total,
+                )
+                if index_inventory is not None:
+                    shard_info["safetensors_index_path"] = str(index_inventory.index_path)
+                    shard_info["shard_index_base"] = index_inventory.index_base
+                    if index_inventory.error is not None:
+                        shard_info["safetensors_index_error"] = index_inventory.error
+                        unvalidated_shards.append(str(index_inventory.index_path))
 
                 # Find local siblings plus any cross-directory peers that the
                 # caller already resolved and snapshotted for this scan.
@@ -565,7 +740,14 @@ class ShardedModelDetector:
                 for candidate in (*dir_path.glob("*"), *validated_peer_paths):
                     normalized_candidate = os.path.normcase(os.path.normpath(os.path.abspath(candidate)))
                     candidate_paths.setdefault(normalized_candidate, candidate)
+                if index_inventory is not None and index_inventory.error is None:
+                    for expected_source in index_inventory.expected_source_paths:
+                        expected_path = Path(expected_source)
+                        if expected_path.exists() or expected_path.is_symlink():
+                            normalized_expected = os.path.normcase(os.path.normpath(os.path.abspath(expected_path)))
+                            candidate_paths.setdefault(normalized_expected, expected_path)
 
+                shard_indices: dict[str, int] = {}
                 for file in sorted(candidate_paths.values(), key=str):
                     file_match = re.fullmatch(pattern, file.name)
                     if file_match:
@@ -622,12 +804,12 @@ class ShardedModelDetector:
                             unreadable_shards.append(str(file))
                             continue
                         if expected_target is not None:
-                            expected_path = expected_target.get("resolved_path")
+                            expected_resolved_path = expected_target.get("resolved_path")
                             expected_device = expected_target.get("device")
                             expected_inode = expected_target.get("inode")
-                            if not isinstance(expected_path, str) or normalized_resolved_file != os.path.normcase(
-                                os.path.normpath(expected_path)
-                            ):
+                            if not isinstance(
+                                expected_resolved_path, str
+                            ) or normalized_resolved_file != os.path.normcase(os.path.normpath(expected_resolved_path)):
                                 unvalidated_shards.append(str(file))
                                 continue
                             if any(
@@ -670,10 +852,53 @@ class ShardedModelDetector:
                         total_size += shard_size
                         if file_match.lastindex:
                             with suppress(IndexError, ValueError):
-                                present_indices.add(int(file_match.group(1)))
+                                shard_index = int(file_match.group(1))
+                                present_indices.add(shard_index)
+                                shard_indices[str(file)] = shard_index
 
                 if not shard_info["shards"]:
                     return None
+
+                if requested_expected_total is not None:
+                    authoritative_indices = (
+                        index_inventory.expected_indices
+                        if index_inventory is not None and index_inventory.error is None
+                        else None
+                    )
+                    expected_indices, index_base = cls.expected_indices_for_shard_family(
+                        pattern,
+                        requested_expected_total,
+                        present_indices,
+                        authoritative_indices=authoritative_indices,
+                    )
+                    shard_info["shard_index_base"] = index_base
+                    present_expected_indices: set[int] = set()
+                    unexpected_shards: list[str] = []
+                    expected_source_paths = (
+                        index_inventory.expected_source_paths
+                        if index_inventory is not None and index_inventory.error is None
+                        else None
+                    )
+                    for shard_path, shard_index in shard_indices.items():
+                        normalized_source = os.path.normcase(os.path.normpath(os.path.abspath(shard_path)))
+                        if expected_source_paths is not None and normalized_source not in expected_source_paths:
+                            unexpected_shards.append(shard_path)
+                            continue
+                        if shard_index in expected_indices:
+                            present_expected_indices.add(shard_index)
+                        else:
+                            unexpected_shards.append(shard_path)
+                    if unexpected_shards:
+                        shard_info["unexpected_shards"] = sorted(unexpected_shards)
+                        shard_info["unexpected_shard_count"] = len(unexpected_shards)
+                    missing_indices, missing_count, missing_indices_truncated = _summarize_missing_shard_indices(
+                        present_expected_indices,
+                        expected_indices,
+                    )
+                    if missing_count:
+                        shard_info["missing_shard_count"] = missing_count
+                        shard_info["missing_shard_indices"] = missing_indices
+                        shard_info["missing_shard_indices_truncated"] = missing_indices_truncated
 
                 shard_info["shards"].sort()
                 shard_info["shard_targets"] = shard_targets
@@ -693,15 +918,6 @@ class ShardedModelDetector:
                 if expected_totals:
                     expected_total = max(expected_totals)
                     shard_info["expected_total_shards"] = expected_total
-                    if present_indices:
-                        missing_indices, missing_count, missing_indices_truncated = _summarize_missing_shard_indices(
-                            present_indices,
-                            expected_total,
-                        )
-                        if missing_count:
-                            shard_info["missing_shard_count"] = missing_count
-                            shard_info["missing_shard_indices"] = missing_indices
-                            shard_info["missing_shard_indices_truncated"] = missing_indices_truncated
 
                 shard_info["total_size"] = total_size
 
@@ -1302,6 +1518,7 @@ class ParallelShardHandler:
             "out_of_scope_shards",
             "unvalidated_shards",
             "duplicate_shards",
+            "unexpected_shards",
         ):
             values = self.shard_info.get(key)
             if isinstance(values, list):
@@ -1633,6 +1850,7 @@ class AdvancedFileHandler:
             out_of_scope_count = self.shard_info.get("out_of_scope_shard_count")
             unvalidated_count = self.shard_info.get("unvalidated_shard_count")
             duplicate_count = self.shard_info.get("duplicate_shard_count")
+            unexpected_count = self.shard_info.get("unexpected_shard_count")
             if isinstance(missing_count, int) and missing_count > 0:
                 _mark_inconclusive_scan_outcome(result, "missing_model_shards")
             if isinstance(out_of_scope_count, int) and out_of_scope_count > 0:
@@ -1643,6 +1861,8 @@ class AdvancedFileHandler:
                 _mark_inconclusive_scan_outcome(result, "unvalidated_model_shards")
             if isinstance(duplicate_count, int) and duplicate_count > 0:
                 _mark_inconclusive_scan_outcome(result, "duplicate_model_shard_targets")
+            if isinstance(unexpected_count, int) and unexpected_count > 0:
+                _mark_inconclusive_scan_outcome(result, "unexpected_model_shards")
             if isinstance(missing_count, int) and missing_count > 0:
                 result.add_check(
                     name="Sharded Model Coverage Check",
@@ -1666,6 +1886,8 @@ class AdvancedFileHandler:
                         "unvalidated_shards": self.shard_info.get("unvalidated_shards", []),
                         "duplicate_shard_count": self.shard_info.get("duplicate_shard_count", 0),
                         "duplicate_shards": self.shard_info.get("duplicate_shards", []),
+                        "unexpected_shard_count": self.shard_info.get("unexpected_shard_count", 0),
+                        "unexpected_shards": self.shard_info.get("unexpected_shards", []),
                         "analysis_incomplete": True,
                         "scan_outcome": "inconclusive",
                         "scan_outcome_reason": "missing_model_shards",
@@ -1691,6 +1913,8 @@ class AdvancedFileHandler:
                         "unvalidated_shards": self.shard_info.get("unvalidated_shards", []),
                         "duplicate_shard_count": self.shard_info.get("duplicate_shard_count", 0),
                         "duplicate_shards": self.shard_info.get("duplicate_shards", []),
+                        "unexpected_shard_count": self.shard_info.get("unexpected_shard_count", 0),
+                        "unexpected_shards": self.shard_info.get("unexpected_shards", []),
                         "analysis_incomplete": True,
                         "scan_outcome": "inconclusive",
                         "scan_outcome_reason": "out_of_scope_model_shards",
@@ -1711,6 +1935,8 @@ class AdvancedFileHandler:
                         "unvalidated_shards": self.shard_info.get("unvalidated_shards", []),
                         "duplicate_shard_count": self.shard_info.get("duplicate_shard_count", 0),
                         "duplicate_shards": self.shard_info.get("duplicate_shards", []),
+                        "unexpected_shard_count": self.shard_info.get("unexpected_shard_count", 0),
+                        "unexpected_shards": self.shard_info.get("unexpected_shards", []),
                         "analysis_incomplete": True,
                         "scan_outcome": "inconclusive",
                         "scan_outcome_reason": "unreadable_model_shards",
@@ -1730,9 +1956,31 @@ class AdvancedFileHandler:
                         "present_total_shards": self.shard_info.get("total_shards"),
                         "unvalidated_shard_count": unvalidated_count,
                         "unvalidated_shards": self.shard_info.get("unvalidated_shards", []),
+                        "unexpected_shard_count": self.shard_info.get("unexpected_shard_count", 0),
+                        "unexpected_shards": self.shard_info.get("unexpected_shards", []),
                         "analysis_incomplete": True,
                         "scan_outcome": "inconclusive",
                         "scan_outcome_reason": "unvalidated_model_shards",
+                    },
+                )
+            elif isinstance(unexpected_count, int) and unexpected_count > 0:
+                result.add_check(
+                    name="Sharded Model Coverage Check",
+                    passed=False,
+                    message=(
+                        f"Found {unexpected_count} model shard(s) outside the expected family inventory; "
+                        "scan coverage is incomplete."
+                    ),
+                    severity=IssueSeverity.INFO,
+                    location=self.file_path,
+                    details={
+                        "expected_total_shards": self.shard_info.get("expected_total_shards"),
+                        "present_total_shards": self.shard_info.get("total_shards"),
+                        "unexpected_shard_count": unexpected_count,
+                        "unexpected_shards": self.shard_info.get("unexpected_shards", []),
+                        "analysis_incomplete": True,
+                        "scan_outcome": "inconclusive",
+                        "scan_outcome_reason": "unexpected_model_shards",
                     },
                 )
             if isinstance(duplicate_count, int) and duplicate_count > 0:

@@ -1,5 +1,6 @@
 """Tests for advanced file handler."""
 
+import json
 import os
 import sys
 import tempfile
@@ -137,6 +138,22 @@ def _validated_target(path: Path) -> dict[str, int | str]:
     }
 
 
+def _write_safetensors_index(directory: Path, targets: list[str]) -> Path:
+    """Write a deterministic SafeTensors index that maps one tensor per target."""
+    index_path = directory / "model.safetensors.index.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 0},
+                "weight_map": {f"tensor_{index}": target for index, target in enumerate(targets)},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return index_path
+
+
 class ContextRecordingShardScanner:
     """Scanner that records worker context for propagation tests."""
 
@@ -179,24 +196,32 @@ class TestShardedModelDetector:
             assert shard_info["total_shards"] == 3
             assert len(shard_info["shards"]) == 3
 
-    def test_detect_safetensors_shards(self) -> None:
+    @pytest.mark.parametrize(
+        ("indices", "expected_base"),
+        [
+            ([1, 2], "one"),
+            ([0, 1], "zero"),
+        ],
+        ids=["one-based", "zero-based"],
+    )
+    def test_detect_safetensors_shards(self, tmp_path: Path, indices: list[int], expected_base: str) -> None:
         """Test detection of SafeTensors sharded models."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Create sharded model files
-            shard_files = [
-                "model-00001-of-00002.safetensors",
-                "model-00002-of-00002.safetensors",
-            ]
+        shard_files = [f"model-{index:05d}-of-00002.safetensors" for index in indices]
+        for shard in shard_files:
+            (tmp_path / shard).write_bytes(b"test")
+        _write_safetensors_index(tmp_path, shard_files)
 
-            for shard in shard_files:
-                Path(tmpdir, shard).write_bytes(b"test")
+        shard_info = ShardedModelDetector.detect_shards(str(tmp_path / shard_files[0]))
+        result = AdvancedFileHandler(str(tmp_path / shard_files[0]), CompletingShardScanner()).scan()
 
-            # Test detection
-            test_file = str(Path(tmpdir, shard_files[0]))
-            shard_info = ShardedModelDetector.detect_shards(test_file)
-
-            assert shard_info is not None
-            assert shard_info["total_shards"] == 2
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(tmp_path / shard) for shard in shard_files]
+        assert shard_info["total_shards"] == 2
+        assert shard_info["expected_total_shards"] == 2
+        assert shard_info["shard_index_base"] == expected_base
+        assert "missing_shard_count" not in shard_info
+        assert "unexpected_shard_count" not in shard_info
+        assert result.success is True
 
     def test_detect_shards_records_missing_expected_indices(self, tmp_path: Path) -> None:
         """Missing numbered shards should be explicit in detector metadata."""
@@ -212,6 +237,133 @@ class TestShardedModelDetector:
         assert shard_info["expected_total_shards"] == 3
         assert shard_info["missing_shard_count"] == 1
         assert shard_info["missing_shard_indices"] == [2]
+
+    def test_detect_zero_based_safetensors_missing_index_target_fails_closed(self, tmp_path: Path) -> None:
+        """A zero-based index inventory must not hide an absent shard."""
+        shard_zero = tmp_path / "model-00000-of-00003.safetensors"
+        shard_two = tmp_path / "model-00002-of-00003.safetensors"
+        shard_zero.write_bytes(b"zero")
+        shard_two.write_bytes(b"two")
+        _write_safetensors_index(
+            tmp_path,
+            [
+                "model-00000-of-00003.safetensors",
+                "model-00001-of-00003.safetensors",
+                "model-00002-of-00003.safetensors",
+            ],
+        )
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_zero))
+        result = AdvancedFileHandler(str(shard_zero), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert shard_info["shard_index_base"] == "zero"
+        assert shard_info["missing_shard_count"] == 1
+        assert shard_info["missing_shard_indices"] == [1]
+        assert result.success is False
+        assert "missing_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    def test_detect_safetensors_index_extra_mixed_base_shard_fails_closed(self, tmp_path: Path) -> None:
+        """An extra same-total shard must not be silently accepted as either base."""
+        indexed_shards = [
+            "model-00000-of-00002.safetensors",
+            "model-00001-of-00002.safetensors",
+        ]
+        for shard in (*indexed_shards, "model-00002-of-00002.safetensors"):
+            (tmp_path / shard).write_bytes(shard.encode())
+        _write_safetensors_index(tmp_path, indexed_shards)
+
+        shard_info = ShardedModelDetector.detect_shards(str(tmp_path / indexed_shards[0]))
+        result = AdvancedFileHandler(str(tmp_path / indexed_shards[0]), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert shard_info["unexpected_shards"] == [str(tmp_path / "model-00002-of-00002.safetensors")]
+        assert shard_info["unexpected_shard_count"] == 1
+        assert result.success is False
+        assert "unexpected_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    def test_detect_safetensors_index_wrong_target_fails_closed(self, tmp_path: Path) -> None:
+        """The index target filename, not just the local shard basename, defines completeness."""
+        shard_zero = tmp_path / "model-00000-of-00001.safetensors"
+        shard_zero.write_bytes(b"zero")
+        _write_safetensors_index(tmp_path, ["model-00001-of-00001.safetensors"])
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_zero))
+        result = AdvancedFileHandler(str(shard_zero), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert shard_info["missing_shard_indices"] == [1]
+        assert shard_info["unexpected_shards"] == [str(shard_zero)]
+        assert result.success is False
+        assert "missing_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize(
+        "index_payload",
+        [
+            "{not-json",
+            json.dumps({"weight_map": {"tensor": "../outside/model-00000-of-00001.safetensors"}}),
+            json.dumps({"weight_map": {"tensor": "model-00000-of-00002.safetensors"}}),
+        ],
+        ids=["malformed-json", "traversal-target", "wrong-total"],
+    )
+    def test_detect_zero_based_safetensors_invalid_index_fails_closed(
+        self,
+        tmp_path: Path,
+        index_payload: str,
+    ) -> None:
+        """Malformed, traversal, and wrong-total indexes must not authorize clean coverage."""
+        shard_zero = tmp_path / "model-00000-of-00001.safetensors"
+        shard_zero.write_bytes(b"zero")
+        (tmp_path / "model.safetensors.index.json").write_text(index_payload, encoding="utf-8")
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_zero))
+        result = AdvancedFileHandler(str(shard_zero), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_error"]
+        assert shard_info["unvalidated_shards"] == [str(tmp_path / "model.safetensors.index.json")]
+        assert result.success is False
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    def test_detect_zero_based_safetensors_index_race_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A changing index file must not authorize clean shard coverage."""
+        shard_zero = tmp_path / "model-00000-of-00001.safetensors"
+        shard_zero.write_bytes(b"zero")
+        index_path = _write_safetensors_index(tmp_path, [shard_zero.name])
+        real_stat = os.stat
+        index_stat_calls = 0
+
+        def racing_stat(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            *args: Any,
+            **kwargs: Any,
+        ) -> os.stat_result:
+            nonlocal index_stat_calls
+            result = real_stat(path, *args, **kwargs)
+            follow_symlinks = kwargs.get("follow_symlinks", True)
+            path_value = os.fspath(path)
+            path_obj = Path(path_value) if isinstance(path_value, str) else None
+            if path_obj == index_path and follow_symlinks is False:
+                index_stat_calls += 1
+                if index_stat_calls % 2 == 0:
+                    values = list(result)
+                    values[6] = result.st_size + 1
+                    return os.stat_result(values)
+            return result
+
+        monkeypatch.setattr(os, "stat", racing_stat)
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_zero))
+        result = AdvancedFileHandler(str(shard_zero), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert "changed while reading" in shard_info["safetensors_index_error"]
+        assert result.success is False
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
 
     def test_detect_shards_bounds_missing_expected_indices(self, tmp_path: Path) -> None:
         """Huge declared shard totals should not expand into huge missing-index lists."""
@@ -427,6 +579,30 @@ class TestShardedModelDetector:
         assert shard_info["missing_shard_count"] == 1
         assert shard_info["duplicate_shard_count"] == 1
         assert shard_info["duplicate_shards"] == [str(shard_two)]
+        assert result.success is False
+        assert "duplicate_model_shard_targets" in result.metadata["scan_outcome_reasons"]
+
+    def test_detect_zero_based_safetensors_rejects_duplicate_symlink_targets(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Zero-based shard names still cannot satisfy coverage with one target."""
+        blob = tmp_path / "blob"
+        blob.write_bytes(b"shared")
+        shard_zero = tmp_path / "model-00000-of-00002.safetensors"
+        shard_one = tmp_path / "model-00001-of-00002.safetensors"
+        shard_zero.symlink_to(blob.name)
+        shard_one.symlink_to(blob.name)
+        _write_safetensors_index(tmp_path, [shard_zero.name, shard_one.name])
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_zero))
+        result = AdvancedFileHandler(str(shard_zero), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert shard_info["shard_index_base"] == "zero"
+        assert shard_info["missing_shard_count"] == 1
+        assert shard_info["duplicate_shard_count"] == 1
         assert result.success is False
         assert "duplicate_model_shard_targets" in result.metadata["scan_outcome_reasons"]
 

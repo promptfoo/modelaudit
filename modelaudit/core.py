@@ -105,6 +105,7 @@ from modelaudit.utils.file.handlers import (
     MAX_RECORDED_MISSING_SHARD_INDICES,
     ShardedModelDetector,
     ValidatedShardTargets,
+    _count_expected_shard_indices,
     _pinned_shard_scan_path,
     _ShardPinUnavailableError,
     scan_advanced_large_file,
@@ -649,8 +650,7 @@ def _complete_validated_shard_family_sources(validated_targets: ValidatedShardTa
             not isinstance(pattern, str)
             or not isinstance(shard_index, int)
             or not isinstance(expected_total, int)
-            or expected_total <= 1
-            or not 1 <= shard_index <= expected_total
+            or expected_total <= 0
         ):
             continue
         for family_scope in _validated_shard_family_scopes(source_path, target):
@@ -659,11 +659,15 @@ def _complete_validated_shard_family_sources(validated_targets: ValidatedShardTa
             )
 
     complete_sources: set[str] = set()
-    for (_pattern, expected_total, _family_scope), targets_by_index in grouped_targets.items():
-        # Indices are already bounded to [1, expected_total], so matching the
-        # expected cardinality proves the complete range without materializing
-        # an attacker-controlled range.
-        if len(targets_by_index) != expected_total:
+    for (pattern, expected_total, _family_scope), targets_by_index in grouped_targets.items():
+        expected_indices, _index_base = ShardedModelDetector.expected_indices_for_shard_family(
+            pattern,
+            expected_total,
+            set(targets_by_index),
+        )
+        if len(targets_by_index) != _count_expected_shard_indices(expected_indices):
+            continue
+        if any(index not in expected_indices for index in targets_by_index):
             continue
         if any(len(records) != 1 for records in targets_by_index.values()):
             continue
@@ -735,19 +739,25 @@ def _ensure_streamed_shard_coverage_placeholder(scan_result: ScanResult, source_
         return
     shard_index = shard_match.get("current_shard_index")
     expected_total = shard_match.get("expected_total_shards")
-    if (
-        not isinstance(shard_index, int)
-        or not isinstance(expected_total, int)
-        or expected_total <= 1
-        or not 1 <= shard_index <= expected_total
-    ):
+    if not isinstance(shard_index, int) or not isinstance(expected_total, int) or expected_total <= 0:
         return
 
-    missing_count = expected_total - 1
+    pattern = shard_match.get("pattern")
+    if not isinstance(pattern, str):
+        return
+    expected_indices, _index_base = ShardedModelDetector.expected_indices_for_shard_family(
+        pattern,
+        expected_total,
+        {shard_index},
+    )
+    if shard_index not in expected_indices:
+        return
+    missing_count = _count_expected_shard_indices(expected_indices) - 1
+    if missing_count <= 0:
+        return
     missing_indices = list(
         itertools.islice(
-            (index for index in range(1, expected_total + 1) if index != shard_index),
-            MAX_RECORDED_MISSING_SHARD_INDICES,
+            (index for index in expected_indices if index != shard_index), MAX_RECORDED_MISSING_SHARD_INDICES
         )
     )
     _mark_inconclusive_scan_outcome(scan_result, "missing_model_shards")
@@ -808,6 +818,14 @@ def _remaining_shard_coverage_outcome(details: dict[str, Any]) -> tuple[str, str
         return (
             "duplicate_model_shard_targets",
             f"Skipped {duplicate_count} model shard name(s) resolving to duplicate targets; "
+            "scan coverage is incomplete.",
+        )
+
+    unexpected_count = details.get("unexpected_shard_count")
+    if isinstance(unexpected_count, int) and unexpected_count > 0:
+        return (
+            "unexpected_model_shards",
+            f"Found {unexpected_count} model shard(s) outside the expected family inventory; "
             "scan coverage is incomplete.",
         )
     return None
@@ -2480,6 +2498,7 @@ def scan_model_directory_or_file(
                                         "out_of_scope_shard_count",
                                         "unvalidated_shard_count",
                                         "duplicate_shard_count",
+                                        "unexpected_shard_count",
                                     )
                                     if (
                                         shard_is_in_hf_snapshot
