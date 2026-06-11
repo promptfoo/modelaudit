@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import struct
@@ -24,6 +25,7 @@ from modelaudit.scanners.flax_msgpack_scanner import (
     _UNBOUNDED_GETATTR_PATTERN,
     FlaxMsgpackScanner,
     _matching_jax_transforms,
+    _MsgpackStreamCursor,
     _pattern_has_stream_unsafe_repeat,
 )
 from modelaudit.utils.file.detection import FLAX_MSGPACK_STRUCTURE_READ_BYTES
@@ -1268,6 +1270,26 @@ def test_flax_msgpack_large_binary_benign_getattr_prose_is_not_inconclusive(tmp_
 
     assert result.success is True
     assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_flax_msgpack_binary_anchor_scanner_ignores_benign_getattr_prose() -> None:
+    first_chunk = b"\x00" * 128
+    remaining = b" documentation mentions getattr helper only"
+    cursor = _MsgpackStreamCursor(io.BytesIO(remaining), len(remaining))
+    scanner = FlaxMsgpackScanner()
+    result = ScanResult("flax_msgpack")
+
+    scanner._analyze_streamed_binary_anchor_chunks(
+        first_chunk,
+        cursor,
+        len(remaining),
+        len(first_chunk) + len(remaining),
+        "root.params.blob",
+        result,
+    )
+
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON not in result.metadata.get("scan_outcome_reasons", [])
+    assert all(check.name != "Flax MessagePack Binary Pattern Coverage" for check in result.checks)
 
 
 @pytest.mark.parametrize(

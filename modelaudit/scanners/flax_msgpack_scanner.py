@@ -2498,7 +2498,6 @@ class FlaxMsgpackScanner(BaseScanner):
 
             raw_window = raw_bytes.decode("utf-8", errors="replace")
             normalized_window = _WHITESPACE_RUN_PATTERN.sub(" ", raw_window)
-            lowered_raw_window = raw_window.lower()
             for transform in transform_candidates:
                 if transform not in matched_transforms:
                     matched_transforms[transform] = raw_window
@@ -2513,8 +2512,6 @@ class FlaxMsgpackScanner(BaseScanner):
                             match_sample = normalized_window
                         if match_sample is not None:
                             matched_patterns[pattern] = (lowered_pattern, match_sample)
-                        elif lowered_pattern.split("\\s", 1)[0] in lowered_raw_window:
-                            unresolved_pattern_candidates.add(pattern)
                     continue
 
                 match_sample = None
