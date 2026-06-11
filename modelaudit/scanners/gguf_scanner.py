@@ -175,9 +175,8 @@ _GGUF_NETWORK_URL_ASSIGNMENT_PATTERN = re.compile(
     r"""(?is)\b(?P<name>[a-z_][a-z0-9_]*)\s*=\s*(?:[rubf]{0,2})?(?P<quote>['"])(?:https?|ftp)://[^'"\s<>]+(?P=quote)""",
 )
 _GGUF_REMOTE_URL_PATTERN = re.compile(r"(?i)\b(?:https?|ftp)://[^\s'\"<>)\]}]+")
-_GGUF_FETCH_EXECUTION_SINK_PATTERN = re.compile(
-    r"(?i)\|\s*(?:(?:[a-z]:)?[\\/](?:[^\\/\s]+[\\/])*)?"
-    r"(?:bash|sh|zsh|fish|cmd(?:\.exe)?|powershell|pwsh|python(?:3)?|perl|ruby|node)\b",
+_GGUF_EXECUTION_SINK_COMMANDS = frozenset(
+    {"bash", "sh", "zsh", "fish", "cmd", "powershell", "pwsh", "python", "python3", "perl", "ruby", "node"}
 )
 _GGUF_DOCUMENTATION_URL_HOSTS = frozenset({"hf.co", "huggingface.co", "www.huggingface.co"})
 _GGUF_SHELL_IFS_PATTERN = re.compile(r"(?i)\$\{ifs(?:[^}]*)?\}|\$ifs\b")
@@ -1238,7 +1237,7 @@ class GgufScanner(BaseScanner):
             cls._contains_path_traversal(text)
             or cls._destructive_rm_pattern(text)
             or cls._metadata_command_pattern(text) is not None
-            or _GGUF_FETCH_EXECUTION_SINK_PATTERN.search(text) is not None
+            or cls._text_pipes_to_execution_sink(text)
         ):
             return False
         if cls._shell_remote_fetch_pattern(text) is None and cls._network_api_remote_fetch_pattern(text) is None:
@@ -1281,6 +1280,34 @@ class GgufScanner(BaseScanner):
                 " model card ",
             )
         )
+
+    @classmethod
+    def _text_pipes_to_execution_sink(cls, text: str) -> bool:
+        for piped_part in text.split("|")[1:]:
+            segments = cls._shell_command_segments(piped_part)
+            if segments and cls._segment_starts_with_execution_sink(segments[0]):
+                return True
+        return False
+
+    @classmethod
+    def _segment_starts_with_execution_sink(cls, words: list[str]) -> bool:
+        index = 0
+        while index < len(words):
+            word = words[index]
+            command_name = cls._shell_command_name(word)
+            if command_name in _GGUF_DESTRUCTIVE_COMMAND_PREFIXES:
+                index += 1
+                if command_name == "timeout":
+                    index = cls._skip_timeout_prefix_arguments(words, index)
+                    continue
+                index = cls._skip_command_prefix_arguments(command_name, words, index)
+                continue
+            if "=" in word and not word.startswith("-"):
+                index += 1
+                continue
+            break
+
+        return index < len(words) and cls._shell_command_name(words[index]) in _GGUF_EXECUTION_SINK_COMMANDS
 
     @staticmethod
     def _shell_command_name(word: str) -> str:
