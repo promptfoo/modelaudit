@@ -194,6 +194,12 @@ def _pickleish_tensor_storage_bytes() -> bytes:
     return bytes.fromhex("478727be61f70dbd70953cbd09b996bd5c7a2ebe") + (b"\x00" * 128)
 
 
+def _writestr_preserving_member_name(archive: zipfile.ZipFile, member_name: str, data: bytes) -> None:
+    info = zipfile.ZipInfo("placeholder")
+    info.filename = member_name
+    archive.writestr(info, data)
+
+
 def _binunicode(data: bytes) -> bytes:
     return b"X" + len(data).to_bytes(4, "little") + data
 
@@ -1935,7 +1941,7 @@ def test_scan_file_scans_noncanonical_referenced_storage_aliases(
         archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
         archive.writestr("archive/version", "3\n")
         archive.writestr("archive/byteorder", "little")
-        archive.writestr(storage_member, b"cposix\nsystem\n(S'echo hidden'\ntR.")
+        _writestr_preserving_member_name(archive, storage_member, b"cposix\nsystem\n(S'echo hidden'\ntR.")
 
     report = scan_file(archive_path)
 

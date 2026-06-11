@@ -170,6 +170,12 @@ def _pickleish_tensor_storage_bytes() -> bytes:
     return bytes.fromhex("478727be61f70dbd70953cbd09b996bd5c7a2ebe") + (b"\x00" * 128)
 
 
+def _writestr_preserving_member_name(zip_file: zipfile.ZipFile, member_name: str, data: bytes) -> None:
+    info = zipfile.ZipInfo("placeholder")
+    info.filename = member_name
+    zip_file.writestr(info, data)
+
+
 def _write_zip_with_duplicate_data_pkl(zip_path: Path, first_payload: bytes, second_payload: bytes) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
@@ -600,7 +606,7 @@ def test_pytorch_zip_discovery_scans_noncanonical_referenced_storage_aliases(
         zip_file.writestr("archive/version", "3\n")
         zip_file.writestr("archive/byteorder", "little")
         zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
-        zip_file.writestr(storage_member, _malicious_proto0_system_payload())
+        _writestr_preserving_member_name(zip_file, storage_member, _malicious_proto0_system_payload())
 
     result = PyTorchZipScanner().scan(str(model_path))
 
