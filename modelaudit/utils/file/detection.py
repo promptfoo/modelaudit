@@ -5470,6 +5470,27 @@ def _find_bounded_jpeg_end(sample: bytes) -> int | None:
     return None
 
 
+def _could_start_bounded_media_route(file_path: Path, sample: bytes) -> bool:
+    """Return whether bounded bytes plausibly begin a supported media stream."""
+    if file_path.suffix.lower() not in _MEDIA_ROUTING_SUFFIXES:
+        return False
+    if sample.startswith(_PNG_SIGNATURE):
+        return (
+            len(sample) >= len(_PNG_SIGNATURE) + 8
+            and sample[len(_PNG_SIGNATURE) : len(_PNG_SIGNATURE) + 8] == b"\x00\x00\x00\rIHDR"
+        )
+    return (
+        len(sample) >= 4
+        and sample.startswith(b"\xff\xd8")
+        and sample[2] == 0xFF
+        and sample[3]
+        not in {
+            0x00,
+            0xFF,
+        }
+    )
+
+
 def _detect_bounded_media_route_from_sample(
     file_path: Path,
     sample: bytes,
@@ -5477,8 +5498,7 @@ def _detect_bounded_media_route_from_sample(
     sample_is_prefix: bool,
 ) -> str | None:
     """Return clean-media or strong media/pickle polyglot routing evidence."""
-    ext = file_path.suffix.lower()
-    if ext not in _MEDIA_ROUTING_SUFFIXES:
+    if not _could_start_bounded_media_route(file_path, sample):
         return None
     if sample.startswith(_PNG_SIGNATURE):
         media_end = _find_bounded_png_end(sample)
@@ -5498,23 +5518,20 @@ def _detect_bounded_media_route_from_sample(
 
 def _detect_bounded_media_route_from_edges(file_path: Path, prefix: bytes, tail: bytes) -> str | None:
     """Return bounded media routing evidence from remote head and tail probes."""
-    ext = file_path.suffix.lower()
-    if ext not in _MEDIA_ROUTING_SUFFIXES or not prefix or not tail:
+    if not prefix or not tail or not _could_start_bounded_media_route(file_path, prefix):
         return None
 
+    prefix_route = _detect_bounded_media_route_from_sample(file_path, prefix, sample_is_prefix=True)
+    if prefix_route is not None:
+        return prefix_route
+
     if prefix.startswith(_PNG_SIGNATURE):
-        if len(prefix) < len(_PNG_SIGNATURE) + 8 or prefix[len(_PNG_SIGNATURE) : len(_PNG_SIGNATURE) + 8] != (
-            b"\x00\x00\x00\rIHDR"
-        ):
-            return None
-        media_end = tail.rfind(_PNG_IEND_TRAILER)
+        media_end = tail.find(_PNG_IEND_TRAILER)
         if media_end < 0:
             return None
         media_end += len(_PNG_IEND_TRAILER)
     elif prefix.startswith(b"\xff\xd8"):
-        if len(prefix) < 4 or prefix[2] != 0xFF or prefix[3] in {0x00, 0xFF}:
-            return None
-        media_end = tail.rfind(b"\xff\xd9")
+        media_end = tail.find(b"\xff\xd9")
         if media_end < 0:
             return None
         media_end += 2
@@ -5524,6 +5541,8 @@ def _detect_bounded_media_route_from_edges(file_path: Path, prefix: bytes, tail:
     pickle_route = _detect_media_pickle_polyglot_route(tail[media_end:], sample_is_prefix=False)
     if pickle_route is not None:
         return pickle_route
+    if tail[media_end:].lstrip(_MEDIA_TRAILING_PADDING):
+        return None
     return VALID_MEDIA_ROUTING_FORMAT
 
 

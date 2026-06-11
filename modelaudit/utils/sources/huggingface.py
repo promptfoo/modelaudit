@@ -710,9 +710,11 @@ def _detect_huggingface_content_route_format(
         _MEDIA_ROUTING_SUFFIXES,
         _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS,
         MEDIA_ROUTE_TAIL_READ_BYTES,
+        PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
         PROTO0_1_MAX_PROBE_BYTES,
         VALID_MEDIA_ROUTING_FORMAT,
         _allows_renamed_binary_content_route,
+        _could_start_bounded_media_route,
         _could_start_proto0_or_1_pickle,
         _detect_bounded_media_route_from_edges,
         _is_cntk_signature,
@@ -765,6 +767,8 @@ def _detect_huggingface_content_route_format(
             return None
         if media_route is not None:
             return media_route
+        if _could_start_bounded_media_route(remote_path, prefix):
+            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
 
     if _could_start_proto0_or_1_pickle(prefix):
         pickle_probe = _read_huggingface_probe(
