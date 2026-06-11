@@ -4886,8 +4886,8 @@ def _class_method_nodes(class_node: ast.ClassDef) -> dict[str, ast.FunctionDef |
     }
 
 
-def _class_has_explicit_metaclass(class_node: ast.ClassDef) -> bool:
-    return any(keyword.arg == "metaclass" for keyword in class_node.keywords)
+def _class_definition_has_dynamic_lookup_context(class_node: ast.ClassDef) -> bool:
+    return bool(class_node.decorator_list) or bool(class_node.keywords)
 
 
 def _class_has_plain_local_method(class_node: ast.ClassDef, method_name: str) -> bool:
@@ -4916,7 +4916,7 @@ def _class_lookup_has_source_backed_plain_metaclass(
     class_key = f"{context.module_name}.{context.class_node.name}"
     if class_key in visited:
         return True
-    if _class_has_explicit_metaclass(context.class_node):
+    if _class_definition_has_dynamic_lookup_context(context.class_node):
         return False
     next_visited = visited | {class_key}
     for base in _class_base_targets(

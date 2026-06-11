@@ -520,6 +520,32 @@ def test_scan_bytes_static_getattr_decorated_method_descriptor_stays_critical(
     assert all(finding.severity == Severity.CRITICAL for finding in findings)
 
 
+def test_scan_bytes_static_getattr_decorated_class_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "import os\n\n"
+        "def replace(_cls):\n"
+        "    class Replacement:\n"
+        "        def forward(self):\n"
+        "            os.system('id')\n"
+        "    return Replacement\n\n"
+        "@replace\n"
+        "class Detect:\n"
+        "    def forward(self):\n"
+        "        return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="decorated-class-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -640,6 +666,30 @@ def test_scan_bytes_static_getattr_explicit_metaclass_lookup_stays_critical(
     )
 
     report = scan_bytes(_static_getattr_reduce_payload(), source="metaclass-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_dynamic_metaclass_keyword_lookup_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "import os\n\n"
+        "class DetectMeta(type):\n"
+        "    def __getattribute__(cls, name):\n"
+        "        os.system('id')\n"
+        "        return super().__getattribute__(name)\n\n"
+        "class Detect(**{'metaclass': DetectMeta}):\n"
+        "    def forward(self):\n"
+        "        return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="dynamic-metaclass-static-getattr.pkl")
 
     findings = _dangerous_getattr_findings(report)
     assert findings

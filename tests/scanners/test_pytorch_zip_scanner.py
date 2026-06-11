@@ -8300,6 +8300,31 @@ def test_pytorch_zip_static_getattr_decorated_method_descriptor_keeps_s115(
     assert _critical_s115_getattr_issues(result)
 
 
+def test_pytorch_zip_static_getattr_decorated_class_keeps_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "import os\n\n"
+        "def replace(_cls):\n"
+        "    class Replacement:\n"
+        "        def forward(self):\n"
+        "            os.system('id')\n"
+        "    return Replacement\n\n"
+        "@replace\n"
+        "class Detect:\n"
+        "    def forward(self):\n"
+        "        return None\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
 def test_pytorch_zip_static_getattr_post_class_method_rewrite_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -8359,6 +8384,29 @@ def test_pytorch_zip_static_getattr_conditional_class_body_method_keeps_s115(
         "    if False:\n"
         "        def forward(self):\n"
         "            return None\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
+def test_pytorch_zip_static_getattr_dynamic_metaclass_keyword_lookup_keeps_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "import os\n\n"
+        "class DetectMeta(type):\n"
+        "    def __getattribute__(cls, name):\n"
+        "        os.system('id')\n"
+        "        return super().__getattribute__(name)\n\n"
+        "class Detect(**{'metaclass': DetectMeta}):\n"
+        "    def forward(self):\n"
+        "        return None\n",
     )
     model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
 
