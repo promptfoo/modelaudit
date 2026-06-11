@@ -644,11 +644,13 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
             if getattr(issue, "type", None) != "onnx_check":
                 return None
             details = issue.details if isinstance(issue.details, dict) else {}
-            if "affected_neurons" not in details or "initializer" not in details:
+            anomaly_neurons = details.get("affected_neurons", details.get("outlier_neurons"))
+            if anomaly_neurons is None or "initializer" not in details:
                 return None
             return (
                 stable_value(details.get("clustered_onnx_weight_anomaly")),
                 stable_value(details.get("cluster_size")),
+                stable_value(details.get("analysis_method")),
                 stable_value(details.get("initializer")),
                 stable_value(details.get("initializer_graph_index")),
                 stable_value(details.get("consumer_domain")),
@@ -662,9 +664,11 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
                 stable_value(details.get("quantized_weight")),
                 stable_value(details.get("quantization_kind")),
                 stable_value(details.get("analysis_shape")),
-                stable_value(details.get("affected_neurons")),
+                stable_value(anomaly_neurons),
                 stable_value(details.get("num_extreme_weights")),
                 stable_value(details.get("max_extreme_weights_per_output")),
+                stable_value(details.get("total_outliers")),
+                stable_value(details.get("outlier_percentage")),
             )
 
         seen_issues = set()

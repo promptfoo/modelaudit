@@ -92,6 +92,8 @@ _ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT = 32
 _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT = 32
 _ONNX_WEIGHT_NODE_VISIT_LIMIT = 200_000
 _ONNX_WEIGHT_EDGE_VISIT_LIMIT = 1_000_000
+_ONNX_INTEGER_SCALE_TRACE_DEPTH_LIMIT = 4
+_ONNX_INTEGER_SCALE_TRACE_NODE_LIMIT = 32
 _ONNX_WEIGHT_RESHAPE_RANK_LIMIT = 64
 _ONNX_WEIGHT_METADATA_TEXT_LIMIT = 256
 _ONNX_WEIGHT_METADATA_SEQUENCE_LIMIT = 64
@@ -177,12 +179,6 @@ _QUANTIZED_WEIGHT_CONSUMER_INPUTS: dict[str, frozenset[int]] = {
     "QLinearConv": frozenset({3}),
     "QLinearMatMul": frozenset({3}),
 }
-_QUANTIZED_WEIGHT_TRANSFORM_OPERATORS: frozenset[str] = frozenset(
-    {
-        "DequantizeLinear",
-        "QuantizeLinear",
-    }
-)
 _RECURRENT_WEIGHT_OPERATORS: frozenset[str] = frozenset({"GRU", "LSTM", "RNN"})
 _WEIGHT_COMPUTING_LINEAGE_OPERATORS: frozenset[str] = frozenset(
     {
@@ -1147,6 +1143,8 @@ def _build_onnx_weight_analysis_plan(
     quantized_integer_types = {
         int(getattr(onnx.TensorProto, name))
         for name in (
+            "INT4",
+            "UINT4",
             "INT8",
             "UINT8",
             "INT16",
@@ -1331,11 +1329,118 @@ def _build_onnx_weight_analysis_plan(
         input_index: int,
         output_axes: tuple[int, ...],
         constants: dict[str, Any],
+        consumers_by_value: dict[str, list[Any]],
+        producers_by_value: dict[str, Any],
     ) -> tuple[_OnnxWeightQuantization | None, str | None]:
         if lineage.quantization is not None:
             return lineage.quantization, None
         if not _onnx_quantized_weight_input(node, input_index):
             return None, None
+
+        def scale_initializer_names_in_expression(
+            value_name: str,
+            *,
+            depth: int = 0,
+            visited: frozenset[str] = frozenset(),
+        ) -> tuple[str, ...] | None:
+            if not value_name or value_name in visited:
+                return ()
+            if depth > _ONNX_INTEGER_SCALE_TRACE_DEPTH_LIMIT:
+                return None
+            if value_name in constants:
+                tensor = constants[value_name]
+                try:
+                    return (value_name,) if int(tensor.data_type) in floating_types else ()
+                except (AttributeError, TypeError, ValueError):
+                    return ()
+
+            producer = producers_by_value.get(value_name)
+            if producer is None:
+                return ()
+            if getattr(producer, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS:
+                return ()
+            if producer.op_type not in {"Cast", "Identity", "Mul"}:
+                return ()
+
+            discovered: list[str] = []
+            next_visited = frozenset((*visited, value_name))
+            for source_name in (str(source) for source in getattr(producer, "input", ()) if source):
+                source_discovered = scale_initializer_names_in_expression(
+                    source_name,
+                    depth=depth + 1,
+                    visited=next_visited,
+                )
+                if source_discovered is None:
+                    return None
+                discovered.extend(source_discovered)
+            return tuple(dict.fromkeys(discovered))
+
+        def compatible_integer_scale_names(candidate_names: Iterable[str]) -> list[str]:
+            compatible: list[str] = []
+            target_shape = lineage.shape
+            axis = output_axes[-1] if output_axes else None
+            for candidate_name in candidate_names:
+                tensor = constants.get(candidate_name)
+                if tensor is None:
+                    continue
+                try:
+                    shape = tuple(int(dimension) for dimension in tensor.dims)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if not shape or math.prod(shape) == 1:
+                    compatible.append(candidate_name)
+                    continue
+                if target_shape is None or axis is None or axis < 0 or axis >= len(target_shape):
+                    continue
+                if len(shape) == 1 and int(shape[0]) == int(target_shape[axis]):
+                    compatible.append(candidate_name)
+            return compatible
+
+        def infer_integer_output_scale_name() -> tuple[str | None, str | None]:
+            queue = [(str(output_name), 0) for output_name in getattr(node, "output", ()) if output_name]
+            visited_values: set[str] = set()
+            visited_nodes = 0
+            scale_names: list[str] = []
+            while queue:
+                value_name, depth = queue.pop(0)
+                if not value_name or value_name in visited_values:
+                    continue
+                visited_values.add(value_name)
+                if depth > _ONNX_INTEGER_SCALE_TRACE_DEPTH_LIMIT:
+                    continue
+                for consumer in consumers_by_value.get(value_name, []):
+                    visited_nodes += 1
+                    if visited_nodes > _ONNX_INTEGER_SCALE_TRACE_NODE_LIMIT:
+                        return None, "integer_quantized_weight_scale_trace_limit"
+                    if getattr(consumer, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS:
+                        continue
+                    if consumer.op_type in {"Cast", "Identity"}:
+                        queue.extend((str(output_name), depth + 1) for output_name in consumer.output if output_name)
+                        continue
+                    if consumer.op_type != "Mul":
+                        continue
+                    for source_name in (
+                        str(source) for source in consumer.input if source and str(source) != value_name
+                    ):
+                        source_scale_names = scale_initializer_names_in_expression(source_name)
+                        if source_scale_names is None:
+                            return None, "unsupported_integer_quantized_weight_scale"
+                        scale_names.extend(source_scale_names)
+
+            compatible_names = compatible_integer_scale_names(dict.fromkeys(scale_names))
+            non_scalar_names = [
+                name
+                for name in compatible_names
+                if constants.get(name) is not None
+                and math.prod(int(dimension) for dimension in constants[name].dims) > 1
+            ]
+            if len(non_scalar_names) == 1:
+                return non_scalar_names[0], None
+            if len(non_scalar_names) > 1:
+                return None, "ambiguous_integer_quantized_weight_scale"
+            if compatible_names:
+                return compatible_names[0], None
+            return None, "missing_quantized_weight_scale"
 
         scale_index = _onnx_quantized_weight_scale_input_index(node, input_index)
         zero_point_index = _onnx_quantized_weight_zero_point_input_index(node, input_index)
@@ -1347,14 +1452,9 @@ def _build_onnx_weight_analysis_plan(
                 return None, "missing_quantized_weight_scale"
             scale_name = str(node.input[scale_index])
         else:
-            weight_name = str(node.input[input_index]) if input_index < len(node.input) else ""
-            scale_candidates = []
-            if weight_name.endswith("_quantized"):
-                scale_candidates.append(f"{weight_name.removesuffix('_quantized')}_scale")
-            scale_candidates.append(f"{weight_name}_scale")
-            scale_name = next((candidate for candidate in scale_candidates if candidate in constants), None)
+            scale_name, scale_gap = infer_integer_output_scale_name()
             if scale_name is None:
-                return None, "missing_quantized_weight_scale"
+                return None, scale_gap or "missing_quantized_weight_scale"
 
         if scale_name not in constants:
             return None, "missing_quantized_weight_scale"
@@ -1826,6 +1926,15 @@ def _build_onnx_weight_analysis_plan(
                 known_value_shapes[name] = tuple(int(dimension) for dimension in constant.dims)
             except (AttributeError, TypeError, ValueError):
                 continue
+        consumers_by_value: dict[str, list[Any]] = {}
+        producers_by_value: dict[str, Any] = {}
+        for graph_node in getattr(current_graph, "node", ()):
+            for input_name in graph_node.input:
+                if input_name:
+                    consumers_by_value.setdefault(str(input_name), []).append(graph_node)
+            for output_name in graph_node.output:
+                if output_name:
+                    producers_by_value[str(output_name)] = graph_node
 
         def resolve_attribute(attribute: Any) -> Any | None:
             reference_name = str(getattr(attribute, "ref_attr_name", ""))
@@ -2077,6 +2186,8 @@ def _build_onnx_weight_analysis_plan(
                         input_index,
                         output_axes,
                         constants,
+                        consumers_by_value,
+                        producers_by_value,
                     )
                     if quantization_gap is not None:
                         record_unresolved_lineage(
@@ -2719,6 +2830,8 @@ def _build_onnx_weight_analysis_plan(
         role: str,
     ) -> Any:
         parameter = np.asarray(parameter, dtype=np.float32)
+        if role == "scale" and (not np.all(np.isfinite(parameter)) or bool(np.any(parameter <= 0))):
+            raise ValueError("Quantized weight scale must be finite and positive")
         if parameter.size == 1:
             return parameter.reshape(())
         if axis is None or axis < 0 or axis >= len(target_shape):

@@ -993,12 +993,16 @@ def _onnx_weight_anomaly_cluster_key(issue: Issue) -> tuple[Any, ...] | None:
     if getattr(issue, "type", None) != "onnx_check":
         return None
     details = issue.details if isinstance(issue.details, dict) else {}
-    required_fields = ("initializer", "consumer_op", "affected_neurons", "analysis_shape")
+    required_fields = ("initializer", "consumer_op", "analysis_shape")
     if not all(field in details for field in required_fields):
+        return None
+    anomaly_neurons = details.get("affected_neurons", details.get("outlier_neurons"))
+    if anomaly_neurons is None:
         return None
     return (
         issue.message,
         issue.severity,
+        _stable_cluster_value(details.get("analysis_method")),
         _stable_cluster_value(details.get("initializer")),
         _stable_cluster_value(details.get("initializer_graph_index")),
         _stable_cluster_value(details.get("stored_shape")),
@@ -1013,9 +1017,11 @@ def _onnx_weight_anomaly_cluster_key(issue: Issue) -> tuple[Any, ...] | None:
         _stable_cluster_value(details.get("quantized_weight")),
         _stable_cluster_value(details.get("quantization_kind")),
         _stable_cluster_value(details.get("analysis_shape")),
-        _stable_cluster_value(details.get("affected_neurons")),
+        _stable_cluster_value(anomaly_neurons),
         _stable_cluster_value(details.get("num_extreme_weights")),
         _stable_cluster_value(details.get("max_extreme_weights_per_output")),
+        _stable_cluster_value(details.get("total_outliers")),
+        _stable_cluster_value(details.get("outlier_percentage")),
     )
 
 
