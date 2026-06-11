@@ -25,6 +25,7 @@ from .huggingface_paths import (
     is_huggingface_url,
     parse_huggingface_file_url,
     parse_huggingface_url,
+    parse_huggingface_url_with_revision,
     redact_huggingface_url_for_display,
     redact_huggingface_urls_in_text,
 )
@@ -54,6 +55,7 @@ __all__ = [
     "is_huggingface_url",
     "parse_huggingface_file_url",
     "parse_huggingface_url",
+    "parse_huggingface_url_with_revision",
     "redact_huggingface_url_for_display",
     "redact_huggingface_urls_in_text",
 ]
@@ -146,6 +148,14 @@ def _huggingface_sample_is_prefix(
     return len(probe) >= fallback_limit
 
 
+def _format_huggingface_exception_label(exc: Exception) -> str:
+    """Return a compact, redacted exception label that preserves HTTP status."""
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status_code, int):
+        return f"{type(exc).__name__}: HTTP {status_code}"
+    return type(exc).__name__
+
+
 def _get_model_extensions() -> set[str]:
     """
     Lazy-load model extensions to avoid circular imports.
@@ -215,7 +225,7 @@ def _read_huggingface_prefix(
     except Exception as exc:
         raise ValueError(
             "Hugging Face selective filtering incomplete: unable to inspect skipped file "
-            f"{repo_id}/{filename} ({type(exc).__name__})"
+            f"{repo_id}/{filename} ({_format_huggingface_exception_label(exc)})"
         ) from exc
 
 
@@ -1569,13 +1579,17 @@ def _list_repo_files_with_timeout(
     timeout_seconds: float = 30,
     *,
     deadline: float | None = None,
+    revision: str | None = None,
 ) -> tuple[list[str] | None, str | None, str | None]:
     """Return repository files, their immutable revision, or a failure reason."""
     if deadline is not None:
         try:
+            operation_kwargs: dict[str, Any] = {"repo_id": repo_id, "request_timeout": timeout_seconds}
+            if revision is not None:
+                operation_kwargs["revision"] = revision
             worker_result = _run_huggingface_worker_with_deadline(
                 "list_repo_files",
-                {"repo_id": repo_id, "request_timeout": timeout_seconds},
+                operation_kwargs,
                 deadline,
                 repo_id,
             )
@@ -1599,7 +1613,10 @@ def _list_repo_files_with_timeout(
     from huggingface_hub import HfApi
 
     try:
-        repo_info = HfApi().repo_info(repo_id, timeout=timeout_seconds, files_metadata=False)
+        repo_info_kwargs: dict[str, Any] = {"timeout": timeout_seconds, "files_metadata": False}
+        if revision is not None:
+            repo_info_kwargs["revision"] = revision
+        repo_info = HfApi().repo_info(repo_id, **repo_info_kwargs)
     except Exception as exc:
         return None, None, str(exc)
 
@@ -1914,7 +1931,7 @@ def get_model_info(url: str, timeout_seconds: float | None = None) -> dict:
             "Install with 'pip install modelaudit[huggingface]'"
         ) from e
 
-    namespace, repo_name = parse_huggingface_url(url)
+    namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
     display_url = redact_huggingface_url_for_display(url)
 
@@ -1926,9 +1943,13 @@ def get_model_info(url: str, timeout_seconds: float | None = None) -> dict:
         model_info_kwargs: dict[str, Any] = {}
         if timeout_seconds is not None:
             model_info_kwargs["timeout"] = timeout_seconds
+        if requested_revision is not None:
+            model_info_kwargs["revision"] = requested_revision
         model_info = api.model_info(repo_id, **model_info_kwargs)
         resolved_revision = getattr(model_info, "sha", None)
-        list_revision = resolved_revision if isinstance(resolved_revision, str) and resolved_revision else None
+        list_revision = (
+            resolved_revision if isinstance(resolved_revision, str) and resolved_revision else requested_revision
+        )
 
         # Use list_repo_tree to get accurate file sizes
         # (model_info.siblings often returns None for size)
@@ -1958,7 +1979,7 @@ def get_model_info(url: str, timeout_seconds: float | None = None) -> dict:
             # Still try to get file count from siblings
             siblings = model_info.siblings or []
             for sibling in siblings:
-                if sibling.rfilename != ".gitattributes":
+                if sibling.rfilename not in [".gitattributes", "README.md"]:
                     files.append({"name": sibling.rfilename})
 
         return {
@@ -2067,7 +2088,12 @@ def get_huggingface_file_info(
         raise Exception(f"Failed to get file info for {display_url}: {redact_huggingface_urls_in_text(str(e))}") from e
 
 
-def get_model_size(repo_id: str, timeout_seconds: float | None = None) -> int | None:
+def get_model_size(
+    repo_id: str,
+    timeout_seconds: float | None = None,
+    *,
+    revision: str | None = None,
+) -> int | None:
     """Get the total size of a HuggingFace model repository.
 
     Args:
@@ -2083,6 +2109,8 @@ def get_model_size(repo_id: str, timeout_seconds: float | None = None) -> int | 
         model_info_kwargs: dict[str, Any] = {}
         if timeout_seconds is not None:
             model_info_kwargs["timeout"] = timeout_seconds
+        if revision is not None:
+            model_info_kwargs["revision"] = revision
         model_info = api.model_info(repo_id, **model_info_kwargs)
 
         # Calculate total size from all files
@@ -2098,17 +2126,25 @@ def get_model_size(repo_id: str, timeout_seconds: float | None = None) -> int | 
         return None
 
 
-def _get_model_size_with_deadline(repo_id: str, deadline: float | None) -> int | None:
+def _get_model_size_with_deadline(
+    repo_id: str,
+    deadline: float | None,
+    *,
+    revision: str | None = None,
+) -> int | None:
     """Return model size without allowing the optional lookup to outlive acquisition."""
     if deadline is None:
-        return get_model_size(repo_id)
+        return get_model_size(repo_id, revision=revision)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
     try:
+        operation_kwargs: dict[str, Any] = {"repo_id": repo_id, "request_timeout": min(30.0, remaining)}
+        if revision is not None:
+            operation_kwargs["revision"] = revision
         worker_result = _run_huggingface_worker_with_deadline(
             "get_model_size",
-            {"repo_id": repo_id, "request_timeout": min(30.0, remaining)},
+            operation_kwargs,
             deadline,
             repo_id,
         )
@@ -2152,13 +2188,13 @@ def download_model(
             "Install with 'pip install modelaudit[huggingface]'"
         ) from e
 
-    namespace, repo_name = parse_huggingface_url(url)
+    namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
     display_url = redact_huggingface_url_for_display(url)
     deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
     # Disk space check and path setup
-    model_size = _get_model_size_with_deadline(repo_id, deadline)
+    model_size = _get_model_size_with_deadline(repo_id, deadline, revision=requested_revision)
     download_path = None  # Will be set only if cache_dir is provided
     disk_check_path = None
     download_path_preexisting = False
@@ -2205,6 +2241,7 @@ def download_model(
             repo_id,
             listing_timeout,
             deadline=deadline,
+            revision=requested_revision,
         )
         if repo_files is None:
             raise ValueError(
@@ -2350,7 +2387,7 @@ def download_model_streaming(
             "Install with 'pip install modelaudit[huggingface]'"
         ) from e
 
-    namespace, repo_name = parse_huggingface_url(url)
+    namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
     display_url = redact_huggingface_url_for_display(url)
 
@@ -2380,6 +2417,7 @@ def download_model_streaming(
             repo_id,
             listing_timeout,
             deadline=deadline,
+            revision=requested_revision,
         )
         if repo_files is None:
             if repo_listing_error and repo_listing_error.startswith("timed out after"):
