@@ -2663,6 +2663,64 @@ class TestDvcSecurity:
         assert determine_exit_code(result) == 2
         assert any(issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in result.issues)
 
+    def test_direct_dvc_ambiguous_multifamily_shard_failure_preserves_complete_family_coverage(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Ambiguous multi-family shard failures must not poison complete sibling families."""
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        complete_first = model_dir / "complete-00001-of-00002.safetensors"
+        complete_second = model_dir / "complete-00002-of-00002.safetensors"
+        failed_first = model_dir / "failed-00001-of-00002.safetensors"
+        failed_second = model_dir / "failed-00002-of-00002.safetensors"
+        for shard_path in (complete_first, complete_second, failed_first, failed_second):
+            shard_path.write_bytes(b"shard")
+        dvc_file = tmp_path / "multifamily.dvc"
+        dvc_file.write_text(f"outs:\n- path: model/{complete_first.name}\n- path: model/{complete_second.name}\n")
+        monkeypatch.setattr("modelaudit.utils.sources.dvc.MAX_DVC_OUTPUTS", 1)
+        original_scan_file = core_module.scan_file
+
+        def fake_scan_file(path: str, config: dict[str, Any]) -> ScanResult:
+            if path != str(complete_first):
+                return original_scan_file(path, config)
+            result = ScanResult(scanner_name="safetensors")
+            result.bytes_scanned = complete_first.stat().st_size
+            result.add_check(
+                name="Sharded Model Detection",
+                passed=True,
+                message="Detected complete sharded model",
+                details={"shards": [str(complete_first), str(complete_second)]},
+            )
+            result.add_check(
+                name="Sharded Model Detection",
+                passed=True,
+                message="Detected unrelated incomplete sharded model",
+                details={"shards": [str(failed_first), str(failed_second)]},
+            )
+            result.add_check(
+                name="Shard Scan",
+                passed=False,
+                message="Error scanning shard without retained path",
+                severity=IssueSeverity.INFO,
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": "shard_scan_error",
+                },
+            )
+            result.finish(success=True)
+            return result
+
+        monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_enabled=False)
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert not any(issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in result.issues)
+
     def test_duplicate_yaml_keys_mark_pointer_incomplete(self, tmp_path: Path) -> None:
         """Duplicate outs mappings must not discard an earlier hidden declaration."""
         benign = tmp_path / "benign.pkl"
