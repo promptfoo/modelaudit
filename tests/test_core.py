@@ -1494,6 +1494,10 @@ def test_directory_owner_snapshot_detects_directory_metadata_drift(tmp_path: Pat
     model_dir = tmp_path / "owner-root"
     model_dir.mkdir()
     directory_entry = core_module._directory_owner_snapshot_entry(model_dir, ())
+    link_count_only_directory_entry = replace(
+        directory_entry,
+        link_count=directory_entry.link_count + 1,
+    )
     drifted_directory_entry = replace(
         directory_entry,
         size=directory_entry.size + 4096,
@@ -1506,6 +1510,13 @@ def test_directory_owner_snapshot_detects_directory_metadata_drift(tmp_path: Pat
     source_entry = core_module._directory_owner_snapshot_entry(source_path, ("metadata.json",))
     drifted_source_entry = replace(source_entry, ctime_ns=source_entry.ctime_ns + 10_000_000_000)
 
+    assert (
+        core_module._directory_owner_snapshot_changed_paths(
+            (directory_entry,),
+            (link_count_only_directory_entry,),
+        )
+        == set()
+    )
     assert core_module._directory_owner_snapshot_changed_paths(
         (directory_entry,),
         (drifted_directory_entry,),

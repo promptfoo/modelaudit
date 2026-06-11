@@ -682,8 +682,35 @@ def _directory_owner_snapshot_changed_paths(
     return {
         relative_parts
         for relative_parts in before_by_path.keys() | after_by_path.keys()
-        if before_by_path.get(relative_parts) != after_by_path.get(relative_parts)
+        if not _directory_owner_snapshot_entries_match(
+            before_by_path.get(relative_parts),
+            after_by_path.get(relative_parts),
+        )
     }
+
+
+def _directory_owner_snapshot_entries_match(
+    before: _DirectoryOwnerSnapshotEntry | None,
+    after: _DirectoryOwnerSnapshotEntry | None,
+) -> bool:
+    if before is None or after is None:
+        return before is after
+    if before.entry_type == after.entry_type == "directory":
+        return all(
+            getattr(before, field) == getattr(after, field)
+            for field in (
+                "relative_parts",
+                "entry_type",
+                "device",
+                "inode",
+                "mode",
+                "size",
+                "mtime_ns",
+                "ctime_ns",
+                "raw_link_target",
+            )
+        )
+    return before == after
 
 
 def _make_trusted_stream_shard_root(path: FilePath) -> object:
