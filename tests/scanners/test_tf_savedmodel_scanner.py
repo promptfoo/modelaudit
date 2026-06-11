@@ -2,6 +2,7 @@ import base64
 import hashlib
 import io
 import logging
+import os
 import pickle
 import shutil
 from pathlib import Path
@@ -64,6 +65,10 @@ def _keras_metadata_with_malformed_saved_object(payload: bytes) -> bytes:
 
 def _keras_metadata_with_json_metadata(payload: bytes) -> bytes:
     return _protobuf_bytes_field(1, _protobuf_bytes_field(5, payload))
+
+
+def _descriptor_bound_directory_owner_path_available() -> bool:
+    return bool(hasattr(os, "fchdir") or Path("/proc/self/fd").is_dir() or Path("/dev/fd").is_dir())
 
 
 def test_tf_savedmodel_scanner_can_handle(tmp_path: Path) -> None:
@@ -131,8 +136,18 @@ def test_tf_savedmodel_read_failure_is_inconclusive_not_security_finding(
     assert direct.metadata["operational_error_reason"] == "savedmodel_read_failed"
     assert "savedmodel_read_failed" in direct.metadata["scan_outcome_reasons"]
     metadata = aggregate.file_metadata[path].model_dump()
-    assert "savedmodel_read_failed" in metadata["scan_outcome_reasons"]
-    assert metadata["operational_error_reason"] == "savedmodel_read_failed"
+    if _descriptor_bound_directory_owner_path_available():
+        assert "savedmodel_read_failed" in metadata["scan_outcome_reasons"]
+        assert metadata["operational_error_reason"] == "savedmodel_read_failed"
+    else:
+        assert metadata["directory_owner_scan"] is False
+        assert any(
+            reason in metadata["scan_outcome_reasons"]
+            for reason in {"directory_owner_scan_failed", "directory_owner_snapshot_incomplete"}
+        )
+        child_metadata = aggregate.file_metadata[str(Path(path) / "saved_model.pb")].model_dump()
+        assert "savedmodel_read_failed" in child_metadata["scan_outcome_reasons"]
+        assert child_metadata["operational_error_reason"] == "savedmodel_read_failed"
     assert any(
         check.name == "SavedModel File Read" and "Unable to read TF SavedModel file" in check.message
         for check in aggregate.checks

@@ -490,8 +490,13 @@ def _write_orbax_metadata(directory: Path, *, restore_fn: str | None = None) -> 
     return metadata_path
 
 
+_DESCRIPTOR_BOUND_DIRECTORY_OWNER_PATH_AVAILABLE = bool(
+    hasattr(os, "fchdir") or Path("/proc/self/fd").is_dir() or Path("/dev/fd").is_dir()
+)
+
+
 @pytest.mark.skipif(
-    not (hasattr(os, "fchdir") or Path("/proc/self/fd").is_dir() or Path("/dev/fd").is_dir()),
+    not _DESCRIPTOR_BOUND_DIRECTORY_OWNER_PATH_AVAILABLE,
     reason="descriptor-bound directory owner path is unavailable",
 )
 def test_directory_scan_dispatches_orbax_owner_and_preserves_malicious_finding(tmp_path: Path) -> None:
@@ -543,6 +548,10 @@ def test_directory_scan_keeps_child_scan_for_symlinked_orbax_root(
     assert any(issue.rule_code == "S302" and issue.location == str(metadata_path) for issue in result.issues)
 
 
+@pytest.mark.skipif(
+    not _DESCRIPTOR_BOUND_DIRECTORY_OWNER_PATH_AVAILABLE,
+    reason="descriptor-bound directory owner path is unavailable",
+)
 def test_directory_scan_invokes_orbax_owner_once_and_keeps_clean_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -591,6 +600,10 @@ def test_directory_scan_records_orbax_owner_selection_skip(tmp_path: Path) -> No
     )
 
 
+@pytest.mark.skipif(
+    not _DESCRIPTOR_BOUND_DIRECTORY_OWNER_PATH_AVAILABLE,
+    reason="descriptor-bound directory owner path is unavailable",
+)
 def test_directory_scan_fails_closed_when_orbax_owner_raises(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -618,6 +631,10 @@ def test_directory_scan_fails_closed_when_orbax_owner_raises(
     assert determine_exit_code(result) == 2
 
 
+@pytest.mark.skipif(
+    not _DESCRIPTOR_BOUND_DIRECTORY_OWNER_PATH_AVAILABLE,
+    reason="descriptor-bound directory owner path is unavailable",
+)
 def test_directory_scan_invokes_savedmodel_directory_owner_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -645,6 +662,10 @@ def test_directory_scan_invokes_savedmodel_directory_owner_once(
     assert result.file_metadata[str(model_dir)]["directory_owner_scan"] is True
 
 
+@pytest.mark.skipif(
+    not _DESCRIPTOR_BOUND_DIRECTORY_OWNER_PATH_AVAILABLE,
+    reason="descriptor-bound directory owner path is unavailable",
+)
 def test_large_savedmodel_root_sibling_does_not_block_owner_dispatch(tmp_path: Path) -> None:
     _require_tf_protos()
     model_dir = tmp_path / "saved-model"
@@ -669,6 +690,10 @@ def test_large_savedmodel_root_sibling_does_not_block_owner_dispatch(tmp_path: P
     )
 
 
+@pytest.mark.skipif(
+    not _DESCRIPTOR_BOUND_DIRECTORY_OWNER_PATH_AVAILABLE,
+    reason="descriptor-bound directory owner path is unavailable",
+)
 def test_savedmodel_supplemental_sources_are_rechecked_after_owner_dispatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -811,6 +836,10 @@ def test_directory_scan_does_not_follow_external_savedmodel_marker_before_contai
 
 
 @pytest.mark.usefixtures("requires_symlinks")
+@pytest.mark.skipif(
+    not _DESCRIPTOR_BOUND_DIRECTORY_OWNER_PATH_AVAILABLE,
+    reason="descriptor-bound directory owner path is unavailable",
+)
 def test_unrelated_external_symlink_does_not_suppress_savedmodel_owner_scan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -927,6 +956,10 @@ def test_directory_scan_applies_file_budgets_before_orbax_owner(
     assert owner_metadata["operational_error"] is True
 
 
+@pytest.mark.skipif(
+    not _DESCRIPTOR_BOUND_DIRECTORY_OWNER_PATH_AVAILABLE,
+    reason="descriptor-bound directory owner path is unavailable",
+)
 def test_directory_scan_fails_closed_when_orbax_source_changes_during_owner_scan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1052,6 +1085,10 @@ def test_directory_scan_rejects_owner_namespace_change_before_dispatch(
     assert determine_exit_code(result) == 2
 
 
+@pytest.mark.skipif(
+    not _DESCRIPTOR_BOUND_DIRECTORY_OWNER_PATH_AVAILABLE,
+    reason="descriptor-bound directory owner path is unavailable",
+)
 def test_directory_scan_fails_closed_when_owner_adds_source_after_dispatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1077,6 +1114,10 @@ def test_directory_scan_fails_closed_when_owner_adds_source_after_dispatch(
     assert determine_exit_code(result) == 2
 
 
+@pytest.mark.skipif(
+    not _DESCRIPTOR_BOUND_DIRECTORY_OWNER_PATH_AVAILABLE,
+    reason="descriptor-bound directory owner path is unavailable",
+)
 def test_directory_scan_fails_closed_when_owner_root_is_swapped_and_restored(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1175,6 +1216,10 @@ def test_directory_scan_fails_closed_without_descriptor_owner_binding(
     assert determine_exit_code(result) == 2
 
 
+@pytest.mark.skipif(
+    not _DESCRIPTOR_BOUND_DIRECTORY_OWNER_PATH_AVAILABLE,
+    reason="descriptor-bound directory owner path is unavailable",
+)
 def test_directory_scan_validates_owner_sources_after_scan_exception(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1257,6 +1302,10 @@ def test_directory_owner_snapshot_rejects_directory_swapped_to_symlink_before_de
     assert swapped is True
 
 
+@pytest.mark.skipif(
+    not _DESCRIPTOR_BOUND_DIRECTORY_OWNER_PATH_AVAILABLE,
+    reason="descriptor-bound directory owner path is unavailable",
+)
 def test_directory_scan_dispatches_structure_only_owner_without_child_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1285,6 +1334,10 @@ def test_directory_scan_dispatches_structure_only_owner_without_child_files(
     assert result.has_errors is False
 
 
+@pytest.mark.skipif(
+    not _DESCRIPTOR_BOUND_DIRECTORY_OWNER_PATH_AVAILABLE,
+    reason="descriptor-bound directory owner path is unavailable",
+)
 def test_directory_owner_snapshot_entry_limit_allows_exact_boundary(tmp_path: Path) -> None:
     model_dir = tmp_path / "orbax-model"
     _write_orbax_metadata(model_dir)
