@@ -423,12 +423,21 @@ def _custom_operator_identity_display(value: str) -> str:
     return _bounded_custom_operator_value(value) if value else "<default>"
 
 
-def _custom_operator_identity_hash(domain: str, op_type: str, overload: str) -> str:
+def _custom_operator_values_hash(*values: str) -> str:
     digest = hashlib.sha256()
-    for value in (domain, op_type, overload):
-        digest.update(value.encode("utf-8", errors="surrogatepass"))
-        digest.update(b"\0")
-    return digest.hexdigest()[:16]
+    for value in values:
+        encoded = value.encode("utf-8", errors="surrogatepass")
+        digest.update(len(encoded).to_bytes(8, byteorder="big", signed=False))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _custom_operator_domain_hash(domain: str) -> str:
+    return _custom_operator_values_hash(domain)
+
+
+def _custom_operator_identity_hash(domain: str, op_type: str, overload: str) -> str:
+    return _custom_operator_values_hash(domain, op_type, overload)
 
 
 @dataclass
@@ -444,9 +453,12 @@ class _CustomOperatorAggregate:
 
     def add_node(self, node: Any) -> None:
         self.occurrence_count += 1
-        op_type = _bounded_custom_operator_value(getattr(node, "op_type", ""))
-        domain = _bounded_custom_operator_value(getattr(node, "domain", ""))
-        overload = _bounded_custom_operator_value(getattr(node, "overload", ""))
+        raw_op_type = str(getattr(node, "op_type", "") or "")
+        raw_domain = str(getattr(node, "domain", "") or "")
+        raw_overload = str(getattr(node, "overload", "") or "")
+        op_type = _bounded_custom_operator_value(raw_op_type)
+        domain = _bounded_custom_operator_value(raw_domain)
+        overload = _bounded_custom_operator_value(raw_overload)
         if op_type not in self._operator_sample_seen:
             if len(self.operator_samples) < _ONNX_CUSTOM_OPERATOR_SAMPLE_LIMIT:
                 self.operator_samples.append(op_type)
@@ -454,7 +466,7 @@ class _CustomOperatorAggregate:
             else:
                 self.operator_samples_truncated = True
 
-        operator_identity = (domain, op_type, overload)
+        operator_identity = (raw_domain, raw_op_type, raw_overload)
         if operator_identity not in self._operator_identity_seen:
             if len(self.operator_identities) < _ONNX_CUSTOM_OPERATOR_SAMPLE_LIMIT:
                 self._operator_identity_seen.add(operator_identity)
@@ -463,6 +475,11 @@ class _CustomOperatorAggregate:
                         "domain": domain,
                         "op_type": op_type,
                         "overload": overload,
+                        "operator_identity_hash": _custom_operator_identity_hash(
+                            raw_domain,
+                            raw_op_type,
+                            raw_overload,
+                        ),
                     }
                 )
             else:
@@ -2950,23 +2967,28 @@ class OnnxScanner(BaseScanner):
         # Security risk is in runtime environment (installing malicious operators)
         # not in the ONNX file itself. Emit one bounded aggregate per domain/file.
         for domain, finding in sorted(custom_domain_findings.items()):
-            check_consolidation_key = f"onnx_custom_operator_domain:{_bounded_custom_operator_value(domain)}"
+            domain_display = _bounded_custom_operator_value(domain)
+            domain_hash = _custom_operator_domain_hash(domain)
+            check_consolidation_key = f"onnx_custom_operator_domain:{domain_hash}"
+            details = finding.details(
+                domain=domain,
+                security_note=custom_operator_security_note,
+                check_consolidation_key=check_consolidation_key,
+            )
+            details["domain_hash"] = domain_hash
             result.add_check(
                 name="Custom Operator Domain Check",
                 passed=False,
                 message=(
-                    f"Model references custom operator domain '{domain}' in "
+                    f"Model references custom operator domain '{domain_display}' "
+                    f"(domain identity {domain_hash}) in "
                     f"{finding.occurrence_count} node(s). This is metadata only - ensure operators are "
                     "from trusted sources before installation."
                 ),
                 severity=IssueSeverity.INFO,
                 location=path,
                 rule_code="S1111",
-                details=finding.details(
-                    domain=domain,
-                    security_note=custom_operator_security_note,
-                    check_consolidation_key=check_consolidation_key,
-                ),
+                details=details,
             )
 
         for (domain, op_type, overload), finding in sorted(explicit_custom_operator_findings.items()):

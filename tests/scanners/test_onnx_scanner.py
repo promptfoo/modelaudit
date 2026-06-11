@@ -2414,13 +2414,16 @@ def test_onnx_scanner_custom_domain_aggregate_reports_distinct_operator_identiti
     assert details["domain"] == "com.vendor"
     assert details["occurrence_count"] == len(custom_nodes)
     assert details["distinct_operator_identity_count"] == len(custom_nodes)
-    assert details["operator_identities"] == [
+    assert [
+        {key: identity[key] for key in ("domain", "op_type", "overload")} for identity in details["operator_identities"]
+    ] == [
         {"domain": "com.vendor", "op_type": "KernelA", "overload": "fast"},
         {"domain": "com.vendor", "op_type": "KernelA", "overload": "safe"},
         {"domain": "com.vendor", "op_type": "KernelB", "overload": "fast"},
     ]
+    assert len({identity["operator_identity_hash"] for identity in details["operator_identities"]}) == len(custom_nodes)
     assert details["operator_identities_truncated"] is False
-    assert details["check_consolidation_key"] == "onnx_custom_operator_domain:com.vendor"
+    assert details["check_consolidation_key"] == f"onnx_custom_operator_domain:{details['domain_hash']}"
     assert metadata_custom_domains == ["com.vendor"]
 
 
@@ -2453,7 +2456,13 @@ def test_onnx_scanner_custom_domain_custom_op_overloads_survive_json_and_sarif_s
     ]
 
     assert len(json_custom_issues) == 1
-    assert json_custom_issues[0]["details"]["operator_identities"] == expected_identities
+    assert [
+        {key: identity[key] for key in ("domain", "op_type", "overload")}
+        for identity in json_custom_issues[0]["details"]["operator_identities"]
+    ] == expected_identities
+    assert len(
+        {identity["operator_identity_hash"] for identity in json_custom_issues[0]["details"]["operator_identities"]}
+    ) == len(expected_identities)
     assert json_custom_issues[0]["details"]["distinct_operator_identity_count"] == len(expected_identities)
     assert json_custom_issues[0]["details"]["operator_identities_truncated"] is False
 
@@ -2465,7 +2474,10 @@ def test_onnx_scanner_custom_domain_custom_op_overloads_survive_json_and_sarif_s
     ]
 
     assert len(sarif_results) == 1
-    assert sarif_results[0]["properties"]["operator_identities"] == expected_identities
+    assert [
+        {key: identity[key] for key in ("domain", "op_type", "overload")}
+        for identity in sarif_results[0]["properties"]["operator_identities"]
+    ] == expected_identities
     assert sarif_results[0]["properties"]["distinct_operator_identity_count"] == len(expected_identities)
 
 
@@ -2513,16 +2525,120 @@ def test_onnx_scanner_custom_domains_survive_core_check_consolidation(tmp_path: 
     checks_by_domain = {check.details["domain"]: check for check in custom_checks}
 
     assert sorted(checks_by_domain) == ["ai.onnx.ml.malicious", "com.attacker", "com.microsoft"]
-    assert {check.details["check_consolidation_key"] for check in custom_checks} == {
-        "onnx_custom_operator_domain:ai.onnx.ml.malicious",
-        "onnx_custom_operator_domain:com.attacker",
-        "onnx_custom_operator_domain:com.microsoft",
-    }
+    assert len({check.details["check_consolidation_key"] for check in custom_checks}) == len(custom_nodes)
+    assert all(
+        check.details["check_consolidation_key"] == f"onnx_custom_operator_domain:{check.details['domain_hash']}"
+        for check in custom_checks
+    )
     assert {
         issue.details["domain"]
         for issue in result.issues
         if issue.rule_code == "S1111" and issue.details.get("type") != "python_operator"
     } == set(checks_by_domain)
+
+
+def test_onnx_scanner_long_custom_domain_operator_identities_use_raw_hashes(
+    tmp_path: Path,
+) -> None:
+    shared_display_prefix = "Kernel" + ("A" * 280)
+    custom_nodes = [
+        ("com.vendor", f"{shared_display_prefix}_one", "", "long_one"),
+        ("com.vendor", f"{shared_display_prefix}_two", "", "long_two"),
+    ]
+    model_path = create_onnx_model_with_explicit_custom_operator_identities(tmp_path, custom_nodes)
+
+    result = scan_model_directory_or_file(
+        str(model_path),
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    json_payload = result.model_dump(mode="json")
+    json_custom_issues = [
+        issue
+        for issue in json_payload["issues"]
+        if issue.get("rule_code") == "S1111" and issue.get("details", {}).get("domain") == "com.vendor"
+    ]
+
+    assert len(json_custom_issues) == 1
+    identities = json_custom_issues[0]["details"]["operator_identities"]
+    assert json_custom_issues[0]["details"]["distinct_operator_identity_count"] == len(custom_nodes)
+    assert json_custom_issues[0]["details"]["operator_identities_truncated"] is False
+    assert len(identities) == len(custom_nodes)
+    assert len({identity["op_type"] for identity in identities}) == 1
+    assert len({identity["operator_identity_hash"] for identity in identities}) == len(custom_nodes)
+
+    sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+    sarif_results = [
+        item
+        for item in sarif_payload["runs"][0]["results"]
+        if item["ruleId"] == "S1111" and item.get("properties", {}).get("domain") == "com.vendor"
+    ]
+
+    assert len(sarif_results) == 1
+    assert sarif_results[0]["properties"]["distinct_operator_identity_count"] == len(custom_nodes)
+    assert len(
+        {identity["operator_identity_hash"] for identity in sarif_results[0]["properties"]["operator_identities"]}
+    ) == len(custom_nodes)
+
+
+def test_onnx_scanner_long_custom_domains_survive_core_check_and_issue_dedup(
+    tmp_path: Path,
+) -> None:
+    shared_domain_prefix = "com." + ("a" * 280)
+    custom_nodes = [
+        (f"{shared_domain_prefix}.one", "KernelA", "long_domain_one"),
+        (f"{shared_domain_prefix}.two", "KernelB", "long_domain_two"),
+    ]
+    model_path = create_onnx_model_with_custom_nodes(tmp_path, custom_nodes)
+
+    result = scan_model_directory_or_file(
+        str(model_path),
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    expected_domains = {domain for domain, _op_type, _node_name in custom_nodes}
+    json_payload = result.model_dump(mode="json")
+    json_custom_issues = [
+        issue
+        for issue in json_payload["issues"]
+        if issue.get("rule_code") == "S1111"
+        and issue.get("details", {}).get("domain", "").startswith(shared_domain_prefix)
+    ]
+    json_custom_checks = [
+        check
+        for check in json_payload["checks"]
+        if check.get("rule_code") == "S1111"
+        and check.get("details", {}).get("domain", "").startswith(shared_domain_prefix)
+    ]
+
+    assert {issue["details"]["domain"] for issue in json_custom_issues} == expected_domains
+    assert {check["details"]["domain"] for check in json_custom_checks} == expected_domains
+    assert len({issue["message"] for issue in json_custom_issues}) == len(expected_domains)
+    assert len({check["details"]["domain_hash"] for check in json_custom_checks}) == len(expected_domains)
+    assert len({check["details"]["check_consolidation_key"] for check in json_custom_checks}) == len(expected_domains)
+    assert all(
+        check["details"]["check_consolidation_key"] == f"onnx_custom_operator_domain:{check['details']['domain_hash']}"
+        for check in json_custom_checks
+    )
+
+    sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+    sarif_results = [
+        item
+        for item in sarif_payload["runs"][0]["results"]
+        if item["ruleId"] == "S1111" and item.get("properties", {}).get("domain", "").startswith(shared_domain_prefix)
+    ]
+
+    assert {item["properties"]["domain"] for item in sarif_results} == expected_domains
+    assert len({item["properties"]["domain_hash"] for item in sarif_results}) == len(expected_domains)
+    assert len({item["partialFingerprints"]["primaryLocationLineHash"] for item in sarif_results}) == len(
+        expected_domains
+    )
 
 
 def test_onnx_scanner_repeated_custom_domain_without_opset_import_still_flagged(tmp_path: Path) -> None:
@@ -3903,6 +4019,59 @@ def test_onnx_scanner_long_explicit_custom_op_names_survive_json_and_sarif_dedup
     assert len(sarif_results) == len(custom_nodes)
     assert len({item["properties"]["operator_identity_hash"] for item in sarif_results}) == len(custom_nodes)
     assert len({item["partialFingerprints"]["primaryLocationLineHash"] for item in sarif_results}) == len(custom_nodes)
+
+
+def test_onnx_scanner_custom_operator_identity_hash_length_frames_nul_values(
+    tmp_path: Path,
+) -> None:
+    custom_nodes = [
+        ("", "custom_op\0x", "", "nul_in_op_type"),
+        ("", "custom_op", "x\0", "nul_in_overload"),
+    ]
+    model_path = create_onnx_model_with_explicit_custom_operator_identities(tmp_path, custom_nodes)
+
+    result = scan_model_directory_or_file(
+        str(model_path),
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    expected_identities = {
+        ("", "custom_op\0x", ""),
+        ("", "custom_op", "x\0"),
+    }
+    json_payload = result.model_dump(mode="json")
+    json_custom_issues = [
+        issue
+        for issue in json_payload["issues"]
+        if issue.get("rule_code") == "S1111" and "operator_identity_hash" in issue.get("details", {})
+    ]
+
+    assert len(json_custom_issues) == len(expected_identities)
+    assert {
+        (
+            issue["details"]["operator_identity"]["domain"],
+            issue["details"]["operator_identity"]["op_type"],
+            issue["details"]["operator_identity"]["overload"],
+        )
+        for issue in json_custom_issues
+    } == expected_identities
+    assert len({issue["details"]["operator_identity_hash"] for issue in json_custom_issues}) == len(expected_identities)
+
+    sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+    sarif_results = [
+        item
+        for item in sarif_payload["runs"][0]["results"]
+        if item["ruleId"] == "S1111" and "operator_identity_hash" in item.get("properties", {})
+    ]
+
+    assert len(sarif_results) == len(expected_identities)
+    assert len({item["properties"]["operator_identity_hash"] for item in sarif_results}) == len(expected_identities)
+    assert len({item["partialFingerprints"]["primaryLocationLineHash"] for item in sarif_results}) == len(
+        expected_identities
+    )
 
 
 def test_onnx_scanner_real_pyop_node_still_flagged_despite_weight_bytes(tmp_path: Path) -> None:
