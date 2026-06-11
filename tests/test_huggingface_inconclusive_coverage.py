@@ -75,7 +75,6 @@ def _download_bounded(url: str, destination: Path) -> None:
                 handle.write(chunk)
 
 
-@pytest.mark.integration
 def test_pinned_huggingface_inconclusive_files_fail_coverage_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
