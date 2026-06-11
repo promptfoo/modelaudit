@@ -1668,6 +1668,26 @@ def test_hf_tokenizer_json_over_routing_budget_is_claimed_after_schema_probe(
     assert detect_file_format(str(tokenizer_path)) == "unknown"
 
 
+def test_hf_tokenizer_json_model_vocab_over_structure_budget_is_claimed_after_schema_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 256)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "model": {
+                "type": "Unigram",
+                "vocab": [[f"piece_{index}", -float(index)] for index in range(80)],
+            },
+        },
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+
+
 @pytest.mark.parametrize(
     ("late_fields", "expected_format"),
     [

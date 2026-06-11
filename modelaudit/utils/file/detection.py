@@ -913,6 +913,9 @@ def _hf_tokenizer_probe_model_object(
             model_type_value = model_type in _HF_TOKENIZER_MODEL_TYPES
 
         if key == "vocab":
+            if probe[value_offset] not in {ord("{"), ord("[")}:
+                raise _JSONProbeInvalid
+            saw_vocab = True
             next_offset = _json_probe_skip_value(probe, value_offset)
             if next_offset is None:
                 return None, saw_model_type and saw_vocab
@@ -928,8 +931,6 @@ def _hf_tokenizer_probe_model_object(
                 return None, saw_model_type and saw_vocab
         if key == "type":
             saw_model_type = model_type_value
-        if key == "vocab":
-            saw_vocab = True
 
         offset = next_offset
         offset = _json_probe_skip_whitespace(probe, offset)
@@ -950,6 +951,7 @@ def _hf_tokenizer_suffix_has_route_conflict(
     file_size: int,
     *,
     allow_after_any_value: bool = False,
+    allow_after_vocab_array: bool = False,
 ) -> bool:
     """Return whether a bounded suffix exposes late scanner-owned root evidence."""
     return _hf_tokenizer_suffix_has_structural_route_key(
@@ -957,6 +959,7 @@ def _hf_tokenizer_suffix_has_route_conflict(
         file_size,
         _HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_KEYS,
         allow_after_any_value=allow_after_any_value,
+        allow_after_vocab_array=allow_after_vocab_array,
     )
 
 
@@ -966,6 +969,7 @@ def _hf_tokenizer_suffix_has_structural_route_key(
     keys: frozenset[str],
     *,
     allow_after_any_value: bool = False,
+    allow_after_vocab_array: bool = False,
 ) -> bool:
     """Return whether a bounded suffix exposes a key after a completed value."""
     if file_size <= TOKENIZER_JSON_ROUTING_READ_BYTES:
@@ -985,8 +989,15 @@ def _hf_tokenizer_suffix_has_structural_route_key(
         previous_offset = _json_probe_skip_whitespace_reverse(suffix, offset)
         if previous_offset is None:
             continue
-        if suffix[previous_offset] not in {ord("}"), ord("]")} and not allow_after_any_value:
-            continue
+        if not allow_after_any_value and suffix[previous_offset] != ord("}"):
+            previous_container_offset = _json_probe_skip_whitespace_reverse(suffix, previous_offset)
+            if not (
+                allow_after_vocab_array
+                and suffix[previous_offset] == ord("]")
+                and previous_container_offset is not None
+                and suffix[previous_container_offset] == ord("]")
+            ):
+                continue
         offset = _json_probe_skip_whitespace(suffix, offset + 1)
         if offset >= len(suffix) or suffix[offset] != ord('"'):
             continue
@@ -1058,6 +1069,7 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
                 file_size,
                 keys,
                 allow_after_any_value=key != "model",
+                allow_after_vocab_array=scan_nested_templates and key == "model",
             )
 
         if scan_nested_templates:
@@ -1078,6 +1090,7 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
                     file_size,
                     keys,
                     allow_after_any_value=key != "model",
+                    allow_after_vocab_array=scan_nested_templates and key == "model",
                 )
             if state.has_template_evidence:
                 return True
@@ -1087,6 +1100,7 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
                     file_size,
                     keys,
                     allow_after_any_value=key != "model",
+                    allow_after_vocab_array=scan_nested_templates and key == "model",
                 )
         else:
             next_offset = _json_probe_skip_value(probe, value_offset)
@@ -1215,7 +1229,16 @@ def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
             if state.has_template_evidence:
                 return False
             if next_offset is None:
-                return False
+                return (
+                    sample_is_prefix
+                    and root_keys >= _HF_TOKENIZER_ROOT_KEYS
+                    and saw_model_schema
+                    and not _hf_tokenizer_suffix_has_route_conflict(
+                        file_path,
+                        file_size,
+                        allow_after_vocab_array=True,
+                    )
+                )
         else:
             try:
                 next_offset = _json_probe_skip_value_with_template_scan(
