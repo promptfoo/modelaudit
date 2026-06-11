@@ -11,7 +11,7 @@ import sys
 import tarfile
 import zipfile
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from io import BytesIO, StringIO
 from pathlib import Path, PurePosixPath
@@ -289,6 +289,7 @@ _FLAX_MSGPACK_PROBE_LENGTH_SIZES = {
 VALID_MEDIA_ROUTING_FORMAT = "valid_media"
 MEDIA_ROUTE_READ_BYTES = FLAX_MSGPACK_STRUCTURE_READ_BYTES
 MEDIA_ROUTE_TAIL_READ_BYTES = 64 * 1024
+_MEDIA_ROUTE_MAX_PNG_CHUNKS = 4096
 _MEDIA_ROUTING_SUFFIXES = frozenset({".jpeg", ".jpg", ".png"})
 _MEDIA_TRAILING_PADDING = b"\x00\t\n\r "
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -5420,6 +5421,41 @@ def _find_bounded_png_end(sample: bytes) -> int | None:
     return None
 
 
+def _find_png_end_with_reader(file_size: int, read_at: Callable[[int, int], bytes]) -> int | None:
+    """Return the first byte after a complete PNG stream using sparse bounded reads."""
+    if file_size < len(_PNG_SIGNATURE) + 12:
+        return None
+    try:
+        if read_at(0, len(_PNG_SIGNATURE)) != _PNG_SIGNATURE:
+            return None
+
+        offset = len(_PNG_SIGNATURE)
+        saw_ihdr = False
+        for _ in range(_MEDIA_ROUTE_MAX_PNG_CHUNKS):
+            if offset + 8 > file_size:
+                return None
+            chunk_header = read_at(offset, 8)
+            if len(chunk_header) != 8:
+                return None
+            chunk_length = int.from_bytes(chunk_header[:4], "big")
+            chunk_type = chunk_header[4:8]
+            chunk_end = offset + 12 + chunk_length
+            if chunk_end > file_size:
+                return None
+            if not saw_ihdr:
+                if chunk_type != b"IHDR" or chunk_length != 13:
+                    return None
+                saw_ihdr = True
+            elif chunk_type == b"IHDR":
+                return None
+            if chunk_type == _PNG_IEND_CHUNK:
+                return chunk_end if chunk_length == 0 else None
+            offset = chunk_end
+    except OSError:
+        return None
+    return None
+
+
 def _find_bounded_jpeg_end(sample: bytes) -> int | None:
     """Return the first byte after a complete bounded JPEG stream."""
     if not sample.startswith(b"\xff\xd8"):
@@ -5472,6 +5508,16 @@ def _find_bounded_jpeg_end(sample: bytes) -> int | None:
     return None
 
 
+def _detect_complete_media_route_from_trailing(trailing: bytes, *, sample_is_prefix: bool) -> str | None:
+    """Classify bytes after a complete media stream."""
+    pickle_route = _detect_media_pickle_polyglot_route(trailing, sample_is_prefix=sample_is_prefix)
+    if pickle_route is not None:
+        return pickle_route
+    if sample_is_prefix or trailing.lstrip(_MEDIA_TRAILING_PADDING):
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    return VALID_MEDIA_ROUTING_FORMAT
+
+
 def _could_start_bounded_media_route(file_path: Path, sample: bytes) -> bool:
     """Return whether bounded bytes plausibly begin a supported media stream."""
     if file_path.suffix.lower() not in _MEDIA_ROUTING_SUFFIXES:
@@ -5510,12 +5556,7 @@ def _detect_bounded_media_route_from_sample(
         return None
     if media_end is None:
         return None
-    pickle_route = _detect_media_pickle_polyglot_route(sample[media_end:], sample_is_prefix=sample_is_prefix)
-    if pickle_route is not None:
-        return pickle_route
-    if sample_is_prefix:
-        return None
-    return VALID_MEDIA_ROUTING_FORMAT
+    return _detect_complete_media_route_from_trailing(sample[media_end:], sample_is_prefix=sample_is_prefix)
 
 
 def _detect_bounded_media_route_from_edges(file_path: Path, prefix: bytes, tail: bytes) -> str | None:
@@ -5523,7 +5564,7 @@ def _detect_bounded_media_route_from_edges(file_path: Path, prefix: bytes, tail:
     if not prefix or not tail or not _could_start_bounded_media_route(file_path, prefix):
         return None
 
-    prefix_route = _detect_bounded_media_route_from_sample(file_path, prefix, sample_is_prefix=True)
+    prefix_route = _detect_bounded_media_route_from_sample(file_path, prefix, sample_is_prefix=tail != prefix)
     if prefix_route is not None:
         return prefix_route
 
@@ -5548,6 +5589,33 @@ def _detect_bounded_media_route_from_edges(file_path: Path, prefix: bytes, tail:
     return VALID_MEDIA_ROUTING_FORMAT
 
 
+def _read_local_media_range(file_path: Path, sample: bytes, offset: int, size: int) -> bytes:
+    if size <= 0:
+        return b""
+    end = offset + size
+    if offset >= 0 and end <= len(sample):
+        return sample[offset:end]
+    with file_path.open("rb") as handle:
+        handle.seek(offset)
+        return handle.read(size)
+
+
+def _detect_seekable_png_media_route(file_path: Path, file_size: int, sample: bytes) -> str | None:
+    media_end = _find_png_end_with_reader(
+        file_size,
+        lambda offset, size: _read_local_media_range(file_path, sample, offset, size),
+    )
+    if media_end is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    trailing_size = file_size - media_end
+    if trailing_size <= 0:
+        return VALID_MEDIA_ROUTING_FORMAT
+    read_size = min(trailing_size, MEDIA_ROUTE_READ_BYTES + 1)
+    trailing = _read_local_media_range(file_path, sample, media_end, read_size)
+    return _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=trailing_size > len(trailing))
+
+
 def _detect_bounded_media_route(file_path: Path, file_size: int) -> str | None:
     """Inspect a bounded complete media sample before serialized fallback routing."""
     if file_path.suffix.lower() not in _MEDIA_ROUTING_SUFFIXES:
@@ -5556,11 +5624,20 @@ def _detect_bounded_media_route(file_path: Path, file_size: int) -> str | None:
         sample = read_magic_bytes(str(file_path), min(file_size, MEDIA_ROUTE_READ_BYTES + 1))
     except OSError:
         return None
-    return _detect_bounded_media_route_from_sample(
+    sample_route = _detect_bounded_media_route_from_sample(
         file_path,
         sample,
         sample_is_prefix=file_size > len(sample),
     )
+    if sample_route is not None:
+        return sample_route
+    if (
+        file_size > len(sample)
+        and sample.startswith(_PNG_SIGNATURE)
+        and _could_start_bounded_media_route(file_path, sample)
+    ):
+        return _detect_seekable_png_media_route(file_path, file_size, sample)
+    return None
 
 
 def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:

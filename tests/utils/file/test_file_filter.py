@@ -18,7 +18,9 @@ from modelaudit.utils.file.detection import (
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    MEDIA_ROUTE_READ_BYTES,
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+    PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
     PROTOBUF_MODEL_CANDIDATE_FORMAT,
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
@@ -225,6 +227,13 @@ class TestFileFilter:
         media_path.write_bytes(payload + malicious_pickle_bytes())
 
         assert detect_file_format_for_skip_filter(str(media_path)) == "pickle"
+        assert should_skip_file(str(media_path)) is False
+
+    def test_padded_media_pickle_polyglot_bypasses_default_prefilter(self, tmp_path: Path) -> None:
+        media_path = tmp_path / "padded-polyglot.png"
+        media_path.write_bytes(valid_png_bytes() + (b"\0" * (MEDIA_ROUTE_READ_BYTES + 2)) + malicious_pickle_bytes())
+
+        assert detect_file_format_for_skip_filter(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
         assert should_skip_file(str(media_path)) is False
 
     def test_allow_model_extensions(self):

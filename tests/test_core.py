@@ -215,6 +215,25 @@ def _build_malicious_pickle(*, protocol: int | None = None) -> bytes:
     return pickle.dumps(DangerousPayload(), protocol=protocol)
 
 
+def test_scan_file_padded_media_pickle_polyglot_fails_closed(tmp_path: Path) -> None:
+    media_path = tmp_path / "padded-polyglot.png"
+    media_path.write_bytes(
+        valid_png_bytes() + (b"\0" * (file_detection.MEDIA_ROUTE_READ_BYTES + 2)) + _build_malicious_pickle()
+    )
+
+    result = scan_file(str(media_path), config={"cache_scan_results": False})
+
+    assert result.success is False
+    assert result.scanner_name == "unknown"
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(
+        check.name == "Pickle Routing"
+        and check.status == CheckStatus.FAILED
+        and check.details["format"] == file_detection.PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        for check in result.checks
+    )
+
+
 def _build_protocolless_binary_malicious_pickle() -> bytes:
     """Build a binary pickle gadget without the optional PROTO opcode."""
     return b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94\x8c\x02id\x94\x85\x94R\x94."

@@ -306,6 +306,171 @@ def _read_huggingface_tail(
         ) from exc
 
 
+def _read_huggingface_range(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+    start_offset: int,
+    max_bytes: int,
+) -> bytes:
+    """Read a bounded remote byte range, reusing the cached prefix when possible."""
+    file_size = budget.file_sizes.get(filename)
+    if file_size is None or max_bytes <= 0 or start_offset < 0 or start_offset >= file_size:
+        return b""
+
+    read_size = min(max_bytes, file_size - start_offset)
+    end_offset = start_offset + read_size
+    if end_offset <= len(prefix):
+        return prefix[start_offset:end_offset]
+
+    chunks: list[bytes] = []
+    remote_start = start_offset
+    if start_offset < len(prefix):
+        chunks.append(prefix[start_offset:])
+        remote_start = len(prefix)
+
+    remote_size = read_size - sum(len(chunk) for chunk in chunks)
+    if remote_size <= 0:
+        return b"".join(chunks)[:read_size]
+
+    remote_end = remote_start + remote_size - 1
+    budget.reserve(repo_id, remote_size)
+    try:
+        import re
+
+        import requests
+        from huggingface_hub import hf_hub_url
+        from huggingface_hub.utils import build_hf_headers
+
+        file_url = hf_hub_url(repo_id=repo_id, filename=filename, revision=revision)
+        headers = build_hf_headers(
+            token=None,
+            headers={
+                "Range": f"bytes={remote_start}-{remote_end}",
+                "Accept-Encoding": "identity",
+            },
+        )
+        with requests.get(
+            file_url,
+            headers=headers,
+            stream=True,
+            timeout=budget.request_timeout(repo_id),
+            allow_redirects=True,
+        ) as response:
+            response.raise_for_status()
+            remote_chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=remote_size):
+                budget.check_deadline(repo_id)
+                if not chunk:
+                    continue
+                remote_chunks.append(chunk)
+                total += len(chunk)
+                if total >= remote_size:
+                    break
+            remote_payload = b"".join(remote_chunks)[:remote_size]
+            content_range = getattr(response, "headers", {}).get("Content-Range", "")
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range.strip(), flags=re.IGNORECASE)
+            if getattr(response, "status_code", None) != 206 or match is None:
+                raise ValueError("range Hugging Face response omitted a valid Content-Range")
+            reported_start, reported_end, reported_size = (int(value) for value in match.groups())
+            if (
+                reported_start != remote_start
+                or reported_end != remote_end
+                or reported_size != file_size
+                or len(remote_payload) != remote_size
+            ):
+                raise ValueError("range Hugging Face response reported an inconsistent Content-Range")
+            chunks.append(remote_payload)
+        return b"".join(chunks)[:read_size]
+    except Exception as exc:
+        raise ValueError(
+            "Hugging Face selective filtering incomplete: unable to inspect skipped file "
+            f"{repo_id}/{filename} ({type(exc).__name__})"
+        ) from exc
+
+
+def _detect_huggingface_png_media_route(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> str | None:
+    """Return a PNG media route by walking chunk framing with sparse range reads."""
+    from modelaudit.utils.file.detection import (
+        _PNG_SIGNATURE,
+        MEDIA_ROUTE_READ_BYTES,
+        MEDIA_ROUTE_TAIL_READ_BYTES,
+        PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+        VALID_MEDIA_ROUTING_FORMAT,
+        _detect_complete_media_route_from_trailing,
+        _find_png_end_with_reader,
+    )
+
+    if not prefix.startswith(_PNG_SIGNATURE):
+        return None
+    file_size = budget.file_sizes.get(filename)
+    if file_size is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    tail: bytes | None = None
+    tail_start = file_size
+    range_windows: list[tuple[int, bytes]] = []
+
+    def read_at(offset: int, size: int) -> bytes:
+        nonlocal tail, tail_start
+        end_offset = offset + size
+        if end_offset <= len(prefix):
+            return prefix[offset:end_offset]
+        if tail is None:
+            tail = _read_huggingface_tail(
+                repo_id,
+                filename,
+                revision,
+                budget,
+                prefix,
+                MEDIA_ROUTE_TAIL_READ_BYTES,
+            )
+            tail_start = file_size - len(tail)
+        if tail_start <= offset and end_offset <= tail_start + len(tail):
+            return tail[offset - tail_start : end_offset - tail_start]
+        if offset < len(prefix) and len(prefix) >= tail_start and end_offset <= tail_start + len(tail):
+            prefix_part = prefix[offset : min(end_offset, len(prefix))]
+            tail_part_start = max(len(prefix), tail_start)
+            tail_part = tail[tail_part_start - tail_start : end_offset - tail_start]
+            return prefix_part + tail_part
+        for window_start, window in range_windows:
+            if window_start <= offset and end_offset <= window_start + len(window):
+                return window[offset - window_start : end_offset - window_start]
+        window_size = min(MEDIA_ROUTE_TAIL_READ_BYTES, file_size - offset)
+        window = _read_huggingface_range(repo_id, filename, revision, budget, prefix, offset, window_size)
+        range_windows.append((offset, window))
+        return window[:size]
+
+    try:
+        media_end = _find_png_end_with_reader(
+            file_size,
+            read_at,
+        )
+    except ValueError:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    if media_end is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    trailing_size = file_size - media_end
+    if trailing_size <= 0:
+        return VALID_MEDIA_ROUTING_FORMAT
+    read_size = min(trailing_size, MEDIA_ROUTE_READ_BYTES + 1)
+    try:
+        trailing = read_at(media_end, read_size)
+    except ValueError:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    return _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=trailing_size > len(trailing))
+
+
 def _looks_like_safetensors_prefix(
     repo_id: str,
     filename: str,
@@ -754,15 +919,17 @@ def _detect_huggingface_content_route_format(
         return mxnet_route
 
     if remote_path.suffix.lower() in _MEDIA_ROUTING_SUFFIXES:
-        media_tail = _read_huggingface_tail(
-            repo_id,
-            filename,
-            revision,
-            budget,
-            prefix,
-            MEDIA_ROUTE_TAIL_READ_BYTES,
-        )
-        media_route = _detect_bounded_media_route_from_edges(remote_path, prefix, media_tail)
+        media_route = _detect_huggingface_png_media_route(repo_id, filename, revision, budget, prefix)
+        if media_route is None:
+            media_tail = _read_huggingface_tail(
+                repo_id,
+                filename,
+                revision,
+                budget,
+                prefix,
+                MEDIA_ROUTE_TAIL_READ_BYTES,
+            )
+            media_route = _detect_bounded_media_route_from_edges(remote_path, prefix, media_tail)
         if media_route == VALID_MEDIA_ROUTING_FORMAT:
             return None
         if media_route is not None:
