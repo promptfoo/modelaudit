@@ -347,6 +347,48 @@ def _huggingface_stream_preview_budget_files(
     return [*selected_files, *_huggingface_preview_unselected_files(files, selected_files)]
 
 
+def _huggingface_stream_preview_openvino_companion_names(
+    files: object,
+    selected_files: list[dict[str, Any]],
+    runtime: "_ScanRuntimeConfig",
+) -> set[str]:
+    """Return exact OpenVINO BIN companions intentionally suppressed from no-max previews."""
+    if runtime.scannable_scanner_ids is None or "openvino" not in {
+        str(scanner_id).lower() for scanner_id in runtime.scannable_scanner_ids
+    }:
+        return set()
+
+    from .utils.sources import huggingface as huggingface_source
+
+    file_names = _huggingface_preview_file_names(files)
+    repo_file_set = set(file_names)
+    companion_names: set[str] = set()
+    for selected_name in _huggingface_preview_file_names(selected_files):
+        companion = huggingface_source._openvino_bin_companion_name(selected_name, file_names)
+        if companion is not None and companion in repo_file_set:
+            companion_names.add(companion)
+    return companion_names
+
+
+def _huggingface_stream_preview_unbudgeted_content_route_files(
+    metadata: dict[str, Any],
+    selected_files: list[dict[str, Any]],
+    runtime: "_ScanRuntimeConfig",
+) -> list[dict[str, Any]]:
+    """Return unselected files that make no-max stream dry-run coverage inconclusive."""
+    if runtime.hf_stream_include_all_files or not _huggingface_stream_preview_needs_content_route_budget(runtime):
+        return []
+
+    files = metadata.get("files", [])
+    openvino_companion_names = _huggingface_stream_preview_openvino_companion_names(files, selected_files, runtime)
+    unselected_files = _huggingface_preview_unselected_files(files, selected_files)
+    return [
+        item
+        for item in unselected_files
+        if not (isinstance(item.get("name"), str) and item["name"] in openvino_companion_names)
+    ]
+
+
 def _huggingface_preview_download_files(metadata: dict[str, Any]) -> list[dict[str, Any]]:
     """Return metadata entries the downloader can select without reading model bytes."""
     files = metadata.get("files", [])
@@ -639,6 +681,15 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
     ):
         raise ValueError(
             "Hugging Face dry-run cannot account for content-routed files without reading model bytes; refusing dry-run"
+        )
+    if (
+        runtime.scan_and_delete
+        and max_download_bytes is None
+        and _huggingface_stream_preview_unbudgeted_content_route_files(metadata, selected_files, runtime)
+    ):
+        raise ValueError(
+            "Hugging Face stream dry-run cannot account for content-routed files without --max-size "
+            "or reading model bytes; refusing dry-run"
         )
     if max_download_bytes is not None and budget_size > max_download_bytes:
         raise ValueError(

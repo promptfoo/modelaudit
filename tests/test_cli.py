@@ -4785,6 +4785,128 @@ def test_scan_huggingface_streaming_preview_uses_selected_stream_policy(
 @patch("modelaudit.utils.sources.huggingface.get_model_info")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_dry_run_pytorch_zip_fails_on_unbudgeted_renamed_candidate(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_get_model_info: MagicMock,
+    mock_is_hf_url: MagicMock,
+) -> None:
+    """Exact content-routed stream dry-runs need a size budget for unselected metadata candidates."""
+    mock_is_hf_url.return_value = True
+    mock_get_model_info.return_value = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": _HF_TEST_REVISION,
+        "total_size": 3072,
+        "file_count": 2,
+        "files": [
+            {"name": "model.pt", "size": 1024},
+            {"name": "renamed.payload", "size": 2048},
+        ],
+    }
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--dry-run", "--stream", "--scanners", "pytorch_zip", "--format", "text", "hf://test/model"],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 2, output
+    assert "stream dry-run cannot account for content-routed files without --max-size" in output
+    assert mock_get_model_info.call_args.kwargs["include_metadata_files"] is True
+    assert mock_get_model_info.call_args.kwargs["sniff_content"] is False
+    mock_download_streaming.assert_not_called()
+    mock_scan_streaming.assert_not_called()
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.get_model_info")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_dry_run_openvino_companion_no_max_is_not_selected(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_get_model_info: MagicMock,
+    mock_is_hf_url: MagicMock,
+) -> None:
+    """No-max OpenVINO dry-run should not select or reject exact same-stem BIN companions."""
+    mock_is_hf_url.return_value = True
+    mock_get_model_info.return_value = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": _HF_TEST_REVISION,
+        "total_size": 1100,
+        "file_count": 2,
+        "files": [
+            {"name": "openvino/model.xml", "size": 100},
+            {"name": "openvino/model.bin", "size": 1000},
+        ],
+    }
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--dry-run", "--stream", "--scanners", "openvino", "--format", "text", "hf://test/model"],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, output
+    assert "Scannable files: 1 of 2" in output
+    assert "Scannable size: 100 B" in output
+    mock_download_streaming.assert_not_called()
+    mock_scan_streaming.assert_not_called()
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.get_model_info")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_dry_run_openvino_companion_counts_against_max_size(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_get_model_info: MagicMock,
+    mock_is_hf_url: MagicMock,
+) -> None:
+    """Max-size OpenVINO dry-run should still budget exact same-stem BIN companions."""
+    mock_is_hf_url.return_value = True
+    mock_get_model_info.return_value = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": _HF_TEST_REVISION,
+        "total_size": 1100,
+        "file_count": 2,
+        "files": [
+            {"name": "openvino/model.xml", "size": 100},
+            {"name": "openvino/model.bin", "size": 1000},
+        ],
+    }
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--dry-run",
+            "--stream",
+            "--scanners",
+            "openvino",
+            "--max-size",
+            "500B",
+            "--format",
+            "text",
+            "hf://test/model",
+        ],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 2, output
+    assert "Selected Hugging Face files total 1100 bytes exceeds max size 500 bytes" in output
+    mock_download_streaming.assert_not_called()
+    mock_scan_streaming.assert_not_called()
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.get_model_info")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
 def test_scan_huggingface_streaming_preview_preserves_include_all_files_policy(
     mock_scan_streaming: MagicMock,
     mock_download_streaming: MagicMock,
