@@ -193,8 +193,6 @@ def _format_preview_size(size_bytes: object) -> str:
     """Return a human-readable size for source previews."""
     if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes < 0:
         return "unknown"
-    if size_bytes == 0:
-        return "unknown"
     size = float(size_bytes)
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if size < 1024.0:
@@ -206,7 +204,7 @@ def _format_preview_size(size_bytes: object) -> str:
 def _huggingface_preview_file_size(item: dict[str, Any]) -> int | None:
     """Return a trusted preview size, or None when Hugging Face metadata is inconclusive."""
     size = item.get("size")
-    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
         return None
     return size
 
