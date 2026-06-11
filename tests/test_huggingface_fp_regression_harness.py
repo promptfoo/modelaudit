@@ -912,13 +912,14 @@ def test_hf_file_dry_run_preview_does_not_download_or_scan() -> None:
                 "size": 123,
             },
         ) as mock_get_file_info,
+        patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"}),
         patch("modelaudit.cli.download_file_from_hf") as mock_download_file,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
     ):
         result = runner.invoke(cli, ["scan", "--dry-run", "--format", "json", url])
 
     parsed = parse_click_json_output(result.stdout)
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert result.stdout.lstrip().startswith("{")
     assert parsed["files_scanned"] == 0
     assert "Type: Hugging Face file" in result.stderr

@@ -454,6 +454,13 @@ def _huggingface_direct_preview_matches_metadata_route(filename: str, runtime: "
     if text_like_route_is_proven():
         return True
 
+    from .scanner_registry_metadata import get_scanner_registry_metadata
+
+    for scanner_info in get_scanner_registry_metadata().values():
+        for known_name in scanner_info.get("content_routed_filenames", ()):
+            if name_lower == str(known_name).lower():
+                return True
+
     from .utils.sources import huggingface as huggingface_source
 
     model_extensions = {str(extension).lower() for extension in huggingface_source._get_model_extensions() if extension}
