@@ -1,7 +1,9 @@
 """Tests for advanced file handler."""
 
+import hashlib
 import json
 import os
+import struct
 import sys
 import tempfile
 from collections import Counter
@@ -36,6 +38,28 @@ class CompletingShardScanner:
     def scan(self, shard_path: str) -> ScanResult:
         result = ScanResult(scanner_name=self.name)
         result.bytes_scanned = Path(shard_path).stat().st_size
+        result.finish(success=True)
+        return result
+
+
+class HeaderHashShardScanner:
+    """Scanner that records the SafeTensors header bytes it actually received."""
+
+    name = "header_hash_shard_scanner"
+
+    def scan(self, shard_path: str) -> ScanResult:
+        with Path(shard_path).open("rb") as handle:
+            header_len = struct.unpack("<Q", handle.read(8))[0]
+            header = handle.read(header_len)
+        result = ScanResult(scanner_name=self.name)
+        result.add_check(
+            name="SafeTensors Header Pin",
+            passed=True,
+            message="SafeTensors header was scanned",
+            severity=IssueSeverity.INFO,
+            location=shard_path,
+            details={"header_sha256": hashlib.sha256(header).hexdigest()},
+        )
         result.finish(success=True)
         return result
 
@@ -223,6 +247,38 @@ class TestShardedModelDetector:
         assert "unexpected_shard_count" not in shard_info
         assert result.success is True
 
+    @pytest.mark.parametrize(
+        ("indices", "expected_base"),
+        [
+            ([0, 1], "zero"),
+            ([1, 2], "one"),
+        ],
+        ids=["nested-zero-based", "nested-one-based"],
+    )
+    def test_detect_safetensors_parent_index_governs_nested_shards(
+        self,
+        tmp_path: Path,
+        indices: list[int],
+        expected_base: str,
+    ) -> None:
+        """A parent SafeTensors index should reconcile nested shard paths locally."""
+        shard_files = [f"shards/model-{index:05d}-of-00002.safetensors" for index in indices]
+        (tmp_path / "shards").mkdir()
+        for shard in shard_files:
+            (tmp_path / shard).write_bytes(shard.encode())
+        _write_safetensors_index(tmp_path, shard_files)
+
+        shard_info = ShardedModelDetector.detect_shards(str(tmp_path / shard_files[0]))
+        result = AdvancedFileHandler(str(tmp_path / shard_files[0]), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_path"] == str(tmp_path / "model.safetensors.index.json")
+        assert shard_info["shard_index_base"] == expected_base
+        assert shard_info["shards"] == [str(tmp_path / shard) for shard in shard_files]
+        assert "missing_shard_count" not in shard_info
+        assert "unexpected_shard_count" not in shard_info
+        assert result.success is True
+
     def test_detect_shards_records_missing_expected_indices(self, tmp_path: Path) -> None:
         """Missing numbered shards should be explicit in detector metadata."""
         shard_one = tmp_path / "model-00001-of-00003.safetensors"
@@ -263,6 +319,36 @@ class TestShardedModelDetector:
         assert result.success is False
         assert "missing_model_shards" in result.metadata["scan_outcome_reasons"]
 
+    def test_detect_safetensors_parent_index_missing_nested_shard_with_substitute_fails_closed(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A nested substitute must not hide a shard missing from the parent index."""
+        shard_dir = tmp_path / "shards"
+        shard_dir.mkdir()
+        indexed_present = shard_dir / "model-00001-of-00002.safetensors"
+        substitute = shard_dir / "model-00002-of-00002.safetensors"
+        indexed_present.write_bytes(b"indexed")
+        substitute.write_bytes(b"substitute")
+        _write_safetensors_index(
+            tmp_path,
+            [
+                "shards/model-00000-of-00002.safetensors",
+                "shards/model-00001-of-00002.safetensors",
+            ],
+        )
+
+        shard_info = ShardedModelDetector.detect_shards(str(indexed_present))
+        result = AdvancedFileHandler(str(indexed_present), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert shard_info["shard_index_base"] == "zero"
+        assert shard_info["missing_shard_count"] == 1
+        assert shard_info["missing_shard_indices"] == [0]
+        assert shard_info["unexpected_shards"] == [str(substitute)]
+        assert result.success is False
+        assert "missing_model_shards" in result.metadata["scan_outcome_reasons"]
+
     def test_detect_safetensors_index_extra_mixed_base_shard_fails_closed(self, tmp_path: Path) -> None:
         """An extra same-total shard must not be silently accepted as either base."""
         indexed_shards = [
@@ -296,6 +382,56 @@ class TestShardedModelDetector:
         assert shard_info["unexpected_shards"] == [str(shard_zero)]
         assert result.success is False
         assert "missing_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize(
+        "index_payload",
+        [
+            "{not-json",
+            json.dumps({"weight_map": {"tensor": "../outside/model-00000-of-00001.safetensors"}}),
+        ],
+        ids=["nested-malformed-json", "nested-traversal-target"],
+    )
+    def test_detect_safetensors_parent_index_invalid_nested_inventory_fails_closed(
+        self,
+        tmp_path: Path,
+        index_payload: str,
+    ) -> None:
+        """Malformed and traversal-bearing parent indexes must not authorize nested shards."""
+        shard_dir = tmp_path / "shards"
+        shard_dir.mkdir()
+        shard_zero = shard_dir / "model-00000-of-00001.safetensors"
+        shard_zero.write_bytes(b"zero")
+        (tmp_path / "model.safetensors.index.json").write_text(index_payload, encoding="utf-8")
+
+        shard_info = ShardedModelDetector.detect_shards(str(shard_zero))
+        result = AdvancedFileHandler(str(shard_zero), CompletingShardScanner()).scan()
+
+        assert shard_info is not None
+        assert shard_info["safetensors_index_error"]
+        assert shard_info["unvalidated_shards"] == [str(tmp_path / "model.safetensors.index.json")]
+        assert result.success is False
+        assert "unvalidated_model_shards" in result.metadata["scan_outcome_reasons"]
+
+    def test_complete_single_safetensors_header_scan_is_platform_independent_when_pin_unavailable(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A complete one-shard SafeTensors family should validate the real header without descriptor pinning."""
+        header = b'{"__metadata__":{"format":"pt"},"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}'
+        shard = tmp_path / "model-00000-of-00001.safetensors"
+        shard.write_bytes(struct.pack("<Q", len(header)) + header + b"\0")
+        _write_safetensors_index(tmp_path, [shard.name])
+
+        with patch(
+            "modelaudit.utils.file.handlers._pinned_shard_scan_path",
+            side_effect=AssertionError("single SafeTensors shard should not require descriptor pinning"),
+        ):
+            result = AdvancedFileHandler(str(shard), HeaderHashShardScanner()).scan()
+
+        assert result.success is True
+        header_check = next(check for check in result.checks if check.name == "SafeTensors Header Pin")
+        assert header_check.details["header_sha256"] == hashlib.sha256(header).hexdigest()
+        assert "shard_pin_unavailable" not in result.metadata.get("scan_outcome_reasons", [])
 
     @pytest.mark.parametrize(
         "index_payload",

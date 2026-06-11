@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import signal
 import struct
 import subprocess
@@ -818,6 +819,7 @@ def _validate_remote_safetensors_indexes(
     from modelaudit.utils.file.handlers import (
         MAX_SAFETENSORS_SHARD_INDEX_BYTES,
         SAFETENSORS_INDEX_NAME,
+        SAFETENSORS_SHARD_PATTERN,
         ShardedModelDetector,
     )
 
@@ -884,12 +886,14 @@ def _validate_remote_safetensors_indexes(
 
         target_indices: set[int] = set()
         expected_total: int | None = None
+        target_families: dict[tuple[str, int], set[str]] = {}
         for target_file in target_files:
-            shard_match = ShardedModelDetector.match_shard_filename(PurePosixPath(target_file).name)
+            target_path = PurePosixPath(target_file)
+            shard_match = ShardedModelDetector.match_safetensors_shard_filename(target_path.name)
             if shard_match is None:
                 raise ValueError(
                     "Hugging Face selective filtering incomplete: "
-                    f"SafeTensors index {repo_id}/{index_file} references a non-shard target"
+                    f"SafeTensors index {repo_id}/{index_file} references a non-SafeTensors shard target"
                 )
             shard_index = shard_match.get("current_shard_index")
             shard_total = shard_match.get("expected_total_shards")
@@ -906,6 +910,7 @@ def _validate_remote_safetensors_indexes(
                     f"SafeTensors index {repo_id}/{index_file} has inconsistent shard totals"
                 )
             target_indices.add(shard_index)
+            target_families.setdefault((target_path.parent.as_posix(), shard_total), set()).add(target_file)
 
         if expected_total is None or len(target_files) != expected_total or len(target_indices) != expected_total:
             raise ValueError(
@@ -919,6 +924,29 @@ def _validate_remote_safetensors_indexes(
             raise ValueError(
                 "Hugging Face selective filtering incomplete: "
                 f"SafeTensors index {repo_id}/{index_file} has ambiguous shard indices"
+            )
+
+        unreferenced_siblings: list[str] = []
+        for (target_parent, target_total), referenced_targets in target_families.items():
+            for repo_file in repo_files:
+                if repo_file in referenced_targets:
+                    continue
+                repo_path = PurePosixPath(repo_file)
+                if repo_path.parent.as_posix() != target_parent:
+                    continue
+                sibling_match = re.fullmatch(SAFETENSORS_SHARD_PATTERN, repo_path.name)
+                if sibling_match is None or (sibling_match.lastindex or 0) < 2:
+                    continue
+                try:
+                    sibling_total = int(sibling_match.group(2))
+                except (IndexError, ValueError):
+                    continue
+                if sibling_total == target_total:
+                    unreferenced_siblings.append(repo_file)
+        if unreferenced_siblings:
+            raise ValueError(
+                "Hugging Face selective filtering incomplete: "
+                f"SafeTensors index {repo_id}/{index_file} leaves unreferenced model shard(s)"
             )
 
         for target_file in target_files:

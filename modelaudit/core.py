@@ -32,7 +32,7 @@ from modelaudit.integrations.license_checker import (
     collect_license_metadata,
 )
 from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
-from modelaudit.scanner_results import Check, Issue, IssueSeverity, ScanResult
+from modelaudit.scanner_results import Check, CheckStatus, Issue, IssueSeverity, ScanResult
 from modelaudit.scanner_selection import (
     SCANNER_SELECTION_PREFERRED_KIND,
     ScannerSelectionPolicy,
@@ -106,6 +106,7 @@ from modelaudit.utils.file.handlers import (
     ShardedModelDetector,
     ValidatedShardTargets,
     _count_expected_shard_indices,
+    _is_single_safetensors_shard_path,
     _pinned_shard_scan_path,
     _ShardPinUnavailableError,
     scan_advanced_large_file,
@@ -363,6 +364,16 @@ _TRUSTED_STREAM_SHARD_PARENT_PREFIXES = (
     "modelaudit_stream_",
 )
 _TRUSTED_STREAM_SHARD_ROOT_TOKEN = object()
+
+
+@dataclass(frozen=True)
+class _UnexpectedValidatedShardFamily:
+    """Validated streamed shards that cannot describe one expected family."""
+
+    location: str
+    sources: tuple[str, ...]
+    unexpected_sources: tuple[str, ...]
+    expected_total: int
 
 
 @dataclass(frozen=True)
@@ -727,6 +738,162 @@ def _complete_validated_shard_family_sources(validated_targets: ValidatedShardTa
     return complete_sources
 
 
+def _unexpected_validated_shard_families(
+    validated_targets: ValidatedShardTargets,
+) -> list[_UnexpectedValidatedShardFamily]:
+    """Return trusted streamed families with shard indices outside one expected base."""
+    grouped_targets: dict[tuple[str, int, str], dict[int, list[str]]] = {}
+    for source_path, target in validated_targets.items():
+        shard_match = ShardedModelDetector.match_shard_filename(Path(source_path).name)
+        if shard_match is None:
+            continue
+        pattern = shard_match.get("pattern")
+        shard_index = shard_match.get("current_shard_index")
+        expected_total = shard_match.get("expected_total_shards")
+        if (
+            not isinstance(pattern, str)
+            or not isinstance(shard_index, int)
+            or not isinstance(expected_total, int)
+            or expected_total <= 0
+        ):
+            continue
+        for family_scope in _validated_shard_family_scopes(source_path, target):
+            grouped_targets.setdefault((pattern, expected_total, family_scope), {}).setdefault(shard_index, []).append(
+                source_path
+            )
+
+    unexpected_families: list[_UnexpectedValidatedShardFamily] = []
+    seen_locations: set[str] = set()
+    for (pattern, expected_total, _family_scope), targets_by_index in grouped_targets.items():
+        expected_indices, _index_base = ShardedModelDetector.expected_indices_for_shard_family(
+            pattern,
+            expected_total,
+            set(targets_by_index),
+        )
+        unexpected_sources = tuple(
+            sorted(
+                source_path
+                for shard_index, source_paths in targets_by_index.items()
+                if shard_index not in expected_indices
+                for source_path in source_paths
+            )
+        )
+        if not unexpected_sources:
+            continue
+        sources = tuple(
+            sorted(source_path for source_paths in targets_by_index.values() for source_path in source_paths)
+        )
+        location = sources[0]
+        normalized_location = os.path.normcase(os.path.normpath(os.path.abspath(location)))
+        if normalized_location in seen_locations:
+            continue
+        seen_locations.add(normalized_location)
+        unexpected_families.append(
+            _UnexpectedValidatedShardFamily(
+                location=location,
+                sources=sources,
+                unexpected_sources=unexpected_sources,
+                expected_total=expected_total,
+            )
+        )
+    return unexpected_families
+
+
+def _record_unexpected_validated_shard_families(
+    results: ModelAuditResultModel,
+    unexpected_families: list[_UnexpectedValidatedShardFamily],
+) -> bool:
+    """Persist explicit incomplete outcomes for invalid streamed shard families."""
+    if not unexpected_families:
+        return False
+
+    from .models import FileMetadataModel
+
+    existing_locations = {
+        os.path.normcase(os.path.normpath(os.path.abspath(check.location)))
+        for check in results.checks
+        if check.name == "Sharded Model Coverage Check"
+        and isinstance(check.location, str)
+        and isinstance(check.details, dict)
+        and check.details.get("scan_outcome_reason") == "unexpected_model_shards"
+    }
+    recorded = False
+    for family in unexpected_families:
+        normalized_location = os.path.normcase(os.path.normpath(os.path.abspath(family.location)))
+        if normalized_location not in existing_locations:
+            results.checks.append(
+                Check(
+                    name="Sharded Model Coverage Check",
+                    status=CheckStatus.FAILED,
+                    message=(
+                        f"Found {len(family.unexpected_sources)} model shard(s) outside the expected family inventory; "
+                        "scan coverage is incomplete."
+                    ),
+                    severity=IssueSeverity.INFO,
+                    location=family.location,
+                    details={
+                        "expected_total_shards": family.expected_total,
+                        "present_total_shards": len(family.sources),
+                        "unexpected_shard_count": len(family.unexpected_sources),
+                        "unexpected_shards": list(family.unexpected_sources),
+                        "analysis_incomplete": True,
+                        "scan_outcome": "inconclusive",
+                        "scan_outcome_reason": "unexpected_model_shards",
+                    },
+                )
+            )
+            existing_locations.add(normalized_location)
+            recorded = True
+        for source_path in family.sources:
+            metadata = (
+                results.file_metadata[source_path].model_dump(mode="python")
+                if source_path in results.file_metadata
+                else {}
+            )
+            metadata["analysis_incomplete"] = True
+            metadata["scan_outcome"] = "inconclusive"
+            reasons = metadata.get("scan_outcome_reasons")
+            reason_list = list(reasons) if isinstance(reasons, list) else []
+            if "unexpected_model_shards" not in reason_list:
+                reason_list.append("unexpected_model_shards")
+            metadata["scan_outcome_reasons"] = reason_list
+            metadata["scan_outcome_reason"] = "unexpected_model_shards"
+            results.file_metadata[source_path] = FileMetadataModel(**metadata)
+            recorded = True
+    if recorded:
+        results.has_errors = True
+        results.success = False
+    return recorded
+
+
+def _scan_selected_safetensors_overlap(
+    path: str,
+    config: dict[str, Any],
+    scanner_selection: ScannerSelectionPolicy,
+    scanner_ids: frozenset[str],
+) -> ScanResult | None:
+    """Prefer a validated SafeTensors route when explicit selection excludes an ambiguous owner."""
+    if (
+        "safetensors" not in scanner_ids
+        or not scanner_selection.active
+        or not scanner_selection.allows("safetensors")
+        or scanner_selection.allows("pickle")
+    ):
+        return None
+    scanner_class = _registry.load_scanner_by_id("safetensors")
+    if scanner_class is None:
+        return None
+    result = scanner_class(config=config).scan(path)
+    merge_safetensors_overlap_analysis(
+        path,
+        result,
+        config,
+        scanner_selection,
+        scanner_ids,
+    )
+    return result
+
+
 def _ensure_streamed_shard_coverage_placeholder(scan_result: ScanResult, source_path: Path) -> None:
     """Record the per-file shard gap that trusted cross-file reconciliation may later disprove."""
     for record in itertools.chain(scan_result.checks, scan_result.issues):
@@ -886,9 +1053,13 @@ def _reconcile_cross_directory_shard_coverage(
     missing_shard_errors_only: bool = False,
 ) -> bool:
     """Remove missing-shard outcomes, clearing errors only with explicit ownership proof."""
+    recorded_unexpected = _record_unexpected_validated_shard_families(
+        results,
+        _unexpected_validated_shard_families(validated_targets),
+    )
     complete_sources = _complete_validated_shard_family_sources(validated_targets)
     if not complete_sources:
-        return False
+        return recorded_unexpected
 
     def source_is_complete(path: str | None) -> bool:
         if not isinstance(path, str):
@@ -986,13 +1157,13 @@ def _reconcile_cross_directory_shard_coverage(
         results.file_metadata[source_path] = FileMetadataModel(**metadata)
         reconciled = True
 
-    if reconciled:
+    if reconciled or recorded_unexpected:
         had_errors = results.has_errors
         results.has_errors = _results_have_explicit_operational_error(results) or (
             had_errors and (not missing_shard_errors_only or _results_have_retained_incomplete_outcome(results))
         )
         results.success = not _results_should_be_unsuccessful(results)
-    return reconciled
+    return reconciled or recorded_unexpected
 
 
 def _build_shard_family_cache_fingerprint(
@@ -3771,6 +3942,16 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             sr.bytes_scanned = file_size
         return sr
     if header_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT or magic_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT:
+        selected_safetensors_result = _scan_selected_safetensors_overlap(
+            path,
+            config,
+            scanner_selection,
+            safetensors_overlap_scanner_ids,
+        )
+        if selected_safetensors_result is not None:
+            if selected_safetensors_result.bytes_scanned == 0 and file_size > 0:
+                selected_safetensors_result.bytes_scanned = file_size
+            return selected_safetensors_result
         sr = _make_incomplete_pickle_routing_result(path)
         merge_safetensors_overlap_analysis(
             path,
@@ -4445,25 +4626,28 @@ def scan_model_streaming(
                     resolved_target = initial_target.get("resolved_path")
                     if isinstance(resolved_target, str):
                         selected_resolved_path = resolved_target
-                        try:
-                            pinned_scan_context = _pinned_shard_scan_path(resolved_target, initial_target)
-                            scan_path = Path(pinned_scan_context.__enter__().path)
-                            pre_scan_shard_target = _snapshot_validated_shard_target(
-                                str(source_path),
-                                resolved_path=resolved_target,
-                                family_group=shard_family_group,
-                                family_group_policy="stream_staging",
-                                trusted_root_marker=_trusted_shard_family_root,
-                            )
-                            scan_config[_SHARD_ALREADY_PINNED_CONFIG_KEY] = True
-                        except _ShardPinUnavailableError as error:
-                            if pinned_scan_context is not None:
-                                pinned_scan_context = None
-                            record_shard_pin_failure(source_path, error)
-                            preserve_shard_reconciliation_errors = True
-                            aggregate_hash_complete = False
-                            files_processed += 1
-                            continue
+                        if _is_single_safetensors_shard_path(source_path):
+                            pre_scan_shard_target = initial_shard_target
+                        else:
+                            try:
+                                pinned_scan_context = _pinned_shard_scan_path(resolved_target, initial_target)
+                                scan_path = Path(pinned_scan_context.__enter__().path)
+                                pre_scan_shard_target = _snapshot_validated_shard_target(
+                                    str(source_path),
+                                    resolved_path=resolved_target,
+                                    family_group=shard_family_group,
+                                    family_group_policy="stream_staging",
+                                    trusted_root_marker=_trusted_shard_family_root,
+                                )
+                                scan_config[_SHARD_ALREADY_PINNED_CONFIG_KEY] = True
+                            except _ShardPinUnavailableError as error:
+                                if pinned_scan_context is not None:
+                                    pinned_scan_context = None
+                                record_shard_pin_failure(source_path, error)
+                                preserve_shard_reconciliation_errors = True
+                                aggregate_hash_complete = False
+                                files_processed += 1
+                                continue
 
                 file_hash: str | None = None
                 defer_hash_for_max_total_size = _should_defer_hash_for_max_total_size(

@@ -694,6 +694,85 @@ class TestModelDownload:
 
         mock_snapshot_download.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("foreign_target", "model_extensions"),
+        [
+            ("pytorch_model-00001-of-00001.bin", {".bin", ".safetensors"}),
+            ("checkpoint_1.pt", {".pt", ".safetensors"}),
+            ("model_weights_1.h5", {".h5", ".safetensors"}),
+            ("params_shard_1.bin", {".bin", ".safetensors"}),
+            ("pytorch_model-00001-of-00001.bin", {".safetensors"}),
+        ],
+        ids=[
+            "default-pytorch-bin",
+            "default-checkpoint-pt",
+            "default-keras-h5",
+            "default-custom-bin",
+            "explicit-safetensors-only",
+        ],
+    )
+    def test_download_model_rejects_foreign_safetensors_index_targets_before_snapshot(
+        self,
+        foreign_target: str,
+        model_extensions: set[str],
+    ) -> None:
+        """A SafeTensors index must not authorize foreign shard formats for download."""
+        repo_files = [
+            "model.safetensors.index.json",
+            "model-00000-of-00001.safetensors",
+            foreign_target,
+        ]
+        index_payload = json.dumps({"weight_map": {"tensor": foreign_target}}).encode()
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value=model_extensions),
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
+            patch("requests.get", return_value=_FakeRangeResponse(index_payload)),
+            patch("huggingface_hub.snapshot_download") as mock_snapshot_download,
+            pytest.raises(Exception, match="references a non-SafeTensors shard target"),
+        ):
+            download_model("https://huggingface.co/test/model")
+
+        mock_snapshot_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            [
+                "model.safetensors.index.json",
+                "model-00000-of-00001.safetensors",
+                "model-00001-of-00001.safetensors",
+            ],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_rejects_unreferenced_safetensors_index_siblings(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+    ) -> None:
+        """A valid index plus an extra same-family sibling must fail closed before download."""
+        mock_requests_get.return_value = _FakeRangeResponse(
+            json.dumps({"weight_map": {"tensor": "model-00000-of-00001.safetensors"}}).encode()
+        )
+
+        with pytest.raises(Exception, match="leaves unreferenced model shard"):
+            download_model("https://huggingface.co/test/model")
+
+        mock_snapshot_download.assert_not_called()
+
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -1847,6 +1926,42 @@ class TestModelDownload:
 
         mock_snapshot_download.assert_not_called()
 
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            ["model.safetensors.index.json", "model-00000-of-00001.safetensors"],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_max_size_counts_index_materialized_files(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+    ) -> None:
+        """SafeTensors index expansion must not bypass the selected-file size budget."""
+        mock_requests_get.return_value = _FakeRangeResponse(
+            json.dumps({"weight_map": {"tensor": "model-00000-of-00001.safetensors"}}).encode()
+        )
+        mock_get_paths_info.return_value = [
+            SimpleNamespace(path="model.safetensors.index.json", size=60),
+            SimpleNamespace(path="model-00000-of-00001.safetensors", size=50),
+        ]
+
+        with pytest.raises(Exception, match="selected Hugging Face files total 110 bytes exceeds max size 100 bytes"):
+            download_model("https://huggingface.co/test/model", max_size=100)
+
+        mock_snapshot_download.assert_not_called()
+
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin", ".safetensors"})
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -2258,6 +2373,85 @@ class TestModelDownloadStreaming:
 
         with pytest.raises(Exception, match="references missing model shard"):
             list(download_model_streaming("https://huggingface.co/test/model"))
+
+        mock_hf_hub_download.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "foreign_target",
+        [
+            "pytorch_model-00001-of-00001.bin",
+            "checkpoint_1.pt",
+            "model_weights_1.h5",
+        ],
+        ids=["pytorch-bin", "checkpoint-pt", "keras-h5"],
+    )
+    def test_download_model_streaming_rejects_foreign_safetensors_index_targets_before_download(
+        self,
+        foreign_target: str,
+    ) -> None:
+        """Streaming selection must not let a SafeTensors index pull foreign shard formats."""
+        repo_files = [
+            "model.safetensors.index.json",
+            "model-00000-of-00001.safetensors",
+            foreign_target,
+        ]
+        index_payload = json.dumps({"weight_map": {"tensor": foreign_target}}).encode()
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
+            patch("requests.get", return_value=_FakeRangeResponse(index_payload)),
+            patch("huggingface_hub.hf_hub_download") as mock_hf_hub_download,
+            pytest.raises(Exception, match="references a non-SafeTensors shard target"),
+        ):
+            list(
+                download_model_streaming(
+                    "https://huggingface.co/test/model",
+                    scannable_extensions={".safetensors"},
+                    scannable_scanner_ids={"safetensors"},
+                )
+            )
+
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            [
+                "model.safetensors.index.json",
+                "model-00000-of-00001.safetensors",
+                "model-00001-of-00001.safetensors",
+            ],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_rejects_unreferenced_safetensors_index_siblings(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_detect_content: MagicMock,
+    ) -> None:
+        """Streaming must fail closed on valid index inventories with extra same-family siblings."""
+        mock_requests_get.return_value = _FakeRangeResponse(
+            json.dumps({"weight_map": {"tensor": "model-00000-of-00001.safetensors"}}).encode()
+        )
+
+        with pytest.raises(Exception, match="leaves unreferenced model shard"):
+            list(
+                download_model_streaming(
+                    "https://huggingface.co/test/model",
+                    scannable_extensions={".safetensors"},
+                    scannable_scanner_ids={"safetensors"},
+                )
+            )
 
         mock_hf_hub_download.assert_not_called()
 

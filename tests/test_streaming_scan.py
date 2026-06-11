@@ -31,7 +31,7 @@ from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.models import FileMetadataModel, LicenseInfoModel, create_initial_audit_result
 from modelaudit.scanners import safetensors_scanner
 from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
-from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
+from modelaudit.utils.file.detection import PICKLE_ROUTING_INCONCLUSIVE_FORMAT, SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 
@@ -651,6 +651,84 @@ def test_scan_model_streaming_preserves_max_total_size_failure_after_shard_recon
         assert result.has_errors is True
         assert result.success is False
         assert determine_exit_code(result) == 2
+
+
+def test_scan_model_streaming_selected_safetensors_reconciles_pickle_inconclusive_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit SafeTensors streaming should not keep stale shard gaps from an excluded pickle probe."""
+    import modelaudit.core as core_module
+
+    header = b'{"__metadata__":{"format":"pt"}}'
+    original_detect_file_format = core_module.detect_file_format
+    original_detect_file_format_from_magic = core_module.detect_file_format_from_magic
+
+    def detect_file_format(path: str) -> str:
+        if path.endswith("model-00002-of-00002.safetensors"):
+            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        return original_detect_file_format(path)
+
+    def detect_file_format_from_magic(path: str) -> str:
+        if path.endswith("model-00002-of-00002.safetensors"):
+            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        return original_detect_file_format_from_magic(path)
+
+    monkeypatch.setattr(core_module, "detect_file_format", detect_file_format)
+    monkeypatch.setattr(core_module, "detect_file_format_from_magic", detect_file_format_from_magic)
+
+    with ExitStack() as stack:
+        shards: list[Path] = []
+        for shard_index in range(1, 3):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+            shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+            shards.append(shard_path)
+
+        result = scan_model_streaming(
+            file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+            timeout=30,
+            delete_after_scan=False,
+            shard_family_group="trusted-stream:model-a",
+            cache_enabled=False,
+            scanners=["safetensors"],
+        )
+
+    assert result.success is True
+    assert determine_exit_code(result) == 0
+    assert not any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
+    assert not any(issue.details.get("scan_outcome_reason") == "missing_model_shards" for issue in result.issues)
+    assert all(
+        "missing_model_shards" not in metadata.model_dump().get("scan_outcome_reasons", [])
+        for metadata in result.file_metadata.values()
+    )
+
+
+def test_scan_model_streaming_total_one_mixed_base_family_fails_closed() -> None:
+    """A streamed total-1 SafeTensors family cannot contain both zero- and one-based members."""
+    header = b'{"__metadata__":{"format":"pt"}}'
+    with ExitStack() as stack:
+        shards: list[Path] = []
+        for shard_index in (0, 1):
+            shard_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="modelaudit_stream_")))
+            shard_path = shard_dir / f"model-{shard_index:05d}-of-00001.safetensors"
+            shard_path.write_bytes(struct.pack("<Q", len(header)) + header)
+            shards.append(shard_path)
+
+        result = scan_model_streaming(
+            file_generator=iter((shard, index == len(shards) - 1) for index, shard in enumerate(shards)),
+            timeout=30,
+            delete_after_scan=False,
+            shard_family_group="trusted-stream:model-a",
+            cache_enabled=False,
+        )
+
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(check.details.get("scan_outcome_reason") == "unexpected_model_shards" for check in result.checks)
+    assert all(
+        "unexpected_model_shards" in metadata.model_dump().get("scan_outcome_reasons", [])
+        for metadata in result.file_metadata.values()
+    )
 
 
 @pytest.mark.parametrize("start_index", [0, 1], ids=["zero-based", "one-based"])

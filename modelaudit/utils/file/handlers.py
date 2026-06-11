@@ -463,6 +463,11 @@ def _mark_inconclusive_scan_outcome(result: "ScanResult", reason: str) -> None:
     result.metadata["scan_outcome_reasons"] = reasons
 
 
+def _normalized_absolute_path(path: str | os.PathLike[str]) -> str:
+    """Return the normalized absolute form used for shard-family membership."""
+    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
+
 def _summarize_missing_shard_indices(
     present_indices: set[int],
     expected_indices: ExpectedShardIndices,
@@ -482,6 +487,31 @@ def _summarize_missing_shard_indices(
             break
 
     return missing_indices, missing_count, missing_count > len(missing_indices)
+
+
+def _is_complete_single_safetensors_shard_info(shard_info: dict[str, Any]) -> bool:
+    """Return whether shard metadata describes one complete SafeTensors shard."""
+    if (
+        shard_info.get("pattern") != SAFETENSORS_SHARD_PATTERN
+        or shard_info.get("expected_total_shards") != 1
+        or shard_info.get("total_shards") != 1
+    ):
+        return False
+    incomplete_count_keys = (
+        "missing_shard_count",
+        "unreadable_shard_count",
+        "out_of_scope_shard_count",
+        "unvalidated_shard_count",
+        "duplicate_shard_count",
+        "unexpected_shard_count",
+    )
+    return not any(shard_info.get(key, 0) for key in incomplete_count_keys)
+
+
+def _is_single_safetensors_shard_path(path: str | os.PathLike[str]) -> bool:
+    """Return whether a path names the only member of a SafeTensors shard family."""
+    shard_match = ShardedModelDetector.match_safetensors_shard_filename(Path(path).name)
+    return bool(shard_match is not None and shard_match.get("expected_total_shards") == 1)
 
 
 class ShardedModelDetector:
@@ -558,6 +588,23 @@ class ShardedModelDetector:
         return None
 
     @staticmethod
+    def match_safetensors_shard_filename(file_name: str) -> dict[str, int | str] | None:
+        """Return SafeTensors shard metadata for the exact SafeTensors shard pattern."""
+        match = re.fullmatch(SAFETENSORS_SHARD_PATTERN, file_name)
+        if match is None or (match.lastindex or 0) < 2:
+            return None
+        try:
+            shard_index = int(match.group(1))
+            expected_total = int(match.group(2))
+        except (IndexError, ValueError):
+            return None
+        return {
+            "pattern": SAFETENSORS_SHARD_PATTERN,
+            "current_shard_index": shard_index,
+            "expected_total_shards": expected_total,
+        }
+
+    @staticmethod
     def _safe_index_target_path(index_dir: Path, raw_target: str) -> Path:
         """Return a local path for a SafeTensors index target or raise ValueError."""
         if not raw_target or "\\" in raw_target:
@@ -568,25 +615,19 @@ class ShardedModelDetector:
         return index_dir.joinpath(*target_path.parts)
 
     @classmethod
-    def _load_safetensors_index_inventory(
+    def _read_safetensors_index_inventory(
         cls,
-        dir_path: Path,
+        index_dir: Path,
+        index_path: Path,
         pattern: str,
-        expected_total: int | None,
-    ) -> _SafetensorsShardIndexInventory | None:
-        """Parse an adjacent SafeTensors index into an authoritative shard inventory."""
-        if pattern != SAFETENSORS_SHARD_PATTERN or not isinstance(expected_total, int):
-            return None
-
-        index_path = dir_path / SAFETENSORS_INDEX_NAME
-        if not (index_path.exists() or index_path.is_symlink()):
-            return None
-
+        expected_total: int,
+    ) -> _SafetensorsShardIndexInventory:
+        """Parse one SafeTensors index into an authoritative shard inventory."""
         try:
             resolved_index = index_path.resolve(strict=True)
             hf_cache_root = _find_hf_cache_root(index_path.absolute())
             trusted_hf_blobs_root = _trusted_hf_blobs_root(hf_cache_root) if hf_cache_root is not None else None
-            index_target_allowed = _is_resolved_path_within_directory(dir_path, str(resolved_index)) or (
+            index_target_allowed = _is_resolved_path_within_directory(index_dir, str(resolved_index)) or (
                 trusted_hf_blobs_root is not None and resolved_index.is_relative_to(trusted_hf_blobs_root)
             )
             if not index_target_allowed:
@@ -623,15 +664,17 @@ class ShardedModelDetector:
                 raise ValueError("safetensors index weight_map targets must be strings")
             unique_targets = set(raw_targets)
             for raw_target in sorted(unique_targets):
-                target_file = cls._safe_index_target_path(dir_path, raw_target)
-                target_match = re.fullmatch(pattern, target_file.name)
-                if target_match is None or (target_match.lastindex or 0) < 2:
+                target_file = cls._safe_index_target_path(index_dir, raw_target)
+                target_match = cls.match_safetensors_shard_filename(target_file.name)
+                if target_match is None:
                     raise ValueError("safetensors index target does not match shard filename pattern")
-                target_index = int(target_match.group(1))
-                target_total = int(target_match.group(2))
+                target_index = target_match["current_shard_index"]
+                target_total = target_match["expected_total_shards"]
+                if not isinstance(target_index, int) or not isinstance(target_total, int):
+                    raise ValueError("safetensors index target does not match shard filename pattern")
                 if target_total != expected_total:
                     raise ValueError("safetensors index target total does not match selected shard total")
-                expected_paths.add(os.path.normcase(os.path.normpath(os.path.abspath(target_file))))
+                expected_paths.add(_normalized_absolute_path(target_file))
                 target_indices.add(target_index)
 
             if len(expected_paths) != expected_total or len(target_indices) != expected_total:
@@ -662,6 +705,55 @@ class ShardedModelDetector:
                 index_base="invalid",
                 error=str(exc),
             )
+
+    @staticmethod
+    def _safetensors_inventory_governs_file(
+        inventory: _SafetensorsShardIndexInventory,
+        current_file: Path,
+        pattern: str,
+        expected_total: int,
+    ) -> bool:
+        """Return whether an ancestor index is authoritative for this shard path."""
+        normalized_current = _normalized_absolute_path(current_file)
+        if normalized_current in inventory.expected_source_paths:
+            return True
+        current_match = re.fullmatch(pattern, current_file.name)
+        if current_match is None or (current_match.lastindex or 0) < 2:
+            return False
+        try:
+            current_total = int(current_match.group(2))
+        except (IndexError, ValueError):
+            return False
+        if current_total != expected_total:
+            return False
+        current_parent = os.path.dirname(normalized_current)
+        expected_parents = {os.path.dirname(source_path) for source_path in inventory.expected_source_paths}
+        return current_parent in expected_parents
+
+    @classmethod
+    def _load_safetensors_index_inventory(
+        cls,
+        dir_path: Path,
+        pattern: str,
+        expected_total: int | None,
+        current_file: Path,
+    ) -> _SafetensorsShardIndexInventory | None:
+        """Parse a governing SafeTensors index into an authoritative shard inventory."""
+        if pattern != SAFETENSORS_SHARD_PATTERN or not isinstance(expected_total, int):
+            return None
+
+        for index_dir in (dir_path, *dir_path.parents):
+            index_path = index_dir / SAFETENSORS_INDEX_NAME
+            if not (index_path.exists() or index_path.is_symlink()):
+                continue
+            inventory = cls._read_safetensors_index_inventory(index_dir, index_path, pattern, expected_total)
+            if index_dir == dir_path:
+                return inventory
+            if inventory.error is not None:
+                return inventory
+            if cls._safetensors_inventory_governs_file(inventory, current_file, pattern, expected_total):
+                return inventory
+        return None
 
     @classmethod
     def detect_shards(
@@ -726,6 +818,7 @@ class ShardedModelDetector:
                     dir_path,
                     pattern,
                     requested_expected_total,
+                    Path(file_path),
                 )
                 if index_inventory is not None:
                     shard_info["safetensors_index_path"] = str(index_inventory.index_path)
@@ -1615,7 +1708,10 @@ class ParallelShardHandler:
                 isinstance(self.scanner_config, dict)
                 and self.scanner_config.get(_SHARD_ALREADY_PINNED_CONFIG_KEY) is True
             )
-            if validated_target is None or already_pinned:
+            pin_optional_single_shard = validated_target is not None and _is_complete_single_safetensors_shard_info(
+                self.shard_info
+            )
+            if validated_target is None or already_pinned or pin_optional_single_shard:
                 result: ScanResult = scanner.scan(scan_path)
             else:
                 with _pinned_shard_scan_path(scan_path, validated_target) as pinned_scan:
