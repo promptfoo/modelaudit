@@ -2713,8 +2713,10 @@ def _resolve_scan_source_for_path(
                 from .utils.sources.huggingface import get_model_info
 
                 model_info = get_model_info(path)
-                size_bytes = model_info["total_size"]
-                if size_bytes == 0:
+                size_bytes = int(model_info.get("total_size") or 0)
+                inaccessible_gated_bytes = int(model_info.get("inaccessible_gated_bytes") or 0)
+                unknown_size_count = int(model_info.get("unknown_size_count") or 0)
+                if size_bytes == 0 and unknown_size_count:
                     size_str = "Unknown size"
                 elif size_bytes >= 1024 * 1024 * 1024:
                     size_str = f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
@@ -2722,11 +2724,22 @@ def _resolve_scan_source_for_path(
                     size_str = f"{size_bytes / (1024 * 1024):.2f} MB"
                 else:
                     size_str = f"{size_bytes / 1024:.2f} KB"
+                if size_bytes > 0 and unknown_size_count:
+                    size_str = f"At least {size_str}"
 
                 model_id = _escape_terminal_text(str(model_info["model_id"]))
                 file_count = _escape_terminal_text(str(model_info["file_count"]))
                 click.echo(f"   Model: {model_id}")
                 click.echo(f"   Size: {size_str} ({file_count} files)")
+                if inaccessible_gated_bytes:
+                    gated_file_count = str(model_info.get("inaccessible_gated_file_count", 0))
+                    click.echo(
+                        f"   Access: {_escape_terminal_text(gated_file_count)} selected file(s) are gated/inaccessible"
+                    )
+                if unknown_size_count:
+                    click.echo(
+                        f"   Access: {_escape_terminal_text(str(unknown_size_count))} selected file size(s) unavailable"
+                    )
 
                 if runtime.scan_and_delete:
                     click.echo(style_text("   Mode: Streaming (scan and delete to save disk)", fg="cyan"))

@@ -10589,6 +10589,28 @@ def test_scan_file_does_not_route_incidental_onnx_pb_string(tmp_path: Path) -> N
     assert not any(check.name == "Python Operator Detection" for check in result.checks)
 
 
+def test_scan_directory_missing_onnx_dependency_is_operational_without_security_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "model.onnx"
+    model_path.write_bytes(b"not-a-real-onnx-model")
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+    assert result.files_scanned == 1
+    assert result.bytes_scanned == model_path.stat().st_size
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    metadata = result.file_metadata[str(model_path)]
+    assert metadata["scan_outcome"] == "inconclusive"
+    assert metadata["operational_error"] is True
+    assert metadata["operational_error_reason"] == "onnx_dependency_unavailable"
+
+
 def test_scan_file_fails_closed_when_recognized_format_scanner_is_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

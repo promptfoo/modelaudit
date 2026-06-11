@@ -67,6 +67,7 @@ SCHEMA_VALIDATED_ONNX_DOMAINS: frozenset[str] = frozenset({"ai.onnx.preview"})
 ONNX_STRUCTURE_INCONCLUSIVE_REASON = "onnx_structure_validation_failed"
 ONNX_RAW_DETECTION_INCONCLUSIVE_REASON = "onnx_raw_detection_analysis_incomplete"
 ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON = "onnx_weight_distribution_analysis_incomplete"
+ONNX_DEPENDENCY_UNAVAILABLE_REASON = "onnx_dependency_unavailable"
 ONNX_TENTATIVE_CANDIDATE_UNAVAILABLE_REASON = "onnx_tentative_candidate_analysis_unavailable"
 ONNX_TENTATIVE_CANDIDATE_PARSE_INCOMPLETE_REASON = "onnx_tentative_candidate_parse_incomplete"
 _PYTHON_OPERATOR_TYPES: frozenset[str] = frozenset(
@@ -2594,15 +2595,25 @@ class OnnxScanner(BaseScanner):
                 _finish_scan_result(result)
                 return result
             result.add_check(
-                name="ONNX Library Check",
+                name="ONNX Capability Check",
                 passed=False,
-                message="onnx package not installed, cannot scan ONNX files.",
-                severity=IssueSeverity.WARNING,
+                message="ONNX analysis dependency is unavailable; ONNX scan coverage is incomplete.",
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"required_package": "onnx"},
-                rule_code="S902",
+                details={
+                    "required_package": "onnx",
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": ONNX_DEPENDENCY_UNAVAILABLE_REASON,
+                    "operational_error": True,
+                },
             )
-            result.finish(success=False)
+            result.bytes_scanned = file_size
+            result.metadata["analysis_incomplete"] = True
+            result.metadata["operational_error"] = True
+            result.metadata["operational_error_reason"] = ONNX_DEPENDENCY_UNAVAILABLE_REASON
+            result.metadata["missing_dependency"] = "onnx"
+            _mark_inconclusive_scan_result(result, ONNX_DEPENDENCY_UNAVAILABLE_REASON)
+            _finish_scan_result(result)
             return result
 
         # Read raw bytes first so successful scans can parse and run raw
