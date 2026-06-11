@@ -881,6 +881,13 @@ class SecretsDetector:
             return self._scan_basic_auth_header_bytes_value(value, header_name, context)
         if isinstance(value, dict):
             return self.scan_dict(value, context, header_name)
+        if isinstance(value, list | tuple):
+            findings: list[dict[str, Any]] = []
+            for i, item in enumerate(value):
+                if self._findings_truncated:
+                    break
+                findings.extend(self._scan_basic_auth_structured_header_value(item, header_name, f"{context}[{i}]"))
+            return findings
         return []
 
     def scan_bytes(self, data: bytes, context: str = "") -> list[dict[str, Any]]:

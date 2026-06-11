@@ -474,6 +474,23 @@ class TestSecretsDetector:
     @pytest.mark.parametrize(
         "data",
         [
+            {"config": [["aws_access_key_id=AKIA1234567890ABCDEF"]]},
+            {"config": [("aws_access_key_id=AKIA1234567890ABCDEF",)]},
+        ],
+    )
+    def test_structured_nested_list_and_tuple_values_detect_ordinary_secrets(
+        self,
+        data: dict[str, object],
+    ) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_dict(data)
+
+        assert any(finding.get("secret_type") == "AWS Access Key" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
             {"headers": [["Authorization", f"Basic {_basic_auth_token(b'pair-list:pass')}"]]},
             {"headers": [("Authorization", f"Basic {_basic_auth_token(b'pair-tuple:pass')}")]},
             {
@@ -498,6 +515,8 @@ class TestSecretsDetector:
         [
             {"pairs": [["Authorization", f"Basic {_basic_auth_token(b'pair-list:pass')}"]]},
             {"pairs": [("Proxy-Authorization", f"Basic {_basic_auth_token(b'proxy-pair:pass')}")]},
+            {"pairs": [[["Authorization", f"Basic {_basic_auth_token(b'nested-pair-list:pass')}"]]]},
+            {"pairs": [((("Proxy-Authorization", f"Basic {_basic_auth_token(b'nested-pair-tuple:pass')}"),))]},
         ],
     )
     def test_basic_auth_structured_non_header_pair_arrays_do_not_gain_header_context(
