@@ -1975,6 +1975,82 @@ def test_text_scanner_insecure_standard_requirements_url_remains_actionable(
     assert determine_exit_code(aggregate) == 1
 
 
+def _bert_like_multilingual_vocabulary(*tail_tokens: str) -> str:
+    tokens = [
+        "[PAD]",
+        "[UNK]",
+        "[CLS]",
+        "[SEP]",
+        "[MASK]",
+        "the",
+        "und",
+        "de",
+        "la",
+        "\u4e2d",
+        "\u56fd",
+        "\u8a9e",
+        "\u03b1",
+        "\u03b2",
+        *[f"token{index}" for index in range(128)],
+        *[f"##piece{index}" for index in range(8)],
+        *tail_tokens,
+    ]
+    return "\n".join(tokens) + "\n"
+
+
+@pytest.mark.parametrize("token", ["zombie", "trojan"])
+def test_text_scanner_multilingual_tokenizer_vocab_content_omits_isolated_cc_tokens(
+    tmp_path: Path,
+    token: str,
+) -> None:
+    text_path = tmp_path / "tokenizer-multilingual.txt"
+    text_path.write_text(_bert_like_multilingual_vocabulary(token), encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.details.get("type") == "cc_pattern"
+    ]
+    assert any(
+        check.name == "Network Communication Detection" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "install zombie persistence payload",
+        "zombie_callback=https://evil.example/payload",
+        "https://evil.example/zombie",
+        'requests.get("https://evil.example/zombie")',
+        '{"description":"zombie"}',
+    ],
+)
+def test_text_scanner_multilingual_tokenizer_vocab_active_context_remains_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "tokenizer-multilingual.txt"
+    text_path.write_text(_bert_like_multilingual_vocabulary("zombie", content), encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "cc_pattern"
+        and check.details.get("pattern") == "zombie"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_bare_vocabulary_urls_are_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "vocab.txt"
     text_path.write_text("safe-token\nhttps://docs.example.com/reference\n", encoding="utf-8")

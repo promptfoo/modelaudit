@@ -66,8 +66,13 @@ TOKENIZER_VOCABULARY_PREFIXES = ("tokenizer_vocab", "tokenizer-vocab", "vocab")
 TOKENIZER_VOCABULARY_OMITTABLE_CC_PATTERNS = frozenset({"trojan", "zombie"})
 MIN_TOKENIZER_VOCABULARY_LINES = 8
 MIN_TOKENIZER_VOCABULARY_TOKEN_LINE_RATIO = 0.95
+MIN_STRONG_TOKENIZER_VOCABULARY_LINES = 128
+MIN_STRONG_TOKENIZER_VOCABULARY_SENTINELS = 4
+MIN_STRONG_TOKENIZER_VOCABULARY_SUBWORD_LINES = 4
 MAX_TOKENIZER_VOCABULARY_TOKEN_BYTES = 256
 MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES = 1024
+TOKENIZER_VOCABULARY_SENTINELS = frozenset({b"[PAD]", b"[UNK]", b"[CLS]", b"[SEP]", b"[MASK]"})
+TOKENIZER_VOCABULARY_SUBWORD_PREFIXES = ("##", "\u0120", "\u2581")
 BARE_NETWORK_URL_TOKEN_PATTERN = re.compile(rb"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 REQUIREMENTS_RAW_URL_PATTERN = re.compile(rb"https?://\S+", re.IGNORECASE)
 BARE_NETWORK_IPV4_TOKEN_PATTERN = re.compile(
@@ -686,23 +691,42 @@ class TextScanner(BaseScanner):
         return not any(value <= 0x20 or value == 0x7F for value in line)
 
     @classmethod
-    def _has_line_oriented_tokenizer_vocabulary_evidence(cls, path: str, payload: bytes) -> bool:
-        if not cls._has_tokenizer_vocabulary_filename(path):
-            return False
-
+    def _tokenizer_vocabulary_line_evidence(cls, payload: bytes) -> tuple[int, int, int, int]:
         token_lines = 0
         nonempty_lines = 0
+        sentinel_lines = 0
+        subword_lines = 0
         for raw_line in payload.splitlines():
             line = raw_line.strip()
             if not line:
                 continue
             nonempty_lines += 1
-            if cls._is_tokenizer_vocabulary_token_line(line):
-                token_lines += 1
+            if not cls._is_tokenizer_vocabulary_token_line(line):
+                continue
+            token_lines += 1
+            if line in TOKENIZER_VOCABULARY_SENTINELS:
+                sentinel_lines += 1
+            try:
+                line_text = line.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            if line_text.startswith(TOKENIZER_VOCABULARY_SUBWORD_PREFIXES):
+                subword_lines += 1
+        return nonempty_lines, token_lines, sentinel_lines, subword_lines
+
+    @classmethod
+    def _has_line_oriented_tokenizer_vocabulary_evidence(cls, path: str, payload: bytes) -> bool:
+        nonempty_lines, token_lines, sentinel_lines, subword_lines = cls._tokenizer_vocabulary_line_evidence(payload)
+        if nonempty_lines == 0 or token_lines / nonempty_lines < MIN_TOKENIZER_VOCABULARY_TOKEN_LINE_RATIO:
+            return False
+
+        if cls._has_tokenizer_vocabulary_filename(path):
+            return nonempty_lines >= MIN_TOKENIZER_VOCABULARY_LINES
 
         return (
-            nonempty_lines >= MIN_TOKENIZER_VOCABULARY_LINES
-            and token_lines / nonempty_lines >= MIN_TOKENIZER_VOCABULARY_TOKEN_LINE_RATIO
+            nonempty_lines >= MIN_STRONG_TOKENIZER_VOCABULARY_LINES
+            and sentinel_lines >= MIN_STRONG_TOKENIZER_VOCABULARY_SENTINELS
+            and subword_lines >= MIN_STRONG_TOKENIZER_VOCABULARY_SUBWORD_LINES
         )
 
     @staticmethod

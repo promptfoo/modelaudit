@@ -81,6 +81,29 @@ def _make_trusted_shard_parent(path: Path, *, parents: bool = False) -> None:
     path.chmod(0o755)
 
 
+def _bert_like_multilingual_vocab_bytes(*tail_tokens: str) -> bytes:
+    tokens = [
+        "[PAD]",
+        "[UNK]",
+        "[CLS]",
+        "[SEP]",
+        "[MASK]",
+        "the",
+        "und",
+        "de",
+        "la",
+        "\u4e2d",
+        "\u56fd",
+        "\u8a9e",
+        "\u03b1",
+        "\u03b2",
+        *[f"token{index}" for index in range(128)],
+        *[f"##piece{index}" for index in range(8)],
+        *tail_tokens,
+    ]
+    return ("\n".join(tokens) + "\n").encode()
+
+
 def create_mock_scan_result(**kwargs: Any) -> ModelAuditResultModel:
     """Create a mock ModelAuditResultModel for testing."""
     result = create_initial_audit_result()
@@ -4106,6 +4129,51 @@ def test_scan_huggingface_cached_stream_reconciles_snapshot_alias_shards(
     assert not any(
         record.get("details", {}).get("scan_outcome_reason") == "missing_model_shards"
         for record in [*output_payload["checks"], *output_payload["issues"]]
+    )
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+def test_scan_huggingface_streaming_omits_multilingual_vocab_cc_token(
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Streamed Hugging Face tokenizer vocabularies should retain vocabulary context."""
+    mock_is_hf_url.return_value = True
+    model_dir = tmp_path / "huggingface" / "google-bert" / "bert-base-multilingual-uncased"
+    model_dir.mkdir(parents=True)
+    vocab_path = model_dir / "tokenizer-multilingual.txt"
+    vocab_path.write_bytes(_bert_like_multilingual_vocab_bytes("zombie"))
+    mock_download_streaming.return_value = iter([(vocab_path, True)])
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--stream",
+            "--quiet",
+            "--format",
+            "json",
+            "--scanners",
+            "text",
+            "hf://google-bert/bert-base-multilingual-uncased",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 1
+    assert not output_payload["issues"]
+    assert not [
+        check
+        for check in output_payload["checks"]
+        if check.get("name") == "Network Communication Detection"
+        and check.get("details", {}).get("type") == "cc_pattern"
+    ]
+    assert mock_download_streaming.call_args.kwargs["scannable_extensions"] == frozenset(
+        {".txt", ".md", ".markdown", ".rst"}
     )
 
 
