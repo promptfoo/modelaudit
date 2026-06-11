@@ -45,6 +45,7 @@ from modelaudit.utils.sources.huggingface import (
     is_huggingface_url,
     parse_huggingface_file_url,
     parse_huggingface_url,
+    parse_huggingface_url_with_revision,
     redact_huggingface_url_for_display,
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
@@ -288,6 +289,42 @@ class TestHuggingFaceURLParsing:
         for url, expected in test_cases:
             namespace, repo = parse_huggingface_url(url)
             assert (namespace, repo) == expected, f"Failed to parse {url}"
+
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            ("https://huggingface.co/org/repo?revision=main", ("org", "repo", "main")),
+            ("https://hf.co/org/repo?revision=refs%2Fpr%2F1", ("org", "repo", "refs/pr/1")),
+            ("hf://org/repo?revision=refs%2Fpr%2F1", ("org", "repo", "refs/pr/1")),
+            ("hf://gpt2?revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ("gpt2", "", "a" * 40)),
+        ],
+    )
+    def test_parse_urls_with_revision_query(self, url: str, expected: tuple[str, str, str]) -> None:
+        """Repository URLs should preserve explicit requested revisions."""
+        assert parse_huggingface_url_with_revision(url) == expected
+        assert parse_huggingface_url(url) == expected[:2]
+
+    def test_parse_urls_accepts_duplicate_matching_revision_query(self) -> None:
+        """Repeated matching revision parameters are redundant, not ambiguous."""
+        assert parse_huggingface_url_with_revision("https://huggingface.co/org/repo?revision=main&revision=main") == (
+            "org",
+            "repo",
+            "main",
+        )
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://huggingface.co/org/repo?revision=",
+            "https://huggingface.co/org/repo?revision=main&revision=dev",
+            "https://huggingface.co/org/repo?revision=..",
+            "hf://org/repo?revision=refs%2F..%2Fescape",
+        ],
+    )
+    def test_parse_urls_rejects_invalid_revision_query(self, url: str) -> None:
+        """Ambiguous or unsafe revision query values must fail before SDK calls."""
+        with pytest.raises(ValueError):
+            parse_huggingface_url_with_revision(url)
 
     def test_parse_invalid_urls(self):
         """Test that invalid URLs raise ValueError."""
@@ -582,6 +619,30 @@ class TestModelDownload:
         assert error is None
         mock_repo_info.assert_called_once_with("test/model", timeout=7, files_metadata=False)
 
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_timeout_passes_requested_revision(self, mock_repo_info: MagicMock) -> None:
+        """Requested repository revisions should reach direct HfApi listing calls."""
+        mock_repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            siblings=[SimpleNamespace(rfilename="config.json")],
+        )
+
+        repo_files, revision, error = _list_repo_files_with_timeout(
+            "test/model",
+            timeout_seconds=7,
+            revision="refs/pr/1",
+        )
+
+        assert repo_files == ["config.json"]
+        assert revision == _HF_TEST_REVISION
+        assert error is None
+        mock_repo_info.assert_called_once_with(
+            "test/model",
+            timeout=7,
+            files_metadata=False,
+            revision="refs/pr/1",
+        )
+
     @patch("modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline")
     def test_list_repo_files_deadline_uses_terminable_worker(self, mock_run_worker: MagicMock) -> None:
         """Deadline-bound listings must be terminable, not only socket-timeout bounded."""
@@ -605,6 +666,30 @@ class TestModelDownload:
             "test/model",
         )
 
+    @patch("modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline")
+    def test_list_repo_files_deadline_passes_requested_revision(self, mock_run_worker: MagicMock) -> None:
+        """Requested revisions must also reach the terminable listing worker."""
+        mock_run_worker.return_value = {
+            "value": {"files": ["config.json"], "revision": _HF_TEST_REVISION},
+        }
+
+        repo_files, revision, error = _list_repo_files_with_timeout(
+            "test/model",
+            timeout_seconds=7,
+            deadline=123.0,
+            revision="refs/pr/1",
+        )
+
+        assert repo_files == ["config.json"]
+        assert revision == _HF_TEST_REVISION
+        assert error is None
+        mock_run_worker.assert_called_once_with(
+            "list_repo_files",
+            {"repo_id": "test/model", "request_timeout": 7, "revision": "refs/pr/1"},
+            123.0,
+            "test/model",
+        )
+
     @patch("huggingface_hub.HfApi.repo_info")
     def test_download_worker_serializes_repository_listing(self, mock_repo_info: MagicMock) -> None:
         """The deadline worker should return only serializable listing evidence."""
@@ -622,6 +707,44 @@ class TestModelDownload:
             "value": {"files": ["model.bin", "config.json"], "revision": _HF_TEST_REVISION},
         }
         mock_repo_info.assert_called_once_with("test/model", timeout=7, files_metadata=False)
+
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_download_worker_passes_requested_revision_to_listing(self, mock_repo_info: MagicMock) -> None:
+        """Worker listing operations should not silently fall back to default branch."""
+        mock_repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            siblings=[SimpleNamespace(rfilename="model.bin")],
+        )
+
+        result = _run_huggingface_worker_operation(
+            "list_repo_files",
+            {"repo_id": "test/model", "request_timeout": 7, "revision": "refs/pr/1"},
+        )
+
+        assert result == {
+            "value": {"files": ["model.bin"], "revision": _HF_TEST_REVISION},
+        }
+        mock_repo_info.assert_called_once_with(
+            "test/model",
+            timeout=7,
+            files_metadata=False,
+            revision="refs/pr/1",
+        )
+
+    @patch("huggingface_hub.HfApi.model_info")
+    def test_download_worker_passes_requested_revision_to_model_size(self, mock_model_info: MagicMock) -> None:
+        """Worker model-size operations should query the requested revision."""
+        mock_model_info.return_value = SimpleNamespace(
+            siblings=[SimpleNamespace(size=7), SimpleNamespace(size=None)],
+        )
+
+        result = _run_huggingface_worker_operation(
+            "get_model_size",
+            {"repo_id": "test/model", "request_timeout": 7, "revision": "refs/pr/1"},
+        )
+
+        assert result == {"value": 7}
+        mock_model_info.assert_called_once_with("test/model", timeout=7, revision="refs/pr/1")
 
     @pytest.mark.parametrize("revision", [None, "", "main", "g" * 40])
     @patch("huggingface_hub.HfApi.repo_info")
@@ -1734,7 +1857,7 @@ class TestModelDownload:
         ):
             download_model("https://huggingface.co/test/model", timeout_seconds=1)
 
-        _mock_list_repo_files.assert_called_once_with("test/model", 1.0, deadline=101.0)
+        _mock_list_repo_files.assert_called_once_with("test/model", 1.0, deadline=101.0, revision=None)
         mock_requests_get.assert_not_called()
         mock_snapshot_download.assert_not_called()
 
@@ -1751,7 +1874,7 @@ class TestModelDownload:
         with pytest.raises(RuntimeError, match="stop after model-size lookup"):
             download_model("https://huggingface.co/test/model", timeout_seconds=1)
 
-        mock_get_model_size.assert_called_once_with("test/model", 101.0)
+        mock_get_model_size.assert_called_once_with("test/model", 101.0, revision=None)
 
     @patch("modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline")
     def test_huggingface_path_sizes_use_terminable_deadline_worker(
@@ -3555,7 +3678,7 @@ class TestModelDownloadStreaming:
         with pytest.raises(Exception, match=r"hidden\.payload \(TimeoutError\)"):
             list(download_model_streaming("https://huggingface.co/test/model", timeout_seconds=1))
 
-        _mock_list_repo_files.assert_called_once_with("test/model", 1.0, deadline=101.0)
+        _mock_list_repo_files.assert_called_once_with("test/model", 1.0, deadline=101.0, revision=None)
         mock_requests_get.assert_not_called()
         mock_hf_hub_download.assert_not_called()
 
