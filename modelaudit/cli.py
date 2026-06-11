@@ -172,6 +172,18 @@ def get_model_info(path: str) -> dict[str, Any]:
     return huggingface_source.get_model_info(path)
 
 
+def get_huggingface_file_info(path: str, *, max_size: int | None = None) -> dict[str, Any]:
+    """Delegate Hugging Face direct-file metadata lookup through the source module."""
+    from .utils.sources import huggingface as huggingface_source
+
+    return huggingface_source.get_huggingface_file_info(path, max_size=max_size)
+
+
+def _preview_echo(message: str, *, err: bool) -> None:
+    """Emit dry-run preview lines without contaminating structured stdout."""
+    click.echo(message, err=err)
+
+
 def _format_preview_size(size_bytes: object) -> str:
     """Return a human-readable size for source previews."""
     if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes < 0:
@@ -212,20 +224,24 @@ def _selected_huggingface_preview_files(files: object, runtime: "_ScanRuntimeCon
     return selected
 
 
-def _preview_huggingface_file_source(path: str) -> None:
+def _preview_huggingface_file_source(path: str, *, err: bool = False, max_size: int | None = None) -> None:
     """Print a no-download preview for a direct Hugging Face file URL."""
     display_path = _display_path(path)
     repo_id, revision, filename = parse_huggingface_file_url(path)
-    click.echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:")
-    click.echo("   Type: Hugging Face file")
-    click.echo(f"   Repository: {_escape_terminal_text(repo_id)}")
-    click.echo(f"   Revision: {_escape_terminal_text(revision)}")
-    click.echo(f"   File: {_escape_terminal_text(filename)}")
-    click.echo("   Download: skipped (--dry-run)")
-    click.echo("   Scan: skipped (--dry-run)")
+    metadata = get_huggingface_file_info(path, max_size=max_size)
+    preview_revision = str(metadata.get("resolved_revision") or revision)
+
+    _preview_echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:", err=err)
+    _preview_echo("   Type: Hugging Face file", err=err)
+    _preview_echo(f"   Repository: {_escape_terminal_text(repo_id)}", err=err)
+    _preview_echo(f"   Revision: {_escape_terminal_text(preview_revision)}", err=err)
+    _preview_echo(f"   File: {_escape_terminal_text(filename)}", err=err)
+    _preview_echo(f"   Size: {_format_preview_size(metadata.get('size'))}", err=err)
+    _preview_echo("   Download: skipped (--dry-run)", err=err)
+    _preview_echo("   Scan: skipped (--dry-run)", err=err)
 
 
-def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig") -> None:
+def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", *, err: bool = False) -> None:
     """Print a no-download preview for a Hugging Face repository URL."""
     display_path = _display_path(path)
     metadata = get_model_info(path)
@@ -234,23 +250,24 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig") 
     total_size = metadata.get("total_size")
     selected_size = sum(item.get("size", 0) for item in selected_files if isinstance(item.get("size", 0), int))
 
-    click.echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:")
-    click.echo("   Type: Hugging Face repository")
-    click.echo(
-        f"   Model: {_escape_terminal_text(str(metadata.get('model_id') or metadata.get('repo_id') or 'unknown'))}"
+    _preview_echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:", err=err)
+    _preview_echo("   Type: Hugging Face repository", err=err)
+    _preview_echo(
+        f"   Model: {_escape_terminal_text(str(metadata.get('model_id') or metadata.get('repo_id') or 'unknown'))}",
+        err=err,
     )
-    click.echo(f"   Files: {_escape_terminal_text(str(metadata.get('file_count', 0)))}")
-    click.echo(f"   Total size: {_format_preview_size(total_size)}")
+    _preview_echo(f"   Files: {_escape_terminal_text(str(metadata.get('file_count', 0)))}", err=err)
+    _preview_echo(f"   Total size: {_format_preview_size(total_size)}", err=err)
     if runtime.scannable_extensions is not None or runtime.scannable_filenames is not None:
-        click.echo(f"   Scannable files: {len(selected_files)} of {metadata.get('file_count', 0)}")
-        click.echo(f"   Scannable size: {_format_preview_size(selected_size)}")
+        _preview_echo(f"   Scannable files: {len(selected_files)} of {metadata.get('file_count', 0)}", err=err)
+        _preview_echo(f"   Scannable size: {_format_preview_size(selected_size)}", err=err)
     if runtime.scan_and_delete:
-        click.echo("   Mode: Streaming")
+        _preview_echo("   Mode: Streaming", err=err)
     if runtime.scanner_selection_metadata is not None:
         enabled = runtime.scanner_selection_metadata.get("enabled_scanner_ids", [])
-        click.echo(f"   Enabled scanners: {', '.join(str(scanner) for scanner in enabled)}")
-    click.echo("   Download: skipped (--dry-run)")
-    click.echo("   Scan: skipped (--dry-run)")
+        _preview_echo(f"   Enabled scanners: {', '.join(str(scanner) for scanner in enabled)}", err=err)
+    _preview_echo("   Download: skipped (--dry-run)", err=err)
+    _preview_echo("   Scan: skipped (--dry-run)", err=err)
 
 
 class _OutputWriteError(click.ClickException):
@@ -1445,6 +1462,7 @@ class _ScanPathState:
     collect_dvc_coverage: bool = False
     scanned_paths: list[str] = field(default_factory=list)
     temp_cleanup_entries: list[tuple[str, bool]] = field(default_factory=list)
+    dry_run_preview_count: int = 0
     sbom_paths_resolved: bool = False
     dvc_covered_paths: set[str] = field(default_factory=set)
     dvc_covered_directories: set[str] = field(default_factory=set)
@@ -1456,6 +1474,10 @@ class _ScanPathState:
         """Record an aggregate error that shard reconciliation does not own."""
         self.has_errors_outside_reconciled_shards = True
         audit_result.has_errors = True
+
+    def mark_dry_run_preview(self) -> None:
+        """Record one path whose dry-run intentionally skipped download and scan."""
+        self.dry_run_preview_count += 1
 
     def record_non_shard_result_errors(self, scan_result: ModelAuditResultModel) -> None:
         """Preserve errors from results that cannot join final CLI shard reconciliation."""
@@ -2432,6 +2454,7 @@ def _record_scan_end_and_exit(
     scan_start_time: float,
     *,
     dry_run: bool = False,
+    dry_run_preview_only: bool = False,
 ) -> NoReturn:
     """Record final telemetry and exit with the scan result's status code."""
     scan_duration = time.time() - scan_start_time
@@ -2445,6 +2468,7 @@ def _record_scan_end_and_exit(
 
     if (
         dry_run
+        and dry_run_preview_only
         and audit_result.files_scanned == 0
         and not audit_result.has_errors
         and not audit_result.issues
@@ -2749,7 +2773,12 @@ def _resolve_scan_source_for_path(
         display_path = _display_path(path)
         if dry_run:
             try:
-                _preview_huggingface_file_source(path)
+                _preview_huggingface_file_source(
+                    path,
+                    err=not runtime.show_styled_output,
+                    max_size=runtime.max_download_bytes,
+                )
+                path_state.mark_dry_run_preview()
             except Exception as exc:
                 error_msg = _display_error(exc, path)
                 click.echo(f"Error analyzing {display_path}: {error_msg}", err=True)
@@ -2819,7 +2848,8 @@ def _resolve_scan_source_for_path(
         display_path = _display_path(path)
         if dry_run:
             try:
-                _preview_huggingface_model_source(path, runtime)
+                _preview_huggingface_model_source(path, runtime, err=not runtime.show_styled_output)
+                path_state.mark_dry_run_preview()
             except Exception as exc:
                 error_msg = _display_error(exc, path)
                 click.echo(f"Error analyzing {display_path}: {error_msg}", err=True)
@@ -3114,17 +3144,23 @@ def _resolve_scan_source_for_path(
             from .utils.sources.cloud_storage import analyze_cloud_target
 
             try:
+                preview_err = not runtime.show_styled_output
                 metadata = asyncio.run(analyze_cloud_target(path))
-                click.echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:")
-                click.echo(f"   Type: {metadata['type']}")
+                click.echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:", err=preview_err)
+                click.echo(f"   Type: {metadata['type']}", err=preview_err)
 
                 if metadata["type"] == "file":
-                    click.echo(f"   Size: {metadata.get('human_size', 'unknown')}")
-                    click.echo(f"   Estimated download time: {metadata.get('estimated_time', 'unknown')}")
+                    click.echo(f"   Size: {metadata.get('human_size', 'unknown')}", err=preview_err)
+                    click.echo(
+                        f"   Estimated download time: {metadata.get('estimated_time', 'unknown')}", err=preview_err
+                    )
                 elif metadata["type"] == "directory":
-                    click.echo(f"   Files: {metadata.get('file_count', 0)}")
-                    click.echo(f"   Total size: {metadata.get('human_size', 'unknown')}")
-                    click.echo(f"   Estimated download time: {metadata.get('estimated_time', 'unknown')}")
+                    click.echo(f"   Files: {metadata.get('file_count', 0)}", err=preview_err)
+                    click.echo(f"   Total size: {metadata.get('human_size', 'unknown')}", err=preview_err)
+                    click.echo(
+                        f"   Estimated download time: {metadata.get('estimated_time', 'unknown')}",
+                        err=preview_err,
+                    )
 
                     if runtime.selective_download:
                         from .utils.sources.cloud_storage import filter_scannable_files
@@ -3134,8 +3170,12 @@ def _resolve_scan_source_for_path(
                             scannable_extensions=runtime.scannable_extensions,
                             scannable_filenames=runtime.scannable_filenames,
                         )
-                        click.echo(f"   Scannable files: {len(scannable)} of {metadata.get('file_count', 0)}")
+                        click.echo(
+                            f"   Scannable files: {len(scannable)} of {metadata.get('file_count', 0)}",
+                            err=preview_err,
+                        )
 
+                path_state.mark_dry_run_preview()
                 return _SourceDispatchResult(actual_path=path, local_scan_required=False)
             except Exception as exc:
                 error_msg = _display_error(exc, path)
@@ -4193,7 +4233,12 @@ def scan_command(
         flush_telemetry()
         raise
 
-    _record_scan_end_and_exit(audit_result, scan_start_time, dry_run=dry_run)
+    _record_scan_end_and_exit(
+        audit_result,
+        scan_start_time,
+        dry_run=dry_run,
+        dry_run_preview_only=dry_run and path_state.dry_run_preview_count == len(expanded_paths),
+    )
 
 
 def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:

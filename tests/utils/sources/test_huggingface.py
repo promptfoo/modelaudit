@@ -32,6 +32,7 @@ from modelaudit.utils.sources.huggingface import (
     download_model,
     download_model_streaming,
     extract_model_id_from_path,
+    get_huggingface_file_info,
     get_model_info,
     get_model_size,
     is_huggingface_cache_path,
@@ -3114,6 +3115,7 @@ class TestGetModelInfo:
         # Mock list_repo_tree which is used to get accurate file sizes
         # (implementation skips .gitattributes and README.md)
         mock_api.list_repo_tree.return_value = [
+            SimpleNamespace(path="nested"),
             SimpleNamespace(path="config.json", size=100),
             SimpleNamespace(path="nested/model.safetensors", size=200),
             SimpleNamespace(path="README.md", size=50),  # This will be skipped
@@ -3142,6 +3144,42 @@ class TestGetModelInfo:
         info = get_model_info("https://huggingface.co/test/model")
 
         assert info["author"] == ""
+
+
+class TestGetHuggingFaceFileInfo:
+    """Test direct Hugging Face file metadata preflight."""
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_huggingface_file_info_validates_file_without_download(
+        self,
+        mock_hf_api_class: MagicMock,
+    ) -> None:
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.repo_info.return_value = SimpleNamespace(sha=TEST_COMMIT_SHA)
+        mock_api.get_paths_info.return_value = [SimpleNamespace(path="model.bin", size=512)]
+
+        info = get_huggingface_file_info("https://huggingface.co/test/model/resolve/main/model.bin", max_size=1024)
+
+        assert info == {
+            "repo_id": "test/model",
+            "revision": "main",
+            "resolved_revision": TEST_COMMIT_SHA,
+            "filename": "model.bin",
+            "size": 512,
+        }
+        mock_api.repo_info.assert_called_once_with("test/model", revision="main", files_metadata=False)
+        mock_api.get_paths_info.assert_called_once_with("test/model", "model.bin", revision=TEST_COMMIT_SHA)
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_huggingface_file_info_rejects_missing_file(self, mock_hf_api_class: MagicMock) -> None:
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.repo_info.return_value = SimpleNamespace(sha=TEST_COMMIT_SHA)
+        mock_api.get_paths_info.return_value = []
+
+        with pytest.raises(Exception, match=r"File not found: missing\.bin"):
+            get_huggingface_file_info("https://huggingface.co/test/model/resolve/main/missing.bin")
 
 
 class TestHuggingFaceFileURLs:

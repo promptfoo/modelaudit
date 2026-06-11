@@ -353,6 +353,17 @@ def test_scan_dry_run_local_findings_preserve_issue_exit_code(tmp_path: Path) ->
     assert any(issue.get("severity") == "critical" for issue in output_payload.get("issues", []))
 
 
+def test_scan_dry_run_empty_local_path_preserves_no_files_exit_code(tmp_path: Path) -> None:
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+
+    result = CliRunner().invoke(cli, ["scan", "--dry-run", "--format", "json", str(empty_dir)])
+
+    assert result.exit_code == 2
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 0
+
+
 def test_scan_json_subprocess_separates_logs_from_stdout_for_findings(tmp_path: Path) -> None:
     """Real process execution keeps JSON parseable without leaking finding payloads to logs."""
     import tarfile

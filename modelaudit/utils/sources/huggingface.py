@@ -45,6 +45,7 @@ __all__ = [
     "download_file_from_hf",
     "download_model",
     "extract_model_id_from_path",
+    "get_huggingface_file_info",
     "get_model_info",
     "get_model_size",
     "is_huggingface_cache_path",
@@ -1487,8 +1488,8 @@ def get_model_info(url: str) -> dict:
         try:
             repo_files = api.list_repo_tree(repo_id, recursive=True)
             for item in repo_files:
-                # Skip metadata files
-                if hasattr(item, "path") and item.path not in [".gitattributes", "README.md"]:
+                # Skip metadata files and folder entries returned by recursive listings.
+                if hasattr(item, "path") and hasattr(item, "size") and item.path not in [".gitattributes", "README.md"]:
                     file_size = getattr(item, "size", 0) or 0
                     total_size += file_size
                     files.append({"name": item.path, "size": file_size})
@@ -1512,6 +1513,55 @@ def get_model_info(url: str) -> dict:
         }
     except Exception as e:
         raise Exception(f"Failed to get model info for {display_url}: {redact_huggingface_urls_in_text(str(e))}") from e
+
+
+def get_huggingface_file_info(url: str, max_size: int | None = None) -> dict[str, Any]:
+    """Validate a direct Hugging Face file URL without downloading file contents."""
+    repo_id, revision, filename = parse_huggingface_file_url(url)
+    display_url = redact_huggingface_url_for_display(url)
+
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as e:
+        raise ImportError(
+            "huggingface-hub package is required for HuggingFace URL support. "
+            "Install with 'pip install modelaudit[huggingface]'"
+        ) from e
+
+    try:
+        if max_size is not None and max_size < 0:
+            raise ValueError("Maximum file size must be non-negative")
+
+        api = HfApi()
+        repo_info = api.repo_info(repo_id, revision=revision, files_metadata=False)
+        resolved_revision = getattr(repo_info, "sha", revision)
+        if not isinstance(resolved_revision, str) or not resolved_revision:
+            resolved_revision = revision
+
+        path_info = api.get_paths_info(repo_id, filename, revision=resolved_revision)
+        file_metadata = path_info[0] if path_info else None
+        if file_metadata is None:
+            raise ValueError(f"File not found: {filename}")
+
+        file_size = getattr(file_metadata, "size", None)
+        size_limit = max_size or None
+        if size_limit is not None:
+            if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
+                raise ValueError(f"Unable to determine file size for {display_url}; refusing capped dry-run")
+            if file_size > size_limit:
+                raise ValueError(
+                    f"File size ({_format_size(file_size)}) exceeds maximum allowed size ({_format_size(size_limit)})"
+                )
+
+        return {
+            "repo_id": repo_id,
+            "revision": revision,
+            "resolved_revision": resolved_revision,
+            "filename": filename,
+            "size": file_size if isinstance(file_size, int) and not isinstance(file_size, bool) else None,
+        }
+    except Exception as e:
+        raise Exception(f"Failed to get file info for {display_url}: {redact_huggingface_urls_in_text(str(e))}") from e
 
 
 def get_model_size(repo_id: str, timeout_seconds: float | None = None) -> int | None:

@@ -244,11 +244,12 @@ def test_hf_repo_dry_run_preview_does_not_download_or_scan() -> None:
             ["scan", "--dry-run", "--format", "json", "--scanners", "safetensors", "hf://test/model"],
         )
 
-    parsed = parse_click_json_output(result.output)
+    parsed = parse_click_json_output(result.stdout)
     assert result.exit_code == 0
+    assert result.stdout.lstrip().startswith("{")
     assert parsed["files_scanned"] == 0
-    assert "Download: skipped (--dry-run)" in result.output
-    assert "Scannable files: 1 of 3" in result.output
+    assert "Download: skipped (--dry-run)" in result.stderr
+    assert "Scannable files: 1 of 3" in result.stderr
     mock_get_model_info.assert_called_once_with("hf://test/model")
     mock_download_model.assert_not_called()
     mock_scan.assert_not_called()
@@ -259,16 +260,28 @@ def test_hf_file_dry_run_preview_does_not_download_or_scan() -> None:
     runner = CliRunner()
 
     with (
+        patch(
+            "modelaudit.cli.get_huggingface_file_info",
+            return_value={
+                "repo_id": "test/model",
+                "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "resolved_revision": "b" * 40,
+                "filename": "config.json",
+                "size": 123,
+            },
+        ) as mock_get_file_info,
         patch("modelaudit.cli.download_file_from_hf") as mock_download_file,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
     ):
         result = runner.invoke(cli, ["scan", "--dry-run", "--format", "json", url])
 
-    parsed = parse_click_json_output(result.output)
+    parsed = parse_click_json_output(result.stdout)
     assert result.exit_code == 0
+    assert result.stdout.lstrip().startswith("{")
     assert parsed["files_scanned"] == 0
-    assert "Type: Hugging Face file" in result.output
-    assert "Revision: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in result.output
+    assert "Type: Hugging Face file" in result.stderr
+    assert "Revision: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" in result.stderr
+    mock_get_file_info.assert_called_once_with(url, max_size=None)
     mock_download_file.assert_not_called()
     mock_scan.assert_not_called()
 
@@ -283,6 +296,20 @@ def test_hf_dry_run_gated_error_redacts_credentials() -> None:
 
     assert result.exit_code == 2
     assert "meta-llama/Llama-3.1-8B-Instruct" in result.output
+    assert "hunter2" not in result.output
+    assert "secret-query" not in result.output
+
+
+def test_hf_file_dry_run_validation_error_redacts_credentials() -> None:
+    url = "https://hf_user:hunter2@huggingface.co/test/model/resolve/main/config.json?token=secret-query"
+    runner = CliRunner()
+
+    with patch("modelaudit.cli.get_huggingface_file_info") as mock_get_file_info:
+        mock_get_file_info.side_effect = Exception(f"404 while opening {url}")
+        result = runner.invoke(cli, ["scan", "--dry-run", url])
+
+    assert result.exit_code == 2
+    assert "test/model" in result.output
     assert "hunter2" not in result.output
     assert "secret-query" not in result.output
 
