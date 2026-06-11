@@ -1367,7 +1367,11 @@ class TestTarScanner:
         finally:
             os.unlink(tmp_path)
 
-    def test_scan_large_valid_tar_bypasses_generic_max_file_read_size(self, tmp_path: Path) -> None:
+    def test_scan_large_valid_tar_bypasses_generic_max_file_read_size(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """TAR-owned streaming should not inherit the generic whole-file read rejection."""
         archive_path = tmp_path / "large_by_padding.tar"
         payload = b"safe metadata"
@@ -1379,11 +1383,24 @@ class TestTarScanner:
 
         assert archive_path.stat().st_size > 1024
 
-        result = TarScanner(config={"max_file_read_size": 1024, "max_entry_size": 4096}).scan(str(archive_path))
+        scanner = TarScanner(config={"max_file_read_size": 1024, "max_entry_size": 4096})
+
+        def fail_hashes(_path: str) -> dict[str, str]:
+            pytest.fail("streaming TAR scan should not hash archives above the read cap")
+
+        monkeypatch.setattr(scanner, "calculate_file_hashes", fail_hashes)
+
+        result = scanner.scan(str(archive_path))
 
         assert result.success is True
         assert result.scanner_name == "tar"
         assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+        integrity_checks = [check for check in result.checks if check.name == "File Integrity Hash"]
+        assert len(integrity_checks) == 1
+        assert integrity_checks[0].status == CheckStatus.SKIPPED
+        assert integrity_checks[0].details["scan_outcome_reason"] == "tar_file_integrity_hash_skipped"
+        assert result.metadata["file_hashes_skipped"] is True
+        assert "file_hashes" not in result.metadata
         assert not any(
             check.name == "File Size Limit" and check.status == CheckStatus.FAILED for check in result.checks
         )
@@ -1413,6 +1430,9 @@ class TestTarScanner:
         assert traversal_checks[0].severity == IssueSeverity.CRITICAL
         assert traversal_checks[0].details["entry"] == "../evil.txt"
         assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+        integrity_checks = [check for check in result.checks if check.name == "File Integrity Hash"]
+        assert len(integrity_checks) == 1
+        assert integrity_checks[0].status == CheckStatus.SKIPPED
 
     def test_rejected_regular_tar_member_counts_against_total_budget(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "rejected_budget.tar.gz"
@@ -1997,6 +2017,48 @@ class TestTarScanner:
         assert any(entry["path"].endswith("payload.bin") for entry in contents)
         assert any(entry["path"].endswith("later.txt") for entry in contents)
         assert bytes_read == 0
+
+    def test_scan_compressed_tar_stops_after_oversized_member_without_streaming_body(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        scanner = TarScanner(config={"max_entry_size": 64})
+        archive_path = tmp_path / "oversized_first.tar.gz"
+        payload = b"B" * 4096
+        malicious_payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
+
+        with tarfile.open(archive_path, "w:gz") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+            later_info = tarfile.TarInfo("payload.txt")
+            later_info.size = len(malicious_payload)
+            archive.addfile(later_info, tarfile.io.BytesIO(malicious_payload))  # type: ignore[attr-defined]
+
+        bytes_read = 0
+        original_read = tar_scanner_module._TarBoundedStream.read
+
+        def tracked_read(self: Any, size: int = -1) -> bytes:
+            nonlocal bytes_read
+            data = original_read(self, size)
+            bytes_read += len(data)
+            return data
+
+        monkeypatch.setattr(tar_scanner_module._TarBoundedStream, "read", tracked_read)
+
+        result = scanner._scan_tar_file(str(archive_path))
+
+        assert result.success is False
+        assert "tar_entry_extraction_incomplete" in result.metadata["scan_outcome_reasons"]
+        contents = result.metadata["contents"]
+        assert any(entry["path"].endswith("payload.bin") for entry in contents)
+        assert not any(entry["path"].endswith("payload.txt") for entry in contents)
+        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert bytes_read < len(payload)
+        aggregate_checks = [check for check in result.checks if check.name == "TAR Aggregate Size Limit Check"]
+        assert not any(check.status == CheckStatus.PASSED for check in aggregate_checks)
 
     def test_tiny_total_budget_allows_tar_header_reads_for_empty_member(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "tiny_total_empty.tar"
@@ -2670,6 +2732,8 @@ class TestTarScanner:
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert result.metadata["analysis_incomplete"] is True
         assert "tar_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        aggregate_checks = [check for check in result.checks if check.name == "TAR Aggregate Size Limit Check"]
+        assert not any(check.status == CheckStatus.PASSED for check in aggregate_checks)
 
     def test_core_tar_partial_nested_scan_without_findings_returns_exit_code_2(self, tmp_path: Path) -> None:
         """A failed nested TAR member scan with no finding should stay inconclusive in aggregate output."""

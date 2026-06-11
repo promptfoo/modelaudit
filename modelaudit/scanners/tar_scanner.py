@@ -21,7 +21,7 @@ from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
 from .archive_member_security import scan_archive_member_for_known_risks
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import DEFAULT_MAX_FILE_READ_SIZE, BaseScanner, Check, CheckStatus, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
     "/etc",
@@ -240,8 +240,7 @@ class TarScanner(BaseScanner):
         result = self._create_result()
         result.metadata["file_size"] = self.get_file_size(path)
 
-        # Add file integrity check for compliance
-        self.add_file_integrity_check(path, result)
+        self._add_streaming_safe_integrity_check(path, result)
 
         try:
             self.current_file_path = path
@@ -282,6 +281,31 @@ class TarScanner(BaseScanner):
         result.finish(success=scan_result.success and not result.has_errors)
         result.metadata["contents"] = scan_result.metadata.get("contents", [])
         return result
+
+    def _add_streaming_safe_integrity_check(self, path: str, result: ScanResult) -> None:
+        file_size = self.get_file_size(path)
+        hash_read_limit = self.max_file_read_size if self.max_file_read_size > 0 else DEFAULT_MAX_FILE_READ_SIZE
+        if file_size > hash_read_limit:
+            result.checks.append(
+                Check(
+                    name="File Integrity Hash",
+                    status=CheckStatus.SKIPPED,
+                    message="File integrity hashes skipped for streaming TAR archive",
+                    location=path,
+                    details={
+                        "file_size": file_size,
+                        "max_file_read_size": hash_read_limit,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "tar_file_integrity_hash_skipped",
+                    },
+                )
+            )
+            result.metadata["file_size"] = file_size
+            result.metadata["file_hashes_skipped"] = True
+            result.metadata["file_hashes_skip_reason"] = "tar_file_integrity_hash_skipped"
+            return
+
+        self.add_file_integrity_check(path, result)
 
     def _get_max_entry_size(self) -> int:
         """Return the per-entry extraction limit used for TAR members."""
@@ -1499,6 +1523,8 @@ class TarScanner(BaseScanner):
                                 "scan_outcome_reason": TAR_ENTRY_EXTRACTION_INCOMPLETE_REASON,
                             },
                         )
+                        if compression_codec is not None:
+                            break
                     except Exception as exc:
                         scan_complete = False
                         mark_archive_scan_incomplete(result, "tar_entry_scan_incomplete")
@@ -1538,7 +1564,7 @@ class TarScanner(BaseScanner):
                 rule_code=None,
             )
 
-        if not aggregate_size_check_recorded:
+        if reached_eof and not aggregate_size_check_recorded:
             self._add_tar_aggregate_size_check(
                 result,
                 path,
