@@ -178,6 +178,12 @@ merge_scan_result = core_results.merge_scan_result
 
 HEADER_FORMAT_TO_SCANNER_ID = _registry.get_header_format_to_scanner_ids()
 _HF_DOWNLOAD_METADATA_MAX_BYTES = 64 * 1024
+_HF_CACHEDIR_TAG_CONTENT = (
+    "Signature: 8a477f597d28d172789f06886806bc55\n"
+    "# This file is a cache directory tag created by huggingface_hub.\n"
+    "# For information about cache directory tags, see:\n"
+    "#\thttps://bford.info/cachedir/\n"
+)
 
 
 def _record_dvc_output_limit_incomplete(
@@ -254,7 +260,7 @@ def _dvc_omitted_outputs_covered_by_directory_walk(
                         metadata_scanner_available=metadata_scanner_available,
                         scanner_selection_extensions=scanner_selection_extensions,
                     )
-                    and not _has_hf_download_metadata_sidecar(file_path)
+                    and not _preserve_hf_download_sidecar_asset(file_path, scanner_selection_extensions)
                 ):
                     continue
                 try:
@@ -2345,7 +2351,7 @@ def scan_model_directory_or_file(
                             metadata_scanner_available=metadata_scanner_available,
                             scanner_selection_extensions=scanner_selection_extensions,
                         )
-                        and not _has_hf_download_metadata_sidecar(file_path)
+                        and not _preserve_hf_download_sidecar_asset(file_path, scanner_selection_extensions)
                     ):
                         filename_lower = Path(file_path).name.lower()
                         if filename_lower in LICENSE_FILES:
@@ -3542,13 +3548,13 @@ def _is_hf_cachedir_tag(path_obj: Path) -> bool:
         content = path_obj.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return False
-    return content.startswith("Signature: 8a477f597d28d172789f06886806bc55\n")
+    return content == _HF_CACHEDIR_TAG_CONTENT
 
 
 def _has_hf_download_metadata_sidecar(path: str) -> bool:
     """Return whether a local file is backed by benign Hugging Face download metadata."""
     path_obj = Path(path)
-    if _path_has_part(path_obj, ".cache"):
+    if _find_local_hf_download_root(path_obj) is not None:
         return False
 
     for local_root in path_obj.parents:
@@ -3563,6 +3569,16 @@ def _has_hf_download_metadata_sidecar(path: str) -> bool:
         if metadata_path.is_file() and _is_huggingface_cache_file(str(metadata_path)):
             return True
     return False
+
+
+def _preserve_hf_download_sidecar_asset(
+    path: str,
+    scanner_selection_extensions: frozenset[str] | None,
+) -> bool:
+    """Return whether HF local-dir metadata should keep a skipped file in the inventory."""
+    if scanner_selection_extensions is not None:
+        return False
+    return _has_hf_download_metadata_sidecar(path)
 
 
 @cached_scan()
@@ -4504,7 +4520,7 @@ def scan_model_streaming(
                 break
 
             try:
-                if is_hf_cache and _is_huggingface_cache_file(str(source_path)):
+                if base_dir is not None and _is_huggingface_cache_file(str(source_path)):
                     logger.debug(f"Skipping HuggingFace cache file: {source_path}")
                     continue
 
@@ -4530,7 +4546,7 @@ def scan_model_streaming(
                         metadata_scanner_available=metadata_scanner_available,
                         scanner_selection_extensions=scanner_selection_extensions,
                     )
-                    and not _has_hf_download_metadata_sidecar(str(source_path))
+                    and not _preserve_hf_download_sidecar_asset(str(source_path), scanner_selection_extensions)
                 ):
                     filename_lower = source_path.name.lower()
                     if filename_lower in LICENSE_FILES:

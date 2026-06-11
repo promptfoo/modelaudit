@@ -61,6 +61,25 @@ def create_mock_scan_result(bytes_scanned: int = 1024, with_critical_issue: bool
     return result
 
 
+def write_hf_download_metadata(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n",
+        encoding="utf-8",
+    )
+
+
+def write_hf_cachedir_tag(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "Signature: 8a477f597d28d172789f06886806bc55\n"
+        "# This file is a cache directory tag created by huggingface_hub.\n"
+        "# For information about cache directory tags, see:\n"
+        "#\thttps://bford.info/cachedir/\n",
+        encoding="utf-8",
+    )
+
+
 def create_mock_location_scan_result(
     resolved_path: Path,
     *,
@@ -1514,6 +1533,50 @@ def test_scan_model_streaming_skips_huggingface_cache_metadata(
     mock_scan.assert_called_once()
     assert mock_scan.call_args.args[0] == str(model_file)
     assert result.files_scanned == 1
+
+
+def test_scan_model_streaming_skips_local_download_sidecars(tmp_path: Path) -> None:
+    """Streaming directory scans should skip snapshot_download(local_dir=...) sidecars."""
+    model_dir = tmp_path / "downloaded-model"
+    model_dir.mkdir()
+    config_path = model_dir / "config.json"
+    config_path.write_text('{"model_type":"bert"}', encoding="utf-8")
+    vocab_path = model_dir / "vocab.txt"
+    vocab_path.write_text("[PAD]\n[UNK]\n", encoding="utf-8")
+
+    download_root = model_dir / ".cache" / "huggingface" / "download"
+    config_metadata = download_root / "config.json.metadata"
+    config_lock = download_root / "config.json.lock"
+    vocab_metadata = download_root / "vocab.txt.metadata"
+    cachedir_tag = model_dir / ".cache" / "huggingface" / "CACHEDIR.TAG"
+    write_hf_download_metadata(config_metadata)
+    config_lock.touch()
+    write_hf_download_metadata(vocab_metadata)
+    write_hf_cachedir_tag(cachedir_tag)
+
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        mock_scan.return_value = create_mock_scan_result(bytes_scanned=100)
+
+        result = scan_model_streaming(
+            file_generator=iter(
+                [
+                    (config_metadata, False),
+                    (config_lock, False),
+                    (vocab_metadata, False),
+                    (cachedir_tag, False),
+                    (config_path, False),
+                    (vocab_path, True),
+                ]
+            ),
+            timeout=30,
+            delete_after_scan=False,
+            scan_root=str(model_dir),
+            skip_file_types=True,
+            cache_enabled=False,
+        )
+
+    assert [call.args[0] for call in mock_scan.call_args_list] == [str(config_path), str(vocab_path)]
+    assert result.files_scanned == 2
 
 
 def test_scan_model_streaming_scans_local_file_named_main(tmp_path: Path) -> None:

