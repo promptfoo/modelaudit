@@ -368,6 +368,42 @@ def _contains_suspicious_getattr(value: str) -> bool:
     return False
 
 
+def _contains_getattr_call_anchor(value: str) -> bool:
+    lowered = value.lower()
+    search_offset = 0
+    while search_offset < len(value):
+        getattr_index = lowered.find("getattr", search_offset)
+        if getattr_index == -1:
+            return False
+        open_index = getattr_index + len("getattr")
+        while open_index < len(value) and value[open_index].isspace():
+            open_index += 1
+        if open_index < len(value) and value[open_index] == "(":
+            return True
+        search_offset = getattr_index + len("getattr")
+    return False
+
+
+def _contains_quoted_dunder_attribute_after_comma(value: str) -> bool:
+    search_offset = 0
+    while search_offset < len(value):
+        comma_index = value.find(",", search_offset)
+        if comma_index == -1:
+            return False
+        quote_index = comma_index + 1
+        while quote_index < len(value) and value[quote_index].isspace():
+            quote_index += 1
+        if quote_index < len(value) and value[quote_index] in {'"', "'"}:
+            quote = value[quote_index]
+            end_quote = value.find(quote, quote_index + 1)
+            if end_quote != -1:
+                attribute = value[quote_index + 1 : end_quote]
+                if attribute.startswith("__") and attribute.endswith("__"):
+                    return True
+        search_offset = comma_index + 1
+    return False
+
+
 def _get_regex_parser() -> Any:
     return vars(re).get("_parser")
 
@@ -2481,9 +2517,15 @@ class FlaxMsgpackScanner(BaseScanner):
         matched_patterns: dict[str, tuple[str, str]] = {}
         matched_transforms: dict[str, str] = {}
         unresolved_pattern_candidates: set[str] = set()
+        track_split_getattr_pattern = any(
+            pattern == _UNBOUNDED_GETATTR_PATTERN for _, pattern, _, _ in self._binary_stream_pattern_matchers
+        )
+        saw_getattr_call_candidate = False
+        saw_getattr_dunder_candidate = False
         raw_tail = b""
 
         def inspect_window(raw_bytes: bytes) -> None:
+            nonlocal saw_getattr_call_candidate, saw_getattr_dunder_candidate
             raw_window_lower = raw_bytes.lower()
             transform_candidates = [
                 transform for anchor, transform in self._binary_stream_transform_matchers if anchor in raw_window_lower
@@ -2493,11 +2535,25 @@ class FlaxMsgpackScanner(BaseScanner):
                 for anchor, pattern, compiled_pattern, lowered_pattern in self._binary_stream_pattern_matchers
                 if pattern not in matched_patterns and anchor in raw_window_lower
             ]
-            if not transform_candidates and not pattern_candidates:
+            inspect_split_getattr_candidate = (
+                track_split_getattr_pattern
+                and _UNBOUNDED_GETATTR_PATTERN not in matched_patterns
+                and (b"getattr" in raw_window_lower or (saw_getattr_call_candidate and b"__" in raw_window_lower))
+            )
+            if not transform_candidates and not pattern_candidates and not inspect_split_getattr_candidate:
                 return
 
             raw_window = raw_bytes.decode("utf-8", errors="replace")
             normalized_window = _WHITESPACE_RUN_PATTERN.sub(" ", raw_window)
+            if inspect_split_getattr_candidate:
+                previously_saw_getattr_call = saw_getattr_call_candidate
+                if _contains_getattr_call_anchor(raw_window) or _contains_getattr_call_anchor(normalized_window):
+                    saw_getattr_call_candidate = True
+                if previously_saw_getattr_call and (
+                    _contains_quoted_dunder_attribute_after_comma(raw_window)
+                    or _contains_quoted_dunder_attribute_after_comma(normalized_window)
+                ):
+                    saw_getattr_dunder_candidate = True
             for transform in transform_candidates:
                 if transform not in matched_transforms:
                     matched_transforms[transform] = raw_window
@@ -2544,6 +2600,8 @@ class FlaxMsgpackScanner(BaseScanner):
                 result,
             )
 
+        if saw_getattr_call_candidate and saw_getattr_dunder_candidate:
+            unresolved_pattern_candidates.add(_UNBOUNDED_GETATTR_PATTERN)
         unresolved_patterns = sorted(unresolved_pattern_candidates - set(matched_patterns))
         existing_reasons = result.metadata.get("scan_outcome_reasons", [])
         if unresolved_patterns and self.BINARY_PATTERN_INCONCLUSIVE_REASON not in existing_reasons:

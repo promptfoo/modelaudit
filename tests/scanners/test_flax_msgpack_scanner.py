@@ -1292,6 +1292,29 @@ def test_flax_msgpack_binary_anchor_scanner_ignores_benign_getattr_prose() -> No
     assert all(check.name != "Flax MessagePack Binary Pattern Coverage" for check in result.checks)
 
 
+def test_flax_msgpack_binary_anchor_scanner_fails_closed_for_split_getattr_dunder() -> None:
+    first_chunk = (b"\x00" * 128) + b"getattr(object"
+    remaining = (b"x" * (64 * 1024 + 4096 + 100)) + b", '__custom_hook__')"
+    cursor = _MsgpackStreamCursor(io.BytesIO(remaining), len(remaining))
+    scanner = FlaxMsgpackScanner()
+    result = ScanResult("flax_msgpack")
+
+    scanner._analyze_streamed_binary_anchor_chunks(
+        first_chunk,
+        cursor,
+        len(remaining),
+        len(first_chunk) + len(remaining),
+        "root.params.blob",
+        result,
+    )
+
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    coverage_check = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
+    assert coverage_check.details["pattern"] == _UNBOUNDED_GETATTR_PATTERN
+    assert coverage_check.details["stream_overlap_chars"] == 4096
+
+
 @pytest.mark.parametrize(
     ("pattern", "payload"),
     [
