@@ -170,16 +170,6 @@ _HF_TRAINING_ARGS_REDUCE_REFERENCES = frozenset(
         ("transformers.training_args", "OptimizerNames"),
     }
 )
-_HF_TRAINING_ARGS_RECONSTRUCTION_REFERENCES = frozenset(
-    {
-        ("accelerate.state", "PartialState"),
-        ("accelerate.utils.dataclasses", "DeepSpeedPlugin"),
-        ("transformers.integrations.deepspeed", "HfDeepSpeedConfig"),
-        ("transformers.integrations.deepspeed", "HfTrainerDeepSpeedConfig"),
-        ("transformers.trainer_pt_utils", "AcceleratorConfig"),
-        ("transformers.training_args", "TrainingArguments"),
-    }
-)
 
 
 def _binunicode(data: bytes) -> bytes:
