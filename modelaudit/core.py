@@ -1234,13 +1234,25 @@ def _select_non_hdf5_preferred_scanner_id(
     if ext in _R_SERIALIZED_EXTENSIONS and header_format in _COMPRESSED_HEADER_FORMATS | {"r_serialized"}:
         return "r_serialized"
 
-    if ext == ".nemo" and (
-        header_format == "tar"
-        or (header_format == "gzip" and validate_file_type_with_formats(path, header_format, "nemo"))
-    ):
-        return "nemo"
+    if ext == ".nemo":
+        if header_format == "tar":
+            return "nemo"
+        if header_format == "gzip" and (
+            _gzip_tar_trailing_status_for_config(path, config) is not None
+            or validate_file_type_with_formats(path, header_format, "nemo")
+        ):
+            return "nemo"
 
     return _registry.get_scanner_id_for_header_format(header_format)
+
+
+def _gzip_tar_trailing_status_for_config(path: str, config: dict[str, Any] | None) -> str | None:
+    """Return invalid/nonzero gzip TAR tail status using configured compressed-wrapper limits."""
+    return gzip_tar_trailing_data_status(
+        path,
+        max_decompressed_bytes=config.get("compressed_max_decompressed_bytes") if config is not None else None,
+        max_decompression_ratio=config.get("compressed_max_decompression_ratio") if config is not None else None,
+    )
 
 
 def _select_hdf5_userblock_supplemental_scanner_id(
@@ -1346,6 +1358,7 @@ def _preferred_scanner_can_handle(
     scanner_id: str,
     header_format: str,
     path: str,
+    config: dict[str, Any] | None = None,
 ) -> bool:
     """Honor trusted header routing even when scanner can_handle is suffix-gated."""
     if scanner_id == "keras_h5" and find_hdf5_signature_offset(path) is not None:
@@ -1363,6 +1376,9 @@ def _preferred_scanner_can_handle(
         "skops",
         "torchserve_mar",
     }:
+        return True
+
+    if scanner_id == "nemo" and header_format == "gzip" and _gzip_tar_trailing_status_for_config(path, config):
         return True
 
     if scanner_class.can_handle(path):
@@ -3813,11 +3829,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             file_type_valid = True
             format_probe_error = e
     gzip_tar_trailing_status = (
-        gzip_tar_trailing_data_status(
-            path,
-            max_decompressed_bytes=config.get("compressed_max_decompressed_bytes"),
-            max_decompression_ratio=config.get("compressed_max_decompression_ratio"),
-        )
+        _gzip_tar_trailing_status_for_config(path, config)
         if (
             format_probe_error is None
             and ext == ".nemo"
@@ -3915,7 +3927,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         and scanner_id
         and (
             scanner_id == trusted_flax_overlap_scanner_id
-            or _preferred_scanner_can_handle(preferred_scanner, scanner_id, header_format, path)
+            or _preferred_scanner_can_handle(preferred_scanner, scanner_id, header_format, path, config)
         )
     ):
         logger.debug(

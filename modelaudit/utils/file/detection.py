@@ -3837,6 +3837,12 @@ def _gzip_tar_trailing_data_status(
         with path.open("rb") as raw:
             if raw.read(len(_GZIP_MAGIC)) != _GZIP_MAGIC:
                 return None
+            try:
+                is_tar = tarfile.is_tarfile(path)
+            except (EOFError, tarfile.TarError):
+                return None
+            if not is_tar:
+                return None
             raw.seek(0)
             with tarfile.open(fileobj=raw, mode="r:gz") as archive:
                 archive.getmembers()

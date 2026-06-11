@@ -374,6 +374,49 @@ class TestNemoScannerBasic:
         finally:
             reset_cache_manager()
 
+    def test_truncated_gzip_nemo_keeps_nemo_ownership_when_header_stays_gzip(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Retained gzip headers with invalid TAR tails still fail closed as NeMo-owned scans."""
+        path = tmp_path / "truncated-retained-gzip.nemo"
+        payload = _build_nemo_tar_bytes(b"model:\n  _target_: nemo.Model\n")
+        path.write_bytes(payload[:-1])
+        monkeypatch.setattr("modelaudit.core.detect_file_format", lambda _path: "gzip")
+
+        direct_result = scan_file(str(path), config={"cache_scan_results": False})
+        aggregate_result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        integrity_checks = [
+            check
+            for check in direct_result.checks
+            if check.name == "Compressed TAR Stream Integrity" and check.status == CheckStatus.FAILED
+        ]
+        assert direct_result.scanner_name == "nemo"
+        assert direct_result.success is False
+        assert integrity_checks
+        assert integrity_checks[0].rule_code == "S902"
+        assert "could not be fully validated" in integrity_checks[0].message
+        assert aggregate_result.scanner_names == ["nemo"]
+        assert aggregate_result.success is False
+        assert determine_exit_code(aggregate_result) == 2
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            cached_aggregate = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            assert cached_aggregate.success is False
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
     def test_missing_yaml_dependency_is_reported_as_warning(self, tmp_path, monkeypatch):
         """Missing PyYAML should be a non-passing warning, not a pass."""
         path = _create_nemo_file(tmp_path, {"model": "test"})
