@@ -1351,6 +1351,32 @@ class TextScanner(BaseScanner):
         return False
 
     @classmethod
+    def _documentation_open_call_contains_position(cls, payload: bytes, position: int) -> bool:
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        current_line_prefix = payload[line_start:position]
+        current_indent = len(current_line_prefix) - len(current_line_prefix.lstrip(b" \t"))
+        if current_indent == 0:
+            return False
+
+        context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        previous_line_end = line_start - 1
+        while previous_line_end >= context_start:
+            previous_line_start = max(
+                payload.rfind(b"\n", context_start, previous_line_end) + 1,
+                context_start,
+            )
+            previous_line = payload[previous_line_start:previous_line_end]
+            stripped = previous_line.strip()
+            if stripped and not stripped.startswith(b"#"):
+                previous_indent = len(previous_line) - len(previous_line.lstrip(b" \t"))
+                if previous_indent < current_indent:
+                    return cls._documentation_prefix_has_enclosing_call(previous_line)
+            if previous_line_start == context_start:
+                break
+            previous_line_end = previous_line_start - 1
+        return False
+
+    @classmethod
     def _documentation_finding_is_actionable(cls, payload: bytes, finding: dict[str, Any]) -> bool:
         position = finding.get("position")
         if not isinstance(position, int) or position < 0 or position > len(payload):
@@ -1360,6 +1386,8 @@ class TextScanner(BaseScanner):
         if cls._documentation_position_is_in_passive_bibliography_field(payload, position):
             return False
         if cls._documentation_multiline_return_contains_position(payload, position):
+            return True
+        if cls._documentation_open_call_contains_position(payload, position):
             return True
         if cls._documentation_position_is_in_passive_markdown_link(payload, position):
             return False
@@ -1717,10 +1745,17 @@ class TextScanner(BaseScanner):
                 if cls._documentation_bibliography_url_field_is_passive(payload, line_start, line, match.start()):
                     continue
                 absolute_position = line_start + match.start()
-                if cls._documentation_line_is_code_shaped(
-                    line,
-                    match.start(),
-                ) or cls._documentation_multiline_return_contains_position(payload, absolute_position):
+                if (
+                    cls._documentation_line_is_code_shaped(
+                        line,
+                        match.start(),
+                    )
+                    or cls._documentation_multiline_return_contains_position(
+                        payload,
+                        absolute_position,
+                    )
+                    or cls._documentation_open_call_contains_position(payload, absolute_position)
+                ):
                     return False
             for pattern in (
                 BARE_NETWORK_IPV4_TOKEN_PATTERN,
@@ -1742,10 +1777,17 @@ class TextScanner(BaseScanner):
                         if before in {b".", b"_"} or after in {b".", b"_"} or tld not in DOCUMENTATION_BARE_DOMAIN_TLDS:
                             continue
                     absolute_position = line_start + match.start()
-                    if cls._documentation_line_is_code_shaped(
-                        line,
-                        match.start(),
-                    ) or cls._documentation_multiline_return_contains_position(payload, absolute_position):
+                    if (
+                        cls._documentation_line_is_code_shaped(
+                            line,
+                            match.start(),
+                        )
+                        or cls._documentation_multiline_return_contains_position(
+                            payload,
+                            absolute_position,
+                        )
+                        or cls._documentation_open_call_contains_position(payload, absolute_position)
+                    ):
                         return False
             if line_end == len(payload):
                 break
@@ -1776,7 +1818,9 @@ class TextScanner(BaseScanner):
         if finding_limit.get(
             "truncated_finding_type"
         ) == "endpoint_redaction_classification" and cls._is_documentation_sidecar(path):
-            return cls._documentation_network_token_lines_are_passive(payload)
+            return all(
+                cls._sidecar_network_finding_is_informational(path, payload, finding) for finding in findings
+            ) and cls._documentation_network_token_lines_are_passive(payload)
         if finding_limit.get("truncated_finding_type") not in PASSIVE_NETWORK_FINDING_TYPES:
             return False
         truncated_finding = finding_limit.get("truncated_finding")

