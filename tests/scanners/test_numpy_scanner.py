@@ -12,7 +12,14 @@ from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.rules import Severity
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.numpy_scanner import NUMPY_HEADER_MAX_SIZE, NumPyScanner, _read_numpy_array_header
+from modelaudit.scanners.numpy_scanner import (
+    NUMPY_HEADER_MAX_SIZE,
+    NumPyScanner,
+    _numpy_object_reconstruction_reference_is_trusted,
+    _read_numpy_array_header,
+)
+
+_MALFORMED_NUMPY_RECONSTRUCT_PAYLOAD = b"cnumpy._core.multiarray\n_reconstruct\n(NtR."
 
 
 def test_numpy_scanner_valid(tmp_path):
@@ -290,6 +297,19 @@ class _SSLPayload:
 
 def _failed_checks(result: ScanResult) -> list[Check]:
     return [c for c in result.checks if c.status.value == "failed"]
+
+
+def _replace_npy_data_payload(path: Path, payload: bytes) -> None:
+    with path.open("rb") as handle:
+        version = np.lib.format.read_magic(handle)
+        if version == (1, 0):
+            np.lib.format.read_array_header_1_0(handle)
+        elif version == (2, 0):
+            np.lib.format.read_array_header_2_0(handle)
+        else:
+            np.lib.format.read_array_header_1_0(handle)
+        payload_start = handle.tell()
+    path.write_bytes(path.read_bytes()[:payload_start] + payload)
 
 
 def _assert_no_trailing_pickle_parse_noise(result: ScanResult) -> None:
@@ -689,6 +709,78 @@ def test_benign_object_dtype_numpy_no_nested_critical(tmp_path: Path) -> None:
     assert result.has_errors is False
     assert any("CVE-2019-6446" in (c.name + c.message) for c in result.checks)
     assert not any(i.severity == IssueSeverity.CRITICAL for i in result.issues if "CVE-2019-6446" not in i.message)
+
+
+def test_object_dtype_numpy_preserves_untrusted_reconstruction_origin_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import modelaudit_picklescan.api as picklescan_api
+
+    untrusted_references = {
+        "numpy._core.multiarray._reconstruct",
+        "numpy.core.multiarray._reconstruct",
+        "numpy.dtype",
+        "numpy.ndarray",
+    }
+    original_picklescan_trust = picklescan_api.import_only_reference_is_proven_trusted
+    original_requires_origin_review = picklescan_api.import_only_module_requires_origin_review
+
+    def trust_reference(module: str, name: str) -> bool:
+        if f"{module}.{name}" in untrusted_references:
+            return False
+        return original_picklescan_trust(module, name)
+
+    def requires_origin_review(module: str, name: str) -> bool:
+        if f"{module}.{name}" in untrusted_references:
+            return True
+        return original_requires_origin_review(module, name)
+
+    monkeypatch.setattr(picklescan_api, "import_only_reference_is_proven_trusted", trust_reference)
+    monkeypatch.setattr(picklescan_api, "import_only_module_requires_origin_review", requires_origin_review)
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_reconstruction_reference_is_trusted",
+        lambda module, name: False if f"{module}.{name}" in untrusted_references else trust_reference(module, name),
+    )
+
+    arr = np.array([{"k": "v"}, [1, 2, 3]], dtype=object)
+    path = tmp_path / "untrusted_reconstruction.npy"
+    np.save(path, arr, allow_pickle=True)
+
+    result = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    assert determine_exit_code(result) == 1
+    assert any(
+        item.rule_code == "NON_ALLOWLISTED_GLOBAL" and item.details.get("import_reference") in untrusted_references
+        for item in result.issues
+    )
+
+
+def test_object_dtype_numpy_malformed_reconstruct_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "malformed_reconstruct.npy"
+    np.save(path, np.array([None], dtype=object), allow_pickle=True)
+    _replace_npy_data_payload(path, _MALFORMED_NUMPY_RECONSTRUCT_PAYLOAD)
+
+    result = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    assert determine_exit_code(result) == 1
+    assert any(
+        issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and issue.details.get("import_reference") == "numpy._core.multiarray._reconstruct"
+        for issue in result.issues
+    )
+
+
+def test_numpy_object_reconstruction_trust_fails_closed_without_picklescan_owner_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.scanners.numpy_scanner.import_only_reference_is_proven_trusted", lambda *_: False)
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._picklescan_loaded_site_package_reference_owner_matches",
+        None,
+    )
+
+    assert _numpy_object_reconstruction_reference_is_trusted("numpy", "dtype") is False
 
 
 def test_numpy_object_dtype_benign_exit0(tmp_path: Path) -> None:

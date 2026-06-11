@@ -55,25 +55,43 @@ def _scan_payload(
     filename: str,
     *,
     trust_numpy_array_wrapper: bool = True,
+    trust_numpy_dtype: bool = True,
+    picklescan_trust_numpy_dtype: bool | None = None,
 ) -> ScanResult:
     path = tmp_path / filename
     path.write_bytes(payload)
     original_reference_is_trusted = picklescan_api.import_only_reference_is_proven_trusted
     original_requires_origin_review = picklescan_api.import_only_module_requires_origin_review
+    if picklescan_trust_numpy_dtype is None:
+        picklescan_trust_numpy_dtype = trust_numpy_dtype
 
-    def trust_joblib_wrapper(module: str, name: str) -> bool:
+    def trust_embedded_pickle_reference(module: str, name: str) -> bool:
         if (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper"):
             return trust_numpy_array_wrapper
+        if (module, name) == ("numpy", "dtype"):
+            return picklescan_trust_numpy_dtype
+        return original_reference_is_trusted(module, name)
+
+    def trust_joblib_validated_reference(module: str, name: str) -> bool:
+        if (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper"):
+            return trust_numpy_array_wrapper
+        if (module, name) == ("numpy", "dtype"):
+            return trust_numpy_dtype
         return original_reference_is_trusted(module, name)
 
     def requires_origin_review(module: str, name: str) -> bool:
         if (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper"):
             return not trust_numpy_array_wrapper
+        if (module, name) == ("numpy", "dtype"):
+            return not picklescan_trust_numpy_dtype
         return original_requires_origin_review(module, name)
 
     with (
-        patch("modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted", trust_joblib_wrapper),
-        patch("modelaudit_picklescan.api.import_only_reference_is_proven_trusted", trust_joblib_wrapper),
+        patch(
+            "modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted",
+            trust_joblib_validated_reference,
+        ),
+        patch("modelaudit_picklescan.api.import_only_reference_is_proven_trusted", trust_embedded_pickle_reference),
         patch("modelaudit_picklescan.api.import_only_module_requires_origin_review", requires_origin_review),
     ):
         return JoblibScanner().scan(str(path))
@@ -557,6 +575,57 @@ def test_scan_keeps_untrusted_numpy_wrapper_origin_review_after_valid_raw_array(
         return isinstance(details, dict) and details.get("import_reference") == "joblib.numpy_pickle.NumpyArrayWrapper"
 
     assert any(has_numpy_wrapper_origin_review(finding) for finding in (*result.issues, *result.checks))
+
+
+def test_scan_keeps_untrusted_numpy_dtype_origin_review_after_valid_raw_array(tmp_path: Path) -> None:
+    payload = _joblib_numpy_list_payload(resumed_ops=_binunicode("done"))
+
+    result = _scan_payload(
+        tmp_path,
+        payload,
+        "untrusted_numpy_dtype_origin_review.joblib",
+        trust_numpy_dtype=False,
+    )
+
+    assert result.success is False
+    assert result.metadata["pickle_verdict"] == "suspicious"
+    assert "trusted_incomplete_tail" not in result.metadata
+
+    def has_numpy_dtype_origin_review(finding: object) -> bool:
+        details = getattr(finding, "details", None)
+        return isinstance(details, dict) and details.get("import_reference") == "numpy.dtype"
+
+    assert any(has_numpy_dtype_origin_review(finding) for finding in (*result.issues, *result.checks))
+
+
+def test_scan_preserves_unvalidated_numpy_dtype_origin_review_before_valid_raw_array(tmp_path: Path) -> None:
+    payload = _joblib_numpy_list_payload(
+        leading_ops=b"cnumpy\ndtype\n0",
+        resumed_ops=_binunicode("done"),
+    )
+
+    result = _scan_payload(
+        tmp_path,
+        payload,
+        "unvalidated_numpy_dtype_origin_review.joblib",
+        trust_numpy_dtype=True,
+        picklescan_trust_numpy_dtype=False,
+    )
+
+    assert result.success is False
+    assert "trusted_incomplete_tail" not in result.metadata
+    assert any(
+        check.status == CheckStatus.FAILED
+        and check.details.get("import_reference") == "numpy.dtype"
+        and check.details.get("position") == 4
+        for check in result.checks
+    )
+    assert not any(
+        check.status == CheckStatus.FAILED
+        and check.details.get("import_reference") == "numpy.dtype"
+        and check.details.get("position") == 128
+        for check in result.checks
+    )
 
 
 def test_scan_accepts_numpy_matrix_array_payload(tmp_path: Path) -> None:

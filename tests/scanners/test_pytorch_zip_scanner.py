@@ -150,6 +150,7 @@ _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD = (
     b"K\x00tq\x10b\x89h\x03X\x0c\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00"
     b"q\x11h\x05\x86q\x12Rq\x13tq\x14b."
 )
+_MALFORMED_NUMPY_RECONSTRUCT_PAYLOAD = b"cnumpy._core.multiarray\n_reconstruct\n(NtR."
 
 
 def _write_training_args_bin(path: Path, payload: bytes) -> None:
@@ -708,6 +709,28 @@ def test_pytorch_zip_suppresses_safe_numpy_rng_state_reconstruct_call_graph_nois
         and issue.details.get("import_reference") == "numpy.core.multiarray._reconstruct"
         for issue in result.issues
     )
+
+
+def test_pytorch_zip_malformed_numpy_reconstruct_member_fails_closed(tmp_path: Path) -> None:
+    model_path = tmp_path / "malformed_reconstruct.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _MALFORMED_NUMPY_RECONSTRUCT_PAYLOAD)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert determine_exit_code(aggregate) == 1
+    assert any(
+        issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and issue.details.get("import_reference") == "numpy._core.multiarray._reconstruct"
+        for issue in result.issues
+    )
+    outcome = result.metadata["pickle_member_worst_outcome"]
+    assert outcome["pickle_filename"] == "archive/data.pkl"
+    assert outcome["pickle_verdict"] == "suspicious"
+    assert outcome["max_severity"] == "warning"
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
