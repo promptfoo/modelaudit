@@ -4233,7 +4233,10 @@ def test_scan_huggingface_streaming_dry_run_uses_metadata_preview_without_downlo
     mock_plan_streaming.assert_called_once()
     mock_get_model_info.assert_called_once()
     assert mock_get_model_info.call_args.args == ("hf://test/model",)
-    assert mock_get_model_info.call_args.kwargs == {}
+    preview_kwargs = mock_get_model_info.call_args.kwargs
+    assert preview_kwargs["streaming_selection"] is True
+    assert preview_kwargs["include_all_files"] is False
+    assert "xgboost" in preview_kwargs["scannable_scanner_ids"]
     mock_download_file.assert_not_called()
     mock_download_model.assert_not_called()
     mock_download_streaming.assert_not_called()
@@ -4278,7 +4281,10 @@ def test_scan_huggingface_streaming_dry_run_json_stdout_is_parseable(
     mock_plan_streaming.assert_called_once()
     mock_get_model_info.assert_called_once()
     assert mock_get_model_info.call_args.args == ("hf://test/model",)
-    assert mock_get_model_info.call_args.kwargs == {}
+    preview_kwargs = mock_get_model_info.call_args.kwargs
+    assert preview_kwargs["streaming_selection"] is True
+    assert preview_kwargs["include_all_files"] is False
+    assert "xgboost" in preview_kwargs["scannable_scanner_ids"]
     mock_download_file.assert_not_called()
     mock_download_model.assert_not_called()
     mock_download_streaming.assert_not_called()
@@ -5295,6 +5301,88 @@ def test_scan_huggingface_streaming_dry_run_allows_selected_scannable_files(
     assert preview["artifact_downloads"] == 0
     assert preview["scanner_execution"] is False
     mock_detect_content.assert_not_called()
+    mock_download_streaming.assert_not_called()
+    mock_scan_streaming.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_scan_local.assert_not_called()
+    mock_format_scan_output.assert_not_called()
+
+
+def test_scan_huggingface_streaming_dry_run_metadata_selection_ignores_unselected_sidecars() -> None:
+    """Metadata-only streaming dry-runs should not probe unrelated unselected repository files."""
+    sidecars = [f"sidecar-{index}.notmodel" for index in range(300)]
+    repo_files = ["README", "model_card", *sidecars]
+    api = MagicMock()
+    api.repo_info.return_value = types.SimpleNamespace(
+        sha=_HF_TEST_REVISION,
+        modelId="test/model",
+        author="tester",
+        siblings=[
+            types.SimpleNamespace(rfilename=file_name, size=100 + index) for index, file_name in enumerate(repo_files)
+        ],
+    )
+    path_size_deadlines: list[float | None] = []
+
+    def path_sizes_side_effect(
+        repo_id: str,
+        filenames: list[str],
+        **kwargs: object,
+    ) -> tuple[dict[str, int | None], str]:
+        assert repo_id == "test/model"
+        assert filenames == ["README", "model_card"]
+        deadline = kwargs.get("deadline")
+        path_size_deadlines.append(deadline if isinstance(deadline, float) else None)
+        return {"README": 100, "model_card": 101}, _HF_TEST_REVISION
+
+    with (
+        patch("huggingface_hub.HfApi", return_value=api),
+        patch(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            return_value=(repo_files, _HF_TEST_REVISION, None),
+        ) as mock_list_repo_files,
+        patch(
+            "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None
+        ) as mock_detect_content,
+        patch(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            side_effect=path_sizes_side_effect,
+        ) as mock_path_sizes,
+        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
+        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--stream",
+                "--timeout",
+                "7",
+                "--format",
+                "json",
+                "--scanners",
+                "metadata",
+                "hf://test/model",
+            ],
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 0, result.output
+    preview = json.loads(result.output)
+    assert preview["dry_run"] is True
+    assert preview["mode"] == "streaming"
+    assert preview["selected_file_count"] == 2
+    assert preview["file_count"] == 2
+    assert preview["total_size_bytes"] == 201
+    assert preview["scanner_selection"]["requested_scanner_ids"] == ["metadata"]
+    assert 0 < api.repo_info.call_args.kwargs["timeout"] <= 7
+    assert path_size_deadlines and path_size_deadlines[0] is not None
+    mock_list_repo_files.assert_called_once()
+    mock_detect_content.assert_not_called()
+    mock_path_sizes.assert_called_once()
     mock_download_streaming.assert_not_called()
     mock_scan_streaming.assert_not_called()
     mock_download_model.assert_not_called()
