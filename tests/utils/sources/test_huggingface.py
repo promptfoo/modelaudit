@@ -2708,6 +2708,54 @@ class TestModelDownloadStreaming:
 
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            [
+                "MODEL.UBJ",
+                *[
+                    f"model-{index:05d}-of-{_HF_CONTENT_SNIFF_MAX_FILES + 1:05d}.safetensors"
+                    for index in range(1, _HF_CONTENT_SNIFF_MAX_FILES + 2)
+                ],
+            ],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_extension_only_non_overlap_skips_declared_safetensors_shards_before_probe(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Extension-only selection must also avoid probing declared non-overlap SafeTensors shards."""
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            assert filename == "MODEL.UBJ"
+            path = tmp_path / filename
+            path.write_bytes(b"downloaded")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                scannable_extensions={".ubj"},
+            )
+        )
+
+        assert results == [(tmp_path / "MODEL.UBJ", True)]
+        mock_requests_get.assert_not_called()
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="MODEL.UBJ",
+            revision=_HF_TEST_REVISION,
+        )
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
         return_value=(["model-00001-of-00002.safetensors"], _HF_TEST_REVISION, None),
     )
     @patch("requests.get")

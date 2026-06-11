@@ -917,18 +917,36 @@ def _hf_safetensors_route_scanner_ids() -> frozenset[str]:
     return scanner_ids_for_detected_format("safetensors")
 
 
+@cache
+def _hf_route_scanner_ids_for_formats(format_names: frozenset[str]) -> frozenset[str]:
+    from ...scanner_selection import scanner_ids_for_detected_format
+
+    scanner_ids: set[str] = set()
+    for format_name in format_names:
+        scanner_ids.update(scanner_ids_for_detected_format(format_name))
+    return frozenset(scanner_ids)
+
+
 def _hf_safetensors_shard_excluded_by_selection(
     filename: str,
     selected_route_scanner_ids: set[str] | None,
+    selected_route_formats: set[str] | None,
 ) -> bool:
     """Return whether no selected scanner can claim a declared SafeTensors shard."""
-    if selected_route_scanner_ids is None or _HF_SAFETENSORS_SHARD_PATTERN.search(filename) is None:
+    if _HF_SAFETENSORS_SHARD_PATTERN.search(filename) is None:
         return False
 
     # SafeTensors content routes intentionally include overlap-capable scanners
     # such as pickle and compressed, not only the SafeTensors scanner itself.
-    selected_safetensors_routes = selected_route_scanner_ids.intersection(_hf_safetensors_route_scanner_ids())
-    return not selected_safetensors_routes
+    safetensors_route_scanner_ids = _hf_safetensors_route_scanner_ids()
+    if selected_route_scanner_ids is not None:
+        selected_safetensors_routes = selected_route_scanner_ids.intersection(safetensors_route_scanner_ids)
+        return not selected_safetensors_routes
+    if selected_route_formats is None:
+        return False
+
+    selected_format_route_scanner_ids = _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
+    return not selected_format_route_scanner_ids.intersection(safetensors_route_scanner_ids)
 
 
 def _get_selected_hf_content_route_formats(
@@ -1080,7 +1098,11 @@ def _select_streamable_hf_files(
         for file_name in repo_files:
             if file_name in selected_files:
                 continue
-            if _hf_safetensors_shard_excluded_by_selection(file_name, selected_route_scanner_ids):
+            if _hf_safetensors_shard_excluded_by_selection(
+                file_name,
+                selected_route_scanner_ids,
+                selected_route_formats,
+            ):
                 continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
@@ -1094,6 +1116,7 @@ def _select_streamable_hf_files(
             if detected_format == "safetensors" and _hf_safetensors_shard_excluded_by_selection(
                 file_name,
                 selected_route_scanner_ids,
+                selected_route_formats,
             ):
                 continue
             if selected_route_scanner_ids is not None:
