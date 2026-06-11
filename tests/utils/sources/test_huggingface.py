@@ -2665,7 +2665,7 @@ class TestModelDownloadStreaming:
         _mock_list_repo_files: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """Declared suffixes owned by disabled scanners must not be body-sniffed."""
+        """Shard-shaped SafeTensors artifacts excluded by selection must not be body-sniffed."""
         policy = resolve_scanner_selection_policy(scanners=["pickle"])
         extensions = selected_scanner_extensions(policy, conservative=True)
         assert extensions is not None
@@ -2695,6 +2695,48 @@ class TestModelDownloadStreaming:
         mock_hf_hub_download.assert_called_once_with(
             repo_id="test/model",
             filename="payload.pkl",
+            revision=_HF_TEST_REVISION,
+        )
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["payload.safetensors"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_selected_pickle_preserves_safetensors_pickle_control(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Non-shard SafeTensors suffixes should still be probed for selected pickle payloads."""
+        policy = resolve_scanner_selection_policy(scanners=["pickle"])
+        malicious_pickle = b"cos\nsystem\n(S'echo pwn'\ntR."
+        mock_requests_get.return_value = _FakeRangeResponse(malicious_pickle)
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / filename
+            path.write_bytes(malicious_pickle)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                scannable_extensions=selected_scanner_extensions(policy, conservative=True),
+                scannable_filenames=selected_scanner_filenames(policy, conservative=True),
+                scannable_scanner_ids=policy.enabled_scanner_ids,
+            )
+        )
+
+        assert results == [(tmp_path / "payload.safetensors", True)]
+        assert mock_requests_get.call_count == 1
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="payload.safetensors",
             revision=_HF_TEST_REVISION,
         )
 

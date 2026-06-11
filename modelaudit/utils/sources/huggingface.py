@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import signal
 import struct
 import subprocess
@@ -11,7 +12,6 @@ import time
 from collections.abc import Callable, Collection, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
-from functools import cache
 from glob import escape as escape_glob
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -41,6 +41,7 @@ _MAX_HF_STREAMING_UNFILTERED_FILES = 128
 _HF_DOWNLOAD_WORKER_RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
 _POSIX_TERMINATE_SIGNAL = getattr(signal, "SIGTERM", 15)
 _POSIX_KILL_SIGNAL = getattr(signal, "SIGKILL", 9)
+_HF_SAFETENSORS_SHARD_PATTERN = re.compile(r"(^|/).+-\d{5}-of-\d{5}\.safetensors$", re.IGNORECASE)
 
 __all__ = [
     "download_file_from_hf",
@@ -908,40 +909,16 @@ def _get_hf_content_route_scanner_ids() -> set[str]:
     return scanner_ids
 
 
-@cache
-def _get_hf_declared_suffix_scanner_ids() -> tuple[tuple[str, frozenset[str]], ...]:
-    """Return scanner-owned filename suffixes that should not be re-probed when disabled."""
-    from ...scanner_registry_metadata import get_scanner_registry_metadata
-
-    suffix_owners: dict[str, set[str]] = {}
-    for scanner_id, scanner_info in get_scanner_registry_metadata().items():
-        for key in ("extensions", "content_routed_extensions", "scanner_only_extensions"):
-            for extension in scanner_info.get(key, []):
-                suffix = str(extension).lower()
-                if suffix:
-                    suffix_owners.setdefault(suffix, set()).add(scanner_id)
-    return tuple((suffix, frozenset(scanner_ids)) for suffix, scanner_ids in suffix_owners.items())
-
-
-def _declared_suffix_scanner_ids_for_hf_file(filename: str) -> frozenset[str]:
-    """Return scanners that declare a non-empty suffix matching this remote filename."""
-    filename_lower = filename.lower()
-    scanner_ids: set[str] = set()
-    for suffix, suffix_scanner_ids in _get_hf_declared_suffix_scanner_ids():
-        if filename_lower.endswith(suffix):
-            scanner_ids.update(suffix_scanner_ids)
-    return frozenset(scanner_ids)
-
-
-def _hf_declared_suffix_excluded_by_selection(
+def _hf_safetensors_shard_excluded_by_selection(
     filename: str,
     selected_route_scanner_ids: set[str] | None,
 ) -> bool:
-    """Return whether scanner selection excludes a trusted declared-suffix artifact."""
+    """Return whether scanner selection excludes a shard-shaped SafeTensors artifact."""
     if selected_route_scanner_ids is None:
         return False
-    declared_scanner_ids = _declared_suffix_scanner_ids_for_hf_file(filename)
-    return bool(declared_scanner_ids) and not declared_scanner_ids.intersection(selected_route_scanner_ids)
+    return (
+        "safetensors" not in selected_route_scanner_ids and _HF_SAFETENSORS_SHARD_PATTERN.search(filename) is not None
+    )
 
 
 def _get_selected_hf_content_route_formats(
@@ -1093,7 +1070,7 @@ def _select_streamable_hf_files(
         for file_name in repo_files:
             if file_name in selected_files:
                 continue
-            if _hf_declared_suffix_excluded_by_selection(file_name, selected_route_scanner_ids):
+            if _hf_safetensors_shard_excluded_by_selection(file_name, selected_route_scanner_ids):
                 continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
