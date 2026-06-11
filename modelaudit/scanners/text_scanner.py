@@ -605,9 +605,19 @@ DOCUMENTATION_FENCED_FETCH_RESPONSE_ASSIGNMENT_PATTERN = re.compile(
     rb"(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
     re.IGNORECASE,
 )
+DOCUMENTATION_FENCED_FETCH_RESPONSE_CONTAINER_ASSIGNMENT_PATTERN = re.compile(
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*="
+    rb"\s*(?:[\[\(\{]\s*){1,8}(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
+    re.IGNORECASE,
+)
 DOCUMENTATION_FENCED_IMPORTED_FETCH_RESPONSE_ASSIGNMENT_PATTERN = re.compile(
     rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*=\s*(?:\(\s*){0,8}"
     rb"(?P<fetch>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_IMPORTED_FETCH_RESPONSE_CONTAINER_ASSIGNMENT_PATTERN = re.compile(
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*="
+    rb"\s*(?:[\[\(\{]\s*){1,8}(?P<fetch>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_IMPORTED_NETWORK_FUNCTION_ALIAS_ASSIGNMENT_PATTERN = re.compile(
@@ -2417,7 +2427,36 @@ class TextScanner(BaseScanner):
                 continue
             response_assignments.setdefault(match.group("target"), []).append(match.start())
 
+        for match in DOCUMENTATION_FENCED_FETCH_RESPONSE_CONTAINER_ASSIGNMENT_PATTERN.finditer(fenced_code):
+            if cls._documentation_fenced_match_is_line_comment(
+                fenced_code,
+                match.start(),
+            ) or cls._documentation_python_string_spans_contain_absolute_position(
+                fenced_code,
+                match.start(),
+                string_spans,
+                string_span_starts,
+            ):
+                continue
+            response_assignments.setdefault(match.group("target"), []).append(match.start())
+
         for match in DOCUMENTATION_FENCED_IMPORTED_FETCH_RESPONSE_ASSIGNMENT_PATTERN.finditer(fenced_code):
+            if cls._documentation_fenced_match_is_line_comment(
+                fenced_code,
+                match.start(),
+            ) or cls._documentation_python_string_spans_contain_absolute_position(
+                fenced_code,
+                match.start(),
+                string_spans,
+                string_span_starts,
+            ):
+                continue
+            if any(
+                position < match.start() for position, _imported_name in imported_targets.get(match.group("fetch"), [])
+            ):
+                response_assignments.setdefault(match.group("target"), []).append(match.start())
+
+        for match in DOCUMENTATION_FENCED_IMPORTED_FETCH_RESPONSE_CONTAINER_ASSIGNMENT_PATTERN.finditer(fenced_code):
             if cls._documentation_fenced_match_is_line_comment(
                 fenced_code,
                 match.start(),

@@ -2258,6 +2258,63 @@ exec(resp.text)
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_fenced_documentation_passive_media_does_not_hide_container_response_execution(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import requests
+
+responses = [requests.get("http://images.cocodataset.org/val2017/000000039769.jpg")]
+exec(responses[0].text)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_passive_media_container_image_load_is_informational(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+from PIL import Image
+import requests
+
+responses = [requests.get("http://images.cocodataset.org/val2017/000000039769.jpg", stream=True)]
+image = Image.open(responses[0].raw)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    informational_types = {
+        check.details.get("type")
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.severity == IssueSeverity.INFO
+    }
+    assert {"network_function", "network_library", "url_detected"} <= informational_types
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
 def test_text_scanner_fenced_documentation_passive_media_does_not_hide_executed_response_alias(
     tmp_path: Path,
 ) -> None:
