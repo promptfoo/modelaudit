@@ -82,6 +82,14 @@ def _malicious_eval_pickle_payload() -> bytes:
     return pickle.dumps({"payload": MaliciousClass()})
 
 
+def _large_framed_malicious_eval_pickle_payload() -> bytes:
+    class MaliciousClass:
+        def __reduce__(self) -> tuple[object, tuple[str]]:
+            return (eval, ("print('pwned')",))
+
+    return pickle.dumps({"pad": b"A" * 10_000, "payload": MaliciousClass()}, protocol=4)
+
+
 def _malicious_newobj_ex_pickle_payload() -> bytes:
     return pickle.dumps(object.__new__(_NewObjExImportGadget), protocol=4)
 
@@ -549,7 +557,14 @@ def test_pytorch_zip_discovery_trusts_torch_storage_untyped_storage(tmp_path: Pa
     assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
 
 
-@pytest.mark.parametrize("payload", [_malicious_proto0_system_payload(), _malicious_eval_pickle_payload()])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _malicious_proto0_system_payload(),
+        _malicious_eval_pickle_payload(),
+        _large_framed_malicious_eval_pickle_payload(),
+    ],
+)
 def test_pytorch_zip_discovery_scans_referenced_storage_blob_when_it_is_a_pickle(
     payload: bytes,
     tmp_path: Path,

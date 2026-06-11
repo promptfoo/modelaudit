@@ -1689,9 +1689,8 @@ class PyTorchZipScanner(BaseScanner):
         )
         if not data_start:
             return False
-        if not any(data_start.startswith(magic) for magic in _PICKLE_BINARY_PROTOCOL_PREFIXES) and (
-            data_start[0] not in PROTO0_1_START_BYTES
-        ):
+        is_binary_pickle_candidate = data_start.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES)
+        if not is_binary_pickle_candidate and data_start[0] not in PROTO0_1_START_BYTES:
             return False
 
         sample = data_start
@@ -1703,7 +1702,21 @@ class PyTorchZipScanner(BaseScanner):
                 phase="pickle_discovery",
                 result=result,
             )
+        if is_binary_pickle_candidate:
+            return self._binary_pickle_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
         return self._has_complete_pickle_stream_without_frame_stop_overrun(sample)
+
+    @staticmethod
+    def _binary_pickle_probe_should_scan(sample: bytes, *, sample_is_prefix: bool) -> bool:
+        opcode_count = 0
+        try:
+            for opcode, _arg, _pos in pickletools.genops(sample):
+                opcode_count += 1
+                if opcode.name == "STOP":
+                    return opcode_count >= 2
+        except Exception:
+            return sample_is_prefix and opcode_count >= 2
+        return sample_is_prefix and opcode_count >= 2
 
     @staticmethod
     def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> bool:

@@ -823,7 +823,8 @@ def _trusted_storage_zip_entry_looks_like_pickle(
     )
     if not prefix:
         return False
-    if not prefix.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES) and prefix[0] not in _PROTO0_1_START_BYTES:
+    is_binary_pickle_candidate = prefix.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES)
+    if not is_binary_pickle_candidate and prefix[0] not in _PROTO0_1_START_BYTES:
         return False
 
     sample = prefix
@@ -834,7 +835,21 @@ def _trusted_storage_zip_entry_looks_like_pickle(
             _TRUSTED_STORAGE_PICKLE_PROBE_BYTES,
             probe_bytes_remaining,
         )
+    if is_binary_pickle_candidate:
+        return _binary_pickle_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
     return _has_complete_pickle_stream_without_frame_stop_overrun(sample)
+
+
+def _binary_pickle_probe_should_scan(sample: bytes, *, sample_is_prefix: bool) -> bool:
+    opcode_count = 0
+    try:
+        for opcode, _arg, _pos in pickletools.genops(sample):
+            opcode_count += 1
+            if opcode.name == "STOP":
+                return opcode_count >= 2
+    except Exception:
+        return sample_is_prefix and opcode_count >= 2
+    return sample_is_prefix and opcode_count >= 2
 
 
 def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> bool:

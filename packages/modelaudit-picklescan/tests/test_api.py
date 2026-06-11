@@ -1891,6 +1891,7 @@ def test_scan_file_routes_torch_storage_untyped_storage_blob_as_raw_storage(tmp_
     [
         b"cposix\nsystem\n(S'echo hidden'\ntR.",
         pickle.dumps(MaliciousPayload(), protocol=4),
+        pickle.dumps({"pad": b"A" * 10_000, "payload": MaliciousPayload()}, protocol=4),
     ],
 )
 def test_scan_file_scans_referenced_storage_blob_when_it_is_a_pickle(payload: bytes, tmp_path: Path) -> None:
