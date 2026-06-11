@@ -33,6 +33,7 @@ from modelaudit.integrations.license_checker import (
 )
 from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
 from modelaudit.scanner_results import (
+    ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
     INCONCLUSIVE_SCAN_OUTCOME,
     OPERATIONAL_ERROR_METADATA_KEY,
     SCAN_OUTCOME_METADATA_KEY,
@@ -1400,14 +1401,21 @@ def _has_only_allowed_alternate_format_inconclusive_reasons(result: ScanResult, 
     return bool(reasons) and all(isinstance(reason, str) and reason in allowed_reasons for reason in reasons)
 
 
-def _has_suppressed_actionable_scanner_evidence(result: ScanResult) -> bool:
-    suppressed_checks = result._private_metadata.get(SUPPRESSED_FAILED_CHECKS_METADATA_KEY)
-    if not isinstance(suppressed_checks, list):
+def _has_private_actionable_scanner_evidence(result: ScanResult) -> bool:
+    for metadata_key in (ACTIONABLE_FAILED_CHECKS_METADATA_KEY, SUPPRESSED_FAILED_CHECKS_METADATA_KEY):
+        private_checks = result._private_metadata.get(metadata_key)
+        if _private_checks_contain_actionable_evidence(private_checks):
+            return True
+    return False
+
+
+def _private_checks_contain_actionable_evidence(private_checks: Any) -> bool:
+    if not isinstance(private_checks, list):
         return False
-    for suppressed_check in suppressed_checks:
-        if not isinstance(suppressed_check, dict):
+    for private_check in private_checks:
+        if not isinstance(private_check, dict):
             continue
-        if suppressed_check.get("severity") in {IssueSeverity.WARNING.value, IssueSeverity.CRITICAL.value}:
+        if private_check.get("severity") in {IssueSeverity.WARNING.value, IssueSeverity.CRITICAL.value}:
             return True
     return False
 
@@ -1431,7 +1439,7 @@ def _validated_alternate_format_for_mismatch(
         PROTOBUF_MODEL_CANDIDATE_FORMAT,
     }:
         return None
-    if result.has_errors or result.has_warnings or _has_suppressed_actionable_scanner_evidence(result):
+    if result.has_errors or result.has_warnings or _has_private_actionable_scanner_evidence(result):
         return None
     if result.metadata.get(OPERATIONAL_ERROR_METADATA_KEY) is True:
         return None

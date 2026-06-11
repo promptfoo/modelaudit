@@ -31,7 +31,7 @@ from modelaudit.config import ModelAuditConfig, set_config
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.rules import Severity
-from modelaudit.scanner_results import SUPPRESSED_FAILED_CHECKS_METADATA_KEY
+from modelaudit.scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY, SUPPRESSED_FAILED_CHECKS_METADATA_KEY
 from modelaudit.scanners import (
     archive_dispatch,
     flax_msgpack_scanner,
@@ -10085,7 +10085,13 @@ def test_scan_file_keeps_s901_when_malicious_pt_onnx_finding_is_suppressed(tmp_p
 
     assert result.scanner_name == "onnx"
     assert not any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
+    assert ACTIONABLE_FAILED_CHECKS_METADATA_KEY not in result.metadata
     assert SUPPRESSED_FAILED_CHECKS_METADATA_KEY not in result.metadata
+    assert {
+        "name": "Python Operator Detection",
+        "rule_code": "S902",
+        "severity": "critical",
+    } in result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY]
     assert result._private_metadata[SUPPRESSED_FAILED_CHECKS_METADATA_KEY] == [
         {
             "name": "Python Operator Detection",
@@ -10093,6 +10099,41 @@ def test_scan_file_keeps_s901_when_malicious_pt_onnx_finding_is_suppressed(tmp_p
             "severity": "critical",
         }
     ]
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+
+
+def test_scan_file_keeps_s901_when_malicious_pt_onnx_finding_is_downgraded(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    rule_config = ModelAuditConfig()
+    rule_config.severity = {"S501": Severity.INFO, "S902": Severity.INFO}
+    set_config(rule_config)
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "downgraded-malicious.pt", op_type="PythonOp")
+
+    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert ACTIONABLE_FAILED_CHECKS_METADATA_KEY not in result.metadata
+    assert {
+        "name": "JIT/Script Code Execution Detection",
+        "rule_code": "S501",
+        "severity": "critical",
+    } in result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY]
+    assert {
+        "name": "Python Operator Detection",
+        "rule_code": "S902",
+        "severity": "critical",
+    } in result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY]
+    assert all(issue.severity == IssueSeverity.INFO for issue in result.issues if issue.rule_code in {"S501", "S902"})
+    assert any(
+        issue.severity == IssueSeverity.INFO and issue.details.get("op_type") == "PythonOp" for issue in result.issues
+    )
+    assert not any(
+        issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
     assert format_check.severity == IssueSeverity.WARNING
     assert format_check.rule_code == "S901"
     assert _actionable_s901_issues(result)
