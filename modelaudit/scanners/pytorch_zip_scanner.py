@@ -147,6 +147,7 @@ _PICKLE_BINARY_PROTOCOL_PREFIXES: tuple[bytes, ...] = (
 _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
 _JIT_SCAN_MEMBER_MAX_BYTES = 32 * 1024 * 1024
 _PYTORCH_ZIP_INTEGRITY_PREFIX_BYTES = 8 * 1024 * 1024
+_PYTORCH_ZIP_HASH_CHUNK_BYTES = 1024 * 1024
 _PICKLE_DISCOVERY_LONG_PROBE_BYTES = PROTO0_1_MAX_PROBE_BYTES
 _NESTED_ZIP_HEADER_PROBE_BYTES = 4
 _ZIP_LOCAL_FILE_SIGNATURES: tuple[bytes, ...] = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
@@ -819,20 +820,26 @@ class PyTorchZipScanner(BaseScanner):
             max_bytes=max_bytes,
         )
 
-    def _add_bounded_file_integrity_check(self, path: str, result: ScanResult, file_size: int) -> None:
-        prefix_limit = _PYTORCH_ZIP_INTEGRITY_PREFIX_BYTES
-        if self.max_file_read_size and self.max_file_read_size > 0:
-            prefix_limit = min(prefix_limit, self.max_file_read_size)
-        bytes_to_hash = min(file_size, max(prefix_limit, 0))
+    def _add_pytorch_zip_integrity_check(self, path: str, result: ScanResult, file_size: int) -> None:
+        if not (self.max_file_read_size and self.max_file_read_size > 0 and file_size > self.max_file_read_size):
+            self.add_file_integrity_check(path, result)
+            return
+
+        prefix_size = min(file_size, self.max_file_read_size, _PYTORCH_ZIP_INTEGRITY_PREFIX_BYTES)
         hasher = hashlib.sha256()
         bytes_hashed = 0
         with open(path, "rb") as handle:
-            while bytes_hashed < bytes_to_hash:
-                chunk = handle.read(min(1024 * 1024, bytes_to_hash - bytes_hashed))
+            remaining = prefix_size
+            while remaining > 0:
+                self.check_interrupted()
+                if self._check_timeout(allow_partial=True):
+                    break
+                chunk = handle.read(min(_PYTORCH_ZIP_HASH_CHUNK_BYTES, remaining))
                 if not chunk:
                     break
                 hasher.update(chunk)
                 bytes_hashed += len(chunk)
+                remaining -= len(chunk)
 
         sha256_prefix = hasher.hexdigest()
         result.add_check(
@@ -861,11 +868,9 @@ class PyTorchZipScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
 
-        # Add file integrity check for compliance
-        if self.max_file_read_size and self.max_file_read_size > 0 and file_size > self.max_file_read_size:
-            self._add_bounded_file_integrity_check(path, result, file_size)
-        else:
-            self.add_file_integrity_check(path, result)
+        # Add file integrity check for compliance without unbounded reads on
+        # multi-GB PyTorch archives that are analyzed through bounded members.
+        self._add_pytorch_zip_integrity_check(path, result, file_size)
 
         # Validate ZIP format
         header = read_zip_header(path)
@@ -1800,15 +1805,18 @@ class PyTorchZipScanner(BaseScanner):
 
             # Add CVE-2025-32434 specific warnings
             self._add_weights_only_safety_warnings(sub_result, result, path, name)
-            archive_file_hashes = result.metadata.get("file_hashes")
-            if isinstance(archive_file_hashes, dict):
-                archive_file_hashes = dict(archive_file_hashes)
-            archive_file_size = result.metadata.get("file_size")
+            parent_file_hashes = result.metadata.get("file_hashes")
+            parent_file_hashes_copy = dict(parent_file_hashes) if isinstance(parent_file_hashes, dict) else None
+            parent_file_size = result.metadata.get("file_size")
             result.merge(sub_result)
-            if archive_file_hashes is not None:
-                result.metadata["file_hashes"] = archive_file_hashes
-            if archive_file_size is not None:
-                result.metadata["file_size"] = archive_file_size
+            if parent_file_hashes_copy is not None:
+                result.metadata["file_hashes"] = parent_file_hashes_copy
+            else:
+                result.metadata.pop("file_hashes", None)
+            if parent_file_size is not None:
+                result.metadata["file_size"] = parent_file_size
+            else:
+                result.metadata.pop("file_size", None)
 
         return bytes_scanned
 

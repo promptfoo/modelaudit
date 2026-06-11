@@ -2563,6 +2563,20 @@ class PickleScanner(BaseScanner):
         )
         return probe_limit if total_size is None else min(max(total_size, 0), probe_limit)
 
+    def _legacy_pytorch_preamble_probe_size(self, total_size: int | None) -> int:
+        probe_limit = min(
+            _PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES,
+            self._standalone_pickle_scanner.options.max_known_stream_read_bytes,
+        )
+        return probe_limit if total_size is None else min(max(total_size, 0), probe_limit)
+
+    def _read_legacy_pytorch_preamble_probe(self, path: str, file_size: int) -> bytes:
+        probe_size = self._legacy_pytorch_preamble_probe_size(file_size)
+        if probe_size <= 0:
+            return b""
+        with open(path, "rb") as handle:
+            return self._read_stream_bytes(handle, probe_size)
+
     def _root_expensive_raw_scan_limit(self) -> int:
         limit = self.config.get("pickle_expensive_raw_scan_limit_bytes", _ROOT_EXPENSIVE_RAW_SCAN_LIMIT_BYTES)
         try:
@@ -3860,7 +3874,7 @@ class PickleScanner(BaseScanner):
                     file_obj.seek(start_position)
                     preamble_probe = self._read_stream_bytes(
                         file_obj,
-                        min(control_probe_size, _PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES),
+                        self._legacy_pytorch_preamble_probe_size(standalone_size),
                     )
                 except (AttributeError, OSError, ValueError) as error:
                     self._record_stream_coverage_failure(deferred_size_check, source, error)
@@ -3962,24 +3976,19 @@ class PickleScanner(BaseScanner):
                 allow_binary_tail_scan = False
             elif deferred_size_check is not None:
                 return deferred_size_check
-            if deferred_size_check is not None and (
-                legacy_layout is not None or _matches_legacy_pytorch_preamble(control_probe)
-            ):
+            if deferred_size_check is not None and legacy_layout is not None:
                 self._add_stream_integrity_check(raw_data, result, source, hash_complete=False)
             else:
                 self._add_seekable_stream_integrity_check(file_obj, result, source, start_position, standalone_size)
             binary_tail_payload: bytes | None = None
             raw_position_offset = start_position
         else:
+            initial_payload = b""
             try:
-                initial_payload = b""
                 if deferred_size_check is not None:
                     initial_payload = self._read_stream_bytes(
                         file_obj,
-                        min(
-                            self._legacy_pytorch_control_probe_size(standalone_size),
-                            _PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES,
-                        ),
+                        self._legacy_pytorch_preamble_probe_size(standalone_size),
                     )
                     if not _matches_legacy_pytorch_preamble(initial_payload):
                         return deferred_size_check
@@ -4150,10 +4159,7 @@ class PickleScanner(BaseScanner):
                 if deferred_size_check is not None:
                     preamble_probe = self._read_stream_bytes(
                         layout_handle,
-                        min(
-                            self._legacy_pytorch_control_probe_size(file_size),
-                            _PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES,
-                        ),
+                        self._legacy_pytorch_preamble_probe_size(file_size),
                     )
                     if not _matches_legacy_pytorch_preamble(preamble_probe):
                         return deferred_size_check
@@ -4174,13 +4180,13 @@ class PickleScanner(BaseScanner):
                     total_size=file_size,
                     read_at=read_at,
                 )
-            legacy_preamble_matched = _matches_legacy_pytorch_preamble(control_probe)
+            legacy_framing_matched = _matches_legacy_pytorch_preamble(control_probe)
             if deferred_size_check is not None and legacy_layout is None:
                 return deferred_size_check
             if deferred_size_check is not None:
                 raw_data = control_probe[: self._root_raw_scan_limit()]
 
-            if deferred_size_check is not None and (legacy_layout is not None or legacy_preamble_matched):
+            if deferred_size_check is not None and legacy_layout is not None:
                 self._add_bounded_file_integrity_check(raw_data, result, path, file_size)
             else:
                 self.add_file_integrity_check(path, result)
@@ -4209,7 +4215,7 @@ class PickleScanner(BaseScanner):
             else:
                 with open(path, "rb") as handle:
                     scan_result = self._scan_standalone_stream(handle, file_size, source=path)
-                if legacy_preamble_matched:
+                if legacy_framing_matched:
                     self._mark_legacy_pytorch_control_layout_incomplete(scan_result, path)
                     legacy_control_incomplete = True
                 detector_data = raw_data

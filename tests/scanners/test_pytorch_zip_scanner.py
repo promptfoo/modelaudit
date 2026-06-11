@@ -1163,6 +1163,59 @@ def test_pytorch_zip_initialize_scan_does_not_read_archive_members(
     assert "pickle_files" not in result.metadata
 
 
+def test_pytorch_zip_initialize_scan_uses_prefix_hash_for_oversized_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zip_path = create_mock_pytorch_zip(tmp_path / "large.pt")
+    prefix_limit = 1024
+    with zip_path.open("ab") as handle:
+        handle.write(b"A" * (prefix_limit * 2))
+
+    def fail_full_hash(self: PyTorchZipScanner, path: str, result: ScanResult) -> None:
+        del self, path, result
+        raise AssertionError("oversized PyTorch ZIP initialization should not hash the full archive")
+
+    monkeypatch.setattr(PyTorchZipScanner, "add_file_integrity_check", fail_full_hash)
+
+    scanner = PyTorchZipScanner(config={"max_file_read_size": prefix_limit})
+    result = scanner._initialize_scan(str(zip_path))
+
+    integrity_check = next(check for check in result.checks if check.name == "File Integrity Hash")
+    expected_prefix_hash = hashlib.sha256(zip_path.read_bytes()[:prefix_limit]).hexdigest()
+    assert result.success is True
+    assert result.metadata["file_hashes"] == {"sha256_prefix": expected_prefix_hash}
+    assert integrity_check.details["sha256_prefix"] == expected_prefix_hash
+    assert integrity_check.details["bytes_hashed"] == prefix_limit
+    assert integrity_check.details["hash_complete"] is False
+    assert "sha256" not in integrity_check.details
+
+
+def test_pytorch_zip_scan_preserves_prefix_hash_for_oversized_archive_after_pickle_merge(
+    tmp_path: Path,
+) -> None:
+    zip_path = create_mock_pytorch_zip(tmp_path / "large.pt")
+    prefix_limit = 1024
+    with zip_path.open("ab") as handle:
+        handle.write(b"A" * (prefix_limit * 2))
+
+    with zip_path.open("rb") as handle:
+        expected_prefix_hash = hashlib.sha256(handle.read(prefix_limit)).hexdigest()
+
+    scanner = PyTorchZipScanner(config={"max_file_read_size": prefix_limit})
+    result = scanner.scan(str(zip_path))
+
+    nested_integrity_check = next(
+        check
+        for check in result.checks
+        if check.name == "File Integrity Check" and (check.location or "").endswith(":data.pkl")
+    )
+    assert result.success is True
+    assert result.metadata["file_hashes"] == {"sha256_prefix": expected_prefix_hash}
+    assert nested_integrity_check.details["hash_complete"] is True
+    assert "sha256" in nested_integrity_check.details
+
+
 def test_pytorch_zip_scan_does_not_route_numeric_tensor_data_files_as_pickles(tmp_path: Path) -> None:
     """Numeric tensor payloads should be prefix-probed but not routed as pickles."""
     zip_path = tmp_path / "model.pt"

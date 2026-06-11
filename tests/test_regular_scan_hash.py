@@ -11,6 +11,7 @@ import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
+from tests.helpers import create_mock_pytorch_zip
 
 
 class TestRegularScanContentHash:
@@ -391,6 +392,61 @@ class TestHashGenerationEdgeCases:
 
         assert hashed_paths == [str(first), str(second)]
         assert content_hashes[str(third)].startswith("unhashable_max_total_size_")
+
+    def test_hash_files_by_path_defers_oversized_pytorch_zip_read_limit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Aggregate hashing must not full-read oversized ZIP-backed PyTorch containers."""
+        from modelaudit import core
+
+        zip_path = create_mock_pytorch_zip(tmp_path / "large.pt")
+        with zip_path.open("ab") as handle:
+            handle.write(b"A" * 2048)
+
+        def fail_hash(path: str) -> str:
+            if path == str(zip_path):
+                pytest.fail("oversized PyTorch ZIP was content-hashed before bounded scan dispatch")
+            return "a" * 64
+
+        monkeypatch.setattr(core, "_calculate_file_hash", fail_hash)
+
+        content_hashes = core._hash_files_by_path(
+            [str(zip_path)],
+            config={"max_file_read_size": 64},
+        )
+
+        assert content_hashes[str(zip_path)].startswith("unhashable_pytorch_zip_read_limit_")
+
+    def test_single_file_scan_defers_oversized_pytorch_zip_content_hash(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Single-file scans must not publish aggregate hashes for prefix-hashed PyTorch ZIPs."""
+        from modelaudit import core
+
+        zip_path = create_mock_pytorch_zip(tmp_path / "large.pt")
+        with zip_path.open("ab") as handle:
+            handle.write(b"A" * 2048)
+
+        def fail_hash(path: str) -> str:
+            if path == str(zip_path):
+                pytest.fail("oversized PyTorch ZIP was content-hashed before bounded scan dispatch")
+            return "a" * 64
+
+        monkeypatch.setattr(core.BaseScanner, "default_max_file_read_size", 256)
+        monkeypatch.setattr(core, "_calculate_file_hash", fail_hash)
+
+        result = scan_model_directory_or_file(
+            str(zip_path),
+            max_file_size=10_000,
+            cache_enabled=False,
+        )
+
+        assert result.success is True
+        assert result.content_hash is None
+        file_hashes = result.file_metadata[str(zip_path)].file_hashes
+        assert file_hashes is not None
+        assert file_hashes.sha256_prefix
+        assert file_hashes.sha256 is None
 
     def test_directory_scan_omits_content_hash_when_max_total_hashing_incomplete(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
