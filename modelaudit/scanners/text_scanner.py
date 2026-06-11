@@ -52,6 +52,28 @@ PASSIVE_NETWORK_FINDING_TYPES = frozenset(
 )
 PASSIVE_DATA_TEXT_FILENAMES = frozenset({"classes.txt"})
 PASSIVE_DATA_TEXT_PREFIXES = ("label", "token", "vocab")
+TOKENIZER_VOCABULARY_FILENAMES = frozenset(
+    {
+        "tokenizer.txt",
+        "tokenizer_vocab.txt",
+        "tokenizer-vocab.txt",
+        "tokens.txt",
+        "vocab.txt",
+        "vocabulary.txt",
+    }
+)
+TOKENIZER_VOCABULARY_PREFIXES = ("tokenizer_vocab", "tokenizer-vocab", "vocab")
+TOKENIZER_VOCABULARY_OMITTABLE_CC_PATTERNS = frozenset({"trojan", "zombie"})
+MIN_TOKENIZER_VOCABULARY_LINES = 8
+MIN_TOKENIZER_VOCABULARY_TOKEN_LINE_RATIO = 0.95
+MIN_STRONG_TOKENIZER_VOCABULARY_LINES = 128
+MIN_STRONG_TOKENIZER_VOCABULARY_SENTINELS = 4
+MIN_STRONG_TOKENIZER_VOCABULARY_SUBWORD_LINES = 4
+MAX_TOKENIZER_VOCABULARY_TOKEN_BYTES = 256
+MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES = 1024
+TOKENIZER_VOCABULARY_SENTINELS = frozenset({b"[PAD]", b"[UNK]", b"[CLS]", b"[SEP]", b"[MASK]"})
+TOKENIZER_VOCABULARY_SUBWORD_PREFIXES = ("##", "\u0120", "\u2581")
+TOKENIZER_VOCABULARY_SUBWORD_SUFFIXES = ("</w>", "@@")
 BARE_NETWORK_URL_TOKEN_PATTERN = re.compile(rb"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 REQUIREMENTS_RAW_URL_PATTERN = re.compile(rb"https?://\S+", re.IGNORECASE)
 BARE_NETWORK_IPV4_TOKEN_PATTERN = re.compile(
@@ -655,14 +677,90 @@ class TextScanner(BaseScanner):
         return filename in PASSIVE_DATA_TEXT_FILENAMES or filename.startswith(PASSIVE_DATA_TEXT_PREFIXES)
 
     @staticmethod
-    def _finding_line_parts(payload: bytes, finding: dict[str, Any]) -> tuple[bytes, int] | None:
+    def _has_tokenizer_vocabulary_filename(path: str) -> bool:
+        filename = os.path.basename(path).lower()
+        return filename in TOKENIZER_VOCABULARY_FILENAMES or (
+            filename.endswith(".txt") and filename.startswith(TOKENIZER_VOCABULARY_PREFIXES)
+        )
+
+    @staticmethod
+    def _is_tokenizer_vocabulary_token_line(line: bytes) -> bool:
+        if not line or len(line) > MAX_TOKENIZER_VOCABULARY_TOKEN_BYTES:
+            return False
+        if line != line.strip():
+            return False
+        return not any(value <= 0x20 or value == 0x7F for value in line)
+
+    @staticmethod
+    def _find_next_line_separator(payload: bytes, start: int) -> tuple[int, int]:
+        payload_length = len(payload)
+        index = start
+        while index < payload_length:
+            value = payload[index]
+            if value == 0x0A:
+                return index, index + 1
+            if value == 0x0D:
+                next_start = index + 1
+                if next_start < payload_length and payload[next_start] == 0x0A:
+                    next_start += 1
+                return index, next_start
+            index += 1
+        return payload_length, payload_length
+
+    @classmethod
+    def _tokenizer_vocabulary_line_evidence(cls, payload: bytes) -> tuple[int, int, int, int]:
+        token_lines = 0
+        nonempty_lines = 0
+        sentinel_lines = 0
+        subword_lines = 0
+        line_start = 0
+        payload_length = len(payload)
+        while line_start < payload_length:
+            line_end, next_line_start = cls._find_next_line_separator(payload, line_start)
+            raw_line = payload[line_start:line_end]
+            line_start = next_line_start
+            line = raw_line.strip()
+            if not line:
+                continue
+            nonempty_lines += 1
+            if not cls._is_tokenizer_vocabulary_token_line(line):
+                continue
+            token_lines += 1
+            if line in TOKENIZER_VOCABULARY_SENTINELS:
+                sentinel_lines += 1
+            try:
+                line_text = line.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            if line_text.startswith(TOKENIZER_VOCABULARY_SUBWORD_PREFIXES) or line_text.endswith(
+                TOKENIZER_VOCABULARY_SUBWORD_SUFFIXES
+            ):
+                subword_lines += 1
+        return nonempty_lines, token_lines, sentinel_lines, subword_lines
+
+    @classmethod
+    def _has_line_oriented_tokenizer_vocabulary_evidence(cls, path: str, payload: bytes) -> bool:
+        nonempty_lines, token_lines, sentinel_lines, subword_lines = cls._tokenizer_vocabulary_line_evidence(payload)
+        if nonempty_lines == 0 or token_lines / nonempty_lines < MIN_TOKENIZER_VOCABULARY_TOKEN_LINE_RATIO:
+            return False
+
+        if cls._has_tokenizer_vocabulary_filename(path):
+            return nonempty_lines >= MIN_TOKENIZER_VOCABULARY_LINES
+
+        return (
+            nonempty_lines >= MIN_STRONG_TOKENIZER_VOCABULARY_LINES
+            and sentinel_lines >= MIN_STRONG_TOKENIZER_VOCABULARY_SENTINELS
+            and subword_lines >= MIN_STRONG_TOKENIZER_VOCABULARY_SUBWORD_LINES
+        )
+
+    @classmethod
+    def _finding_line_parts(cls, payload: bytes, finding: dict[str, Any]) -> tuple[bytes, int] | None:
         position = finding.get("position")
         if not isinstance(position, int) or position < 0 or position > len(payload):
             return None
-        line_start = max(payload.rfind(b"\n", 0, position) + 1, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
-        line_end = payload.find(b"\n", position)
-        if line_end < 0:
-            line_end = len(payload)
+        previous_separator = max(payload.rfind(b"\n", 0, position), payload.rfind(b"\r", 0, position))
+        line_start = max(previous_separator + 1, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        line_end, _ = cls._find_next_line_separator(payload, position)
         line_end = min(line_end, position + MAX_TEXT_FINDING_CONTEXT_BYTES)
         return payload[line_start:line_end], position - line_start
 
@@ -1463,6 +1561,69 @@ class TextScanner(BaseScanner):
             return False
         return any(isinstance(value, str) and line_text == value.casefold() for value in candidates)
 
+    @classmethod
+    def _is_isolated_tokenizer_vocabulary_cc_finding(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        if finding.get("type") != "cc_pattern":
+            return False
+
+        pattern = finding.get("pattern")
+        if not isinstance(pattern, str) or pattern.casefold() not in TOKENIZER_VOCABULARY_OMITTABLE_CC_PATTERNS:
+            return False
+
+        line = cls._finding_line(payload, finding)
+        if line is None or not cls._is_tokenizer_vocabulary_token_line(line):
+            return False
+
+        try:
+            line_text = line.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+
+        for prefix in ("##", "\u0120", "\u2581"):
+            if line_text.startswith(prefix):
+                line_text = line_text[len(prefix) :]
+                break
+        for suffix in TOKENIZER_VOCABULARY_SUBWORD_SUFFIXES:
+            if line_text.endswith(suffix):
+                line_text = line_text[: -len(suffix)]
+                break
+
+        pattern_text = pattern.casefold()
+        normalized_line_text = line_text.casefold()
+        return normalized_line_text in {pattern_text, f"{pattern_text}s"}
+
+    @classmethod
+    def _retarget_or_omit_tokenizer_vocabulary_cc_finding(
+        cls,
+        payload: bytes,
+        finding: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, bool]:
+        pattern = finding.get("pattern")
+        if finding.get("type") != "cc_pattern" or not isinstance(pattern, str):
+            return finding, False
+
+        pattern_text = pattern.casefold()
+        if pattern_text not in TOKENIZER_VOCABULARY_OMITTABLE_CC_PATTERNS:
+            return finding, False
+
+        pattern_bytes = pattern_text.encode()
+        lowered_payload = payload.lower()
+        search_start = 0
+        occurrences_examined = 0
+        while True:
+            position = lowered_payload.find(pattern_bytes, search_start)
+            if position < 0:
+                return None, False
+            occurrences_examined += 1
+            if occurrences_examined > MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES:
+                return finding, True
+            candidate = {**finding, "position": position}
+            if cls._is_isolated_tokenizer_vocabulary_cc_finding(payload, candidate):
+                search_start = position + len(pattern_bytes)
+                continue
+            candidate.pop("snippet", None)
+            return candidate, False
+
     @staticmethod
     def _all_network_candidate_lines_are_bare(payload: bytes) -> bool:
         for line in payload.splitlines():
@@ -1546,12 +1707,14 @@ class TextScanner(BaseScanner):
         path: str,
         payload: bytes,
         findings: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], bool]:
+    ) -> tuple[list[dict[str, Any]], bool, set[str]]:
         classified_findings: list[dict[str, Any]] = []
         classification_incomplete = False
+        classification_limit_sources: set[str] = set()
         remaining_occurrences = MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES
         documentation_sidecar = cls._is_documentation_sidecar(path)
         lowered_payload = payload.lower() if documentation_sidecar else b""
+        tokenizer_vocabulary_sidecar = cls._has_line_oriented_tokenizer_vocabulary_evidence(path, payload)
         last_retargetable_index = max(
             (index for index, finding in enumerate(findings) if cls._documentation_finding_tokens(finding)),
             default=-1,
@@ -1567,10 +1730,23 @@ class TextScanner(BaseScanner):
                     index == last_retargetable_index,
                 )
                 classification_incomplete = classification_incomplete or retarget_incomplete
+                if retarget_incomplete:
+                    classification_limit_sources.add("documentation")
+            if tokenizer_vocabulary_sidecar:
+                retargeted_finding, tokenizer_retarget_incomplete = (
+                    cls._retarget_or_omit_tokenizer_vocabulary_cc_finding(payload, finding)
+                )
+                classification_incomplete = classification_incomplete or tokenizer_retarget_incomplete
+                retarget_incomplete = retarget_incomplete or tokenizer_retarget_incomplete
+                if tokenizer_retarget_incomplete:
+                    classification_limit_sources.add("tokenizer_vocabulary")
+                if retargeted_finding is None:
+                    continue
+                finding = retargeted_finding
             if not retarget_incomplete and cls._sidecar_network_finding_is_informational(path, payload, finding):
                 finding = {**finding, "severity": "INFO"}
             classified_findings.append(finding)
-        return classified_findings, classification_incomplete
+        return classified_findings, classification_incomplete, classification_limit_sources
 
     @staticmethod
     def _is_unreadable_path_result(result: ScanResult) -> bool:
@@ -1699,23 +1875,45 @@ class TextScanner(BaseScanner):
                     max_findings=max_findings,
                 )
                 network_findings, finding_limit = self._split_detector_finding_limit(network_findings)
-                network_findings, classification_incomplete = self._downgrade_sidecar_network_findings(
-                    path,
-                    inspected_payload,
-                    network_findings,
+                network_findings, classification_incomplete, classification_limit_sources = (
+                    self._downgrade_sidecar_network_findings(
+                        path,
+                        inspected_payload,
+                        network_findings,
+                    )
                 )
                 if network_findings or not truncated:
                     self.add_network_communication_findings(network_findings, result, context=path)
                 if classification_incomplete:
                     detector_incomplete = True
+                    classification_limits = {
+                        "documentation": MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES,
+                        "tokenizer_vocabulary": MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES,
+                    }
+                    active_classification_limits = [
+                        classification_limits[source]
+                        for source in classification_limit_sources
+                        if source in classification_limits
+                    ]
+                    classification_details: dict[str, Any] = {
+                        "classification_limit_sources": sorted(classification_limit_sources),
+                    }
+                    if len(active_classification_limits) == 1:
+                        classification_details["max_classification_occurrences"] = active_classification_limits[0]
+                    if "documentation" in classification_limit_sources:
+                        classification_details["max_documentation_classification_occurrences"] = (
+                            MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES
+                        )
+                    if "tokenizer_vocabulary" in classification_limit_sources:
+                        classification_details["max_tokenizer_vocabulary_cc_retarget_occurrences"] = (
+                            MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES
+                        )
                     self._mark_content_security_scan_incomplete(
                         result,
                         path,
                         reason=TEXT_CONTENT_SECURITY_CLASSIFICATION_LIMIT_REASON,
-                        message="Documentation network finding classification exceeded the work limit",
-                        details={
-                            "max_classification_occurrences": MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES,
-                        },
+                        message="Text network finding classification exceeded the work limit",
+                        details=classification_details,
                     )
                 if finding_limit is not None:
                     if self._passive_network_reporting_limit(
