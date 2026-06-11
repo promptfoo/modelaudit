@@ -1463,13 +1463,19 @@ def create_matmul_integer_weight_model(
 
 
 def create_qdq_4bit_weight_model(tmp_path: Path, data_type: int, *, malicious: bool = False) -> Path:
-    high_value = 7 if data_type == TensorProto.INT4 else 15
+    high_values: dict[int, int] = {
+        int(TensorProto.INT2): 1,
+        int(TensorProto.UINT2): 3,
+        int(TensorProto.INT4): 7,
+        int(TensorProto.UINT4): 15,
+    }
+    high_value = high_values[data_type]
     values = [0] * (100 * 10)
     if malicious:
         for row in range(50, 55):
             values[row * 10 + 3] = high_value
     quantized_weight = helper.make_tensor("W", data_type, [100, 10], values)
-    scale = onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="scale")
+    scale = onnx.numpy_helper.from_array(np.asarray(10.0, dtype=np.float32), name="scale")
     zero_point = helper.make_tensor("zero_point", data_type, [], [0])
     X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])
     Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])
@@ -1483,6 +1489,97 @@ def create_qdq_4bit_weight_model(tmp_path: Path, data_type: int, *, malicious: b
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
     model.ir_version = 10
     path = tmp_path / f"qdq-weight-{TensorProto.DataType.Name(data_type).lower()}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_qdq_transposed_weight_model(tmp_path: Path, *, malicious: bool = False) -> Path:
+    weights = np.zeros((10, 100), dtype=np.int8)
+    if malicious:
+        weights[3, 50:55] = 100
+    quantized_weight = onnx.numpy_helper.from_array(weights, name="W")
+    scale = onnx.numpy_helper.from_array(np.linspace(0.1, 1.0, 10, dtype=np.float32), name="scale")
+    zero_point = onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="zero_point")
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])
+    nodes = [
+        helper.make_node("DequantizeLinear", ["W", "scale", "zero_point"], ["dequantized_weight"], axis=0),
+        helper.make_node("Transpose", ["dequantized_weight"], ["transposed_weight"], perm=[1, 0]),
+        helper.make_node("MatMul", ["X", "transposed_weight"], ["Y"]),
+    ]
+    graph = helper.make_graph(
+        nodes, "qdq_transposed_weight_graph", [X], [Y], initializer=[quantized_weight, scale, zero_point]
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / "qdq-transposed-weight.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_qlinear_matmul_nd_scale_model(tmp_path: Path, *, malicious: bool = False) -> Path:
+    weights = np.zeros((100, 10), dtype=np.uint8)
+    if malicious:
+        weights[50:55, 3] = 255
+    initializers = [
+        onnx.numpy_helper.from_array(weights, name="W"),
+        onnx.numpy_helper.from_array(np.asarray(0.1, dtype=np.float32), name="X_scale"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="X_zero_point"),
+        onnx.numpy_helper.from_array(np.ones((1, 10), dtype=np.float32), name="W_scale"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="W_zero_point"),
+        onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="Y_scale"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="Y_zero_point"),
+    ]
+    X = helper.make_tensor_value_info("X", TensorProto.UINT8, [1, 100])
+    Y = helper.make_tensor_value_info("Y", TensorProto.UINT8, [1, 10])
+    node = helper.make_node(
+        "QLinearMatMul",
+        ["X", "X_scale", "X_zero_point", "W", "W_scale", "W_zero_point", "Y_scale", "Y_zero_point"],
+        ["Y"],
+        name="qlinear_matmul",
+    )
+    graph = helper.make_graph([node], "qlinear_matmul_nd_scale_graph", [X], [Y], initializer=initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+    path = tmp_path / "qlinear-matmul-nd-scale.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_qlinear_matmul_group_fanout_model(tmp_path: Path, *, consumer_count: int = 100) -> Path:
+    weights = np.zeros((64, 64), dtype=np.uint8)
+    weights[50:55, 3] = 255
+    initializers = [
+        onnx.numpy_helper.from_array(weights, name="W"),
+        onnx.numpy_helper.from_array(np.asarray(0.1, dtype=np.float32), name="X_scale"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="X_zero_point"),
+        onnx.numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name="Y_scale"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="Y_zero_point"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.uint8), name="W_zero_point"),
+    ]
+    nodes = []
+    for index in range(consumer_count):
+        scale_name = f"W_scale_{index}"
+        initializers.append(
+            onnx.numpy_helper.from_array(np.asarray(0.1 + index / 1000, dtype=np.float32), name=scale_name)
+        )
+        nodes.append(
+            helper.make_node(
+                "QLinearMatMul",
+                ["X", "X_scale", "X_zero_point", "W", scale_name, "W_zero_point", "Y_scale", "Y_zero_point"],
+                [f"Y_{index}"],
+                name=f"qlinear_matmul_{index}",
+            ),
+        )
+    X = helper.make_tensor_value_info("X", TensorProto.UINT8, [1, 64])
+    Y = helper.make_tensor_value_info(f"Y_{consumer_count - 1}", TensorProto.UINT8, [1, 64])
+    graph = helper.make_graph(nodes, "qlinear_group_fanout", [X], [Y], initializer=initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
+    model.ir_version = 10
+    onnx.checker.check_model(model)
+    path = tmp_path / "qlinear-group-fanout.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -5270,7 +5367,7 @@ class TestWeightDistributionSemantics:
 
     @pytest.mark.parametrize("data_type", [TensorProto.INT4, TensorProto.UINT4])
     @pytest.mark.parametrize("malicious", [False, True])
-    def test_qdq_4bit_weight_path_is_analyzed(
+    def test_qdq_low_bit_weight_path_is_analyzed(
         self,
         tmp_path: Path,
         data_type: int,
@@ -5287,6 +5384,59 @@ class TestWeightDistributionSemantics:
         assert semantics["eligible_initializer_count"] == 1
         assert semantics["analyzed_initializer_count"] == 1
         assert semantics["eligible"][0]["quantization_kind"] == "DequantizeLinear"
+
+    @pytest.mark.parametrize("data_type", [TensorProto.INT2, TensorProto.UINT2])
+    def test_qdq_2bit_weight_path_fails_closed_when_decoder_cannot_materialize(
+        self,
+        tmp_path: Path,
+        data_type: int,
+    ) -> None:
+        model_path = create_qdq_4bit_weight_model(tmp_path, data_type, malicious=True)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        assert coverage[0].details["extraction_failures"] == 1
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
+
+    def test_qdq_transpose_materializes_before_axis_changes(self, tmp_path: Path) -> None:
+        model_path = create_qdq_transposed_weight_model(tmp_path, malicious=True)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        checks = self._extreme_checks(result)
+        assert len(checks) == 1
+        assert checks[0].details["affected_neurons"] == [3]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 1
+        context = semantics["eligible"][0]
+        assert context["lineage"] == ["DequantizeLinear", "Transpose"]
+        assert context["quantization_axis"] == 0
+
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_qlinear_matmul_nd_scale_broadcast_is_analyzed(
+        self,
+        tmp_path: Path,
+        malicious: bool,
+    ) -> None:
+        model_path = create_qlinear_matmul_nd_scale_model(tmp_path, malicious=malicious)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        checks = self._extreme_checks(result)
+        assert len(checks) == int(malicious)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 1
+        context = semantics["eligible"][0]
+        assert context["consumer_op"] == "QLinearMatMul"
+        assert context["quantization_scale"] == "W_scale"
 
     def test_quantized_lineage_self_overwrite_cycle_is_bounded(self, tmp_path: Path) -> None:
         weights = np.zeros((100, 10), dtype=np.int8)
@@ -5368,6 +5518,19 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["eligible_initializer_count"] == 1
         assert semantics["analyzed_layer_count"] == 100
+
+    def test_quantized_copy_retained_budget_fails_closed(self, tmp_path: Path) -> None:
+        model_path = create_qlinear_matmul_group_fanout_model(tmp_path)
+
+        result = OnnxScanner({"max_array_size": 64 * 64 * 4 + 1}).scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        assert coverage[0].details["extraction_failures"] == 1
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_layer_count"] < 100
 
     def test_sparse_weight_lineage_fails_closed(self, tmp_path: Path) -> None:
         model_path = create_sparse_weight_model(tmp_path)
@@ -5803,6 +5966,24 @@ class TestWeightDistributionSemantics:
         assert {issue.details["consumer_op"] for issue in onnx_weight_issues} == {"MatMul", "Gather"}
         assert sum(1 for issue in onnx_weight_issues if issue.details["consumer_op"] == "Gather") == 2
 
+    def test_aggregate_does_not_cluster_distinct_file_hashes_with_same_signature(self, tmp_path: Path) -> None:
+        positive_weights = np.zeros((100, 10), dtype=np.float32)
+        positive_weights[50:55, 3] = 10.0
+        negative_weights = np.zeros((100, 10), dtype=np.float32)
+        negative_weights[10:15, 3] = -10.0
+        create_onnx_weight_model(tmp_path, positive_weights, op_type="MatMul", filename="positive.onnx")
+        create_onnx_weight_model(tmp_path, negative_weights, op_type="MatMul", filename="negative.onnx")
+
+        aggregate = scan_model_directory_or_file(
+            str(tmp_path),
+            recursive=False,
+            scanners=["onnx"],
+            cache_enabled=False,
+        )
+
+        clustered = [issue for issue in aggregate.issues if issue.details.get("clustered_onnx_weight_anomaly") is True]
+        assert clustered == []
+
     @pytest.mark.integration
     def test_hf_minilm_pinned_quantized_export_has_bounded_lineage_coverage(self, tmp_path: Path) -> None:
         huggingface_hub = pytest.importorskip("huggingface_hub")
@@ -5820,6 +6001,13 @@ class TestWeightDistributionSemantics:
         assert semantics["analyzed_initializer_count"] == 72
         assert semantics["analyzed_layer_count"] == 72
         assert semantics["coverage_gaps"] == {"lineages_per_value_limit": 109}
+        anomaly_checks = [
+            check
+            for check in result.checks
+            if check.name == "Weight Distribution Anomaly Detection" and check.status == CheckStatus.FAILED
+        ]
+        assert len(anomaly_checks) == 31
+        assert {check.severity for check in anomaly_checks} == {IssueSeverity.INFO}
         assert all(
             check.details["analyzed_initializers"] == 72
             for check in result.checks

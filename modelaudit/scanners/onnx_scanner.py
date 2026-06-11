@@ -94,6 +94,7 @@ _ONNX_WEIGHT_NODE_VISIT_LIMIT = 200_000
 _ONNX_WEIGHT_EDGE_VISIT_LIMIT = 1_000_000
 _ONNX_INTEGER_SCALE_TRACE_DEPTH_LIMIT = 4
 _ONNX_INTEGER_SCALE_TRACE_NODE_LIMIT = 32
+_ONNX_WEIGHT_RETAINED_ARRAY_BUDGET_MULTIPLIER = 8
 _ONNX_WEIGHT_RESHAPE_RANK_LIMIT = 64
 _ONNX_WEIGHT_METADATA_TEXT_LIMIT = 256
 _ONNX_WEIGHT_METADATA_SEQUENCE_LIMIT = 64
@@ -1143,6 +1144,8 @@ def _build_onnx_weight_analysis_plan(
     quantized_integer_types = {
         int(getattr(onnx.TensorProto, name))
         for name in (
+            "INT2",
+            "UINT2",
             "INT4",
             "UINT4",
             "INT8",
@@ -2836,6 +2839,11 @@ def _build_onnx_weight_analysis_plan(
             return parameter.reshape(())
         if axis is None or axis < 0 or axis >= len(target_shape):
             raise ValueError(f"Quantized weight {role} axis is invalid")
+        if parameter.ndim > 1:
+            try:
+                return np.broadcast_to(parameter, target_shape)
+            except ValueError as exc:
+                raise ValueError(f"Quantized weight {role} shape is incompatible with weight shape") from exc
         if parameter.ndim != 1 or int(parameter.shape[0]) != int(target_shape[axis]):
             raise ValueError(f"Quantized weight {role} shape is incompatible with weight axis")
         broadcast_shape = [1] * len(target_shape)
@@ -2914,37 +2922,60 @@ def _build_onnx_weight_analysis_plan(
             transformed_views: dict[tuple[_OnnxWeightTransform, ...], Any] = {(): array}
             quantized_views: dict[tuple[tuple[_OnnxWeightTransform, ...], _OnnxWeightQuantization], Any] = {}
             for consumer_group in initializer_groups.values():
-                transformed = transformed_views.get(consumer_group.lineage.transforms)
-                if transformed is None:
-                    transformed = array
-                    for transform in consumer_group.lineage.transforms:
-                        if transform.kind == "Identity":
-                            continue
-                        if transform.kind == "DequantizeLinear":
-                            continue
-                        if transform.kind == "Transpose":
-                            transformed = np.transpose(transformed, axes=transform.parameters)
-                        elif transform.kind == "Reshape":
-                            transformed = np.reshape(transformed, transform.parameters)
-                        if transformed.size and not np.shares_memory(array, transformed):
-                            raise RuntimeError("ONNX weight lineage transform requires a full-tensor copy")
-                    transformed_views[consumer_group.lineage.transforms] = transformed
                 analysis_materialization = "zero_copy_view_chunked_reduction"
-                analysis_storage_shares_memory = bool(array.size == 0 or np.shares_memory(array, transformed))
                 if consumer_group.quantization is not None:
                     quantized_key = (consumer_group.lineage.transforms, consumer_group.quantization)
-                    quantized = quantized_views.get(quantized_key)
-                    if quantized is None:
-                        quantized = materialize_quantized_weights(transformed, consumer_group.quantization)
-                        if retain_array_check is not None and not retain_array_check(
-                            bounded_name,
-                            int(quantized.nbytes),
-                        ):
-                            raise ValueError("Quantized weight dequantization exceeds retained array budget")
-                        quantized_views[quantized_key] = quantized
-                    transformed = quantized
+                    transformed = quantized_views.get(quantized_key)
+                    if transformed is None:
+                        transformed = array
+                        quantization_applied = False
+                        for transform in consumer_group.lineage.transforms:
+                            if transform.kind == "Identity":
+                                continue
+                            if transform.kind == "DequantizeLinear":
+                                transformed = materialize_quantized_weights(transformed, consumer_group.quantization)
+                                if retain_array_check is not None and not retain_array_check(
+                                    bounded_name,
+                                    int(transformed.nbytes),
+                                ):
+                                    raise ValueError("Quantized weight dequantization exceeds retained array budget")
+                                quantization_applied = True
+                                continue
+                            if transform.kind == "Transpose":
+                                transformed = np.transpose(transformed, axes=transform.parameters)
+                            elif transform.kind == "Reshape":
+                                transformed = np.reshape(transformed, transform.parameters)
+                            if (
+                                not quantization_applied
+                                and transformed.size
+                                and not np.shares_memory(array, transformed)
+                            ):
+                                raise RuntimeError("ONNX weight lineage transform requires a full-tensor copy")
+                        if not quantization_applied:
+                            transformed = materialize_quantized_weights(transformed, consumer_group.quantization)
+                            if retain_array_check is not None and not retain_array_check(
+                                bounded_name,
+                                int(transformed.nbytes),
+                            ):
+                                raise ValueError("Quantized weight dequantization exceeds retained array budget")
+                        quantized_views[quantized_key] = transformed
                     analysis_materialization = "bounded_quantized_dequantize_copy"
                     analysis_storage_shares_memory = False
+                else:
+                    transformed = transformed_views.get(consumer_group.lineage.transforms)
+                    if transformed is None:
+                        transformed = array
+                        for transform in consumer_group.lineage.transforms:
+                            if transform.kind == "Identity":
+                                continue
+                            if transform.kind == "Transpose":
+                                transformed = np.transpose(transformed, axes=transform.parameters)
+                            elif transform.kind == "Reshape":
+                                transformed = np.reshape(transformed, transform.parameters)
+                            if transformed.size and not np.shares_memory(array, transformed):
+                                raise RuntimeError("ONNX weight lineage transform requires a full-tensor copy")
+                        transformed_views[consumer_group.lineage.transforms] = transformed
+                    analysis_storage_shares_memory = bool(array.size == 0 or np.shares_memory(array, transformed))
 
                 output_axes = consumer_group.output_axes
                 tensor_weights = transformed
@@ -3847,12 +3878,25 @@ class OnnxScanner(BaseScanner):
         def inline_storage_fits_budget(initializer: Any, _name: str, _estimated_bytes: int) -> bool:
             return max_array_size is None or _onnx_inline_storage_nbytes(initializer) <= max_array_size
 
+        retained_array_budget = (
+            None if max_array_size is None else max_array_size * _ONNX_WEIGHT_RETAINED_ARRAY_BUDGET_MULTIPLIER
+        )
+        retained_array_bytes = 0
+
+        def retained_array_fits_budget(_name: str, retained_bytes: int) -> bool:
+            nonlocal retained_array_bytes
+            if retained_array_budget is not None and retained_array_bytes + retained_bytes > retained_array_budget:
+                return False
+            retained_array_bytes += retained_bytes
+            return True
+
         plan = _build_onnx_weight_analysis_plan(
             model,
             onnx=onnx,
             np=np,
             max_array_size=max_array_size,
             pre_materialization_check=inline_storage_fits_budget,
+            retain_array_check=retained_array_fits_budget,
         )
         result.metadata["onnx_weight_distribution_semantics"] = plan.metadata
 

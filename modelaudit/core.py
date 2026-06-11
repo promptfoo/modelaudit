@@ -989,7 +989,11 @@ def _stable_cluster_value(value: Any) -> Any:
     return value
 
 
-def _onnx_weight_anomaly_cluster_key(issue: Issue) -> tuple[Any, ...] | None:
+def _onnx_weight_anomaly_cluster_key(
+    issue: Issue,
+    *,
+    content_hash: str | None = None,
+) -> tuple[Any, ...] | None:
     if getattr(issue, "type", None) != "onnx_check":
         return None
     details = issue.details if isinstance(issue.details, dict) else {}
@@ -1002,6 +1006,7 @@ def _onnx_weight_anomaly_cluster_key(issue: Issue) -> tuple[Any, ...] | None:
     return (
         issue.message,
         issue.severity,
+        content_hash,
         _stable_cluster_value(details.get("analysis_method")),
         _stable_cluster_value(details.get("initializer")),
         _stable_cluster_value(details.get("initializer_graph_index")),
@@ -1057,7 +1062,7 @@ def _onnx_weight_anomaly_provenance(results: ModelAuditResultModel, issue: Issue
 def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
     clusters: dict[tuple[Any, ...], list[Issue]] = {}
     for issue in results.issues:
-        key = _onnx_weight_anomaly_cluster_key(issue)
+        key = _onnx_weight_anomaly_cluster_key(issue, content_hash=_file_content_hash(results, issue.location))
         if key is not None:
             clusters.setdefault(key, []).append(issue)
 
@@ -1067,7 +1072,7 @@ def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
     emitted: set[tuple[Any, ...]] = set()
     retained_issues: list[Issue] = []
     for issue in results.issues:
-        key = _onnx_weight_anomaly_cluster_key(issue)
+        key = _onnx_weight_anomaly_cluster_key(issue, content_hash=_file_content_hash(results, issue.location))
         if key is None:
             retained_issues.append(issue)
             continue
