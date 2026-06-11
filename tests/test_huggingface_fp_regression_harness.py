@@ -629,6 +629,38 @@ def test_hf_repo_dry_run_max_size_refuses_unselected_content_route_candidates() 
     mock_scan.assert_not_called()
 
 
+def test_hf_repo_dry_run_allows_harmless_unselected_sidecars() -> None:
+    runner = CliRunner()
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": "a" * 40,
+        "total_size": 30,
+        "file_count": 3,
+        "files": [
+            {"name": "model.safetensors", "size": 20},
+            {"name": "assets/thumbnail.png", "size": 5},
+            {"name": "train_script.py", "size": 5},
+        ],
+    }
+
+    with (
+        _mock_hf_model_info(return_value=metadata),
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+        patch("modelaudit.utils.sources.huggingface._read_huggingface_prefix") as mock_read_prefix,
+    ):
+        result = runner.invoke(cli, ["scan", "--dry-run", "--format", "json", "hf://test/model"])
+
+    parsed = parse_click_json_output(result.stdout)
+    assert result.exit_code == 0, result.output
+    assert parsed["files_scanned"] == 0
+    assert "Download: skipped (--dry-run)" in result.stderr
+    mock_read_prefix.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
 def test_hf_repo_dry_run_refuses_unselected_content_route_candidates_without_size_cap() -> None:
     runner = CliRunner()
     metadata = {
@@ -808,6 +840,36 @@ def test_hf_file_dry_run_preview_rejects_scanner_excluded_file() -> None:
 
     assert result.exit_code == 2
     assert "cannot prove this file would be scanned from metadata" in result.output
+    mock_download_file.assert_not_called()
+    mock_scan.assert_not_called()
+
+
+def test_hf_file_dry_run_preview_allows_exclude_only_selection() -> None:
+    url = "https://huggingface.co/test/model/resolve/main/model.safetensors"
+    runner = CliRunner()
+
+    with (
+        patch(
+            "modelaudit.cli.get_huggingface_file_info",
+            return_value={
+                "repo_id": "test/model",
+                "revision": "main",
+                "resolved_revision": "b" * 40,
+                "filename": "model.safetensors",
+                "size": 123,
+            },
+        ),
+        patch("modelaudit.cli.download_file_from_hf") as mock_download_file,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+    ):
+        result = runner.invoke(
+            cli,
+            ["scan", "--dry-run", "--format", "json", "--exclude-scanner", "metadata", url],
+        )
+
+    parsed = parse_click_json_output(result.stdout)
+    assert result.exit_code == 0, result.output
+    assert parsed["files_scanned"] == 0
     mock_download_file.assert_not_called()
     mock_scan.assert_not_called()
 

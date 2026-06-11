@@ -3135,17 +3135,50 @@ class TestGetModelInfo:
         }
         mock_api.list_repo_tree.assert_called_once_with("test/model", recursive=True, revision=TEST_COMMIT_SHA)
 
+    @patch("modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline")
     @patch("huggingface_hub.HfApi")
-    def test_get_model_info_passes_timeout_to_revision_lookup(self, mock_hf_api_class: MagicMock) -> None:
+    def test_get_model_info_passes_timeout_to_metadata_lookups(
+        self,
+        mock_hf_api_class: MagicMock,
+        mock_worker: MagicMock,
+    ) -> None:
         mock_api = MagicMock()
         mock_hf_api_class.return_value = mock_api
         mock_api.model_info.return_value = SimpleNamespace(modelId="test/model", sha=TEST_COMMIT_SHA, siblings=[])
-        mock_api.list_repo_tree.return_value = []
+        mock_worker.return_value = {"value": {"files": [{"path": "model.safetensors", "size": 0}]}}
 
-        get_model_info("https://huggingface.co/test/model", timeout_seconds=7)
+        info = get_model_info("https://huggingface.co/test/model", timeout_seconds=7)
 
         mock_api.model_info.assert_called_once_with("test/model", timeout=7)
-        mock_api.list_repo_tree.assert_called_once_with("test/model", recursive=True, revision=TEST_COMMIT_SHA)
+        mock_api.list_repo_tree.assert_not_called()
+        mock_worker.assert_called_once()
+        operation, operation_kwargs, deadline, repo_id = mock_worker.call_args.args
+        assert operation == "list_repo_tree"
+        assert operation_kwargs == {"repo_id": "test/model", "revision": TEST_COMMIT_SHA}
+        assert isinstance(deadline, float)
+        assert repo_id == "test/model"
+        assert info["files"] == [{"name": "model.safetensors", "size": 0}]
+
+    @patch("modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline")
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_info_recursive_tree_timeout_propagates(
+        self,
+        mock_hf_api_class: MagicMock,
+        mock_worker: MagicMock,
+    ) -> None:
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.model_info.return_value = SimpleNamespace(
+            modelId="test/model",
+            sha=TEST_COMMIT_SHA,
+            siblings=[SimpleNamespace(rfilename="model.safetensors")],
+        )
+        mock_worker.side_effect = TimeoutError("Hugging Face acquisition timed out for test/model")
+
+        with pytest.raises(Exception, match="timed out for test/model"):
+            get_model_info("https://huggingface.co/test/model", timeout_seconds=1)
+
+        mock_api.list_repo_tree.assert_not_called()
 
     @patch("huggingface_hub.HfApi")
     def test_get_model_info_without_author(self, mock_hf_api_class: MagicMock) -> None:

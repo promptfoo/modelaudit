@@ -31,6 +31,21 @@ def _run_operation(operation: str, operation_kwargs: dict[str, Any]) -> dict[str
                 if isinstance(file_name, str) and file_name:
                     files.append(file_name)
         return {"value": {"files": files, "revision": getattr(repo_info, "sha", None)}}
+    if operation == "list_repo_tree":
+        from huggingface_hub import HfApi
+
+        repo_files = HfApi().list_repo_tree(
+            operation_kwargs["repo_id"],
+            recursive=True,
+            revision=operation_kwargs.get("revision"),
+        )
+        tree_files: list[dict[str, Any]] = []
+        for item in repo_files:
+            path = getattr(item, "path", None)
+            if not isinstance(path, str) or not hasattr(item, "size"):
+                continue
+            tree_files.append({"path": path, "size": getattr(item, "size", None)})
+        return {"value": {"files": tree_files}}
     if operation == "snapshot_download":
         from huggingface_hub import snapshot_download
 

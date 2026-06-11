@@ -114,6 +114,29 @@ from .utils.sources.pytorch_hub import (
 
 logger = logging.getLogger("modelaudit")
 _JSON_VALUE_ADAPTER = TypeAdapter(Any)
+_HF_DRY_RUN_HARMLESS_UNSELECTED_SUFFIXES = frozenset(
+    {
+        ".cfg",
+        ".csv",
+        ".gif",
+        ".gitignore",
+        ".ini",
+        ".ipynb",
+        ".jpeg",
+        ".jpg",
+        ".lock",
+        ".log",
+        ".png",
+        ".py",
+        ".pyw",
+        ".svg",
+        ".toml",
+        ".tsv",
+        ".webp",
+        ".yaml",
+        ".yml",
+    }
+)
 
 
 def _display_path(path: str) -> str:
@@ -238,15 +261,20 @@ def _huggingface_preview_files_by_name(files: object, names: list[str]) -> list[
     return selected
 
 
-def _huggingface_preview_has_unselected_files(files: object, selected_files: list[dict[str, Any]]) -> bool:
-    """Return whether metadata contains files not covered by metadata-only preview routing."""
+def _huggingface_preview_has_uncertain_unselected_files(files: object, selected_files: list[dict[str, Any]]) -> bool:
+    """Return whether unselected metadata may hide content-routed model bytes."""
     all_names = set(_huggingface_preview_file_names(files))
     selected_names: set[str] = set()
     for item in selected_files:
         name = item.get("name")
         if isinstance(name, str) and name in all_names:
             selected_names.add(name)
-    return bool(all_names.difference(selected_names))
+    for name in all_names.difference(selected_names):
+        suffix = PurePosixPath(name.lower()).suffix
+        if suffix and suffix in _HF_DRY_RUN_HARMLESS_UNSELECTED_SUFFIXES:
+            continue
+        return True
+    return False
 
 
 def _huggingface_preview_download_files(metadata: dict[str, Any]) -> list[dict[str, Any]]:
@@ -344,10 +372,13 @@ def _huggingface_direct_preview_matches_metadata_route(filename: str, runtime: "
         filenames = {str(value).lower() for value in runtime.scannable_filenames or ()}
         if name_lower in filenames:
             return True
-        if runtime.scannable_extensions is None:
+        if runtime.scannable_extensions is not None:
+            extensions = {str(extension).lower() for extension in runtime.scannable_extensions if str(extension)}
+            return any(filename_lower.endswith(extension) for extension in extensions)
+        requested_scanners = runtime.scanner_selection_metadata.get("requested_scanner_ids")
+        excluded_scanners = runtime.scanner_selection_metadata.get("excluded_scanner_ids")
+        if requested_scanners or not excluded_scanners:
             return False
-        extensions = {str(extension).lower() for extension in runtime.scannable_extensions if str(extension)}
-        return any(filename_lower.endswith(extension) for extension in extensions)
 
     if runtime.skip_non_model_files and suffix in {".py", ".js", ".html", ".css"}:
         return False
@@ -415,7 +446,7 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
     if (
         not runtime.scan_and_delete
         and download_files is not None
-        and _huggingface_preview_has_unselected_files(files, download_files)
+        and _huggingface_preview_has_uncertain_unselected_files(files, download_files)
     ):
         raise ValueError(
             "Hugging Face dry-run cannot account for content-routed files without reading model bytes; refusing dry-run"

@@ -8,7 +8,7 @@ import struct
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
 from glob import escape as escape_glob
@@ -1460,6 +1460,28 @@ def _verify_huggingface_selection_within_max_size(
     return total_size
 
 
+def _collect_huggingface_tree_file_metadata(repo_files: Iterable[Any]) -> tuple[int, list[dict[str, int | str]]]:
+    """Return recursive Hub file metadata, skipping folders and git metadata."""
+    total_size = 0
+    files: list[dict[str, int | str]] = []
+    for item in repo_files:
+        if isinstance(item, dict):
+            path = item.get("path")
+            has_size = "size" in item
+            raw_size = item.get("size")
+        else:
+            path = getattr(item, "path", None)
+            has_size = hasattr(item, "size")
+            raw_size = getattr(item, "size", None)
+
+        if not isinstance(path, str) or not has_size or path == ".gitattributes":
+            continue
+        file_size = raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else 0
+        total_size += file_size
+        files.append({"name": path, "size": file_size})
+    return total_size, files
+
+
 def get_model_info(url: str, timeout_seconds: float | None = None) -> dict:
     """Get information about a HuggingFace model without downloading it.
 
@@ -1483,6 +1505,8 @@ def get_model_info(url: str, timeout_seconds: float | None = None) -> dict:
 
     api = HfApi()
     try:
+        deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+
         # Get model info for metadata
         model_info_kwargs: dict[str, Any] = {}
         if timeout_seconds is not None:
@@ -1494,15 +1518,24 @@ def get_model_info(url: str, timeout_seconds: float | None = None) -> dict:
         # Use list_repo_tree to get accurate file sizes
         # (model_info.siblings often returns None for size)
         total_size = 0
-        files = []
+        files: list[dict[str, int | str]] = []
         try:
-            repo_files = api.list_repo_tree(repo_id, recursive=True, revision=list_revision)
-            for item in repo_files:
-                # Skip metadata files and folder entries returned by recursive listings.
-                if hasattr(item, "path") and hasattr(item, "size") and item.path != ".gitattributes":
-                    file_size = getattr(item, "size", 0) or 0
-                    total_size += file_size
-                    files.append({"name": item.path, "size": file_size})
+            if deadline is None:
+                repo_files = api.list_repo_tree(repo_id, recursive=True, revision=list_revision)
+            else:
+                worker_result = _run_huggingface_worker_with_deadline(
+                    "list_repo_tree",
+                    {"repo_id": repo_id, "revision": list_revision},
+                    deadline,
+                    repo_id,
+                )
+                value = worker_result.get("value")
+                if not isinstance(value, dict) or not isinstance(value.get("files"), list):
+                    raise RuntimeError("repository tree listing returned an invalid response")
+                repo_files = value["files"]
+            total_size, files = _collect_huggingface_tree_file_metadata(repo_files)
+        except TimeoutError:
+            raise
         except Exception as e:
             # If list_repo_tree fails, return 0 (will show as "Unknown size" in CLI)
             logger.debug(f"list_repo_tree failed for {repo_id}, falling back to unknown size: {e}")
