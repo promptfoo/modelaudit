@@ -632,11 +632,51 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
 
     def deduplicate_issues(self) -> None:
         """Remove duplicate issues based on message, severity, and location."""
+
+        def stable_value(value: Any) -> Any:
+            if isinstance(value, list | tuple):
+                return tuple(stable_value(item) for item in value)
+            if isinstance(value, dict):
+                return tuple(sorted((str(key), stable_value(item)) for key, item in value.items()))
+            return value
+
+        def onnx_weight_context_key(issue: Issue) -> tuple[Any, ...] | None:
+            if getattr(issue, "type", None) != "onnx_check":
+                return None
+            details = issue.details if isinstance(issue.details, dict) else {}
+            if "affected_neurons" not in details or "initializer" not in details:
+                return None
+            return (
+                stable_value(details.get("clustered_onnx_weight_anomaly")),
+                stable_value(details.get("cluster_size")),
+                stable_value(details.get("initializer")),
+                stable_value(details.get("initializer_graph_index")),
+                stable_value(details.get("consumer_domain")),
+                stable_value(details.get("consumer_op")),
+                stable_value(details.get("consumer_input_index")),
+                stable_value(details.get("output_axes")),
+                stable_value(details.get("conceptual_output_axes")),
+                stable_value(details.get("analysis_kind")),
+                stable_value(details.get("group")),
+                stable_value(details.get("lineage")),
+                stable_value(details.get("quantized_weight")),
+                stable_value(details.get("quantization_kind")),
+                stable_value(details.get("analysis_shape")),
+                stable_value(details.get("affected_neurons")),
+                stable_value(details.get("num_extreme_weights")),
+                stable_value(details.get("max_extreme_weights_per_output")),
+            )
+
         seen_issues = set()
         deduplicated_issues = []
         for issue in self.issues:
             # Include location in the deduplication key to avoid hiding issues in different files
-            issue_key = (issue.message, issue.severity, issue.location or "")
+            issue_key = (
+                issue.message,
+                issue.severity,
+                issue.location or "",
+                onnx_weight_context_key(issue),
+            )
             if issue_key not in seen_issues:
                 seen_issues.add(issue_key)
                 deduplicated_issues.append(issue)

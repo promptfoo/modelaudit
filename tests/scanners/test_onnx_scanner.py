@@ -1387,9 +1387,13 @@ def create_einsum_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
     return path
 
 
-def create_qdq_weight_model(tmp_path: Path) -> Path:
-    quantized_weight = onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.int8), name="W")
-    scale = onnx.numpy_helper.from_array(np.asarray(0.1, dtype=np.float32), name="scale")
+def create_qdq_weight_model(tmp_path: Path, *, malicious: bool = False, malformed_scale: bool = False) -> Path:
+    weights = np.zeros((100, 10), dtype=np.int8)
+    if malicious:
+        weights[50:55, 3] = 100
+    quantized_weight = onnx.numpy_helper.from_array(weights, name="W")
+    scale_value = np.asarray([0.1, 0.2], dtype=np.float32) if malformed_scale else np.asarray(0.1, dtype=np.float32)
+    scale = onnx.numpy_helper.from_array(scale_value, name="scale")
     zero_point = onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="zero_point")
     X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])
     Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])
@@ -1400,8 +1404,62 @@ def create_qdq_weight_model(tmp_path: Path) -> Path:
     graph = helper.make_graph(nodes, "qdq_weight_graph", [X], [Y], initializer=[quantized_weight, scale, zero_point])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
+    if not malformed_scale:
+        onnx.checker.check_model(model)
+    path = tmp_path / f"qdq-weight-{'malformed' if malformed_scale else 'malicious' if malicious else 'clean'}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_matmul_integer_weight_model(
+    tmp_path: Path,
+    *,
+    malicious: bool = False,
+    omit_scale: bool = False,
+    filename: str = "matmul-integer-weight.onnx",
+) -> Path:
+    weights = np.zeros((100, 10), dtype=np.int8)
+    if malicious:
+        weights[50:55, 3] = 100
+    initializers = [
+        onnx.numpy_helper.from_array(weights, name="W_quantized"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="X_zero_point"),
+        onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="W_zero_point"),
+    ]
+    if not omit_scale:
+        initializers.append(onnx.numpy_helper.from_array(np.asarray(0.1, dtype=np.float32), name="W_scale"))
+    X = helper.make_tensor_value_info("X", TensorProto.INT8, [1, 100])
+    Y = helper.make_tensor_value_info("Y", TensorProto.INT32, [1, 10])
+    node = helper.make_node(
+        "MatMulInteger",
+        ["X", "W_quantized", "X_zero_point", "W_zero_point"],
+        ["Y"],
+        name="quantized_linear",
+    )
+    graph = helper.make_graph([node], "matmul_integer_weight_graph", [X], [Y], initializer=initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
     onnx.checker.check_model(model)
-    path = tmp_path / "qdq-weight.onnx"
+    path = tmp_path / filename
+    onnx.save(model, str(path))
+    return path
+
+
+def create_conv_group_fanout_model(tmp_path: Path, *, consumer_count: int = 101) -> Path:
+    weights = np.zeros((100, 1, 1), dtype=np.float32)
+    weights[3, 0, 0] = 10.0
+    initializer = onnx.numpy_helper.from_array(weights, name="W")
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100, 1])
+    outputs = [f"Y_{index}" for index in range(consumer_count)]
+    Y = helper.make_tensor_value_info(outputs[-1], TensorProto.FLOAT, [1, 100, 1])
+    nodes = [
+        helper.make_node("Conv", ["X", "W"], [output], name=f"conv_{index}", group=index + 1)
+        for index, output in enumerate(outputs)
+    ]
+    graph = helper.make_graph(nodes, "conv_group_fanout", [X], [Y], initializer=[initializer])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    path = tmp_path / "conv-group-fanout.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -4666,7 +4724,6 @@ class TestWeightDistributionSemantics:
     @pytest.mark.parametrize(
         ("op_type", "weights", "expected_reason"),
         [
-            ("MatMulInteger", np.full((128, 1), 127, dtype=np.int8), "quantized_operator"),
             ("Mul", np.zeros((288, 1), dtype=np.float32), "bookkeeping_constant"),
             ("Add", np.zeros((288, 1), dtype=np.float32), "bookkeeping_constant"),
         ],
@@ -5076,16 +5133,166 @@ class TestWeightDistributionSemantics:
         assert semantics["eligible"][0]["consumer_op"] == "Einsum"
         assert semantics["eligible"][0]["output_axes"] == [1]
 
-    def test_qdq_weight_path_remains_a_clean_quantized_exclusion(self, tmp_path: Path) -> None:
-        model_path = create_qdq_weight_model(tmp_path)
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_qdq_weight_path_is_analyzed_under_bounded_dequantization(
+        self,
+        tmp_path: Path,
+        malicious: bool,
+    ) -> None:
+        model_path = create_qdq_weight_model(tmp_path, malicious=malicious)
 
         result = OnnxScanner().scan(str(model_path))
 
         assert result.success is True
+        checks = self._extreme_checks(result)
+        assert len(checks) == int(malicious)
         assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
         semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert semantics["eligible_initializer_count"] == 0
-        assert semantics["exclusion_counts"]["quantized_operator"] == 3
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 1
+        assert semantics["analyzed_layer_count"] == 1
+        context = semantics["eligible"][0]
+        assert context["quantized_weight"] is True
+        assert context["quantization_kind"] == "DequantizeLinear"
+        assert context["analysis_materialization"] == "bounded_quantized_dequantize_copy"
+        assert context["analysis_storage_shares_memory"] is False
+        if malicious:
+            assert checks[0].details["affected_neurons"] == [3]
+            assert checks[0].details["lineage"] == ["DequantizeLinear"]
+
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_matmul_integer_weight_path_is_analyzed_with_inferred_scale(
+        self,
+        tmp_path: Path,
+        malicious: bool,
+    ) -> None:
+        model_path = create_matmul_integer_weight_model(tmp_path, malicious=malicious)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        checks = self._extreme_checks(result)
+        assert len(checks) == int(malicious)
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 1
+        context = semantics["eligible"][0]
+        assert context["consumer_op"] == "MatMulInteger"
+        assert context["quantization_kind"] == "MatMulInteger"
+        assert context["quantization_scale"] == "W_scale"
+        assert context["quantization_zero_point"] == "W_zero_point"
+        assert context["analysis_materialization"] == "bounded_quantized_dequantize_copy"
+        if malicious:
+            assert checks[0].details["affected_neurons"] == [3]
+
+    def test_matmul_integer_missing_inferred_scale_fails_closed(self, tmp_path: Path) -> None:
+        model_path = create_matmul_integer_weight_model(tmp_path, omit_scale=True)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        assert coverage[0].details["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == "missing_quantized_weight_scale"
+
+    def test_qdq_malformed_scale_shape_fails_closed(self, tmp_path: Path) -> None:
+        model_path = create_qdq_weight_model(tmp_path, malformed_scale=True)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        assert coverage[0].details["extraction_failures"] == 1
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
+
+    def test_quantized_lineage_self_overwrite_cycle_is_bounded(self, tmp_path: Path) -> None:
+        weights = np.zeros((100, 10), dtype=np.int8)
+        weights[50:55, 3] = 100
+        initializers = [
+            onnx.numpy_helper.from_array(weights, name="W"),
+            onnx.numpy_helper.from_array(np.asarray(0.1, dtype=np.float32), name="scale"),
+            onnx.numpy_helper.from_array(np.asarray(0, dtype=np.int8), name="zero_point"),
+        ]
+        graph = helper.make_graph(
+            [
+                helper.make_node("DequantizeLinear", ["W", "scale", "zero_point"], ["W"]),
+                helper.make_node("MatMul", ["X", "W"], ["Y"]),
+            ],
+            "self_overwrite_qdq_cycle",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        model_path = tmp_path / "self-overwrite-qcycle.onnx"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert len(self._extreme_checks(result)) == 1
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 1
+        assert semantics["node_visit_count"] == 2
+
+    def test_quantized_dequantized_size_budget_fails_closed(self, tmp_path: Path) -> None:
+        model_path = create_matmul_integer_weight_model(tmp_path)
+
+        result = OnnxScanner({"max_array_size": 2000}).scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        assert coverage[0].details["oversized_initializers_skipped"] == 1
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_initializer_count"] == 0
+
+    def test_weight_lineage_edge_budget_exhaustion_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("modelaudit.scanners.onnx_scanner._ONNX_WEIGHT_EDGE_VISIT_LIMIT", 1)
+        model_path = create_onnx_weight_model(
+            tmp_path,
+            np.zeros((100, 10), dtype=np.float32),
+            op_type="MatMul",
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        assert coverage[0].details["coverage_gaps"] == {"edge_visit_limit": 1}
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["edge_visit_limit"] == 1
+
+    def test_initializer_group_fanout_limit_fails_closed_without_dropping_detected_groups(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        model_path = create_conv_group_fanout_model(tmp_path)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is False
+        assert len(coverage) == 1
+        assert coverage[0].details["coverage_gaps"] == {"initializer_analysis_group_limit": 1}
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_layer_count"] == 100
 
     def test_sparse_weight_lineage_fails_closed(self, tmp_path: Path) -> None:
         model_path = create_sparse_weight_model(tmp_path)
@@ -5489,6 +5696,55 @@ class TestWeightDistributionSemantics:
         semantics = standalone.metadata["onnx_weight_distribution_semantics"]
         assert semantics["eligible_initializer_count"] == 1
         assert semantics["analyzed_layer_count"] == 2
+
+    def test_aggregate_clusters_duplicate_exports_without_merging_distinct_anomalies(self, tmp_path: Path) -> None:
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+        first = create_onnx_weight_model(tmp_path, weights, op_type="MatMul", filename="duplicate-a.onnx")
+        second = tmp_path / "duplicate-b.onnx"
+        second.write_bytes(first.read_bytes())
+        create_onnx_weight_model(tmp_path, weights, op_type="Gather", filename="distinct-gather.onnx")
+
+        aggregate = scan_model_directory_or_file(
+            str(tmp_path),
+            recursive=False,
+            scanners=["onnx"],
+            cache_enabled=False,
+        )
+
+        clustered = [issue for issue in aggregate.issues if issue.details.get("clustered_onnx_weight_anomaly") is True]
+        assert len(clustered) == 1
+        assert clustered[0].details["cluster_size"] == 2
+        assert {item["file"] for item in clustered[0].details["export_provenance"]} == {str(first), str(second)}
+        assert clustered[0].details["byte_identical_export_groups"][0]["export_count"] == 2
+        onnx_weight_issues = [
+            issue for issue in aggregate.issues if issue.type == "onnx_check" and "affected_neurons" in issue.details
+        ]
+        assert len(onnx_weight_issues) == 2
+        assert {issue.details["consumer_op"] for issue in onnx_weight_issues} == {"MatMul", "Gather"}
+
+    @pytest.mark.integration
+    def test_hf_minilm_pinned_quantized_export_has_bounded_lineage_coverage(self, tmp_path: Path) -> None:
+        huggingface_hub = pytest.importorskip("huggingface_hub")
+        model_path = huggingface_hub.hf_hub_download(
+            "sentence-transformers/all-MiniLM-L12-v2",
+            "onnx/model_qint8_avx512.onnx",
+            revision="a50ef00143b4d5391434df20ae11632588ac25be",
+            cache_dir=tmp_path / "hf-cache",
+        )
+
+        result = OnnxScanner({"cache_scan_results": False}).scan(model_path)
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 72
+        assert semantics["analyzed_initializer_count"] == 72
+        assert semantics["analyzed_layer_count"] == 72
+        assert semantics["coverage_gaps"] == {"lineages_per_value_limit": 109}
+        assert all(
+            check.details["analyzed_initializers"] == 72
+            for check in result.checks
+            if check.name == "Weight Distribution Analysis Coverage"
+        )
 
 
 class TestRawDetectorCoverage:

@@ -977,6 +977,148 @@ def _reconcile_cross_directory_shard_coverage(
     return reconciled
 
 
+_ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT = 20
+_ONNX_WEIGHT_CLUSTER_HASH_GROUP_LIMIT = 20
+
+
+def _stable_cluster_value(value: Any) -> Any:
+    if isinstance(value, list | tuple):
+        return tuple(_stable_cluster_value(item) for item in value)
+    if isinstance(value, dict):
+        return tuple(sorted((str(key), _stable_cluster_value(item)) for key, item in value.items()))
+    return value
+
+
+def _onnx_weight_anomaly_cluster_key(issue: Issue) -> tuple[Any, ...] | None:
+    if getattr(issue, "type", None) != "onnx_check":
+        return None
+    details = issue.details if isinstance(issue.details, dict) else {}
+    required_fields = ("initializer", "consumer_op", "affected_neurons", "analysis_shape")
+    if not all(field in details for field in required_fields):
+        return None
+    return (
+        issue.message,
+        issue.severity,
+        _stable_cluster_value(details.get("initializer")),
+        _stable_cluster_value(details.get("initializer_graph_index")),
+        _stable_cluster_value(details.get("stored_shape")),
+        _stable_cluster_value(details.get("consumer_domain")),
+        _stable_cluster_value(details.get("consumer_op")),
+        _stable_cluster_value(details.get("consumer_input_index")),
+        _stable_cluster_value(details.get("output_axes")),
+        _stable_cluster_value(details.get("conceptual_output_axes")),
+        _stable_cluster_value(details.get("analysis_kind")),
+        _stable_cluster_value(details.get("group")),
+        _stable_cluster_value(details.get("lineage")),
+        _stable_cluster_value(details.get("quantized_weight")),
+        _stable_cluster_value(details.get("quantization_kind")),
+        _stable_cluster_value(details.get("analysis_shape")),
+        _stable_cluster_value(details.get("affected_neurons")),
+        _stable_cluster_value(details.get("num_extreme_weights")),
+        _stable_cluster_value(details.get("max_extreme_weights_per_output")),
+    )
+
+
+def _file_content_hash(results: ModelAuditResultModel, location: str | None) -> str | None:
+    if location is None:
+        return None
+    metadata = results.file_metadata.get(location)
+    if metadata is None:
+        return None
+    metadata_dict = metadata.model_dump(mode="python") if hasattr(metadata, "model_dump") else dict(metadata)
+    content_hash = metadata_dict.get("content_hash")
+    return content_hash if isinstance(content_hash, str) else None
+
+
+def _onnx_weight_anomaly_provenance(results: ModelAuditResultModel, issue: Issue) -> dict[str, Any]:
+    details = issue.details if isinstance(issue.details, dict) else {}
+    return {
+        "file": issue.location,
+        "content_hash": _file_content_hash(results, issue.location),
+        "initializer": details.get("initializer"),
+        "initializer_graph_index": details.get("initializer_graph_index"),
+        "consumer_domain": details.get("consumer_domain"),
+        "consumer_op": details.get("consumer_op"),
+        "consumer_node": details.get("consumer_node"),
+        "consumer_node_index": details.get("consumer_node_index"),
+        "consumer_input_index": details.get("consumer_input_index"),
+        "output_axes": details.get("output_axes"),
+        "analysis_id": details.get("analysis_id"),
+        "quantization_kind": details.get("quantization_kind"),
+    }
+
+
+def _cluster_onnx_weight_anomaly_issues(results: ModelAuditResultModel) -> None:
+    clusters: dict[tuple[Any, ...], list[Issue]] = {}
+    for issue in results.issues:
+        key = _onnx_weight_anomaly_cluster_key(issue)
+        if key is not None:
+            clusters.setdefault(key, []).append(issue)
+
+    if not any(len(cluster) > 1 for cluster in clusters.values()):
+        return
+
+    emitted: set[tuple[Any, ...]] = set()
+    retained_issues: list[Issue] = []
+    for issue in results.issues:
+        key = _onnx_weight_anomaly_cluster_key(issue)
+        if key is None:
+            retained_issues.append(issue)
+            continue
+        cluster = clusters[key]
+        if len(cluster) == 1:
+            retained_issues.append(issue)
+            continue
+        if key in emitted:
+            continue
+        emitted.add(key)
+
+        representative = cluster[0]
+        provenance = [_onnx_weight_anomaly_provenance(results, clustered) for clustered in cluster]
+        hash_groups: dict[str, list[str | None]] = {}
+        for item in provenance:
+            content_hash = item.get("content_hash")
+            if isinstance(content_hash, str):
+                hash_groups.setdefault(content_hash, []).append(item.get("file"))
+        byte_identical_groups = [
+            {
+                "content_hash": content_hash,
+                "export_count": len(files),
+                "files": files[:_ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT],
+                "files_truncated": len(files) > _ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT,
+            }
+            for content_hash, files in sorted(hash_groups.items())
+            if len(files) > 1
+        ]
+
+        details = dict(representative.details)
+        details.update(
+            {
+                "clustered_onnx_weight_anomaly": True,
+                "cluster_size": len(cluster),
+                "representative_file": representative.location,
+                "export_provenance": provenance[:_ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT],
+                "export_provenance_truncated": len(provenance) > _ONNX_WEIGHT_CLUSTER_PROVENANCE_LIMIT,
+                "byte_identical_export_groups": byte_identical_groups[:_ONNX_WEIGHT_CLUSTER_HASH_GROUP_LIMIT],
+                "byte_identical_export_groups_truncated": len(byte_identical_groups)
+                > _ONNX_WEIGHT_CLUSTER_HASH_GROUP_LIMIT,
+            }
+        )
+        retained_issues.append(
+            Issue(
+                message=f"{representative.message} (clustered across {len(cluster)} equivalent ONNX exports)",
+                severity=representative.severity,
+                location=representative.location,
+                details=details,
+                timestamp=representative.timestamp,
+                why=representative.why,
+                type=getattr(representative, "type", None),
+                rule_code=getattr(representative, "rule_code", None),
+            )
+        )
+    results.issues = retained_issues
+
+
 def _build_shard_family_cache_fingerprint(
     shard_family_key: _ShardFamilyKey,
     scanned_file_paths: list[str],
@@ -3307,6 +3449,7 @@ def scan_model_directory_or_file(
         logger.info(f"Computed aggregate content hash from {len(file_hashes)} file(s): {results.content_hash}")
 
     # Finalize statistics and return Pydantic model
+    _cluster_onnx_weight_anomaly_issues(results)
     results.finalize_statistics()
     results.deduplicate_issues()
     _attach_phase_timings(results, phase_timings)
@@ -4605,6 +4748,7 @@ def scan_model_streaming(
             logger.info(f"Computed aggregate content hash: {results.content_hash}")
 
         # Finalize statistics
+        _cluster_onnx_weight_anomaly_issues(results)
         results.finalize_statistics()
         results.success = not _results_should_be_unsuccessful(results)
 
