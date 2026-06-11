@@ -8,6 +8,7 @@ import struct
 import subprocess
 import sys
 import time
+import unicodedata
 from collections.abc import Callable, Collection, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -24,6 +25,7 @@ from .huggingface_paths import (
     is_huggingface_url,
     parse_huggingface_file_url,
     parse_huggingface_url,
+    parse_huggingface_url_with_revision,
     redact_huggingface_url_for_display,
     redact_huggingface_urls_in_text,
 )
@@ -52,6 +54,7 @@ __all__ = [
     "is_huggingface_url",
     "parse_huggingface_file_url",
     "parse_huggingface_url",
+    "parse_huggingface_url_with_revision",
     "redact_huggingface_url_for_display",
     "redact_huggingface_urls_in_text",
 ]
@@ -144,6 +147,14 @@ def _huggingface_sample_is_prefix(
     return len(probe) >= fallback_limit
 
 
+def _format_huggingface_exception_label(exc: Exception) -> str:
+    """Return a compact, redacted exception label that preserves HTTP status."""
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status_code, int):
+        return f"{type(exc).__name__}: HTTP {status_code}"
+    return type(exc).__name__
+
+
 def _get_model_extensions() -> set[str]:
     """
     Lazy-load model extensions to avoid circular imports.
@@ -213,7 +224,7 @@ def _read_huggingface_prefix(
     except Exception as exc:
         raise ValueError(
             "Hugging Face selective filtering incomplete: unable to inspect skipped file "
-            f"{repo_id}/{filename} ({type(exc).__name__})"
+            f"{repo_id}/{filename} ({_format_huggingface_exception_label(exc)})"
         ) from exc
 
 
@@ -229,6 +240,321 @@ def _read_huggingface_probe(
     if len(prefix) >= max_bytes:
         return prefix[:max_bytes]
     return _read_huggingface_prefix(repo_id, filename, revision, budget, max_bytes)
+
+
+def _read_huggingface_tail(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+    max_bytes: int,
+) -> bytes:
+    """Read a bounded remote tail when the earlier prefix proved the file size."""
+    file_size = budget.file_sizes.get(filename)
+    if file_size is None or max_bytes <= 0:
+        return b""
+    if file_size <= len(prefix):
+        return prefix[-max_bytes:]
+
+    read_size = min(file_size, max_bytes)
+    start_offset = file_size - read_size
+    if start_offset == 0:
+        return _read_huggingface_probe(repo_id, filename, revision, budget, prefix, read_size)[-read_size:]
+
+    budget.reserve(repo_id, read_size)
+    try:
+        import re
+
+        import requests
+        from huggingface_hub import hf_hub_url
+        from huggingface_hub.utils import build_hf_headers
+
+        file_url = hf_hub_url(repo_id=repo_id, filename=filename, revision=revision)
+        headers = build_hf_headers(
+            token=None,
+            headers={
+                "Range": f"bytes={start_offset}-{file_size - 1}",
+                "Accept-Encoding": "identity",
+            },
+        )
+        with requests.get(
+            file_url,
+            headers=headers,
+            stream=True,
+            timeout=budget.request_timeout(repo_id),
+            allow_redirects=True,
+        ) as response:
+            response.raise_for_status()
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=read_size):
+                budget.check_deadline(repo_id)
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                total += len(chunk)
+                if total >= read_size:
+                    break
+            tail = b"".join(chunks)[:read_size]
+            content_range = getattr(response, "headers", {}).get("Content-Range", "")
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range.strip(), flags=re.IGNORECASE)
+            if getattr(response, "status_code", None) != 206 or match is None:
+                raise ValueError("tail Hugging Face response omitted a valid Content-Range")
+            reported_start, reported_end, reported_size = (int(value) for value in match.groups())
+            if (
+                reported_start != start_offset
+                or reported_end != file_size - 1
+                or reported_size != file_size
+                or len(tail) != read_size
+            ):
+                raise ValueError("tail Hugging Face response reported an inconsistent Content-Range")
+        return tail
+    except Exception as exc:
+        raise ValueError(
+            "Hugging Face selective filtering incomplete: unable to inspect skipped file "
+            f"{repo_id}/{filename} ({type(exc).__name__})"
+        ) from exc
+
+
+def _read_huggingface_range(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+    start_offset: int,
+    max_bytes: int,
+) -> bytes:
+    """Read a bounded remote byte range, reusing the cached prefix when possible."""
+    file_size = budget.file_sizes.get(filename)
+    if file_size is None or max_bytes <= 0 or start_offset < 0 or start_offset >= file_size:
+        return b""
+
+    read_size = min(max_bytes, file_size - start_offset)
+    end_offset = start_offset + read_size
+    if end_offset <= len(prefix):
+        return prefix[start_offset:end_offset]
+
+    chunks: list[bytes] = []
+    remote_start = start_offset
+    if start_offset < len(prefix):
+        chunks.append(prefix[start_offset:])
+        remote_start = len(prefix)
+
+    remote_size = read_size - sum(len(chunk) for chunk in chunks)
+    if remote_size <= 0:
+        return b"".join(chunks)[:read_size]
+
+    remote_end = remote_start + remote_size - 1
+    budget.reserve(repo_id, remote_size)
+    try:
+        import re
+
+        import requests
+        from huggingface_hub import hf_hub_url
+        from huggingface_hub.utils import build_hf_headers
+
+        file_url = hf_hub_url(repo_id=repo_id, filename=filename, revision=revision)
+        headers = build_hf_headers(
+            token=None,
+            headers={
+                "Range": f"bytes={remote_start}-{remote_end}",
+                "Accept-Encoding": "identity",
+            },
+        )
+        with requests.get(
+            file_url,
+            headers=headers,
+            stream=True,
+            timeout=budget.request_timeout(repo_id),
+            allow_redirects=True,
+        ) as response:
+            response.raise_for_status()
+            remote_chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=remote_size):
+                budget.check_deadline(repo_id)
+                if not chunk:
+                    continue
+                remote_chunks.append(chunk)
+                total += len(chunk)
+                if total >= remote_size:
+                    break
+            remote_payload = b"".join(remote_chunks)[:remote_size]
+            content_range = getattr(response, "headers", {}).get("Content-Range", "")
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range.strip(), flags=re.IGNORECASE)
+            if getattr(response, "status_code", None) != 206 or match is None:
+                raise ValueError("range Hugging Face response omitted a valid Content-Range")
+            reported_start, reported_end, reported_size = (int(value) for value in match.groups())
+            if (
+                reported_start != remote_start
+                or reported_end != remote_end
+                or reported_size != file_size
+                or len(remote_payload) != remote_size
+            ):
+                raise ValueError("range Hugging Face response reported an inconsistent Content-Range")
+            chunks.append(remote_payload)
+        return b"".join(chunks)[:read_size]
+    except Exception as exc:
+        raise ValueError(
+            "Hugging Face selective filtering incomplete: unable to inspect skipped file "
+            f"{repo_id}/{filename} ({type(exc).__name__})"
+        ) from exc
+
+
+def _detect_huggingface_png_media_route(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> str | None:
+    """Return a PNG media route by walking chunk framing with sparse range reads."""
+    from modelaudit.utils.file.detection import (
+        _PNG_SIGNATURE,
+        MEDIA_ROUTE_READ_BYTES,
+        MEDIA_ROUTE_TAIL_READ_BYTES,
+        PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+        VALID_MEDIA_ROUTING_FORMAT,
+        _detect_complete_media_route_from_trailing,
+        _find_png_end_with_reader,
+    )
+
+    if not prefix.startswith(_PNG_SIGNATURE):
+        return None
+    file_size = budget.file_sizes.get(filename)
+    if file_size is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    tail: bytes | None = None
+    tail_start = file_size
+    range_windows: list[tuple[int, bytes]] = []
+
+    def read_at(offset: int, size: int) -> bytes:
+        nonlocal tail, tail_start
+        end_offset = offset + size
+        if end_offset <= len(prefix):
+            return prefix[offset:end_offset]
+        if tail is None:
+            tail = _read_huggingface_tail(
+                repo_id,
+                filename,
+                revision,
+                budget,
+                prefix,
+                MEDIA_ROUTE_TAIL_READ_BYTES,
+            )
+            tail_start = file_size - len(tail)
+        if tail_start <= offset and end_offset <= tail_start + len(tail):
+            return tail[offset - tail_start : end_offset - tail_start]
+        if offset < len(prefix) and len(prefix) >= tail_start and end_offset <= tail_start + len(tail):
+            prefix_part = prefix[offset : min(end_offset, len(prefix))]
+            tail_part_start = max(len(prefix), tail_start)
+            tail_part = tail[tail_part_start - tail_start : end_offset - tail_start]
+            return prefix_part + tail_part
+        for window_start, window in range_windows:
+            if window_start <= offset and end_offset <= window_start + len(window):
+                return window[offset - window_start : end_offset - window_start]
+        window_size = min(MEDIA_ROUTE_TAIL_READ_BYTES, file_size - offset)
+        window = _read_huggingface_range(repo_id, filename, revision, budget, prefix, offset, window_size)
+        range_windows.append((offset, window))
+        return window[:size]
+
+    try:
+        media_end = _find_png_end_with_reader(
+            file_size,
+            read_at,
+        )
+    except ValueError:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    if media_end is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    trailing_size = file_size - media_end
+    if trailing_size <= 0:
+        return VALID_MEDIA_ROUTING_FORMAT
+    read_size = min(trailing_size, MEDIA_ROUTE_READ_BYTES + 1)
+    try:
+        trailing = read_at(media_end, read_size)
+    except ValueError:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    return _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=trailing_size > len(trailing))
+
+
+def _detect_huggingface_jpeg_media_route(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> str | None:
+    """Return a JPEG media route by walking marker structure with sparse range reads."""
+    from modelaudit.utils.file.detection import (
+        MEDIA_ROUTE_READ_BYTES,
+        MEDIA_ROUTE_TAIL_READ_BYTES,
+        PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+        VALID_MEDIA_ROUTING_FORMAT,
+        _detect_complete_media_route_from_trailing,
+        _find_jpeg_end_with_reader,
+    )
+
+    if not prefix.startswith(b"\xff\xd8"):
+        return None
+    file_size = budget.file_sizes.get(filename)
+    if file_size is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    tail: bytes | None = None
+    tail_start = file_size
+    range_windows: list[tuple[int, bytes]] = []
+
+    def read_at(offset: int, size: int) -> bytes:
+        nonlocal tail, tail_start
+        end_offset = offset + size
+        if end_offset <= len(prefix):
+            return prefix[offset:end_offset]
+        if tail is None:
+            tail = _read_huggingface_tail(
+                repo_id,
+                filename,
+                revision,
+                budget,
+                prefix,
+                MEDIA_ROUTE_TAIL_READ_BYTES,
+            )
+            tail_start = file_size - len(tail)
+        if tail_start <= offset and end_offset <= tail_start + len(tail):
+            return tail[offset - tail_start : end_offset - tail_start]
+        if offset < len(prefix) and len(prefix) >= tail_start and end_offset <= tail_start + len(tail):
+            prefix_part = prefix[offset : min(end_offset, len(prefix))]
+            tail_part_start = max(len(prefix), tail_start)
+            tail_part = tail[tail_part_start - tail_start : end_offset - tail_start]
+            return prefix_part + tail_part
+        for window_start, window in range_windows:
+            if window_start <= offset and end_offset <= window_start + len(window):
+                return window[offset - window_start : end_offset - window_start]
+        window_size = min(MEDIA_ROUTE_TAIL_READ_BYTES, file_size - offset)
+        window = _read_huggingface_range(repo_id, filename, revision, budget, prefix, offset, window_size)
+        range_windows.append((offset, window))
+        return window[:size]
+
+    try:
+        media_end = _find_jpeg_end_with_reader(file_size, read_at)
+    except ValueError:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    if media_end is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    trailing_size = file_size - media_end
+    if trailing_size <= 0:
+        return VALID_MEDIA_ROUTING_FORMAT
+    read_size = min(trailing_size, MEDIA_ROUTE_READ_BYTES + 1)
+    try:
+        trailing = read_at(media_end, read_size)
+    except ValueError:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    return _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=trailing_size > len(trailing))
 
 
 def _looks_like_safetensors_prefix(
@@ -632,10 +958,16 @@ def _detect_huggingface_content_route_format(
         return None
 
     from modelaudit.utils.file.detection import (
+        _MEDIA_ROUTING_SUFFIXES,
         _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS,
+        MEDIA_ROUTE_TAIL_READ_BYTES,
+        PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
         PROTO0_1_MAX_PROBE_BYTES,
+        VALID_MEDIA_ROUTING_FORMAT,
         _allows_renamed_binary_content_route,
+        _could_start_bounded_media_route,
         _could_start_proto0_or_1_pickle,
+        _detect_bounded_media_route_from_edges,
         _is_cntk_signature,
         _is_content_routed_lightgbm_signature,
         _looks_like_proto0_or_1_pickle,
@@ -671,6 +1003,27 @@ def _detect_huggingface_content_route_format(
     mxnet_route = _detect_huggingface_mxnet_symbol_route(repo_id, filename, revision, budget, prefix)
     if mxnet_route is not None:
         return mxnet_route
+
+    if remote_path.suffix.lower() in _MEDIA_ROUTING_SUFFIXES:
+        media_route = _detect_huggingface_png_media_route(repo_id, filename, revision, budget, prefix)
+        if media_route is None:
+            media_route = _detect_huggingface_jpeg_media_route(repo_id, filename, revision, budget, prefix)
+        if media_route is None:
+            media_tail = _read_huggingface_tail(
+                repo_id,
+                filename,
+                revision,
+                budget,
+                prefix,
+                MEDIA_ROUTE_TAIL_READ_BYTES,
+            )
+            media_route = _detect_bounded_media_route_from_edges(remote_path, prefix, media_tail)
+        if media_route == VALID_MEDIA_ROUTING_FORMAT:
+            return None
+        if media_route is not None:
+            return media_route
+        if _could_start_bounded_media_route(remote_path, prefix):
+            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
 
     if _could_start_proto0_or_1_pickle(prefix):
         pickle_probe = _read_huggingface_probe(
@@ -791,6 +1144,64 @@ def _select_huggingface_model_files(
 def _build_literal_allow_patterns(filenames: list[str]) -> list[str]:
     """Escape repository filenames before passing them to the Hub glob filter."""
     return [escape_glob(filename) for filename in filenames]
+
+
+def _remote_companion_path_key(filename: str) -> str:
+    return unicodedata.normalize("NFC", filename).casefold()
+
+
+def _openvino_bin_companion_name(filename: str, repo_files: Collection[str] | None = None) -> str | None:
+    """Return the exact same-stem OpenVINO weights filename for a repo XML path."""
+    remote_path = PurePosixPath(filename)
+    if remote_path.suffix.lower() != ".xml":
+        return None
+    expected_companion = remote_path.with_suffix(".bin").as_posix()
+    if repo_files is None or expected_companion in repo_files:
+        return expected_companion
+
+    expected_key = _remote_companion_path_key(expected_companion)
+    candidates = [repo_file for repo_file in repo_files if _remote_companion_path_key(repo_file) == expected_key]
+    if len(candidates) == 1:
+        return candidates[0]
+    return expected_companion
+
+
+def _include_huggingface_openvino_companions(
+    repo_id: str,
+    repo_files: list[str],
+    revision: str,
+    model_files: list[str],
+    *,
+    include_openvino_companions: bool = True,
+    deadline: float | None = None,
+) -> list[str]:
+    """Include exact OpenVINO XML/BIN companions before size checks and downloads."""
+    if not include_openvino_companions:
+        return model_files
+
+    from modelaudit.utils.file.detection import XML_MODEL_INCONCLUSIVE_FORMAT
+
+    repo_file_set = set(repo_files)
+    selected_files = set(model_files)
+    expanded_files = list(model_files)
+    probe_budget = _HuggingFaceProbeBudget(
+        remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
+        deadline=deadline,
+    )
+
+    for filename in model_files:
+        companion = _openvino_bin_companion_name(filename, repo_files)
+        if companion is None or companion not in repo_file_set or companion in selected_files:
+            continue
+
+        detected_format = _detect_huggingface_content_route_format(repo_id, filename, revision, probe_budget)
+        if detected_format not in {"openvino", XML_MODEL_INCONCLUSIVE_FORMAT}:
+            continue
+
+        expanded_files.append(companion)
+        selected_files.add(companion)
+
+    return expanded_files
 
 
 def _extract_huggingface_repo_files(repo_info: Any) -> list[str] | None:
@@ -1046,6 +1457,16 @@ def _select_streamable_hf_files(
                 )
             model_files.append(file_name)
 
+    exact_openvino_companion_candidates = (
+        {
+            companion
+            for selected_file in model_files
+            if (companion := _openvino_bin_companion_name(selected_file, repo_files)) is not None
+        }
+        if selected_route_scanner_ids == {"openvino"}
+        else set()
+    )
+
     if sniff_renamed_files:
         inspected_files = 0
         probe_budget = _HuggingFaceProbeBudget(
@@ -1055,6 +1476,8 @@ def _select_streamable_hf_files(
         selected_files = set(model_files)
         for file_name in repo_files:
             if file_name in selected_files:
+                continue
+            if file_name in exact_openvino_companion_candidates:
                 continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
@@ -1150,13 +1573,17 @@ def _list_repo_files_with_timeout(
     timeout_seconds: float = 30,
     *,
     deadline: float | None = None,
+    revision: str | None = None,
 ) -> tuple[list[str] | None, str | None, str | None]:
     """Return repository files, their immutable revision, or a failure reason."""
     if deadline is not None:
         try:
+            operation_kwargs: dict[str, Any] = {"repo_id": repo_id, "request_timeout": timeout_seconds}
+            if revision is not None:
+                operation_kwargs["revision"] = revision
             worker_result = _run_huggingface_worker_with_deadline(
                 "list_repo_files",
-                {"repo_id": repo_id, "request_timeout": timeout_seconds},
+                operation_kwargs,
                 deadline,
                 repo_id,
             )
@@ -1180,7 +1607,10 @@ def _list_repo_files_with_timeout(
     from huggingface_hub import HfApi
 
     try:
-        repo_info = HfApi().repo_info(repo_id, timeout=timeout_seconds, files_metadata=False)
+        repo_info_kwargs: dict[str, Any] = {"timeout": timeout_seconds, "files_metadata": False}
+        if revision is not None:
+            repo_info_kwargs["revision"] = revision
+        repo_info = HfApi().repo_info(repo_id, **repo_info_kwargs)
     except Exception as exc:
         return None, None, str(exc)
 
@@ -1471,21 +1901,27 @@ def get_model_info(url: str) -> dict:
             "Install with 'pip install modelaudit[huggingface]'"
         ) from e
 
-    namespace, repo_name = parse_huggingface_url(url)
+    namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
     display_url = redact_huggingface_url_for_display(url)
 
     api = HfApi()
     try:
         # Get model info for metadata
-        model_info = api.model_info(repo_id)
+        model_info_kwargs: dict[str, Any] = {}
+        if requested_revision is not None:
+            model_info_kwargs["revision"] = requested_revision
+        model_info = api.model_info(repo_id, **model_info_kwargs)
 
         # Use list_repo_tree to get accurate file sizes
         # (model_info.siblings often returns None for size)
         total_size = 0
         files = []
         try:
-            repo_files = api.list_repo_tree(repo_id, recursive=False)
+            list_repo_tree_kwargs: dict[str, Any] = {"recursive": False}
+            if requested_revision is not None:
+                list_repo_tree_kwargs["revision"] = requested_revision
+            repo_files = api.list_repo_tree(repo_id, **list_repo_tree_kwargs)
             for item in repo_files:
                 # Skip metadata files
                 if hasattr(item, "path") and item.path not in [".gitattributes", "README.md"]:
@@ -1514,7 +1950,12 @@ def get_model_info(url: str) -> dict:
         raise Exception(f"Failed to get model info for {display_url}: {redact_huggingface_urls_in_text(str(e))}") from e
 
 
-def get_model_size(repo_id: str, timeout_seconds: float | None = None) -> int | None:
+def get_model_size(
+    repo_id: str,
+    timeout_seconds: float | None = None,
+    *,
+    revision: str | None = None,
+) -> int | None:
     """Get the total size of a HuggingFace model repository.
 
     Args:
@@ -1530,6 +1971,8 @@ def get_model_size(repo_id: str, timeout_seconds: float | None = None) -> int | 
         model_info_kwargs: dict[str, Any] = {}
         if timeout_seconds is not None:
             model_info_kwargs["timeout"] = timeout_seconds
+        if revision is not None:
+            model_info_kwargs["revision"] = revision
         model_info = api.model_info(repo_id, **model_info_kwargs)
 
         # Calculate total size from all files
@@ -1545,17 +1988,25 @@ def get_model_size(repo_id: str, timeout_seconds: float | None = None) -> int | 
         return None
 
 
-def _get_model_size_with_deadline(repo_id: str, deadline: float | None) -> int | None:
+def _get_model_size_with_deadline(
+    repo_id: str,
+    deadline: float | None,
+    *,
+    revision: str | None = None,
+) -> int | None:
     """Return model size without allowing the optional lookup to outlive acquisition."""
     if deadline is None:
-        return get_model_size(repo_id)
+        return get_model_size(repo_id, revision=revision)
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
     try:
+        operation_kwargs: dict[str, Any] = {"repo_id": repo_id, "request_timeout": min(30.0, remaining)}
+        if revision is not None:
+            operation_kwargs["revision"] = revision
         worker_result = _run_huggingface_worker_with_deadline(
             "get_model_size",
-            {"repo_id": repo_id, "request_timeout": min(30.0, remaining)},
+            operation_kwargs,
             deadline,
             repo_id,
         )
@@ -1599,13 +2050,13 @@ def download_model(
             "Install with 'pip install modelaudit[huggingface]'"
         ) from e
 
-    namespace, repo_name = parse_huggingface_url(url)
+    namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
     display_url = redact_huggingface_url_for_display(url)
     deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
     # Disk space check and path setup
-    model_size = _get_model_size_with_deadline(repo_id, deadline)
+    model_size = _get_model_size_with_deadline(repo_id, deadline, revision=requested_revision)
     download_path = None  # Will be set only if cache_dir is provided
     disk_check_path = None
     download_path_preexisting = False
@@ -1652,6 +2103,7 @@ def download_model(
             repo_id,
             listing_timeout,
             deadline=deadline,
+            revision=requested_revision,
         )
         if repo_files is None:
             raise ValueError(
@@ -1671,6 +2123,13 @@ def download_model(
             repo_files,
             repo_revision,
             model_extensions,
+            deadline=deadline,
+        )
+        model_files = _include_huggingface_openvino_companions(
+            repo_id,
+            repo_files,
+            repo_revision,
+            model_files,
             deadline=deadline,
         )
         if deadline is not None and time.monotonic() >= deadline:
@@ -1790,7 +2249,7 @@ def download_model_streaming(
             "Install with 'pip install modelaudit[huggingface]'"
         ) from e
 
-    namespace, repo_name = parse_huggingface_url(url)
+    namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
     display_url = redact_huggingface_url_for_display(url)
 
@@ -1820,6 +2279,7 @@ def download_model_streaming(
             repo_id,
             listing_timeout,
             deadline=deadline,
+            revision=requested_revision,
         )
         if repo_files is None:
             if repo_listing_error and repo_listing_error.startswith("timed out after"):
@@ -1841,6 +2301,17 @@ def download_model_streaming(
             include_all_files=include_all_files,
             deadline=deadline,
         )
+        openvino_companion_suppression_enabled = scannable_scanner_ids is None or "openvino" in {
+            str(scanner_id).lower() for scanner_id in scannable_scanner_ids
+        }
+        model_files = _include_huggingface_openvino_companions(
+            repo_id,
+            repo_files,
+            repo_revision,
+            model_files,
+            include_openvino_companions=openvino_companion_suppression_enabled,
+            deadline=deadline,
+        )
         revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
             repo_id,
             model_files,
@@ -1856,12 +2327,37 @@ def download_model_streaming(
             download_path = _build_huggingface_download_path(cache_dir, namespace, repo_name)
             download_path.mkdir(parents=True, exist_ok=True)
 
-        # Download each file one at a time
-        total_files = len(model_files)
-        downloaded_total_size = 0
-        for idx, filename in enumerate(model_files):
-            is_last = idx == total_files - 1
+        selected_file_set = set(model_files)
+        openvino_companion_by_xml = (
+            {
+                filename: companion
+                for filename in model_files
+                if (companion := _openvino_bin_companion_name(filename, model_files)) in selected_file_set
+            }
+            if openvino_companion_suppression_enabled
+            else {}
+        )
+        openvino_xml_by_companion = {companion: xml for xml, companion in openvino_companion_by_xml.items()}
 
+        # Download each file one at a time. OpenVINO XML/BIN pairs are staged
+        # together, then only the XML is yielded so the scanner owns the logical
+        # model and the weights sidecar is not routed as standalone PyTorch.
+        downloaded_total_size = 0
+        downloaded_paths: dict[str, Path] = {}
+        consumed_filenames: set[str] = set()
+        pending_yield: Path | None = None
+
+        def queue_yield(path: Path) -> Path | None:
+            nonlocal pending_yield
+            previous = pending_yield
+            pending_yield = path
+            return previous
+
+        def download_one_file(filename: str) -> Path:
+            nonlocal downloaded_total_size
+            cached_path = downloaded_paths.get(filename)
+            if cached_path is not None:
+                return cached_path
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
 
@@ -1912,7 +2408,43 @@ def download_model_streaming(
                 size_limit,
                 initial_size=downloaded_total_size,
             )
-            yield (downloaded_file, is_last)
+            downloaded_paths[filename] = downloaded_file
+            return downloaded_file
+
+        for filename in model_files:
+            if filename in consumed_filenames:
+                continue
+
+            if filename in openvino_xml_by_companion:
+                # Wait for the XML so we can prove it is an OpenVINO model
+                # before suppressing standalone analysis of the same-stem .bin.
+                continue
+
+            downloaded_file = download_one_file(filename)
+            companion = openvino_companion_by_xml.get(filename)
+            if companion is not None:
+                from modelaudit.scanners.openvino_scanner import OpenVinoScanner
+
+                if OpenVinoScanner.can_handle(str(downloaded_file)):
+                    download_one_file(companion)
+                    consumed_filenames.add(companion)
+                else:
+                    companion_path = download_one_file(companion)
+                    previous = queue_yield(downloaded_file)
+                    if previous is not None:
+                        yield (previous, False)
+                    previous = queue_yield(companion_path)
+                    if previous is not None:
+                        yield (previous, False)
+                    consumed_filenames.add(companion)
+                    continue
+
+            previous = queue_yield(downloaded_file)
+            if previous is not None:
+                yield (previous, False)
+
+        if pending_yield is not None:
+            yield (pending_yield, True)
 
     except Exception as e:
         raise Exception(

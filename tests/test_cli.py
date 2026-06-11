@@ -146,6 +146,46 @@ def create_mock_scan_result(**kwargs: Any) -> ModelAuditResultModel:
     return result
 
 
+def assert_huggingface_acquisition_error_payload(
+    payload: dict[str, Any],
+    source_key: str,
+    *,
+    blocked: bool,
+    expected_revision: str | None = None,
+) -> None:
+    """Assert stable JSON semantics for a failed Hugging Face acquisition."""
+    assert payload["success"] is False
+    assert payload["has_errors"] is True
+    assert payload["bytes_scanned"] == 0
+    assert payload["files_scanned"] == 0
+    assert payload["assets"] == []
+    metadata = payload["file_metadata"][source_key]
+    reason = "huggingface_acquisition_blocked" if blocked else "huggingface_acquisition_error"
+    assert metadata["source"] == "huggingface"
+    assert metadata["source_url"] == source_key
+    assert metadata["acquisition_error"] is True
+    assert metadata["blocked"] is blocked
+    assert metadata["error_category"] == ("blocked" if blocked else "acquisition_error")
+    assert metadata["operational_error"] is True
+    assert metadata["operational_error_reason"] == reason
+    assert metadata["scan_outcome"] == "inconclusive"
+    assert metadata["scan_outcome_reason"] == reason
+    assert metadata["scan_outcome_reasons"] == [reason]
+    if expected_revision is not None:
+        assert metadata["requested_revision"] == expected_revision
+    issue = next(issue for issue in payload["issues"] if issue["type"] == "huggingface_acquisition_error")
+    assert issue["severity"] == "info"
+    assert issue["location"] == source_key
+    assert issue["details"]["source"] == "huggingface"
+    assert issue["details"]["source_url"] == source_key
+    assert issue["details"]["acquisition_error"] is True
+    assert issue["details"]["blocked"] is blocked
+    assert issue["details"]["error_category"] == ("blocked" if blocked else "acquisition_error")
+    assert issue["details"]["scan_outcome"] == "inconclusive"
+    assert issue["details"]["scan_outcome_reason"] == reason
+    assert issue["details"]["scan_outcome_reasons"] == [reason]
+
+
 def test_format_scan_json_redacts_sources_without_corrupting_result_metadata() -> None:
     first_url = "s3://bucket/model.pkl?token=first-secret"
     second_url = "s3://bucket/model.pkl?token=second-secret"
@@ -3454,19 +3494,340 @@ def test_scan_huggingface_metadata_preflight_verbose_log_is_sanitized(
 
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.cli.download_model")
-def test_scan_huggingface_url_download_failure(mock_download, mock_is_hf_url):
+def test_scan_huggingface_url_download_failure(
+    mock_download: MagicMock,
+    mock_is_hf_url: MagicMock,
+) -> None:
     """Test handling of download failure for HuggingFace URL."""
     # Setup mocks
     mock_is_hf_url.return_value = True
     mock_download.side_effect = Exception("Download failed")
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "https://huggingface.co/test/model"])
+    result = runner.invoke(cli, ["scan", "--no-cache", "--format", "text", "https://huggingface.co/test/model"])
 
     # Should fail with error code 2
     assert result.exit_code == 2
     assert "Error processing model" in result.output or "Error downloading model" in result.output
     assert "Download failed" in result.output
+    assert "MODEL ACQUISITION FAILED" in result.output
+    assert "No model artifacts were scanned for failed Hugging Face source(s)." in result.output
+    assert "blocked Hugging Face source(s)" not in result.output
+    assert "SCAN COMPLETED WITH OPERATIONAL ERRORS" not in result.output
+
+
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_huggingface_gated_text_reports_blocked_without_artifact_scan(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+) -> None:
+    """Text output must not present gated acquisition as a generic completed scan."""
+    url = f"https://huggingface.co/test/gated?revision={_HF_TEST_REVISION}&token=hf_secret"
+    mock_download.side_effect = RuntimeError("GatedRepoError: 403 Forbidden")
+
+    result = CliRunner().invoke(cli, ["scan", "--quiet", "--no-cache", "--format", "text", url])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 2
+    assert "MODEL ACQUISITION BLOCKED" in output
+    assert "No model artifacts were scanned for blocked Hugging Face source(s)." in output
+    assert "NO FILES SCANNED" not in output
+    assert "SCAN COMPLETED WITH OPERATIONAL ERRORS" not in output
+    assert "hf_secret" not in output
+    mock_scan.assert_not_called()
+
+
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_huggingface_gated_json_reports_acquisition_error(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+) -> None:
+    """Gated repositories must not produce successful empty JSON results."""
+    url = f"https://huggingface.co/test/gated?revision={_HF_TEST_REVISION}&token=hf_secret"
+    mock_download.side_effect = RuntimeError(
+        "GatedRepoError: 403 Forbidden for https://huggingface.co/test/gated?token=hf_secret\nFORGED"
+    )
+
+    with (
+        patch("modelaudit.cli.record_scan_completed") as mock_completed,
+        patch("modelaudit.cli.record_scan_failed") as mock_failed,
+    ):
+        result = CliRunner().invoke(cli, ["scan", "--quiet", "--no-cache", "--format", "json", url])
+
+    parsed = parse_click_json_output(result.output)
+    source_key = f"https://huggingface.co/test/gated@{_HF_TEST_REVISION}"
+    assert result.exit_code == 2
+    assert "hf_secret" not in result.output
+    assert "\\nFORGED" in result.output
+    assert_huggingface_acquisition_error_payload(
+        parsed,
+        source_key,
+        blocked=True,
+        expected_revision=_HF_TEST_REVISION,
+    )
+    mock_scan.assert_not_called()
+    mock_completed.assert_not_called()
+    mock_failed.assert_called_once()
+    assert mock_failed.call_args.args[1] == "Model acquisition failed"
+
+
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_huggingface_transient_json_reports_acquisition_failed_not_blocked(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+) -> None:
+    """Non-auth acquisition failures should fail closed without pretending to be gated."""
+    url = f"https://huggingface.co/test/model?revision={_HF_TEST_REVISION}"
+    mock_download.side_effect = RuntimeError("Connection timed out while listing repository files")
+
+    result = CliRunner().invoke(cli, ["scan", "--quiet", "--no-cache", "--format", "json", url])
+
+    parsed = parse_click_json_output(result.output)
+    source_key = f"https://huggingface.co/test/model@{_HF_TEST_REVISION}"
+    assert result.exit_code == 2
+    assert_huggingface_acquisition_error_payload(
+        parsed,
+        source_key,
+        blocked=False,
+        expected_revision=_HF_TEST_REVISION,
+    )
+    mock_scan.assert_not_called()
+
+
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_huggingface_file_unauthorized_json_reports_acquisition_error(
+    mock_scan: MagicMock,
+    mock_download_file: MagicMock,
+) -> None:
+    """Direct HF file auth failures should share repository acquisition semantics."""
+    url = f"https://huggingface.co/test/gated/resolve/{_HF_TEST_REVISION}/model.bin?token=hf_secret"
+    mock_download_file.side_effect = RuntimeError("401 Unauthorized for https://huggingface.co/test/gated")
+
+    result = CliRunner().invoke(cli, ["scan", "--quiet", "--no-cache", "--format", "json", url])
+
+    parsed = parse_click_json_output(result.output)
+    source_key = f"https://huggingface.co/test/gated/resolve/{_HF_TEST_REVISION}/model.bin"
+    assert result.exit_code == 2
+    assert "hf_secret" not in result.output
+    assert_huggingface_acquisition_error_payload(
+        parsed,
+        source_key,
+        blocked=True,
+        expected_revision=_HF_TEST_REVISION,
+    )
+    mock_scan.assert_not_called()
+
+
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_huggingface_file_encoded_revision_source_key_is_not_double_suffixed(
+    mock_scan: MagicMock,
+    mock_download_file: MagicMock,
+) -> None:
+    """Direct file URLs already carry revisions in their path, including encoded slash refs."""
+    url = "https://huggingface.co/test/gated/resolve/refs%2Fpr%2F1/model.bin"
+    mock_download_file.side_effect = RuntimeError("403 Forbidden")
+
+    result = CliRunner().invoke(cli, ["scan", "--quiet", "--no-cache", "--format", "json", url])
+
+    parsed = parse_click_json_output(result.output)
+    source_key = "https://huggingface.co/test/gated/resolve/refs%2Fpr%2F1/model.bin"
+    assert result.exit_code == 2
+    assert f"{source_key}@refs/pr/1" not in result.output
+    assert_huggingface_acquisition_error_payload(
+        parsed,
+        source_key,
+        blocked=True,
+        expected_revision="refs/pr/1",
+    )
+    mock_scan.assert_not_called()
+
+
+@patch("modelaudit.core.scan_model_streaming")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+def test_scan_huggingface_streaming_gated_json_reports_acquisition_error(
+    mock_download_streaming: MagicMock,
+    mock_scan_streaming: MagicMock,
+) -> None:
+    """Streaming acquisition failures must not claim a completed stream scan."""
+    url = f"https://huggingface.co/test/gated?revision={_HF_TEST_REVISION}"
+    mock_download_streaming.side_effect = RuntimeError("GatedRepoError: 403 Forbidden")
+
+    result = CliRunner().invoke(cli, ["scan", "--quiet", "--stream", "--format", "json", url])
+
+    parsed = parse_click_json_output(result.output)
+    source_key = f"https://huggingface.co/test/gated@{_HF_TEST_REVISION}"
+    assert result.exit_code == 2
+    assert_huggingface_acquisition_error_payload(
+        parsed,
+        source_key,
+        blocked=True,
+        expected_revision=_HF_TEST_REVISION,
+    )
+    mock_scan_streaming.assert_not_called()
+    assert "Streaming scan complete" not in result.output
+
+
+@patch("modelaudit.core.scan_model_streaming")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+def test_scan_huggingface_streaming_late_failure_is_not_acquisition_error(
+    mock_download_streaming: MagicMock,
+    mock_scan_streaming: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """A stream failure after yielding an artifact must not claim zero artifact acquisition."""
+    streamed_file = tmp_path / "model.bin"
+    streamed_file.write_bytes(b"payload")
+
+    def interrupted_stream() -> Iterator[tuple[Path, bool]]:
+        yield streamed_file, False
+        raise RuntimeError("GatedRepoError: 403 Forbidden after first artifact")
+
+    def consume_stream(file_generator: Iterator[tuple[Path, bool]], **_kwargs: Any) -> ModelAuditResultModel:
+        for _file_path, _is_last in file_generator:
+            pass
+        return create_mock_scan_result(files_scanned=1, issues=[])
+
+    mock_download_streaming.return_value = interrupted_stream()
+    mock_scan_streaming.side_effect = consume_stream
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--quiet", "--stream", "--format", "json", "https://huggingface.co/test/gated"],
+    )
+
+    parsed = parse_click_json_output(result.output)
+    assert result.exit_code == 2
+    assert parsed["success"] is False
+    assert parsed["has_errors"] is True
+    assert not any(issue.get("type") == "huggingface_acquisition_error" for issue in parsed["issues"])
+    assert parsed["file_metadata"] == {}
+    assert "no model artifacts were scanned" not in result.output.lower()
+
+
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_huggingface_benign_successful_acquisition_not_marked_acquisition_error(
+    mock_rmtree: MagicMock,
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Clean successful HF acquisition should stay a normal successful scan."""
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "model.safetensors").write_bytes(b"safe")
+    mock_download.return_value = downloaded_dir
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--quiet", "--no-cache", "--format", "json", "https://huggingface.co/test/clean"],
+    )
+
+    parsed = parse_click_json_output(result.output)
+    assert result.exit_code == 0
+    assert parsed["success"] is True
+    assert parsed["has_errors"] is False
+    assert parsed["files_scanned"] == 1
+    assert parsed["file_metadata"] == {}
+    assert not any(issue.get("type") == "huggingface_acquisition_error" for issue in parsed["issues"])
+    mock_scan.assert_called_once()
+    mock_rmtree.assert_called_once()
+
+
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+@patch("shutil.rmtree")
+def test_scan_huggingface_malicious_successful_acquisition_still_reports_security_findings(
+    mock_rmtree: MagicMock,
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """The acquisition-error path must not hide malicious content after a successful download."""
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "model.bin").write_bytes(b"malicious")
+    mock_download.return_value = downloaded_dir
+    mock_scan.return_value = create_mock_scan_result(
+        files_scanned=1,
+        issues=[
+            {
+                "message": "Malicious pickle opcode detected",
+                "severity": "critical",
+                "location": str(downloaded_dir / "model.bin"),
+                "type": "pickle_rce",
+            }
+        ],
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--quiet", "--no-cache", "--format", "json", "https://huggingface.co/test/malicious"],
+    )
+
+    parsed = parse_click_json_output(result.output)
+    assert result.exit_code == 1
+    assert parsed["files_scanned"] == 1
+    assert parsed["issues"][0]["type"] == "pickle_rce"
+    assert parsed["file_metadata"] == {}
+    mock_scan.assert_called_once()
+    mock_rmtree.assert_called_once()
+
+
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_huggingface_blocked_source_does_not_hide_local_malicious_findings(
+    mock_scan: MagicMock,
+    mock_download: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Operational acquisition errors must not suppress findings from other inputs."""
+    local_model = tmp_path / "local.bin"
+    local_model.write_bytes(b"malicious")
+    mock_download.side_effect = RuntimeError("GatedRepoError: 403 Forbidden")
+    mock_scan.return_value = create_mock_scan_result(
+        files_scanned=1,
+        issues=[
+            {
+                "message": "Malicious pickle opcode detected",
+                "severity": "critical",
+                "location": str(local_model),
+                "type": "pickle_rce",
+            }
+        ],
+    )
+    blocked_url = f"https://huggingface.co/test/gated?revision={_HF_TEST_REVISION}"
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--quiet", "--no-cache", "--format", "json", str(local_model), blocked_url],
+    )
+
+    parsed = parse_click_json_output(result.output)
+    source_key = f"https://huggingface.co/test/gated@{_HF_TEST_REVISION}"
+    assert result.exit_code == 2
+    assert parsed["success"] is False
+    assert parsed["files_scanned"] == 1
+    assert any(issue["type"] == "pickle_rce" for issue in parsed["issues"])
+    assert_huggingface_acquisition_error_payload(
+        {
+            **parsed,
+            "bytes_scanned": 0,
+            "files_scanned": 0,
+            "assets": [],
+        },
+        source_key,
+        blocked=True,
+        expected_revision=_HF_TEST_REVISION,
+    )
+    mock_scan.assert_called_once()
 
 
 @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
@@ -4407,7 +4768,106 @@ def test_scan_directory_skips_huggingface_cache_bookkeeping(tmp_path):
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
-def test_scan_huggingface_streaming_with_issues(mock_scan_streaming, mock_download_streaming, mock_is_hf_url, tmp_path):
+def test_scan_huggingface_streaming_incomplete_result_reports_failed_progress(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Partial HF stream results must not claim a completed streaming scan."""
+    mock_is_hf_url.return_value = True
+
+    test_file = tmp_path / "malicious.pkl"
+    test_file.write_text("malicious content")
+    mock_download_streaming.return_value = iter([(test_file, False)])
+    mock_scan_streaming.return_value = create_mock_scan_result(
+        bytes_scanned=100,
+        files_scanned=1,
+        issues=[
+            {
+                "message": "Dangerous import detected before interruption",
+                "severity": "critical",
+                "location": "malicious.pkl",
+            },
+            {
+                "message": "Streaming source interrupted before all artifacts could be scanned",
+                "severity": "info",
+                "location": "hf://test/model",
+                "type": "streaming_source_interrupted",
+                "details": {
+                    "operational_error": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": "streaming_source_interrupted",
+                },
+            },
+        ],
+        has_errors=True,
+        success=False,
+    )
+
+    result = CliRunner().invoke(cli, ["scan", "--stream", "--format", "text", "hf://test/model"])
+    clean_output = strip_ansi(result.output)
+
+    assert result.exit_code == 2
+    assert "Streaming scan complete" not in clean_output
+    assert "Streaming scan incomplete" in clean_output
+    assert "SCAN SUMMARY" in clean_output
+    assert "SCAN COMPLETED WITH OPERATIONAL ERRORS" in clean_output
+    assert "Dangerous import detected before interruption" in clean_output
+    mock_download_streaming.assert_called_once()
+    mock_scan_streaming.assert_called_once()
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_security_findings_keep_complete_progress(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Security findings without operational errors should keep the complete banner."""
+    mock_is_hf_url.return_value = True
+
+    test_file = tmp_path / "malicious.pkl"
+    test_file.write_text("malicious content")
+    mock_download_streaming.return_value = iter([(test_file, True)])
+    mock_scan_streaming.return_value = create_mock_scan_result(
+        bytes_scanned=100,
+        files_scanned=1,
+        issues=[
+            {
+                "message": "Dangerous import detected",
+                "severity": "critical",
+                "location": "malicious.pkl",
+            }
+        ],
+        has_errors=False,
+        success=True,
+    )
+
+    result = CliRunner().invoke(cli, ["scan", "--stream", "--format", "text", "hf://test/malicious-model"])
+    clean_output = strip_ansi(result.output)
+
+    assert result.exit_code == 1
+    assert "Streaming scan complete" in clean_output
+    assert "Streaming scan incomplete" not in clean_output
+    assert "CRITICAL SECURITY ISSUES FOUND" in clean_output
+    assert "Dangerous import detected" in clean_output
+    mock_download_streaming.assert_called_once()
+    mock_scan_streaming.assert_called_once()
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_with_issues(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Test streaming scan with security issues detected."""
     mock_is_hf_url.return_value = True
 
@@ -4415,7 +4875,7 @@ def test_scan_huggingface_streaming_with_issues(mock_scan_streaming, mock_downlo
     test_file = tmp_path / "malicious.pkl"
     test_file.write_text("malicious content")
 
-    def file_generator():
+    def file_generator() -> Iterator[tuple[Path, bool]]:
         yield (test_file, True)
 
     mock_download_streaming.return_value = file_generator()
