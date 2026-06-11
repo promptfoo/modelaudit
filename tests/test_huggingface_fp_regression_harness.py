@@ -293,6 +293,7 @@ def test_hf_repo_dry_run_preview_enforces_max_size() -> None:
     metadata = {
         "repo_id": "test/model",
         "model_id": "test/model",
+        "revision": "a" * 40,
         "total_size": 20,
         "file_count": 1,
         "files": [{"name": "model.safetensors", "size": 20}],
@@ -324,11 +325,56 @@ def test_hf_repo_dry_run_preview_enforces_max_size() -> None:
     mock_scan.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "revision",
+    [None, "main", "g" * 40],
+    ids=["none", "mutable-main", "non-hex-sha"],
+)
+def test_hf_repo_dry_run_with_max_size_rejects_non_immutable_metadata_revision(revision: object) -> None:
+    runner = CliRunner()
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": revision,
+        "total_size": 20,
+        "file_count": 1,
+        "files": [{"name": "model.safetensors", "size": 20}],
+    }
+
+    with (
+        _mock_hf_model_info(return_value=metadata) as mock_get_model_info,
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--format",
+                "json",
+                "--max-size",
+                "100B",
+                "--scanners",
+                "safetensors",
+                "hf://test/model",
+            ],
+        )
+
+    assert result.exit_code == 2
+    assert "get_model_info() metadata revision for test/model is not an immutable commit SHA" in result.output
+    assert "Download: skipped (--dry-run)" not in result.output
+    mock_get_model_info.assert_called_once_with("hf://test/model", timeout_seconds=3600)
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
 def test_hf_repo_dry_run_preview_rejects_unknown_selected_size_with_max_size() -> None:
     runner = CliRunner()
     metadata = {
         "repo_id": "test/model",
         "model_id": "test/model",
+        "revision": "a" * 40,
         "total_size": 0,
         "file_count": 1,
         "files": [{"name": "model.safetensors"}],
@@ -365,6 +411,7 @@ def test_hf_repo_dry_run_preview_allows_zero_byte_selected_size_with_max_size() 
     metadata = {
         "repo_id": "test/model",
         "model_id": "test/model",
+        "revision": "a" * 40,
         "total_size": 0,
         "file_count": 1,
         "files": [{"name": "model.safetensors", "size": 0}],
@@ -404,6 +451,7 @@ def test_hf_repo_dry_run_preview_uses_non_streaming_download_set_for_max_size() 
     metadata = {
         "repo_id": "test/model",
         "model_id": "test/model",
+        "revision": "a" * 40,
         "total_size": 120,
         "file_count": 2,
         "files": [
@@ -443,6 +491,7 @@ def test_hf_repo_dry_run_preview_includes_readme_in_max_size_budget() -> None:
     metadata = {
         "repo_id": "test/model",
         "model_id": "test/model",
+        "revision": "a" * 40,
         "total_size": 120,
         "file_count": 2,
         "files": [
@@ -482,6 +531,7 @@ def test_hf_repo_dry_run_preview_keeps_scannable_size_scanner_selected() -> None
     metadata = {
         "repo_id": "test/model",
         "model_id": "test/model",
+        "revision": "a" * 40,
         "total_size": 120,
         "file_count": 2,
         "files": [

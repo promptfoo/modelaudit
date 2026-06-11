@@ -209,6 +209,21 @@ def _huggingface_preview_file_size(item: dict[str, Any]) -> int | None:
     return size
 
 
+def _require_huggingface_preview_immutable_revision(metadata: dict[str, Any]) -> None:
+    """Fail closed unless repository metadata was resolved to an immutable revision."""
+    from .utils.sources import huggingface as huggingface_source
+
+    revision = metadata.get("revision")
+    if huggingface_source._is_huggingface_commit_sha(revision):
+        return
+
+    repo_id = str(metadata.get("repo_id") or metadata.get("model_id") or "unknown")
+    raise ValueError(
+        f"Hugging Face get_model_info() metadata revision for {repo_id} is not an immutable commit SHA; "
+        "refusing dry-run with max size"
+    )
+
+
 def _huggingface_preview_file_names(files: object) -> list[str]:
     """Return stable file names from Hugging Face preview metadata."""
     if not isinstance(files, list):
@@ -394,6 +409,8 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
     """Print a no-download preview for a Hugging Face repository URL."""
     display_path = _display_path(path)
     metadata = get_model_info(path, timeout_seconds=runtime.timeout)
+    if runtime.max_download_bytes is not None:
+        _require_huggingface_preview_immutable_revision(metadata)
     files = metadata.get("files", [])
     selected_files = (
         _huggingface_preview_stream_files(metadata, runtime)
