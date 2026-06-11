@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import re
 import struct
 from typing import Any, BinaryIO, ClassVar, NamedTuple
+from urllib.parse import unquote
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
@@ -41,6 +43,33 @@ GGUF_STRUCTURE_INCONCLUSIVE_REASON = "gguf_structure_validation_failed"
 GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON = "gguf_duplicate_metadata_keys"
 GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON = "gguf_metadata_limit_exceeded"
 GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON = "gguf_tensor_limit_exceeded"
+_GGUF_METADATA_COMMAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "python_command_api",
+        re.compile(
+            r"(?i)\b(?:os\.system|os\.popen|subprocess\."
+            r"(?:popen|call|run|check_call|check_output|getoutput|getstatusoutput)|eval|exec|__import__)\s*\(",
+        ),
+    ),
+    (
+        "shell_command",
+        re.compile(
+            r"(?i)(?:^|[;&|`$()]\s*)(?:bash|sh|zsh|fish|cmd(?:\.exe)?|powershell|pwsh|python(?:3)?|perl|ruby|node)\s+-[ce]\b",
+        ),
+    ),
+    ("destructive_rm", re.compile(r"(?i)(?:^|[;&|`$()]\s*)rm\s+-[a-z]*[rf][a-z]*\s+(?:/|~|\$|\.\.)")),
+    ("backtick_command", re.compile(r"(?i)`\s*(?:rm|curl|wget|bash|sh|python(?:3)?|powershell|pwsh|cmd(?:\.exe)?)\b")),
+)
+_GGUF_METADATA_REMOTE_FETCH_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("shell_download", re.compile(r"(?i)\b(?:curl|wget)\b(?:\s+--?[^\s]+)*\s+(?:https?|ftp)://")),
+    (
+        "network_api",
+        re.compile(
+            r"(?i)\b(?:requests\.(?:get|post|put|request)|urllib\.request\.urlopen|urlopen|fetch)\s*\(\s*[\"'](?:https?|ftp)://",
+        ),
+    ),
+    ("powershell_download", re.compile(r"(?i)\b(?:invoke-webrequest|iwr)\b(?:\s+--?[^\s]+)*\s+(?:https?|ftp)://")),
+)
 
 
 class _GgufMetadataLimitExceeded(ValueError):
@@ -318,7 +347,7 @@ class GgufScanner(BaseScanner):
                 metadata_key_occurrences[key] = occurrence
 
                 # Security check for suspicious keys
-                if any(x in key for x in ("../", "..\\", "/", "\\")):
+                if self._contains_path_traversal(key):
                     result.add_check(
                         name="Metadata Key Security Check",
                         passed=False,
@@ -341,14 +370,18 @@ class GgufScanner(BaseScanner):
                 metadata[key] = value
 
                 # Security check for suspicious values
-                if isinstance(value, str) and any(p in value for p in ("/", "\\", ";", "&&", "|", "`")):
+                metadata_evidence = self._metadata_value_security_evidence(key, value) if isinstance(value, str) else []
+                for evidence in metadata_evidence:
                     result.add_check(
                         name="Metadata Value Security Check",
                         passed=False,
-                        message=f"Suspicious metadata value for key '{key}': {value}",
+                        message=(
+                            f"Suspicious metadata value for key '{key}' contains "
+                            f"{evidence['evidence_type'].replace('_', ' ')} evidence"
+                        ),
                         severity=IssueSeverity.INFO,
                         location=self.current_file_path,
-                        details={"key": key, "value": str(value)[:200]},
+                        details={"key": key, "value": str(value)[:200], **evidence},
                         rule_code="S902",
                     )
 
@@ -857,6 +890,48 @@ class GgufScanner(BaseScanner):
     @staticmethod
     def _is_chat_template_key(key: str) -> bool:
         return key == "tokenizer.chat_template" or key.startswith("tokenizer.chat_template.")
+
+    @staticmethod
+    def _metadata_decode_variants(value: str) -> tuple[str, ...]:
+        variants: list[str] = []
+        current = value
+        for _ in range(3):
+            if current not in variants:
+                variants.append(current)
+            decoded = unquote(current)
+            if decoded == current:
+                break
+            current = decoded
+        return tuple(variants)
+
+    @classmethod
+    def _contains_path_traversal(cls, value: str) -> bool:
+        for candidate in cls._metadata_decode_variants(value):
+            normalized = candidate.replace("\\", "/")
+            if any(part == ".." for part in normalized.split("/")):
+                return True
+        return False
+
+    @classmethod
+    def _metadata_value_security_evidence(cls, key: str, value: str) -> list[dict[str, str]]:
+        if cls._is_chat_template_key(key):
+            return []
+
+        evidence: list[dict[str, str]] = []
+        if cls._contains_path_traversal(value):
+            evidence.append({"evidence_type": "path_traversal", "pattern": "dot_dot_path_segment"})
+
+        for pattern_name, pattern in _GGUF_METADATA_COMMAND_PATTERNS:
+            if pattern.search(value):
+                evidence.append({"evidence_type": "command_execution", "pattern": pattern_name})
+                break
+
+        for pattern_name, pattern in _GGUF_METADATA_REMOTE_FETCH_PATTERNS:
+            if pattern.search(value):
+                evidence.append({"evidence_type": "remote_fetch", "pattern": pattern_name})
+                break
+
+        return evidence
 
     @staticmethod
     def _record_chat_template_occurrence(

