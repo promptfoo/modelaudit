@@ -1395,6 +1395,18 @@ def test_real_hf_esm2_large_h5_reaches_keras_scan_without_read_cap(tmp_path: Pat
     )
 
 
+@pytest.mark.integration
+def test_real_hf_whisper_large_v2_h5_reaches_keras_scan_without_read_cap(tmp_path: Path) -> None:
+    _assert_real_hf_h5_reaches_keras_scan(
+        tmp_path,
+        repo_id="openai/whisper-large-v2",
+        revision="ae4642769ce2ad8fc292556ccea8e901f1530655",
+        expected_size=6_174_574_896,
+        expected_blob_id="38414d47073f613961f19565ed6b481e1b9b0f80",
+        expected_sha256="489f5f36ba6e1959913bb77b30baf85e8b791e1e585dec7d65a2e217bfb8be47",
+    )
+
+
 def test_missing_h5py_returns_inconclusive_exit2_without_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
