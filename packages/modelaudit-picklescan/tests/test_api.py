@@ -7157,6 +7157,23 @@ def test_safe_numpy_ndarray_reconstruct_dataflow_fails_closed_on_unsafe_follow_o
     )
 
 
+def test_safe_numpy_ndarray_reconstruct_dataflow_preserves_memo_across_follow_on_streams() -> None:
+    pytest.importorskip("numpy")
+    unsafe_follow_on = b"\x80\x02h\x00cbuiltins\neval\nK\x00\x85U\x01b\x87R."
+    payload = _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD + unsafe_follow_on
+
+    assert not package_api._pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload)
+
+    report = scan_bytes(payload, source="safe-numpy-with-memoized-follow-on.pkl")
+
+    assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
+    assert any(
+        finding.rule_code in {"DANGEROUS_CALL_GRAPH", "NON_ALLOWLISTED_GLOBAL"}
+        and finding.details.get("import_reference") in {"numpy._core.multiarray._reconstruct", "builtins.eval"}
+        for finding in report.findings
+    )
+
+
 def test_safe_numpy_ndarray_reconstruct_dataflow_accepts_inert_object_array_state() -> None:
     numpy = pytest.importorskip("numpy")
     buffer = io.BytesIO()

@@ -106,8 +106,12 @@ def _numpy_object_reconstruction_reference_is_trusted(module: str, name: str) ->
     try:
         if import_only_reference_is_proven_trusted(module, name):
             return True
-    except Exception:
-        pass
+    except Exception as error:
+        warnings.warn(
+            f"Falling back to loaded NumPy reconstruction owner proof for {module}.{name}: {error}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     try:
         if _picklescan_loaded_site_package_reference_owner_matches is None:

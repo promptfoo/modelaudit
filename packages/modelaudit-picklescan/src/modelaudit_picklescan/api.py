@@ -2328,7 +2328,6 @@ def _pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload: bytes | 
         opcode_count = 0
         while offset < len(payload):
             stack = []
-            memo = {}
             stream_saw_stop = False
             for opcode, arg, pos in pickletools.genops(payload[offset:]):
                 opcode_count += 1
