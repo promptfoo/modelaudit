@@ -799,14 +799,31 @@ class JoblibScanner(BaseScanner):
                 and finding.details.get("import_reference") == _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE
             )
 
-        removed = any(is_validated_wrapper_finding(issue) for issue in result.issues) or any(
-            is_validated_wrapper_finding(check) for check in result.checks
+        def is_validated_wrapper_source_notice(finding: Any) -> bool:
+            return (
+                finding.details.get("notice_code") == "call_graph_source_unavailable"
+                and finding.details.get("import_reference") == _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE
+            )
+
+        removed = (
+            any(is_validated_wrapper_finding(issue) for issue in result.issues)
+            or any(is_validated_wrapper_source_notice(issue) for issue in result.issues)
+            or any(is_validated_wrapper_finding(check) for check in result.checks)
+            or any(is_validated_wrapper_source_notice(check) for check in result.checks)
         )
         if not removed:
             return
 
-        result.issues = [issue for issue in result.issues if not is_validated_wrapper_finding(issue)]
-        result.checks = [check for check in result.checks if not is_validated_wrapper_finding(check)]
+        result.issues = [
+            issue
+            for issue in result.issues
+            if not is_validated_wrapper_finding(issue) and not is_validated_wrapper_source_notice(issue)
+        ]
+        result.checks = [
+            check
+            for check in result.checks
+            if not is_validated_wrapper_finding(check) and not is_validated_wrapper_source_notice(check)
+        ]
         has_security_findings = any(
             issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues
         ) or any(

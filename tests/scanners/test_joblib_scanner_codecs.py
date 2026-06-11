@@ -14,6 +14,7 @@ from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from unittest.mock import patch
 
+import modelaudit_picklescan.api as picklescan_api
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
@@ -57,11 +58,24 @@ def _scan_payload(
 ) -> ScanResult:
     path = tmp_path / filename
     path.write_bytes(payload)
+    original_reference_is_trusted = picklescan_api.import_only_reference_is_proven_trusted
+    original_requires_origin_review = picklescan_api.import_only_module_requires_origin_review
 
     def trust_joblib_wrapper(module: str, name: str) -> bool:
-        return trust_numpy_array_wrapper and (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper")
+        if (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper"):
+            return trust_numpy_array_wrapper
+        return original_reference_is_trusted(module, name)
 
-    with patch("modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted", trust_joblib_wrapper):
+    def requires_origin_review(module: str, name: str) -> bool:
+        if (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper"):
+            return not trust_numpy_array_wrapper
+        return original_requires_origin_review(module, name)
+
+    with (
+        patch("modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted", trust_joblib_wrapper),
+        patch("modelaudit_picklescan.api.import_only_reference_is_proven_trusted", trust_joblib_wrapper),
+        patch("modelaudit_picklescan.api.import_only_module_requires_origin_review", requires_origin_review),
+    ):
         return JoblibScanner().scan(str(path))
 
 
