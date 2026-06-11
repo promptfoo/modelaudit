@@ -136,7 +136,9 @@ DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
     rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
     rb"[\s(\[{\\]{0,4096}[rubfRUBF]*[\"']?$"
 )
-DOCUMENTATION_CODE_RETURN_STRING_PATTERN = re.compile(rb"(?:^|[\r\n;{[(])[ \t]*(?:return|yield)\s+[rubfRUBF]*[\"']?$")
+DOCUMENTATION_CODE_RETURN_STRING_PATTERN = re.compile(
+    rb"(?:^|[\r\n;{[(])[ \t]*(?:return|yield)\s+(?:[\s(\[{]{0,4096})?[rubfRUBF]*[\"']?$"
+)
 DOCUMENTATION_PASSIVE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
     rb"<(?:a\b[^<>]{0,4096}\bhref|img\b[^<>]{0,4096}\bsrc)\s*=\s*[\"']?$",
     re.IGNORECASE,
@@ -151,10 +153,43 @@ DOCUMENTATION_CODE_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^
 DOCUMENTATION_MARKDOWN_LINK_URL_PREFIX_PATTERN = re.compile(rb"!?\[[^\]\r\n]{0,4096}\]\($")
 DOCUMENTATION_BIBLIOGRAPHY_ENTRY_START_PATTERN = re.compile(rb"(?im)^\s*@[A-Za-z][A-Za-z0-9_-]*\s*\{")
 DOCUMENTATION_BIBLIOGRAPHY_FIELD_PREFIX_PATTERN = re.compile(
-    rb"\s*[A-Za-z][A-Za-z0-9_-]*\s*=\s*[{\"']?[^,\r\n]{0,4096}$",
+    rb"\s*(?P<field>[A-Za-z][A-Za-z0-9_-]*)\s*=\s*[{\"']?[^,\r\n]{0,4096}$",
     re.IGNORECASE,
 )
 DOCUMENTATION_BIBLIOGRAPHY_URL_FIELD_PREFIX_PATTERN = re.compile(rb"\s*url\s*=\s*\{?\s*$", re.IGNORECASE)
+DOCUMENTATION_PASSIVE_BIBLIOGRAPHY_FIELDS = frozenset(
+    {
+        b"abstract",
+        b"address",
+        b"archiveprefix",
+        b"author",
+        b"booktitle",
+        b"copyright",
+        b"doi",
+        b"edition",
+        b"editor",
+        b"eprint",
+        b"howpublished",
+        b"institution",
+        b"isbn",
+        b"issn",
+        b"journal",
+        b"license",
+        b"month",
+        b"note",
+        b"number",
+        b"organization",
+        b"pages",
+        b"primaryclass",
+        b"publisher",
+        b"school",
+        b"series",
+        b"title",
+        b"url",
+        b"volume",
+        b"year",
+    }
+)
 DOCUMENTATION_MARKDOWN_PREFIX_PATTERN = re.compile(rb"(?:(?:[-*+>]|[0-9]{1,9}[.)])\s+){1,8}")
 DOCUMENTATION_CONFIG_NETWORK_KEY = rb"(?:endpoint|callback|webhook)(?:s|[_-][A-Za-z0-9_.-]{1,128}|(?:url|uri)s?)?"
 DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
@@ -1620,7 +1655,10 @@ class TextScanner(BaseScanner):
             return False
         line = payload[line_start:line_end]
         line_position = position - line_start
-        return DOCUMENTATION_BIBLIOGRAPHY_FIELD_PREFIX_PATTERN.fullmatch(line[:line_position]) is not None
+        field_match = DOCUMENTATION_BIBLIOGRAPHY_FIELD_PREFIX_PATTERN.fullmatch(line[:line_position])
+        return (
+            field_match is not None and field_match.group("field").lower() in DOCUMENTATION_PASSIVE_BIBLIOGRAPHY_FIELDS
+        )
 
     @classmethod
     def _documentation_bibliography_url_field_is_passive(
@@ -1821,11 +1859,12 @@ class TextScanner(BaseScanner):
         line_lookup: dict[int, tuple[int, int, int]] | None = None,
     ) -> dict[str, Any]:
         line_start, _line_end, line_number = cls._documentation_line_bounds(payload, span_start, line_lookup)
+        column = len(payload[line_start:span_start].decode("utf-8", errors="replace")) + 1
         return {
             "kind": kind,
             "value": cls._normalize_documentation_network_evidence_value(value),
             "line": line_number,
-            "column": span_start - line_start + 1,
+            "column": column,
             "span_start": span_start,
             "span_end": span_end,
         }

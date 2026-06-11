@@ -204,6 +204,25 @@ def test_text_scanner_model_card_deduplicates_shared_cloud_url_evidence(tmp_path
     }
 
 
+def test_text_scanner_model_card_evidence_column_counts_unicode_characters(tmp_path: Path) -> None:
+    prefix = "Résumé files: [model]("
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(f"{prefix}https://huggingface.co/datasets/trivia_qa)\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    check = next(
+        check
+        for check in _failed_network_detection_checks(result)
+        if check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://huggingface.co/datasets/trivia_qa",
+        }
+    )
+    assert check.details["column"] == len(prefix) + 1
+
+
 def test_text_scanner_model_card_cloud_url_preserves_higher_actionable_severity(tmp_path: Path) -> None:
     text_path = tmp_path / "model_card.md"
     text_path.write_text('endpoint = "https://bucket.s3.amazonaws.com/cmd.sh"\n', encoding="utf-8")
@@ -495,6 +514,29 @@ def test_text_scanner_model_card_markdown_link_return_remains_actionable(tmp_pat
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_model_card_parenthesized_markdown_link_return_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        'def endpoint():\n    return ("[download](https://evil.example/payload.sh)")\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_model_card_bibliography_url_field_is_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "model_card.md"
     text_path.write_text(
@@ -518,6 +560,31 @@ def test_text_scanner_model_card_bibliography_url_field_is_informational(tmp_pat
     assert network_checks
     assert all(check.severity == IssueSeverity.INFO for check in network_checks)
     assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_model_card_unclosed_bibliography_does_not_suppress_endpoint_code(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        '@misc{paper,\n  title = {Reference}\nendpoint = "https://evil.example/payload.sh"\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
 
 
 def test_text_scanner_model_card_dedup_bounds_repeated_documentation_links(tmp_path: Path) -> None:
