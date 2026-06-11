@@ -1324,6 +1324,32 @@ class TextScanner(BaseScanner):
             previous_line_end = previous_line_start - 1
         return False
 
+    @staticmethod
+    def _documentation_multiline_return_contains_position(payload: bytes, position: int) -> bool:
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        current_line_prefix = payload[line_start:position]
+        current_indent = len(current_line_prefix) - len(current_line_prefix.lstrip(b" \t"))
+        if current_indent == 0:
+            return False
+
+        context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        previous_line_end = line_start - 1
+        while previous_line_end >= context_start:
+            previous_line_start = max(
+                payload.rfind(b"\n", context_start, previous_line_end) + 1,
+                context_start,
+            )
+            previous_line = payload[previous_line_start:previous_line_end]
+            stripped = previous_line.strip()
+            if stripped and not stripped.startswith(b"#"):
+                previous_indent = len(previous_line) - len(previous_line.lstrip(b" \t"))
+                if previous_indent < current_indent:
+                    return DOCUMENTATION_PYTHON_BLOCK_VALUE_PREFIX_PATTERN.fullmatch(stripped) is not None
+            if previous_line_start == context_start:
+                break
+            previous_line_end = previous_line_start - 1
+        return False
+
     @classmethod
     def _documentation_finding_is_actionable(cls, payload: bytes, finding: dict[str, Any]) -> bool:
         position = finding.get("position")
@@ -1333,6 +1359,8 @@ class TextScanner(BaseScanner):
             return False
         if cls._documentation_position_is_in_passive_bibliography_field(payload, position):
             return False
+        if cls._documentation_multiline_return_contains_position(payload, position):
+            return True
         if cls._documentation_position_is_in_passive_markdown_link(payload, position):
             return False
         if cls._finding_line_prefix_is_truncated(payload, finding):
@@ -1656,9 +1684,12 @@ class TextScanner(BaseScanner):
         line = payload[line_start:line_end]
         line_position = position - line_start
         field_match = DOCUMENTATION_BIBLIOGRAPHY_FIELD_PREFIX_PATTERN.fullmatch(line[:line_position])
-        return (
-            field_match is not None and field_match.group("field").lower() in DOCUMENTATION_PASSIVE_BIBLIOGRAPHY_FIELDS
-        )
+        if field_match is None:
+            return False
+        field = field_match.group("field").lower()
+        if field == b"url":
+            return DOCUMENTATION_BIBLIOGRAPHY_URL_FIELD_PREFIX_PATTERN.fullmatch(line[:line_position]) is not None
+        return field in DOCUMENTATION_PASSIVE_BIBLIOGRAPHY_FIELDS
 
     @classmethod
     def _documentation_bibliography_url_field_is_passive(
@@ -1685,7 +1716,11 @@ class TextScanner(BaseScanner):
                 url_spans.append((match.start(), match.end()))
                 if cls._documentation_bibliography_url_field_is_passive(payload, line_start, line, match.start()):
                     continue
-                if cls._documentation_line_is_code_shaped(line, match.start()):
+                absolute_position = line_start + match.start()
+                if cls._documentation_line_is_code_shaped(
+                    line,
+                    match.start(),
+                ) or cls._documentation_multiline_return_contains_position(payload, absolute_position):
                     return False
             for pattern in (
                 BARE_NETWORK_IPV4_TOKEN_PATTERN,
@@ -1706,7 +1741,11 @@ class TextScanner(BaseScanner):
                         tld = match.group().rsplit(b".", 1)[-1].decode("utf-8", errors="ignore").casefold()
                         if before in {b".", b"_"} or after in {b".", b"_"} or tld not in DOCUMENTATION_BARE_DOMAIN_TLDS:
                             continue
-                    if cls._documentation_line_is_code_shaped(line, match.start()):
+                    absolute_position = line_start + match.start()
+                    if cls._documentation_line_is_code_shaped(
+                        line,
+                        match.start(),
+                    ) or cls._documentation_multiline_return_contains_position(payload, absolute_position):
                         return False
             if line_end == len(payload):
                 break
