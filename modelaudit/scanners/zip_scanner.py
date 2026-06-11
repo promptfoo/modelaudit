@@ -12,6 +12,7 @@ from itertools import pairwise
 from typing import Any, BinaryIO, ClassVar, cast
 
 from ..core_results import mark_operational_scan_error
+from ..scanner_registry_metadata import TEXT_CONTENT_ROUTED_FILENAMES
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_config import get_archive_depth
@@ -1946,26 +1947,36 @@ class ZipScanner(BaseScanner):
 
                 # Extract and scan the file
                 tmp_path: str | None = None
+                tmp_dir: str | None = None
                 try:
                     max_entry_size = self._get_max_entry_size()
                     is_security_only_member = self._is_security_only_member_entry(name)
                     is_content_only_member = self._is_content_only_member_entry(name)
-
-                    if is_content_only_member:
-                        suffix = ""
-                    elif name.lower().endswith(".zip"):
-                        suffix = ".zip"
-                    else:
-                        safe_name = re.sub(
-                            r"[^a-zA-Z0-9_.-]",
-                            "_",
-                            os.path.basename(name),
-                        )
-                        suffix = f"_{safe_name}"
+                    is_mar_python_fallback = (
+                        archive_ext == ".mar" and name.lower().endswith(".py") and not is_security_only_member
+                    )
 
                     try:
-                        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                            tmp_path = tmp.name
+                        with contextlib.ExitStack() as stack:
+                            tmp_file: BinaryIO
+                            if is_content_only_member:
+                                named_tmp = stack.enter_context(tempfile.NamedTemporaryFile(suffix="", delete=False))
+                                tmp_path = named_tmp.name
+                                tmp_file = cast(BinaryIO, named_tmp)
+                            else:
+                                safe_name = (
+                                    re.sub(
+                                        r"[^a-zA-Z0-9_.-]",
+                                        "_",
+                                        os.path.basename(name),
+                                    )
+                                    or "member"
+                                )
+                                if safe_name.lower() not in TEXT_CONTENT_ROUTED_FILENAMES or is_mar_python_fallback:
+                                    safe_name = f"member_{safe_name}"
+                                tmp_dir = tempfile.mkdtemp(prefix="modelaudit_zip_")
+                                tmp_path = os.path.join(tmp_dir, safe_name)
+                                tmp_file = stack.enter_context(open(tmp_path, "wb"))
                             total_size = 0
                             with z.open(info) as entry:
                                 while True:
@@ -1982,10 +1993,10 @@ class ZipScanner(BaseScanner):
                                             "ZIP archive exceeds maximum total uncompressed size of "
                                             f"{max_total_uncompressed_size} bytes",
                                         )
-                                    tmp.write(chunk)
+                                    tmp_file.write(chunk)
                             extracted_uncompressed_size += total_size
 
-                        if archive_ext == ".mar" and name.lower().endswith(".py") and not is_security_only_member:
+                        if is_mar_python_fallback:
                             mar_python_result = self._scan_mar_python_entry(path, name, tmp_path, total_size)
                             if mar_python_result is not None:
                                 result.merge(mar_python_result)
@@ -2052,6 +2063,9 @@ class ZipScanner(BaseScanner):
                         if tmp_path is not None:
                             with contextlib.suppress(FileNotFoundError):
                                 os.unlink(tmp_path)
+                        if tmp_dir is not None:
+                            with contextlib.suppress(OSError):
+                                os.rmdir(tmp_dir)
 
                 except Exception as e:
                     scan_complete = False

@@ -199,6 +199,18 @@ def _bert_vocab_payload(min_bytes: int = 16 * 1024) -> bytes:
     return payload
 
 
+def _bpe_merges_payload(min_bytes: int = 3 * 1024 * 1024) -> bytes:
+    lines = ["#version: 0.2"]
+    total_bytes = len(lines[0]) + 1
+    index = 0
+    while total_bytes <= min_bytes:
+        line = f"token_{index % 8192} token_{(index * 17) % 8192}"
+        lines.append(line)
+        total_bytes += len(line) + 1
+        index += 1
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 def test_detect_file_format_directory(tmp_path):
     """Test detecting a directory format."""
     # Create a regular directory
@@ -429,6 +441,48 @@ def test_detect_bert_vocabulary_text_does_not_route_as_flax(tmp_path: Path) -> N
     assert detect_file_format_from_magic(str(vocab)) == "unknown"
     assert detect_file_format_for_skip_filter(str(vocab)) == "unknown"
     assert detect_file_format(str(vocab)) == "unknown"
+
+
+def test_detect_large_bpe_merges_text_does_not_route_as_flax(tmp_path: Path) -> None:
+    merges = tmp_path / "merges.txt"
+    payload = _bpe_merges_payload()
+    merges.write_bytes(payload)
+
+    assert len(payload) > file_detection._CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+    assert file_detection._is_complete_declared_text_asset(merges, merges.stat().st_size) is True
+    assert detect_file_format_from_magic(str(merges)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(merges)) == "unknown"
+    assert detect_file_format(str(merges)) == "unknown"
+
+
+def test_detect_ascii_scalar_merges_still_fails_closed_as_flax(tmp_path: Path) -> None:
+    merges = tmp_path / "merges.txt"
+    merges.write_bytes(b"A" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 2))
+
+    assert file_detection._is_complete_declared_text_asset(merges, merges.stat().st_size) is False
+    assert detect_file_format_from_magic(str(merges)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(merges)) == "flax_msgpack"
+    assert detect_file_format(str(merges)) == "flax_msgpack"
+
+
+def test_detect_control_byte_merges_still_fails_closed_as_flax(tmp_path: Path) -> None:
+    merges = tmp_path / "merges.txt"
+    merges.write_bytes(b"\x00" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 2))
+
+    assert file_detection._is_complete_declared_text_asset(merges, merges.stat().st_size) is False
+    assert detect_file_format_from_magic(str(merges)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(merges)) == "flax_msgpack"
+    assert detect_file_format(str(merges)) == "flax_msgpack"
+
+
+def test_detect_printable_utf8_non_text_suffix_still_fails_closed_as_flax(tmp_path: Path) -> None:
+    payload = _bpe_merges_payload()
+    renamed = tmp_path / "merges.jpg"
+    renamed.write_bytes(payload)
+
+    assert detect_file_format_from_magic(str(renamed)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(renamed)) == "flax_msgpack"
+    assert detect_file_format(str(renamed)) == "flax_msgpack"
 
 
 def test_detect_multilingual_readme_does_not_route_as_flax(tmp_path: Path) -> None:

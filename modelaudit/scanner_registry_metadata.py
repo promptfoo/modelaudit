@@ -4,6 +4,19 @@ from __future__ import annotations
 
 from typing import Any
 
+TEXT_CONTENT_ROUTED_FILENAMES = [
+    "readme",
+    "model_card",
+    "requirements.txt",
+    "vocab.txt",
+    "vocabulary.txt",
+    "tokens.txt",
+    "tokenizer.txt",
+    "merges.txt",
+    "labels.txt",
+    "classes.txt",
+]
+
 # Extension-only format detection is intentionally narrower than scanner routing:
 # generic config/text extensions are routed by scanner descriptors and content
 # gates, but they are not authoritative enough for magic-vs-extension validation.
@@ -253,17 +266,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "class": "TextScanner",
         "description": "Scans ML-related text files",
         "extensions": [".txt", ".md", ".markdown", ".rst"],
-        "content_routed_filenames": [
-            "readme",
-            "model_card",
-            "requirements.txt",
-            "vocab.txt",
-            "vocabulary.txt",
-            "tokens.txt",
-            "tokenizer.txt",
-            "labels.txt",
-            "classes.txt",
-        ],
+        "content_routed_filenames": TEXT_CONTENT_ROUTED_FILENAMES,
         "priority": 0,
         "dependencies": [],
         "numpy_sensitive": False,

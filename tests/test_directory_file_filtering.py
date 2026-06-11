@@ -3,6 +3,7 @@
 import bz2
 import gzip
 import importlib
+import io
 import json
 import lzma
 import pickle
@@ -89,6 +90,18 @@ def _bert_vocab_text() -> str:
     tokens.extend(f"[unused{index}]" for index in range(2048))
     tokens.extend(f"token_{index}" for index in range(2048))
     return "\n".join(tokens) + "\n"
+
+
+def _bpe_merges_text(min_bytes: int = 3 * 1024 * 1024) -> str:
+    lines = ["#version: 0.2"]
+    total_bytes = len(lines[0]) + 1
+    index = 0
+    while total_bytes <= min_bytes:
+        line = f"token_{index % 8192} token_{(index * 17) % 8192}"
+        lines.append(line)
+        total_bytes += len(line) + 1
+        index += 1
+    return "\n".join(lines) + "\n"
 
 
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
@@ -566,6 +579,74 @@ class TestDirectoryFileFiltering:
         assert metadata["scanner_dependency_ids"] == ["text"]
         assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
         assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    def test_large_merges_text_stays_on_text_route_in_directory_scan(self, tmp_path: Path) -> None:
+        merges = tmp_path / "merges.txt"
+        merges.write_text(_bpe_merges_text(), encoding="utf-8")
+
+        assert merges.stat().st_size > file_detection._CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["text"]
+        assert determine_exit_code(results) == 0
+        metadata = results.file_metadata[str(merges)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["text"]
+        assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
+        assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    def test_large_merges_text_stays_on_text_route_inside_zip_member(self, tmp_path: Path) -> None:
+        payload = _bpe_merges_text().encode("utf-8")
+        archive = tmp_path / "tokenizer.zip"
+        with zipfile.ZipFile(archive, "w") as zip_archive:
+            zip_archive.writestr("tokenizer/merges.txt", payload)
+
+        results = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["zip"]
+        assert determine_exit_code(results) == 0
+        metadata = results.file_metadata[str(archive)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["zip", "text"]
+        assert metadata["contents"] == [
+            {"path": f"{archive}:tokenizer/merges.txt", "type": "text", "size": len(payload)}
+        ]
+        assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
+        assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    def test_large_merges_text_stays_on_text_route_inside_tar_member(self, tmp_path: Path) -> None:
+        payload = _bpe_merges_text().encode("utf-8")
+        archive = tmp_path / "tokenizer.tar"
+        member = tarfile.TarInfo("tokenizer/merges.txt")
+        member.size = len(payload)
+        with tarfile.open(archive, "w") as tar_archive:
+            tar_archive.addfile(member, io.BytesIO(payload))
+
+        results = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["tar"]
+        assert determine_exit_code(results) == 0
+        metadata = results.file_metadata[str(archive)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["tar", "text"]
+        assert metadata["contents"] == [
+            {"path": f"{archive}:tokenizer/merges.txt", "type": "text", "size": len(payload)}
+        ]
+        assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
+        assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    def test_binary_merges_still_fails_closed_as_flax_in_directory_scan(self, tmp_path: Path) -> None:
+        merges = tmp_path / "merges.txt"
+        merges.write_bytes(b"\x00" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 2))
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["flax_msgpack"]
+        assert determine_exit_code(results) == 2
+        metadata = results.file_metadata[str(merges)].model_dump(mode="python")
+        assert "flax_msgpack_routing_incomplete" in metadata["scan_outcome_reasons"]
 
     def test_large_json_array_under_skipped_suffix_is_scanned_fail_closed(self, tmp_path: Path) -> None:
         json_array = tmp_path / "metadata.jpg"

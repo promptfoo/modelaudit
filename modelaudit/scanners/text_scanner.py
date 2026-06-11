@@ -50,8 +50,9 @@ PASSIVE_NETWORK_FINDING_TYPES = frozenset(
         "url_detected",
     }
 )
-PASSIVE_DATA_TEXT_FILENAMES = frozenset({"classes.txt"})
+PASSIVE_DATA_TEXT_FILENAMES = frozenset({"classes.txt", "merges.txt"})
 PASSIVE_DATA_TEXT_PREFIXES = ("label", "token", "vocab")
+PASSIVE_DATA_SECRET_TYPES = frozenset({"Basic Auth Credentials", "Bearer Token"})
 BARE_NETWORK_URL_TOKEN_PATTERN = re.compile(rb"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 REQUIREMENTS_RAW_URL_PATTERN = re.compile(rb"https?://\S+", re.IGNORECASE)
 BARE_NETWORK_IPV4_TOKEN_PATTERN = re.compile(
@@ -609,6 +610,7 @@ class TextScanner(BaseScanner):
             "vocabulary.txt",
             "tokens.txt",
             "tokenizer.txt",
+            "merges.txt",
             "labels.txt",
             "classes.txt",
             "model_card.md",
@@ -1463,6 +1465,22 @@ class TextScanner(BaseScanner):
             return False
         return any(isinstance(value, str) and line_text == value.casefold() for value in candidates)
 
+    @classmethod
+    def _is_bare_data_secret_token(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        if finding.get("secret_type") not in PASSIVE_DATA_SECRET_TYPES:
+            return False
+        line_parts = cls._finding_line_parts(payload, finding)
+        if line_parts is None:
+            return False
+        line, position = line_parts
+        length = finding.get("length")
+        if not isinstance(length, int) or length <= 0 or position + length > len(line):
+            return False
+        stripped = line.strip()
+        if not stripped or b"@" in stripped or b":" in stripped or b"=" in stripped:
+            return False
+        return line[position : position + length].strip() == stripped
+
     @staticmethod
     def _all_network_candidate_lines_are_bare(payload: bytes) -> bool:
         for line in payload.splitlines():
@@ -1572,6 +1590,20 @@ class TextScanner(BaseScanner):
             classified_findings.append(finding)
         return classified_findings, classification_incomplete
 
+    @classmethod
+    def _downgrade_sidecar_secret_findings(
+        cls,
+        path: str,
+        payload: bytes,
+        findings: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not cls._is_passive_data_sidecar(path):
+            return findings
+        return [
+            {**finding, "severity": "INFO"} if cls._is_bare_data_secret_token(payload, finding) else finding
+            for finding in findings
+        ]
+
     @staticmethod
     def _is_unreadable_path_result(result: ScanResult) -> bool:
         return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
@@ -1664,6 +1696,7 @@ class TextScanner(BaseScanner):
                     max_findings=max_findings,
                 )
                 secret_findings, finding_limit = self._split_detector_finding_limit(secret_findings)
+                secret_findings = self._downgrade_sidecar_secret_findings(path, inspected_payload, secret_findings)
                 if secret_findings or not truncated:
                     self.add_embedded_secret_findings(secret_findings, result, context=path)
                 if finding_limit is not None:
@@ -1842,7 +1875,7 @@ class TextScanner(BaseScanner):
                     details={"file_type": "documentation"},
                     rule_code=None,  # Passing check
                 )
-            elif filename in ["vocab.txt", "vocabulary.txt", "tokens.txt", "tokenizer.txt"]:
+            elif filename in ["vocab.txt", "vocabulary.txt", "tokens.txt", "tokenizer.txt", "merges.txt"]:
                 result.add_check(
                     name="File Type Identification",
                     passed=True,

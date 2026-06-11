@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import re
 import tarfile
 import tempfile
-from typing import Any, ClassVar
+from typing import Any, BinaryIO, ClassVar, cast
 
+from ..scanner_registry_metadata import TEXT_CONTENT_ROUTED_FILENAMES
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_locations import rewrite_extracted_member_location
@@ -243,6 +245,7 @@ class TarScanner(BaseScanner):
         member: tarfile.TarInfo,
         *,
         suffix: str,
+        basename: str | None = None,
     ) -> tuple[str, int]:
         """Stream a TAR member to disk while enforcing the configured size limit."""
         max_entry_size = self._get_max_entry_size()
@@ -256,9 +259,18 @@ class TarScanner(BaseScanner):
 
         total_size = 0
         tmp_path: str | None = None
+        tmp_dir: str | None = None
         try:
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                tmp_path = tmp.name
+            with contextlib.ExitStack() as stack:
+                tmp_file: BinaryIO
+                if basename is None:
+                    named_tmp = stack.enter_context(tempfile.NamedTemporaryFile(suffix=suffix, delete=False))
+                    tmp_path = named_tmp.name
+                    tmp_file = cast(BinaryIO, named_tmp)
+                else:
+                    tmp_dir = tempfile.mkdtemp(prefix="modelaudit_tar_")
+                    tmp_path = os.path.join(tmp_dir, basename)
+                    tmp_file = stack.enter_context(open(tmp_path, "wb"))
                 while True:
                     chunk = fileobj.read(ARCHIVE_MEMBER_COPY_CHUNK_BYTES)
                     if not chunk:
@@ -268,10 +280,12 @@ class TarScanner(BaseScanner):
                         raise _TarEntryExtractionIncomplete(
                             f"TAR entry {member.name} exceeds maximum size of {max_entry_size} bytes"
                         )
-                    tmp.write(chunk)
+                    tmp_file.write(chunk)
         except Exception:
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+            if tmp_dir and os.path.isdir(tmp_dir):
+                os.rmdir(tmp_dir)
             raise
         finally:
             fileobj.close()
@@ -624,6 +638,7 @@ class TarScanner(BaseScanner):
                 try:
                     # Check for compound extensions like .tar.gz
                     name_lower = name.lower()
+                    safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.basename(name)) or "member"
                     is_tar_extension = any(name_lower.endswith(ext) for ext in self.supported_extensions)
                     if is_tar_extension:
                         # Extract the full extension for the temp file
@@ -634,10 +649,16 @@ class TarScanner(BaseScanner):
                         else:
                             suffix = ".tar"  # fallback
                     else:
-                        safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.basename(name))
                         suffix = f"_{safe_name}"
 
-                    tmp_path, total_size = self._extract_member_to_tempfile(tar, member, suffix=suffix)
+                    basename = safe_name if safe_name.lower() in TEXT_CONTENT_ROUTED_FILENAMES else None
+                    tmp_path, total_size = self._extract_member_to_tempfile(
+                        tar,
+                        member,
+                        suffix=suffix,
+                        basename=basename,
+                    )
+                    tmp_dir = os.path.dirname(tmp_path) if basename is not None else None
                     try:
                         if is_tar_extension and tarfile.is_tarfile(tmp_path):
                             nested_config = dict(self.config)
@@ -691,6 +712,9 @@ class TarScanner(BaseScanner):
                         contents.append(asset_entry)
                     finally:
                         os.unlink(tmp_path)
+                        if tmp_dir is not None:
+                            with contextlib.suppress(OSError):
+                                os.rmdir(tmp_dir)
                 except _TarEntryExtractionIncomplete as exc:
                     scan_complete = False
                     mark_archive_scan_incomplete(result, "tar_entry_extraction_incomplete")

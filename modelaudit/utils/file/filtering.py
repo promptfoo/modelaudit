@@ -300,6 +300,20 @@ def _has_scannable_content(path: str) -> bool:
         return True
 
 
+def _has_complete_declared_text_content(path: str) -> bool:
+    """Return whether an exact declared text route owns a skipped text-like filename."""
+    try:
+        from .detection import _is_complete_declared_text_asset
+
+        file_path = Path(path)
+        if not file_path.is_file():
+            return False
+        return _is_complete_declared_text_asset(file_path, file_path.stat().st_size)
+    except Exception as exc:
+        logger.debug("Declared text sniffing failed for %s; preserving fail-closed defaults: %s", path, exc)
+        return False
+
+
 def should_skip_file(
     path: str,
     skip_extensions: set[str] | None = None,
@@ -352,6 +366,9 @@ def should_skip_file(
         selected_extensions = {candidate.lower() for candidate in scanner_selection_extensions}
         if any(candidate in selected_extensions for candidate in candidate_extensions):
             return False
+
+    if use_default_skip_extensions and ext in skip_extensions and _has_complete_declared_text_content(path):
+        return False
 
     # Preserve scanner coverage for archive/metadata formats that are otherwise
     # part of the default skip list.

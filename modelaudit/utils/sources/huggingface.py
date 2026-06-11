@@ -16,6 +16,7 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
+from ...scanner_registry_metadata import TEXT_CONTENT_ROUTED_FILENAMES
 from ..helpers.disk_space import check_disk_space
 from .huggingface_paths import (
     extract_model_id_from_path,
@@ -33,19 +34,7 @@ logger = logging.getLogger(__name__)
 _HF_CONTENT_SNIFF_BYTES = 8 * 1024
 _HF_CONTENT_SNIFF_MAX_FILES = 256
 _HF_CONTENT_SNIFF_MAX_TOTAL_BYTES = 64 * 1024 * 1024
-_HF_TEXT_ROUTE_DECLARED_FILENAMES = frozenset(
-    {
-        "readme",
-        "model_card",
-        "requirements.txt",
-        "vocab.txt",
-        "vocabulary.txt",
-        "tokens.txt",
-        "tokenizer.txt",
-        "labels.txt",
-        "classes.txt",
-    }
-)
+_HF_TEXT_ROUTE_DECLARED_FILENAMES = frozenset(TEXT_CONTENT_ROUTED_FILENAMES)
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
 _MAX_HF_STREAMING_EXTENSIONLESS_FILES = 128
@@ -515,14 +504,22 @@ def _probe_huggingface_executorch_prefix(prefix: bytes, *, sample_is_prefix: boo
     )
 
 
-def _is_complete_huggingface_text_or_json(probe: bytes, *, sample_is_prefix: bool) -> bool:
+def _is_complete_huggingface_text_or_json(
+    probe: bytes,
+    *,
+    sample_is_prefix: bool,
+    declared_text_asset: bool = False,
+) -> bool:
     """Return whether a complete bounded probe is owned by benign text or JSON."""
     if sample_is_prefix:
         return False
 
-    from modelaudit.utils.file.detection import _is_complete_bounded_text_payload
+    from modelaudit.utils.file.detection import _is_complete_bounded_text_payload, _is_complete_declared_text_payload
 
-    if _is_complete_bounded_text_payload(probe):
+    text_owned = (
+        _is_complete_declared_text_payload(probe) if declared_text_asset else _is_complete_bounded_text_payload(probe)
+    )
+    if text_owned:
         return True
     normalized = probe.lstrip()
     if normalized.startswith(b"\xef\xbb\xbf"):
@@ -592,6 +589,7 @@ def _detect_huggingface_flax_msgpack_route(
 ) -> str | None:
     """Return a bounded Flax MessagePack route for a suffix-skipped remote file."""
     from modelaudit.utils.file.detection import (
+        _CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES,
         _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES,
         _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES,
         FLAX_MSGPACK_STRUCTURE_READ_BYTES,
@@ -617,27 +615,34 @@ def _detect_huggingface_flax_msgpack_route(
     )
     if initial_probe_state is True:
         return "flax_msgpack"
-    declared_text_asset = (
-        suffix in _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES
-        or remote_path.name.lower() in _HF_TEXT_ROUTE_DECLARED_FILENAMES
-    )
+    declared_text_filename = remote_path.name.lower() in _HF_TEXT_ROUTE_DECLARED_FILENAMES
+    declared_text_asset = suffix in _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES or declared_text_filename
     max_probe_size = FLAX_MSGPACK_STRUCTURE_READ_BYTES
     raw_probe: bytes | None = None
     should_probe_complete_text = initial_probe_state is False or (initial_probe_state is None and declared_text_asset)
     if should_probe_complete_text:
         if len(prefix) < _HF_CONTENT_SNIFF_BYTES or not declared_text_asset:
             return None
+        text_probe_limit = (
+            _CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES
+            if declared_text_filename
+            else _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+        )
         raw_text_probe = _read_huggingface_probe(
             repo_id,
             filename,
             revision,
             budget,
             prefix,
-            _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES + 1,
+            text_probe_limit + 1,
         )
-        text_sample_is_prefix = len(raw_text_probe) > _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
-        text_probe = raw_text_probe[:_CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES]
-        if _is_complete_huggingface_text_or_json(text_probe, sample_is_prefix=text_sample_is_prefix):
+        text_sample_is_prefix = len(raw_text_probe) > text_probe_limit
+        text_probe = raw_text_probe[:text_probe_limit]
+        if _is_complete_huggingface_text_or_json(
+            text_probe,
+            sample_is_prefix=text_sample_is_prefix,
+            declared_text_asset=declared_text_filename,
+        ):
             return None
         raw_probe = raw_text_probe
     elif len(prefix) < _HF_CONTENT_SNIFF_BYTES:

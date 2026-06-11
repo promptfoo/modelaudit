@@ -827,6 +827,7 @@ def test_remote_prefilters_preserve_text_scanner_content_routed_filenames() -> N
             "vocabulary.txt",
             "tokens.txt",
             "tokenizer.txt",
+            "merges.txt",
             "labels.txt",
             "classes.txt",
         }

@@ -18,7 +18,11 @@ from io import BytesIO, StringIO
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Literal, cast
 
-from ...scanner_registry_metadata import get_extension_format_map, get_registered_scanner_extensions
+from ...scanner_registry_metadata import (
+    TEXT_CONTENT_ROUTED_FILENAMES,
+    get_extension_format_map,
+    get_registered_scanner_extensions,
+)
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
 from ._compression import is_zlib_header
 from .hdf5 import find_hdf5_signature_offset
@@ -53,6 +57,7 @@ _TF_METAGRAPH_MAX_ROUTING_PAYLOAD_BYTES = _TF_METAGRAPH_MAX_VALIDATE_BYTES
 _TF_METAGRAPH_MAX_ROUTING_FIELDS = 32768
 _TF_METAGRAPH_MAX_ROUTING_DEPTH = 64
 _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES = 2 * 1024 * 1024
+_CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES = 10 * 1024 * 1024
 _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES = b"\t\n\r" + bytes(range(0x20, 0x7F))
 _CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES = (
     bytes(byte for byte in range(0x20) if byte not in {0x09, 0x0A, 0x0C, 0x0D}) + b"\x7f"
@@ -4416,6 +4421,8 @@ def _detect_renamed_tensorflow_protobuf(
     suffix = file_path.suffix.lower()
     if _is_complete_bounded_printable_text(file_path, file_size):
         return "unknown"
+    if _is_complete_bounded_utf8_non_model_text(file_path, file_size):
+        return "unknown"
     route = _classify_bounded_tensorflow_protobuf(file_path, file_size)
     if (
         suffix in {".py", ".pyw"}
@@ -5362,14 +5369,26 @@ def _is_complete_bounded_printable_text(file_path: Path, file_size: int) -> bool
 
 def _is_complete_bounded_text_payload(payload: bytes) -> bool:
     """Return whether a complete bounded payload is validated text, including UTF-8 prose."""
-    if not payload.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES):
-        return True
     if any(byte in _CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES for byte in payload):
         return False
     try:
         decoded = payload.decode("utf-8-sig")
     except UnicodeDecodeError:
         return False
+    return _decoded_text_payload_has_text_shape(decoded)
+
+
+def _decoded_text_payload_has_text_shape(decoded: str) -> bool:
+    """Reject binary-looking scalar streams while accepting ordinary prose and tokenizer text."""
+    if _decoded_text_payload_is_low_diversity_scalar_stream(decoded):
+        return False
+    return any(
+        unicodedata.category(character)[0] in {"L", "N", "P", "S"} for character in decoded if not character.isspace()
+    )
+
+
+def _decoded_text_payload_is_low_diversity_scalar_stream(decoded: str) -> bool:
+    """Return whether text is a long, low-diversity scalar stream."""
     content_characters: set[str] = set()
     content_character_count = 0
     saw_textual_character = False
@@ -5386,19 +5405,62 @@ def _is_complete_bounded_text_payload(payload: bytes) -> bool:
 
     if not saw_textual_character:
         return False
-    return not (
+    return (
         content_character_count >= _CONTENT_ROUTE_UTF8_SCALAR_STREAM_MIN_CHARS
         and len(content_characters) <= _CONTENT_ROUTE_UTF8_SCALAR_STREAM_MAX_UNIQUE_CHARS
     )
+
+
+def _is_complete_bounded_utf8_non_model_text(file_path: Path, file_size: int) -> bool:
+    """Return whether a complete bounded UTF-8 file is non-model text."""
+    if file_size > _CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES:
+        return False
+    try:
+        payload = read_magic_bytes(str(file_path), file_size)
+    except OSError:
+        return False
+    if any(byte in _CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES for byte in payload):
+        return False
+    try:
+        decoded = payload.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False
+    return not any(
+        not character.isspace() for character in decoded
+    ) or _decoded_text_payload_is_low_diversity_scalar_stream(decoded)
+
+
+def _is_complete_declared_text_payload(payload: bytes) -> bool:
+    """Return whether an exact declared text asset has complete, line-oriented text content."""
+    if not _is_complete_bounded_text_payload(payload):
+        return False
+    return not (
+        len(payload) > _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES and b"\n" not in payload and b"\r" not in payload
+    )
+
+
+def _is_complete_declared_text_asset(file_path: Path, file_size: int) -> bool:
+    """Return whether an exact declared tokenizer/text asset owns the file."""
+    if file_path.name.lower() not in TEXT_CONTENT_ROUTED_FILENAMES:
+        return False
+    if file_size > _CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES:
+        return False
+    try:
+        payload = read_magic_bytes(str(file_path), file_size)
+    except OSError:
+        return False
+    return _is_complete_declared_text_payload(payload)
 
 
 def _preserve_inconclusive_protobuf_model_routing(file_path: Path, file_size: int) -> bool:
     """Keep ambiguous binary model protobufs scannable without claiming proven text."""
     if file_path.suffix.lower() in {".py", ".pyw"} and not _has_bounded_non_source_control_signal(file_path, file_size):
         return False
-    return not _is_complete_structured_json_content_owner(
-        file_path, file_size
-    ) and not _is_complete_bounded_printable_text(file_path, file_size)
+    return (
+        not _is_complete_structured_json_content_owner(file_path, file_size)
+        and not _is_complete_bounded_printable_text(file_path, file_size)
+        and not _is_complete_bounded_utf8_non_model_text(file_path, file_size)
+    )
 
 
 def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
@@ -5416,6 +5478,8 @@ def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
             return False
         if json_document_probe is None and ext not in _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES:
             return True
+        if _is_complete_declared_text_asset(file_path, size):
+            return False
         if _is_complete_bounded_printable_text(file_path, size):
             return False
     if ext == "":

@@ -57,6 +57,18 @@ _HF_BERT_MULTILINGUAL_CASED_VOCAB_URL = (
     "https://huggingface.co/google-bert/bert-base-multilingual-cased/resolve/"
     f"{_HF_BERT_MULTILINGUAL_CASED_REVISION}/vocab.txt"
 )
+_HF_QWEN2_VL_2B_MERGES_REVISION = "895c3a49bc3fa70a340399125c650a463535e71c"
+_HF_QWEN2_VL_2B_MERGES_URL = (
+    f"https://huggingface.co/Qwen/Qwen2-VL-2B-Instruct/resolve/{_HF_QWEN2_VL_2B_MERGES_REVISION}/merges.txt"
+)
+_HF_HOLO_31_4B_MERGES_REVISION = "b63fb9bacd968a20b31d0c704b14429c0aad3a84"
+_HF_HOLO_31_4B_MERGES_URL = (
+    f"https://huggingface.co/Hcompany/Holo-3.1-4B/resolve/{_HF_HOLO_31_4B_MERGES_REVISION}/merges.txt"
+)
+_HF_QWEN2_15B_MERGES_REVISION = "ba1cf1846d7df0a0591d6c00649f57e798519da8"
+_HF_QWEN2_15B_MERGES_URL = (
+    f"https://huggingface.co/Qwen/Qwen2-1.5B-Instruct/resolve/{_HF_QWEN2_15B_MERGES_REVISION}/merges.txt"
+)
 
 
 def _bert_vocab_payload(min_bytes: int = 16 * 1024) -> bytes:
@@ -66,6 +78,18 @@ def _bert_vocab_payload(min_bytes: int = 16 * 1024) -> bytes:
     payload = ("\n".join(tokens) + "\n").encode("utf-8")
     assert len(payload) > min_bytes
     return payload
+
+
+def _bpe_merges_payload(min_bytes: int = 3 * 1024 * 1024) -> bytes:
+    lines = ["#version: 0.2"]
+    total_bytes = len(lines[0]) + 1
+    index = 0
+    while total_bytes <= min_bytes:
+        line = f"token_{index % 8192} token_{(index * 17) % 8192}"
+        lines.append(line)
+        total_bytes += len(line) + 1
+        index += 1
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 class _FakeRangeResponse:
@@ -2252,6 +2276,49 @@ class TestModelDownloadStreaming:
         assert budget.file_sizes["vocab.txt"] == len(vocab_payload)
         assert len(budget.prefixes["vocab.txt"]) == len(vocab_payload)
 
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_rejects_large_complete_merges_text(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Remote Flax routing should treat complete BPE merge rules as tokenizer text."""
+        merges_payload = _bpe_merges_payload()
+        assert len(merges_payload) > 2 * FLAX_MSGPACK_STRUCTURE_READ_BYTES
+        mock_requests_get.side_effect = _fake_bounded_range_response(merges_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_flax_msgpack_route(
+            "Hcompany/Holo-3.1-4B",
+            "merges.txt",
+            _HF_HOLO_31_4B_MERGES_REVISION,
+            budget,
+            merges_payload[:8192],
+        )
+
+        assert detected_format is None
+        assert budget.file_sizes["merges.txt"] == len(merges_payload)
+        assert len(budget.prefixes["merges.txt"]) == len(merges_payload)
+
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_preserves_generic_large_text_suffix_fail_closed(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Generic large text suffixes should not inherit tokenizer-text ownership."""
+        payload = _bpe_merges_payload()
+        mock_requests_get.side_effect = _fake_bounded_range_response(payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_flax_msgpack_route(
+            "test/model",
+            "notes.txt",
+            _HF_TEST_REVISION,
+            budget,
+            payload[:8192],
+        )
+
+        assert detected_format == "flax_msgpack"
+
     @patch("modelaudit.utils.sources.huggingface.time.monotonic", return_value=100.0)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
@@ -3004,6 +3071,45 @@ class TestModelDownloadStreaming:
 
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["known.msgpack", "merges.txt"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_selected_flax_skips_large_merges_text(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Remote Flax selection should not promote complete BPE merge rules."""
+        merges_payload = _bpe_merges_payload()
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / filename
+            path.write_bytes(b"\x81\xa6params\x80")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_requests_get.side_effect = _fake_bounded_range_response(merges_payload)
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+                scannable_scanner_ids={"flax_msgpack"},
+            )
+        )
+
+        assert [path.name for path, _is_last in results] == ["known.msgpack"]
+        mock_hf_hub_download.assert_called_once()
+        assert mock_hf_hub_download.call_args.kwargs["filename"] == "known.msgpack"
+        assert all(
+            f"/resolve/{_HF_TEST_REVISION}/merges.txt" in call.args[0] for call in mock_requests_get.call_args_list
+        )
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
         return_value=(["known.msgpack", "README.md"], _HF_TEST_REVISION, None),
     )
     @patch("requests.get")
@@ -3043,6 +3149,49 @@ class TestModelDownloadStreaming:
         assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
             "known.msgpack",
             "README.md",
+        ]
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["known.msgpack", "merges.txt"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_selected_flax_preserves_binary_merges_checkpoint(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Remote merges.txt names must not suppress structurally valid Flax MessagePack."""
+        msgpack = pytest.importorskip("msgpack")
+        hidden_payload = msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / filename
+            path.write_bytes(hidden_payload if filename == "merges.txt" else b"\x81\xa6params\x80")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_requests_get.side_effect = _fake_bounded_range_response(hidden_payload)
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+                scannable_scanner_ids={"flax_msgpack"},
+            )
+        )
+
+        assert [path.name for path, _is_last in results] == ["known.msgpack", "merges.txt"]
+        assert results[-1][1] is True
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "known.msgpack",
+            "merges.txt",
         ]
 
     @patch(
@@ -4198,6 +4347,79 @@ def test_live_pinned_bert_vocab_does_not_emit_flax_routing_incomplete(
     assert report["files_scanned"] == 1
     assert report["scanner_names"] == ["text"]
     assert metadata["file_size"] == 995526
+    assert metadata["scanner_dependency_ids"] == ["text"]
+    assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
+    assert "MessagePack Routing Analysis Incomplete" not in [check["name"] for check in report.get("checks", [])]
+    assert all(issue["severity"] == "info" for issue in report["issues"])
+    assert "flax_msgpack_routing_incomplete" not in [
+        issue.get("details", {}).get("scan_outcome_reason") for issue in report["issues"]
+    ]
+    assert "token=" not in result.output
+    assert "Authorization" not in result.output
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("MODELAUDIT_RUN_LIVE_HF_QA") != "1",
+    reason="Set MODELAUDIT_RUN_LIVE_HF_QA=1 to run live pinned Hugging Face QA",
+)
+@pytest.mark.parametrize(
+    ("url", "expected_size"),
+    [
+        (_HF_QWEN2_VL_2B_MERGES_URL, 1_671_839),
+        (_HF_HOLO_31_4B_MERGES_URL, 3_353_259),
+        (_HF_QWEN2_15B_MERGES_URL, 1_671_839),
+    ],
+    ids=["rank-257-qwen2-vl", "rank-259-holo", "rank-260-qwen2-15b"],
+)
+def test_live_pinned_tokenizer_merges_does_not_emit_flax_routing_incomplete(
+    url: str,
+    expected_size: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pinned live merges.txt QA for tokenizer text routing regressions."""
+    from click.testing import CliRunner
+
+    from modelaudit.cli import cli
+
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf-home"))
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hf-cache"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+    monkeypatch.setenv("PROMPTFOO_DISABLE_TELEMETRY", "1")
+    monkeypatch.setenv("NO_ANALYTICS", "1")
+    for token_env in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
+        monkeypatch.delenv(token_env, raising=False)
+
+    output_path = tmp_path / "scan.json"
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--quiet",
+            "--format",
+            "json",
+            "--output",
+            str(output_path),
+            "--no-cache",
+            "--max-size",
+            "5MB",
+            "--timeout",
+            "120",
+            url,
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    report = json.loads(output_path.read_text())
+    metadata = next(iter(report["file_metadata"].values()))
+    assert report["success"] is True
+    assert report["has_errors"] is False
+    assert report["files_scanned"] == 1
+    assert report["scanner_names"] == ["text"]
+    assert metadata["file_size"] == expected_size
     assert metadata["scanner_dependency_ids"] == ["text"]
     assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
     assert "MessagePack Routing Analysis Incomplete" not in [check["name"] for check in report.get("checks", [])]

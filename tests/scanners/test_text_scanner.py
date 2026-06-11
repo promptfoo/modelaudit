@@ -2020,6 +2020,44 @@ def test_text_scanner_bare_active_vocabulary_tokens_are_informational(
     assert determine_exit_code(aggregate) == 0
 
 
+def test_text_scanner_bare_merges_basic_token_pair_is_informational(tmp_path: Path) -> None:
+    text_dir = tmp_path / "text_tokenizer"
+    text_dir.mkdir()
+    text_path = text_dir / "merges.txt"
+    text_path.write_text("#version: 0.2\nsafe token\nBasic configuration\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    secret_checks = [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert secret_checks
+    assert all(check.severity == IssueSeverity.INFO for check in secret_checks)
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_merges_basic_assignments_remain_actionable(tmp_path: Path) -> None:
+    text_dir = tmp_path / "text_tokenizer"
+    text_dir.mkdir()
+    text_path = text_dir / "merges.txt"
+    text_path.write_text("authorization=Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 @pytest.mark.parametrize(
     ("content", "finding_type"),
     [
