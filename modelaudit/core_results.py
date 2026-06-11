@@ -653,6 +653,9 @@ def determine_exit_code(results: ModelAuditResultModel) -> int:
     if results.success is False:
         return 2
 
+    if getattr(results, "dry_run", False):
+        return 0
+
     if results.files_scanned == 0:
         return 2
 
