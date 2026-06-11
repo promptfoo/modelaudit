@@ -1637,6 +1637,33 @@ def test_can_handle_renamed_jax_json_checkpoint_without_routing_ajax_near_match(
     assert JaxCheckpointScanner.can_handle(str(near_match_path)) is False
 
 
+@pytest.mark.usefixtures("requires_symlinks")
+def test_can_handle_refused_renamed_jax_json_symlink_as_unknown(tmp_path: Path) -> None:
+    target_path = tmp_path / "payload.txt"
+    symlink_path = tmp_path / "payload.jpg"
+    target_path.write_text("ordinary payload", encoding="utf-8")
+    symlink_path.symlink_to(target_path)
+
+    assert is_jax_json_checkpoint_file(symlink_path) is False
+    assert JaxCheckpointScanner.can_handle(str(symlink_path)) is False
+
+
+def test_can_handle_unavailable_renamed_jax_json_file_as_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload_path = tmp_path / "payload.jpg"
+    payload_path.write_text("ordinary payload", encoding="utf-8")
+
+    def fail_open(_path: str | bytes | os.PathLike[str] | os.PathLike[bytes], _flags: int) -> int:
+        raise PermissionError("forced JAX routing open failure")
+
+    monkeypatch.setattr(detection_module.os, "open", fail_open)
+
+    assert is_jax_json_checkpoint_file(payload_path) is False
+    assert JaxCheckpointScanner.can_handle(str(payload_path)) is False
+
+
 def test_oversized_renamed_jax_json_checkpoint_fails_closed_without_routing_ajax_near_match(tmp_path: Path) -> None:
     checkpoint_path = tmp_path / "large-model.jpg"
     near_match_path = tmp_path / "large-ajax.jpg"

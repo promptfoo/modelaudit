@@ -5039,10 +5039,31 @@ def _same_regular_file_identity(current: os.stat_result, expected: os.stat_resul
     )
 
 
-def _read_jax_json_checkpoint_prefix(file_path: Path) -> tuple[int, bytes] | None:
+_JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE: Literal["unavailable"] = "unavailable"
+
+
+def _jax_json_checkpoint_prefix_failure_result(
+    file_path: Path,
+    expected_stat: os.stat_result,
+) -> Literal["unavailable"] | None:
+    """Fall through unchanged unavailable files but fail closed on retargets."""
+    try:
+        current_stat = file_path.lstat()
+    except OSError:
+        return None
+    if _same_regular_file_identity(current_stat, expected_stat):
+        return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
+    return None
+
+
+def _read_jax_json_checkpoint_prefix(file_path: Path) -> tuple[int, bytes] | Literal["unavailable"] | None:
     """Read the routing prefix without following a changed lexical entry."""
     try:
         expected_stat = file_path.lstat()
+    except OSError:
+        return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
+
+    try:
         reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
         file_attributes = getattr(expected_stat, "st_file_attributes", 0)
         if (
@@ -5050,11 +5071,14 @@ def _read_jax_json_checkpoint_prefix(file_path: Path) -> tuple[int, bytes] | Non
             or stat.S_ISLNK(expected_stat.st_mode)
             or bool(reparse_flag and file_attributes & reparse_flag)
         ):
-            return None
+            return _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE
 
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(file_path, flags)
+        try:
+            descriptor = os.open(file_path, flags)
+        except OSError:
+            return _jax_json_checkpoint_prefix_failure_result(file_path, expected_stat)
         try:
             opened_stat = os.fstat(descriptor)
             if not _same_regular_file_identity(opened_stat, expected_stat):
@@ -5063,7 +5087,10 @@ def _read_jax_json_checkpoint_prefix(file_path: Path) -> tuple[int, bytes] | Non
             chunks: list[bytes] = []
             remaining = read_limit
             while remaining > 0:
-                chunk = os.read(descriptor, remaining)
+                try:
+                    chunk = os.read(descriptor, remaining)
+                except OSError:
+                    return _jax_json_checkpoint_prefix_failure_result(file_path, expected_stat)
                 if not chunk:
                     break
                 chunks.append(chunk)
@@ -5073,13 +5100,15 @@ def _read_jax_json_checkpoint_prefix(file_path: Path) -> tuple[int, bytes] | Non
         finally:
             os.close(descriptor)
     except OSError:
-        return None
+        return _jax_json_checkpoint_prefix_failure_result(file_path, expected_stat)
     return expected_stat.st_size, b"".join(chunks)
 
 
 def _probe_jax_json_checkpoint_file(file_path: Path) -> bool | None:
-    """Return True for JAX JSON, None for bounded ambiguity, else False."""
+    """Return True for JAX JSON, None for bounded ambiguity or retargets, else False."""
     snapshot = _read_jax_json_checkpoint_prefix(file_path)
+    if snapshot == _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE:
+        return False
     if snapshot is None:
         return None
     file_size, prefix = snapshot
