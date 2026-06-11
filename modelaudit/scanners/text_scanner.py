@@ -1670,6 +1670,46 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
+    def _documentation_python_string_contains_absolute_position(source: bytes, position: int) -> bool:
+        if position < 0 or position > len(source):
+            return False
+        text = source.decode("utf-8", errors="replace")
+        character_position = len(source[:position].decode("utf-8", errors="replace"))
+        line_offsets = [0]
+        cursor = 0
+        for line in text.splitlines(keepends=True):
+            cursor += len(line)
+            line_offsets.append(cursor)
+
+        def absolute_position(token_position: tuple[int, int]) -> int:
+            line_number, column = token_position
+            line_index = line_number - 1
+            if line_index < 0:
+                return column
+            if line_index >= len(line_offsets):
+                return len(text)
+            return min(line_offsets[line_index] + column, len(text))
+
+        try:
+            for current in tokenize.generate_tokens(io.StringIO(text).readline):
+                token_start = absolute_position(current.start)
+                token_end = absolute_position(current.end)
+                if not (token_start <= character_position < token_end):
+                    continue
+                if current.type == FSTRING_MIDDLE_TOKEN_TYPE:
+                    return True
+                if current.type != token.STRING:
+                    continue
+                local_position = character_position - token_start
+                return not TextScanner._documentation_f_string_expression_contains_position(
+                    current.string,
+                    local_position,
+                )
+        except (IndentationError, tokenize.TokenError):
+            return False
+        return False
+
+    @staticmethod
     def _span_overlaps_any(start: int, end: int, spans: tuple[tuple[int, int], ...]) -> bool:
         return any(start < span_end and span_start < end for span_start, span_end in spans)
 
@@ -1696,9 +1736,13 @@ class TextScanner(BaseScanner):
         imported_targets: dict[bytes, list[int]] = {}
         network_names = {b"get", b"head", b"post", b"put", b"patch", b"delete", b"request", b"urlopen", b"urlretrieve"}
         for match in DOCUMENTATION_FENCED_NETWORK_FUNCTION_IMPORT_PATTERN.finditer(fenced_code):
-            if cls._documentation_fenced_match_is_line_comment(fenced_code, match.start()):
+            if cls._documentation_fenced_match_is_line_comment(
+                fenced_code,
+                match.start(),
+            ) or cls._documentation_python_string_contains_absolute_position(fenced_code, match.start()):
                 continue
-            for import_part in match.group("imports").split(b","):
+            imports = match.group("imports").replace(b"(", b" ").replace(b")", b" ")
+            for import_part in imports.split(b","):
                 name_part = import_part.strip()
                 if not name_part:
                     continue
@@ -1728,7 +1772,9 @@ class TextScanner(BaseScanner):
             if cls._documentation_fenced_match_is_line_comment(fenced_code, match.start()):
                 continue
             receiver = match.group("receiver")
-            receiver_is_session = b"Session" in receiver or any(
+            receiver_is_session = re.fullmatch(
+                rb"(?:requests\.)?session\s*\([^)]*\)", receiver, flags=re.IGNORECASE
+            ) is not None or any(
                 position < match.start() for position in session_assignment_positions.get(receiver, [])
             )
             if receiver_is_session:
@@ -1790,7 +1836,10 @@ class TextScanner(BaseScanner):
             DOCUMENTATION_FENCED_URL_REQUEST_ASSIGNMENT_PATTERN,
         ):
             for match in pattern.finditer(fenced_code):
-                if cls._documentation_fenced_match_is_line_comment(fenced_code, match.start()):
+                if cls._documentation_fenced_match_is_line_comment(
+                    fenced_code,
+                    match.start(),
+                ) or cls._documentation_python_string_contains_absolute_position(fenced_code, match.start()):
                     continue
                 safe_assigned_urls[(match.group("target"), match.start())] = match.group("url").decode(
                     "utf-8",
@@ -1798,7 +1847,10 @@ class TextScanner(BaseScanner):
                 )
         assignment_positions: dict[bytes, list[int]] = {}
         for match in DOCUMENTATION_FENCED_VARIABLE_ASSIGNMENT_PATTERN.finditer(fenced_code):
-            if cls._documentation_fenced_match_is_line_comment(fenced_code, match.start()):
+            if cls._documentation_fenced_match_is_line_comment(
+                fenced_code,
+                match.start(),
+            ) or cls._documentation_python_string_contains_absolute_position(fenced_code, match.start()):
                 continue
             assignment_positions.setdefault(match.group("target"), []).append(match.start())
         call_target_urls: list[str] = []
@@ -2223,6 +2275,13 @@ class TextScanner(BaseScanner):
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(line) is not None
         )
 
+    @classmethod
+    def _documentation_code_bare_network_token_requires_classification(cls, line: bytes, position: int) -> bool:
+        return cls._documentation_python_string_contains_position(
+            line,
+            position,
+        ) and cls._documentation_assignment_is_actionable(line[:position])
+
     @staticmethod
     def _split_detector_finding_limit(
         findings: list[dict[str, Any]],
@@ -2285,6 +2344,8 @@ class TextScanner(BaseScanner):
                     if cls._span_overlaps_any(match.start(), match.end(), url_spans):
                         continue
                     if not cls._documentation_bare_network_token_candidate_is_relevant(line, match.start()):
+                        if cls._documentation_code_bare_network_token_requires_classification(line, match.start()):
+                            return False
                         continue
                     finding = {
                         "type": finding_type,
