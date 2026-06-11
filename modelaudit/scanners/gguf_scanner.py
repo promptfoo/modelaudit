@@ -51,8 +51,9 @@ _GGUF_METADATA_COMMAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "python_command_api",
         re.compile(
-            r"(?i)\b(?:os\.system|os\.popen|subprocess\."
-            r"(?:popen|call|run|check_call|check_output|getoutput|getstatusoutput)|eval|exec|__import__)\s*\(",
+            r"(?i)(?:\b(?:os\.system|os\.popen|subprocess\."
+            r"(?:popen|call|run|check_call|check_output|getoutput|getstatusoutput))"
+            r"|(?<![\w.])(?:eval|exec|__import__))\s*\(",
         ),
     ),
     (
@@ -121,6 +122,7 @@ _GGUF_METADATA_NETWORK_APIS = (
 _GGUF_NETWORK_URL_ASSIGNMENT_PATTERN = re.compile(
     r"""(?is)\b(?P<name>[a-z_][a-z0-9_]*)\s*=\s*(?:[rubf]{0,2})?(?P<quote>['"])(?:https?|ftp)://[^'"\s<>]+(?P=quote)""",
 )
+_GGUF_SHELL_IFS_PATTERN = re.compile(r"(?i)\$\{ifs(?:[^}]*)?\}|\$ifs\b")
 _GGUF_SHELL_VARIABLE_NAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_]*$")
 _GGUF_DEFAULT_MAX_TEMPLATE_SIZE = 50000
 _GGUF_CHAT_TEMPLATE_METADATA_PATTERN_TYPES = tuple(JINJA2_SSTI_PATTERNS)
@@ -971,6 +973,7 @@ class GgufScanner(BaseScanner):
 
     @staticmethod
     def _shell_command_segments(value: str) -> list[list[str]]:
+        value = _GGUF_SHELL_IFS_PATTERN.sub(" ", value)
         segments: list[list[str]] = []
         current_segment: list[str] = []
         current_word: list[str] = []
