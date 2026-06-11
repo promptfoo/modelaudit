@@ -271,7 +271,7 @@ _NETWORK_SCAN_SEEDS: tuple[bytes, ...] = (
     b"websocket",
     b"zombie",
 )
-_PICKLE_LITERAL_URL_RE = re.compile(rb"(?i)https?://[A-Za-z0-9\-._~:/?#@!$&*+=%-]+")
+_PICKLE_LITERAL_URL_RE = re.compile(rb"(?i)https?://[A-Za-z0-9\-._~:/?#[\]@!$&()*+,;=%-]+")
 _PICKLE_LITERAL_URL_NETWORK_FUNCTION_TOKENS: tuple[bytes, ...] = (
     b"dns.resolver",
     b"ftp.connect",
@@ -1351,204 +1351,237 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
             for builder in builders
         )
 
-    try:
-        for opcode_index, (opcode, arg, position) in enumerate(pickletools.genops(data), start=1):
-            if opcode_index > _PICKLE_LITERAL_RECORD_MAX_OPCODES:
+    opcode_count = 0
+    parsed_streams = 0
+    stream = io.BytesIO(data)
+    offset = 0
+    while offset < len(data):
+        while offset < len(data) and (
+            data[offset] in _CVE_PICKLE_STREAM_PADDING or data[offset] not in _PICKLE_OPCODE_PREFIX_BYTES
+        ):
+            offset += 1
+        if offset >= len(data):
+            break
+
+        stack = []
+        memo = {}
+        stream_builder_start = len(builders)
+        stream_complete = False
+        saw_opcode = False
+        stream.seek(offset)
+        try:
+            for opcode, arg, position in pickletools.genops(stream):
+                opcode_count += 1
+                if opcode_count > _PICKLE_LITERAL_RECORD_MAX_OPCODES:
+                    finish_previous_literal(position)
+                    mark_unresolved_records_executable_consumers()
+                    return build_records()
+
+                saw_opcode = True
                 finish_previous_literal(position)
-                mark_unresolved_records_executable_consumers()
-                return build_records()
+                opcode_name = opcode.name
 
-            finish_previous_literal(position)
-            opcode_name = opcode.name
-
-            if opcode_name == "MARK":
-                stack.append(marker)
-                continue
-
-            if opcode_name in _PICKLE_LITERAL_OPCODE_NAMES:
-                literal = _literal_arg_bytes(arg)
-                if literal is None or not isinstance(position, int):
-                    push(unknown)
+                if opcode_name == "MARK":
+                    stack.append(marker)
                     continue
-                index = len(builders)
-                builders.append(_PickleLiteralRecordBuilder(position, len(data), literal))
-                last_literal_index = index
-                push(_PickleStackValue(text=_literal_arg_text(arg), record_indexes=(index,)))
-                continue
 
-            if opcode_name == "GLOBAL":
-                parts = _global_parts(arg)
-                if parts is None:
-                    push(unknown)
-                else:
-                    module, name = parts
-                    push(_PickleStackValue(text=f"{module}.{name}", global_module=module, global_name=name))
-                continue
+                if opcode_name in _PICKLE_LITERAL_OPCODE_NAMES:
+                    literal = _literal_arg_bytes(arg)
+                    if literal is None or not isinstance(position, int):
+                        push(unknown)
+                        continue
+                    index = len(builders)
+                    builders.append(_PickleLiteralRecordBuilder(position, len(data), literal))
+                    last_literal_index = index
+                    push(_PickleStackValue(text=_literal_arg_text(arg), record_indexes=(index,)))
+                    continue
 
-            if opcode_name == "STACK_GLOBAL":
-                name_value = pop_value()
-                module_value = pop_value()
-                if module_value.text is None or name_value.text is None:
-                    push(unknown)
-                else:
-                    push(
-                        _PickleStackValue(
-                            text=f"{module_value.text}.{name_value.text}",
-                            global_module=module_value.text,
-                            global_name=name_value.text,
+                if opcode_name == "GLOBAL":
+                    parts = _global_parts(arg)
+                    if parts is None:
+                        push(unknown)
+                    else:
+                        module, name = parts
+                        push(_PickleStackValue(text=f"{module}.{name}", global_module=module, global_name=name))
+                    continue
+
+                if opcode_name == "STACK_GLOBAL":
+                    name_value = pop_value()
+                    module_value = pop_value()
+                    if module_value.text is None or name_value.text is None:
+                        push(unknown)
+                    else:
+                        push(
+                            _PickleStackValue(
+                                text=f"{module_value.text}.{name_value.text}",
+                                global_module=module_value.text,
+                                global_name=name_value.text,
+                            )
                         )
-                    )
-                continue
+                    continue
 
-            if opcode_name in {"MEMOIZE", "PUT", "BINPUT", "LONG_BINPUT"}:
-                if stack and isinstance(stack[-1], _PickleStackValue):
-                    memo_index = len(memo) if opcode_name == "MEMOIZE" else _pickle_literal_memo_index(arg)
-                    if memo_index is not None and len(memo) < _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES:
-                        memo[memo_index] = stack[-1]
-                continue
+                if opcode_name in {"MEMOIZE", "PUT", "BINPUT", "LONG_BINPUT"}:
+                    if stack and isinstance(stack[-1], _PickleStackValue):
+                        memo_index = len(memo) if opcode_name == "MEMOIZE" else _pickle_literal_memo_index(arg)
+                        if memo_index is not None and len(memo) < _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES:
+                            memo[memo_index] = stack[-1]
+                    continue
 
-            if opcode_name in {"GET", "BINGET", "LONG_BINGET"}:
-                lookup_index = _pickle_literal_memo_index(arg)
-                push(memo.get(lookup_index, unknown) if lookup_index is not None else unknown)
-                continue
+                if opcode_name in {"GET", "BINGET", "LONG_BINGET"}:
+                    lookup_index = _pickle_literal_memo_index(arg)
+                    push(memo.get(lookup_index, unknown) if lookup_index is not None else unknown)
+                    continue
 
-            if opcode_name == "POP":
-                pop_value()
-                continue
+                if opcode_name == "POP":
+                    pop_value()
+                    continue
 
-            if opcode_name == "POP_MARK":
-                pop_to_mark()
-                continue
+                if opcode_name == "POP_MARK":
+                    pop_to_mark()
+                    continue
 
-            if opcode_name == "DUP":
-                push(stack[-1] if stack and isinstance(stack[-1], _PickleStackValue) else unknown)
-                continue
+                if opcode_name == "DUP":
+                    push(stack[-1] if stack and isinstance(stack[-1], _PickleStackValue) else unknown)
+                    continue
 
-            if opcode_name in {"EMPTY_TUPLE", "EMPTY_LIST", "EMPTY_DICT", "EMPTY_SET"}:
-                push(unknown)
-                continue
-
-            if opcode_name in {"TUPLE", "LIST", "DICT", "SET", "FROZENSET"}:
-                push_container(pop_to_mark())
-                continue
-
-            if opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
-                arity = int(opcode_name[-1])
-                if len(stack) < arity:
+                if opcode_name in {"EMPTY_TUPLE", "EMPTY_LIST", "EMPTY_DICT", "EMPTY_SET"}:
                     push(unknown)
                     continue
-                tuple_values = [pop_value() for _ in range(arity)]
-                tuple_values.reverse()
-                push_container(tuple(tuple_values))
-                continue
 
-            if opcode_name == "APPEND":
-                item = pop_value()
-                target = pop_value()
-                push_container((target, item))
-                continue
+                if opcode_name in {"TUPLE", "LIST", "DICT", "SET", "FROZENSET"}:
+                    push_container(pop_to_mark())
+                    continue
 
-            if opcode_name == "SETITEM":
-                value = pop_value()
-                key = pop_value()
-                target = pop_value()
-                push_container((target, key, value))
-                continue
+                if opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
+                    arity = int(opcode_name[-1])
+                    if len(stack) < arity:
+                        push(unknown)
+                        continue
+                    tuple_values = [pop_value() for _ in range(arity)]
+                    tuple_values.reverse()
+                    push_container(tuple(tuple_values))
+                    continue
 
-            if opcode_name in {"APPENDS", "SETITEMS", "ADDITEMS"}:
-                marked_values = pop_to_mark()
-                target = pop_value() if stack and isinstance(stack[-1], _PickleStackValue) else unknown
-                push_container((target, *marked_values))
-                continue
+                if opcode_name == "APPEND":
+                    item = pop_value()
+                    target = pop_value()
+                    push_container((target, item))
+                    continue
 
-            if opcode_name == "REDUCE":
-                args = pop_value()
-                callable_value = pop_value()
-                if _pickle_stack_value_is_executable_network_consumer(callable_value):
-                    mark_literal_result_consumers(args)
-                push(unknown)
-                continue
+                if opcode_name == "SETITEM":
+                    value = pop_value()
+                    key = pop_value()
+                    target = pop_value()
+                    push_container((target, key, value))
+                    continue
 
-            if opcode_name == "NEWOBJ":
-                args = pop_value()
-                callable_value = pop_value()
-                if _pickle_stack_value_is_executable_network_consumer(callable_value):
-                    mark_literal_result_consumers(args)
-                push(unknown)
-                continue
+                if opcode_name in {"APPENDS", "SETITEMS", "ADDITEMS"}:
+                    marked_values = pop_to_mark()
+                    target = pop_value() if stack and isinstance(stack[-1], _PickleStackValue) else unknown
+                    push_container((target, *marked_values))
+                    continue
 
-            if opcode_name == "NEWOBJ_EX":
-                kwargs = pop_value()
-                args = pop_value()
-                callable_value = pop_value()
-                if _pickle_stack_value_is_executable_network_consumer(callable_value):
-                    mark_literal_result_consumers(args, kwargs)
-                push(unknown)
-                continue
+                if opcode_name == "REDUCE":
+                    args = pop_value()
+                    callable_value = pop_value()
+                    if _pickle_stack_value_is_executable_network_consumer(callable_value):
+                        mark_literal_result_consumers(args)
+                    push(unknown)
+                    continue
 
-            if opcode_name == "OBJ":
-                obj_values = pop_to_mark()
-                if obj_values and _pickle_stack_value_is_executable_network_consumer(obj_values[0]):
-                    mark_literal_result_consumers(*obj_values[1:])
-                push(unknown)
-                continue
+                if opcode_name == "NEWOBJ":
+                    args = pop_value()
+                    callable_value = pop_value()
+                    if _pickle_stack_value_is_executable_network_consumer(callable_value):
+                        mark_literal_result_consumers(args)
+                    push(unknown)
+                    continue
 
-            if opcode_name == "INST":
-                inst_values = pop_to_mark()
-                inst_global = unknown
-                parts = _global_parts(arg)
-                if parts is not None:
-                    module, name = parts
-                    inst_global = _PickleStackValue(global_module=module, global_name=name)
-                if _pickle_stack_value_is_executable_network_consumer(inst_global):
-                    mark_literal_result_consumers(*inst_values)
-                push(unknown)
-                continue
+                if opcode_name == "NEWOBJ_EX":
+                    kwargs = pop_value()
+                    args = pop_value()
+                    callable_value = pop_value()
+                    if _pickle_stack_value_is_executable_network_consumer(callable_value):
+                        mark_literal_result_consumers(args, kwargs)
+                    push(unknown)
+                    continue
 
-            if opcode_name == "BINPERSID":
-                mark_literal_result_consumers(pop_value())
-                push(unknown)
-                continue
+                if opcode_name == "OBJ":
+                    obj_values = pop_to_mark()
+                    if obj_values and _pickle_stack_value_is_executable_network_consumer(obj_values[0]):
+                        mark_literal_result_consumers(*obj_values[1:])
+                    push(unknown)
+                    continue
 
-            if opcode_name == "PERSID":
-                push(unknown)
-                continue
+                if opcode_name == "INST":
+                    inst_values = pop_to_mark()
+                    inst_global = unknown
+                    parts = _global_parts(arg)
+                    if parts is not None:
+                        module, name = parts
+                        inst_global = _PickleStackValue(global_module=module, global_name=name)
+                    if _pickle_stack_value_is_executable_network_consumer(inst_global):
+                        mark_literal_result_consumers(*inst_values)
+                    push(unknown)
+                    continue
 
-            if opcode_name == "BUILD":
-                pop_value()
-                continue
+                if opcode_name == "BINPERSID":
+                    mark_literal_result_consumers(pop_value())
+                    push(unknown)
+                    continue
 
-            if opcode_name in {
-                "BINBYTES",
-                "BINBYTES8",
-                "BINFLOAT",
-                "BININT",
-                "BININT1",
-                "BININT2",
-                "BYTEARRAY8",
-                "EXT1",
-                "EXT2",
-                "EXT4",
-                "FLOAT",
-                "INT",
-                "LONG",
-                "LONG1",
-                "LONG4",
-                "NEWFALSE",
-                "NEWTRUE",
-                "NEXT_BUFFER",
-                "NONE",
-                "READONLY_BUFFER",
-                "SHORT_BINBYTES",
-            }:
-                push(unknown)
-                continue
+                if opcode_name == "PERSID":
+                    push(unknown)
+                    continue
 
-            if opcode_name == "STOP":
-                break
+                if opcode_name == "BUILD":
+                    pop_value()
+                    continue
 
-    except Exception:
-        return ()
+                if opcode_name in {
+                    "BINBYTES",
+                    "BINBYTES8",
+                    "BINFLOAT",
+                    "BININT",
+                    "BININT1",
+                    "BININT2",
+                    "BYTEARRAY8",
+                    "EXT1",
+                    "EXT2",
+                    "EXT4",
+                    "FLOAT",
+                    "INT",
+                    "LONG",
+                    "LONG1",
+                    "LONG4",
+                    "NEWFALSE",
+                    "NEWTRUE",
+                    "NEXT_BUFFER",
+                    "NONE",
+                    "READONLY_BUFFER",
+                    "SHORT_BINBYTES",
+                }:
+                    push(unknown)
+                    continue
+
+                if opcode_name == "STOP":
+                    stream_complete = True
+                    break
+
+        except Exception:
+            if parsed_streams == 0:
+                return ()
+            del builders[stream_builder_start:]
+            last_literal_index = None
+            break
+
+        if not saw_opcode:
+            offset += 1
+            continue
+        parsed_streams += 1
+        if not stream_complete:
+            break
+        offset = max(offset + 1, stream.tell())
 
     return build_records()
 

