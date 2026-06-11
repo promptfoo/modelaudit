@@ -82,7 +82,7 @@ _PYTORCH_LEGACY_STORAGE_ELEMENT_SIZES = {
     "UntypedStorage": 1,
 }
 _PYTORCH_LEGACY_PROTOCOL0_STORAGE_PID_RE = re.compile(
-    r"^\('storage', <class 'torch\.(?P<storage_name>[A-Za-z0-9_]+Storage)'>, "
+    r"^\('storage', <class 'torch(?:\.storage)?\.(?P<storage_name>[A-Za-z0-9_]+Storage)'>, "
     r"'(?P<key>[0-9]{1,128})', '(?P<location>[^']+)', (?P<element_count>[0-9]{1,20}), "
     r"(?P<view_metadata>None|\('[0-9]{1,128}', (?P<view_offset>[0-9]{1,20}), "
     r"(?P<view_size>[0-9]{1,20})\))\)$"

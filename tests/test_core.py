@@ -228,6 +228,7 @@ def _build_legacy_pytorch_storage_tail_pickle(
     *,
     protocol: int = 2,
     storage_keys: tuple[str, ...] = ("0",),
+    protocol0_storage_type: str = "torch.ByteStorage",
 ) -> bytes:
     """Build a legacy PyTorch container with control pickles followed by raw storage bytes."""
     storage_payload = b"ABCD"
@@ -239,8 +240,8 @@ def _build_legacy_pytorch_storage_tail_pickle(
     if protocol == 0:
         object_stream = bytearray(b"]")
         for key in storage_keys:
-            persistent_id = f"('storage', <class 'torch.ByteStorage'>, '{key}', 'cpu', {storage_size}, None)".encode(
-                "ascii"
+            persistent_id = (
+                f"('storage', <class '{protocol0_storage_type}'>, '{key}', 'cpu', {storage_size}, None)".encode("ascii")
             )
             object_stream += b"P" + persistent_id + b"\na"
         object_stream += b"."
@@ -7307,6 +7308,26 @@ def test_scan_model_directory_or_file_trusts_protocol0_legacy_pytorch_storage_ta
     assert any(issue.rule_code == "S212" for issue in aggregate.issues)
 
 
+def test_scan_model_directory_or_file_trusts_protocol0_torch_storage_module_tail(tmp_path: Path) -> None:
+    payload = _build_legacy_pytorch_storage_tail_pickle(
+        protocol=0,
+        protocol0_storage_type="torch.storage.UntypedStorage",
+    )
+    model_path = tmp_path / "weights.pt"
+    model_path.write_bytes(payload)
+
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    metadata = aggregate.file_metadata[str(model_path)]
+
+    assert determine_exit_code(aggregate) == 1
+    assert metadata["legacy_pytorch_container"] is True
+    assert metadata["legacy_pytorch_storage_key_count"] == 1
+    assert metadata["legacy_pytorch_storage_end"] == len(payload)
+    assert metadata["pickle_report_status"] == "complete"
+    assert not any(issue.rule_code == "S901" for issue in aggregate.issues)
+    assert any(issue.rule_code == "S212" for issue in aggregate.issues)
+
+
 def test_scan_model_directory_or_file_trusts_nested_legacy_pytorch_storage_tail(tmp_path: Path) -> None:
     archive_path = tmp_path / "legacy-storage-tail.zip"
     _create_misnamed_zip(archive_path, {"weights.pt": _build_legacy_pytorch_storage_tail_pickle()})
@@ -7318,6 +7339,31 @@ def test_scan_model_directory_or_file_trusts_nested_legacy_pytorch_storage_tail(
     assert metadata["legacy_pytorch_container"] is True
     assert metadata["legacy_pytorch_storage_start"] == 208
     assert metadata["legacy_pytorch_storage_end"] == 220
+    assert metadata["pickle_report_status"] == "complete"
+    assert not any(issue.rule_code == "S901" for issue in aggregate.issues)
+    assert any(
+        issue.rule_code == "S212"
+        and issue.details.get("zip_entry") == "weights.pt"
+        and issue.location == f"{archive_path}:weights.pt"
+        for issue in aggregate.issues
+    )
+
+
+def test_scan_model_directory_or_file_trusts_nested_protocol0_torch_storage_module_tail(tmp_path: Path) -> None:
+    payload = _build_legacy_pytorch_storage_tail_pickle(
+        protocol=0,
+        protocol0_storage_type="torch.storage.UntypedStorage",
+    )
+    archive_path = tmp_path / "nested-protocol0-storage-module.zip"
+    _create_misnamed_zip(archive_path, {"weights.pt": payload})
+
+    aggregate = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
+    metadata = aggregate.file_metadata[str(archive_path)]
+
+    assert determine_exit_code(aggregate) == 1
+    assert metadata["legacy_pytorch_container"] is True
+    assert metadata["legacy_pytorch_storage_key_count"] == 1
+    assert metadata["legacy_pytorch_storage_end"] == len(payload)
     assert metadata["pickle_report_status"] == "complete"
     assert not any(issue.rule_code == "S901" for issue in aggregate.issues)
     assert any(
