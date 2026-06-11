@@ -13,6 +13,7 @@ import zipfile
 import zlib
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from functools import lru_cache
 from io import BytesIO, StringIO
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Literal, cast
@@ -65,6 +66,7 @@ _TensorFlowProtoRoute = Literal[
     "inconclusive",
 ]
 _TensorFlowOuterHint = Literal["unknown", "tf_metagraph", "tf_savedmodel"]
+_SentencePieceModelProtoRoute = Literal["unknown", "strong", "malformed_candidate"]
 _GzipTarTrailingStatus = Literal["invalid", "nonzero"]
 _TORCH7_SIGNATURE_READ_BYTES = 4096
 _TORCH7_ASCII_HEADER_MAX_LINE_BYTES = 4096
@@ -90,6 +92,65 @@ _ONNX_MODEL_FIELD_WIRE_TYPES = {
 _PROTO_GROUP_MAX_ROUTING_FIELDS = 512
 _PROTO_GROUP_MAX_ROUTING_DEPTH = 8
 _COREML_PROTO_SIGNATURE_READ_BYTES = 1024 * 1024
+_SENTENCEPIECE_MODEL_PROTO_READ_BYTES = 10 * 1024 * 1024
+_SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES = 4096
+_SENTENCEPIECE_MODEL_MAX_FIELDS = 512 * 1024
+_SENTENCEPIECE_MIN_STRONG_PIECES = 8
+_SENTENCEPIECE_MAX_PIECE_FIELDS = 16
+_SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES = 4096
+_SENTENCEPIECE_MAX_PIECE_TEXT_BYTES = 512
+_SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS = 512
+_SENTENCEPIECE_MAX_TRAINER_SPEC_MESSAGE_BYTES = 64 * 1024
+_SENTENCEPIECE_MAX_TRAINER_SPEC_TEXT_BYTES = 4096
+_SENTENCEPIECE_UNKNOWN_PIECE_TYPE = 2
+_SENTENCEPIECE_BYTE_PIECE_TYPE = 6
+_SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT = 256
+_SENTENCEPIECE_IDENTITY_TOKENS = frozenset({"<unk>", "<s>", "</s>", "<pad>", "<bos>", "<eos>"})
+_SENTENCEPIECE_BYTE_FALLBACK_RE = re.compile(r"^<0x[0-9A-Fa-f]{2}>$")
+_SENTENCEPIECE_TRAINER_SPEC_VARINT_FIELDS = frozenset(
+    {
+        3,
+        4,
+        6,
+        11,
+        12,
+        13,
+        14,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        32,
+        33,
+        34,
+        35,
+        40,
+        41,
+        42,
+        43,
+        49,
+        50,
+        52,
+    }
+)
+_SENTENCEPIECE_TRAINER_SPEC_STRING_FIELDS = frozenset({1, 2, 5, 7, 30, 31, 36, 44, 45, 46, 47, 48, 53, 54})
+_SENTENCEPIECE_TRAINER_SPEC_FIXED32_FIELDS = frozenset({10, 15, 51})
+_SENTENCEPIECE_TRAINER_SPEC_FIXED64_FIELDS: frozenset[int] = frozenset()
+_SENTENCEPIECE_NORMALIZER_SPEC_WIRE_TYPES = {
+    1: 2,
+    2: 2,
+    3: 0,
+    4: 0,
+    5: 0,
+    6: 2,
+}
 _COREML_PROTO_PREFIX_WIRE_TYPES = frozenset({0, 1, 2, 3, 5})
 _COREML_GROUP_BUDGET_EXHAUSTED: Literal["budget_exhausted"] = "budget_exhausted"
 _COREML_GROUP_INCOMPLETE: Literal["incomplete"] = "incomplete"
@@ -231,6 +292,7 @@ _XML_MODEL_ROOT_FORMATS = {
 }
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
 PROTOBUF_MODEL_CANDIDATE_FORMAT = "protobuf_model_candidate"
+SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT = "sentencepiece_model_proto_inconclusive"
 JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES = 1024 * 1024
 JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES = 2 * JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES
 _JAX_JSON_CHECKPOINT_IDENTITY_KEYS = frozenset(
@@ -2592,6 +2654,810 @@ def _skip_proto_value(data: bytes, offset: int, wire_type: int, end: int | None 
         next_offset = offset + 4
         return next_offset if next_offset <= limit else None
     return None
+
+
+@dataclass
+class _SentencePieceTrainerSpecSignals:
+    model_type: int | None = None
+    vocab_size: int | None = None
+    unk_id: int = 0
+    unk_id_explicit: bool = False
+    unk_piece: str | None = None
+    unk_piece_explicit: bool = False
+    byte_fallback: bool = False
+    byte_fallback_explicit: bool = False
+
+    @property
+    def has_core_metadata(self) -> bool:
+        return self.model_type is not None and self.vocab_size is not None
+
+    def merge_from(self, other: "_SentencePieceTrainerSpecSignals") -> None:
+        if other.model_type is not None:
+            self.model_type = other.model_type
+        if other.vocab_size is not None:
+            self.vocab_size = other.vocab_size
+        if other.unk_id_explicit:
+            self.unk_id = other.unk_id
+            self.unk_id_explicit = True
+        if other.unk_piece_explicit:
+            self.unk_piece = other.unk_piece
+            self.unk_piece_explicit = True
+        if other.byte_fallback_explicit:
+            self.byte_fallback = other.byte_fallback
+            self.byte_fallback_explicit = True
+
+
+@dataclass
+class _SentencePiecePieceProtoSignals:
+    piece_text: str | None = None
+    piece_type: int | None = None
+    decoded_text_bytes: int = 0
+
+
+def _decode_proto_int32_varint(value: int) -> int:
+    """Decode proto2 int32 values that may be sign-extended into a uint64 varint."""
+    if value >= 1 << 63:
+        value -= 1 << 64
+    return value
+
+
+def _decode_bounded_proto_string(data: bytes, start: int, end: int, *, max_bytes: int) -> str | None:
+    if end < start or end - start > max_bytes:
+        return None
+    try:
+        value = data[start:end].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not value or "\x00" in value:
+        return None
+    return value
+
+
+def _parse_sentencepiece_piece_proto(data: bytes, start: int, end: int) -> tuple[str, int | None] | None:
+    """Return the token text and optional type for one SentencePiece piece."""
+    if end - start > _SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES:
+        return None
+
+    offset = start
+    fields_seen = 0
+    piece_text: str | None = None
+    piece_type: int | None = None
+    has_score = False
+    while offset < end and fields_seen < _SENTENCEPIECE_MAX_PIECE_FIELDS:
+        tag_result = _read_proto_varint(data, offset, end)
+        if tag_result is None:
+            return None
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return None
+
+        if field_number == 1 and wire_type == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset, end)
+            if bounds is None:
+                return None
+            length, value_start, _value_end, actual_value_end = bounds
+            if length == 0 or length > _SENTENCEPIECE_MAX_PIECE_TEXT_BYTES or actual_value_end > end:
+                return None
+            piece_text = _decode_bounded_proto_string(
+                data,
+                value_start,
+                actual_value_end,
+                max_bytes=_SENTENCEPIECE_MAX_PIECE_TEXT_BYTES,
+            )
+            if piece_text is None:
+                return None
+            offset = actual_value_end
+        elif field_number == 2 and wire_type == 5:
+            fixed32_end = value_offset + 4
+            if fixed32_end > end:
+                return None
+            has_score = True
+            offset = fixed32_end
+        elif field_number == 3 and wire_type == 0:
+            type_result = _read_proto_varint(data, value_offset, end)
+            if type_result is None:
+                return None
+            piece_type, offset = type_result
+            if not 1 <= piece_type <= 6:
+                return None
+        else:
+            skipped_offset = _skip_proto_value(data, value_offset, wire_type, end)
+            if skipped_offset is None:
+                return None
+            offset = skipped_offset
+        fields_seen += 1
+
+    if offset != end or fields_seen >= _SENTENCEPIECE_MAX_PIECE_FIELDS:
+        return None
+    if piece_text is None or not has_score:
+        return None
+    return piece_text, piece_type
+
+
+def _parse_sentencepiece_trainer_spec_proto(
+    data: bytes,
+    start: int,
+    end: int,
+) -> _SentencePieceTrainerSpecSignals | None:
+    """Parse enough TrainerSpec structure to identify custom unknown-piece models."""
+    if end - start > _SENTENCEPIECE_MAX_TRAINER_SPEC_MESSAGE_BYTES:
+        return None
+
+    offset = start
+    fields_seen = 0
+    signals = _SentencePieceTrainerSpecSignals()
+    while offset < end and fields_seen < _SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS:
+        tag_result = _read_proto_varint(data, offset, end)
+        if tag_result is None:
+            return None
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return None
+
+        if field_number in _SENTENCEPIECE_TRAINER_SPEC_VARINT_FIELDS:
+            if wire_type != 0:
+                return None
+            value_result = _read_proto_varint(data, value_offset, end)
+            if value_result is None:
+                return None
+            value, offset = value_result
+            if field_number == 3 and 1 <= value <= 4:
+                signals.model_type = value
+            elif field_number == 4 and value > 0:
+                signals.vocab_size = value
+            elif field_number == 35:
+                if value not in {0, 1}:
+                    return None
+                signals.byte_fallback = bool(value)
+                signals.byte_fallback_explicit = True
+            elif field_number == 40:
+                signals.unk_id = _decode_proto_int32_varint(value)
+                signals.unk_id_explicit = True
+        elif field_number in _SENTENCEPIECE_TRAINER_SPEC_STRING_FIELDS:
+            if wire_type != 2:
+                return None
+            bounds = _read_length_delimited_proto_value(data, value_offset, end)
+            if bounds is None:
+                return None
+            _length, value_start, _sampled_value_end, actual_value_end = bounds
+            if actual_value_end > end:
+                return None
+            if field_number == 45:
+                signals.unk_piece = _decode_bounded_proto_string(
+                    data,
+                    value_start,
+                    actual_value_end,
+                    max_bytes=_SENTENCEPIECE_MAX_TRAINER_SPEC_TEXT_BYTES,
+                )
+                if signals.unk_piece is None:
+                    return None
+                signals.unk_piece_explicit = True
+            offset = actual_value_end
+        elif field_number in _SENTENCEPIECE_TRAINER_SPEC_FIXED32_FIELDS:
+            if wire_type != 5:
+                return None
+            offset = value_offset + 4
+            if offset > end:
+                return None
+        elif field_number in _SENTENCEPIECE_TRAINER_SPEC_FIXED64_FIELDS:
+            if wire_type != 1:
+                return None
+            offset = value_offset + 8
+            if offset > end:
+                return None
+        else:
+            next_offset = _skip_proto_value(data, value_offset, wire_type, end)
+            if next_offset is None:
+                return None
+            offset = next_offset
+
+        fields_seen += 1
+
+    if offset != end or fields_seen >= _SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS:
+        return None
+    return signals
+
+
+def _is_well_formed_sentencepiece_submessage(
+    data: bytes,
+    start: int,
+    end: int,
+    *,
+    expected_wire_types: dict[int, int] | None = None,
+    max_fields: int = _SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS,
+) -> bool:
+    offset = start
+    fields_seen = 0
+    while offset < end and fields_seen < max_fields:
+        tag_result = _read_proto_varint(data, offset, end)
+        if tag_result is None:
+            return False
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+        if expected_wire_types is not None and expected_wire_types.get(field_number, wire_type) != wire_type:
+            return False
+        next_offset = _skip_proto_value(data, value_offset, wire_type, end)
+        if next_offset is None:
+            return False
+        offset = next_offset
+        fields_seen += 1
+
+    return offset == end and fields_seen < max_fields
+
+
+def _is_well_formed_sentencepiece_submessage_stream(
+    stream: BinaryIO,
+    end_offset: int,
+    *,
+    expected_wire_types: dict[int, int] | None = None,
+    max_fields: int = _SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS,
+) -> bool:
+    fields_seen = 0
+    while stream.tell() < end_offset and fields_seen < max_fields:
+        tag = _read_proto_varint_stream(stream, end_offset)
+        if tag is None:
+            return False
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+        if expected_wire_types is not None and expected_wire_types.get(field_number, wire_type) != wire_type:
+            return False
+        skip_status = _skip_proto_stream_value(
+            stream,
+            wire_type,
+            end_offset,
+            field_number=field_number,
+        )
+        if skip_status is not True:
+            return False
+        fields_seen += 1
+
+    return stream.tell() == end_offset and fields_seen < max_fields
+
+
+def _is_sentencepiece_special_identity_piece(piece: str) -> bool:
+    return piece in _SENTENCEPIECE_IDENTITY_TOKENS
+
+
+def _is_sentencepiece_byte_fallback_piece(piece: str) -> bool:
+    return _SENTENCEPIECE_BYTE_FALLBACK_RE.fullmatch(piece) is not None
+
+
+def _has_strong_sentencepiece_model_proto_evidence(
+    *,
+    piece_count: int,
+    typed_piece_count: int,
+    special_identity_piece_count: int,
+    unknown_piece_count: int,
+    unknown_piece_index: int | None,
+    unknown_piece_text: str | None,
+    byte_piece_count: int,
+    byte_piece_texts: set[str],
+    malformed_byte_piece: bool,
+    trainer_spec: _SentencePieceTrainerSpecSignals | None,
+) -> bool:
+    if unknown_piece_count != 1 or unknown_piece_index is None or unknown_piece_text is None:
+        return False
+    if malformed_byte_piece:
+        return False
+    if byte_piece_count:
+        if trainer_spec is None or not trainer_spec.byte_fallback:
+            return False
+        if (
+            byte_piece_count != _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT
+            or len(byte_piece_texts) != _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT
+        ):
+            return False
+    elif trainer_spec is not None and trainer_spec.byte_fallback:
+        return False
+
+    if (
+        trainer_spec is not None
+        and trainer_spec.has_core_metadata
+        and trainer_spec.vocab_size == piece_count
+        and 0 <= trainer_spec.unk_id < piece_count
+        and trainer_spec.unk_id == unknown_piece_index
+        and (not trainer_spec.unk_piece_explicit or trainer_spec.unk_piece == unknown_piece_text)
+    ):
+        return True
+
+    if piece_count < _SENTENCEPIECE_MIN_STRONG_PIECES:
+        return False
+    return typed_piece_count >= 3 and special_identity_piece_count >= 3
+
+
+def _has_sufficient_sentencepiece_piece_scan_evidence(
+    *,
+    piece_count: int,
+    unknown_piece_count: int,
+    unknown_piece_index: int | None,
+    unknown_piece_text: str | None,
+    byte_piece_count: int,
+    byte_piece_texts: set[str],
+    malformed_byte_piece: bool,
+) -> bool:
+    if piece_count < _SENTENCEPIECE_MIN_STRONG_PIECES:
+        return False
+    if unknown_piece_count != 1 or unknown_piece_index is None or unknown_piece_text is None:
+        return False
+    if malformed_byte_piece:
+        return False
+    return not byte_piece_count or (
+        byte_piece_count == _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT
+        and len(byte_piece_texts) == _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT
+    )
+
+
+def _has_strong_sentencepiece_model_proto_prefix(data: bytes, *, sample_is_prefix: bool = False) -> bool:
+    """Recognize a SentencePiece ModelProto from repeated scored pieces."""
+    offset = 0
+    fields_seen = 0
+    piece_count = 0
+    typed_piece_count = 0
+    special_identity_piece_count = 0
+    unknown_piece_count = 0
+    unknown_piece_index: int | None = None
+    unknown_piece_text: str | None = None
+    byte_piece_count = 0
+    byte_piece_texts: set[str] = set()
+    malformed_byte_piece = False
+    trainer_spec: _SentencePieceTrainerSpecSignals | None = None
+    strong_match = False
+
+    def accept_incomplete_prefix() -> bool:
+        return False
+
+    while offset < len(data) and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            return accept_incomplete_prefix()
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+        if wire_type not in {0, 1, 2, 5}:
+            return False
+        if field_number in {1, 2, 3, 4, 5} and wire_type != 2:
+            return False
+
+        if field_number == 1:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return accept_incomplete_prefix()
+            length, value_start, _sampled_value_end, actual_value_end = bounds
+            if length == 0 or actual_value_end > len(data):
+                return accept_incomplete_prefix()
+            parsed_piece = _parse_sentencepiece_piece_proto(data, value_start, actual_value_end)
+            if parsed_piece is None:
+                return False
+            piece, piece_type = parsed_piece
+            piece_index = piece_count
+            piece_count += 1
+            if piece_type is not None:
+                typed_piece_count += 1
+            if _is_sentencepiece_special_identity_piece(piece):
+                special_identity_piece_count += 1
+            if piece_type == _SENTENCEPIECE_UNKNOWN_PIECE_TYPE:
+                unknown_piece_count += 1
+                unknown_piece_index = piece_index
+                unknown_piece_text = piece
+            elif piece_type == _SENTENCEPIECE_BYTE_PIECE_TYPE:
+                byte_piece_count += 1
+                if _is_sentencepiece_byte_fallback_piece(piece):
+                    byte_piece_texts.add(piece)
+                else:
+                    malformed_byte_piece = True
+            offset = actual_value_end
+        elif field_number == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return accept_incomplete_prefix()
+            _length, value_start, _sampled_value_end, actual_value_end = bounds
+            if actual_value_end > len(data):
+                return accept_incomplete_prefix()
+            parsed_trainer_spec = _parse_sentencepiece_trainer_spec_proto(data, value_start, actual_value_end)
+            if parsed_trainer_spec is None:
+                return False
+            if trainer_spec is None:
+                trainer_spec = parsed_trainer_spec
+            else:
+                trainer_spec.merge_from(parsed_trainer_spec)
+            offset = actual_value_end
+        elif field_number == 3:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return accept_incomplete_prefix()
+            _length, value_start, _sampled_value_end, actual_value_end = bounds
+            if actual_value_end > len(data):
+                return accept_incomplete_prefix()
+            if not _is_well_formed_sentencepiece_submessage(
+                data,
+                value_start,
+                actual_value_end,
+                expected_wire_types=_SENTENCEPIECE_NORMALIZER_SPEC_WIRE_TYPES,
+            ):
+                return False
+            offset = actual_value_end
+        elif field_number in {4, 5}:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return accept_incomplete_prefix()
+            _length, value_start, _sampled_value_end, actual_value_end = bounds
+            if actual_value_end > len(data):
+                return accept_incomplete_prefix()
+            if not _is_well_formed_sentencepiece_submessage(data, value_start, actual_value_end):
+                return False
+            offset = actual_value_end
+        else:
+            return False
+
+        fields_seen += 1
+        strong_match = _has_strong_sentencepiece_model_proto_evidence(
+            piece_count=piece_count,
+            typed_piece_count=typed_piece_count,
+            special_identity_piece_count=special_identity_piece_count,
+            unknown_piece_count=unknown_piece_count,
+            unknown_piece_index=unknown_piece_index,
+            unknown_piece_text=unknown_piece_text,
+            byte_piece_count=byte_piece_count,
+            byte_piece_texts=byte_piece_texts,
+            malformed_byte_piece=malformed_byte_piece,
+            trainer_spec=trainer_spec,
+        )
+
+    return (
+        strong_match and not sample_is_prefix and offset == len(data) and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS
+    )
+
+
+def _read_bounded_sentencepiece_submessage(stream: BinaryIO, value_end: int, *, max_bytes: int) -> bytes | None:
+    length = value_end - stream.tell()
+    if length < 0 or length > max_bytes:
+        return None
+    payload = stream.read(length)
+    return payload if len(payload) == length else None
+
+
+def _parse_sentencepiece_piece_proto_stream(
+    stream: BinaryIO,
+    value_end: int,
+    *,
+    decode_text: bool,
+    max_decoded_text_bytes: int,
+) -> _SentencePiecePieceProtoSignals | None:
+    """Validate one piece submessage while avoiding unnecessary text reads."""
+    if value_end - stream.tell() > _SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES:
+        return None
+
+    fields_seen = 0
+    text_bounds: tuple[int, int] | None = None
+    piece_type: int | None = None
+    has_score = False
+    while stream.tell() < value_end and fields_seen < _SENTENCEPIECE_MAX_PIECE_FIELDS:
+        tag = _read_proto_varint_stream(stream, value_end)
+        if tag is None:
+            return None
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return None
+
+        if field_number == 1 and wire_type == 2:
+            bounds = _read_proto_length_delimited_bounds_stream(stream, value_end)
+            if bounds is None:
+                return None
+            length, value_start, actual_value_end = bounds
+            if length == 0 or length > _SENTENCEPIECE_MAX_PIECE_TEXT_BYTES:
+                return None
+            text_bounds = (value_start, actual_value_end)
+            stream.seek(actual_value_end)
+        elif field_number == 2 and wire_type == 5:
+            fixed32_end = stream.tell() + 4
+            if fixed32_end > value_end:
+                return None
+            has_score = True
+            stream.seek(fixed32_end)
+        elif field_number == 3 and wire_type == 0:
+            parsed_type = _read_proto_varint_stream(stream, value_end)
+            if parsed_type is None or not 1 <= parsed_type <= 6:
+                return None
+            piece_type = parsed_type
+        else:
+            skip_status = _skip_proto_stream_value(
+                stream,
+                wire_type,
+                value_end,
+                field_number=field_number,
+            )
+            if skip_status is not True:
+                return None
+        fields_seen += 1
+
+    if stream.tell() != value_end or fields_seen >= _SENTENCEPIECE_MAX_PIECE_FIELDS:
+        return None
+    if text_bounds is None or not has_score:
+        return None
+
+    should_decode_text = decode_text or piece_type in {
+        _SENTENCEPIECE_UNKNOWN_PIECE_TYPE,
+        _SENTENCEPIECE_BYTE_PIECE_TYPE,
+        3,
+        4,
+        5,
+    }
+    if not should_decode_text:
+        return _SentencePiecePieceProtoSignals(piece_type=piece_type)
+
+    text_start, text_end = text_bounds
+    text_length = text_end - text_start
+    if text_length > max_decoded_text_bytes:
+        return None
+    stream.seek(text_start)
+    payload = stream.read(text_length)
+    if len(payload) != text_length:
+        return None
+    stream.seek(value_end)
+    piece_text = _decode_bounded_proto_string(
+        payload,
+        0,
+        len(payload),
+        max_bytes=_SENTENCEPIECE_MAX_PIECE_TEXT_BYTES,
+    )
+    if piece_text is None:
+        return None
+    return _SentencePiecePieceProtoSignals(
+        piece_text=piece_text,
+        piece_type=piece_type,
+        decoded_text_bytes=text_length,
+    )
+
+
+def _parse_sentencepiece_trainer_spec_proto_stream(
+    stream: BinaryIO,
+    value_end: int,
+) -> _SentencePieceTrainerSpecSignals | None:
+    payload = _read_bounded_sentencepiece_submessage(
+        stream,
+        value_end,
+        max_bytes=_SENTENCEPIECE_MAX_TRAINER_SPEC_MESSAGE_BYTES,
+    )
+    if payload is None:
+        return None
+    return _parse_sentencepiece_trainer_spec_proto(payload, 0, len(payload))
+
+
+def _classify_sentencepiece_model_proto_stream(
+    stream: BinaryIO,
+    file_size: int,
+    *,
+    max_decoded_piece_text_bytes: int = _SENTENCEPIECE_MODEL_PROTO_READ_BYTES,
+) -> _SentencePieceModelProtoRoute:
+    offset = 0
+    fields_seen = 0
+    piece_count = 0
+    typed_piece_count = 0
+    special_identity_piece_count = 0
+    unknown_piece_count = 0
+    unknown_piece_index: int | None = None
+    unknown_piece_text: str | None = None
+    byte_piece_count = 0
+    byte_piece_texts: set[str] = set()
+    malformed_byte_piece = False
+    trainer_spec: _SentencePieceTrainerSpecSignals | None = None
+    strong_match = False
+    decoded_piece_text_bytes = 0
+
+    def reject_candidate() -> _SentencePieceModelProtoRoute:
+        return "malformed_candidate" if piece_count else "unknown"
+
+    while offset < file_size and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS:
+        tag = _read_proto_varint_stream(stream, file_size)
+        if tag is None:
+            return reject_candidate()
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return reject_candidate()
+
+        if field_number == 1:
+            if wire_type != 2:
+                return reject_candidate()
+            bounds = _read_proto_length_delimited_bounds_stream(stream, file_size)
+            if bounds is None:
+                return reject_candidate()
+            _length, _value_start, actual_value_end = bounds
+            decode_piece_text = not _has_sufficient_sentencepiece_piece_scan_evidence(
+                piece_count=piece_count,
+                unknown_piece_count=unknown_piece_count,
+                unknown_piece_index=unknown_piece_index,
+                unknown_piece_text=unknown_piece_text,
+                byte_piece_count=byte_piece_count,
+                byte_piece_texts=byte_piece_texts,
+                malformed_byte_piece=malformed_byte_piece,
+            )
+            parsed_piece = _parse_sentencepiece_piece_proto_stream(
+                stream,
+                actual_value_end,
+                decode_text=decode_piece_text,
+                max_decoded_text_bytes=max_decoded_piece_text_bytes - decoded_piece_text_bytes,
+            )
+            if parsed_piece is None:
+                return reject_candidate()
+            decoded_piece_text_bytes += parsed_piece.decoded_text_bytes
+            piece = parsed_piece.piece_text
+            piece_type = parsed_piece.piece_type
+            piece_index = piece_count
+            piece_count += 1
+            if piece_type is not None:
+                typed_piece_count += 1
+            if piece is not None and _is_sentencepiece_special_identity_piece(piece):
+                special_identity_piece_count += 1
+            if piece_type is not None:
+                if piece_type == _SENTENCEPIECE_UNKNOWN_PIECE_TYPE:
+                    if piece is None:
+                        return reject_candidate()
+                    unknown_piece_count += 1
+                    unknown_piece_index = piece_index
+                    unknown_piece_text = piece
+                elif piece_type == _SENTENCEPIECE_BYTE_PIECE_TYPE:
+                    if piece is None:
+                        return reject_candidate()
+                    byte_piece_count += 1
+                    if _is_sentencepiece_byte_fallback_piece(piece):
+                        byte_piece_texts.add(piece)
+                    else:
+                        malformed_byte_piece = True
+            stream.seek(actual_value_end)
+            offset = actual_value_end
+        elif field_number == 2:
+            if wire_type != 2:
+                return reject_candidate()
+            bounds = _read_proto_length_delimited_bounds_stream(stream, file_size)
+            if bounds is None:
+                return reject_candidate()
+            _length, _value_start, actual_value_end = bounds
+            parsed_trainer_spec = _parse_sentencepiece_trainer_spec_proto_stream(stream, actual_value_end)
+            if parsed_trainer_spec is None:
+                return reject_candidate()
+            if trainer_spec is None:
+                trainer_spec = parsed_trainer_spec
+            else:
+                trainer_spec.merge_from(parsed_trainer_spec)
+            stream.seek(actual_value_end)
+            offset = actual_value_end
+        elif field_number == 3:
+            if wire_type != 2:
+                return reject_candidate()
+            bounds = _read_proto_length_delimited_bounds_stream(stream, file_size)
+            if bounds is None:
+                return reject_candidate()
+            _length, _value_start, actual_value_end = bounds
+            if not _is_well_formed_sentencepiece_submessage_stream(
+                stream,
+                actual_value_end,
+                expected_wire_types=_SENTENCEPIECE_NORMALIZER_SPEC_WIRE_TYPES,
+            ):
+                return reject_candidate()
+            stream.seek(actual_value_end)
+            offset = actual_value_end
+        elif field_number in {4, 5}:
+            if wire_type != 2:
+                return reject_candidate()
+            bounds = _read_proto_length_delimited_bounds_stream(stream, file_size)
+            if bounds is None:
+                return reject_candidate()
+            _length, _value_start, actual_value_end = bounds
+            if not _is_well_formed_sentencepiece_submessage_stream(stream, actual_value_end):
+                return reject_candidate()
+            stream.seek(actual_value_end)
+            offset = actual_value_end
+        else:
+            return reject_candidate()
+
+        fields_seen += 1
+        strong_match = _has_strong_sentencepiece_model_proto_evidence(
+            piece_count=piece_count,
+            typed_piece_count=typed_piece_count,
+            special_identity_piece_count=special_identity_piece_count,
+            unknown_piece_count=unknown_piece_count,
+            unknown_piece_index=unknown_piece_index,
+            unknown_piece_text=unknown_piece_text,
+            byte_piece_count=byte_piece_count,
+            byte_piece_texts=byte_piece_texts,
+            malformed_byte_piece=malformed_byte_piece,
+            trainer_spec=trainer_spec,
+        )
+
+    if strong_match and stream.tell() == file_size and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS:
+        return "strong"
+    return "malformed_candidate" if piece_count else "unknown"
+
+
+@lru_cache(maxsize=1024)
+def _classify_sentencepiece_model_proto_file_cached(
+    path: str,
+    size: int,
+    mtime_ns: int,
+    ctime_ns: int,
+    fingerprint_head: bytes,
+    fingerprint_tail: bytes,
+) -> _SentencePieceModelProtoRoute:
+    del mtime_ns, ctime_ns, fingerprint_head, fingerprint_tail
+    file_path = Path(path)
+    try:
+        with file_path.open("rb") as handle:
+            if size <= _SENTENCEPIECE_MODEL_PROTO_READ_BYTES:
+                payload = handle.read(size)
+                if len(payload) != size:
+                    return "unknown"
+                return _classify_sentencepiece_model_proto_stream(BytesIO(payload), size)
+            return _classify_sentencepiece_model_proto_stream(
+                handle,
+                size,
+                max_decoded_piece_text_bytes=_SENTENCEPIECE_MODEL_PROTO_READ_BYTES,
+            )
+    except OSError:
+        return "unknown"
+
+
+def _sentencepiece_model_proto_cache_fingerprint(file_path: Path, size: int) -> tuple[bytes, bytes]:
+    try:
+        with file_path.open("rb") as handle:
+            head = handle.read(min(size, _SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES))
+            if size <= _SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES:
+                return head, b""
+            handle.seek(max(size - _SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES, 0))
+            tail = handle.read(_SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES)
+            return head, tail
+    except OSError:
+        return b"", b""
+
+
+def _classify_sentencepiece_model_proto_file(path: str | Path) -> _SentencePieceModelProtoRoute:
+    file_path = Path(path)
+    try:
+        if not file_path.is_file():
+            return "unknown"
+        stat = file_path.stat()
+        if stat.st_size < 32:
+            return "unknown"
+        fingerprint_head, fingerprint_tail = _sentencepiece_model_proto_cache_fingerprint(file_path, stat.st_size)
+        return _classify_sentencepiece_model_proto_file_cached(
+            str(file_path.resolve()),
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+            fingerprint_head,
+            fingerprint_tail,
+        )
+    except OSError:
+        return "unknown"
+
+
+def _is_malformed_sentencepiece_model_proto_candidate_file(path: str | Path) -> bool:
+    return _classify_sentencepiece_model_proto_file(path) == "malformed_candidate"
+
+
+def _should_fail_closed_malformed_sentencepiece_model_proto_file(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in {"", ".proto"} and _is_malformed_sentencepiece_model_proto_candidate_file(path)
+
+
+def _should_treat_sentencepiece_model_proto_file_as_unknown(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in {".model", ".proto"} and is_sentencepiece_model_proto_file(path)
+
+
+def is_sentencepiece_model_proto_file(path: str | Path) -> bool:
+    """Return True for strongly identified SentencePiece tokenizer ModelProto files."""
+    return _classify_sentencepiece_model_proto_file(path) == "strong"
 
 
 def _skip_coreml_proto_group(
@@ -7344,6 +8210,12 @@ def detect_format_from_magic_bytes(
         if xgboost_route is not None:
             return xgboost_route
 
+    if file_path is not None and _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+        return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+
+    if file_path is not None and _should_treat_sentencepiece_model_proto_file_as_unknown(file_path):
+        return "unknown"
+
     renamed_tensorflow_format = "unknown"
     if file_path is not None:
         renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(
@@ -7500,6 +8372,9 @@ def detect_file_format_from_magic(path: str) -> str:
                 if xgboost_route is not None:
                     return xgboost_route
 
+            if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+                return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+
             if (
                 _allows_renamed_binary_content_route(file_path)
                 and _detect_executorch_content_route(file_path, magic8) == "executorch"
@@ -7523,6 +8398,9 @@ def detect_file_format_from_magic(path: str) -> str:
                     return xml_format
             if _could_be_content_routed_flax_msgpack(file_path):
                 return "flax_msgpack"
+
+            if _should_treat_sentencepiece_model_proto_file_as_unknown(file_path):
+                return "unknown"
 
             renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
             if renamed_tensorflow_format != "unknown":
@@ -7681,6 +8559,12 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             xgboost_route = _detect_extensionless_xgboost_ubjson_route(prefix[:xgboost_probe_size])
             if xgboost_route is not None:
                 return xgboost_route
+
+        if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+            return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+
+        if _should_treat_sentencepiece_model_proto_file_as_unknown(file_path):
+            return "unknown"
 
         if (
             _allows_renamed_binary_content_route(file_path)
@@ -7892,6 +8776,12 @@ def detect_file_format(path: str) -> str:
         if xgboost_route is not None:
             return xgboost_route
 
+    if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+        return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+
+    if _should_treat_sentencepiece_model_proto_file_as_unknown(file_path):
+        return "unknown"
+
     renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(
         file_path,
         size,
@@ -7946,6 +8836,8 @@ def detect_file_format(path: str) -> str:
         )
         if xgboost_route is not None:
             return xgboost_route
+        if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+            return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
         magic64 = read_magic_bytes(path, 64)

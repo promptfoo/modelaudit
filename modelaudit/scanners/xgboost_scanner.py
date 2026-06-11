@@ -30,7 +30,11 @@ import tempfile
 from typing import Any, ClassVar, cast
 
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
-from ..utils.file.detection import has_jax_json_checkpoint_structure, is_huggingface_tokenizer_json_file
+from ..utils.file.detection import (
+    has_jax_json_checkpoint_structure,
+    is_huggingface_tokenizer_json_file,
+    is_sentencepiece_model_proto_file,
+)
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
@@ -517,9 +521,10 @@ class XGBoostScanner(BaseScanner):
                 return False
             return cls._is_xgboost_json(path) or cls._is_probable_xgboost_json_candidate(path)
 
-        # For .model files, accept (generic extension)
+        # For .model files, keep ambiguous inputs on the XGBoost route but do
+        # not claim strongly identified SentencePiece tokenizer ModelProto files.
         if file_ext == ".model":
-            return True
+            return not is_sentencepiece_model_proto_file(path)
 
         # Check for XGBoost files without extension
         if file_ext == "":
