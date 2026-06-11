@@ -753,20 +753,28 @@ def test_license_metadata_comment_separated_wrapped_base64_tail_routes_in_direct
     archive_source.unlink()
 
     result = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    def slash_location(value: str | Path) -> str:
+        return str(value).replace("\\", "/")
+
     metadata_pattern_locations = {
-        check.location
+        slash_location(check.location)
         for check in result.checks
+        if check.location
         if check.name == "Metadata Pattern Check"
         and check.status.value == "failed"
         and check.details.get("key") == "license"
         and check.details.get("pattern") == "https?://"
     }
+    s905_locations = {
+        slash_location(issue.location) for issue in result.issues if issue.rule_code == "S905" and issue.location
+    }
 
-    assert any(issue.rule_code == "S905" and issue.location == str(direct_file) for issue in result.issues)
-    assert str(direct_file) in metadata_pattern_locations
-    assert any(location and location.endswith(f"/{shard_file.name}") for location in metadata_pattern_locations)
+    assert slash_location(direct_file) in s905_locations
+    assert slash_location(direct_file) in metadata_pattern_locations
+    assert any(location.endswith(f"/{shard_file.name}") for location in metadata_pattern_locations)
     assert any(
-        location and str(archive_path) in location and "folder/inner.safetensors" in location
+        slash_location(archive_path) in location and "folder/inner.safetensors" in location
         for location in metadata_pattern_locations
     )
 
