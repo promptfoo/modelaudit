@@ -17,8 +17,9 @@ from click.testing import CliRunner
 from modelaudit.cli import cli
 from modelaudit.integrations.sbom_generator import generate_sbom, generate_sbom_pydantic
 from modelaudit.integrations.source_redaction import redact_source_identifier
-from modelaudit.models import FileMetadataModel
+from modelaudit.models import AssetModel, FileMetadataModel
 from modelaudit.scanners.base import Issue, IssueSeverity
+from tests.helpers.file_creators import create_malicious_pickle
 
 
 def create_mock_scan_result(
@@ -38,6 +39,31 @@ def create_mock_scan_result(
     if scanners:
         result.scanner_names = scanners
     return result
+
+
+def _write_hf_download_metadata(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            [
+                "a" * 40,
+                "b" * 64,
+                "1710000000.0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_hf_cachedir_tag(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "Signature: 8a477f597d28d172789f06886806bc55\n"
+        "# This file is a cache directory tag created by huggingface_hub.\n"
+        "# For information about cache directory tags, see:\n"
+        "#\thttps://bford.info/cachedir/\n",
+        encoding="utf-8",
+    )
 
 
 class TestSBOMURLFixes:
@@ -692,7 +718,15 @@ class TestSBOMURLFixes:
         (downloaded_dir / "model.bin").write_bytes(b"model")
         mock_download.return_value = downloaded_dir
 
-        mock_scan.return_value = create_mock_scan_result(bytes_scanned=200, files_scanned=2, has_errors=False)
+        mock_scan.return_value = create_mock_scan_result(
+            bytes_scanned=200,
+            files_scanned=2,
+            assets=[
+                AssetModel(path=str(downloaded_dir / "config.json"), type="json"),
+                AssetModel(path=str(downloaded_dir / "model.bin"), type="binary"),
+            ],
+            has_errors=False,
+        )
 
         # Test CLI with SBOM output
         sbom_output = tmp_path / "model.sbom.json"
@@ -709,6 +743,70 @@ class TestSBOMURLFixes:
         component_names = {comp["name"] for comp in sbom_data["components"]}
         assert "config.json" in component_names
         assert "model.bin" in component_names
+
+    def test_cli_non_streaming_sbom_uses_scanned_local_dir_assets(self, tmp_path: Path) -> None:
+        """Directory SBOMs must reflect scanned assets, not an independent tree walk."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        model_path = model_dir / "model.pkl"
+        model_path.write_bytes(b"\x80\x04}\x94.")
+
+        download_root = model_dir / ".cache" / "huggingface" / "download"
+        benign_sidecar = download_root / "model.pkl.metadata"
+        _write_hf_download_metadata(benign_sidecar)
+        malicious_sidecar = download_root / "payload.pkl.metadata"
+        create_malicious_pickle(malicious_sidecar)
+        cachedir_tag = model_dir / ".cache" / "huggingface" / "CACHEDIR.TAG"
+        _write_hf_cachedir_tag(cachedir_tag)
+
+        sbom_output = tmp_path / "model.sbom.json"
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--no-cache",
+                "--quiet",
+                "--sbom",
+                str(sbom_output),
+                str(model_dir),
+            ],
+        )
+
+        assert result.exit_code == 1, f"CLI failed unexpectedly: {result.output}\n{result.exception}"
+        sbom_data = json.loads(sbom_output.read_text(encoding="utf-8"))
+        component_refs = {component["bom-ref"] for component in sbom_data["components"]}
+
+        assert str(model_path) in component_refs
+        assert str(malicious_sidecar) in component_refs
+        assert str(benign_sidecar) not in component_refs
+        assert str(cachedir_tag) not in component_refs
+
+    def test_cli_non_streaming_sbom_uses_empty_scanned_asset_set(self, tmp_path: Path) -> None:
+        """Empty directory inventories must not fall back to walking skipped HF sidecars."""
+        model_dir = tmp_path / "downloaded-model"
+        cachedir_tag = model_dir / ".cache" / "huggingface" / "CACHEDIR.TAG"
+        _write_hf_cachedir_tag(cachedir_tag)
+
+        sbom_output = tmp_path / "empty.sbom.json"
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--no-cache",
+                "--quiet",
+                "--sbom",
+                str(sbom_output),
+                str(model_dir),
+            ],
+        )
+
+        assert result.exit_code == 2, f"CLI returned an unexpected result: {result.output}\n{result.exception}"
+        sbom_data = json.loads(sbom_output.read_text(encoding="utf-8"))
+
+        assert sbom_data.get("components", []) == []
+        assert str(cachedir_tag) not in json.dumps(sbom_data)
 
     @pytest.mark.integration
     @patch("modelaudit.cli.is_cloud_url")
