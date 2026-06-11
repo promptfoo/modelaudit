@@ -17,6 +17,7 @@ from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils.file.detection import (
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
+    huggingface_tokenizer_json_has_template_route_evidence,
     is_huggingface_tokenizer_json_file,
     is_jax_json_checkpoint_file,
 )
@@ -780,7 +781,7 @@ class JaxCheckpointScanner(BaseScanner):
 
         # Handle file-based checkpoints
         if os.path.isfile(path):
-            if is_huggingface_tokenizer_json_file(path):
+            if is_huggingface_tokenizer_json_file(path) or huggingface_tokenizer_json_has_template_route_evidence(path):
                 return False
             ext = os.path.splitext(path)[1].lower()
             if ext in cls.supported_extensions:

@@ -1495,6 +1495,23 @@ def test_hf_tokenizer_json_nested_template_evidence_is_not_claimed(
     assert detect_file_format(str(tokenizer_path)) == "unknown"
 
 
+def test_hf_tokenizer_json_decodes_escaped_template_route_evidence(tmp_path: Path) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    malicious_template = "{{ ''.__class__.__mro__[1].__subclasses__() }}"
+    tokenizer_path.write_text(
+        (
+            '{"version":"1.0","added_tokens":[],'
+            '"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},'
+            f'"chat\\u005ftemplate":{json.dumps(malicious_template)}}}'
+        ),
+        encoding="utf-8",
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+
+
 def test_hf_tokenizer_json_allows_vocab_jinja_markers_when_schema_is_bounded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1554,6 +1571,29 @@ def test_hf_tokenizer_json_with_late_root_overlap_after_probe_is_not_claimed(
 
     assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
     assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+
+
+def test_hf_tokenizer_json_incomplete_root_value_checks_escaped_suffix_conflicts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "padding": {"data": "x" * 1024},
+        },
+    )
+    malicious_template = "{{ ''.__class__.__mro__[1].__subclasses__() }}"
+    tokenizer_path.write_text(
+        tokenizer_path.read_text(encoding="utf-8")[:-1]
+        + f', "chat\\u005ftemplate": {json.dumps(malicious_template)}}}',
+        encoding="utf-8",
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
 
 
 def test_hf_tokenizer_json_over_routing_budget_is_claimed_after_schema_probe(
