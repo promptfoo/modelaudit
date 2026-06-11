@@ -2212,13 +2212,12 @@ def test_onnx_scanner_reuses_raw_bytes_for_model_parse(
     assert parsed_payloads == [model_path.read_bytes()]
 
 
-def test_onnx_scanner_raw_read_failure_falls_back_to_path_parse(
+def test_onnx_scanner_raw_read_failure_falls_back_to_file_backed_parse(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Raw-detector read failures should keep structural parsing but fail closed."""
     model_path = create_onnx_model(tmp_path)
-    real_load = onnx.load
     raw_read_attempts = 0
     path_loads: list[str] = []
 
@@ -2231,7 +2230,7 @@ def test_onnx_scanner_raw_read_failure_falls_back_to_path_parse(
 
     def tracking_path_loader(path: str, *, load_external_data: bool) -> Any:
         path_loads.append(path)
-        return real_load(path, load_external_data=load_external_data)
+        raise AssertionError("raw-read fallback should use bounded file-backed structural parsing")
 
     monkeypatch.setattr("modelaudit.scanners.onnx_scanner.open", fail_first_raw_read, raising=False)
     monkeypatch.setattr(onnx, "load", tracking_path_loader)
@@ -2239,10 +2238,11 @@ def test_onnx_scanner_raw_read_failure_falls_back_to_path_parse(
     result = OnnxScanner({"check_jit_script": False, "check_network_comm": False}).scan(str(model_path))
     coverage_checks = [check for check in result.checks if check.name == "Raw Detector Analysis Coverage"]
 
-    assert path_loads == [str(model_path)]
+    assert path_loads == []
     assert result.success is False
     assert result.bytes_scanned > 0
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
     assert len(coverage_checks) == 1
     assert coverage_checks[0].details["detector"] == "raw_file_read"
     assert coverage_checks[0].details["coverage_gap"] == "file_read_failed"
@@ -5489,6 +5489,251 @@ class TestWeightDistributionSemantics:
         semantics = standalone.metadata["onnx_weight_distribution_semantics"]
         assert semantics["eligible_initializer_count"] == 1
         assert semantics["analyzed_layer_count"] == 2
+
+
+def _encode_proto_varint(value: int) -> bytes:
+    if value < 0:
+        raise ValueError("test protobuf helper only encodes non-negative integers")
+    encoded = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            encoded.append(byte | 0x80)
+        else:
+            encoded.append(byte)
+            return bytes(encoded)
+
+
+def _proto_key(field_number: int, wire_type: int) -> bytes:
+    return _encode_proto_varint((field_number << 3) | wire_type)
+
+
+def _proto_varint(field_number: int, value: int) -> bytes:
+    return _proto_key(field_number, 0) + _encode_proto_varint(value)
+
+
+def _proto_bytes(field_number: int, payload: bytes) -> bytes:
+    return _proto_key(field_number, 2) + _encode_proto_varint(len(payload)) + payload
+
+
+def _write_sparse_raw_onnx_model(
+    tmp_path: Path,
+    *,
+    raw_data_size: int,
+    op_type: str = "Relu",
+    domain: str = "",
+    filename: str = "large.onnx",
+) -> Path:
+    node_payload = b"".join(
+        [
+            _proto_bytes(1, b"input"),
+            _proto_bytes(2, b"output"),
+            _proto_bytes(3, b"node"),
+            _proto_bytes(4, op_type.encode()),
+            _proto_bytes(7, domain.encode()) if domain else b"",
+        ],
+    )
+    tensor_prefix = b"".join(
+        [
+            _proto_varint(1, max(raw_data_size // 4, 1)),
+            _proto_varint(2, int(TensorProto.FLOAT)),
+            _proto_bytes(8, b"W"),
+        ],
+    )
+    raw_header = _proto_key(9, 2) + _encode_proto_varint(raw_data_size)
+    tensor_len = len(tensor_prefix) + len(raw_header) + raw_data_size
+    initializer_header = _proto_key(5, 2) + _encode_proto_varint(tensor_len)
+    graph_prefix = b"".join(
+        [
+            _proto_bytes(1, node_payload),
+            _proto_bytes(2, b"graph"),
+            _proto_bytes(11, _proto_bytes(1, b"input")),
+            _proto_bytes(12, _proto_bytes(1, b"output")),
+        ],
+    )
+    graph_len = len(graph_prefix) + len(initializer_header) + tensor_len
+    opset_payload = _proto_bytes(1, b"") + _proto_varint(2, 13)
+    prefix = b"".join(
+        [
+            _proto_varint(1, 8),
+            _proto_bytes(2, b"modelaudit-test"),
+            _proto_bytes(8, opset_payload),
+            _proto_key(7, 2),
+            _encode_proto_varint(graph_len),
+            graph_prefix,
+            initializer_header,
+            tensor_prefix,
+            raw_header,
+        ],
+    )
+    path = tmp_path / filename
+    with path.open("wb") as handle:
+        handle.write(prefix)
+        handle.truncate(len(prefix) + raw_data_size)
+    return path
+
+
+def _write_malformed_declared_length_onnx(tmp_path: Path) -> Path:
+    path = tmp_path / "declared-too-long.onnx"
+    path.write_bytes(_proto_key(7, 2) + _encode_proto_varint(64) + b"\x08")
+    return path
+
+
+def _nested_graph_payload(depth: int) -> bytes:
+    if depth <= 0:
+        return _proto_bytes(1, _proto_bytes(4, b"Relu")) + _proto_bytes(2, b"leaf")
+    attribute_payload = _proto_bytes(1, b"body") + _proto_bytes(6, _nested_graph_payload(depth - 1))
+    node_payload = _proto_bytes(4, b"If") + _proto_bytes(5, attribute_payload)
+    return _proto_bytes(1, node_payload) + _proto_bytes(2, b"nested")
+
+
+def _write_deeply_nested_onnx(tmp_path: Path) -> Path:
+    graph_payload = _nested_graph_payload(140)
+    model_payload = _proto_varint(1, 8) + _proto_bytes(7, graph_payload)
+    path = tmp_path / "deep.onnx"
+    path.write_bytes(model_payload)
+    return path
+
+
+def _write_tensor_rank_bomb_onnx(tmp_path: Path) -> Path:
+    dims = b"".join(_proto_varint(1, 1) for _ in range(4097))
+    tensor = dims + _proto_varint(2, int(TensorProto.FLOAT)) + _proto_bytes(8, b"W")
+    graph = _proto_bytes(5, tensor) + _proto_bytes(2, b"rank-bomb")
+    model = _proto_varint(1, 8) + _proto_bytes(7, graph)
+    path = tmp_path / "rank-bomb.onnx"
+    path.write_bytes(model)
+    return path
+
+
+class TestLargeOnnxFileBackedInspection:
+    """Regression coverage for bounded file-backed ONNX structural scans."""
+
+    @staticmethod
+    def _checks(result: Any, name: str) -> list[Any]:
+        return [check for check in result.checks if check.name == name]
+
+    def test_large_onnx_uses_file_backed_structure_without_max_read_rejection(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = _write_sparse_raw_onnx_model(tmp_path, raw_data_size=2 * 1024 * 1024)
+
+        def _fail_string_parse(_data: bytes) -> Any:
+            raise AssertionError("large ONNX scan should not parse from a full bytes buffer")
+
+        monkeypatch.setattr(onnx, "load_model_from_string", _fail_string_parse)
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1024}).scan(str(model_path))
+
+        assert result.bytes_scanned == model_path.stat().st_size
+        assert result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
+        assert result.metadata["onnx_structure_parse"]["omitted_raw_data_bytes"] == 2 * 1024 * 1024
+        assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "onnx_raw_detection_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert "onnx_weight_distribution_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert self._checks(result, "Custom Operator Domain Check")[-1].status == CheckStatus.PASSED
+        assert self._checks(result, "Python Operator Detection")[-1].status == CheckStatus.PASSED
+        assert self._checks(result, "Tensor Size Validation")[-1].status == CheckStatus.PASSED
+
+    def test_explicit_onnx_max_file_read_size_still_fails_closed(self, tmp_path: Path) -> None:
+        model_path = _write_sparse_raw_onnx_model(tmp_path, raw_data_size=4096)
+
+        result = OnnxScanner(config={"max_file_read_size": 1024}).scan(str(model_path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["scan_outcome_reasons"] == ["max_file_read_size_exceeded"]
+        assert any(check.name == "File Size Limit" and check.status == CheckStatus.FAILED for check in result.checks)
+
+    def test_file_backed_large_onnx_still_flags_python_operator(self, tmp_path: Path) -> None:
+        model_path = _write_sparse_raw_onnx_model(
+            tmp_path,
+            raw_data_size=2 * 1024 * 1024,
+            op_type="PythonOp",
+            filename="python-op.onnx",
+        )
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1024}).scan(str(model_path))
+
+        python_checks = self._checks(result, "Python Operator Detection")
+        assert any(
+            check.status == CheckStatus.FAILED and check.severity == IssueSeverity.CRITICAL for check in python_checks
+        )
+        assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
+    def test_file_backed_external_data_controls_preserved(self, tmp_path: Path) -> None:
+        traversal = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="../escape.bin",
+            missing_external=True,
+        )
+        traversal_result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(traversal))
+        assert traversal_result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
+        assert any("External Data Path Traversal" in check.name for check in traversal_result.checks)
+
+        declared_length = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="weights.bin",
+            external_metadata={"length": "1"},
+            external_file_bytes=b"\x00" * 8,
+            tensor_shape=(2,),
+        )
+        declared_length_result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(declared_length))
+        size_checks = self._checks(declared_length_result, "External Data Size Validation")
+        assert any(
+            check.status == CheckStatus.FAILED and check.severity == IssueSeverity.CRITICAL for check in size_checks
+        )
+
+    @pytest.mark.parametrize(
+        ("writer", "reason"),
+        [
+            (_write_malformed_declared_length_onnx, "declared_length_out_of_bounds"),
+            (_write_deeply_nested_onnx, "protobuf_nesting_limit_exceeded"),
+            (_write_tensor_rank_bomb_onnx, "tensor_rank_limit_exceeded"),
+        ],
+    )
+    def test_file_backed_malformed_or_bomb_onnx_fails_closed(
+        self,
+        tmp_path: Path,
+        writer: Any,
+        reason: str,
+    ) -> None:
+        model_path = writer(tmp_path)
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        parse_checks = self._checks(result, "ONNX Model Parsing")
+        assert result.success is False
+        assert any(check.status == CheckStatus.FAILED and reason in str(check.details) for check in parse_checks)
+        assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
+    @pytest.mark.integration
+    def test_pinned_huggingface_large_onnx_reaches_file_backed_terminal_scan(self) -> None:
+        from huggingface_hub import hf_hub_download
+
+        path = Path(
+            hf_hub_download(
+                repo_id="sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+                revision="4328cf26390c98c5e3c738b4460a05b95f4911f5",
+                filename="onnx/model.onnx",
+            ),
+        )
+
+        result = OnnxScanner().scan(str(path))
+
+        assert path.stat().st_size == 1_110_068_629
+        assert result.bytes_scanned == path.stat().st_size
+        assert result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
+        assert result.metadata["onnx_structure_parse"]["omitted_raw_data_bytes"] > 1_000_000_000
+        assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+        assert any(
+            check.name == "Python Operator Detection" and check.status == CheckStatus.PASSED for check in result.checks
+        )
 
 
 class TestRawDetectorCoverage:
