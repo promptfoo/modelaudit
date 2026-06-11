@@ -2924,20 +2924,47 @@ class PyTorchZipScanner(BaseScanner):
         return None, source if isinstance(source, str) else None
 
     def _get_installed_pytorch_version(self) -> str | None:
-        """Get PyTorch version from an already-imported module without importing torch."""
-        try:
-            import sys
+        """Get installed PyTorch version without importing torch."""
+        import sys
 
-            torch_module = sys.modules.get("torch")
-            if torch_module is None:
-                return None
-            version = getattr(torch_module, "__version__", None)
-            if isinstance(version, str) and version.strip():
-                return version.strip()
-        except Exception:
+        torch_module = sys.modules.get("torch")
+        if torch_module is not None:
+            try:
+                module_version = getattr(torch_module, "__version__", None)
+            except Exception as exc:
+                logger.debug("Unable to read already-imported torch.__version__: %s", exc)
+            else:
+                if isinstance(module_version, str) and module_version.strip():
+                    return module_version.strip()
+                if module_version is not None:
+                    logger.debug("Ignoring non-string already-imported torch.__version__: %r", module_version)
+
+        try:
+            from importlib import metadata
+        except Exception as exc:
+            logger.debug("Unable to load importlib.metadata for PyTorch version detection: %s", exc)
             return None
 
-        return None
+        try:
+            package_version: object = metadata.version("torch")
+        except metadata.PackageNotFoundError:
+            return None
+        except Exception as exc:
+            logger.debug("Unable to read installed torch package metadata: %s", exc)
+            return None
+
+        if not isinstance(package_version, str):
+            logger.debug("Ignoring non-string installed torch package version metadata: %r", package_version)
+            return None
+
+        package_version = package_version.strip()
+        if not package_version:
+            logger.debug("Ignoring blank installed torch package version metadata")
+            return None
+
+        if not self._looks_like_pytorch_version(package_version):
+            logger.debug("Using malformed installed torch package version metadata conservatively: %r", package_version)
+        return package_version
 
     def _select_pytorch_version_for_check(
         self,
