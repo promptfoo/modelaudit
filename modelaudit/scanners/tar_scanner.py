@@ -13,7 +13,7 @@ import tempfile
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Any, BinaryIO, ClassVar, cast
+from typing import Any, ClassVar, cast
 
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
@@ -123,12 +123,6 @@ class _TarBoundedStream:
 
 def _tar_padded_size(size: int) -> int:
     return ((max(size, 0) + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
-
-
-@contextmanager
-def _open_binary_stream(path: str) -> Iterator[BinaryIO]:
-    with open(path, "rb") as raw:
-        yield raw
 
 
 class _ModelAuditTarInfo(tarfile.TarInfo):
@@ -359,36 +353,37 @@ class TarScanner(BaseScanner):
             limits.append(max_total_size)
         return max(1, min(limits))
 
-    def _open_tar_stream(self, path: str, stack: ExitStack) -> tuple[tarfile.TarFile, _TarBoundedStream, str | None]:
+    @contextmanager
+    def _open_tar_stream(self, path: str) -> Iterator[tuple[tarfile.TarFile, _TarBoundedStream, str | None]]:
         """Open a TAR stream through a bounded decompressed-byte reader."""
         compression_codec = self._detect_compressed_tar_wrapper(path)
-        raw = stack.enter_context(_open_binary_stream(path))
-        if compression_codec == "gzip":
-            decompressed: Any = stack.enter_context(gzip.GzipFile(fileobj=raw, mode="rb"))
-        elif compression_codec == "bzip2":
-            decompressed = stack.enter_context(bz2.BZ2File(raw, mode="rb"))
-        elif compression_codec == "xz":
-            decompressed = stack.enter_context(lzma.LZMAFile(raw, mode="rb"))  # noqa: SIM115
-        else:
-            decompressed = raw
+        with open(path, "rb") as raw, ExitStack() as stack:
+            if compression_codec == "gzip":
+                decompressed: Any = stack.enter_context(gzip.GzipFile(fileobj=raw, mode="rb"))
+            elif compression_codec == "bzip2":
+                decompressed = stack.enter_context(bz2.BZ2File(raw, mode="rb"))
+            elif compression_codec == "xz":
+                decompressed = stack.enter_context(lzma.LZMAFile(raw, mode="rb"))
+            else:
+                decompressed = raw
 
-        bounded_stream = _TarBoundedStream(
-            decompressed,
-            max_bytes=self.max_decompressed_bytes if compression_codec is not None else 0,
-            max_read_size=self._tar_stream_read_limit(),
-        )
-        archive = stack.enter_context(
-            tarfile.open(  # noqa: SIM115
-                fileobj=cast(Any, bounded_stream),
-                mode="r|",
-                bufsize=tarfile.BLOCKSIZE,
-                tarinfo=cast(
-                    type[tarfile.TarInfo],
-                    _tarinfo_class_with_metadata_limit(self._tar_stream_read_limit()),
-                ),
+            bounded_stream = _TarBoundedStream(
+                decompressed,
+                max_bytes=self.max_decompressed_bytes if compression_codec is not None else 0,
+                max_read_size=self._tar_stream_read_limit(),
             )
-        )
-        return archive, bounded_stream, compression_codec
+            archive = stack.enter_context(
+                tarfile.open(
+                    fileobj=cast(Any, bounded_stream),
+                    mode="r|",
+                    bufsize=tarfile.BLOCKSIZE,
+                    tarinfo=cast(
+                        type[tarfile.TarInfo],
+                        _tarinfo_class_with_metadata_limit(self._tar_stream_read_limit()),
+                    ),
+                )
+            )
+            yield archive, bounded_stream, compression_codec
 
     def _rewrite_nested_result_context(
         self,
@@ -746,9 +741,7 @@ class TarScanner(BaseScanner):
         consumed_size = 0
 
         try:
-            archive_stack = ExitStack()
-            with archive_stack:
-                tar, bounded_stream, compression_codec = self._open_tar_stream(path, archive_stack)
+            with self._open_tar_stream(path) as (tar, bounded_stream, compression_codec):
                 compressed_size = os.path.getsize(path)
                 while True:
                     try:
@@ -1000,9 +993,7 @@ class TarScanner(BaseScanner):
         stream_budget_failed = False
 
         try:
-            archive_stack = ExitStack()
-            with archive_stack:
-                tar, bounded_stream, compression_codec = self._open_tar_stream(path, archive_stack)
+            with self._open_tar_stream(path) as (tar, bounded_stream, compression_codec):
                 compressed_size = os.path.getsize(path)
                 security_only_nested_entries = self.config.get(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY)
                 if not isinstance(security_only_nested_entries, set):
