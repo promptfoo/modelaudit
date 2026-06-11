@@ -6,7 +6,7 @@ import math
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from modelaudit_picklescan import Finding, Notice, PickleReport, ScanError, ScanOptions, ScanStatus, Severity
 
@@ -62,6 +62,18 @@ _LEGACY_SCAN_OUTCOME_REASONS = {
 _INT_TEXT_RE = re.compile(r"[+-]?\d+")
 _LEGACY_RULE_CODE_RE = re.compile(r"^S\d+$")
 _LOCATION_POSITION_RE = re.compile(r"\(pos\s+(?P<position>\d+)\)\s*$")
+_UNKNOWN_OPCODE_POSITION_RE = re.compile(r"at position (?P<position>\d+), opcode b[\"']")
+_LEGACY_PYTORCH_PROTOCOL0_STORAGE_PREVIEW_RE = re.compile(
+    r"^str:\"\('storage', <class 'torch\.(?P<storage_name>[A-Za-z0-9_]+Storage)'>, "
+    r"'(?P<storage_key>[0-9]{1,128})', '[^']+', (?P<element_count>[0-9]+), "
+    r"(?P<view_metadata>None|\('[0-9]{1,128}', [0-9]+, [0-9]+\))\)\"$"
+)
+_LEGACY_PYTORCH_PROTOCOL0_VIEW_RE = re.compile(r"^\('[0-9]{1,128}', (?P<offset>[0-9]+), (?P<size>[0-9]+)\)$")
+_LEGACY_PYTORCH_BINARY_STORAGE_PREVIEW_RE = re.compile(
+    r"^tuple\(str_span\(len=7\), global:torch\.(?P<storage_name>[A-Za-z0-9_]+Storage), "
+    r"str_span\(len=[0-9]+\), str_span\(len=[0-9]+\), int:(?P<element_count>[0-9]+), "
+    r"(?P<view_metadata>NoneType:None|tuple\(.*\))\)$"
+)
 _BENIGN_SERIALIZATION_TAIL_MODULE_PREFIXES = frozenset(
     {
         "collections",
@@ -70,29 +82,29 @@ _BENIGN_SERIALIZATION_TAIL_MODULE_PREFIXES = frozenset(
         "sklearn",
     }
 )
-_LEGACY_PYTORCH_STORAGE_NAMES = frozenset(
-    {
-        "BFloat16Storage",
-        "BoolStorage",
-        "ByteStorage",
-        "CharStorage",
-        "ComplexDoubleStorage",
-        "ComplexFloatStorage",
-        "DoubleStorage",
-        "FloatStorage",
-        "HalfStorage",
-        "IntStorage",
-        "LongStorage",
-        "QInt32Storage",
-        "QInt8Storage",
-        "QUInt2x4Storage",
-        "QUInt4x2Storage",
-        "QUInt8Storage",
-        "ShortStorage",
-        "Storage",
-        "UntypedStorage",
-    }
-)
+_LEGACY_PYTORCH_STREAM_COUNT = 5
+_LEGACY_PYTORCH_STORAGE_ELEMENT_SIZES = {
+    "BFloat16Storage": 2,
+    "BoolStorage": 1,
+    "ByteStorage": 1,
+    "CharStorage": 1,
+    "ComplexDoubleStorage": 16,
+    "ComplexFloatStorage": 8,
+    "DoubleStorage": 8,
+    "FloatStorage": 4,
+    "HalfStorage": 2,
+    "IntStorage": 4,
+    "LongStorage": 8,
+    "QInt32Storage": 4,
+    "QInt8Storage": 1,
+    "QUInt2x4Storage": 1,
+    "QUInt4x2Storage": 1,
+    "QUInt8Storage": 1,
+    "ShortStorage": 2,
+    "Storage": 1,
+    "UntypedStorage": 1,
+}
+_LEGACY_PYTORCH_STORAGE_NAMES = frozenset(_LEGACY_PYTORCH_STORAGE_ELEMENT_SIZES)
 _LEGACY_PYTORCH_REBUILD_IMPORTS = frozenset(
     {
         ("torch", "_rebuild_tensor"),
@@ -476,16 +488,16 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
     if not has_trusted_pickle_boundary:
         return False
 
-    legacy_pytorch_storage_tail = _is_legacy_pytorch_storage_tail(report)
-    if report.has_security_findings and not legacy_pytorch_storage_tail:
-        return False
-
     for notice in report.notices:
         if notice.code != "parse_incomplete":
             continue
 
         exception_type = notice.details.get("exception_type")
         exception_message = str(notice.details.get("exception", ""))
+        legacy_pytorch_storage_tail = _is_legacy_pytorch_storage_tail(report, exception_message)
+        if report.has_security_findings and not legacy_pytorch_storage_tail:
+            return False
+
         if (
             exception_type == "UnicodeDecodeError"
             and source_ext in {".bin", ".pkl", ".pickle"}
@@ -542,7 +554,7 @@ def _is_unknown_opcode_tail_parse_error(exception_message: str) -> bool:
     )
 
 
-def _is_legacy_pytorch_storage_tail(report: PickleReport) -> bool:
+def _is_legacy_pytorch_storage_tail(report: PickleReport, exception_message: str) -> bool:
     """Recognize the legacy (non-zip) PyTorch layout: state_dict pickle(s) followed by raw tensor storage bytes.
 
     Legacy ``torch.save`` writes the model's pickle metadata and then appends the raw storage bytes of every
@@ -551,19 +563,194 @@ def _is_legacy_pytorch_storage_tail(report: PickleReport) -> bool:
     """
     if not report.findings:
         return False
+    storage_finding_count = _legacy_pytorch_storage_persistent_id_opcode_count(report)
+    if storage_finding_count != 1:
+        return False
     if not all(_is_pytorch_storage_persistent_id_finding(finding) for finding in report.findings):
         return False
-    return _has_only_legacy_pytorch_tail_imports(report)
+    if not _has_legacy_pytorch_control_stream_shape(report):
+        return False
+    storage_span = _single_legacy_pytorch_storage_span(report)
+    if storage_span is None:
+        return False
+    parse_error_position = _unknown_opcode_position(exception_message)
+    if parse_error_position is None or parse_error_position != report.coverage.bytes_scanned:
+        return False
+    if parse_error_position < 0 or report.coverage.bytes_total is None:
+        return False
+    return report.coverage.bytes_total - parse_error_position == storage_span
 
 
 def _is_pytorch_storage_persistent_id_finding(finding: Finding) -> bool:
     """Return True when the finding is PyTorch's own externalized tensor-storage persistent_id."""
     opcode = finding.details.get("opcode")
-    return (
-        finding.rule_code == "PERSISTENT_ID"
-        and opcode == "BINPERSID"
-        and finding.details.get("pytorch_storage_persistent_id") is True
-    )
+    if finding.rule_code != "PERSISTENT_ID":
+        return False
+    if opcode == "BINPERSID":
+        return finding.details.get("pytorch_storage_persistent_id") is True
+    if opcode == "PERSID":
+        return _legacy_pytorch_protocol0_storage_record(finding) is not None
+    return False
+
+
+def _legacy_pytorch_storage_persistent_id_opcode_count(report: PickleReport) -> int | None:
+    opcode_counts = report.metadata.get("opcode_counts")
+    if not isinstance(opcode_counts, Mapping):
+        return None
+    count = 0
+    for opcode in ("BINPERSID", "PERSID"):
+        raw_value = opcode_counts.get(opcode, 0)
+        if isinstance(raw_value, bool) or not isinstance(raw_value, int):
+            return None
+        count += raw_value
+    return count
+
+
+def _has_legacy_pytorch_control_stream_shape(report: PickleReport) -> bool:
+    opcode_counts = report.metadata.get("opcode_counts")
+    follow_on_opcode_counts = report.metadata.get("follow_on_opcode_counts")
+    first_pickle_end_pos = report.metadata.get("first_pickle_end_pos")
+    if not isinstance(opcode_counts, Mapping) or not isinstance(follow_on_opcode_counts, Mapping):
+        return False
+    if follow_on_opcode_counts:
+        return False
+    if not isinstance(first_pickle_end_pos, int) or first_pickle_end_pos < 0:
+        return False
+    stop_count = opcode_counts.get("STOP")
+    if isinstance(stop_count, bool) or stop_count != _LEGACY_PYTORCH_STREAM_COUNT:
+        return False
+    protocols = report.metadata.get("protocols")
+    if protocols is not None:
+        if not isinstance(protocols, Sequence) or isinstance(protocols, str | bytes):
+            return False
+        if len(protocols) != _LEGACY_PYTORCH_STREAM_COUNT:
+            return False
+        if any(isinstance(protocol, bool) or not isinstance(protocol, int) or protocol < 0 for protocol in protocols):
+            return False
+    return True
+
+
+def _single_legacy_pytorch_storage_span(report: PickleReport) -> int | None:
+    if not _has_only_legacy_pytorch_tail_imports(report):
+        if not _has_only_legacy_pytorch_protocol0_imports(report):
+            return None
+        protocol0_record = None
+        for finding in report.findings:
+            protocol0_record = _legacy_pytorch_protocol0_storage_record(finding)
+            if protocol0_record is not None:
+                break
+        if protocol0_record is None:
+            return None
+        storage_name, element_count = protocol0_record
+    else:
+        binary_storage_name = _single_legacy_pytorch_storage_reference_name(report)
+        binary_element_count = _single_legacy_pytorch_binary_storage_element_count(report)
+        if binary_storage_name is None or binary_element_count is None:
+            return None
+        storage_name = binary_storage_name
+        element_count = binary_element_count
+
+    element_size = _LEGACY_PYTORCH_STORAGE_ELEMENT_SIZES.get(storage_name)
+    if element_size is None:
+        return None
+    return 8 + (element_count * element_size)
+
+
+def _has_only_legacy_pytorch_protocol0_imports(report: PickleReport) -> bool:
+    import_references = report.metadata.get("import_references")
+    if not _is_reference_sequence(import_references):
+        return False
+    if report.metadata.get("import_references_truncated") is True:
+        return False
+    for reference in cast(Sequence[object], import_references):
+        if not isinstance(reference, Mapping) or bool(reference.get("is_dangerous")):
+            return False
+        module = reference.get("module")
+        name = reference.get("name")
+        if not isinstance(module, str) or not isinstance(name, str):
+            return False
+        if (module, name) in _LEGACY_PYTORCH_REBUILD_IMPORTS or (module, name) in _LEGACY_PYTORCH_AUXILIARY_IMPORTS:
+            continue
+        return False
+    return True
+
+
+def _single_legacy_pytorch_storage_reference_name(report: PickleReport) -> str | None:
+    import_references = report.metadata.get("import_references")
+    if not _is_reference_sequence(import_references):
+        return None
+    storage_names = {
+        reference.get("name")
+        for reference in cast(Sequence[object], import_references)
+        if isinstance(reference, Mapping) and _is_legacy_pytorch_storage_persistent_id_reference(reference)
+    }
+    if len(storage_names) != 1:
+        return None
+    storage_name = next(iter(storage_names))
+    return storage_name if isinstance(storage_name, str) else None
+
+
+def _single_legacy_pytorch_binary_storage_element_count(report: PickleReport) -> int | None:
+    for finding in report.findings:
+        if finding.details.get("opcode") != "BINPERSID":
+            continue
+        preview = finding.details.get("persistent_id_preview")
+        if not isinstance(preview, str):
+            return None
+        match = _LEGACY_PYTORCH_BINARY_STORAGE_PREVIEW_RE.match(preview)
+        if match is None:
+            return None
+        if match.group("storage_name") != _single_legacy_pytorch_storage_reference_name(report):
+            return None
+        return _legacy_pytorch_element_count(match.group("element_count"))
+    return None
+
+
+def _legacy_pytorch_protocol0_storage_record(finding: Finding) -> tuple[str, int] | None:
+    if finding.rule_code != "PERSISTENT_ID" or finding.details.get("opcode") != "PERSID":
+        return None
+    preview = finding.details.get("persistent_id_preview")
+    if not isinstance(preview, str):
+        return None
+    match = _LEGACY_PYTORCH_PROTOCOL0_STORAGE_PREVIEW_RE.match(preview)
+    if match is None:
+        return None
+    storage_name = match.group("storage_name")
+    element_count = _legacy_pytorch_element_count(match.group("element_count"))
+    if element_count is None:
+        return None
+    view_metadata = match.group("view_metadata")
+    if view_metadata != "None":
+        view_match = _LEGACY_PYTORCH_PROTOCOL0_VIEW_RE.match(view_metadata)
+        if view_match is None:
+            return None
+        view_offset = _legacy_pytorch_element_count(view_match.group("offset"))
+        view_size = _legacy_pytorch_element_count(view_match.group("size"))
+        if view_offset is None or view_size is None or view_offset > element_count or view_size > element_count:
+            return None
+        if view_size > element_count - view_offset:
+            return None
+    return storage_name, element_count
+
+
+def _legacy_pytorch_element_count(value: str) -> int | None:
+    try:
+        element_count = int(value)
+    except ValueError:
+        return None
+    if element_count < 0 or element_count > (1 << 63) - 1:
+        return None
+    return element_count
+
+
+def _unknown_opcode_position(exception_message: str) -> int | None:
+    match = _UNKNOWN_OPCODE_POSITION_RE.search(exception_message)
+    if match is None:
+        return None
+    try:
+        return int(match.group("position"))
+    except ValueError:
+        return None
 
 
 def _has_only_legacy_pytorch_tail_imports(report: PickleReport) -> bool:

@@ -225,17 +225,27 @@ def _build_protocolless_binary_benign_scalar_pickle() -> bytes:
 
 
 def _build_legacy_pytorch_storage_tail_pickle() -> bytes:
-    """Build a minimal legacy PyTorch-style pickle followed by raw storage bytes."""
-    return (
-        b"\x80\x04("
-        b"\x8c\x07storage\x94"
-        b"\x8c\x05torch\x94"
-        b"\x8c\x0cFloatStorage\x94\x93"
-        b"\x8c\x01k\x94"
-        b"\x8c\x03cpu\x94"
-        b"K\x01tQ."
-        b"\x00RAW"
+    """Build a legacy PyTorch container with control pickles followed by raw storage bytes."""
+    storage_payload = b"ABCD"
+    storage_size = len(storage_payload)
+    object_stream = (
+        b"\x80\x02](X\x07\x00\x00\x00storagectorch\nByteStorage\nX\x01\x00\x00\x000X\x03\x00\x00\x00cpuK\x04NtQa."
     )
+    control_streams = (
+        pickle.dumps(0x1950A86A20F9469CFC6C, protocol=2),
+        pickle.dumps(1001, protocol=2),
+        pickle.dumps(
+            {
+                "protocol_version": 1001,
+                "little_endian": True,
+                "type_sizes": {"short": 2, "int": 4, "long": 8},
+            },
+            protocol=2,
+        ),
+        object_stream,
+        pickle.dumps(["0"], protocol=2),
+    )
+    return b"".join(control_streams) + storage_size.to_bytes(8, "little") + storage_payload
 
 
 def _write_pickle_safetensors_polyglot(path: Path, header_length: int) -> None:
@@ -7248,8 +7258,10 @@ def test_scan_model_directory_or_file_trusts_legacy_pytorch_storage_tail(tmp_pat
     metadata = aggregate.file_metadata[str(model_path)]
 
     assert determine_exit_code(aggregate) == 1
-    assert metadata["trusted_incomplete_tail"] is True
-    assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert metadata["legacy_pytorch_container"] is True
+    assert metadata["legacy_pytorch_storage_start"] == 208
+    assert metadata["legacy_pytorch_storage_end"] == 220
+    assert metadata["pickle_report_status"] == "complete"
     assert not any(issue.rule_code == "S901" for issue in aggregate.issues)
     assert any(issue.rule_code == "S212" for issue in aggregate.issues)
 
@@ -7262,11 +7274,13 @@ def test_scan_model_directory_or_file_trusts_nested_legacy_pytorch_storage_tail(
     metadata = aggregate.file_metadata[str(archive_path)]
 
     assert determine_exit_code(aggregate) == 1
-    assert metadata["trusted_incomplete_tail"] is True
-    assert "zip_analysis_incomplete" in metadata["scan_outcome_reasons"]
+    assert metadata["legacy_pytorch_container"] is True
+    assert metadata["legacy_pytorch_storage_start"] == 208
+    assert metadata["legacy_pytorch_storage_end"] == 220
+    assert metadata["pickle_report_status"] == "complete"
     assert not any(issue.rule_code == "S901" for issue in aggregate.issues)
     assert any(
-        issue.rule_code == "S902"
+        issue.rule_code == "S212"
         and issue.details.get("zip_entry") == "weights.pt"
         and issue.location == f"{archive_path}:weights.pt"
         for issue in aggregate.issues

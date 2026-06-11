@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 from pathlib import Path
 
 import pytest
@@ -47,25 +48,63 @@ def _binunicode(value: bytes) -> bytes:
     return b"X" + len(value).to_bytes(4, "little") + value
 
 
-def _legacy_pytorch_storage_tail_payload(protocol: int) -> bytes:
-    if protocol == 2:
+_LEGACY_PYTORCH_MAGIC_NUMBER = 0x1950A86A20F9469CFC6C
+_LEGACY_PYTORCH_PROTOCOL_VERSION = 1001
+_LEGACY_PYTORCH_SYS_INFO = {
+    "protocol_version": _LEGACY_PYTORCH_PROTOCOL_VERSION,
+    "little_endian": True,
+    "type_sizes": {"short": 2, "int": 4, "long": 8},
+}
+
+
+def _legacy_pytorch_object_stream(protocol: int, storage_size: int) -> bytes:
+    if protocol == 0:
+        persistent_id = (
+            b"('storage', <class 'torch.ByteStorage'>, '0', 'cpu', " + str(storage_size).encode("ascii") + b", None)"
+        )
+        return b"]P" + persistent_id + b"\na."
+    if protocol in {1, 2, 3}:
+        payload = b""
+        if protocol >= 2:
+            payload += b"\x80" + bytes([protocol])
         return (
-            b"\x80\x02("
+            payload
+            + b"]("
             + _binunicode(b"storage")
-            + b"ctorch\nFloatStorage\n"
-            + _binunicode(b"k")
+            + b"ctorch\nByteStorage\n"
+            + _binunicode(b"0")
             + _binunicode(b"cpu")
-            + b"K\x01tQ."
-            + b"\x00RAW"
+            + b"K"
+            + bytes([storage_size])
+            + b"NtQa."
         )
     if protocol in {4, 5}:
         return (
             bytes([0x80, protocol])
-            + b"(\x8c\x07storage\x94\x8c\x05torch\x94\x8c\x0cFloatStorage\x94\x93"
-            + b"\x8c\x01k\x94\x8c\x03cpu\x94K\x01tQ."
-            + b"\x00RAW"
+            + b"]\x94(\x8c\x07storage\x94\x8c\x05torch\x94\x8c\x0bByteStorage\x94\x93\x94"
+            + b"\x8c\x010\x94\x8c\x03cpu\x94K"
+            + bytes([storage_size])
+            + b"Nt\x94Qa."
         )
     raise ValueError(f"unsupported protocol: {protocol}")
+
+
+def _legacy_pytorch_storage_tail_payload(
+    protocol: int,
+    *,
+    storage_payload: bytes = b"ABCD",
+    declared_storage_size: int | None = None,
+    suffix: bytes = b"",
+) -> bytes:
+    storage_size = len(storage_payload) if declared_storage_size is None else declared_storage_size
+    control_streams = (
+        pickle.dumps(_LEGACY_PYTORCH_MAGIC_NUMBER, protocol=protocol),
+        pickle.dumps(_LEGACY_PYTORCH_PROTOCOL_VERSION, protocol=protocol),
+        pickle.dumps(_LEGACY_PYTORCH_SYS_INFO, protocol=protocol),
+        _legacy_pytorch_object_stream(protocol, storage_size),
+        pickle.dumps(["0"], protocol=protocol),
+    )
+    return b"".join(control_streams) + storage_size.to_bytes(8, "little") + storage_payload + suffix
 
 
 def test_scan_options_from_config_parses_string_values() -> None:
@@ -1353,9 +1392,9 @@ def _legacy_pytorch_tail_import_references() -> list[dict[str, object]]:
             "is_dangerous": False,
         },
         {
-            "import_reference": "torch.FloatStorage",
+            "import_reference": "torch.ByteStorage",
             "module": "torch",
-            "name": "FloatStorage",
+            "name": "ByteStorage",
             "opcode": "GLOBAL",
             "position": 251,
             "is_dangerous": False,
@@ -1378,17 +1417,49 @@ def _legacy_pytorch_tail_unrelated_torch_import_references() -> list[dict[str, o
 
 
 def _pytorch_storage_persistent_id_finding(*, opcode: str = "BINPERSID") -> Finding:
+    details: dict[str, object] = {
+        "opcode": opcode,
+        "pytorch_storage_key": "0",
+    }
+    if opcode == "BINPERSID":
+        details.update(
+            {
+                "persistent_id_preview": (
+                    "tuple(str_span(len=7), global:torch.ByteStorage, str_span(len=1), "
+                    "str_span(len=3), int:4, NoneType:None)"
+                ),
+                "pytorch_storage_persistent_id": True,
+            }
+        )
+    else:
+        details["persistent_id_preview"] = "str:\"('storage', <class 'torch.ByteStorage'>, '0', 'cpu', 4, None)\""
     return Finding(
         message=f"Found pickle persistent ID opcode: {opcode}",
         severity=Severity.WARNING,
         location="pytorch_model.bin (pos 316)",
         rule_code="PERSISTENT_ID",
-        details={
-            "opcode": opcode,
-            "pytorch_storage_persistent_id": True,
-            "pytorch_storage_key": "k",
-        },
+        details=details,
     )
+
+
+def _legacy_pytorch_tail_coverage(*, parse_error_position: int = 208, tail_size: int = 12) -> CoverageSummary:
+    return CoverageSummary(
+        bytes_scanned=parse_error_position,
+        bytes_total=parse_error_position + tail_size,
+        opcode_count=53,
+        raw_scan_complete=False,
+        opcode_scan_complete=False,
+    )
+
+
+def _legacy_pytorch_tail_metadata(*, follow_on_opcode_counts: dict[str, int] | None = None) -> dict[str, object]:
+    return {
+        "first_pickle_end_pos": 15,
+        "opcode_counts": {"STOP": 5, "BINPERSID": 1},
+        "follow_on_opcode_counts": {} if follow_on_opcode_counts is None else follow_on_opcode_counts,
+        "protocols": [2, 2, 2, 2, 2],
+        "import_references": _legacy_pytorch_tail_import_references(),
+    }
 
 
 def test_pickle_report_to_scan_result_trusts_legacy_pytorch_storage_tail() -> None:
@@ -1404,16 +1475,14 @@ def test_pickle_report_to_scan_result_trusts_legacy_pytorch_storage_tail() -> No
                 location="pytorch_model.bin (pos 16932)",
                 code="parse_incomplete",
                 details={
-                    "exception": "at position 16932, opcode b'\\x00' unknown",
+                    "exception": "at position 208, opcode b'\\x04' unknown",
                     "exception_type": "ValueError",
                     "analysis_incomplete": True,
                 },
             ),
         ),
-        metadata={
-            "first_pickle_end_pos": 15,
-            "import_references": _legacy_pytorch_tail_import_references(),
-        },
+        coverage=_legacy_pytorch_tail_coverage(),
+        metadata=_legacy_pytorch_tail_metadata(),
     )
 
     result = pickle_report_to_scan_result(report)
@@ -1428,7 +1497,7 @@ def test_pickle_report_to_scan_result_trusts_legacy_pytorch_storage_tail() -> No
     )
 
 
-@pytest.mark.parametrize("protocol", [2, 4, 5])
+@pytest.mark.parametrize("protocol", [0, 1, 2, 3, 4, 5])
 def test_pickle_report_to_scan_result_trusts_real_legacy_pytorch_storage_tail(protocol: int) -> None:
     report = scan_bytes(
         _legacy_pytorch_storage_tail_payload(protocol),
@@ -1437,11 +1506,25 @@ def test_pickle_report_to_scan_result_trusts_real_legacy_pytorch_storage_tail(pr
 
     result = pickle_report_to_scan_result(report)
 
-    assert report.metadata["protocols"] == (protocol,)
-    assert any(
-        finding.rule_code == "PERSISTENT_ID" and finding.details.get("pytorch_storage_persistent_id") is True
-        for finding in report.findings
-    )
+    assert report.metadata["opcode_counts"]["STOP"] == 5
+    if protocol >= 2:
+        assert report.metadata["protocols"] == (protocol, protocol, protocol, protocol, protocol)
+    else:
+        assert "protocols" not in report.metadata
+    if protocol == 0:
+        assert any(
+            finding.rule_code == "PERSISTENT_ID"
+            and finding.details.get("opcode") == "PERSID"
+            and "'storage'" in str(finding.details.get("persistent_id_preview"))
+            for finding in report.findings
+        )
+    else:
+        assert any(
+            finding.rule_code == "PERSISTENT_ID"
+            and finding.details.get("opcode") == "BINPERSID"
+            and finding.details.get("pytorch_storage_persistent_id") is True
+            for finding in report.findings
+        )
     assert result.metadata["trusted_incomplete_tail"] is True
     assert not any(issue.rule_code == "S901" for issue in result.issues)
     assert any(
@@ -1452,7 +1535,7 @@ def test_pickle_report_to_scan_result_trusts_real_legacy_pytorch_storage_tail(pr
     )
 
 
-def test_pickle_report_to_scan_result_escalates_real_protocol0_persid_unknown_tail() -> None:
+def test_pickle_report_to_scan_result_escalates_non_legacy_protocol0_persid_unknown_tail() -> None:
     report = scan_bytes(b"Pexternal-storage-key\n.\x00RAW", source="legacy-pytorch-protocol0.bin")
 
     result = pickle_report_to_scan_result(report)
@@ -1464,6 +1547,62 @@ def test_pickle_report_to_scan_result_escalates_real_protocol0_persid_unknown_ta
         and "pytorch_storage_persistent_id" not in finding.details
         for finding in report.findings
     )
+    assert "trusted_incomplete_tail" not in result.metadata
+    assert any(issue.rule_code == "S901" for issue in result.issues)
+
+
+def test_pickle_report_to_scan_result_escalates_truncated_legacy_pytorch_storage_tail() -> None:
+    report = scan_bytes(
+        _legacy_pytorch_storage_tail_payload(2, storage_payload=b"ABC", declared_storage_size=4),
+        source="truncated-legacy-pytorch.bin",
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert report.coverage.bytes_total == report.coverage.bytes_scanned + 11
+    assert "trusted_incomplete_tail" not in result.metadata
+    assert any(issue.rule_code == "S901" for issue in result.issues)
+
+
+def test_pickle_report_to_scan_result_escalates_oversized_legacy_pytorch_storage_tail() -> None:
+    report = PickleReport(
+        source="pytorch_model.bin",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(_pytorch_storage_persistent_id_finding(),),
+        notices=(
+            Notice(
+                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
+                severity=Severity.INFO,
+                location="pytorch_model.bin (pos 208)",
+                code="parse_incomplete",
+                details={
+                    "exception": "at position 208, opcode b'\\x04' unknown",
+                    "exception_type": "ValueError",
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+        coverage=_legacy_pytorch_tail_coverage(tail_size=(100 * 1024 * 1024) + 12),
+        metadata=_legacy_pytorch_tail_metadata(),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert "trusted_incomplete_tail" not in result.metadata
+    assert any(issue.rule_code == "S901" for issue in result.issues)
+
+
+def test_pickle_report_to_scan_result_escalates_concatenated_pickle_after_storage_tail() -> None:
+    malicious_suffix = b"cos\nsystem\n(Sid\ntR."
+    report = scan_bytes(
+        _legacy_pytorch_storage_tail_payload(2, suffix=malicious_suffix),
+        source="legacy-pytorch-with-suffix.bin",
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert report.coverage.bytes_total == report.coverage.bytes_scanned + 12 + len(malicious_suffix)
     assert "trusted_incomplete_tail" not in result.metadata
     assert any(issue.rule_code == "S901" for issue in result.issues)
 
@@ -1481,16 +1620,14 @@ def test_pickle_report_to_scan_result_trusts_nested_legacy_pytorch_storage_tail(
                 location="bundle.zip:pytorch_model.bin (pos 16932)",
                 code="parse_incomplete",
                 details={
-                    "exception": "at position 16932, opcode b'\\x7f' unknown",
+                    "exception": "at position 208, opcode b'\\x04' unknown",
                     "exception_type": "ValueError",
                     "analysis_incomplete": True,
                 },
             ),
         ),
-        metadata={
-            "first_pickle_end_pos": 15,
-            "import_references": _legacy_pytorch_tail_import_references(),
-        },
+        coverage=_legacy_pytorch_tail_coverage(),
+        metadata=_legacy_pytorch_tail_metadata(),
     )
 
     result = pickle_report_to_scan_result(report)
@@ -1512,14 +1649,49 @@ def test_pickle_report_to_scan_result_escalates_unknown_tail_for_unrelated_torch
                 location="pytorch_model.bin (pos 16932)",
                 code="parse_incomplete",
                 details={
-                    "exception": "at position 16932, opcode b'\\x00' unknown",
+                    "exception": "at position 208, opcode b'\\x04' unknown",
                     "exception_type": "ValueError",
                     "analysis_incomplete": True,
                 },
             ),
         ),
+        coverage=_legacy_pytorch_tail_coverage(),
         metadata={
-            "first_pickle_end_pos": 15,
+            **_legacy_pytorch_tail_metadata(),
+            "import_references": _legacy_pytorch_tail_unrelated_torch_import_references(),
+        },
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert "trusted_incomplete_tail" not in result.metadata
+    assert any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
+
+
+def test_pickle_report_to_scan_result_escalates_protocol0_tail_for_unrelated_import() -> None:
+    report = PickleReport(
+        source="pytorch_model.bin",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(_pytorch_storage_persistent_id_finding(opcode="PERSID"),),
+        notices=(
+            Notice(
+                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
+                severity=Severity.INFO,
+                location="pytorch_model.bin (pos 231)",
+                code="parse_incomplete",
+                details={
+                    "exception": "at position 231, opcode b'\\x04' unknown",
+                    "exception_type": "ValueError",
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+        coverage=_legacy_pytorch_tail_coverage(parse_error_position=231),
+        metadata={
+            "first_pickle_end_pos": 28,
+            "opcode_counts": {"STOP": 5, "PERSID": 1},
+            "follow_on_opcode_counts": {},
             "import_references": _legacy_pytorch_tail_unrelated_torch_import_references(),
         },
     )
@@ -1543,17 +1715,14 @@ def test_pickle_report_to_scan_result_escalates_unknown_tail_when_import_referen
                 location="pytorch_model.bin (pos 16932)",
                 code="parse_incomplete",
                 details={
-                    "exception": "at position 16932, opcode b'\\x00' unknown",
+                    "exception": "at position 208, opcode b'\\x04' unknown",
                     "exception_type": "ValueError",
                     "analysis_incomplete": True,
                 },
             ),
         ),
-        metadata={
-            "first_pickle_end_pos": 15,
-            "import_references": _legacy_pytorch_tail_import_references(),
-            "import_references_truncated": True,
-        },
+        coverage=_legacy_pytorch_tail_coverage(),
+        metadata={**_legacy_pytorch_tail_metadata(), "import_references_truncated": True},
     )
 
     result = pickle_report_to_scan_result(report)
