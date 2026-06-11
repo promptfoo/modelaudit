@@ -4527,6 +4527,35 @@ def test_scan_huggingface_streaming_scan_errors(mock_scan_streaming, mock_downlo
     mock_scan_streaming.assert_called_once()
 
 
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_inconclusive_without_issues_reports_inconclusive(
+    mock_scan: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Scans with incomplete coverage should not be reported as clean."""
+    test_file = tmp_path / "large.bin"
+    test_file.write_bytes(b"weights")
+    mock_scan.return_value = create_mock_scan_result(
+        bytes_scanned=7,
+        files_scanned=1,
+        success=False,
+        has_errors=False,
+        file_metadata={
+            str(test_file): {
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reasons": ["pickle_analysis_incomplete"],
+            }
+        },
+    )
+
+    result = CliRunner().invoke(cli, ["scan", str(test_file)])
+
+    assert result.exit_code == 2
+    assert "Inconclusive" in result.output
+    assert "Clean" not in result.output
+    mock_scan.assert_called_once()
+
+
 def test_scan_stream_help():
     """Test that --stream flag appears in help."""
     runner = CliRunner()
