@@ -681,6 +681,7 @@ def _streamed_onnx_external_data_hash_paths(path: Path) -> list[Path]:
         import onnx
 
         from modelaudit.scanners.onnx_scanner import (
+            _is_trusted_huggingface_cache_external_alias,
             _is_windows_absolute_path,
             _iter_model_external_data_tensor_groups,
             _resolve_external_location,
@@ -690,11 +691,12 @@ def _streamed_onnx_external_data_hash_paths(path: Path) -> list[Path]:
         return []
 
     try:
-        model = onnx.load(str(path), load_external_data=False)
+        model_path = Path(os.path.abspath(path))
+        model = onnx.load(str(model_path), load_external_data=False)
     except Exception:
         return []
 
-    model_dir = path.parent
+    model_dir = model_path.parent
     lexical_model_dir = Path(os.path.abspath(model_dir))
     try:
         resolved_model_dir = model_dir.resolve()
@@ -724,12 +726,21 @@ def _streamed_onnx_external_data_hash_paths(path: Path) -> list[Path]:
                 continue
 
             external_path = _resolve_external_location(model_dir, location)
-            if not is_within_directory(str(resolved_model_dir), str(external_path)) or not external_path.is_file():
+            external_hash_path = external_path
+            if not is_within_directory(str(resolved_model_dir), str(external_path)):
+                if not _is_trusted_huggingface_cache_external_alias(
+                    model_path,
+                    lexical_external_path,
+                    external_path,
+                ):
+                    continue
+                external_hash_path = lexical_external_path
+            if not external_hash_path.is_file():
                 continue
             if external_path in seen_external_paths:
                 continue
             seen_external_paths.add(external_path)
-            external_paths.append(external_path)
+            external_paths.append(external_hash_path)
 
     return external_paths
 
@@ -4723,6 +4734,7 @@ def scan_model_streaming(
     results = create_initial_audit_result()
     file_hashes: list[str] = []
     hashed_stream_file_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
+    hashed_stream_source_hashes_by_path: dict[Path, str] = {}
     aggregate_hash_complete = True
     top_level_hashed_bytes = 0
     files_processed = 0
@@ -4844,11 +4856,16 @@ def scan_model_streaming(
         scan_config: dict[str, Any],
         *,
         progress_label: str,
+        track_stream_source: bool = False,
+        skip_if_stream_source_seen: bool = False,
     ) -> str | None:
         """Hash one streamed source once before it can be deleted or consumed."""
         nonlocal aggregate_hash_complete, top_level_hashed_bytes
 
         scan_path_key = Path(os.path.abspath(scan_path))
+        if skip_if_stream_source_seen and scan_path_key in hashed_stream_source_hashes_by_path:
+            return hashed_stream_source_hashes_by_path[scan_path_key]
+
         scan_path_identity = _snapshot_file_identity(scan_path)
         if scan_path_identity is not None and (scan_path_key, scan_path_identity) in hashed_stream_file_instances:
             return None
@@ -4875,6 +4892,8 @@ def scan_model_streaming(
         file_hashes.append(file_hash)
         if scan_path_identity is not None:
             hashed_stream_file_instances.add((scan_path_key, scan_path_identity))
+        if track_stream_source:
+            hashed_stream_source_hashes_by_path[scan_path_key] = file_hash
         return file_hash
 
     def append_streamed_openvino_companion_hash(
@@ -5086,6 +5105,7 @@ def scan_model_streaming(
                     scan_path,
                     scan_config,
                     progress_label=source_path.name,
+                    track_stream_source=True,
                 )
                 if openvino_scan_companion_path is not None:
                     append_streamed_openvino_companion_hash(
@@ -5095,14 +5115,18 @@ def scan_model_streaming(
                     )
                 if scanner_selection.allows("onnx"):
                     for onnx_external_data_path in _streamed_onnx_external_data_hash_paths(scan_path):
+                        external_data_key = Path(os.path.abspath(onnx_external_data_path))
+                        external_data_was_stream_source = external_data_key in hashed_stream_source_hashes_by_path
                         external_data_identity = _snapshot_file_identity(onnx_external_data_path)
                         if external_data_identity is not None:
                             onnx_external_data_pre_scan_identities[onnx_external_data_path] = external_data_identity
-                            onnx_external_data_bytes_scanned += _snapshot_file_size(external_data_identity)
+                            if not external_data_was_stream_source:
+                                onnx_external_data_bytes_scanned += _snapshot_file_size(external_data_identity)
                         append_streamed_file_hash(
                             onnx_external_data_path,
                             scan_config,
                             progress_label=onnx_external_data_path.name,
+                            skip_if_stream_source_seen=True,
                         )
 
                 # Scan the file

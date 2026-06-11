@@ -2445,6 +2445,7 @@ def download_model_streaming(
         downloaded_selected_paths: dict[str, Path] = {}
         downloaded_context_paths: dict[str, Path] = {}
         context_cleanup_paths: set[Path] = set()
+        accounted_selected_filenames: set[str] = set()
         consumed_filenames: set[str] = set()
 
         def emit_file(path: Path, cleanup_paths: list[Path], is_last: bool) -> Iterator[tuple[Path, bool]]:
@@ -2501,7 +2502,8 @@ def download_model_streaming(
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
 
-            if size_limit is not None:
+            already_accounted = filename in accounted_selected_filenames
+            if size_limit is not None and not already_accounted:
                 advertised_size = selected_sizes[filename]
                 projected_total = downloaded_total_size + advertised_size
                 if projected_total > size_limit:
@@ -2514,9 +2516,10 @@ def download_model_streaming(
             downloaded_file = prefetched_selected_paths.pop(filename, None)
             if downloaded_file is None or not downloaded_file.is_file():
                 downloaded_file = download_stream_file(filename)
-            if size_limit is not None:
+            if size_limit is not None and not already_accounted:
                 downloaded_file_size = _get_downloaded_huggingface_file_size(repo_id, downloaded_file, filename)
                 downloaded_total_size += downloaded_file_size
+                accounted_selected_filenames.add(filename)
                 if downloaded_total_size > size_limit:
                     raise ValueError(
                         f"Cannot download {repo_id}: downloaded selected Hugging Face files total "
@@ -2560,7 +2563,6 @@ def download_model_streaming(
                             revision=download_revision,
                             deadline=deadline,
                         )
-                    active_total_size = downloaded_total_size
                     for external_filename in external_data_files:
                         if deadline is not None and time.monotonic() >= deadline:
                             raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
@@ -2578,27 +2580,28 @@ def download_model_streaming(
                                 if _should_cleanup_hf_streaming_context_file(cache_dir, download_path, external_path):
                                     onnx_external_data_cleanup_paths.append(external_path)
                                 continue
-                            if size_limit is not None:
+                            if size_limit is not None and external_filename not in accounted_selected_filenames:
                                 external_file_size = _get_downloaded_huggingface_file_size(
                                     repo_id,
                                     external_path,
                                     external_filename,
                                 )
-                                projected_total = active_total_size + external_file_size
+                                projected_total = downloaded_total_size + external_file_size
                                 if projected_total > size_limit:
                                     raise ValueError(
                                         f"Cannot download {repo_id}: downloaded bytes plus selected ONNX "
                                         f"external_data file {external_filename} would total {projected_total} "
                                         f"bytes, exceeding max size {size_limit} bytes"
                                     )
-                                active_total_size = projected_total
+                                downloaded_total_size = projected_total
+                                accounted_selected_filenames.add(external_filename)
                             continue
                         external_path = downloaded_context_paths.get(external_filename)
                         if external_path is not None and external_path.is_file():
                             continue
                         if size_limit is not None:
                             advertised_size = external_data_sizes[external_filename]
-                            projected_total = active_total_size + advertised_size
+                            projected_total = downloaded_total_size + advertised_size
                             if projected_total > size_limit:
                                 raise ValueError(
                                     f"Cannot download {repo_id}: downloaded bytes plus ONNX external_data file "
@@ -2612,15 +2615,14 @@ def download_model_streaming(
                                 external_path,
                                 external_filename,
                             )
-                            projected_total = active_total_size + external_file_size
+                            projected_total = downloaded_total_size + external_file_size
                             if projected_total > size_limit:
                                 raise ValueError(
                                     f"Cannot download {repo_id}: downloaded bytes plus ONNX external_data file "
                                     f"{external_filename} would total {projected_total} bytes, exceeding max size "
                                     f"{size_limit} bytes"
                                 )
-                            active_total_size = projected_total
-                            downloaded_total_size += external_file_size
+                            downloaded_total_size = projected_total
                         downloaded_context_paths[external_filename] = external_path
                         if _should_cleanup_hf_streaming_context_file(cache_dir, download_path, external_path):
                             context_cleanup_paths.add(external_path)

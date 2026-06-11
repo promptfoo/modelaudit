@@ -2002,6 +2002,45 @@ def test_scan_model_streaming_onnx_external_data_contributes_content_hash(tmp_pa
     assert changed_result.content_hash != result.content_hash
 
 
+def test_scan_model_streaming_onnx_external_data_refetch_does_not_duplicate_content_hash(
+    tmp_path: Path,
+) -> None:
+    """A selected sidecar later re-fetched as ONNX context should stay one aggregate member."""
+    model_path = tmp_path / "model.onnx"
+    sidecar_path = tmp_path / "model.onnx_data"
+    model_payload = create_external_onnx_payload(tmp_path)
+    sidecar_payload = struct.pack("f", 1.0)
+
+    model_path.write_bytes(model_payload)
+    sidecar_path.write_bytes(sidecar_payload)
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(sidecar_path), compute_sha256_hash(model_path)])
+    model_path.unlink()
+    sidecar_path.unlink()
+
+    def refetched_sidecar_generator() -> Iterator[tuple[Path, bool]]:
+        sidecar_path.write_bytes(sidecar_payload)
+        yield sidecar_path, False
+        model_path.write_bytes(model_payload)
+        sidecar_path.write_bytes(sidecar_payload)
+        yield model_path, True
+
+    with patch("modelaudit.core.scan_file") as mock_scan:
+        mock_scan.return_value = create_mock_scan_result(bytes_scanned=1)
+        result = scan_model_streaming(
+            file_generator=refetched_sidecar_generator(),
+            timeout=30,
+            delete_after_scan=True,
+            cache_enabled=False,
+            scanners=["onnx"],
+            skip_file_types=False,
+        )
+
+    assert result.content_hash == expected_hash
+    assert result.bytes_scanned == 2
+    assert mock_scan.call_args_list[0].args[0] == str(sidecar_path)
+    assert mock_scan.call_args_list[1].args[0] == str(model_path)
+
+
 def test_scan_model_streaming_onnx_external_data_counts_toward_max_total_size(tmp_path: Path) -> None:
     """Staged ONNX external_data sidecars must count against total streaming caps."""
     model_path = tmp_path / "model.onnx"
@@ -2774,6 +2813,46 @@ def test_scan_model_streaming_hf_cache_onnx_external_data_uses_snapshot_alias(
     assert len(passed_external) == 1
     assert symlink_traversal_checks == []
     assert determine_exit_code(result) == 0
+
+
+def test_scan_model_streaming_hf_cache_context_only_onnx_external_data_contributes_hash_and_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Trusted HF snapshot sidecar aliases should be hashed even when yielded only as context."""
+    cache_hub = tmp_path / "hf-hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+    cache_root = cache_hub / "models--test--model"
+    blobs_dir = cache_root / "blobs"
+    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    model_link = snapshot_dir / "model.onnx"
+    sidecar_link = snapshot_dir / "model.onnx_data"
+    model_link.symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    sidecar_link.symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(model_link), compute_sha256_hash(sidecar_link)])
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_link, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(snapshot_dir),
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert determine_exit_code(result) == 0
+    assert result.files_scanned == 1
+    assert result.content_hash == expected_hash
+    assert result.bytes_scanned >= model_blob.stat().st_size + sidecar_blob.stat().st_size
 
 
 def test_scan_model_streaming_hf_cache_onnx_external_data_rejects_nested_cache_lookalike(

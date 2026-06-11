@@ -676,13 +676,21 @@ def _is_trusted_huggingface_cache_external_alias(
     external_revision = _hf_cache_snapshot_revision(lexical_external_path, model_cache_root)
     if model_revision is None or external_revision != model_revision:
         return False
-    if not lexical_external_path.is_symlink() or _has_symlink_component(
-        lexical_external_path.parent,
-        model_path.parent,
+    if (
+        not model_path.is_symlink()
+        or not lexical_external_path.is_symlink()
+        or _has_symlink_component(
+            lexical_external_path.parent,
+            model_path.parent,
+        )
     ):
         return False
     blobs_root = _trusted_hf_blobs_root(model_cache_root)
     if blobs_root is None:
+        return False
+    try:
+        model_path.resolve(strict=True).relative_to(blobs_root)
+    except (OSError, RuntimeError, ValueError):
         return False
     try:
         external_path.relative_to(blobs_root)

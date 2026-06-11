@@ -4088,6 +4088,36 @@ class TestCVE202634447SymlinkTraversal:
         assert len(resolved_checks) == 1
         assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
 
+    def test_huggingface_cache_snapshot_regular_model_with_sidecar_symlink_to_blob_still_flagged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        cache_hub = tmp_path / "hf-hub"
+        monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+        cache_root = cache_hub / "models--FacebookAI--xlm-roberta-large"
+        blobs_dir = cache_root / "blobs"
+        snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+        blobs_dir.mkdir(parents=True)
+        snapshot_dir.mkdir(parents=True)
+
+        source_dir = tmp_path / "source-regular-model"
+        source_dir.mkdir()
+        source_model = create_onnx_model(source_dir, external=True, external_path="model.onnx_data")
+        sidecar_blob = blobs_dir / "sidecar-blob"
+        sidecar_blob.write_bytes((source_dir / "model.onnx_data").read_bytes())
+        model_path = snapshot_dir / "model.onnx"
+        model_path.write_bytes(source_model.read_bytes())
+        (snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+
+        result = OnnxScanner().scan(str(model_path))
+
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
+        assert result.success is False
+        assert len(cve_checks) == 1
+        assert cve_checks[0].details["resolved_path"] == str(sidecar_blob.resolve())
+
     def test_huggingface_cache_snapshot_sidecar_symlink_outside_blob_still_flagged(
         self,
         tmp_path: Path,
