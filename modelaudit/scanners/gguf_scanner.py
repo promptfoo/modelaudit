@@ -126,7 +126,9 @@ _GGUF_METADATA_NETWORK_APIS = (
     "requests.put",
     "requests.request",
     "urllib.request.urlopen",
+    "urllib.request.urlretrieve",
     "urlopen",
+    "urlretrieve",
     "fetch",
 )
 _GGUF_NETWORK_URL_ASSIGNMENT_PATTERN = re.compile(
@@ -1056,13 +1058,47 @@ class GgufScanner(BaseScanner):
             if in_fence:
                 doc_lines += 1
                 continue
+            if cls._line_contains_security_evidence(line):
+                continue
             if lowered.startswith(("#", "//", "*", "-", ">")):
                 doc_lines += 1
                 continue
-            if any(marker in lowered for marker in ("example", "documentation", "instructions", "model card", "usage")):
+            if cls._line_looks_like_documentation(lowered):
                 doc_lines += 1
 
         return doc_lines > len(lines) / 2
+
+    @classmethod
+    def _line_contains_security_evidence(cls, line: str) -> bool:
+        return (
+            cls._contains_path_traversal(line)
+            or cls._destructive_rm_pattern(line)
+            or cls._shell_remote_fetch_pattern(line) is not None
+            or cls._network_api_remote_fetch_pattern(line) is not None
+            or any(pattern.search(line) for _pattern_name, pattern in _GGUF_METADATA_COMMAND_PATTERNS)
+        )
+
+    @staticmethod
+    def _line_looks_like_documentation(lowered_line: str) -> bool:
+        return lowered_line.startswith(
+            (
+                "example:",
+                "examples:",
+                "documentation:",
+                "instructions:",
+                "model card",
+                "repository instructions:",
+                "usage:",
+            )
+        ) or any(
+            marker in lowered_line
+            for marker in (
+                " example is documentation",
+                " examples are documented",
+                " examples are listed",
+                " model card ",
+            )
+        )
 
     @staticmethod
     def _shell_command_name(word: str) -> str:

