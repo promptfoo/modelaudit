@@ -3511,8 +3511,6 @@ def _is_benign_local_hf_download_bookkeeping_file(
     allow_git_bookkeeping: bool,
 ) -> bool:
     """Return True only for local download bookkeeping files that do not look scannable."""
-    import json
-
     filename = path_obj.name
     try:
         max_size = _HF_DOWNLOAD_METADATA_MAX_BYTES
@@ -3531,15 +3529,13 @@ def _is_benign_local_hf_download_bookkeeping_file(
             if require_existing_target and not _download_sidecar_target_exists(path_obj, download_root):
                 return False
             content = path_obj.read_text(encoding="utf-8")
-            if _is_hf_download_metadata_text(content):
-                return True
-            return isinstance(json.loads(content), dict)
+            return _is_hf_download_metadata_text(content)
         if filename in {".gitignore", ".gitattributes"}:
             if not allow_git_bookkeeping:
                 return False
             content = path_obj.read_text(encoding="utf-8")
             return "\x00" not in content
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+    except (OSError, UnicodeDecodeError, RecursionError, ValueError):
         return False
     return False
 

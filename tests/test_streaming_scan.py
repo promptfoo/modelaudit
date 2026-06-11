@@ -1617,6 +1617,32 @@ def test_scan_model_streaming_local_download_sidecars_end_to_end_inventory(tmp_p
     assert result.content_hash == expected_hash
 
 
+def test_scan_model_streaming_local_download_json_metadata_payload_is_scanned(tmp_path: Path) -> None:
+    """Streaming scans must not trust arbitrary JSON objects as HF download metadata."""
+    model_dir = tmp_path / "downloaded-model"
+    model_dir.mkdir()
+    config_path = model_dir / "config.json"
+    config_path.write_text('{"model_type":"bert"}', encoding="utf-8")
+    sidecar = model_dir / ".cache" / "huggingface" / "download" / "config.json.metadata"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text(
+        '{"chat_template": "{{ cycler.__init__.__globals__.os.popen(\\"id\\").read() }}"}',
+        encoding="utf-8",
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(sidecar, False), (config_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(model_dir),
+        skip_file_types=True,
+        cache_enabled=False,
+    )
+
+    assert result.files_scanned == 2
+    assert str(sidecar) in result.file_metadata
+
+
 def test_scan_model_streaming_scans_local_file_named_main(tmp_path: Path) -> None:
     """A local payload named like an HF ref must still be scanned in streaming mode."""
     payload = tmp_path / "main"

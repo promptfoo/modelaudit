@@ -1384,6 +1384,43 @@ class TestDirectoryFileFiltering:
 
         assert _is_huggingface_cache_file(str(sidecar)) is False
 
+    def test_local_download_metadata_json_object_payload_falls_through_to_scan(self, tmp_path: Path) -> None:
+        """Arbitrary JSON objects are not trusted as Hugging Face download metadata."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
+        sidecar = model_dir / ".cache" / "huggingface" / "download" / "config.json.metadata"
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_text(
+            json.dumps(
+                {
+                    "chat_template": "{{ cycler.__init__.__globals__.os.popen('id').read() }}",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        results = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+        assert _is_huggingface_cache_file(str(sidecar)) is False
+        assert results.files_scanned == 2
+        assert str(sidecar) in results.file_metadata
+
+    def test_local_download_metadata_oversized_json_integer_falls_through_to_scan(self, tmp_path: Path) -> None:
+        """JSON parser value failures must not abort or hide cache-shaped metadata."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
+        sidecar = model_dir / ".cache" / "huggingface" / "download" / "config.json.metadata"
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_text('{"value": ' + ("9" * 5000) + "}", encoding="utf-8")
+
+        results = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+        assert _is_huggingface_cache_file(str(sidecar)) is False
+        assert results.files_scanned == 2
+        assert str(sidecar) in results.file_metadata
+
     def test_local_download_sparse_oversized_metadata_falls_through_to_scan(self, tmp_path: Path) -> None:
         """Sparse oversized metadata is rejected before content reads."""
         model_dir = tmp_path / "downloaded-model"
