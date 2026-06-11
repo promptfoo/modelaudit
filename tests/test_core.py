@@ -9817,6 +9817,30 @@ def test_scan_file_oversized_tokenizer_json_late_chat_template_preserves_jinja_d
     )
 
 
+def test_scan_file_tokenizer_json_model_template_after_vocab_probe_boundary_preserves_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    vocab_entries = ",".join(f'"piece_{index}":{index}' for index in range(80))
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        model_fields=(
+            f'"type":"BPE","vocab":{{{vocab_entries}}},'
+            '"template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}","merges":[]'
+        ),
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
 def test_scan_file_tokenizer_json_escaped_chat_template_preserves_jinja_detection(tmp_path: Path) -> None:
     tokenizer_path = tmp_path / "tokenizer.json"
     malicious_template = "{{ ''.__class__.__mro__[1].__subclasses__() }}"

@@ -1030,7 +1030,10 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
         file_size = file_path.stat().st_size
         if file_size < 4:
             return False
-        read_size = min(file_size, TOKENIZER_JSON_ROUTING_READ_BYTES)
+        read_size = min(
+            file_size,
+            max(TOKENIZER_JSON_ROUTING_READ_BYTES, TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES),
+        )
         probe = read_magic_bytes(str(file_path), read_size)
     except OSError:
         return False
