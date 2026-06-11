@@ -99,6 +99,9 @@ _GGUF_FETCH_OPTIONS_WITH_VALUE = frozenset(
         "--output-document",
         "--post-data",
         "--post-file",
+        "--proto",
+        "--proto-default",
+        "--proto-redir",
         "--proxy",
         "--retry",
         "--retry-delay",
@@ -1068,6 +1071,7 @@ class GgufScanner(BaseScanner):
         doc_lines = 0
         in_fence = False
         fenced_lines: list[str] = []
+        possible_evidence_lines: list[str] = []
         for line in lines:
             lowered = line.lower()
             if lowered.startswith(("```", "~~~")):
@@ -1087,8 +1091,13 @@ class GgufScanner(BaseScanner):
                 if cls._line_contains_security_evidence(line):
                     if cls._text_contains_only_benign_documentation_fetch(line):
                         doc_lines += 1
+                    else:
+                        possible_evidence_lines.append(line)
                     continue
                 doc_lines += 1
+                continue
+            if cls._line_may_contain_security_evidence(lowered):
+                possible_evidence_lines.append(line)
 
         if in_fence:
             fenced_text = "\n".join(fenced_lines)
@@ -1096,7 +1105,42 @@ class GgufScanner(BaseScanner):
                 return False
             doc_lines += len(fenced_lines)
 
-        return doc_lines > len(lines) / 2
+        if doc_lines <= len(lines) / 2:
+            return False
+
+        return not any(cls._line_contains_security_evidence(line) for line in possible_evidence_lines)
+
+    @staticmethod
+    def _line_may_contain_security_evidence(lowered_line: str) -> bool:
+        return any(
+            marker in lowered_line
+            for marker in (
+                "..",
+                "curl",
+                "wget",
+                "invoke-webrequest",
+                "iwr",
+                "http://",
+                "https://",
+                "ftp://",
+                "requests.",
+                "httpx.",
+                "urllib",
+                "urlopen",
+                "urlretrieve",
+                "fetch",
+                "subprocess",
+                "os.system",
+                "os.popen",
+                "eval(",
+                "exec(",
+                "__import__(",
+                "bash",
+                "powershell",
+                "pwsh",
+                "cmd",
+            )
+        )
 
     @classmethod
     def _text_contains_actionable_fenced_evidence(cls, text: str) -> bool:
@@ -1402,9 +1446,33 @@ class GgufScanner(BaseScanner):
         open_position = value.find("(", after_position, after_position + 128)
         if open_position == -1:
             return None
-        close_position = value.find(")", open_position + 1, open_position + 2049)
-        end_position = close_position if close_position != -1 else open_position + 2048
-        return value[open_position:end_position]
+        end_limit = min(len(value), open_position + 2048)
+        depth = 0
+        quote: str | None = None
+        escaped = False
+        for index in range(open_position, end_limit):
+            character = value[index]
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                    continue
+                if character == "\\":
+                    escaped = True
+                    continue
+                if character == quote:
+                    quote = None
+                continue
+            if character in {"'", '"'}:
+                quote = character
+                continue
+            if character == "(":
+                depth += 1
+                continue
+            if character == ")":
+                depth -= 1
+                if depth == 0:
+                    return value[open_position : index + 1]
+        return value[open_position:end_limit]
 
     @classmethod
     def _api_argument_window_has_remote_url(cls, value: str, after_position: int) -> bool:
