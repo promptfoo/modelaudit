@@ -1733,6 +1733,94 @@ def test_legacy_pytorch_container_does_not_report_known_stream_truncated(tmp_pat
     assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
 
 
+def test_large_legacy_pytorch_container_defers_file_size_limit(tmp_path: Path) -> None:
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 512)
+    path = tmp_path / "legacy-large.bin"
+    path.write_bytes(payload)
+
+    result = PickleScanner(config={"max_file_read_size": 256}).scan(str(path))
+
+    assert result.success is True
+    assert result.metadata["legacy_pytorch_container"] is True
+    assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
+    assert result.metadata["legacy_pytorch_storage_payload_skipped"] is True
+    assert result.metadata["legacy_pytorch_bounded_analysis"] is True
+    assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+    bounded_check = next(check for check in result.checks if check.name == "Legacy PyTorch Bounded Analysis")
+    assert bounded_check.status == CheckStatus.PASSED
+    assert bounded_check.details["max_file_read_size"] == 256
+    assert bounded_check.details["tensor_storage_materialized"] is False
+
+
+def test_large_legacy_pytorch_malicious_control_still_fails(tmp_path: Path) -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(
+        b"A" * 512,
+        malicious_object=True,
+    )
+    path = tmp_path / "legacy-large-malicious.pt"
+    path.write_bytes(payload)
+
+    result = PickleScanner(config={"max_file_read_size": 256}).scan(str(path))
+
+    assert result.metadata["legacy_pytorch_bounded_analysis"] is True
+    assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any(issue.details.get("import_reference") == EXPECTED_SYSTEM_GLOBAL for issue in result.issues)
+
+
+def test_large_non_legacy_pytorch_suffix_keeps_file_size_limit(tmp_path: Path) -> None:
+    path = tmp_path / "not-legacy.pt"
+    path.write_bytes(pickle.dumps({"safe": True}, protocol=4) + (b"A" * 512))
+
+    result = PickleScanner(config={"max_file_read_size": 256}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "max_file_read_size_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert not result.metadata.get("legacy_pytorch_bounded_analysis")
+    assert any(check.name == "File Size Limit" and check.status == CheckStatus.FAILED for check in result.checks)
+
+
+def test_large_legacy_pytorch_truncated_storage_is_inconclusive_not_file_size(
+    tmp_path: Path,
+) -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(
+        b"A" * 128,
+        declared_storage_size=512,
+    )
+    path = tmp_path / "legacy-truncated-storage.bin"
+    path.write_bytes(payload)
+
+    result = PickleScanner(config={"max_file_read_size": 256}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "legacy_pytorch_storage_layout_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+    storage_check = next(check for check in result.checks if check.name == "Legacy PyTorch Storage Layout")
+    assert storage_check.status == CheckStatus.FAILED
+    assert storage_check.details["control_scan_limit_bytes"] == pickle_scanner._PYTORCH_LEGACY_MAX_CONTROL_BYTES
+    assert storage_check.details["max_control_opcodes"] == pickle_scanner._PYTORCH_LEGACY_MAX_CONTROL_OPCODES
+
+
+def test_large_seekable_legacy_pytorch_stream_defers_file_size_limit() -> None:
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 512)
+    stream = io.BytesIO(payload)
+
+    result = PickleScanner(config={"max_file_read_size": 256}).scan_stream(
+        stream,
+        len(payload),
+        source="legacy-large-stream.pt",
+    )
+
+    assert result.success is True
+    assert result.metadata["legacy_pytorch_container"] is True
+    assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
+    assert result.metadata["legacy_pytorch_bounded_analysis"] is True
+    assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+    assert stream.tell() == 0
+
+
 def test_legacy_pytorch_container_accepts_historical_big_endian_storage_header(tmp_path: Path) -> None:
     storage_payload = b"A" * 64
     payload, pickle_end = _make_legacy_pytorch_container(storage_payload)
