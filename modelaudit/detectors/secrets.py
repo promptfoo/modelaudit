@@ -354,7 +354,11 @@ BASIC_AUTH_HEADER_PREFIX_PATTERN = re.compile(
     r"(?:^|[^\w-])(?:proxy-authorization|authorization)\s*[\"']?\s*[:=]\s*[\"']?\s*$",
     re.IGNORECASE,
 )
-BASIC_AUTH_HEADER_NAMES = frozenset({"authorization", "proxyauthorization"})
+BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS = 256
+BASIC_AUTH_HEADER_NAMES = {
+    "authorization": "Authorization",
+    "proxyauthorization": "Proxy-Authorization",
+}
 BASIC_AUTH_VALUE_PREFIX_PATTERN = re.compile(r"^\s*Basic\s+", re.IGNORECASE)
 
 
@@ -362,8 +366,12 @@ def _normalize_basic_auth_header_name(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.casefold())
 
 
+def _canonical_basic_auth_header_name(value: str) -> str | None:
+    return BASIC_AUTH_HEADER_NAMES.get(_normalize_basic_auth_header_name(value))
+
+
 def _is_basic_auth_header_name(value: str) -> bool:
-    return _normalize_basic_auth_header_name(value) in BASIC_AUTH_HEADER_NAMES
+    return _canonical_basic_auth_header_name(value) is not None
 
 
 class SecretsDetector:
@@ -572,7 +580,22 @@ class SecretsDetector:
     @staticmethod
     def _basic_auth_match_has_header_context(text: str, position: int) -> bool:
         line_start = max(text.rfind("\n", 0, position), text.rfind("\r", 0, position)) + 1
-        return BASIC_AUTH_HEADER_PREFIX_PATTERN.search(text[line_start:position]) is not None
+        line_prefix = text[line_start:position]
+        if len(line_prefix) > BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS:
+            return False
+        if BASIC_AUTH_HEADER_PREFIX_PATTERN.search(line_prefix) is not None:
+            return True
+        if line_prefix.strip():
+            return False
+
+        previous_end = line_start
+        while previous_end > 0 and text[previous_end - 1] in "\r\n":
+            previous_end -= 1
+        previous_start = max(text.rfind("\n", 0, previous_end), text.rfind("\r", 0, previous_end)) + 1
+        previous_line = text[previous_start:previous_end]
+        if len(previous_line) > BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS:
+            return False
+        return BASIC_AUTH_HEADER_PREFIX_PATTERN.search(previous_line) is not None
 
     @staticmethod
     def _basic_auth_token_decodes_to_credentials(token: str) -> bool:
@@ -589,7 +612,7 @@ class SecretsDetector:
             return False
 
         username, separator, password = decoded.partition(b":")
-        return bool(separator and username and password)
+        return bool(separator and (username or password))
 
     def _basic_auth_match_is_valid(self, text: str, match: re.Match[str], token: str) -> bool:
         return self._basic_auth_match_has_header_context(
@@ -891,8 +914,9 @@ class SecretsDetector:
 
             # Check the value
             if isinstance(value, str):
-                if _is_basic_auth_header_name(str(key)) and BASIC_AUTH_VALUE_PREFIX_PATTERN.match(value):
-                    findings.extend(self.scan_text(f"{key}: {value}", key_context, is_binary_source=False))
+                header_name = _canonical_basic_auth_header_name(str(key))
+                if header_name is not None and BASIC_AUTH_VALUE_PREFIX_PATTERN.match(value):
+                    findings.extend(self.scan_text(f"{header_name}: {value}", key_context, is_binary_source=False))
                 else:
                     findings.extend(self.scan_text(value, key_context, is_binary_source=False))
             elif isinstance(value, bytes):

@@ -155,6 +155,13 @@ class TestSecretsDetector:
             ("aUtHoRiZaTiOn: bAsIc dTpw", "dTpw"),
             ("GET / HTTP/1.1\r\nHost: example.test\r\nAuthorization: Basic YTo/Pz8/\r\n", "YTo/Pz8/"),
             ('{"Authorization": "Basic YTp+fn5+"}', "YTp+fn5+"),
+            (f"Authorization: Basic {_basic_auth_token(b'api-token:')}", _basic_auth_token(b"api-token:")),
+            (f"Authorization: Basic {_basic_auth_token(b':password')}", _basic_auth_token(b":password")),
+            (f"Authorization:\n  Basic {_basic_auth_token(b'wrapped:pass')}", _basic_auth_token(b"wrapped:pass")),
+            (
+                f"Proxy-Authorization:\r\n\tBasic {_basic_auth_token(b'wrapped-proxy:pass')}",
+                _basic_auth_token(b"wrapped-proxy:pass"),
+            ),
         ],
     )
     def test_basic_auth_valid_headers_are_detected(self, text: str, token: str) -> None:
@@ -181,6 +188,8 @@ class TestSecretsDetector:
             "Authorization: Basic dXNl cjpwYXNz",
             "Proxy-Authorization: Basic Og==",
             "X-Authorization: Basic dXNlcjpwYXNz",
+            f"Authorization notes:\n  Basic {_basic_auth_token(b'wrapped:pass')}",
+            f"Authorization: documented value\n  Basic {_basic_auth_token(b'wrapped:pass')}",
             f"Authorization: Basic {'A' * (BASIC_AUTH_TOKEN_MAX_LENGTH + 1)}",
         ],
     )
@@ -191,11 +200,12 @@ class TestSecretsDetector:
 
         assert _basic_auth_findings(findings) == []
 
-    def test_basic_auth_structured_header_values_are_detected(self) -> None:
+    @pytest.mark.parametrize("header_name", ["Authorization", "proxy_authorization", "proxyAuthorization"])
+    def test_basic_auth_structured_header_values_are_detected(self, header_name: str) -> None:
         detector = SecretsDetector()
         token = _basic_auth_token(b"structured:s3cr3t")
 
-        findings = detector.scan_dict({"headers": {"Authorization": f"Basic {token}"}})
+        findings = detector.scan_dict({"headers": {header_name: f"Basic {token}"}})
 
         assert _basic_auth_findings(findings)
 
