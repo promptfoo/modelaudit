@@ -7532,7 +7532,7 @@ def test_scan_file_large_confirmed_jax_foreign_overlap_is_inconclusive_not_cache
 
 
 @pytest.mark.parametrize("suffix", [".ckpt", ".pickle"])
-def test_scan_file_routes_jax_json_on_pickle_owned_suffixes_through_json_analysis(tmp_path: Path, suffix: str) -> None:
+def test_scan_file_routes_jax_json_on_pickle_owned_suffixes_through_jax_analysis(tmp_path: Path, suffix: str) -> None:
     model_path = tmp_path / f"state{suffix}"
     model_path.write_text(
         json.dumps({"framework": "jax", "payload": "jax.experimental.host_callback.call(os.system, 'id')"}),
@@ -7541,8 +7541,8 @@ def test_scan_file_routes_jax_json_on_pickle_owned_suffixes_through_json_analysi
 
     result = scan_file(str(model_path), config={"cache_scan_results": False})
 
-    assert result.scanner_name == "jinja2_template"
-    assert set(result.metadata["scanner_dependency_ids"]) >= {"jinja2_template", "jax_checkpoint"}
+    assert result.scanner_name == "jax_checkpoint"
+    assert result.metadata["scanner_dependency_ids"] == ["jax_checkpoint"]
     assert any(
         check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
     )
