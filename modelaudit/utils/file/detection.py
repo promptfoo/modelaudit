@@ -13,6 +13,7 @@ import zipfile
 import zlib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from functools import lru_cache
 from io import BytesIO, StringIO
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Literal, cast
@@ -99,6 +100,8 @@ _SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS = 512
 _SENTENCEPIECE_MAX_TRAINER_SPEC_MESSAGE_BYTES = 64 * 1024
 _SENTENCEPIECE_MAX_TRAINER_SPEC_TEXT_BYTES = 4096
 _SENTENCEPIECE_UNKNOWN_PIECE_TYPE = 2
+_SENTENCEPIECE_BYTE_PIECE_TYPE = 6
+_SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT = 256
 _SENTENCEPIECE_IDENTITY_TOKENS = frozenset({"<unk>", "<s>", "</s>", "<pad>", "<bos>", "<eos>"})
 _SENTENCEPIECE_BYTE_FALLBACK_RE = re.compile(r"^<0x[0-9A-Fa-f]{2}>$")
 _SENTENCEPIECE_TRAINER_SPEC_VARINT_FIELDS = frozenset(
@@ -1438,14 +1441,23 @@ def _skip_proto_value(data: bytes, offset: int, wire_type: int, end: int | None 
 
 @dataclass
 class _SentencePieceTrainerSpecSignals:
-    has_model_type: bool = False
-    has_vocab_size: bool = False
-    has_unk_id: bool = False
+    model_type: int | None = None
+    vocab_size: int | None = None
+    unk_id: int = 0
     unk_piece: str | None = None
+    unk_piece_explicit: bool = False
+    byte_fallback: bool = False
 
     @property
-    def has_custom_unknown_metadata(self) -> bool:
-        return self.has_model_type and self.has_vocab_size and self.has_unk_id and self.unk_piece is not None
+    def has_core_metadata(self) -> bool:
+        return self.model_type is not None and self.vocab_size is not None
+
+
+def _decode_proto_int32_varint(value: int) -> int:
+    """Decode proto2 int32 values that may be sign-extended into a uint64 varint."""
+    if value >= 1 << 63:
+        value -= 1 << 64
+    return value
 
 
 def _decode_bounded_proto_string(data: bytes, start: int, end: int, *, max_bytes: int) -> str | None:
@@ -1553,11 +1565,15 @@ def _parse_sentencepiece_trainer_spec_proto(
                 return None
             value, offset = value_result
             if field_number == 3 and 1 <= value <= 4:
-                signals.has_model_type = True
+                signals.model_type = value
             elif field_number == 4 and value > 0:
-                signals.has_vocab_size = True
+                signals.vocab_size = value
+            elif field_number == 35:
+                if value not in {0, 1}:
+                    return None
+                signals.byte_fallback = bool(value)
             elif field_number == 40:
-                signals.has_unk_id = True
+                signals.unk_id = _decode_proto_int32_varint(value)
         elif field_number in _SENTENCEPIECE_TRAINER_SPEC_STRING_FIELDS:
             if wire_type != 2:
                 return None
@@ -1576,6 +1592,7 @@ def _parse_sentencepiece_trainer_spec_proto(
                 )
                 if signals.unk_piece is None:
                     return None
+                signals.unk_piece_explicit = True
             offset = actual_value_end
         elif field_number in _SENTENCEPIECE_TRAINER_SPEC_FIXED32_FIELDS:
             if wire_type != 5:
@@ -1632,28 +1649,55 @@ def _is_well_formed_sentencepiece_submessage(
     return offset == end and fields_seen < max_fields
 
 
-def _is_sentencepiece_identity_piece(piece: str) -> bool:
-    return piece in _SENTENCEPIECE_IDENTITY_TOKENS or _SENTENCEPIECE_BYTE_FALLBACK_RE.fullmatch(piece) is not None
+def _is_sentencepiece_special_identity_piece(piece: str) -> bool:
+    return piece in _SENTENCEPIECE_IDENTITY_TOKENS
+
+
+def _is_sentencepiece_byte_fallback_piece(piece: str) -> bool:
+    return _SENTENCEPIECE_BYTE_FALLBACK_RE.fullmatch(piece) is not None
 
 
 def _has_strong_sentencepiece_model_proto_evidence(
     *,
     piece_count: int,
     typed_piece_count: int,
-    identity_piece_count: int,
-    has_unknown_piece: bool,
-    unknown_piece_texts: set[str],
+    special_identity_piece_count: int,
+    unknown_piece_count: int,
+    unknown_piece_index: int | None,
+    unknown_piece_text: str | None,
+    byte_piece_count: int,
+    byte_piece_texts: set[str],
+    malformed_byte_piece: bool,
     trainer_spec: _SentencePieceTrainerSpecSignals | None,
 ) -> bool:
-    if piece_count < _SENTENCEPIECE_MIN_STRONG_PIECES or not has_unknown_piece:
+    if unknown_piece_count != 1 or unknown_piece_index is None or unknown_piece_text is None:
         return False
-    if typed_piece_count >= 3 and identity_piece_count >= 3:
-        return True
-    return (
+    if malformed_byte_piece:
+        return False
+    if byte_piece_count:
+        if trainer_spec is None or not trainer_spec.byte_fallback:
+            return False
+        if (
+            byte_piece_count != _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT
+            or len(byte_piece_texts) != _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT
+        ):
+            return False
+    elif trainer_spec is not None and trainer_spec.byte_fallback:
+        return False
+
+    if (
         trainer_spec is not None
-        and trainer_spec.has_custom_unknown_metadata
-        and trainer_spec.unk_piece in unknown_piece_texts
-    )
+        and trainer_spec.has_core_metadata
+        and trainer_spec.vocab_size == piece_count
+        and 0 <= trainer_spec.unk_id < piece_count
+        and trainer_spec.unk_id == unknown_piece_index
+        and (not trainer_spec.unk_piece_explicit or trainer_spec.unk_piece == unknown_piece_text)
+    ):
+        return True
+
+    if piece_count < _SENTENCEPIECE_MIN_STRONG_PIECES:
+        return False
+    return typed_piece_count >= 3 and special_identity_piece_count >= 3
 
 
 def _has_strong_sentencepiece_model_proto_prefix(data: bytes, *, sample_is_prefix: bool = False) -> bool:
@@ -1662,9 +1706,13 @@ def _has_strong_sentencepiece_model_proto_prefix(data: bytes, *, sample_is_prefi
     fields_seen = 0
     piece_count = 0
     typed_piece_count = 0
-    identity_piece_count = 0
-    has_unknown_piece = False
-    unknown_piece_texts: set[str] = set()
+    special_identity_piece_count = 0
+    unknown_piece_count = 0
+    unknown_piece_index: int | None = None
+    unknown_piece_text: str | None = None
+    byte_piece_count = 0
+    byte_piece_texts: set[str] = set()
+    malformed_byte_piece = False
     trainer_spec: _SentencePieceTrainerSpecSignals | None = None
     strong_match = False
 
@@ -1696,14 +1744,22 @@ def _has_strong_sentencepiece_model_proto_prefix(data: bytes, *, sample_is_prefi
             if parsed_piece is None:
                 return False
             piece, piece_type = parsed_piece
+            piece_index = piece_count
             piece_count += 1
             if piece_type is not None:
                 typed_piece_count += 1
-            if _is_sentencepiece_identity_piece(piece):
-                identity_piece_count += 1
-            if piece == "<unk>" or piece_type == _SENTENCEPIECE_UNKNOWN_PIECE_TYPE:
-                has_unknown_piece = True
-                unknown_piece_texts.add(piece)
+            if _is_sentencepiece_special_identity_piece(piece):
+                special_identity_piece_count += 1
+            if piece_type == _SENTENCEPIECE_UNKNOWN_PIECE_TYPE:
+                unknown_piece_count += 1
+                unknown_piece_index = piece_index
+                unknown_piece_text = piece
+            elif piece_type == _SENTENCEPIECE_BYTE_PIECE_TYPE:
+                byte_piece_count += 1
+                if _is_sentencepiece_byte_fallback_piece(piece):
+                    byte_piece_texts.add(piece)
+                else:
+                    malformed_byte_piece = True
             offset = actual_value_end
         elif field_number == 2:
             bounds = _read_length_delimited_proto_value(data, value_offset)
@@ -1751,14 +1807,35 @@ def _has_strong_sentencepiece_model_proto_prefix(data: bytes, *, sample_is_prefi
         strong_match = _has_strong_sentencepiece_model_proto_evidence(
             piece_count=piece_count,
             typed_piece_count=typed_piece_count,
-            identity_piece_count=identity_piece_count,
-            has_unknown_piece=has_unknown_piece,
-            unknown_piece_texts=unknown_piece_texts,
+            special_identity_piece_count=special_identity_piece_count,
+            unknown_piece_count=unknown_piece_count,
+            unknown_piece_index=unknown_piece_index,
+            unknown_piece_text=unknown_piece_text,
+            byte_piece_count=byte_piece_count,
+            byte_piece_texts=byte_piece_texts,
+            malformed_byte_piece=malformed_byte_piece,
             trainer_spec=trainer_spec,
         )
 
     return (
         strong_match and not sample_is_prefix and offset == len(data) and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS
+    )
+
+
+@lru_cache(maxsize=128)
+def _is_sentencepiece_model_proto_file_cached(path_key: str, size: int, mtime_ns: int, read_bytes: int) -> bool:
+    file_path = Path(path_key)
+    try:
+        if size < 32:
+            return False
+        with file_path.open("rb") as handle:
+            prefix = handle.read(min(size, read_bytes))
+    except OSError:
+        return False
+
+    return _has_strong_sentencepiece_model_proto_prefix(
+        prefix,
+        sample_is_prefix=size > len(prefix),
     )
 
 
@@ -1768,17 +1845,15 @@ def is_sentencepiece_model_proto_file(path: str | Path) -> bool:
     try:
         if not file_path.is_file():
             return False
-        size = file_path.stat().st_size
-        if size < 32:
-            return False
-        with file_path.open("rb") as handle:
-            prefix = handle.read(min(size, _SENTENCEPIECE_MODEL_PROTO_READ_BYTES))
+        stat = file_path.stat()
     except OSError:
         return False
 
-    return _has_strong_sentencepiece_model_proto_prefix(
-        prefix,
-        sample_is_prefix=size > len(prefix),
+    return _is_sentencepiece_model_proto_file_cached(
+        str(file_path),
+        stat.st_size,
+        stat.st_mtime_ns,
+        _SENTENCEPIECE_MODEL_PROTO_READ_BYTES,
     )
 
 

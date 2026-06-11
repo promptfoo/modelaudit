@@ -95,6 +95,7 @@ from modelaudit.utils.file.detection import (
     is_executorch_archive,
     is_keras_zip_archive,
     is_pytorch_zip_archive,
+    is_sentencepiece_model_proto_file,
     is_skops_archive,
     is_torchserve_mar_archive,
     should_defer_safetensors_header_limit_hash,
@@ -3706,6 +3707,13 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             if nested_xgboost_route == "xgboost":
                 config[XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY] = True
     is_xgboost_pickle_spoof = ext in _XGBOOST_BINARY_EXTENSIONS and header_format == "pickle"
+    sentencepiece_model_proto_owned = (
+        format_probe_error is None
+        and ext == ".model"
+        and header_format == "unknown"
+        and magic_format == "unknown"
+        and is_sentencepiece_model_proto_file(path)
+    )
     # Record telemetry for file type detection
     detected_format = header_format if header_format != "unknown" else ext_format
     record_file_type_detected(path, detected_format)
@@ -3959,7 +3967,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 and scanner_selection.allows(fallback_scanner_id)
             ):
                 scanner_class = _registry.load_scanner_by_id(fallback_scanner_id)
-        elif scanner_class is None:
+        elif scanner_class is None and not sentencepiece_model_proto_owned:
             scanner_class = _registry.get_scanner_for_path(
                 path,
                 scanner_selection=scanner_selection if scanner_selection.active else None,
@@ -4031,7 +4039,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     kind=SCANNER_SELECTION_PREFERRED_KIND,
                 )
         else:
-            if unavailable_preferred_scanner_id is None and scanner_selection.active:
+            if (
+                unavailable_preferred_scanner_id is None
+                and scanner_selection.active
+                and not sentencepiece_model_proto_owned
+            ):
                 candidate_scanner_id = skipped_preferred_scanner_id
                 if candidate_scanner_id is None:
                     candidate_scanner_class = _registry.get_scanner_for_path(path)

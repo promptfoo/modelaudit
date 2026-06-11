@@ -85,7 +85,74 @@ def _sentencepiece_piece(piece: str, piece_type: int) -> bytes:
     return _proto_field(1, 2, _proto_varint(len(piece_payload)) + piece_payload)
 
 
-def _sentencepiece_model_proto() -> bytes:
+def _sentencepiece_trainer_spec(
+    *,
+    model_type: int = 1,
+    vocab_size: int,
+    unk_id: int | None = 0,
+    unk_piece: str | None = "<unk>",
+    byte_fallback: bool = False,
+    extra_fields: bytes = b"",
+) -> bytes:
+    trainer_spec = _proto_field(3, 0, _proto_varint(model_type)) + _proto_field(4, 0, _proto_varint(vocab_size))
+    if byte_fallback:
+        trainer_spec += _proto_field(35, 0, _proto_varint(1))
+    if unk_id is not None:
+        trainer_spec += _proto_field(40, 0, _proto_varint(unk_id))
+    if unk_piece is not None:
+        encoded_unk_piece = unk_piece.encode("utf-8")
+        trainer_spec += _proto_field(45, 2, _proto_varint(len(encoded_unk_piece)) + encoded_unk_piece)
+    return _proto_field(2, 2, _proto_varint(len(trainer_spec + extra_fields)) + trainer_spec + extra_fields)
+
+
+def _sentencepiece_model_proto(*, include_trainer_spec: bool = False) -> bytes:
+    pieces = [
+        ("<unk>", 2),
+        ("<s>", 3),
+        ("</s>", 3),
+        ("<pad>", 3),
+        ("the", 1),
+        ("of", 1),
+        ("and", 1),
+        ("to", 1),
+    ]
+    model = b"".join(_sentencepiece_piece(piece, piece_type) for piece, piece_type in pieces)
+    if include_trainer_spec:
+        model += _sentencepiece_trainer_spec(vocab_size=len(pieces))
+    return model
+
+
+def _sentencepiece_model_proto_with_default_unknown_metadata() -> bytes:
+    pieces = [
+        ("<unk>", 2),
+        ("hello", 1),
+        ("world", 1),
+        ("token", 1),
+    ]
+    return b"".join(
+        _sentencepiece_piece(piece, piece_type) for piece, piece_type in pieces
+    ) + _sentencepiece_trainer_spec(
+        vocab_size=len(pieces),
+        unk_id=None,
+        unk_piece=None,
+    )
+
+
+def _sentencepiece_model_proto_with_duplicate_unknown_pieces() -> bytes:
+    pieces = [
+        ("<unk>", 2),
+        ("<bad_unk>", 2),
+        ("<s>", 3),
+        ("</s>", 3),
+        ("<pad>", 3),
+        ("the", 1),
+        ("of", 1),
+        ("and", 1),
+    ]
+    return b"".join(_sentencepiece_piece(piece, piece_type) for piece, piece_type in pieces)
+
+
+def _sentencepiece_model_proto_with_byte_pieces_without_fallback() -> bytes:
     pieces = [
         ("<unk>", 2),
         ("<s>", 3),
@@ -100,26 +167,18 @@ def _sentencepiece_model_proto() -> bytes:
 
 
 def _sentencepiece_model_proto_with_trainer_varint_field_52() -> bytes:
-    trainer_spec = (
-        _proto_field(3, 0, _proto_varint(1))
-        + _proto_field(4, 0, _proto_varint(64))
-        + _proto_field(40, 0, _proto_varint(0))
-        + _proto_field(45, 2, _proto_varint(len(b"<unk>")) + b"<unk>")
-        + _proto_field(52, 0, _proto_varint(7))
+    return _sentencepiece_model_proto() + _sentencepiece_trainer_spec(
+        vocab_size=8,
+        extra_fields=_proto_field(52, 0, _proto_varint(7)),
     )
-    return _sentencepiece_model_proto() + _proto_field(2, 2, _proto_varint(len(trainer_spec)) + trainer_spec)
 
 
 def _sentencepiece_model_proto_with_trainer_string_field_54() -> bytes:
     seed_sentencepieces_file = b"seed_sentencepieces.tsv"
-    trainer_spec = (
-        _proto_field(3, 0, _proto_varint(1))
-        + _proto_field(4, 0, _proto_varint(64))
-        + _proto_field(40, 0, _proto_varint(0))
-        + _proto_field(45, 2, _proto_varint(len(b"<unk>")) + b"<unk>")
-        + _proto_field(54, 2, _proto_varint(len(seed_sentencepieces_file)) + seed_sentencepieces_file)
+    return _sentencepiece_model_proto() + _sentencepiece_trainer_spec(
+        vocab_size=8,
+        extra_fields=_proto_field(54, 2, _proto_varint(len(seed_sentencepieces_file)) + seed_sentencepieces_file),
     )
-    return _sentencepiece_model_proto() + _proto_field(2, 2, _proto_varint(len(trainer_spec)) + trainer_spec)
 
 
 def _large_real_sentencepiece_model_proto_shape() -> bytes:
@@ -136,13 +195,23 @@ def _large_real_sentencepiece_model_proto_shape() -> bytes:
     ]
     pieces.extend((f"<0x{byte:02X}>", 6) for byte in range(256))
     pieces.extend((f"t{index}", 1) for index in range(7000))
-    return b"".join(_sentencepiece_piece(piece, piece_type) for piece, piece_type in pieces)
+    return b"".join(
+        _sentencepiece_piece(piece, piece_type) for piece, piece_type in pieces
+    ) + _sentencepiece_trainer_spec(
+        vocab_size=len(pieces),
+        unk_id=3,
+        byte_fallback=True,
+    )
 
 
 _SENTENCEPIECE_FIXTURE_DIR = Path(__file__).resolve().parents[1] / "assets" / "samples" / "sentencepiece"
 _SENTENCEPIECE_OFFICIAL_FIXTURES = (
     "custom_unknown_disabled_specials.model",
     "custom_unknown_disabled_specials_byte_fallback.model",
+)
+_SENTENCEPIECE_SEMANTIC_MALFORMED_FACTORIES = (
+    pytest.param(_sentencepiece_model_proto_with_duplicate_unknown_pieces, id="duplicate-unknown-pieces"),
+    pytest.param(_sentencepiece_model_proto_with_byte_pieces_without_fallback, id="byte-pieces-without-fallback"),
 )
 _SENTENCEPIECE_MALFORMED_TAILS = (
     pytest.param(b"\x12\x80", id="truncated-length-varint"),
@@ -432,6 +501,12 @@ class TestXGBoostScannerBasic:
 
         assert not XGBoostScanner.can_handle(str(tokenizer_model))
 
+    def test_can_handle_rejects_sentencepiece_with_proto2_default_unknown_metadata(self, tmp_path: Path) -> None:
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(_sentencepiece_model_proto_with_default_unknown_metadata())
+
+        assert not XGBoostScanner.can_handle(str(tokenizer_model))
+
     def test_can_handle_rejects_strong_sentencepiece_with_well_formed_tail(self, tmp_path: Path) -> None:
         tokenizer_model = tmp_path / "tokenizer.model"
         tokenizer_model.write_bytes(_sentencepiece_model_proto() + _proto_field(2, 2, _proto_varint(0)))
@@ -453,6 +528,15 @@ class TestXGBoostScannerBasic:
     def test_can_handle_keeps_malformed_sentencepiece_like_model_on_xgboost_route(self, tmp_path: Path) -> None:
         tokenizer_model = tmp_path / "tokenizer.model"
         tokenizer_model.write_bytes(b"\x0a\x0e\x0a\x05<unk>\x15\x00" + (b"\0" * 64))
+
+        assert XGBoostScanner.can_handle(str(tokenizer_model))
+
+    @pytest.mark.parametrize("payload_factory", _SENTENCEPIECE_SEMANTIC_MALFORMED_FACTORIES)
+    def test_can_handle_keeps_semantically_malformed_sentencepiece_on_xgboost_route(
+        self, tmp_path: Path, payload_factory: Callable[[], bytes]
+    ) -> None:
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(payload_factory())
 
         assert XGBoostScanner.can_handle(str(tokenizer_model))
 
@@ -1861,6 +1945,63 @@ class TestXGBoostFailClosedEndToEnd:
         assert determine_exit_code(aggregate) == 0
         assert not any(issue.rule_code == "S1004" for issue in aggregate.issues)
 
+    def test_sentencepiece_ownership_probe_is_carried_through_direct_scan(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(_sentencepiece_model_proto())
+        parse_calls = 0
+        original_parser = file_detection._has_strong_sentencepiece_model_proto_prefix
+
+        def count_sentencepiece_parse(data: bytes, *, sample_is_prefix: bool = False) -> bool:
+            nonlocal parse_calls
+            parse_calls += 1
+            return original_parser(data, sample_is_prefix=sample_is_prefix)
+
+        file_detection._is_sentencepiece_model_proto_file_cached.cache_clear()
+        monkeypatch.setattr(
+            file_detection,
+            "_has_strong_sentencepiece_model_proto_prefix",
+            count_sentencepiece_parse,
+        )
+
+        result = scan_file(str(tokenizer_model), config={"cache_enabled": False})
+
+        assert result.success is True
+        assert result.scanner_name == "unknown"
+        assert parse_calls == 1
+
+    def test_sentencepiece_model_with_proto2_default_unknown_metadata_is_not_xgboost_false_positive(
+        self, tmp_path: Path
+    ) -> None:
+        # Synthetic regression for HuggingFaceH4/zephyr-7b-beta@892b3d7... tokenizer.model.
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(_sentencepiece_model_proto_with_default_unknown_metadata())
+
+        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+        streaming = scan_model_streaming(
+            file_generator=iterate_files_streaming(tmp_path),
+            scan_root=str(tmp_path),
+            delete_after_scan=False,
+            cache_enabled=False,
+            skip_file_types=True,
+        )
+        cli_result = CliRunner().invoke(
+            cli,
+            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
+            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+        )
+        cli_payload = parse_click_json_output(cli_result.output)
+
+        assert direct.success is True
+        assert direct.scanner_name == "unknown"
+        _assert_no_xgboost_s1004(aggregate)
+        _assert_no_xgboost_s1004(streaming)
+        assert cli_result.exit_code == 0
+        assert "xgboost" not in cli_payload.get("scanner_names", [])
+        assert not any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
+
     def test_sentencepiece_model_with_trainer_varint_field_52_is_not_xgboost_false_positive(
         self, tmp_path: Path
     ) -> None:
@@ -1996,6 +2137,63 @@ class TestXGBoostFailClosedEndToEnd:
         assert result.scanner_name == "xgboost"
         assert "xgboost_binary_structure_unrecognized" in result.metadata["scan_outcome_reasons"]
         assert any(issue.rule_code == "S1004" for issue in result.issues)
+
+    @pytest.mark.parametrize("payload_factory", _SENTENCEPIECE_SEMANTIC_MALFORMED_FACTORIES)
+    def test_semantically_malformed_sentencepiece_model_still_fails_closed_in_xgboost(
+        self, tmp_path: Path, payload_factory: Callable[[], bytes]
+    ) -> None:
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(payload_factory())
+
+        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+        streaming = scan_model_streaming(
+            file_generator=iterate_files_streaming(tmp_path),
+            scan_root=str(tmp_path),
+            delete_after_scan=False,
+            cache_enabled=False,
+            skip_file_types=True,
+        )
+        cli_result = CliRunner().invoke(
+            cli,
+            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
+            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+        )
+        cli_payload = parse_click_json_output(cli_result.output)
+
+        assert direct.success is False
+        assert direct.scanner_name == "xgboost"
+        assert "xgboost_binary_structure_unrecognized" in direct.metadata["scan_outcome_reasons"]
+        assert any(issue.rule_code == "S1004" for issue in direct.issues)
+        _assert_xgboost_s1004(aggregate)
+        _assert_xgboost_s1004(streaming)
+        assert cli_result.exit_code == 2
+        assert "xgboost" in cli_payload.get("scanner_names", [])
+        assert any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
+
+    @pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+    @pytest.mark.parametrize("payload_factory", _SENTENCEPIECE_SEMANTIC_MALFORMED_FACTORIES)
+    def test_archived_semantically_malformed_sentencepiece_model_still_fails_closed_in_xgboost(
+        self, tmp_path: Path, archive_kind: str, payload_factory: Callable[[], bytes]
+    ) -> None:
+        member_name = "models/tokenizer.model"
+        archive_file = tmp_path / f"tokenizer-bundle.{archive_kind}"
+        payload = payload_factory()
+        if archive_kind == "zip":
+            with zipfile.ZipFile(archive_file, "w") as archive:
+                archive.writestr(member_name, payload)
+        else:
+            with tarfile.open(archive_file, "w") as archive:
+                info = tarfile.TarInfo(member_name)
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+
+        result = scan_model_directory_or_file(str(archive_file), cache_enabled=False)
+
+        assert determine_exit_code(result) == 2
+        assert any(
+            issue.rule_code == "S1004" and issue.location == f"{archive_file}:{member_name}" for issue in result.issues
+        )
 
     @pytest.mark.parametrize("tail", _SENTENCEPIECE_MALFORMED_TAILS)
     def test_sentencepiece_model_with_malformed_tail_still_fails_closed_in_xgboost(
