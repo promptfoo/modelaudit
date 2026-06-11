@@ -338,6 +338,20 @@ DOCUMENTATION_GIT_CLONE_COMMAND_PATTERN = re.compile(
     + rb"(?:\s+[^\s;&|#]{1,4096})?(?=\s*(?:$|[;&|#]))",
     re.IGNORECASE,
 )
+DOCUMENTATION_FENCED_GIT_CLONE_REFERENCE_PATTERN = re.compile(
+    DOCUMENTATION_SHELL_LINE_PREFIX
+    + DOCUMENTATION_NETWORK_COMMAND_LINE_LIMIT
+    + DOCUMENTATION_SHELL_WRAPPED_COMMAND
+    + DOCUMENTATION_COMMAND_PATH_PREFIX
+    + rb"git(?:\.exe)?\s+clone"
+    rb"(?:\s+"
+    + DOCUMENTATION_GIT_CLONE_OPTION
+    + rb"){0,8}\s+(?:--\s+)?(?P<destination>"
+    + DOCUMENTATION_GIT_CLONE_DESTINATION
+    + rb")"
+    + rb"(?:\s+[^\s;&|#]{1,4096})?(?=\s*(?:$|[;&|#]))",
+    re.IGNORECASE,
+)
 DOCUMENTATION_SSH_OPTION_WITH_ARGUMENT = rb"-(?:B|b|c|D|E|F|I|i|J|L|l|m|O|o|p|Q|R|S|W|w)(?:=|\s+)?[^\s]{1,4096}"
 DOCUMENTATION_SSH_OPTION_WITHOUT_ARGUMENT = rb"-[46AaCfGgKkMNnqsTtVvXxYy]+"
 DOCUMENTATION_SSH_OPTION = (
@@ -445,7 +459,8 @@ DOCUMENTATION_FENCED_URL_REQUEST_ASSIGNMENT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_URL_VARIABLE_CALL_PATTERN = re.compile(
-    rb"\b(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(\s*(?P<target>[A-Za-z_][A-Za-z0-9_]*)\b",
+    rb"\b(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(\s*"
+    rb"(?P<target>[A-Za-z_][A-Za-z0-9_]*)\b(?=\s*(?:[,)]))",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_DIRECT_URL_CALL_PATTERN = re.compile(
@@ -1344,7 +1359,7 @@ class TextScanner(BaseScanner):
         if line_parts is None:
             return True
         line, position = line_parts
-        if cls._documentation_fenced_git_clone_reference_is_informational(line, finding):
+        if cls._documentation_fenced_git_clone_reference_is_informational(line, position, finding):
             return True
         if cls._documentation_fenced_package_version_is_informational(line, position, finding):
             return True
@@ -1374,8 +1389,13 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
-    def _documentation_fenced_git_clone_reference_is_informational(line: bytes, finding: dict[str, Any]) -> bool:
-        if DOCUMENTATION_GIT_CLONE_COMMAND_PATTERN.match(line) is None:
+    def _documentation_fenced_git_clone_reference_is_informational(
+        line: bytes,
+        position: int,
+        finding: dict[str, Any],
+    ) -> bool:
+        clone_match = DOCUMENTATION_FENCED_GIT_CLONE_REFERENCE_PATTERN.match(line)
+        if clone_match is None or not clone_match.start("destination") <= position < clone_match.end("destination"):
             return False
         finding_type = finding.get("type")
         if finding_type in {"domain", "domain_name"}:
@@ -1541,6 +1561,7 @@ class TextScanner(BaseScanner):
     @classmethod
     def _documentation_fenced_passive_network_example_contains_finding(
         cls,
+        payload: bytes,
         finding: dict[str, Any],
         fenced_passive_network_example_ranges: tuple[tuple[int, int], ...],
     ) -> bool:
@@ -1549,6 +1570,32 @@ class TextScanner(BaseScanner):
             finding.get("type") in DOCUMENTATION_FENCED_PASSIVE_NETWORK_FINDING_TYPES
             and isinstance(finding_position, int)
             and cls._documentation_position_is_fenced_code(fenced_passive_network_example_ranges, finding_position)
+            and cls._documentation_fenced_passive_finding_matches_vetted_example(payload, finding)
+        )
+
+    @classmethod
+    def _documentation_fenced_passive_finding_matches_vetted_example(
+        cls,
+        payload: bytes,
+        finding: dict[str, Any],
+    ) -> bool:
+        finding_type = finding.get("type")
+        if finding_type == "network_function":
+            return finding.get("function") in {"requests.get", "urlopen"}
+        if finding_type == "network_library":
+            return finding.get("library") in {"requests", "urllib"}
+        if finding_type not in PASSIVE_NETWORK_FINDING_TYPES | {"suspicious_port"}:
+            return False
+        line_parts = cls._finding_line_parts(payload, finding)
+        if line_parts is None:
+            return False
+        line, position = line_parts
+        return any(
+            match.start() <= position < match.end()
+            and cls._documentation_fenced_bare_url_is_informational(
+                match.group().decode("utf-8", errors="ignore").rstrip("`.")
+            )
+            for match in DOCUMENTATION_FENCED_BARE_URL_TOKEN_PATTERN.finditer(line)
         )
 
     @staticmethod
@@ -1568,6 +1615,7 @@ class TextScanner(BaseScanner):
         fenced_passive_network_example_ranges: tuple[tuple[int, int], ...],
     ) -> bool:
         if cls._documentation_fenced_passive_network_example_contains_finding(
+            payload,
             finding,
             fenced_passive_network_example_ranges,
         ):

