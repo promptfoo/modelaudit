@@ -493,10 +493,10 @@ def _directory_owner_snapshot_stat_matches(
     expected: os.stat_result,
 ) -> bool:
     """Return whether one lexical entry kept the same no-follow identity."""
-    return all(
-        getattr(current, field) == getattr(expected, field)
-        for field in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink")
-    )
+    identity_fields: tuple[str, ...] = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if not (stat.S_ISDIR(current.st_mode) and stat.S_ISDIR(expected.st_mode)):
+        identity_fields = (*identity_fields, "st_nlink")
+    return all(getattr(current, field) == getattr(expected, field) for field in identity_fields)
 
 
 def _capture_directory_owner_namespace_by_descriptor(

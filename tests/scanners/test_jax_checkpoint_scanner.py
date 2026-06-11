@@ -2516,16 +2516,8 @@ def test_malformed_orbax_metadata_is_inconclusive(tmp_path: Path) -> None:
         for check in result.checks
     )
     owner_metadata = aggregate.file_metadata[str(checkpoint_dir)]
-    if owner_metadata["directory_owner_scan"]:
-        assert "jax_orbax_metadata_parse_failed" in owner_metadata["scan_outcome_reasons"]
-    else:
-        assert owner_metadata["directory_owner_scan"] is False
-        assert any(
-            reason in owner_metadata["scan_outcome_reasons"]
-            for reason in {"directory_owner_scan_failed", "directory_owner_snapshot_incomplete"}
-        )
-        child_metadata = aggregate.file_metadata[str(checkpoint_dir / "metadata.json")]
-        assert "jax_json_parse_failed" in child_metadata["scan_outcome_reasons"]
+    assert owner_metadata["directory_owner_scan"] is True
+    assert "jax_orbax_metadata_parse_failed" in owner_metadata["scan_outcome_reasons"]
     assert owner_metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert determine_exit_code(aggregate) == 2
 
