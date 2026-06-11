@@ -1377,6 +1377,14 @@ class TextScanner(BaseScanner):
         return False
 
     @classmethod
+    def _documentation_nested_config_contains_position(cls, payload: bytes, position: int) -> bool:
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        if context_start > 0:
+            context_start = payload.rfind(b"\n", 0, context_start) + 1
+        return cls._documentation_nested_config_is_actionable(payload[context_start:position])
+
+    @classmethod
     def _documentation_finding_is_actionable(cls, payload: bytes, finding: dict[str, Any]) -> bool:
         position = finding.get("position")
         if not isinstance(position, int) or position < 0 or position > len(payload):
@@ -1755,6 +1763,7 @@ class TextScanner(BaseScanner):
                         absolute_position,
                     )
                     or cls._documentation_open_call_contains_position(payload, absolute_position)
+                    or cls._documentation_nested_config_contains_position(payload, absolute_position)
                 ):
                     return False
             for pattern in (
@@ -1787,6 +1796,7 @@ class TextScanner(BaseScanner):
                             absolute_position,
                         )
                         or cls._documentation_open_call_contains_position(payload, absolute_position)
+                        or cls._documentation_nested_config_contains_position(payload, absolute_position)
                     ):
                         return False
             if line_end == len(payload):
