@@ -39,6 +39,9 @@ _HF_T10_SHA256 = "995b5f0a2fe72453ddc8ce97e1a93747554ec3ec0ac92d86e82a57050db51b
 _HF_T10_MAX_BYTES = 10 * 1024 * 1024
 _HF_TORCHSCRIPT_QA_REPO_ID = "google-bert/bert-large-uncased"
 _HF_TORCHSCRIPT_QA_REVISION = "6da4b6a26a1877e173fca3225479512db81a5e5b"
+_HF_TORCHSCRIPT_ST_QA_REPO_ID = "sentence-transformers/all-MiniLM-L12-v2"
+_HF_TORCHSCRIPT_ST_QA_REVISION = "a50ef00143b4d5391434df20ae11632588ac25be"
+_TORCHSCRIPT_DEBUG_PKL = b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00."
 
 
 def _pickle_global(module: str, name: str) -> bytes:
@@ -73,6 +76,25 @@ def _torchscript_module_build_intlist_payload() -> bytes:
         + b"](K\x01K\x02K\x03e\x85R"
         + b"sb."
     )
+
+
+def _write_torchscript_generated_module(zip_file: zipfile.ZipFile) -> None:
+    zip_file.writestr(
+        "archive/code/__torch__.py",
+        "\n".join(
+            [
+                "class Module(Module):",
+                "  __parameters__ = []",
+                "  __buffers__ = []",
+                "  training : bool",
+                "  def forward(self: __torch__.Module,",
+                "    x: Tensor) -> Tensor:",
+                "    return x",
+                "",
+            ]
+        ),
+    )
+    zip_file.writestr("archive/code/__torch__.py.debug_pkl", _TORCHSCRIPT_DEBUG_PKL)
 
 
 def _hf_training_args_metadata_payload() -> bytes:
@@ -6342,27 +6364,11 @@ def test_pytorch_zip_allows_torchscript_generated_python_files(tmp_path: Path) -
 
 def test_pytorch_zip_hf_google_bert_rust_model_torchscript_reconstruction_control(tmp_path: Path) -> None:
     model_path = tmp_path / "rust_model.ot"
-    debug_pkl = b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00."
     with zipfile.ZipFile(model_path, "w") as zip_file:
         zip_file.writestr("archive/version", "3")
         zip_file.writestr("archive/byteorder", "little")
         zip_file.writestr("archive/data.pkl", _torchscript_module_build_intlist_payload())
-        zip_file.writestr(
-            "archive/code/__torch__.py",
-            "\n".join(
-                [
-                    "class Module(Module):",
-                    "  __parameters__ = []",
-                    "  __buffers__ = []",
-                    "  training : bool",
-                    "  def forward(self: __torch__.Module,",
-                    "    x: Tensor) -> Tensor:",
-                    "    return x",
-                    "",
-                ]
-            ),
-        )
-        zip_file.writestr("archive/code/__torch__.py.debug_pkl", debug_pkl)
+        _write_torchscript_generated_module(zip_file)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
@@ -6393,6 +6399,80 @@ def test_pytorch_zip_hf_google_bert_rust_model_torchscript_reconstruction_contro
         and check.details.get("file") == "archive/code/__torch__.py"
         for check in result.checks
     ), f"{_HF_TORCHSCRIPT_QA_REPO_ID}@{_HF_TORCHSCRIPT_QA_REVISION}"
+
+
+def test_pytorch_zip_hf_sentence_transformers_rust_model_classifies_members_independently(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "rust_model.ot"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _torchscript_module_build_intlist_payload())
+        zip_file.writestr("archive/constants.pkl", pickle.dumps({"constants": ()}, protocol=4))
+        _write_torchscript_generated_module(zip_file)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    checks_by_member = _weights_only_analysis_checks_by_member(result)
+    assert {
+        "archive/data.pkl",
+        "archive/constants.pkl",
+        "archive/code/__torch__.py.debug_pkl",
+    }.issubset(checks_by_member), f"{_HF_TORCHSCRIPT_ST_QA_REPO_ID}@{_HF_TORCHSCRIPT_ST_QA_REVISION}"
+    data_check = checks_by_member["archive/data.pkl"]
+    constants_check = checks_by_member["archive/constants.pkl"]
+    debug_check = checks_by_member["archive/code/__torch__.py.debug_pkl"]
+
+    assert data_check.status == CheckStatus.FAILED
+    assert data_check.severity == IssueSeverity.WARNING
+    assert data_check.details["nested_execution_opcode_evidence"] is False
+    assert data_check.details["opcode_counts"] == {"GLOBAL": 2, "NEWOBJ": 1, "REDUCE": 1, "BUILD": 1}
+    assert constants_check.status == CheckStatus.PASSED
+    assert constants_check.details["dangerous_opcodes_found"] is False
+    assert debug_check.status == CheckStatus.PASSED
+    assert debug_check.details["dangerous_opcodes_found"] is False
+
+    outcomes = {record["pickle_filename"]: record for record in result.metadata["pickle_member_outcomes"]}
+    assert outcomes["archive/data.pkl"]["max_severity"] == "warning"
+    assert outcomes["archive/constants.pkl"]["pickle_verdict"] == "clean"
+    assert outcomes["archive/code/__torch__.py.debug_pkl"]["pickle_verdict"] == "clean"
+    assert result.metadata["pickle_member_worst_outcome"]["pickle_filename"] == "archive/data.pkl"
+    assert result.metadata["pickle_member_worst_outcome"]["max_severity"] == "warning"
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_pytorch_zip_torchscript_member_does_not_mask_critical_sidecar_pickle(tmp_path: Path) -> None:
+    model_path = tmp_path / "rust_model_with_sidecar.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _torchscript_module_build_intlist_payload())
+        zip_file.writestr("archive/evil.pkl", b"\x80\x04cos\nsystem\n\x8c\x02id\x85R.")
+        _write_torchscript_generated_module(zip_file)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    checks_by_member = _weights_only_analysis_checks_by_member(result)
+    data_check = checks_by_member["archive/data.pkl"]
+    evil_check = checks_by_member["archive/evil.pkl"]
+    assert data_check.severity == IssueSeverity.WARNING
+    assert evil_check.status == CheckStatus.FAILED
+    assert evil_check.severity == IssueSeverity.CRITICAL
+    assert evil_check.details["opcode_counts"] == {"REDUCE": 1}
+    assert evil_check.details["assessment"] == "malicious"
+    assert evil_check.details["import_analysis"]["found_malicious"] == ["os.system"]
+
+    assert result.has_errors is True
+    assert result.metadata["pickle_member_worst_outcome"]["pickle_filename"] == "archive/evil.pkl"
+    assert result.metadata["pickle_member_worst_outcome"]["max_severity"] == "critical"
+    assert result.metadata["pickle_member_worst_outcome"]["pickle_verdict"] == "malicious"
+    assert any(
+        issue.location == f"{model_path}:archive/evil.pkl"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("import_analysis", {}).get("found_malicious") == ["os.system"]
+        for issue in result.issues
+    )
 
 
 def test_pytorch_zip_requires_exact_case_torchscript_debug_pair(tmp_path: Path) -> None:
@@ -8389,6 +8469,15 @@ def _pickle_result_with_reduce(import_reference: str | None = None) -> ScanResul
 
 def _weights_only_analysis_check(result: ScanResult) -> Check:
     return next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
+
+
+def _weights_only_analysis_checks_by_member(result: ScanResult) -> dict[str, Check]:
+    return {
+        str(check.details["pickle_filename"]): check
+        for check in result.checks
+        if check.name == "CVE-2025-32434 Pickle Format Security Analysis"
+        and isinstance(check.details.get("pickle_filename"), str)
+    }
 
 
 def _legacy_s207_pickle_result(opcode_counts: dict[str, int]) -> ScanResult:

@@ -73,6 +73,17 @@ _PICKLE_CODE_EXECUTION_OPCODE_RISKS = (
     ("BUILD", "__setstate__ method exploitation"),
 )
 _PICKLE_NESTED_EXECUTION_OPCODES = frozenset({"REDUCE", "INST", "OBJ", "NEWOBJ", "NEWOBJ_EX", "BUILD"})
+_PICKLE_MEMBER_SEVERITY_RANK = {
+    "debug": 0,
+    "info": 1,
+    "warning": 2,
+    "critical": 3,
+}
+_PICKLE_MEMBER_VERDICT_RANK = {
+    "clean": 0,
+    "suspicious": 2,
+    "malicious": 3,
+}
 
 
 @dataclass(frozen=True)
@@ -1718,6 +1729,13 @@ class PyTorchZipScanner(BaseScanner):
                     self.scanner_selection,
                     context="embedded PyTorch pickle analysis",
                 )
+                self._record_pickle_member_outcome(
+                    result,
+                    name,
+                    None,
+                    analysis_state="skipped",
+                    location=pickle_source,
+                )
                 continue
 
             # Choose scanning approach based on file size with spooling for seekability
@@ -1765,8 +1783,70 @@ class PyTorchZipScanner(BaseScanner):
             # Add CVE-2025-32434 specific warnings
             self._add_weights_only_safety_warnings(sub_result, result, path, name)
             result.merge(sub_result)
+            self._record_pickle_member_outcome(result, name, sub_result, location=pickle_source)
 
         return bytes_scanned
+
+    @staticmethod
+    def _pickle_member_max_severity(member_result: ScanResult) -> str | None:
+        severities = [issue.severity.value for issue in member_result.issues if issue.severity is not None]
+        if not severities:
+            return None
+        return max(severities, key=lambda severity: _PICKLE_MEMBER_SEVERITY_RANK.get(severity, -1))
+
+    @staticmethod
+    def _pickle_member_outcome_rank(record: dict[str, Any]) -> int:
+        rank = _PICKLE_MEMBER_SEVERITY_RANK.get(str(record.get("max_severity")), -1)
+        verdict = record.get("pickle_verdict")
+        if isinstance(verdict, str):
+            rank = max(rank, _PICKLE_MEMBER_VERDICT_RANK.get(verdict, -1))
+        if record.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
+            rank = max(rank, 2)
+        if record.get("analysis_state") == "skipped":
+            rank = max(rank, 1)
+        return rank
+
+    @classmethod
+    def _record_pickle_member_outcome(
+        cls,
+        result: ScanResult,
+        pickle_name: str,
+        member_result: ScanResult | None,
+        *,
+        analysis_state: str = "scanned",
+        location: str,
+    ) -> None:
+        normalized_name = pickle_name.replace("\\", "/").lstrip("/")
+        record: dict[str, Any] = {
+            "pickle_filename": normalized_name,
+            "location": location,
+            "analysis_state": analysis_state,
+        }
+        if member_result is not None:
+            max_severity = cls._pickle_member_max_severity(member_result)
+            record.update(
+                {
+                    "success": member_result.success,
+                    "pickle_report_status": member_result.metadata.get("pickle_report_status"),
+                    "pickle_verdict": member_result.metadata.get("pickle_verdict"),
+                    "scan_outcome": member_result.metadata.get("scan_outcome", "complete"),
+                    "max_severity": max_severity,
+                    "issue_count": len(member_result.issues),
+                    "failed_check_count": sum(
+                        1 for check in member_result.checks if check.status == CheckStatus.FAILED
+                    ),
+                }
+            )
+
+        outcomes = result.metadata.setdefault("pickle_member_outcomes", [])
+        if isinstance(outcomes, list):
+            outcomes.append(record)
+
+        worst_outcome = result.metadata.get("pickle_member_worst_outcome")
+        if not isinstance(worst_outcome, dict) or cls._pickle_member_outcome_rank(
+            record
+        ) > cls._pickle_member_outcome_rank(worst_outcome):
+            result.metadata["pickle_member_worst_outcome"] = dict(record)
 
     @classmethod
     def _trusted_pytorch_storage_data_pkl_members(cls, safe_entries: list[zipfile.ZipInfo]) -> dict[str, set[str]]:
@@ -3614,6 +3694,7 @@ class PyTorchZipScanner(BaseScanner):
                 location=f"{model_path}:{pickle_name}",
                 details={
                     "cve_id": self.CVE_2025_32434_ID,
+                    "pickle_filename": pickle_name,
                     "opcode_counts": opcode_counts,
                     "total_dangerous_opcodes": sum(opcode_counts.values()),
                     "unique_opcode_types": dangerous_opcodes_found,
@@ -3652,6 +3733,7 @@ class PyTorchZipScanner(BaseScanner):
                 location=f"{model_path}:{pickle_name}",
                 details={
                     "cve_id": self.CVE_2025_32434_ID,
+                    "pickle_filename": pickle_name,
                     "dangerous_opcodes_found": False,
                     "safetensors_available": has_safetensors,
                     "recommendation": (
