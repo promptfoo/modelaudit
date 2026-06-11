@@ -3,9 +3,11 @@
 from typing import Any
 
 from modelaudit.scanner_results import (
+    ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
     INCONCLUSIVE_SCAN_OUTCOME,
     SCAN_OUTCOME_REASONS_METADATA_KEY,
     SCANNER_DEPENDENCY_IDS_METADATA_KEY,
+    SUPPRESSED_FAILED_CHECKS_METADATA_KEY,
 )
 
 _OPERATIONAL_ERROR_INDICATORS = (
@@ -36,6 +38,10 @@ _OPERATIONAL_ERROR_INDICATORS = (
     "too many open files",
     "associated .bin weights file not found",
 )
+_PRIVATE_EVIDENCE_METADATA_KEYS = (
+    ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
+    SUPPRESSED_FAILED_CHECKS_METADATA_KEY,
+)
 
 
 def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
@@ -44,6 +50,10 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
         return False
 
     if _metadata_disqualifies_cache(scan_result.get("metadata")):
+        return False
+
+    private_metadata = scan_result.get("_private_metadata")
+    if isinstance(private_metadata, dict) and any(key in private_metadata for key in _PRIVATE_EVIDENCE_METADATA_KEYS):
         return False
 
     for collection_name in ("issues", "checks"):
