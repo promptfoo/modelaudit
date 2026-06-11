@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import struct
+from collections.abc import Iterable
 from typing import Any, BinaryIO, ClassVar, NamedTuple
 from urllib.parse import unquote
 
@@ -63,6 +64,34 @@ _GGUF_DESTRUCTIVE_COMMAND_PREFIXES = ("sudo", "doas", "command", "env", "nohup",
 _GGUF_METADATA_SHELL_FETCH_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("shell_download", ("curl", "wget")),
     ("powershell_download", ("invoke-webrequest", "iwr")),
+)
+_GGUF_FETCH_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "-a",
+        "--append-output",
+        "-d",
+        "--data",
+        "--data-ascii",
+        "--data-binary",
+        "--data-raw",
+        "--data-urlencode",
+        "-f",
+        "--form",
+        "--form-string",
+        "-h",
+        "--header",
+        "-o",
+        "--output",
+        "--output-document",
+        "--post-data",
+        "--post-file",
+        "--proxy",
+        "-u",
+        "--user",
+        "--url",
+        "-uri",
+        "-outfile",
+    }
 )
 _GGUF_METADATA_NETWORK_APIS = (
     "requests.get",
@@ -965,14 +994,16 @@ class GgufScanner(BaseScanner):
         if index >= len(words) or words[index] != "rm":
             return False
 
-        has_recursive_force = False
+        has_recursive = False
+        has_force = False
         index += 1
         while index < len(words) and words[index].startswith("-"):
             option = words[index].lower()
-            has_recursive_force = has_recursive_force or ("r" in option and "f" in option)
+            has_recursive = has_recursive or "r" in option
+            has_force = has_force or "f" in option
             index += 1
 
-        if not has_recursive_force or index >= len(words):
+        if not (has_recursive and has_force) or index >= len(words):
             return False
 
         target = words[index].replace("\\", "/")
@@ -983,72 +1014,113 @@ class GgufScanner(BaseScanner):
         return any(cls._destructive_rm_segment(segment) for segment in cls._shell_command_segments(value))
 
     @staticmethod
-    def _substring_positions(value: str, needle: str) -> list[int]:
-        positions: list[int] = []
+    def _iter_substring_positions(value: str, needle: str) -> Iterable[int]:
         start = 0
         while True:
             position = value.find(needle, start)
             if position == -1:
-                return positions
-            positions.append(position)
+                return
+            yield position
             start = position + 1
 
-    @classmethod
-    def _has_command_token_before_url(cls, value: str, command: str, url_positions: list[int]) -> bool:
-        for position in cls._substring_positions(value, command):
-            before = value[position - 1] if position else ""
-            after_position = position + len(command)
-            after = value[after_position] if after_position < len(value) else ""
-            if before and (before.isalnum() or before in "._-"):
-                continue
-            if after and (after.isalnum() or after in "._-"):
-                continue
-            if any(position < url_position for url_position in url_positions):
-                return True
+    @staticmethod
+    def _is_remote_url_token(word: str) -> bool:
+        token = word.strip("\"'<>[]{}(),")
+        return any(token.startswith(scheme) for scheme in _GGUF_REMOTE_URL_SCHEMES)
+
+    @staticmethod
+    def _is_fetch_option_with_value(word: str) -> bool:
+        if word in _GGUF_FETCH_OPTIONS_WITH_VALUE:
+            return True
+        if "=" in word:
+            option_name, _option_value = word.split("=", 1)
+            return option_name in _GGUF_FETCH_OPTIONS_WITH_VALUE
         return False
+
+    @classmethod
+    def _fetch_segment_has_remote_url(cls, words: list[str], command: str) -> bool:
+        for command_index, word in enumerate(words):
+            if word != command:
+                continue
+            index = command_index + 1
+            while index < len(words):
+                candidate = words[index]
+                if cls._is_remote_url_token(candidate):
+                    return True
+                if candidate.startswith("-"):
+                    if any(scheme in candidate for scheme in _GGUF_REMOTE_URL_SCHEMES):
+                        return True
+                    if cls._is_fetch_option_with_value(candidate):
+                        if "=" in candidate:
+                            index += 1
+                            continue
+                        index += 1
+                        if index < len(words) and cls._is_remote_url_token(words[index]):
+                            return True
+                    index += 1
+                    continue
+                break
+        return False
+
+    @classmethod
+    def _has_fetch_command_with_url(cls, value: str, commands: tuple[str, ...]) -> bool:
+        for segment in cls._shell_command_segments(value):
+            for command in commands:
+                if cls._fetch_segment_has_remote_url(segment, command):
+                    return True
+        return False
+
+    @staticmethod
+    def _has_remote_url(value: str) -> bool:
+        return any(scheme in value for scheme in _GGUF_REMOTE_URL_SCHEMES)
+
+    @staticmethod
+    def _has_token_boundary(value: str, position: int, token: str) -> bool:
+        before = value[position - 1] if position else ""
+        after_position = position + len(token)
+        after = value[after_position] if after_position < len(value) else ""
+        if before and (before.isalnum() or before in "._-"):
+            return False
+        return not (after and (after.isalnum() or after in "._-"))
+
+    @classmethod
+    def _api_argument_window_has_remote_url(cls, value: str, after_position: int) -> bool:
+        open_position = value.find("(", after_position, after_position + 128)
+        if open_position == -1:
+            return False
+        close_position = value.find(")", open_position + 1, open_position + 2049)
+        end_position = close_position if close_position != -1 else open_position + 2048
+        return cls._has_remote_url(value[open_position:end_position])
 
     @classmethod
     def _shell_remote_fetch_pattern(cls, value: str) -> str | None:
         value_lower = value.lower()
-        url_positions = [
-            position
-            for scheme in _GGUF_REMOTE_URL_SCHEMES
-            for position in cls._substring_positions(value_lower, scheme)
-        ]
-        if not url_positions:
+        if not cls._has_remote_url(value_lower):
+            return None
+        if not any(
+            command in value_lower
+            for _pattern_name, commands in _GGUF_METADATA_SHELL_FETCH_COMMANDS
+            for command in commands
+        ):
             return None
 
         for pattern_name, commands in _GGUF_METADATA_SHELL_FETCH_COMMANDS:
-            if any(cls._has_command_token_before_url(value_lower, command, url_positions) for command in commands):
+            if cls._has_fetch_command_with_url(value_lower, commands):
                 return pattern_name
         return None
 
     @classmethod
     def _network_api_remote_fetch_pattern(cls, value: str) -> str | None:
         value_lower = value.lower()
-        url_positions = [
-            position
-            for scheme in _GGUF_REMOTE_URL_SCHEMES
-            for position in cls._substring_positions(value_lower, scheme)
-        ]
-        if not url_positions:
+        if not cls._has_remote_url(value_lower):
             return None
 
         for api_name in _GGUF_METADATA_NETWORK_APIS:
-            for api_position in cls._substring_positions(value_lower, api_name):
-                before = value_lower[api_position - 1] if api_position else ""
+            for api_position in cls._iter_substring_positions(value_lower, api_name):
+                if not cls._has_token_boundary(value_lower, api_position, api_name):
+                    continue
                 after_position = api_position + len(api_name)
-                after = value_lower[after_position] if after_position < len(value_lower) else ""
-                if before and (before.isalnum() or before in "._-"):
-                    continue
-                if after and (after.isalnum() or after in "._-"):
-                    continue
-                open_position = value_lower.find("(", after_position, after_position + 128)
-                if open_position == -1:
-                    continue
-                close_position = value_lower.find(")", open_position + 1, open_position + 2049)
-                end_position = close_position if close_position != -1 else open_position + 2048
-                if any(open_position < url_position < end_position for url_position in url_positions):
+                if cls._api_argument_window_has_remote_url(value_lower, after_position):
                     return "network_api"
         return None
 

