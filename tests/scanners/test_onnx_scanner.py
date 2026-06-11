@@ -5656,6 +5656,20 @@ def _write_many_string_data_entries_onnx(tmp_path: Path) -> Path:
     return path
 
 
+def _write_packed_float_tensor_payload_onnx(tmp_path: Path, *, count: int = 1_000_001) -> Path:
+    tensor = (
+        _proto_varint(1, count)
+        + _proto_varint(2, int(TensorProto.FLOAT))
+        + _proto_bytes(8, b"W")
+        + _proto_bytes(4, b"\x00\x00\x00\x00" * count)
+    )
+    graph = _proto_bytes(5, tensor) + _proto_bytes(2, b"packed-float")
+    model = _proto_varint(1, 8) + _proto_bytes(7, graph)
+    path = tmp_path / "packed-float.onnx"
+    path.write_bytes(model)
+    return path
+
+
 def _write_invalid_field_zero_onnx(tmp_path: Path) -> Path:
     path = tmp_path / "field-zero.onnx"
     path.write_bytes(_proto_varint(1, 8) + b"\x00")
@@ -5726,6 +5740,14 @@ def _write_aggregate_string_bomb_onnx(tmp_path: Path) -> Path:
     return path
 
 
+def _write_aggregate_sequence_entry_bomb_onnx(tmp_path: Path) -> Path:
+    node = b"".join(_proto_bytes(1, b"") for _ in range(5)) + _proto_bytes(4, b"Relu")
+    graph = _proto_bytes(1, node) + _proto_bytes(2, b"sequence-bomb")
+    path = tmp_path / "aggregate-sequence-bomb.onnx"
+    path.write_bytes(_proto_varint(1, 8) + _proto_bytes(7, graph))
+    return path
+
+
 class TestLargeOnnxFileBackedInspection:
     """Regression coverage for bounded file-backed ONNX structural scans."""
 
@@ -5783,6 +5805,27 @@ class TestLargeOnnxFileBackedInspection:
             check.status == CheckStatus.FAILED and check.severity == IssueSeverity.CRITICAL for check in python_checks
         )
         assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
+    def test_file_backed_large_onnx_skips_unbounded_integrity_hash(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = _write_sparse_raw_onnx_model(tmp_path, raw_data_size=2 * 1024 * 1024)
+
+        def _fail_hash(_scanner: OnnxScanner, _path: str) -> dict[str, str | None]:
+            raise AssertionError("file-backed ONNX scan should not hash beyond the bounded pre-parse budget")
+
+        monkeypatch.setattr(OnnxScanner, "calculate_file_hashes", _fail_hash)
+
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1024}).scan(str(model_path))
+
+        integrity_checks = self._checks(result, "File Integrity Hash")
+        assert integrity_checks[-1].status == CheckStatus.PASSED
+        assert integrity_checks[-1].details["hash_calculation_skipped"] is True
+        assert integrity_checks[-1].details["max_hash_bytes"] == 1024
+        assert result.metadata["file_hashes"] == {"md5": None, "sha256": None, "sha512": None}
+        assert result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
 
     def test_file_backed_raw_detector_budget_is_not_incomplete_when_detectors_disabled(self, tmp_path: Path) -> None:
         model_path = _write_sparse_raw_onnx_model(tmp_path, raw_data_size=2 * 1024 * 1024)
@@ -5856,6 +5899,25 @@ class TestLargeOnnxFileBackedInspection:
         assert result.success is False
         assert any(check.status == CheckStatus.FAILED and reason in str(check.details) for check in parse_checks)
         assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
+    def test_file_backed_packed_tensor_payload_counts_are_not_metadata_bombs(self, tmp_path: Path) -> None:
+        model_path = _write_packed_float_tensor_payload_onnx(tmp_path)
+
+        model, state = onnx_scanner_module._load_onnx_structure_file_backed(
+            str(model_path),
+            model_path.stat().st_size,
+        )
+        result = OnnxScanner(config={"onnx_raw_detector_max_bytes": 1}).scan(str(model_path))
+
+        assert len(model.graph.initializer[0].float_data) == 1_000_001
+        assert state.coverage_gaps == {}
+        assert result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
+        assert not any(
+            check.name == "ONNX Model Parsing"
+            and check.status == CheckStatus.FAILED
+            and "tensor_data_sequence_limit_exceeded" in str(check.details)
+            for check in result.checks
+        )
 
     def test_file_backed_wire_format_matches_in_memory_operator_detection(self, tmp_path: Path) -> None:
         model_path = create_onnx_model(
@@ -5969,6 +6031,12 @@ class TestLargeOnnxFileBackedInspection:
                 "_ONNX_STRUCTURE_MAX_RETAINED_STRING_BYTES",
                 8,
                 "retained_string_bytes_limit_exceeded",
+            ),
+            (
+                _write_aggregate_sequence_entry_bomb_onnx,
+                "_ONNX_STRUCTURE_MAX_RETAINED_SEQUENCE_ENTRIES",
+                4,
+                "retained_sequence_entries_limit_exceeded",
             ),
         ],
     )

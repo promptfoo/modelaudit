@@ -108,6 +108,7 @@ _ONNX_STRUCTURE_MAX_STRING_DATA_FIELDS = 100_000
 _ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES = 100_000
 _ONNX_STRUCTURE_MAX_FIELD_NUMBER = (1 << 29) - 1
 _ONNX_STRUCTURE_MAX_RETAINED_OBJECTS = 1_000_000
+_ONNX_STRUCTURE_MAX_RETAINED_SEQUENCE_ENTRIES = 1_000_000
 _ONNX_STRUCTURE_MAX_RETAINED_STRING_BYTES = 64 * 1024 * 1024
 _STANDARD_NEURAL_NETWORK_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
 _SAME_TYPE_ELEMENTWISE_OPERATORS: frozenset[str] = frozenset(
@@ -2715,6 +2716,7 @@ class _OnnxStructureParseState:
     tensor_count: int = 0
     graph_count: int = 0
     retained_object_count: int = 0
+    retained_sequence_entries: int = 0
     retained_string_bytes: int = 0
     string_fields_skipped: int = 0
     fields_seen: int = 0
@@ -2736,6 +2738,18 @@ class _OnnxStructureParseState:
                 f"ONNX structural parser retained object count exceeds limit ({_ONNX_STRUCTURE_MAX_RETAINED_OBJECTS})",
             )
         self.retained_object_count += 1
+
+    def record_retained_sequence_entry(self, reason: str = "retained_sequence_entries_limit_exceeded") -> None:
+        if self.retained_sequence_entries >= _ONNX_STRUCTURE_MAX_RETAINED_SEQUENCE_ENTRIES:
+            self.record_gap(reason)
+            raise _OnnxStructureParseError(
+                reason,
+                (
+                    "ONNX structural parser retained sequence entries exceed aggregate limit "
+                    f"({_ONNX_STRUCTURE_MAX_RETAINED_SEQUENCE_ENTRIES})"
+                ),
+            )
+        self.retained_sequence_entries += 1
 
     def record_retained_string(self, length: int, field_name: str) -> None:
         if length < 0 or length > _ONNX_STRUCTURE_MAX_RETAINED_STRING_BYTES - self.retained_string_bytes:
@@ -2759,6 +2773,7 @@ class _OnnxStructureParseState:
             "tensor_count": self.tensor_count,
             "graph_count": self.graph_count,
             "retained_object_count": self.retained_object_count,
+            "retained_sequence_entries": self.retained_sequence_entries,
             "retained_string_bytes": self.retained_string_bytes,
             "string_fields_skipped": self.string_fields_skipped,
             "fields_seen": self.fields_seen,
@@ -2897,6 +2912,7 @@ def _ensure_onnx_sequence_capacity(
     if len(values) >= limit:
         state.record_gap(reason)
         raise _OnnxStructureParseError(reason, f"ONNX protobuf repeated field exceeds limit ({limit})")
+    state.record_retained_sequence_entry()
 
 
 def _append_onnx_string_value(
@@ -3054,20 +3070,12 @@ def _parse_onnx_tensor(
         elif field_number == 4:
             if wire_type == 5:
                 _skip_onnx_bytes(handle, 4, end)
-                counts["float_data"] = _increment_onnx_count(
-                    counts["float_data"],
-                    1,
-                    reason="tensor_data_sequence_limit_exceeded",
-                )
+                counts["float_data"] += 1
             elif wire_type == 2:
                 length, payload_end = _read_onnx_length_bounds(handle, end)
                 if length % 4:
                     raise _OnnxStructureParseError("malformed_packed_float_data", "Packed float_data length is invalid")
-                counts["float_data"] = _increment_onnx_count(
-                    counts["float_data"],
-                    length // 4,
-                    reason="tensor_data_sequence_limit_exceeded",
-                )
+                counts["float_data"] += length // 4
                 handle.seek(payload_end)
             else:
                 _skip_onnx_unknown_field(handle, wire_type, end)
@@ -3075,21 +3083,13 @@ def _parse_onnx_tensor(
             key_name = {5: "int32_data", 7: "int64_data", 11: "uint64_data"}[field_number]
             if wire_type == 0:
                 _read_onnx_varint(handle, end)
-                counts[key_name] = _increment_onnx_count(
-                    counts[key_name],
-                    1,
-                    reason="tensor_data_sequence_limit_exceeded",
-                )
+                counts[key_name] += 1
             elif wire_type == 2:
                 _length, payload_end = _read_onnx_length_bounds(handle, end)
                 while handle.tell() < payload_end:
                     state.check_interrupted()
                     _read_onnx_varint(handle, payload_end)
-                    counts[key_name] = _increment_onnx_count(
-                        counts[key_name],
-                        1,
-                        reason="tensor_data_sequence_limit_exceeded",
-                    )
+                    counts[key_name] += 1
                 handle.seek(payload_end)
             else:
                 _skip_onnx_unknown_field(handle, wire_type, end)
@@ -3118,11 +3118,7 @@ def _parse_onnx_tensor(
         elif field_number == 10:
             if wire_type == 1:
                 _skip_onnx_bytes(handle, 8, end)
-                counts["double_data"] = _increment_onnx_count(
-                    counts["double_data"],
-                    1,
-                    reason="tensor_data_sequence_limit_exceeded",
-                )
+                counts["double_data"] += 1
             elif wire_type == 2:
                 length, payload_end = _read_onnx_length_bounds(handle, end)
                 if length % 8:
@@ -3130,11 +3126,7 @@ def _parse_onnx_tensor(
                         "malformed_packed_double_data",
                         "Packed double_data length is invalid",
                     )
-                counts["double_data"] = _increment_onnx_count(
-                    counts["double_data"],
-                    length // 8,
-                    reason="tensor_data_sequence_limit_exceeded",
-                )
+                counts["double_data"] += length // 8
                 handle.seek(payload_end)
             else:
                 _skip_onnx_unknown_field(handle, wire_type, end)
@@ -3747,6 +3739,38 @@ class OnnxScanner(BaseScanner):
             return None
         return data
 
+    def _add_onnx_file_integrity_check(
+        self,
+        path: str,
+        result: ScanResult,
+        *,
+        file_size: int,
+        max_hash_bytes: int,
+    ) -> None:
+        if file_size <= max_hash_bytes:
+            self.add_file_integrity_check(path, result)
+            return
+
+        hashes: dict[str, str | None] = {"md5": None, "sha256": None, "sha512": None}
+        result.add_check(
+            name="File Integrity Hash",
+            passed=True,
+            message="File integrity hash calculation skipped for oversized ONNX file",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "md5": None,
+                "sha256": None,
+                "sha512": None,
+                "file_size": file_size,
+                "hash_calculation_skipped": True,
+                "max_hash_bytes": max_hash_bytes,
+                "reason": "file_exceeds_onnx_hash_budget",
+            },
+        )
+        result.metadata["file_hashes"] = hashes
+        result.metadata["file_size"] = file_size
+
     def _mark_structure_parse_coverage_gaps(
         self,
         result: ScanResult,
@@ -3782,9 +3806,15 @@ class OnnxScanner(BaseScanner):
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
+        raw_detector_max_bytes = self._resolve_onnx_raw_detector_max_bytes()
 
         # Add file integrity check for compliance
-        self.add_file_integrity_check(path, result)
+        self._add_onnx_file_integrity_check(
+            path,
+            result,
+            file_size=file_size,
+            max_hash_bytes=raw_detector_max_bytes,
+        )
         self.current_file_path = path
 
         if not _check_onnx():
@@ -3824,7 +3854,6 @@ class OnnxScanner(BaseScanner):
         # structurally from the file descriptor so tensor payloads can be
         # skipped rather than materialized.
         model_data: bytes | None = None
-        raw_detector_max_bytes = self._resolve_onnx_raw_detector_max_bytes()
         check_jit = self._get_bool_config("check_jit_script", True)
         check_net = self._get_bool_config("check_network_comm", True)
         raw_detectors_enabled = check_jit or check_net
