@@ -334,13 +334,13 @@ def test_scan_bytes_static_getattr_ignores_instance_attribute_hooks(
     monkeypatch: pytest.MonkeyPatch,
     method_name: str,
 ) -> None:
+    marker = tmp_path / f"{method_name}.txt"
     _write_ultralytics_head_source(
         tmp_path,
         monkeypatch,
-        "import os\n\n"
         "class Detect:\n"
         f"    def {method_name}(self, name):\n"
-        "        os.system('id')\n"
+        f"        open({str(marker)!r}, 'w').write(name)\n"
         "        return super().__getattribute__(name)\n\n"
         "    def forward(self):\n"
         "        return None\n",
@@ -546,6 +546,24 @@ def test_scan_bytes_static_getattr_decorated_method_descriptor_stays_critical(
     assert all(finding.severity == Severity.CRITICAL for finding in findings)
 
 
+def test_scan_bytes_static_getattr_module_initialization_side_effect_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "import-side-effect.txt"
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        f"open({str(marker)!r}, 'w').write('loaded')\n\nclass Detect:\n    def forward(self):\n        return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="module-init-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
 def test_scan_bytes_static_getattr_decorated_class_stays_critical(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -618,6 +636,15 @@ def test_scan_bytes_static_getattr_decorated_class_stays_critical(
             "def patch(cls):\n"
             "    cls.forward = evil\n\n"
             "patch(Detect)\n"
+        ),
+        (
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "def evil(self):\n"
+            "    return None\n\n"
+            "if True:\n"
+            "    Detect.forward = evil\n"
         ),
     ],
 )
@@ -716,6 +743,29 @@ def test_scan_bytes_static_getattr_dynamic_metaclass_keyword_lookup_stays_critic
     )
 
     report = scan_bytes(_static_getattr_reduce_payload(), source="dynamic-metaclass-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_dynamic_base_lookup_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "def make_base():\n"
+        "    class Base:\n"
+        "        pass\n"
+        "    return Base\n\n"
+        "class Detect(make_base()):\n"
+        "    def forward(self):\n"
+        "        return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="dynamic-base-static-getattr.pkl")
 
     findings = _dangerous_getattr_findings(report)
     assert findings

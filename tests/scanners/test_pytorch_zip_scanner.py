@@ -8177,13 +8177,13 @@ def test_pytorch_zip_static_getattr_ignores_instance_attribute_hooks(
     monkeypatch: pytest.MonkeyPatch,
     method_name: str,
 ) -> None:
+    marker = tmp_path / f"{method_name}.txt"
     _write_ultralytics_head_source(
         tmp_path,
         monkeypatch,
-        "import os\n\n"
         "class Detect:\n"
         f"    def {method_name}(self, name):\n"
-        "        os.system('id')\n"
+        f"        open({str(marker)!r}, 'w').write(name)\n"
         "        return super().__getattribute__(name)\n\n"
         "    def forward(self):\n"
         "        return None\n",
@@ -8324,6 +8324,23 @@ def test_pytorch_zip_static_getattr_decorated_method_descriptor_keeps_s115(
     assert _critical_s115_getattr_issues(result)
 
 
+def test_pytorch_zip_static_getattr_module_initialization_side_effect_keeps_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "import-side-effect.txt"
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        f"open({str(marker)!r}, 'w').write('loaded')\n\nclass Detect:\n    def forward(self):\n        return None\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
 def test_pytorch_zip_static_getattr_decorated_class_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -8362,6 +8379,28 @@ def test_pytorch_zip_static_getattr_post_class_method_rewrite_keeps_s115(
         "def evil(self):\n"
         "    return None\n\n"
         "Detect.forward = evil\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
+def test_pytorch_zip_static_getattr_control_flow_post_class_rewrite_keeps_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n"
+        "    def forward(self):\n"
+        "        return None\n\n"
+        "def evil(self):\n"
+        "    return None\n\n"
+        "if True:\n"
+        "    Detect.forward = evil\n",
     )
     model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
 
@@ -8429,6 +8468,28 @@ def test_pytorch_zip_static_getattr_dynamic_metaclass_keyword_lookup_keeps_s115(
         "        os.system('id')\n"
         "        return super().__getattribute__(name)\n\n"
         "class Detect(**{'metaclass': DetectMeta}):\n"
+        "    def forward(self):\n"
+        "        return None\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
+def test_pytorch_zip_static_getattr_dynamic_base_lookup_keeps_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "def make_base():\n"
+        "    class Base:\n"
+        "        pass\n"
+        "    return Base\n\n"
+        "class Detect(make_base()):\n"
         "    def forward(self):\n"
         "        return None\n",
     )

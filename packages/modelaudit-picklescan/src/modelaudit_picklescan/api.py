@@ -1752,6 +1752,8 @@ def _getattr_reconstruction_has_source_backed_proof(invocation: Mapping[str, obj
     target_module = str(invocation.get("getattr_target_module", ""))
     target_name = str(invocation.get("getattr_target_name", ""))
     attribute_name = str(invocation.get("getattr_attribute_name", ""))
+    if not module_initialization_is_proven_inert(target_module):
+        return False
     if not class_static_attribute_lookup_is_proven_source_backed(target_module, target_name, attribute_name):
         return False
     resolved_invocation = _getattr_reconstruction_resolved_source_proof_invocation(invocation)

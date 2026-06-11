@@ -4976,13 +4976,14 @@ def _class_attribute_rebound_after_definition(context: _ClassSourceContext, attr
             continue
         if not seen_class_definition:
             continue
-        if _statement_rebinds_name(statement, context.class_node.name):
-            return True
-        if _statement_writes_class_attribute(statement, class_aliases, attribute):
-            return True
+        for candidate in _definition_scope_statements((statement,)):
+            if _statement_rebinds_name(candidate, context.class_node.name):
+                return True
+            if _statement_writes_class_attribute(candidate, class_aliases, attribute):
+                return True
+            class_aliases.update(_statement_class_alias_targets(candidate, class_aliases))
         if _statement_contains_runtime_call(statement):
             return True
-        class_aliases.update(_statement_class_alias_targets(statement, class_aliases))
     return False
 
 
