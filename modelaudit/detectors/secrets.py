@@ -18,7 +18,10 @@ logger: logging.Logger = logging.getLogger(__name__)
 BASIC_AUTH_SECRET_TYPE = "Basic Auth Credentials"
 BASIC_AUTH_TOKEN_MAX_LENGTH = 8192
 BASIC_AUTH_CONFIDENCE = 0.8
-BASIC_AUTH_PATTERN = rf"\bBasic\s+([A-Za-z0-9+/]{{2,{BASIC_AUTH_TOKEN_MAX_LENGTH}}}={{0,2}})(?![A-Za-z0-9+/=])"
+BASIC_AUTH_TOKEN_TERMINATOR = r"(?=$|[\s\"',;\]\)}])"
+BASIC_AUTH_PATTERN = (
+    rf"\bBasic\s+([A-Za-z0-9+/]{{2,{BASIC_AUTH_TOKEN_MAX_LENGTH}}}={{0,2}}){BASIC_AUTH_TOKEN_TERMINATOR}"
+)
 BASIC_AUTH_HEADER_VALUE_CONTEXT_MAX_BYTES = BASIC_AUTH_TOKEN_MAX_LENGTH + 64
 
 # High-priority secret patterns with descriptions

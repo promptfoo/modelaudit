@@ -198,6 +198,7 @@ class TestSecretsDetector:
             "Authorization: Basic dXNl cjpwYXNz",
             "Proxy-Authorization: Basic Og==",
             "X-Authorization: Basic dXNlcjpwYXNz",
+            "Authorization: Basic dXNlcjpwYXNz-extra",
             f"Authorization notes:\n  Basic {_basic_auth_token(b'wrapped:pass')}",
             f"Authorization: documented value\n  Basic {_basic_auth_token(b'wrapped:pass')}",
             f"Authorization notes:\n  - Basic {_basic_auth_token(b'listed:pass')}",
