@@ -402,7 +402,7 @@ def _remote_safetensors_payload_overlap_gap_scanner_ids(
     if header_len <= 0 or header_len > declared_size - 8 or declared_size <= 8 + header_len:
         return []
     if active_scanner_ids is None:
-        return sorted(_HF_SAFETENSORS_PAYLOAD_OVERLAP_SCANNER_IDS)
+        return []
 
     active = {str(scanner_id).lower() for scanner_id in active_scanner_ids}
     return sorted(_HF_SAFETENSORS_PAYLOAD_OVERLAP_SCANNER_IDS.intersection(active))
@@ -2386,7 +2386,10 @@ def get_model_info(url: str) -> dict:
         total_size = 0
         files = []
         try:
-            repo_files = api.list_repo_tree(repo_id, recursive=False)
+            repo_tree_kwargs: dict[str, Any] = {"recursive": False}
+            if requested_revision is not None:
+                repo_tree_kwargs["revision"] = requested_revision
+            repo_files = api.list_repo_tree(repo_id, **repo_tree_kwargs)
             for item in repo_files:
                 # Skip metadata files
                 if hasattr(item, "path") and item.path not in [".gitattributes", "README.md"]:

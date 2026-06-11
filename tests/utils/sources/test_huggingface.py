@@ -3099,6 +3099,53 @@ class TestModelDownloadStreaming:
 
     @patch("huggingface_hub.hf_hub_download")
     @patch("huggingface_hub.utils.build_hf_headers", return_value={})
+    @patch("huggingface_hub.hf_hub_url", return_value="https://huggingface.co/test/model/resolve/rev/model.safetensors")
+    @patch("requests.get")
+    def test_download_model_streaming_default_scanners_do_not_assume_payload_overlap(
+        self,
+        mock_requests_get: MagicMock,
+        _mock_hf_hub_url: MagicMock,
+        _mock_build_headers: MagicMock,
+        mock_hf_hub_download: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Header-only mode should fail closed on evidence, not every ordinary tensor payload."""
+        filename = "model-00001-of-00001.safetensors"
+        frame, header_len = _make_safetensors_frame(
+            {"tensor": {"dtype": "U8", "shape": [4], "data_offsets": [0, 4]}},
+            b"data",
+        )
+        declared_size = len(frame)
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            lambda *_args, **_kwargs: ([filename], _HF_TEST_REVISION, None),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: ({filename: declared_size}, _HF_TEST_REVISION),
+        )
+        mock_requests_get.side_effect = [
+            _strict_range_response(frame[:8], declared_size),
+            _strict_range_response(frame[: 8 + header_len], declared_size),
+        ]
+
+        results = list(
+            download_model_streaming(
+                f"hf://test/model?revision={_HF_TEST_REVISION}",
+                max_size=1024,
+                scannable_extensions={".safetensors"},
+            )
+        )
+
+        _path, _is_last, scan_result = cast(tuple[Path, bool, Any], results[0])
+        assert scan_result.success is True
+        assert "remote_overlap_scanner_ids" not in scan_result.metadata
+        assert scan_result.metadata["tensor_payload_bytes_downloaded"] == 0
+        assert mock_requests_get.call_count == 2
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("huggingface_hub.hf_hub_download")
+    @patch("huggingface_hub.utils.build_hf_headers", return_value={})
     @patch("huggingface_hub.hf_hub_url")
     @patch("requests.get")
     def test_download_model_streaming_uses_safetensors_index_for_nonstandard_shards(
@@ -4115,6 +4162,25 @@ class TestGetModelInfo:
         assert info["author"] == "test-author"
         assert info["total_size"] == 100
         assert info["file_count"] == 1
+        mock_api.list_repo_tree.assert_called_once_with("test/model", recursive=False)
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_info_pins_tree_to_requested_revision(self, mock_hf_api_class: MagicMock) -> None:
+        """Metadata display should describe the same immutable revision as downloads."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.model_info.return_value = SimpleNamespace(modelId="test/model", author="test-author")
+        mock_api.list_repo_tree.return_value = [SimpleNamespace(path="model.safetensors", size=123)]
+
+        info = get_model_info(f"hf://test/model?revision={_HF_TEST_REVISION}")
+
+        assert info["total_size"] == 123
+        mock_api.model_info.assert_called_once_with("test/model", revision=_HF_TEST_REVISION)
+        mock_api.list_repo_tree.assert_called_once_with(
+            "test/model",
+            recursive=False,
+            revision=_HF_TEST_REVISION,
+        )
 
     @patch("huggingface_hub.HfApi")
     def test_get_model_info_without_author(self, mock_hf_api_class):
