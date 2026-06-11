@@ -1740,14 +1740,18 @@ def test_large_legacy_pytorch_container_defers_file_size_limit(tmp_path: Path) -
 
     result = PickleScanner(config={"max_file_read_size": 256}).scan(str(path))
 
-    assert result.success is True
+    assert result.success is False
     assert result.metadata["legacy_pytorch_container"] is True
     assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
     assert result.metadata["legacy_pytorch_storage_payload_skipped"] is True
     assert result.metadata["legacy_pytorch_bounded_analysis"] is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "legacy_pytorch_storage_payload_skipped" in result.metadata["scan_outcome_reasons"]
     assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
     bounded_check = next(check for check in result.checks if check.name == "Legacy PyTorch Bounded Analysis")
+    coverage_check = next(check for check in result.checks if check.name == "Legacy PyTorch Storage Payload Coverage")
     assert bounded_check.status == CheckStatus.PASSED
+    assert coverage_check.status == CheckStatus.FAILED
     assert bounded_check.details["max_file_read_size"] == 256
     assert bounded_check.details["tensor_storage_materialized"] is False
 
@@ -1762,10 +1766,48 @@ def test_large_legacy_pytorch_malicious_control_still_fails(tmp_path: Path) -> N
 
     result = PickleScanner(config={"max_file_read_size": 256}).scan(str(path))
 
+    assert result.success is False
     assert result.metadata["legacy_pytorch_bounded_analysis"] is True
+    assert "legacy_pytorch_storage_payload_skipped" in result.metadata["scan_outcome_reasons"]
     assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(issue.details.get("import_reference") == EXPECTED_SYSTEM_GLOBAL for issue in result.issues)
+
+
+def test_regular_scan_defers_oversized_raw_legacy_pytorch_content_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit import core
+
+    payload, _pickle_end = _make_legacy_pytorch_container(b"A" * 512)
+    path = tmp_path / "legacy-large.pt"
+    path.write_bytes(payload)
+
+    def fail_hash(candidate: str) -> str:
+        if candidate == str(path):
+            pytest.fail("oversized raw legacy PyTorch file was hashed before bounded scan dispatch")
+        return "a" * 64
+
+    monkeypatch.setattr(core, "_calculate_file_hash", fail_hash)
+
+    result = scan_model_directory_or_file(
+        str(path),
+        max_file_size=10_000,
+        max_file_read_size=256,
+        cache_enabled=False,
+    )
+
+    metadata = result.file_metadata[str(path)].model_dump(mode="python")
+
+    assert result.success is True
+    assert result.content_hash is None
+    assert metadata["file_hashes"]["sha256"] is None
+    assert isinstance(metadata["file_hashes"]["sha256_prefix"], str)
+    assert metadata["legacy_pytorch_bounded_analysis"] is True
+    assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "legacy_pytorch_storage_payload_skipped" in metadata["scan_outcome_reasons"]
+    assert determine_exit_code(result) == 1
 
 
 def test_large_non_legacy_pytorch_suffix_keeps_file_size_limit(tmp_path: Path) -> None:
@@ -1846,10 +1888,12 @@ def test_large_seekable_legacy_pytorch_stream_defers_file_size_limit() -> None:
         source="legacy-large-stream.pt",
     )
 
-    assert result.success is True
+    assert result.success is False
     assert result.metadata["legacy_pytorch_container"] is True
     assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
     assert result.metadata["legacy_pytorch_bounded_analysis"] is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "legacy_pytorch_storage_payload_skipped" in result.metadata["scan_outcome_reasons"]
     assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
     assert stream.tell() == 0
     integrity_check = next(check for check in result.checks if check.name == "File Integrity Check")
@@ -1874,11 +1918,13 @@ def test_large_non_seekable_legacy_pytorch_stream_uses_stream_budget_not_file_ca
         source="legacy-large-nonseekable.pt",
     )
 
-    assert result.success is True
+    assert result.success is False
     assert result.metadata["legacy_pytorch_container"] is True
     assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
     assert result.metadata["pickle_stream_bytes_buffered"] == len(payload)
     assert result.metadata["pickle_stream_bytes_buffered"] > 64
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "legacy_pytorch_storage_payload_skipped" in result.metadata["scan_outcome_reasons"]
     assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
 
 
@@ -1944,11 +1990,13 @@ def test_sparse_multigib_legacy_pytorch_file_uses_prefix_hash(tmp_path: Path) ->
 
     result = PickleScanner(config={"pickle_root_raw_scan_limit_bytes": 4096}).scan(str(path))
 
-    assert result.success is True
+    assert result.success is False
     assert result.metadata["legacy_pytorch_container"] is True
     assert result.metadata["legacy_pytorch_storage_payload_skipped"] is True
     assert result.metadata["legacy_pytorch_storage_end"] == file_size
     assert result.metadata["legacy_pytorch_bounded_analysis_file_size"] == file_size
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "legacy_pytorch_storage_payload_skipped" in result.metadata["scan_outcome_reasons"]
     integrity_check = next(check for check in result.checks if check.name == "File Integrity Check")
     assert integrity_check.details["hash_complete"] is False
     assert integrity_check.details["bytes_hashed"] == 4096
@@ -1982,11 +2030,12 @@ def test_large_legacy_pytorch_file_validates_storage_headers_beyond_control_prob
         }
     ).scan(str(path))
 
-    assert result.success is True
+    assert result.success is False
     assert result.metadata["legacy_pytorch_container"] is True
     assert result.metadata["legacy_pytorch_storage_key_count"] == 2
     assert result.metadata["legacy_pytorch_storage_end"] == file_size
     assert result.metadata["legacy_pytorch_bounded_analysis"] is True
+    assert "legacy_pytorch_storage_payload_skipped" in result.metadata["scan_outcome_reasons"]
     assert "legacy_pytorch_storage_layout_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
 
 
@@ -2083,11 +2132,13 @@ def test_non_seekable_legacy_pytorch_stream_omits_only_raw_storage() -> None:
         source="legacy-storage.pt",
     )
 
-    assert result.success is True
+    assert result.success is False
     assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
     assert result.metadata["legacy_pytorch_storage_end"] == len(payload)
     assert result.metadata["legacy_pytorch_storage_scan_bounded"] is True
     assert result.metadata["legacy_pytorch_storage_bytes_buffered"] == 256 - pickle_end
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "legacy_pytorch_storage_payload_skipped" in result.metadata["scan_outcome_reasons"]
     assert "non_seekable_stream_truncated" not in result.metadata.get("scan_outcome_reasons", [])
     assert not any(check.name == "Pickle Stream Read Limit" for check in result.checks)
     assert not any(check.name == "Legacy PyTorch Storage Layout" for check in result.checks)
@@ -2128,8 +2179,9 @@ def test_non_seekable_legacy_pytorch_stream_scans_malicious_control_pickle() -> 
         source="legacy-malicious-storage.pt",
     )
 
-    assert result.success is True
+    assert result.success is False
     assert result.metadata["legacy_pytorch_storage_scan_bounded"] is True
+    assert "legacy_pytorch_storage_payload_skipped" in result.metadata["scan_outcome_reasons"]
     assert "non_seekable_stream_truncated" not in result.metadata.get("scan_outcome_reasons", [])
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(issue.details.get("import_reference") == EXPECTED_SYSTEM_GLOBAL for issue in result.issues)

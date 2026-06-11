@@ -2323,6 +2323,40 @@ class PickleScanner(BaseScanner):
         )
         result.finish(success=False)
 
+    def _mark_legacy_pytorch_storage_payload_incomplete(
+        self,
+        result: ScanResult,
+        layout: _LegacyPyTorchStreamLayout,
+        source: str,
+        *,
+        file_size: int | None,
+        position_offset: int = 0,
+    ) -> None:
+        if layout.storage_key_count <= 0 or layout.storage_end is None:
+            return
+        reason = "legacy_pytorch_storage_payload_skipped"
+        mark_inconclusive_scan_result(result, reason)
+        result.metadata["legacy_pytorch_storage_payload_incomplete"] = True
+        result.add_check(
+            name="Legacy PyTorch Storage Payload Coverage",
+            passed=False,
+            message="Legacy PyTorch tensor storage was skipped by bounded analysis",
+            severity=IssueSeverity.INFO,
+            location=source,
+            details={
+                "file_size": file_size,
+                "storage_key_count": layout.storage_key_count,
+                "storage_start": position_offset + layout.pickle_end,
+                "storage_end": position_offset + layout.storage_end,
+                "max_file_read_size": self.max_file_read_size,
+                "tensor_storage_materialized": False,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+            rule_code="S902",
+        )
+        result.finish(success=False)
+
     @staticmethod
     def _mark_legacy_pytorch_control_layout_incomplete(
         result: ScanResult,
@@ -3857,6 +3891,14 @@ class PickleScanner(BaseScanner):
                         source,
                         file_size=standalone_size,
                     )
+                    if deferred_size_check is not None:
+                        self._mark_legacy_pytorch_storage_payload_incomplete(
+                            result,
+                            legacy_layout,
+                            source,
+                            file_size=standalone_size,
+                            position_offset=start_position,
+                        )
                     suffix_raw_limit = max(self._root_raw_scan_limit() - len(raw_data), 0)
                     try:
                         suffix_raw_data = self._scan_legacy_pytorch_seekable_suffix(
@@ -3941,6 +3983,13 @@ class PickleScanner(BaseScanner):
                         source,
                         file_size=standalone_size,
                     )
+                    if deferred_size_check is not None:
+                        self._mark_legacy_pytorch_storage_payload_incomplete(
+                            result,
+                            legacy_layout,
+                            source,
+                            file_size=standalone_size,
+                        )
                     suffix = payload[legacy_layout.storage_end :]
                     self._scan_legacy_pytorch_suffix_bytes(
                         result,
@@ -3981,6 +4030,12 @@ class PickleScanner(BaseScanner):
                 result.metadata["legacy_pytorch_storage_bytes_buffered"] = max(
                     min(len(payload), legacy_layout.storage_end) - legacy_layout.pickle_end,
                     0,
+                )
+                self._mark_legacy_pytorch_storage_payload_incomplete(
+                    result,
+                    legacy_layout,
+                    source,
+                    file_size=standalone_size,
                 )
             else:
                 self._add_stream_truncation_check(stream_read, result, source, standalone_size)
@@ -4112,6 +4167,13 @@ class PickleScanner(BaseScanner):
                         path,
                         file_size=file_size,
                     )
+                    if deferred_size_check is not None:
+                        self._mark_legacy_pytorch_storage_payload_incomplete(
+                            scan_result,
+                            legacy_layout,
+                            path,
+                            file_size=file_size,
+                        )
                     suffix_raw_limit = max(self._root_raw_scan_limit() - len(detector_data), 0)
                     suffix_raw_data = self._scan_legacy_pytorch_file_suffix(
                         scan_result,

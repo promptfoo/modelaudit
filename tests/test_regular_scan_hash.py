@@ -417,6 +417,30 @@ class TestHashGenerationEdgeCases:
 
         assert content_hashes[str(zip_path)].startswith("unhashable_pytorch_zip_read_limit_")
 
+    def test_hash_files_by_path_defers_oversized_pytorch_zip_ckpt_read_limit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """All PyTorchZipScanner suffixes should use bounded ZIP hash deferral."""
+        from modelaudit import core
+
+        zip_path = create_mock_pytorch_zip(tmp_path / "large.ckpt")
+        with zip_path.open("ab") as handle:
+            handle.write(b"A" * 2048)
+
+        def fail_hash(path: str) -> str:
+            if path == str(zip_path):
+                pytest.fail("oversized PyTorch ZIP .ckpt was content-hashed before bounded scan dispatch")
+            return "a" * 64
+
+        monkeypatch.setattr(core, "_calculate_file_hash", fail_hash)
+
+        content_hashes = core._hash_files_by_path(
+            [str(zip_path)],
+            config={"max_file_read_size": 64},
+        )
+
+        assert content_hashes[str(zip_path)].startswith("unhashable_pytorch_zip_read_limit_")
+
     def test_single_file_scan_defers_oversized_pytorch_zip_content_hash(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

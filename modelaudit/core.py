@@ -1729,20 +1729,21 @@ def _should_defer_hash_for_max_file_size(file_path: str, config: dict[str, Any])
     return file_size > max_file_size and not should_use_advanced_handler(file_path)
 
 
+_PYTORCH_HASH_DEFERRAL_EXTENSIONS = {".bin", ".ckpt", ".pkl", ".pt", ".pth"}
+
+
+def _max_file_read_size_for_hash_deferral(config: dict[str, Any]) -> int:
+    try:
+        return int(config.get("max_file_read_size", BaseScanner.default_max_file_read_size) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _should_defer_hash_for_pytorch_zip_read_limit(file_path: str, config: dict[str, Any]) -> bool:
     """Avoid full-file aggregate hashing for oversized ZIP-backed PyTorch containers."""
-    if Path(file_path).suffix.lower() not in {".bin", ".pt", ".pth"}:
+    if Path(file_path).suffix.lower() not in _PYTORCH_HASH_DEFERRAL_EXTENSIONS:
         return False
-    try:
-        max_file_read_size = int(
-            config.get(
-                "max_file_read_size",
-                BaseScanner.default_max_file_read_size,
-            )
-            or 0
-        )
-    except (TypeError, ValueError):
-        return False
+    max_file_read_size = _max_file_read_size_for_hash_deferral(config)
     if max_file_read_size <= 0:
         return False
 
@@ -1759,6 +1760,42 @@ def _should_defer_hash_for_pytorch_zip_read_limit(file_path: str, config: dict[s
         return is_pytorch_zip_archive(file_path, config)
     except Exception:
         return True
+
+
+def _should_defer_hash_for_legacy_pytorch_read_limit(file_path: str, config: dict[str, Any]) -> bool:
+    """Avoid full-file aggregate hashing for oversized raw legacy PyTorch containers."""
+    if Path(file_path).suffix.lower() not in _PYTORCH_HASH_DEFERRAL_EXTENSIONS:
+        return False
+    max_file_read_size = _max_file_read_size_for_hash_deferral(config)
+    if max_file_read_size <= 0:
+        return False
+
+    try:
+        file_size = os.path.getsize(file_path)
+    except OSError:
+        return False
+    if file_size <= max_file_read_size:
+        return False
+
+    try:
+        from modelaudit.scanners.pickle_scanner import PickleScanner
+
+        scanner = PickleScanner(config=config)
+        with open(file_path, "rb") as handle:
+            control_probe = handle.read(scanner._legacy_pytorch_control_probe_size(file_size))
+
+            def read_at(local_offset: int, size: int) -> bytes:
+                handle.seek(local_offset)
+                return handle.read(size)
+
+            legacy_layout, legacy_storage_valid = scanner._legacy_pytorch_layout_for_scan(
+                control_probe,
+                total_size=file_size,
+                read_at=read_at,
+            )
+    except Exception:
+        return False
+    return legacy_layout is not None and legacy_storage_valid
 
 
 def _should_defer_hash_for_max_total_size(
@@ -1782,6 +1819,7 @@ def _is_incomplete_aggregate_hash_placeholder(content_hash: str) -> bool:
         (
             "unhashable_max_file_size_",
             "unhashable_max_total_size_",
+            "unhashable_legacy_pytorch_read_limit_",
             "unhashable_pytorch_zip_read_limit_",
         )
     )
@@ -1817,6 +1855,9 @@ def _hash_files_by_path(
             continue
         if _should_defer_hash_for_pytorch_zip_read_limit(routing_path, hash_config):
             content_hashes[file_path] = f"unhashable_pytorch_zip_read_limit_{id(file_path)}"
+            continue
+        if _should_defer_hash_for_legacy_pytorch_read_limit(routing_path, hash_config):
+            content_hashes[file_path] = f"unhashable_legacy_pytorch_read_limit_{id(file_path)}"
             continue
         if _should_defer_hash_for_max_file_size(routing_path, hash_config):
             content_hashes[file_path] = f"unhashable_max_file_size_{id(file_path)}"
@@ -3147,10 +3188,15 @@ def scan_model_directory_or_file(
                 )
                 defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(target, config)
                 defer_hash_for_pytorch_zip_read_limit = _should_defer_hash_for_pytorch_zip_read_limit(target, config)
+                defer_hash_for_legacy_pytorch_read_limit = _should_defer_hash_for_legacy_pytorch_read_limit(
+                    target,
+                    config,
+                )
                 if (
                     defer_hash_for_max_total_size
                     or defer_hash_for_max_file_size
                     or defer_hash_for_pytorch_zip_read_limit
+                    or defer_hash_for_legacy_pytorch_read_limit
                 ):
                     aggregate_hash_complete = False
                 if (
@@ -3158,6 +3204,7 @@ def scan_model_directory_or_file(
                     and not defer_hash_for_max_file_size
                     and not defer_hash_for_max_total_size
                     and not defer_hash_for_pytorch_zip_read_limit
+                    and not defer_hash_for_legacy_pytorch_read_limit
                 ):
                     try:
                         top_level_hashing_started_at = _start_phase_timing(phase_timings)
@@ -4503,10 +4550,15 @@ def scan_model_streaming(
                     str(scan_path),
                     scan_config,
                 )
+                defer_hash_for_legacy_pytorch_read_limit = _should_defer_hash_for_legacy_pytorch_read_limit(
+                    str(scan_path),
+                    scan_config,
+                )
                 if (
                     defer_hash_for_max_total_size
                     or defer_hash_for_max_file_size
                     or defer_hash_for_pytorch_zip_read_limit
+                    or defer_hash_for_legacy_pytorch_read_limit
                 ):
                     aggregate_hash_complete = False
                 if (
@@ -4514,6 +4566,7 @@ def scan_model_streaming(
                     and not defer_hash_for_max_file_size
                     and not defer_hash_for_max_total_size
                     and not defer_hash_for_pytorch_zip_read_limit
+                    and not defer_hash_for_legacy_pytorch_read_limit
                 ):
                     if progress_callback:
                         progress_callback(
