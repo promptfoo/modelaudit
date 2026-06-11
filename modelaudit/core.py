@@ -3075,6 +3075,15 @@ def scan_model_directory_or_file(
                         if not record_dvc_directory_special_file(file_path_obj):
                             record_non_regular_directory_entry(file_path_obj)
                         continue
+                    trusted_owner_content_source = directory_owner_content_source_paths.get(
+                        str(Path(os.path.abspath(file_path_obj)))
+                    )
+                    if (
+                        is_directory_owner_source
+                        and trusted_owner_content_source is not None
+                        and str(resolved_file) == trusted_owner_content_source
+                    ):
+                        continue
                     snapshot_path = Path(file_path).absolute()
                     snapshot_shard_family_key = _shard_family_key_for_path(str(snapshot_path))
                     route_hf_shard_alias = (
@@ -3548,15 +3557,29 @@ def scan_model_directory_or_file(
                 recorded_content_hashes: set[str] = set()
                 if directory_owner_class is not None and directory_owner_result is None:
                     child_owner_relative_parts: set[tuple[str, ...]] = set()
+                    child_content_sources: set[str] = set()
                     for child_source in hash_source_by_path.values():
                         try:
-                            child_owner_relative_parts.add(Path(child_source).resolve().relative_to(base_dir).parts)
-                        except (OSError, ValueError):
+                            child_content_source = Path(child_source).resolve(strict=True)
+                        except (OSError, RuntimeError):
                             continue
+                        child_content_sources.add(str(child_content_source))
+                        try:
+                            child_owner_relative_parts.add(child_content_source.relative_to(base_dir).parts)
+                        except ValueError:
+                            continue
+
+                    def owner_source_covered_by_child(source: str) -> bool:
+                        if Path(os.path.relpath(source, owner_root_path)).parts in child_owner_relative_parts:
+                            return True
+                        try:
+                            owner_content_path = Path(owner_content_source(source)).resolve(strict=True)
+                        except (OSError, RuntimeError):
+                            return False
+                        return str(owner_content_path) in child_content_sources
+
                     owner_only_sources = [
-                        source
-                        for source in owner_sources
-                        if Path(os.path.relpath(source, owner_root_path)).parts not in child_owner_relative_parts
+                        source for source in owner_sources if not owner_source_covered_by_child(source)
                     ]
 
                     if owner_block_reason is None:

@@ -1,11 +1,13 @@
 """Test HuggingFace cache symlink handling."""
 
+import json
 import os
 from pathlib import Path
 
 import pytest
 
 from modelaudit.core import scan_model_directory_or_file
+from modelaudit.scanner_results import CheckStatus
 from modelaudit.scanners.base import IssueSeverity
 
 
@@ -86,6 +88,40 @@ class TestHuggingFaceSymlinks:
         ]
         assert results.files_scanned == 1
         assert len(path_traversal_issues) == 0
+
+    def test_hf_orbax_owner_symlink_blob_scanned_once(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Trusted HF owner aliases should not duplicate backing blob accounting or findings."""
+        hf_home = tmp_path / ".cache" / "huggingface"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+        cache_dir = hf_home / "hub" / "models--org--orbax"
+        snapshots_dir = cache_dir / "snapshots" / "abc123"
+        blobs_dir = cache_dir / "blobs"
+        snapshots_dir.mkdir(parents=True)
+        blobs_dir.mkdir(parents=True)
+
+        metadata_blob = blobs_dir / "metadata-blob"
+        metadata_payload = json.dumps(
+            {"type": "orbax_checkpoint", "restore_fn": "os.system"},
+            separators=(",", ":"),
+        )
+        metadata_blob.write_text(metadata_payload, encoding="utf-8")
+        metadata_link = snapshots_dir / "metadata.json"
+        os.symlink("../../blobs/metadata-blob", metadata_link)
+
+        results = scan_model_directory_or_file(str(snapshots_dir))
+
+        restore_checks = [check for check in results.checks if check.name == "Orbax Restore Function Check"]
+        assert results.files_scanned == 1
+        assert results.bytes_scanned == metadata_blob.stat().st_size
+        assert len(restore_checks) == 1
+        assert restore_checks[0].status == CheckStatus.FAILED
+        assert restore_checks[0].severity == IssueSeverity.CRITICAL
+        assert restore_checks[0].location == str(metadata_link)
+        assert restore_checks[0].details["restore_fn"] == "os.system"
 
     def test_malicious_symlink_outside_cache(self, tmp_path):
         """Test that symlinks pointing outside the cache structure are still caught."""
