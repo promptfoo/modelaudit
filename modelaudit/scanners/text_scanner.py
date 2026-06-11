@@ -213,6 +213,10 @@ DOCUMENTATION_NESTED_CONFIG_VALUE_LINE_PATTERN = re.compile(
     rb"[ \t]+(?:[-*+]\s+)?[\"']?(?:url|uri)[\"']?\s*:\s*[\"']?",
     re.IGNORECASE,
 )
+DOCUMENTATION_NESTED_CONFIG_LIST_ITEM_PATTERN = re.compile(
+    rb"[ \t]+[-*+]\s+\S.*",
+    re.IGNORECASE,
+)
 DOCUMENTATION_CONFIG_TAG_PATTERN = re.compile(
     rb"<(?:endpoint|callback|webhook)(?:[-_:][A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*)?>\s*$",
     re.IGNORECASE,
@@ -1019,21 +1023,44 @@ class TextScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _documentation_nested_config_is_actionable(prefix: bytes) -> bool:
+    def _documentation_line_indent(line: bytes) -> int:
+        return len(line) - len(line.lstrip(b" \t"))
+
+    @classmethod
+    def _documentation_nested_config_is_actionable(cls, prefix: bytes) -> bool:
         if DOCUMENTATION_NESTED_CONFIG_OBJECT_PATTERN.search(prefix) is not None:
             return True
         lines = prefix.splitlines()
         if len(lines) < 2:
             return False
-        parent_line, value_line = lines[-2:]
-        if (
-            DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(parent_line) is None
-            or DOCUMENTATION_NESTED_CONFIG_VALUE_LINE_PATTERN.fullmatch(value_line) is None
-        ):
+        value_line = lines[-1]
+        if DOCUMENTATION_NESTED_CONFIG_VALUE_LINE_PATTERN.fullmatch(value_line) is None:
             return False
-        parent_indent = len(parent_line) - len(parent_line.lstrip(b" \t"))
-        value_indent = len(value_line) - len(value_line.lstrip(b" \t"))
-        return value_indent > parent_indent
+        value_indent = cls._documentation_line_indent(value_line)
+        for line_index in range(len(lines) - 2, -1, -1):
+            line = lines[line_index]
+            if not line.strip():
+                return False
+            line_indent = cls._documentation_line_indent(line)
+            if line_indent >= value_indent:
+                continue
+            if DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(line) is not None:
+                return value_indent > line_indent
+            if DOCUMENTATION_NESTED_CONFIG_LIST_ITEM_PATTERN.fullmatch(line) is not None:
+                for parent_index in range(line_index - 1, -1, -1):
+                    parent_line = lines[parent_index]
+                    if not parent_line.strip():
+                        return False
+                    parent_indent = cls._documentation_line_indent(parent_line)
+                    if parent_indent >= line_indent:
+                        continue
+                    return (
+                        value_indent > line_indent
+                        and DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(parent_line) is not None
+                    )
+                return False
+            return False
+        return False
 
     @staticmethod
     def _documentation_assignment_is_actionable(prefix: bytes) -> bool:
