@@ -4172,6 +4172,14 @@ def scan_command(
         severity=severity,
         scan_start_time=scan_start_time,
     )
+    if dry_run and huggingface_preview_paths and runtime.output_format == "sarif":
+        click.echo(
+            "Error: Hugging Face dry-run previews support text or json output, not sarif",
+            err=True,
+        )
+        record_scan_failed(time.time() - scan_start_time, "Unsupported Hugging Face dry-run preview output")
+        flush_telemetry()
+        sys.exit(2)
     _show_scan_runtime_defaults(
         runtime,
         expanded_paths,
@@ -4281,6 +4289,10 @@ def scan_command(
     if dry_run and huggingface_preview_paths and path_state.has_no_scan_content(audit_result):
         try:
             try:
+                if audit_result.has_errors:
+                    record_scan_failed(time.time() - scan_start_time, "Dry-run preview completed with errors")
+                    flush_telemetry()
+                    sys.exit(2)
                 if path_state.dry_run_previews:
                     output_text = _format_huggingface_dry_run_previews(
                         path_state.dry_run_previews, runtime.output_format
@@ -4296,10 +4308,6 @@ def scan_command(
             record_scan_failed(time.time() - scan_start_time, "Unable to write scan output")
             flush_telemetry()
             raise
-        if audit_result.has_errors:
-            record_scan_failed(time.time() - scan_start_time, "Dry-run preview completed with errors")
-            flush_telemetry()
-            sys.exit(2)
         record_scan_completed(time.time() - scan_start_time, {"dry_run": True, "previews": path_state.dry_run_previews})
         flush_telemetry()
         sys.exit(0)

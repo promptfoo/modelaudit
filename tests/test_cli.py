@@ -4255,6 +4255,87 @@ def test_scan_huggingface_streaming_dry_run_rejects_mixed_scan_inputs(tmp_path: 
     mock_scan_local.assert_not_called()
 
 
+def test_scan_huggingface_streaming_dry_run_rejects_sarif_before_metadata() -> None:
+    """SARIF is a scan-result format, not a metadata-only HF preview format."""
+    with (
+        patch("modelaudit.utils.sources.huggingface.get_model_info") as mock_get_model_info,
+        patch("modelaudit.cli._get_huggingface_file_metadata") as mock_get_file_metadata,
+        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
+        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.download_file_from_hf") as mock_download_file,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--dry-run", "--stream", "--format", "sarif", "hf://test/model"],
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 2
+    assert "support text or json output, not sarif" in result.output
+    assert "Dry run preview" not in result.output
+    assert "runs" not in result.output
+    mock_get_model_info.assert_not_called()
+    mock_get_file_metadata.assert_not_called()
+    mock_download_streaming.assert_not_called()
+    mock_scan_streaming.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_download_file.assert_not_called()
+    mock_scan_local.assert_not_called()
+    mock_format_scan_output.assert_not_called()
+
+
+def test_scan_huggingface_streaming_dry_run_metadata_failure_suppresses_partial_output(tmp_path: Path) -> None:
+    """A later metadata failure must not emit or write earlier successful previews."""
+    output_file = tmp_path / "preview.json"
+    with (
+        patch(
+            "modelaudit.utils.sources.huggingface.get_model_info",
+            side_effect=[
+                {
+                    "repo_id": "test/model-a",
+                    "model_id": "test/model-a",
+                    "total_size": 1234,
+                    "file_count": 2,
+                },
+                RuntimeError("metadata unavailable for https://huggingface.co/test/model-b\nFORGED"),
+            ],
+        ),
+        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
+        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--stream",
+                "--format",
+                "json",
+                "--output",
+                str(output_file),
+                "hf://test/model-a",
+                "hf://test/model-b",
+            ],
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 2
+    assert "Error previewing model" in result.output
+    assert "Preview written to" not in result.output
+    assert not output_file.exists()
+    mock_download_streaming.assert_not_called()
+    mock_scan_streaming.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_scan_local.assert_not_called()
+    mock_format_scan_output.assert_not_called()
+
+
 def test_scan_huggingface_streaming_dry_run_text_escapes_metadata() -> None:
     """Human-readable dry-run previews should escape model-controlled metadata."""
     with (
