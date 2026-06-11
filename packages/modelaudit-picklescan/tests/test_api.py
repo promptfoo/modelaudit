@@ -6352,6 +6352,30 @@ def test_safe_numpy_ndarray_reconstruct_dataflow_fails_closed_after_opcode_cap(
     )
 
 
+def test_safe_numpy_ndarray_reconstruct_dataflow_fails_closed_on_unsafe_follow_on_stream() -> None:
+    safe_payload = _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD.replace(
+        b"cnumpy._core.multiarray\n_reconstruct\n",
+        b"cnumpy.core.multiarray\n_reconstruct\n",
+    )
+    unsafe_follow_on = safe_payload.replace(
+        b"cnumpy\nndarray\n",
+        b"cbuiltins\neval\n",
+    )
+    payload = safe_payload + unsafe_follow_on
+
+    assert not package_api._pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload)
+
+    report = scan_bytes(payload, source="safe-numpy-with-unsafe-follow-on.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.rule_code in {"DANGEROUS_CALL_GRAPH", "DANGEROUS_GLOBAL"}
+        and finding.details.get("import_reference") in {"numpy.core.multiarray._reconstruct", "builtins.eval"}
+        for finding in report.findings
+    )
+
+
 def test_safe_numpy_reconstruct_call_graph_suppression_requires_trusted_origin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
