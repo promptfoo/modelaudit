@@ -34,6 +34,7 @@ from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, Iss
 from modelaudit.scanners.tar_scanner import TarScanner
 from modelaudit.scanners.xgboost_scanner import XGBOOST_JSON_ROUTING_CHUNK_BYTES, XGBoostScanner
 from modelaudit.scanners.zip_scanner import ZipScanner
+from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
     detect_file_format,
     detect_file_format_for_skip_filter,
@@ -96,6 +97,17 @@ def _sentencepiece_model_proto() -> bytes:
         ("<0x04>", 6),
     ]
     return b"".join(_sentencepiece_piece(piece, piece_type) for piece, piece_type in pieces)
+
+
+def _sentencepiece_model_proto_with_trainer_varint_field_52() -> bytes:
+    trainer_spec = (
+        _proto_field(3, 0, _proto_varint(1))
+        + _proto_field(4, 0, _proto_varint(64))
+        + _proto_field(40, 0, _proto_varint(0))
+        + _proto_field(45, 2, _proto_varint(len(b"<unk>")) + b"<unk>")
+        + _proto_field(52, 0, _proto_varint(7))
+    )
+    return _sentencepiece_model_proto() + _proto_field(2, 2, _proto_varint(len(trainer_spec)) + trainer_spec)
 
 
 def _large_real_sentencepiece_model_proto_shape() -> bytes:
@@ -414,9 +426,25 @@ class TestXGBoostScannerBasic:
 
         assert not XGBoostScanner.can_handle(str(tokenizer_model))
 
+    def test_can_handle_rejects_sentencepiece_with_trainer_varint_field_52(self, tmp_path: Path) -> None:
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(_sentencepiece_model_proto_with_trainer_varint_field_52())
+
+        assert not XGBoostScanner.can_handle(str(tokenizer_model))
+
     def test_can_handle_keeps_malformed_sentencepiece_like_model_on_xgboost_route(self, tmp_path: Path) -> None:
         tokenizer_model = tmp_path / "tokenizer.model"
         tokenizer_model.write_bytes(b"\x0a\x0e\x0a\x05<unk>\x15\x00" + (b"\0" * 64))
+
+        assert XGBoostScanner.can_handle(str(tokenizer_model))
+
+    def test_can_handle_keeps_capped_sentencepiece_prefix_on_xgboost_route(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        prefix = _sentencepiece_model_proto()
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(prefix + b"\x12\x80")
+        monkeypatch.setattr(file_detection, "_SENTENCEPIECE_MODEL_PROTO_READ_BYTES", len(prefix))
 
         assert XGBoostScanner.can_handle(str(tokenizer_model))
 
@@ -1815,6 +1843,36 @@ class TestXGBoostFailClosedEndToEnd:
         assert determine_exit_code(aggregate) == 0
         assert not any(issue.rule_code == "S1004" for issue in aggregate.issues)
 
+    def test_sentencepiece_model_with_trainer_varint_field_52_is_not_xgboost_false_positive(
+        self, tmp_path: Path
+    ) -> None:
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(_sentencepiece_model_proto_with_trainer_varint_field_52())
+
+        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+        streaming = scan_model_streaming(
+            file_generator=iterate_files_streaming(tmp_path),
+            scan_root=str(tmp_path),
+            delete_after_scan=False,
+            cache_enabled=False,
+            skip_file_types=True,
+        )
+        cli_result = CliRunner().invoke(
+            cli,
+            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
+            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+        )
+        cli_payload = parse_click_json_output(cli_result.output)
+
+        assert direct.success is True
+        assert direct.scanner_name == "unknown"
+        _assert_no_xgboost_s1004(aggregate)
+        _assert_no_xgboost_s1004(streaming)
+        assert cli_result.exit_code == 0
+        assert "xgboost" not in cli_payload.get("scanner_names", [])
+        assert not any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
+
     def test_large_real_sentencepiece_model_shape_is_not_tensorflow_or_xgboost_false_positive(
         self, tmp_path: Path
     ) -> None:
@@ -1897,6 +1955,40 @@ class TestXGBoostFailClosedEndToEnd:
     ) -> None:
         tokenizer_model = tmp_path / "tokenizer.model"
         tokenizer_model.write_bytes(_sentencepiece_model_proto() + tail)
+
+        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+        streaming = scan_model_streaming(
+            file_generator=iterate_files_streaming(tmp_path),
+            scan_root=str(tmp_path),
+            delete_after_scan=False,
+            cache_enabled=False,
+            skip_file_types=True,
+        )
+        cli_result = CliRunner().invoke(
+            cli,
+            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
+            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+        )
+        cli_payload = parse_click_json_output(cli_result.output)
+
+        assert direct.success is False
+        assert direct.scanner_name == "xgboost"
+        assert "xgboost_binary_structure_unrecognized" in direct.metadata["scan_outcome_reasons"]
+        assert any(issue.rule_code == "S1004" for issue in direct.issues)
+        _assert_xgboost_s1004(aggregate)
+        _assert_xgboost_s1004(streaming)
+        assert cli_result.exit_code == 2
+        assert "xgboost" in cli_payload.get("scanner_names", [])
+        assert any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
+
+    def test_capped_sentencepiece_prefix_with_unread_tail_still_fails_closed_in_xgboost(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        prefix = _sentencepiece_model_proto()
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(prefix + b"\x12\x80")
+        monkeypatch.setattr(file_detection, "_SENTENCEPIECE_MODEL_PROTO_READ_BYTES", len(prefix))
 
         direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
         aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)

@@ -89,8 +89,8 @@ _ONNX_MODEL_FIELD_WIRE_TYPES = {
 _PROTO_GROUP_MAX_ROUTING_FIELDS = 512
 _PROTO_GROUP_MAX_ROUTING_DEPTH = 8
 _COREML_PROTO_SIGNATURE_READ_BYTES = 1024 * 1024
-_SENTENCEPIECE_MODEL_PROTO_READ_BYTES = 64 * 1024
-_SENTENCEPIECE_MODEL_MAX_FIELDS = 16384
+_SENTENCEPIECE_MODEL_PROTO_READ_BYTES = 10 * 1024 * 1024
+_SENTENCEPIECE_MODEL_MAX_FIELDS = 512 * 1024
 _SENTENCEPIECE_MIN_STRONG_PIECES = 8
 _SENTENCEPIECE_MAX_PIECE_FIELDS = 16
 _SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES = 4096
@@ -131,11 +131,12 @@ _SENTENCEPIECE_TRAINER_SPEC_VARINT_FIELDS = frozenset(
         43,
         49,
         50,
+        52,
     }
 )
 _SENTENCEPIECE_TRAINER_SPEC_STRING_FIELDS = frozenset({1, 2, 5, 7, 30, 31, 36, 44, 45, 46, 47, 48, 53})
 _SENTENCEPIECE_TRAINER_SPEC_FIXED32_FIELDS = frozenset({10, 15, 51})
-_SENTENCEPIECE_TRAINER_SPEC_FIXED64_FIELDS = frozenset({52})
+_SENTENCEPIECE_TRAINER_SPEC_FIXED64_FIELDS: frozenset[int] = frozenset()
 _SENTENCEPIECE_NORMALIZER_SPEC_WIRE_TYPES = {
     1: 2,
     2: 2,
@@ -1668,7 +1669,7 @@ def _has_strong_sentencepiece_model_proto_prefix(data: bytes, *, sample_is_prefi
     strong_match = False
 
     def accept_incomplete_prefix() -> bool:
-        return strong_match and sample_is_prefix
+        return False
 
     while offset < len(data) and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS:
         tag_result = _read_proto_varint(data, offset)
@@ -1756,7 +1757,9 @@ def _has_strong_sentencepiece_model_proto_prefix(data: bytes, *, sample_is_prefi
             trainer_spec=trainer_spec,
         )
 
-    return strong_match and offset == len(data) and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS
+    return (
+        strong_match and not sample_is_prefix and offset == len(data) and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS
+    )
 
 
 def is_sentencepiece_model_proto_file(path: str | Path) -> bool:
