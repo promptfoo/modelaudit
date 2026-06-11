@@ -195,6 +195,8 @@ _LLAMAFILE_EXECUTABLE_MAGICS = frozenset(
         b"\xcf\xfa\xed\xfe",
         b"\xca\xfe\xba\xbe",
         b"\xbe\xba\xfe\xca",
+        b"\xca\xfe\xba\xbf",
+        b"\xbf\xba\xfe\xca",
     }
 )
 _LLAMAFILE_ROUTE_CHUNK_BYTES = 1024 * 1024
