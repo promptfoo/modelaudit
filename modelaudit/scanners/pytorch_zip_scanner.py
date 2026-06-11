@@ -343,6 +343,7 @@ class PyTorchZipScanner(BaseScanner):
     DEFAULT_MAX_NESTED_ZIP_DEPTH: ClassVar[int] = 5
     DEFAULT_MAX_BLACKLIST_SCAN_BYTES: ClassVar[int] = 100 * 1024 * 1024
     MAX_STORAGE_REFERENCE_DATA_PICKLE_BYTES: ClassVar[int] = 10 * 1024 * 1024
+    MAX_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES: ClassVar[int] = 64 * 1024 * 1024
     BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_blacklist_member_size_limit"
     BLACKLIST_READ_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_blacklist_member_read_failed"
     ENTRY_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_entry_limit"
@@ -445,20 +446,30 @@ class PyTorchZipScanner(BaseScanner):
                 safe_entries = self._validate_zip_entries(zip_file, result, path)
                 self._check_timeout()  # Check timeout after entry validation
 
+                validated_storage_data_pkl_members = self._validated_pytorch_storage_data_pkl_members_from_data_pickle(
+                    zip_file,
+                    safe_entries,
+                    result,
+                )
+
                 # Discover pickle files in the archive
-                pickle_files = self._discover_pickle_files(zip_file, safe_entries, result)
+                pickle_files = self._discover_pickle_files(
+                    zip_file,
+                    safe_entries,
+                    result,
+                    trusted_pytorch_storage_data_pkl_members=validated_storage_data_pkl_members,
+                )
 
                 # Extract version info and check for CVE vulnerabilities
                 self._check_pytorch_vulnerabilities(zip_file, safe_entries, result, path)
 
                 # Scan all discovered pickle files
-                trusted_pytorch_storage_data_pkl_members = self._trusted_pytorch_storage_data_pkl_members(safe_entries)
                 bytes_scanned = self._scan_pickle_files(
                     zip_file,
                     pickle_files,
                     result,
                     path,
-                    trusted_pytorch_storage_data_pkl_members=trusted_pytorch_storage_data_pkl_members,
+                    trusted_pytorch_storage_data_pkl_members=validated_storage_data_pkl_members,
                 )
                 self._scan_nested_zip_members(zip_file, safe_entries, result, path)
                 self._check_timeout()  # Check timeout after pickle scanning
@@ -1273,6 +1284,8 @@ class PyTorchZipScanner(BaseScanner):
         zip_file: zipfile.ZipFile,
         safe_entries: list[zipfile.ZipInfo],
         result: ScanResult,
+        *,
+        trusted_pytorch_storage_data_pkl_members: dict[str, set[str]] | None = None,
     ) -> list[zipfile.ZipInfo]:
         """Discover pickle files in the ZIP archive"""
         pickle_files: list[zipfile.ZipInfo] = []
@@ -1297,10 +1310,16 @@ class PyTorchZipScanner(BaseScanner):
             if name.endswith(".pkl") or name == "data.pkl" or name.endswith("/data.pkl"):
                 add_pickle_entry(entry)
 
-        trusted_storage_blob_members = self._trusted_pytorch_storage_blob_members_from_data_pickle(
-            zip_file,
-            safe_entries,
-            result,
+        if trusted_pytorch_storage_data_pkl_members is None:
+            trusted_pytorch_storage_data_pkl_members = (
+                self._validated_pytorch_storage_data_pkl_members_from_data_pickle(
+                    zip_file,
+                    safe_entries,
+                    result,
+                )
+            )
+        trusted_storage_blob_members = self._storage_blob_members_from_data_pkl_members(
+            trusted_pytorch_storage_data_pkl_members
         )
 
         # Second pass: always sniff unselected members. A benign data.pkl must not
@@ -1704,7 +1723,10 @@ class PyTorchZipScanner(BaseScanner):
             )
         if is_binary_pickle_candidate:
             return self._binary_pickle_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
-        return self._has_complete_pickle_stream_without_frame_stop_overrun(sample)
+        return self._proto0_or_1_trusted_storage_probe_should_scan(
+            sample,
+            sample_is_prefix=entry.file_size > len(sample),
+        )
 
     @staticmethod
     def _binary_pickle_probe_should_scan(sample: bytes, *, sample_is_prefix: bool) -> bool:
@@ -1717,6 +1739,23 @@ class PyTorchZipScanner(BaseScanner):
         except Exception:
             return sample_is_prefix
         return sample_is_prefix and opcode_count >= 2
+
+    @staticmethod
+    def _proto0_or_1_trusted_storage_probe_should_scan(sample: bytes, *, sample_is_prefix: bool) -> bool:
+        if PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(sample):
+            return True
+        if not sample_is_prefix:
+            return False
+        if PyTorchZipScanner._contains_pickle_frame_opcode(sample):
+            return False
+        return _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=True)
+
+    @staticmethod
+    def _contains_pickle_frame_opcode(sample: bytes) -> bool:
+        try:
+            return any(opcode.name == "FRAME" for opcode, _arg, _pos in pickletools.genops(sample))
+        except Exception:
+            return False
 
     @staticmethod
     def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> bool:
@@ -1947,6 +1986,14 @@ class PyTorchZipScanner(BaseScanner):
             trusted_blobs.update(f"{prefix}data/{storage_key}" for storage_key in storage_keys & referenced_keys)
         return trusted_blobs
 
+    @staticmethod
+    def _storage_blob_members_from_data_pkl_members(storage_keys_by_data_pkl: dict[str, set[str]]) -> set[str]:
+        return {
+            f"{data_pkl_member[: -len('data.pkl')]}data/{storage_key}"
+            for data_pkl_member, storage_keys in storage_keys_by_data_pkl.items()
+            for storage_key in storage_keys
+        }
+
     def _trusted_pytorch_storage_blob_members_from_data_pickle(
         self,
         zip_file: zipfile.ZipFile,
@@ -1954,6 +2001,21 @@ class PyTorchZipScanner(BaseScanner):
         result: ScanResult,
     ) -> set[str]:
         """Return tensor storage blobs referenced by same-prefix ``data.pkl`` before pickle discovery."""
+        return self._storage_blob_members_from_data_pkl_members(
+            self._validated_pytorch_storage_data_pkl_members_from_data_pickle(
+                zip_file,
+                safe_entries,
+                result,
+            )
+        )
+
+    def _validated_pytorch_storage_data_pkl_members_from_data_pickle(
+        self,
+        zip_file: zipfile.ZipFile,
+        safe_entries: list[zipfile.ZipInfo],
+        result: ScanResult,
+    ) -> dict[str, set[str]]:
+        """Return validated same-prefix PyTorch storage keys referenced by each data.pkl."""
         members = [
             (self._get_zip_member_name(entry), entry)
             for entry in safe_entries
@@ -1963,7 +2025,8 @@ class PyTorchZipScanner(BaseScanner):
         for name, entry in members:
             entries_by_name.setdefault(name, []).append(entry)
 
-        trusted_blobs: set[str] = set()
+        trusted_members: dict[str, set[str]] = {}
+        storage_reference_bytes_read = 0
         for data_pkl_member, data_pkl_entries in entries_by_name.items():
             if data_pkl_member.rsplit("/", 1)[-1] != "data.pkl":
                 continue
@@ -1999,12 +2062,32 @@ class PyTorchZipScanner(BaseScanner):
                 continue
 
             try:
+                if (
+                    storage_reference_bytes_read + data_pkl_entry.file_size
+                    > self.MAX_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES
+                ):
+                    self._record_storage_reference_validation_incomplete(
+                        result,
+                        data_pkl_member=data_pkl_member,
+                        message=(
+                            "PyTorch storage reference validation skipped data.pkl members after "
+                            f"{self.MAX_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES} bytes"
+                        ),
+                        reason=self.STORAGE_REFERENCE_VALIDATION_INCONCLUSIVE_REASON,
+                        details={
+                            "member_size": data_pkl_entry.file_size,
+                            "bytes_read": storage_reference_bytes_read,
+                            "max_total_bytes": self.MAX_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES,
+                        },
+                    )
+                    continue
                 pickle_data = self._read_member_bytes(
                     zip_file,
                     data_pkl_entry,
                     phase="pytorch_storage_pickle_discovery",
                     result=result,
                 )
+                storage_reference_bytes_read += len(pickle_data)
             except Exception as exc:
                 self._record_storage_reference_validation_incomplete(
                     result,
@@ -2040,11 +2123,11 @@ class PyTorchZipScanner(BaseScanner):
                     },
                 )
 
-            trusted_blobs.update(
-                f"{data_prefix}{storage_key}" for storage_key in referenced_keys & existing_storage_keys
-            )
+            trusted_storage_keys = referenced_keys & existing_storage_keys
+            if trusted_storage_keys:
+                trusted_members[data_pkl_member] = trusted_storage_keys
 
-        return trusted_blobs
+        return trusted_members
 
     def _record_storage_reference_validation_incomplete(
         self,

@@ -102,6 +102,10 @@ def _malicious_proto0_system_payload() -> bytes:
     return b"cposix\nsystem\n(S'echo hidden'\ntR."
 
 
+def _large_proto0_system_payload() -> bytes:
+    return b"cposix\nsystem\n(S'" + (b"A" * 10_000) + b"'\ntR."
+
+
 def _short_binunicode(data: bytes) -> bytes:
     assert len(data) < 256
     return b"\x8c" + bytes([len(data)]) + data + b"\x94"
@@ -147,6 +151,19 @@ def _pytorch_storage_persistent_id_payload_with_extra_field(key: str) -> bytes:
     payload = _pytorch_storage_persistent_id_payload(key)
     assert payload.endswith(b"tQ.")
     return payload[:-3] + _short_binunicode(b"evil") + b"tQ."
+
+
+def _string_storage_type_persistent_id_payload(key: str) -> bytes:
+    key_bytes = key.encode("utf-8")
+    assert len(key_bytes) < 256
+    return (
+        b"\x80\x04("
+        + _short_binunicode(b"storage")
+        + _short_binunicode(b"torch.FloatStorage")
+        + _short_binunicode(key_bytes)
+        + _short_binunicode(b"cpu")
+        + b"K\x01tQ."
+    )
 
 
 def _short_binbytes(value: bytes) -> bytes:
@@ -571,6 +588,7 @@ def test_pytorch_zip_discovery_trusts_torch_storage_untyped_storage(tmp_path: Pa
     "payload",
     [
         _malicious_proto0_system_payload(),
+        _large_proto0_system_payload(),
         _malicious_eval_pickle_payload(),
         _large_framed_malicious_eval_pickle_payload(),
         _large_length_prefixed_malicious_eval_pickle_payload(),
@@ -666,6 +684,24 @@ def test_pytorch_zip_discovery_scans_untrusted_storage_lookalike_pickles(
         assert expected_reason in result.metadata["scan_outcome_reasons"]
 
 
+def test_pytorch_zip_data_pkl_keeps_unvalidated_storage_pid_warning(tmp_path: Path) -> None:
+    model_path = tmp_path / "string_storage_pid.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _string_storage_type_persistent_id_payload("0"))
+        zip_file.writestr("archive/data/0", b"\x00" * 16)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert not any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
+    assert any(
+        issue.details.get("pickle_rule_code") == "PERSISTENT_ID"
+        and issue.details.get("pickle_filename") == "archive/data.pkl"
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_discovery_marks_storage_reference_opcode_budget_incomplete(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -689,6 +725,35 @@ def test_pytorch_zip_discovery_marks_storage_reference_opcode_budget_incomplete(
     assert "archive/data/0" in result.metadata["pickle_files"]
     assert any(
         issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_storage_reference_total_budget_keeps_blob_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        PyTorchZipScanner,
+        "MAX_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES",
+        len(_pytorch_storage_persistent_id_payload("0")) + 1,
+    )
+    model_path = tmp_path / "storage_reference_total_budget.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        for index in range(2):
+            prefix = f"archive{index}/"
+            zip_file.writestr(f"{prefix}version", "3\n")
+            zip_file.writestr(f"{prefix}byteorder", "little")
+            zip_file.writestr(f"{prefix}data.pkl", _pytorch_storage_persistent_id_payload("0"))
+            zip_file.writestr(f"{prefix}data/0", _malicious_proto0_system_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_storage_reference_validation_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "archive1/data/0" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive1/data/0"
         for issue in result.issues
     )
 

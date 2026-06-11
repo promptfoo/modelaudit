@@ -86,6 +86,7 @@ _MAX_PYTORCH_ZIP_PICKLE_MEMBERS = 256
 _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES = 512 * 1024 * 1024
 _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES = 512 * 1024 * 1024
 _MAX_PYTORCH_ZIP_STORAGE_REFERENCE_DATA_PICKLE_BYTES = 10 * 1024 * 1024
+_MAX_PYTORCH_ZIP_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES = 64 * 1024 * 1024
 _PYTORCH_STORAGE_TRUST_MAX_OPCODES = 100_000
 _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH = 1024
 _PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES = 100_000
@@ -669,6 +670,7 @@ def _validated_pytorch_storage_entry_ids(
 
     trusted_entry_ids: set[int] = set()
     notices: list[Notice] = []
+    storage_reference_bytes_read = 0
     for data_pkl_name, data_pkl_entries in entries_by_name.items():
         if data_pkl_name.rsplit("/", 1)[-1] != "data.pkl":
             continue
@@ -706,8 +708,30 @@ def _validated_pytorch_storage_entry_ids(
             continue
 
         try:
+            if (
+                storage_reference_bytes_read + data_pkl_entry.file_size
+                > _MAX_PYTORCH_ZIP_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES
+            ):
+                notices.append(
+                    _pytorch_zip_storage_reference_validation_notice(
+                        source=source,
+                        data_pkl_member=data_pkl_name,
+                        message=(
+                            "PyTorch ZIP storage reference validation skipped data.pkl members after "
+                            f"{_MAX_PYTORCH_ZIP_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES} bytes"
+                        ),
+                        code="pytorch_zip_storage_reference_validation_failed",
+                        details={
+                            "member_size": data_pkl_entry.file_size,
+                            "bytes_read": storage_reference_bytes_read,
+                            "max_total_bytes": _MAX_PYTORCH_ZIP_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES,
+                        },
+                    )
+                )
+                continue
             with archive.open(data_pkl_entry, "r") as member:
                 pickle_data = member.read(_MAX_PYTORCH_ZIP_STORAGE_REFERENCE_DATA_PICKLE_BYTES)
+            storage_reference_bytes_read += len(pickle_data)
         except Exception as error:
             notices.append(
                 _pytorch_zip_storage_reference_validation_notice(
@@ -837,7 +861,7 @@ def _trusted_storage_zip_entry_looks_like_pickle(
         )
     if is_binary_pickle_candidate:
         return _binary_pickle_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
-    return _has_complete_pickle_stream_without_frame_stop_overrun(sample)
+    return _proto0_or_1_trusted_storage_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
 
 
 def _binary_pickle_probe_should_scan(sample: bytes, *, sample_is_prefix: bool) -> bool:
@@ -850,6 +874,23 @@ def _binary_pickle_probe_should_scan(sample: bytes, *, sample_is_prefix: bool) -
     except Exception:
         return sample_is_prefix
     return sample_is_prefix and opcode_count >= 2
+
+
+def _proto0_or_1_trusted_storage_probe_should_scan(sample: bytes, *, sample_is_prefix: bool) -> bool:
+    if _has_complete_pickle_stream_without_frame_stop_overrun(sample):
+        return True
+    if not sample_is_prefix:
+        return False
+    if _contains_pickle_frame_opcode(sample):
+        return False
+    return _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=True)
+
+
+def _contains_pickle_frame_opcode(sample: bytes) -> bool:
+    try:
+        return any(opcode.name == "FRAME" for opcode, _arg, _pos in pickletools.genops(sample))
+    except Exception:
+        return False
 
 
 def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> bool:

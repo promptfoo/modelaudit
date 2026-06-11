@@ -179,6 +179,10 @@ def _fake_byte_storage_persistent_id_payload(key: str) -> bytes:
     )
 
 
+def _large_proto0_system_payload() -> bytes:
+    return b"cposix\nsystem\n(S'" + (b"A" * 10_000) + b"'\ntR."
+
+
 def _large_length_prefixed_malicious_payload() -> bytes:
     declared_payload = b"A" * 10_000
     return (
@@ -1906,6 +1910,7 @@ def test_scan_file_routes_torch_storage_untyped_storage_blob_as_raw_storage(tmp_
     "payload",
     [
         b"cposix\nsystem\n(S'echo hidden'\ntR.",
+        _large_proto0_system_payload(),
         pickle.dumps(MaliciousPayload(), protocol=4),
         pickle.dumps({"pad": b"A" * 10_000, "payload": MaliciousPayload()}, protocol=4),
         _large_length_prefixed_malicious_payload(),
@@ -2042,6 +2047,37 @@ def test_scan_file_marks_storage_reference_opcode_budget_incomplete(
         finding.rule_code == "DANGEROUS_CALL"
         and finding.location is not None
         and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+def test_scan_file_storage_reference_total_budget_keeps_blob_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        package_api,
+        "_MAX_PYTORCH_ZIP_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES",
+        len(_pytorch_storage_persistent_id_payload("0")) + 1,
+    )
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        for index in range(2):
+            prefix = f"archive{index}/"
+            archive.writestr(f"{prefix}data.pkl", _pytorch_storage_persistent_id_payload("0"))
+            archive.writestr(f"{prefix}version", "3\n")
+            archive.writestr(f"{prefix}byteorder", "little")
+            archive.writestr(f"{prefix}data/0", b"cposix\nsystem\n(S'echo hidden'\ntR.")
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert "archive1/data/0" in report.metadata["pickle_files"]
+    assert any(notice.code == "pytorch_zip_storage_reference_validation_failed" for notice in report.notices)
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive1/data/0" in finding.location
         for finding in report.findings
     )
 
