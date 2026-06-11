@@ -181,7 +181,11 @@ class CompressedScanner(BaseScanner):
             wrapper_path.name[: -len(wrapper_path.suffix)] if wrapper_path.suffix else wrapper_path.name
         )
         inferred_suffix = Path(stem_without_wrapper).suffix
-        return inferred_suffix or ""
+        if inferred_suffix:
+            return inferred_suffix
+        if stem_without_wrapper.lower() in {"tokenizer", "spiece", "sentencepiece"}:
+            return ""
+        return ".bin"
 
     @staticmethod
     def _derive_inner_display_name(path: str) -> str:

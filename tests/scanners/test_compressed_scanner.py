@@ -129,6 +129,36 @@ def test_compressed_scanner_can_handle_requires_matching_signature(tmp_path: Pat
     assert CompressedScanner.can_handle(str(invalid_gzip_path)) is False
 
 
+@pytest.mark.parametrize(
+    ("filename", "expected_suffix"),
+    [
+        ("model.gz", ".bin"),
+        ("weights.xz", ".bin"),
+        ("tokenizer.gz", ""),
+        ("spiece.gz", ""),
+        ("tokenizer.model.gz", ".model"),
+    ],
+)
+def test_declared_compressed_inner_suffix_preserves_routing_intent(
+    filename: str,
+    expected_suffix: str,
+) -> None:
+    assert CompressedScanner._derive_inner_suffix(filename) == expected_suffix
+
+
+def test_bare_compressed_raw_binary_routes_inner_as_pytorch_binary(tmp_path: Path) -> None:
+    wrapper = tmp_path / "model.gz"
+    wrapper.write_bytes(gzip.compress(b"raw binary weights" + b"\0" * 128))
+
+    result = scan_model_directory_or_file(str(wrapper), cache_enabled=False)
+    metadata = result.file_metadata[str(wrapper)]
+    metadata_extra = metadata.model_extra or {}
+
+    assert result.success is True
+    assert metadata_extra["scanner_dependency_ids"] == ["compressed", "pytorch_binary"]
+    assert metadata_extra["decompressed_bytes"] == 146
+
+
 def test_compressed_scanner_can_handle_header_routed_misnamed_wrapper(tmp_path: Path) -> None:
     disguised_gzip_path = tmp_path / "model.jpg"
     disguised_gzip_path.write_bytes(gzip.compress(pickle.dumps({"weights": [1, 2, 3]})))

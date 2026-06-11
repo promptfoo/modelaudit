@@ -2247,6 +2247,26 @@ class TestXGBoostFailClosedEndToEnd:
         assert "xgboost" not in cli_payload.get("scanner_names", [])
         assert not any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
 
+    def test_large_sentencepiece_ownership_probe_skips_unsampled_piece_text(self) -> None:
+        class _CountingBytesIO(io.BytesIO):
+            def __init__(self, payload: bytes) -> None:
+                super().__init__(payload)
+                self.bytes_read = 0
+
+            def read(self, size: int | None = -1) -> bytes:
+                payload = super().read(size)
+                self.bytes_read += len(payload)
+                return payload
+
+        payload = _large_real_sentencepiece_model_proto_shape()
+        stream = _CountingBytesIO(payload)
+
+        route = file_detection._classify_sentencepiece_model_proto_stream(stream, len(payload))
+
+        assert len(payload) > file_detection._SENTENCEPIECE_MODEL_PROTO_READ_BYTES
+        assert route == "strong"
+        assert stream.bytes_read < file_detection._SENTENCEPIECE_MODEL_PROTO_READ_BYTES
+
     @pytest.mark.parametrize("fixture_name", _SENTENCEPIECE_OFFICIAL_FIXTURES)
     def test_dependency_sentencepiece_model_with_disabled_specials_is_not_xgboost_false_positive(
         self, tmp_path: Path, fixture_name: str

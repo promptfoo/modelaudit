@@ -1454,6 +1454,12 @@ class _SentencePieceTrainerSpecSignals:
         return self.model_type is not None and self.vocab_size is not None
 
 
+@dataclass
+class _SentencePiecePieceProtoSignals:
+    piece_text: str | None = None
+    piece_type: int | None = None
+
+
 def _decode_proto_int32_varint(value: int) -> int:
     """Decode proto2 int32 values that may be sign-extended into a uint64 varint."""
     if value >= 1 << 63:
@@ -1732,6 +1738,28 @@ def _has_strong_sentencepiece_model_proto_evidence(
     return typed_piece_count >= 3 and special_identity_piece_count >= 3
 
 
+def _has_sufficient_sentencepiece_piece_scan_evidence(
+    *,
+    piece_count: int,
+    unknown_piece_count: int,
+    unknown_piece_index: int | None,
+    unknown_piece_text: str | None,
+    byte_piece_count: int,
+    byte_piece_texts: set[str],
+    malformed_byte_piece: bool,
+) -> bool:
+    if piece_count < _SENTENCEPIECE_MIN_STRONG_PIECES:
+        return False
+    if unknown_piece_count != 1 or unknown_piece_index is None or unknown_piece_text is None:
+        return False
+    if malformed_byte_piece:
+        return False
+    return not byte_piece_count or (
+        byte_piece_count == _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT
+        and len(byte_piece_texts) == _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT
+    )
+
+
 def _has_strong_sentencepiece_model_proto_prefix(data: bytes, *, sample_is_prefix: bool = False) -> bool:
     """Recognize a SentencePiece ModelProto from repeated scored pieces."""
     offset = 0
@@ -1862,15 +1890,90 @@ def _read_bounded_sentencepiece_submessage(stream: BinaryIO, value_end: int, *, 
     return payload if len(payload) == length else None
 
 
-def _parse_sentencepiece_piece_proto_stream(stream: BinaryIO, value_end: int) -> tuple[str, int | None] | None:
-    payload = _read_bounded_sentencepiece_submessage(
-        stream,
-        value_end,
-        max_bytes=_SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES,
-    )
-    if payload is None:
+def _parse_sentencepiece_piece_proto_stream(
+    stream: BinaryIO,
+    value_end: int,
+    *,
+    decode_text: bool,
+) -> _SentencePiecePieceProtoSignals | None:
+    """Validate one piece submessage while avoiding unnecessary text reads."""
+    if value_end - stream.tell() > _SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES:
         return None
-    return _parse_sentencepiece_piece_proto(payload, 0, len(payload))
+
+    fields_seen = 0
+    text_bounds: tuple[int, int] | None = None
+    piece_type: int | None = None
+    has_score = False
+    while stream.tell() < value_end and fields_seen < _SENTENCEPIECE_MAX_PIECE_FIELDS:
+        tag = _read_proto_varint_stream(stream, value_end)
+        if tag is None:
+            return None
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return None
+
+        if field_number == 1 and wire_type == 2:
+            bounds = _read_proto_length_delimited_bounds_stream(stream, value_end)
+            if bounds is None:
+                return None
+            length, value_start, actual_value_end = bounds
+            if length == 0 or length > _SENTENCEPIECE_MAX_PIECE_TEXT_BYTES:
+                return None
+            text_bounds = (value_start, actual_value_end)
+            stream.seek(actual_value_end)
+        elif field_number == 2 and wire_type == 5:
+            fixed32_end = stream.tell() + 4
+            if fixed32_end > value_end:
+                return None
+            has_score = True
+            stream.seek(fixed32_end)
+        elif field_number == 3 and wire_type == 0:
+            parsed_type = _read_proto_varint_stream(stream, value_end)
+            if parsed_type is None or not 1 <= parsed_type <= 6:
+                return None
+            piece_type = parsed_type
+        else:
+            skip_status = _skip_proto_stream_value(
+                stream,
+                wire_type,
+                value_end,
+                field_number=field_number,
+            )
+            if skip_status is not True:
+                return None
+        fields_seen += 1
+
+    if stream.tell() != value_end or fields_seen >= _SENTENCEPIECE_MAX_PIECE_FIELDS:
+        return None
+    if text_bounds is None or not has_score:
+        return None
+
+    should_decode_text = decode_text or piece_type in {
+        _SENTENCEPIECE_UNKNOWN_PIECE_TYPE,
+        _SENTENCEPIECE_BYTE_PIECE_TYPE,
+        3,
+        4,
+        5,
+    }
+    if not should_decode_text:
+        return _SentencePiecePieceProtoSignals(piece_type=piece_type)
+
+    text_start, text_end = text_bounds
+    stream.seek(text_start)
+    payload = stream.read(text_end - text_start)
+    if len(payload) != text_end - text_start:
+        return None
+    stream.seek(value_end)
+    piece_text = _decode_bounded_proto_string(
+        payload,
+        0,
+        len(payload),
+        max_bytes=_SENTENCEPIECE_MAX_PIECE_TEXT_BYTES,
+    )
+    if piece_text is None:
+        return None
+    return _SentencePiecePieceProtoSignals(piece_text=piece_text, piece_type=piece_type)
 
 
 def _parse_sentencepiece_trainer_spec_proto_stream(
@@ -1921,22 +2024,40 @@ def _classify_sentencepiece_model_proto_stream(stream: BinaryIO, file_size: int)
             if bounds is None:
                 return reject_candidate()
             _length, _value_start, actual_value_end = bounds
-            parsed_piece = _parse_sentencepiece_piece_proto_stream(stream, actual_value_end)
+            decode_piece_text = not _has_sufficient_sentencepiece_piece_scan_evidence(
+                piece_count=piece_count,
+                unknown_piece_count=unknown_piece_count,
+                unknown_piece_index=unknown_piece_index,
+                unknown_piece_text=unknown_piece_text,
+                byte_piece_count=byte_piece_count,
+                byte_piece_texts=byte_piece_texts,
+                malformed_byte_piece=malformed_byte_piece,
+            )
+            parsed_piece = _parse_sentencepiece_piece_proto_stream(
+                stream,
+                actual_value_end,
+                decode_text=decode_piece_text,
+            )
             if parsed_piece is None:
                 return reject_candidate()
-            piece, piece_type = parsed_piece
+            piece = parsed_piece.piece_text
+            piece_type = parsed_piece.piece_type
             piece_index = piece_count
             piece_count += 1
             if piece_type is not None:
                 typed_piece_count += 1
-            if _is_sentencepiece_special_identity_piece(piece):
+            if piece is not None and _is_sentencepiece_special_identity_piece(piece):
                 special_identity_piece_count += 1
             if piece_type is not None:
                 if piece_type == _SENTENCEPIECE_UNKNOWN_PIECE_TYPE:
+                    if piece is None:
+                        return reject_candidate()
                     unknown_piece_count += 1
                     unknown_piece_index = piece_index
                     unknown_piece_text = piece
                 elif piece_type == _SENTENCEPIECE_BYTE_PIECE_TYPE:
+                    if piece is None:
+                        return reject_candidate()
                     byte_piece_count += 1
                     if _is_sentencepiece_byte_fallback_piece(piece):
                         byte_piece_texts.add(piece)
