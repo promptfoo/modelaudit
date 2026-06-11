@@ -2680,6 +2680,39 @@ def scan_model_directory_or_file(
                     seen_complete_hf_shard_families.add(family_dedupe_key)
                 scan_entries.append((representative_file, ordered_family_paths, shard_family_key))
 
+            openvino_companion_by_xml_key: dict[str, str] = {}
+            openvino_xml_key_by_companion_key: dict[str, str] = {}
+            if scanner_selection.allows("openvino"):
+                for representative_file, _scanned_file_paths, shard_family_key in scan_entries:
+                    if shard_family_key is not None:
+                        continue
+                    representative_path = Path(representative_file)
+                    if not _is_openvino_xml_path(representative_path):
+                        continue
+                    companion_path = representative_path.with_suffix(".bin")
+                    if not (companion_path.exists() or companion_path.is_symlink()):
+                        continue
+                    companion_owner = _openvino_weights_companion_owner(companion_path)
+                    xml_key = _openvino_xml_companion_key(representative_path)
+                    if companion_owner is None or _openvino_xml_companion_key(companion_owner) != xml_key:
+                        continue
+                    companion_key = _openvino_xml_companion_key(companion_path)
+                    companion_str = str(companion_path)
+                    openvino_companion_by_xml_key[xml_key] = companion_str
+                    openvino_xml_key_by_companion_key[companion_key] = xml_key
+                if openvino_companion_by_xml_key:
+                    augmented_scan_entries: list[_ScanEntry] = []
+                    for representative_file, scanned_file_paths, shard_family_key in scan_entries:
+                        representative_key = _openvino_xml_companion_key(Path(representative_file))
+                        if shard_family_key is None and representative_key in openvino_xml_key_by_companion_key:
+                            continue
+                        augmented_scanned_paths = list(scanned_file_paths)
+                        companion_path_str = openvino_companion_by_xml_key.get(representative_key)
+                        if companion_path_str is not None and companion_path_str not in augmented_scanned_paths:
+                            augmented_scanned_paths.append(companion_path_str)
+                        augmented_scan_entries.append((representative_file, augmented_scanned_paths, shard_family_key))
+                    scan_entries = augmented_scan_entries
+
             if isinstance(dvc_parent_file, str) and isinstance(dvc_remaining_total_size, int):
                 remaining_size = dvc_remaining_total_size
                 bounded_scan_entries: list[_ScanEntry] = []
@@ -4651,6 +4684,21 @@ def scan_model_streaming(
                         continue
                     scan_path = resolved_path
 
+                openvino_sidecar_owner = _openvino_weights_companion_owner(scan_path)
+                if (
+                    openvino_sidecar_owner is not None
+                    and scanner_selection.allows("openvino")
+                    and not scanning_deferred_openvino_sidecars
+                ):
+                    is_lfs_sidecar, _lfs_info = check_lfs_pointer(str(scan_path))
+                    if not is_lfs_sidecar:
+                        preserve_source_after_scan = True
+                        deferred_openvino_sidecars.setdefault(Path(os.path.abspath(scan_path)), source_path)
+                        sidecar_snapshot = _snapshot_file_identity(scan_path)
+                        if sidecar_snapshot is not None:
+                            preserved_openvino_companion_snapshots[Path(os.path.abspath(scan_path))] = sidecar_snapshot
+                        continue
+
                 if skip_file_types and should_skip_file(
                     str(source_path),
                     metadata_scanner_available=metadata_scanner_available,
@@ -4678,21 +4726,6 @@ def scan_model_streaming(
                     "timeout": timeout - int(time.time() - start_time),
                     **scan_kwargs,
                 }
-
-                openvino_sidecar_owner = _openvino_weights_companion_owner(scan_path)
-                if (
-                    openvino_sidecar_owner is not None
-                    and scanner_selection.allows("openvino")
-                    and not scanning_deferred_openvino_sidecars
-                ):
-                    is_lfs_sidecar, _lfs_info = check_lfs_pointer(str(scan_path))
-                    if not is_lfs_sidecar:
-                        preserve_source_after_scan = True
-                        deferred_openvino_sidecars.setdefault(Path(os.path.abspath(scan_path)), source_path)
-                        sidecar_snapshot = _snapshot_file_identity(scan_path)
-                        if sidecar_snapshot is not None:
-                            preserved_openvino_companion_snapshots[Path(os.path.abspath(scan_path))] = sidecar_snapshot
-                        continue
 
                 if scanner_selection.allows("openvino") and _is_openvino_xml_path(scan_path):
                     candidate_companion = scan_path.with_suffix(".bin")
