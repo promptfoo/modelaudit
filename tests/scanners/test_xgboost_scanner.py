@@ -2069,11 +2069,22 @@ class TestXGBoostFailClosedEndToEnd:
 
     def test_sentencepiece_tokenizer_proto_core_is_clean_unknown(self, tmp_path: Path) -> None:
         tokenizer_proto = tmp_path / "tokenizer.proto"
-        tokenizer_proto.write_bytes(_sentencepiece_model_proto())
+        payload = _sentencepiece_model_proto()
+        tokenizer_proto.write_bytes(payload)
 
         direct = scan_file(str(tokenizer_proto), config={"cache_enabled": False})
         aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
 
+        assert (
+            file_detection.detect_format_from_magic_bytes(
+                payload[:4],
+                payload[:8],
+                payload[:16],
+                len(payload),
+                tokenizer_proto,
+            )
+            == "unknown"
+        )
         assert detect_file_format(str(tokenizer_proto)) == "unknown"
         assert detect_file_format_from_magic(str(tokenizer_proto)) == "unknown"
         assert detect_file_format_for_skip_filter(str(tokenizer_proto)) == "unknown"
@@ -2153,6 +2164,16 @@ class TestXGBoostFailClosedEndToEnd:
         )
         cli_payload = parse_click_json_output(cli_result.output)
 
+        assert (
+            file_detection.detect_format_from_magic_bytes(
+                payload[:4],
+                payload[:8],
+                payload[:16],
+                len(payload),
+                tokenizer_proto,
+            )
+            == expected_format
+        )
         assert detect_file_format(str(tokenizer_proto)) == expected_format
         assert detect_file_format_from_magic(str(tokenizer_proto)) == expected_format
         assert detect_file_format_for_skip_filter(str(tokenizer_proto)) == expected_format

@@ -2254,6 +2254,10 @@ def _should_fail_closed_malformed_sentencepiece_model_proto_file(path: str | Pat
     return Path(path).suffix.lower() in {"", ".proto"} and _is_malformed_sentencepiece_model_proto_candidate_file(path)
 
 
+def _should_treat_sentencepiece_model_proto_file_as_unknown(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in {".model", ".proto"} and is_sentencepiece_model_proto_file(path)
+
+
 def is_sentencepiece_model_proto_file(path: str | Path) -> bool:
     """Return True for strongly identified SentencePiece tokenizer ModelProto files."""
     return _classify_sentencepiece_model_proto_file(path) == "strong"
@@ -7003,7 +7007,7 @@ def detect_format_from_magic_bytes(
     if file_path is not None and _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
         return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
 
-    if file_path is not None and file_path.suffix.lower() == ".model" and is_sentencepiece_model_proto_file(file_path):
+    if file_path is not None and _should_treat_sentencepiece_model_proto_file_as_unknown(file_path):
         return "unknown"
 
     renamed_tensorflow_format = "unknown"
@@ -7189,7 +7193,7 @@ def detect_file_format_from_magic(path: str) -> str:
             if _could_be_content_routed_flax_msgpack(file_path):
                 return "flax_msgpack"
 
-            if file_path.suffix.lower() == ".model" and is_sentencepiece_model_proto_file(file_path):
+            if _should_treat_sentencepiece_model_proto_file_as_unknown(file_path):
                 return "unknown"
 
             renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
@@ -7353,7 +7357,7 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
             return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
 
-        if file_path.suffix.lower() == ".model" and is_sentencepiece_model_proto_file(file_path):
+        if _should_treat_sentencepiece_model_proto_file_as_unknown(file_path):
             return "unknown"
 
         if (
@@ -7569,7 +7573,7 @@ def detect_file_format(path: str) -> str:
     if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
         return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
 
-    if ext == ".model" and is_sentencepiece_model_proto_file(file_path):
+    if _should_treat_sentencepiece_model_proto_file_as_unknown(file_path):
         return "unknown"
 
     renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(
