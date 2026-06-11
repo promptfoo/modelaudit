@@ -3584,6 +3584,8 @@ def test_scan_huggingface_direct_file_dry_run_does_not_download(
         [
             "scan",
             "--dry-run",
+            "--format",
+            "text",
             "https://huggingface.co/test/model/resolve/main/model-00001-of-00002.safetensors",
         ],
     )
@@ -3641,7 +3643,7 @@ def test_scan_huggingface_streaming_dry_run_uses_metadata_preview_without_downlo
 
     result = CliRunner().invoke(
         cli,
-        ["scan", "--dry-run", "--stream", "--scanners", "xgboost", "--quiet", "hf://test/model"],
+        ["scan", "--dry-run", "--stream", "--scanners", "xgboost", "--format", "text", "--quiet", "hf://test/model"],
     )
 
     assert result.exit_code == 0
