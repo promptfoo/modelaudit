@@ -3214,7 +3214,7 @@ class TestModelDownloadStreaming:
             )
         )
 
-        assert [str(result[0]) for result in results] == [shard_a, shard_b]
+        assert [result[0].as_posix() for result in results] == [shard_a, shard_b]
         for streamed in results:
             _path, _is_last, scan_result = cast(tuple[Path, bool, Any], streamed)
             shard_family = scan_result.metadata["remote_shard_family"]
