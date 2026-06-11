@@ -6,11 +6,11 @@ from typing import Any
 from unittest.mock import patch
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.core_results import add_issue_to_model
+from modelaudit.core_results import add_issue_to_model, results_have_inconclusive_outcome
 
 # Ensure models are rebuilt for forward references
 from modelaudit.models import ModelAuditResultModel, rebuild_models
-from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
+from modelaudit.scanners.base import Check, CheckStatus, Issue, IssueSeverity, ScanResult
 
 rebuild_models()
 
@@ -283,6 +283,78 @@ def test_exit_code_incomplete_coverage_reason_without_scan_outcome() -> None:
     )
 
     assert determine_exit_code(results) == 2
+
+
+def test_exit_code_issue_details_incomplete_without_security_findings() -> None:
+    """Issue-only incomplete coverage evidence should fail closed."""
+    results = _create_result_model(
+        issues=[
+            Issue(
+                message="DVC output limit exceeded - not all declared outputs were scanned",
+                severity=IssueSeverity.INFO,
+                location="model.dvc",
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "reason": "dvc_output_limit_exceeded",
+                },
+                timestamp=0.0,
+                why=None,
+                type="dvc_output_limit_exceeded",
+            ),
+        ],
+    )
+
+    assert results_have_inconclusive_outcome(results) is True
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_check_details_incomplete_without_security_findings() -> None:
+    """Check-only incomplete coverage evidence should also fail closed."""
+    results = _create_result_model(
+        checks=[
+            Check(
+                name="DVC Output Resolution",
+                status=CheckStatus.FAILED,
+                message="DVC output resolution incomplete",
+                severity=IssueSeverity.INFO,
+                location="model.dvc",
+                details={"analysis_incomplete": True, "scan_outcome_reason": "dvc_analysis_incomplete"},
+                timestamp=0.0,
+            ),
+        ],
+    )
+
+    assert results_have_inconclusive_outcome(results) is True
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_issue_details_incomplete_with_security_findings() -> None:
+    """Security findings still exit 1 while issue-only coverage remains visible."""
+    results = _create_result_model(
+        issues=[
+            Issue(
+                message="DVC output resolution incomplete",
+                severity=IssueSeverity.INFO,
+                location="model.dvc",
+                details={"analysis_incomplete": True, "scan_outcome_reason": "dvc_analysis_incomplete"},
+                timestamp=0.0,
+                why=None,
+                type=None,
+            ),
+            Issue(
+                message="Dangerous pickle global",
+                severity=IssueSeverity.WARNING,
+                location="payload.pkl",
+                timestamp=0.0,
+                why=None,
+                type=None,
+            ),
+        ],
+    )
+
+    assert results_have_inconclusive_outcome(results) is True
+    assert determine_exit_code(results) == 1
 
 
 def test_exit_code_empty_coverage_reason_placeholder_remains_clean() -> None:

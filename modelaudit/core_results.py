@@ -6,6 +6,7 @@ import logging
 import os
 import time
 from collections import defaultdict
+from collections.abc import Iterable
 from typing import Any
 
 from modelaudit.models import ModelAuditResultModel
@@ -116,9 +117,28 @@ def metadata_has_incomplete_coverage(metadata: Any) -> bool:
     return False
 
 
+def record_details_have_incomplete_coverage(record: Any) -> bool:
+    """Return True when a retained issue/check detail object identifies incomplete coverage."""
+    return metadata_has_incomplete_coverage(_metadata_value(record, "details"))
+
+
+def records_have_incomplete_coverage(records: Iterable[Any] | None) -> bool:
+    """Return True when any retained issue/check carries incomplete coverage details."""
+    if records is None:
+        return False
+    try:
+        return any(record_details_have_incomplete_coverage(record) for record in records)
+    except TypeError:
+        return False
+
+
 def results_have_inconclusive_outcome(results: ModelAuditResultModel) -> bool:
     """Return True when any scanned file has incomplete coverage."""
-    return any(metadata_has_incomplete_coverage(metadata) for metadata in (results.file_metadata or {}).values())
+    if any(metadata_has_incomplete_coverage(metadata) for metadata in (results.file_metadata or {}).values()):
+        return True
+    if records_have_incomplete_coverage(results.issues):
+        return True
+    return records_have_incomplete_coverage(results.checks)
 
 
 def results_have_security_findings(results: ModelAuditResultModel) -> bool:

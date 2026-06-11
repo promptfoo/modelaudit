@@ -569,6 +569,37 @@ class TestModelAuditResultModel:
         assert result.file_metadata["model.bin"]["scan_outcome_reasons"] == ["bounded_probe_exhausted"]
         assert determine_exit_code(result) == 1
 
+    def test_aggregate_scan_result_issue_only_incomplete_coverage_fails_closed(self) -> None:
+        """Dict aggregation should honor incomplete coverage retained only in issue details."""
+        result = create_initial_audit_result()
+        result.aggregate_scan_result(
+            {
+                "success": True,
+                "files_scanned": 1,
+                "issues": [
+                    {
+                        "message": "DVC output limit exceeded - not all declared outputs were scanned",
+                        "severity": "info",
+                        "location": "model.dvc",
+                        "type": "dvc_output_limit_exceeded",
+                        "details": {
+                            "analysis_incomplete": True,
+                            "scan_outcome": "inconclusive",
+                            "reason": "dvc_output_limit_exceeded",
+                        },
+                        "timestamp": 0.0,
+                    }
+                ],
+                "checks": [],
+                "assets": [],
+            }
+        )
+
+        assert result.has_errors is False
+        assert result.success is False
+        assert result.issues[0].details["reason"] == "dvc_output_limit_exceeded"
+        assert determine_exit_code(result) == 2
+
     def test_aggregate_scanner_names_wraps_scalar_strings(self) -> None:
         """Scalar scanner fields should not be split into characters."""
         result = create_initial_audit_result()
@@ -647,6 +678,27 @@ class TestModelAuditResultModel:
         assert any(metadata["scan_outcome"] == "inconclusive" for metadata in result.file_metadata.values())
         assert scan_result.metadata["scan_outcome"] == "inconclusive"
         assert "scanner_reported_unsuccessful_without_outcome" in scan_result.metadata["scan_outcome_reasons"]
+        assert determine_exit_code(result) == 2
+
+    def test_aggregate_scan_result_direct_check_only_incomplete_coverage_fails_closed(self) -> None:
+        """Direct aggregation should honor incomplete coverage retained only in check details."""
+        result = create_initial_audit_result()
+        scan_result = ScanResult(scanner_name="dvc")
+        scan_result.add_check(
+            name="DVC Output Resolution",
+            passed=False,
+            message="DVC output resolution incomplete",
+            severity=IssueSeverity.INFO,
+            location="model.dvc",
+            details={"analysis_incomplete": True, "scan_outcome_reason": "dvc_analysis_incomplete"},
+        )
+        scan_result.finish(success=True)
+
+        result.aggregate_scan_result_direct(scan_result)
+
+        assert result.has_errors is False
+        assert result.success is False
+        assert result.checks[0].details["scan_outcome_reason"] == "dvc_analysis_incomplete"
         assert determine_exit_code(result) == 2
 
     def test_aggregate_scan_result_direct_operational_flag_sets_error_state(self) -> None:

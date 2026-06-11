@@ -81,6 +81,13 @@ def _file_metadata_has_incomplete_coverage(file_metadata: Any) -> bool:
     return any(_metadata_has_incomplete_coverage(metadata) for metadata in file_metadata.values())
 
 
+def _records_have_incomplete_coverage(records: Any) -> bool:
+    """Return True when any issue/check details identify incomplete scan coverage."""
+    if not isinstance(records, list):
+        return False
+    return any(_metadata_has_incomplete_coverage(_metadata_value(record, "details")) for record in records)
+
+
 def _issues_have_security_findings(issues: list[Any]) -> bool:
     """Return True when incoming issue records contain WARNING/CRITICAL findings."""
     for issue in issues:
@@ -498,12 +505,17 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
             self.scanner_selection = incoming_scanner_selection
 
         incoming_issues = results_dict.get("issues", [])
+        incoming_checks = results_dict.get("checks", [])
         incoming_has_security_findings = (
             _issues_have_security_findings(incoming_issues) if isinstance(incoming_issues, list) else False
         )
-        incoming_has_incomplete_coverage = _metadata_has_incomplete_coverage(
-            results_dict.get("metadata")
-        ) or _file_metadata_has_incomplete_coverage(results_dict.get("file_metadata"))
+        incoming_has_incomplete_coverage = _metadata_has_incomplete_coverage(results_dict.get("metadata")) or any(
+            (
+                _file_metadata_has_incomplete_coverage(results_dict.get("file_metadata")),
+                _records_have_incomplete_coverage(incoming_issues),
+                _records_have_incomplete_coverage(incoming_checks),
+            )
+        )
 
         # Update success status for operational/incomplete scan failures.
         # Security findings should drive exit code 1 without becoming an
@@ -584,7 +596,15 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
             self.has_errors = True
 
         # Update success status for operational errors or incomplete coverage.
-        if bool(metadata.get("operational_error")) or _metadata_has_incomplete_coverage(metadata):
+        records_have_incomplete_coverage = any(
+            _metadata_has_incomplete_coverage(_metadata_value(record, "details"))
+            for record in [*scan_result.issues, *scan_result.checks]
+        )
+        if (
+            bool(metadata.get("operational_error"))
+            or _metadata_has_incomplete_coverage(metadata)
+            or records_have_incomplete_coverage
+        ):
             self.success = False
 
         if metadata:

@@ -8,7 +8,7 @@ import pytest
 
 import modelaudit.integrations.sarif_formatter as sarif_formatter
 from modelaudit.models import AssetModel, FileHashesModel, FileMetadataModel, create_initial_audit_result
-from modelaudit.scanners.base import Issue, IssueSeverity
+from modelaudit.scanners.base import Check, CheckStatus, Issue, IssueSeverity
 
 _create_artifacts = sarif_formatter._create_artifacts
 _create_results = sarif_formatter._create_results
@@ -546,6 +546,61 @@ class TestCreateRun:
         assert invocation["properties"]["incompleteCoverage"] is True
         assert invocation["properties"]["operationalErrors"] is False
 
+    def test_invocation_properties_mark_issue_only_incomplete_coverage_without_findings(self) -> None:
+        """Issue-only coverage gaps should be unsuccessful SARIF invocations."""
+        result = create_initial_audit_result()
+        result.files_scanned = 1
+        result.issues = [
+            Issue(
+                message="DVC output limit exceeded - not all declared outputs were scanned",
+                severity=IssueSeverity.INFO,
+                location="model.dvc",
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "reason": "dvc_output_limit_exceeded",
+                },
+                type="dvc_output_limit_exceeded",
+                timestamp=time.time(),
+            ),
+        ]
+        result.finalize_statistics()
+
+        run = _create_run(result, ["/test"], verbose=False)
+
+        invocation = run["invocations"][0]
+        assert invocation["exitCode"] == 2
+        assert invocation["exitCodeDescription"] == "Scan outcome was inconclusive"
+        assert invocation["executionSuccessful"] is False
+        assert invocation["properties"]["securityCoverageComplete"] is False
+        assert invocation["properties"]["incompleteCoverage"] is True
+
+    def test_invocation_properties_mark_check_only_incomplete_coverage_without_findings(self) -> None:
+        """Check-only coverage gaps should be unsuccessful SARIF invocations."""
+        result = create_initial_audit_result()
+        result.files_scanned = 1
+        result.checks = [
+            Check(
+                name="DVC Output Resolution",
+                status=CheckStatus.FAILED,
+                message="DVC output resolution incomplete",
+                severity=IssueSeverity.INFO,
+                location="model.dvc",
+                details={"analysis_incomplete": True, "scan_outcome_reason": "dvc_analysis_incomplete"},
+                timestamp=time.time(),
+            ),
+        ]
+        result.finalize_statistics()
+
+        run = _create_run(result, ["/test"], verbose=False)
+
+        invocation = run["invocations"][0]
+        assert invocation["exitCode"] == 2
+        assert invocation["exitCodeDescription"] == "Scan outcome was inconclusive"
+        assert invocation["executionSuccessful"] is False
+        assert invocation["properties"]["securityCoverageComplete"] is False
+        assert invocation["properties"]["incompleteCoverage"] is True
+
     def test_invocation_properties_mark_incomplete_coverage_with_security_findings(self) -> None:
         """Security exit 1 should not hide incomplete coverage in SARIF."""
         result = create_initial_audit_result()
@@ -573,6 +628,40 @@ class TestCreateRun:
         assert invocation["properties"]["incompleteCoverage"] is True
         assert invocation["properties"]["operationalErrors"] is False
         assert run["results"][0]["message"]["text"] == "Dangerous pickle global"
+
+    def test_invocation_properties_mark_issue_only_incomplete_coverage_with_security_findings(self) -> None:
+        """Security findings should keep exit 1 while issue-only coverage remains visible."""
+        result = create_initial_audit_result()
+        result.files_scanned = 2
+        result.issues = [
+            Issue(
+                message="DVC output resolution incomplete",
+                severity=IssueSeverity.INFO,
+                location="model.dvc",
+                details={"analysis_incomplete": True, "scan_outcome_reason": "dvc_analysis_incomplete"},
+                timestamp=time.time(),
+            ),
+            Issue(
+                message="Dangerous pickle global",
+                severity=IssueSeverity.WARNING,
+                location="/test/payload.pkl",
+                timestamp=time.time(),
+            ),
+        ]
+        result.finalize_statistics()
+
+        run = _create_run(result, ["/test"], verbose=False)
+
+        invocation = run["invocations"][0]
+        assert invocation["exitCode"] == 1
+        assert invocation["exitCodeDescription"] == "Security issues detected; scan coverage incomplete"
+        assert invocation["executionSuccessful"] is False
+        assert invocation["properties"]["securityCoverageComplete"] is False
+        assert invocation["properties"]["incompleteCoverage"] is True
+        assert [item["message"]["text"] for item in run["results"]] == [
+            "DVC output resolution incomplete",
+            "Dangerous pickle global",
+        ]
 
 
 class TestCreateRules:

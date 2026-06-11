@@ -4535,22 +4535,60 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
 
 
 def _results_have_incomplete_coverage(results: dict[str, Any]) -> bool:
-    file_metadata = results.get("file_metadata")
-    if not isinstance(file_metadata, dict):
-        return False
-    return any(metadata_has_incomplete_coverage(metadata) for metadata in file_metadata.values())
+    return bool(_incomplete_coverage_summaries(results))
 
 
 def _incomplete_coverage_summaries(results: dict[str, Any]) -> list[tuple[str, str]]:
-    file_metadata = results.get("file_metadata")
-    if not isinstance(file_metadata, dict):
-        return []
-
     summaries: list[tuple[str, str]] = []
-    for file_path, metadata in file_metadata.items():
-        if metadata_has_incomplete_coverage(metadata):
-            summaries.append((str(file_path), _incomplete_coverage_reason(metadata)))
+    seen: set[tuple[str, str]] = set()
+
+    file_metadata = results.get("file_metadata")
+    if isinstance(file_metadata, dict):
+        for file_path, metadata in file_metadata.items():
+            if metadata_has_incomplete_coverage(metadata):
+                _append_incomplete_coverage_summary(
+                    summaries,
+                    seen,
+                    str(file_path),
+                    _incomplete_coverage_reason(metadata),
+                )
+
+    for collection_name in ("issues", "checks"):
+        records = results.get(collection_name)
+        if not isinstance(records, list):
+            continue
+        fallback_location = collection_name[:-1]
+        for record in records:
+            details = _get_issue_attr(record, "details", {})
+            if not metadata_has_incomplete_coverage(details):
+                continue
+            location = (
+                _get_issue_attr(record, "location")
+                or _get_issue_attr(record, "name")
+                or _get_issue_attr(record, "type")
+                or fallback_location
+            )
+            _append_incomplete_coverage_summary(
+                summaries,
+                seen,
+                str(location),
+                _incomplete_coverage_reason(details),
+            )
+
     return summaries
+
+
+def _append_incomplete_coverage_summary(
+    summaries: list[tuple[str, str]],
+    seen: set[tuple[str, str]],
+    location: str,
+    reason: str,
+) -> None:
+    summary = (location, reason)
+    if summary in seen:
+        return
+    seen.add(summary)
+    summaries.append(summary)
 
 
 def _incomplete_coverage_reason(metadata: Any) -> str:
@@ -4558,6 +4596,14 @@ def _incomplete_coverage_reason(metadata: Any) -> str:
         return "incomplete coverage"
 
     reason = metadata.get("scan_outcome_reason")
+    if isinstance(reason, str) and reason:
+        return reason
+
+    reason = metadata.get("reason")
+    if isinstance(reason, str) and reason:
+        return reason
+
+    reason = metadata.get("incomplete_reason")
     if isinstance(reason, str) and reason:
         return reason
 
