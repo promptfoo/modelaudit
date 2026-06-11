@@ -1634,6 +1634,25 @@ def test_scan_model_streaming_openvino_bin_without_yielded_xml_fails_closed(tmp_
     assert any(issue.location == str(bin_path) and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_scan_model_streaming_openvino_pickle_sidecar_reports_payload(tmp_path: Path) -> None:
+    """A yielded OpenVINO XML must still surface pickle payloads in its owned weights."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+    create_malicious_pickle(bin_path)
+
+    result = scan_model_streaming(
+        file_generator=iter([(xml_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+    )
+
+    assert determine_exit_code(result) == 1
+    assert result.scanner_names == ["openvino"]
+    assert result.file_metadata[str(xml_path)]["openvino_weights_pickle_payload_scanned"] is True
+    assert "pickle" in result.file_metadata[str(xml_path)]["scanner_dependency_ids"]
+    assert any(issue.location == str(bin_path) and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
 def test_scan_model_streaming_selected_openvino_preserves_bin_before_skip_filter(tmp_path: Path) -> None:
     """OpenVINO-only streaming must defer bin-first sidecars before extension filtering."""
     xml_path, bin_path = _write_openvino_pair(tmp_path)

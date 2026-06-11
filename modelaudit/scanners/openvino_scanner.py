@@ -275,6 +275,51 @@ class OpenVinoScanner(BaseScanner):
                     "scan_outcome_reason": reason,
                 },
             )
+            return
+
+        self._scan_pickle_payload_sidecar(result, bin_path, bin_size)
+
+    def _scan_pickle_payload_sidecar(self, result: ScanResult, bin_path: Path, bin_size: int) -> None:
+        """Scan an OpenVINO weights sidecar when its content is actually pickle-formatted."""
+        try:
+            from modelaudit.utils.file.detection import detect_file_format_from_magic
+
+            if detect_file_format_from_magic(str(bin_path)) != "pickle":
+                return
+
+            from .pickle_scanner import PickleScanner
+
+            with bin_path.open("rb") as bin_file:
+                pickle_result = PickleScanner(config=self.config).scan_stream(
+                    bin_file,
+                    bin_size,
+                    source=str(bin_path),
+                )
+        except Exception as exc:
+            reason = "openvino_weights_pickle_scan_failed"
+            result.metadata["operational_error"] = True
+            result.metadata["operational_error_reason"] = reason
+            result.metadata["analysis_incomplete"] = True
+            result.metadata["scan_outcome"] = "inconclusive"
+            result.metadata["scan_outcome_reason"] = reason
+            result.add_check(
+                name="OpenVINO Weights Pickle Payload Scan",
+                passed=False,
+                message=f"Unable to inspect pickle-formatted OpenVINO weights sidecar: {exc}",
+                severity=IssueSeverity.INFO,
+                location=str(bin_path),
+                details={
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": reason,
+                },
+            )
+            return
+
+        pickle_result.bytes_scanned = 0
+        result.metadata["openvino_weights_pickle_payload_scanned"] = True
+        result.merge(pickle_result)
 
     @classmethod
     def can_handle(cls, path: str) -> bool:

@@ -5,6 +5,7 @@ import pytest
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.openvino_scanner import OpenVinoScanner
+from tests.helpers import create_malicious_pickle
 
 
 def create_basic_model(dir_path: Path) -> Path:
@@ -58,6 +59,24 @@ def test_openvino_scanner_matches_casefolded_unicode_weights_companion(tmp_path:
     assert result.success is True
     assert result.metadata["bin_size"] == bin_path.stat().st_size
     assert not any("weights file not found" in check.message.lower() for check in result.checks)
+
+
+def test_openvino_scanner_detects_pickle_payload_in_weights_companion(tmp_path: Path) -> None:
+    """A valid OpenVINO XML must not hide pickle-formatted same-stem weights."""
+    xml_path = create_basic_model(tmp_path)
+    bin_path = create_malicious_pickle(tmp_path / "model.bin")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    assert result.success is False
+    assert result.metadata["openvino_weights_pickle_payload_scanned"] is True
+    assert "pickle" in result.metadata["scanner_dependency_ids"]
+    assert any(
+        issue.location == str(bin_path)
+        and issue.severity == IssueSeverity.CRITICAL
+        and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
+        for issue in result.issues
+    )
 
 
 def test_openvino_scanner_can_handle_long_xml_prolog(tmp_path: Path) -> None:
