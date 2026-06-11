@@ -30,6 +30,11 @@ class _LateMaliciousPayload:
         return (os.system, ("echo c085",))
 
 
+def _write_incomplete_png_payload(path: Path) -> None:
+    png_header = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + (b"\x00" * 32)
+    path.write_bytes(png_header + (b"\x00" * (100_000 - len(png_header))))
+
+
 class TestDvcIntegration:
     """Test DVC integration functionality."""
 
@@ -1468,6 +1473,36 @@ class TestDvcSecurity:
             for issue in result.issues
         )
         assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
+
+    def test_dvc_directory_output_keeps_security_exit_when_nested_coverage_incomplete(self, tmp_path: Path) -> None:
+        """Nested DVC coverage gaps should not mask security findings as operational errors."""
+        output_dir = tmp_path / "model"
+        output_dir.mkdir()
+
+        malicious = output_dir / "late_malicious.pkl"
+        with malicious.open("wb") as handle:
+            pickle.dump(_LateMaliciousPayload(), handle)
+
+        incomplete = output_dir / "preview.png"
+        _write_incomplete_png_payload(incomplete)
+
+        dvc_file = tmp_path / "model.dvc"
+        dvc_file.write_text("outs:\n- path: model\n")
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_scan_results=False)
+
+        assert result.files_scanned == 2
+        assert result.success is False
+        assert result.has_errors is False
+        assert determine_exit_code(result) == 1
+        assert any(
+            issue.rule_code == "S201" and issue.location is not None and str(malicious) in issue.location
+            for issue in result.issues
+        )
+        incomplete_metadata = result.file_metadata[str(incomplete)]
+        assert incomplete_metadata["scan_outcome"] == "inconclusive"
+        assert incomplete_metadata["analysis_incomplete"] is True
+        assert "pickle_analysis_incomplete" in incomplete_metadata["scan_outcome_reasons"]
 
     def test_directory_scan_accepts_fully_covered_tail_past_verification_window(self, tmp_path: Path) -> None:
         """A large in-tree DVC tail is covered by the already completed directory walk."""

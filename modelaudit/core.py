@@ -167,6 +167,7 @@ _add_scan_result_to_model = core_results.add_scan_result_to_model
 _consolidate_checks = core_results.consolidate_checks
 _mark_inconclusive_scan_outcome = core_results.mark_inconclusive_scan_outcome
 _mark_operational_scan_error = core_results.mark_operational_scan_error
+_results_have_operational_error = core_results.results_have_operational_error
 _results_should_be_unsuccessful = core_results.results_should_be_unsuccessful
 _scan_result_has_operational_error = core_results.scan_result_has_operational_error
 _serialize_streamed_records = core_results.serialize_streamed_records
@@ -3084,13 +3085,9 @@ def scan_model_directory_or_file(
                         resolved_directory = str(Path(root).resolve())
                         dvc_scanned_directories.add(resolved_directory)
                         internally_scanned_dvc_directories.add(resolved_directory)
-                    if nested_result.has_errors or not nested_result.success:
+                    if _results_have_operational_error(nested_result):
                         scan_metadata["success"] = False
-                        scan_metadata["has_operational_errors"] = bool(
-                            scan_metadata["has_operational_errors"]
-                            or nested_result.has_errors
-                            or not nested_result.success
-                        )
+                        scan_metadata["has_operational_errors"] = True
                     results.content_hash = None
                     aggregate_hash_complete = False
                     continue
