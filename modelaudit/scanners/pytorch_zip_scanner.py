@@ -73,6 +73,9 @@ _PICKLE_CODE_EXECUTION_OPCODE_RISKS = (
     ("BUILD", "__setstate__ method exploitation"),
 )
 _PICKLE_NESTED_EXECUTION_OPCODES = frozenset({"REDUCE", "INST", "OBJ", "NEWOBJ", "NEWOBJ_EX", "BUILD"})
+_PICKLE_SECURITY_RELEVANT_OPCODES = frozenset(
+    {"GLOBAL", "STACK_GLOBAL", "REDUCE", "INST", "OBJ", "NEWOBJ", "NEWOBJ_EX", "BUILD"}
+)
 _PICKLE_OPCODE_BYTES = frozenset(ord(opcode.code) for opcode in pickletools.opcodes)
 
 
@@ -146,7 +149,9 @@ _PICKLE_BINARY_PROTOCOL_PREFIXES: tuple[bytes, ...] = (
 )
 _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
 _TRUSTED_STORAGE_PICKLE_PROBE_BYTES = 4 * 1024
+_PICKLE_FRAME_OPCODE = b"\x95"
 _PICKLE_FRAME_OPCODE_BYTES = 9
+_PICKLE_INCOMPLETE_FRAME_MIN_PAYLOAD_OPCODES = 4
 _PYTORCH_STORAGE_TRUST_MAX_OPCODES = 100_000
 _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH = 1024
 _PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES = 100_000
@@ -1716,7 +1721,12 @@ class PyTorchZipScanner(BaseScanner):
         if not data_start:
             return False
         is_binary_pickle_candidate = data_start.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES)
-        if not is_binary_pickle_candidate and data_start[0] not in PROTO0_1_START_BYTES:
+        is_frame_first_candidate = data_start.startswith(_PICKLE_FRAME_OPCODE)
+        if (
+            not is_binary_pickle_candidate
+            and not is_frame_first_candidate
+            and data_start[0] not in PROTO0_1_START_BYTES
+        ):
             return False
 
         sample = data_start
@@ -1730,6 +1740,8 @@ class PyTorchZipScanner(BaseScanner):
             )
         if is_binary_pickle_candidate:
             return self._binary_pickle_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
+        if is_frame_first_candidate:
+            return self._frame_first_trusted_storage_probe_should_scan(sample)
         return self._proto0_or_1_trusted_storage_probe_should_scan(
             sample,
             sample_is_prefix=entry.file_size > len(sample),
@@ -1757,11 +1769,70 @@ class PyTorchZipScanner(BaseScanner):
     def _proto0_or_1_trusted_storage_probe_should_scan(sample: bytes, *, sample_is_prefix: bool) -> bool:
         if PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(sample):
             return True
+        if PyTorchZipScanner._has_security_relevant_opcode_in_incomplete_frame(sample):
+            return True
         if not sample_is_prefix:
             return False
         if PyTorchZipScanner._contains_pickle_frame_opcode(sample):
             return False
         return _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=True)
+
+    @staticmethod
+    def _frame_first_trusted_storage_probe_should_scan(sample: bytes) -> bool:
+        if not sample.startswith(_PICKLE_FRAME_OPCODE):
+            return False
+        return PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(
+            sample
+        ) or PyTorchZipScanner._has_structural_pickle_evidence_in_incomplete_frame(sample)
+
+    @staticmethod
+    def _has_structural_pickle_evidence_in_incomplete_frame(sample: bytes) -> bool:
+        frame_end: int | None = None
+        payload_opcode_count = 0
+        try:
+            for opcode, arg, pos in pickletools.genops(sample):
+                if pos is None:
+                    continue
+                if opcode.name == "FRAME":
+                    if frame_end is not None or not isinstance(arg, int):
+                        return False
+                    frame_end = pos + _PICKLE_FRAME_OPCODE_BYTES + arg
+                    if frame_end <= len(sample):
+                        return False
+                    continue
+                if frame_end is None or pos >= frame_end:
+                    return False
+                payload_opcode_count += 1
+        except Exception as exc:
+            message = str(exc).lower()
+            return (
+                frame_end is not None
+                and frame_end > len(sample)
+                and payload_opcode_count >= _PICKLE_INCOMPLETE_FRAME_MIN_PAYLOAD_OPCODES
+                and (
+                    "exhausted before seeing stop" in message
+                    or "no newline found when trying to read" in message
+                    or "not enough data" in message
+                    or "expected" in message
+                )
+            )
+        return frame_end is not None and payload_opcode_count >= _PICKLE_INCOMPLETE_FRAME_MIN_PAYLOAD_OPCODES
+
+    @staticmethod
+    def _has_security_relevant_opcode_in_incomplete_frame(sample: bytes) -> bool:
+        incomplete_frame_seen = False
+        security_relevant_opcode_seen = False
+        try:
+            for opcode, arg, pos in pickletools.genops(sample):
+                if opcode.name == "FRAME" and isinstance(arg, int) and pos is not None:
+                    incomplete_frame_seen = pos + _PICKLE_FRAME_OPCODE_BYTES + arg > len(sample)
+                elif opcode.name in _PICKLE_SECURITY_RELEVANT_OPCODES:
+                    security_relevant_opcode_seen = True
+                if incomplete_frame_seen and security_relevant_opcode_seen:
+                    return True
+        except Exception:
+            return incomplete_frame_seen and security_relevant_opcode_seen
+        return False
 
     @staticmethod
     def _contains_pickle_frame_opcode(sample: bytes) -> bool:
@@ -1859,7 +1930,9 @@ class PyTorchZipScanner(BaseScanner):
             except OSError:
                 original_file_size = 1  # Avoid divide-by-zero in density calculations
 
+        fallback_storage_trust_opcodes_remaining = [_PYTORCH_STORAGE_TRUST_MAX_OPCODES]
         for info in pickle_files:
+            self._check_timeout()
             name = self._get_zip_member_name(info)
             pickle_data_size = info.file_size
             pickle_source = f"{path}:{name}"
@@ -1875,6 +1948,7 @@ class PyTorchZipScanner(BaseScanner):
                         path,
                         name,
                         trusted_storage_keys,
+                        opcode_budget_remaining=fallback_storage_trust_opcodes_remaining,
                     )
                 add_scanner_selection_skip_check(
                     result,
@@ -2040,7 +2114,9 @@ class PyTorchZipScanner(BaseScanner):
 
         trusted_members: dict[str, set[str]] = {}
         storage_reference_bytes_read = 0
+        storage_reference_opcodes_remaining = [_PYTORCH_STORAGE_TRUST_MAX_OPCODES]
         for data_pkl_member, data_pkl_entries in entries_by_name.items():
+            self._check_timeout()
             if data_pkl_member.rsplit("/", 1)[-1] != "data.pkl":
                 continue
             prefix = data_pkl_member[: -len("data.pkl")]
@@ -2111,7 +2187,10 @@ class PyTorchZipScanner(BaseScanner):
                 )
                 continue
 
-            referenced_keys, parse_complete = self._trusted_storage_keys_from_pickle_bytes(pickle_data)
+            referenced_keys, parse_complete = self._trusted_storage_keys_from_pickle_bytes(
+                pickle_data,
+                opcode_budget_remaining=storage_reference_opcodes_remaining,
+            )
             if not parse_complete:
                 self._record_storage_reference_validation_incomplete(
                     result,
@@ -2189,6 +2268,7 @@ class PyTorchZipScanner(BaseScanner):
         cls,
         pickle_data: bytes,
         trusted_storage_keys: set[str] | None = None,
+        opcode_budget_remaining: list[int] | None = None,
     ) -> tuple[set[str], bool]:
         """Extract validated PyTorch storage keys without running the embedded pickle scanner."""
         marker = object()
@@ -2305,6 +2385,10 @@ class PyTorchZipScanner(BaseScanner):
 
         try:
             for opcode_count, (opcode, arg, _pos) in enumerate(pickletools.genops(pickle_data), start=1):
+                if opcode_budget_remaining is not None:
+                    if opcode_budget_remaining[0] <= 0:
+                        return set(), False
+                    opcode_budget_remaining[0] -= 1
                 if opcode_count > _PYTORCH_STORAGE_TRUST_MAX_OPCODES:
                     return set(), False
                 opcode_name = opcode.name
@@ -2405,6 +2489,8 @@ class PyTorchZipScanner(BaseScanner):
         path: str,
         pickle_name: str,
         trusted_storage_keys: set[str],
+        *,
+        opcode_budget_remaining: list[int] | None = None,
     ) -> None:
         max_trust_parse_bytes = 10 * 1024 * 1024
         try:
@@ -2430,6 +2516,7 @@ class PyTorchZipScanner(BaseScanner):
         referenced_storage_keys, parse_complete = self._trusted_storage_keys_from_pickle_bytes(
             pickle_data,
             trusted_storage_keys,
+            opcode_budget_remaining=opcode_budget_remaining,
         )
         if not parse_complete:
             return

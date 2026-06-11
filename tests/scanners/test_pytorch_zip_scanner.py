@@ -106,6 +106,26 @@ def _large_proto0_system_payload() -> bytes:
     return b"cposix\nsystem\n(S'" + (b"A" * 10_000) + b"'\ntR."
 
 
+def _protocol_less_framed_malicious_storage_payload() -> bytes:
+    return b"cposix\nsystem\n(S'echo hidden'\ntR" + b"\x95" + struct.pack("<Q", 100) + b"abc"
+
+
+def _frame_first_large_malicious_eval_pickle_payload() -> bytes:
+    benign_prefix = b"N0" * 2100
+    dangerous_suffix = b"cbuiltins\neval\n(S'print(1)'\ntR."
+    body = benign_prefix + dangerous_suffix
+    payload = b"\x95" + len(body).to_bytes(8, "little") + body
+    assert payload[0] == 0x95
+    assert int.from_bytes(payload[1:9], "little") > 4 * 1024
+    assert payload.find(b"cbuiltins\neval\n") > 4 * 1024
+    assert payload.rfind(b".") > 4 * 1024
+    return payload
+
+
+def _frame_first_raw_storage_bytes() -> bytes:
+    return b"\x95" + (10_000).to_bytes(8, "little") + (b"\x00" * 4096)
+
+
 def _short_binunicode(data: bytes) -> bytes:
     assert len(data) < 256
     return b"\x8c" + bytes([len(data)]) + data + b"\x94"
@@ -593,6 +613,24 @@ def test_pytorch_zip_discovery_skips_referenced_storage_blob_binary_magic_withou
     assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
 
 
+def test_pytorch_zip_discovery_skips_referenced_storage_blob_frame_first_without_opcode(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_storage_frame_first_raw_bytes.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        zip_file.writestr("archive/data/0", _frame_first_raw_storage_bytes())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+
+
 def test_pytorch_zip_discovery_trusts_protocol0_storage_persid(tmp_path: Path) -> None:
     model_path = tmp_path / "protocol0_referenced_storage.pt"
     with zipfile.ZipFile(model_path, "w") as zip_file:
@@ -660,6 +698,46 @@ def test_pytorch_zip_discovery_scans_referenced_storage_blob_when_it_is_a_pickle
     assert "archive/data/0" in result.metadata["pickle_files"]
     assert any(
         issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_scans_referenced_storage_blob_with_truncated_frame(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_storage_protocol_less_frame.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        zip_file.writestr("archive/data/0", _protocol_less_framed_malicious_storage_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_scans_referenced_storage_blob_with_frame_first_large_pickle(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_storage_frame_first_pickle.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        zip_file.writestr("archive/data/0", _frame_first_large_malicious_eval_pickle_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("pickle_filename") == "archive/data/0"
+        and "eval" in issue.message.lower()
         for issue in result.issues
     )
 
@@ -810,6 +888,50 @@ def test_pytorch_zip_storage_reference_total_budget_keeps_blob_scan(
         issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive1/data/0"
         for issue in result.issues
     )
+
+
+def test_pytorch_zip_storage_reference_validation_checks_timeout_between_data_pkls(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "storage_reference_timeout.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        for index in range(2):
+            prefix = f"archive{index}/"
+            zip_file.writestr(f"{prefix}version", "3\n")
+            zip_file.writestr(f"{prefix}byteorder", "little")
+            zip_file.writestr(f"{prefix}data.pkl", _pytorch_storage_persistent_id_payload("0"))
+            zip_file.writestr(f"{prefix}data/0", b"\x00" * 8)
+
+    scanner = PyTorchZipScanner()
+    storage_reads: list[str] = []
+    original_read_member_bytes = scanner._read_member_bytes
+
+    def read_member_bytes(
+        zip_file: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        *,
+        phase: str,
+        result: ScanResult,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        if phase == "pytorch_storage_pickle_discovery":
+            storage_reads.append(PyTorchZipScanner._get_zip_member_name(name))
+        return original_read_member_bytes(zip_file, name, phase=phase, result=result, max_bytes=max_bytes)
+
+    def check_timeout() -> None:
+        if storage_reads:
+            raise TimeoutError("storage reference validation deadline exceeded")
+
+    monkeypatch.setattr(scanner, "_read_member_bytes", read_member_bytes)
+    monkeypatch.setattr(scanner, "_check_timeout", check_timeout)
+
+    result = scanner.scan(str(model_path))
+
+    assert storage_reads == ["archive0/data.pkl"]
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_scan_timeout" in result.metadata["scan_outcome_reasons"]
 
 
 @pytest.mark.integration
