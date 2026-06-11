@@ -1,0 +1,223 @@
+{
+  "schema_version": 1,
+  "description": "Opt-in Hugging Face false-positive regression matrix. Entries pin immutable Hub revisions and small trigger paths for live/nightly reproduction; synthetic malicious controls are generated under pytest tmp_path.",
+  "live": {
+    "enabled_by_env": "MODELAUDIT_RUN_HF_FP_LIVE",
+    "full_matrix_env": "MODELAUDIT_RUN_HF_FP_FULL_MATRIX",
+    "cache_dir_env": "MODELAUDIT_HF_FP_CACHE_DIR",
+    "token_env": "HF_TOKEN"
+  },
+  "defaults": {
+    "expected_outcome": {
+      "exit_code": 0,
+      "success": true,
+      "forbidden_issue_severities": ["warning", "critical"]
+    },
+    "modes": ["local-directory", "streaming", "dry-run", "scanner-selective"],
+    "wall_time_budget_seconds": 300,
+    "max_download_bytes": 104857600
+  },
+  "cases": [
+    {
+      "rank": 2,
+      "id": "rank02_sentence_transformers_all_minilm_l6_v2",
+      "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+      "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+      "triggering_paths": [
+        {
+          "path": "model.safetensors",
+          "size_bytes": 90868376,
+          "scanners": ["safetensors"],
+          "expected_outcome": "clean"
+        }
+      ],
+      "expected_outcome": {
+        "exit_code": 0,
+        "success": true,
+        "forbidden_issue_severities": ["warning", "critical"]
+      },
+      "wall_time_budget_seconds": 180,
+      "max_download_bytes": 104857600,
+      "malicious_control": {
+        "path": "controls/rank02_payload.pt",
+        "generator": "synthetic_malicious_pytorch_zip",
+        "scanners": ["pytorch_zip", "pickle"],
+        "expected_exit_code": 1,
+        "expected_issue_severities": ["critical"]
+      }
+    },
+    {
+      "rank": 4,
+      "id": "rank04_nvidia_locateanything_3b",
+      "model_id": "nvidia/LocateAnything-3B",
+      "revision": "272068e81a31e88a48ea03c20a09decba2b62ed6",
+      "triggering_paths": [
+        {
+          "path": "training_args.bin",
+          "size_bytes": 7288,
+          "scanners": ["pickle"],
+          "expected_outcome": "clean"
+        }
+      ],
+      "expected_outcome": {
+        "exit_code": 0,
+        "success": true,
+        "forbidden_issue_severities": ["warning", "critical"]
+      },
+      "wall_time_budget_seconds": 120,
+      "max_download_bytes": 10485760,
+      "malicious_control": {
+        "path": "controls/rank04_payload.pkl",
+        "generator": "synthetic_malicious_pickle",
+        "scanners": ["pickle"],
+        "expected_exit_code": 1,
+        "expected_issue_severities": ["critical"]
+      }
+    },
+    {
+      "rank": 7,
+      "id": "rank07_unsloth_gemma_4_12b_it_gguf",
+      "model_id": "unsloth/gemma-4-12b-it-GGUF",
+      "revision": "3249fa54d5efa384afc552cc6700ad091efd5c39",
+      "triggering_paths": [
+        {
+          "path": "mmproj-F16.gguf",
+          "size_bytes": 175115840,
+          "scanners": ["gguf"],
+          "expected_outcome": "clean"
+        }
+      ],
+      "expected_outcome": {
+        "exit_code": 0,
+        "success": true,
+        "forbidden_issue_severities": ["warning", "critical"]
+      },
+      "wall_time_budget_seconds": 420,
+      "max_download_bytes": 209715200,
+      "malicious_control": {
+        "path": "controls/rank07_payload.pt",
+        "generator": "synthetic_malicious_pytorch_zip",
+        "scanners": ["pytorch_zip", "pickle"],
+        "expected_exit_code": 1,
+        "expected_issue_severities": ["critical"]
+      }
+    },
+    {
+      "rank": 8,
+      "id": "rank08_google_bert_base_uncased",
+      "model_id": "google-bert/bert-base-uncased",
+      "revision": "86b5e0934494bd15c9632b12f734a8a67f723594",
+      "triggering_paths": [
+        {
+          "path": "coreml/fill-mask/float32_model.mlpackage/Data/com.apple.CoreML/model.mlmodel",
+          "size_bytes": 164911,
+          "scanners": ["coreml"],
+          "expected_outcome": "clean"
+        }
+      ],
+      "expected_outcome": {
+        "exit_code": 0,
+        "success": true,
+        "forbidden_issue_severities": ["warning", "critical"]
+      },
+      "wall_time_budget_seconds": 180,
+      "max_download_bytes": 10485760,
+      "malicious_control": {
+        "path": "controls/rank08_payload.pkl",
+        "generator": "synthetic_malicious_pickle",
+        "scanners": ["pickle"],
+        "expected_exit_code": 1,
+        "expected_issue_severities": ["critical"]
+      }
+    },
+    {
+      "rank": 19,
+      "id": "rank19_nvidia_nemotron_3_5_asr_streaming_0_6b",
+      "model_id": "nvidia/nemotron-3.5-asr-streaming-0.6b",
+      "revision": "24b151a851dd15909e1fc611b11bb2da52b9fc81",
+      "triggering_paths": [
+        {
+          "path": "nemotron-3.5-asr-streaming-0.6b.nemo",
+          "size_bytes": 2368284501,
+          "scanners": ["nemo"],
+          "expected_outcome": "clean"
+        }
+      ],
+      "expected_outcome": {
+        "exit_code": 0,
+        "success": true,
+        "forbidden_issue_severities": ["warning", "critical"]
+      },
+      "wall_time_budget_seconds": 1200,
+      "max_download_bytes": 3221225472,
+      "malicious_control": {
+        "path": "controls/rank19_payload.pkl",
+        "generator": "synthetic_malicious_pickle",
+        "scanners": ["pickle"],
+        "expected_exit_code": 1,
+        "expected_issue_severities": ["critical"]
+      }
+    },
+    {
+      "rank": 21,
+      "id": "rank21_meta_llama_3_1_8b_instruct",
+      "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+      "revision": "0e9e39f249a16976918f6564b8830bc894c89659",
+      "modes": ["local-directory", "streaming", "dry-run", "scanner-selective", "gated"],
+      "auth": {
+        "gated": true,
+        "token_env": "HF_TOKEN"
+      },
+      "triggering_paths": [
+        {
+          "path": "model.safetensors.index.json",
+          "size_bytes": 23950,
+          "scanners": ["manifest"],
+          "expected_outcome": "clean"
+        }
+      ],
+      "expected_outcome": {
+        "exit_code": 0,
+        "success": true,
+        "forbidden_issue_severities": ["warning", "critical"]
+      },
+      "wall_time_budget_seconds": 180,
+      "max_download_bytes": 10485760,
+      "malicious_control": {
+        "path": "controls/rank21_payload.pkl",
+        "generator": "synthetic_malicious_pickle",
+        "scanners": ["pickle"],
+        "expected_exit_code": 1,
+        "expected_issue_severities": ["critical"]
+      }
+    },
+    {
+      "rank": 23,
+      "id": "rank23_baai_bge_m3",
+      "model_id": "BAAI/bge-m3",
+      "revision": "5617a9f61b028005a4858fdac845db406aefb181",
+      "triggering_paths": [
+        {
+          "path": "sparse_linear.pt",
+          "size_bytes": 3516,
+          "scanners": ["pytorch_zip", "pickle"],
+          "expected_outcome": "clean"
+        }
+      ],
+      "expected_outcome": {
+        "exit_code": 0,
+        "success": true,
+        "forbidden_issue_severities": ["warning", "critical"]
+      },
+      "wall_time_budget_seconds": 180,
+      "max_download_bytes": 10485760,
+      "malicious_control": {
+        "path": "controls/rank23_payload.pt",
+        "generator": "synthetic_malicious_pytorch_zip",
+        "scanners": ["pytorch_zip", "pickle"],
+        "expected_exit_code": 1,
+        "expected_issue_severities": ["critical"]
+      }
+    }
+  ]
+}

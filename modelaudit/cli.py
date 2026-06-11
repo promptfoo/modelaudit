@@ -96,6 +96,7 @@ from .utils.sources.huggingface import (
     extract_model_id_from_path,
     is_huggingface_file_url,
     is_huggingface_url,
+    parse_huggingface_file_url,
     redact_huggingface_url_for_display,
     redact_huggingface_urls_in_text,
 )
@@ -162,6 +163,94 @@ def _display_error(error: object, path: str) -> str:
             else str(error)
         )
     return _escape_terminal_text(display_error)
+
+
+def get_model_info(path: str) -> dict[str, Any]:
+    """Delegate Hugging Face metadata lookup through the source module."""
+    from .utils.sources import huggingface as huggingface_source
+
+    return huggingface_source.get_model_info(path)
+
+
+def _format_preview_size(size_bytes: object) -> str:
+    """Return a human-readable size for source previews."""
+    if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes < 0:
+        return "unknown"
+    if size_bytes == 0:
+        return "unknown"
+    size = float(size_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0:
+            return f"{size:.2f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024.0
+    return f"{size:.2f} PB"
+
+
+def _selected_huggingface_preview_files(files: object, runtime: "_ScanRuntimeConfig") -> list[dict[str, Any]]:
+    """Return filename-selected Hugging Face preview entries without probing file content."""
+    if not isinstance(files, list):
+        return []
+
+    extensions = None
+    if runtime.scannable_extensions is not None:
+        extensions = {str(extension).lower() for extension in runtime.scannable_extensions if str(extension)}
+    filenames = {str(filename).lower() for filename in runtime.scannable_filenames or ()}
+
+    selected: list[dict[str, Any]] = []
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        name_lower = name.lower()
+        if extensions is None:
+            selected.append(item)
+            continue
+        if any(name_lower.endswith(extension) for extension in extensions) or Path(name_lower).name in filenames:
+            selected.append(item)
+    return selected
+
+
+def _preview_huggingface_file_source(path: str) -> None:
+    """Print a no-download preview for a direct Hugging Face file URL."""
+    display_path = _display_path(path)
+    repo_id, revision, filename = parse_huggingface_file_url(path)
+    click.echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:")
+    click.echo("   Type: Hugging Face file")
+    click.echo(f"   Repository: {_escape_terminal_text(repo_id)}")
+    click.echo(f"   Revision: {_escape_terminal_text(revision)}")
+    click.echo(f"   File: {_escape_terminal_text(filename)}")
+    click.echo("   Download: skipped (--dry-run)")
+    click.echo("   Scan: skipped (--dry-run)")
+
+
+def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig") -> None:
+    """Print a no-download preview for a Hugging Face repository URL."""
+    display_path = _display_path(path)
+    metadata = get_model_info(path)
+    files = metadata.get("files", [])
+    selected_files = _selected_huggingface_preview_files(files, runtime)
+    total_size = metadata.get("total_size")
+    selected_size = sum(item.get("size", 0) for item in selected_files if isinstance(item.get("size", 0), int))
+
+    click.echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:")
+    click.echo("   Type: Hugging Face repository")
+    click.echo(
+        f"   Model: {_escape_terminal_text(str(metadata.get('model_id') or metadata.get('repo_id') or 'unknown'))}"
+    )
+    click.echo(f"   Files: {_escape_terminal_text(str(metadata.get('file_count', 0)))}")
+    click.echo(f"   Total size: {_format_preview_size(total_size)}")
+    if runtime.scannable_extensions is not None or runtime.scannable_filenames is not None:
+        click.echo(f"   Scannable files: {len(selected_files)} of {metadata.get('file_count', 0)}")
+        click.echo(f"   Scannable size: {_format_preview_size(selected_size)}")
+    if runtime.scan_and_delete:
+        click.echo("   Mode: Streaming")
+    if runtime.scanner_selection_metadata is not None:
+        enabled = runtime.scanner_selection_metadata.get("enabled_scanner_ids", [])
+        click.echo(f"   Enabled scanners: {', '.join(str(scanner) for scanner in enabled)}")
+    click.echo("   Download: skipped (--dry-run)")
+    click.echo("   Scan: skipped (--dry-run)")
 
 
 class _OutputWriteError(click.ClickException):
@@ -2338,7 +2427,12 @@ def _record_suppressed_preferred_scanners(audit_result: ModelAuditResultModel) -
     return suppressions
 
 
-def _record_scan_end_and_exit(audit_result: ModelAuditResultModel, scan_start_time: float) -> NoReturn:
+def _record_scan_end_and_exit(
+    audit_result: ModelAuditResultModel,
+    scan_start_time: float,
+    *,
+    dry_run: bool = False,
+) -> NoReturn:
     """Record final telemetry and exit with the scan result's status code."""
     scan_duration = time.time() - scan_start_time
     try:
@@ -2349,6 +2443,8 @@ def _record_scan_end_and_exit(audit_result: ModelAuditResultModel, scan_start_ti
     finally:
         flush_telemetry()
 
+    if dry_run and not audit_result.has_errors and audit_result.success is not False:
+        sys.exit(0)
     sys.exit(determine_exit_code(audit_result))
 
 
@@ -2645,6 +2741,15 @@ def _resolve_scan_source_for_path(
 
     if is_huggingface_file_url(path):
         display_path = _display_path(path)
+        if dry_run:
+            try:
+                _preview_huggingface_file_source(path)
+            except Exception as exc:
+                error_msg = _display_error(exc, path)
+                click.echo(f"Error analyzing {display_path}: {error_msg}", err=True)
+                path_state.mark_non_shard_error(audit_result)
+            return _SourceDispatchResult(actual_path=path, local_scan_required=False)
+
         download_spinner = None
         temp_dir = None
         if runtime.show_styled_output and should_show_spinner():
@@ -2706,12 +2811,19 @@ def _resolve_scan_source_for_path(
 
     if is_huggingface_url(path):
         display_path = _display_path(path)
+        if dry_run:
+            try:
+                _preview_huggingface_model_source(path, runtime)
+            except Exception as exc:
+                error_msg = _display_error(exc, path)
+                click.echo(f"Error analyzing {display_path}: {error_msg}", err=True)
+                path_state.mark_non_shard_error(audit_result)
+            return _SourceDispatchResult(actual_path=path, local_scan_required=False)
+
         if runtime.show_styled_output:
             click.echo(f"\n📥 Preparing to download from {style_text(display_path, fg='cyan')}")
 
             try:
-                from .utils.sources.huggingface import get_model_info
-
                 model_info = get_model_info(path)
                 size_bytes = model_info["total_size"]
                 if size_bytes == 0:
@@ -4075,7 +4187,7 @@ def scan_command(
         flush_telemetry()
         raise
 
-    _record_scan_end_and_exit(audit_result, scan_start_time)
+    _record_scan_end_and_exit(audit_result, scan_start_time, dry_run=dry_run)
 
 
 def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
