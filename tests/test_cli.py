@@ -4753,7 +4753,106 @@ def test_scan_directory_skips_huggingface_cache_bookkeeping(tmp_path):
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
-def test_scan_huggingface_streaming_with_issues(mock_scan_streaming, mock_download_streaming, mock_is_hf_url, tmp_path):
+def test_scan_huggingface_streaming_incomplete_result_reports_failed_progress(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Partial HF stream results must not claim a completed streaming scan."""
+    mock_is_hf_url.return_value = True
+
+    test_file = tmp_path / "malicious.pkl"
+    test_file.write_text("malicious content")
+    mock_download_streaming.return_value = iter([(test_file, False)])
+    mock_scan_streaming.return_value = create_mock_scan_result(
+        bytes_scanned=100,
+        files_scanned=1,
+        issues=[
+            {
+                "message": "Dangerous import detected before interruption",
+                "severity": "critical",
+                "location": "malicious.pkl",
+            },
+            {
+                "message": "Streaming source interrupted before all artifacts could be scanned",
+                "severity": "info",
+                "location": "hf://test/model",
+                "type": "streaming_source_interrupted",
+                "details": {
+                    "operational_error": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": "streaming_source_interrupted",
+                },
+            },
+        ],
+        has_errors=True,
+        success=False,
+    )
+
+    result = CliRunner().invoke(cli, ["scan", "--stream", "hf://test/model"])
+    clean_output = strip_ansi(result.output)
+
+    assert result.exit_code == 2
+    assert "Streaming scan complete" not in clean_output
+    assert "Streaming scan incomplete" in clean_output
+    assert "SCAN SUMMARY" in clean_output
+    assert "SCAN COMPLETED WITH OPERATIONAL ERRORS" in clean_output
+    assert "Dangerous import detected before interruption" in clean_output
+    mock_download_streaming.assert_called_once()
+    mock_scan_streaming.assert_called_once()
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_security_findings_keep_complete_progress(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Security findings without operational errors should keep the complete banner."""
+    mock_is_hf_url.return_value = True
+
+    test_file = tmp_path / "malicious.pkl"
+    test_file.write_text("malicious content")
+    mock_download_streaming.return_value = iter([(test_file, True)])
+    mock_scan_streaming.return_value = create_mock_scan_result(
+        bytes_scanned=100,
+        files_scanned=1,
+        issues=[
+            {
+                "message": "Dangerous import detected",
+                "severity": "critical",
+                "location": "malicious.pkl",
+            }
+        ],
+        has_errors=False,
+        success=True,
+    )
+
+    result = CliRunner().invoke(cli, ["scan", "--stream", "hf://test/malicious-model"])
+    clean_output = strip_ansi(result.output)
+
+    assert result.exit_code == 1
+    assert "Streaming scan complete" in clean_output
+    assert "Streaming scan incomplete" not in clean_output
+    assert "CRITICAL SECURITY ISSUES FOUND" in clean_output
+    assert "Dangerous import detected" in clean_output
+    mock_download_streaming.assert_called_once()
+    mock_scan_streaming.assert_called_once()
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_with_issues(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
     """Test streaming scan with security issues detected."""
     mock_is_hf_url.return_value = True
 
@@ -4761,7 +4860,7 @@ def test_scan_huggingface_streaming_with_issues(mock_scan_streaming, mock_downlo
     test_file = tmp_path / "malicious.pkl"
     test_file.write_text("malicious content")
 
-    def file_generator():
+    def file_generator() -> Iterator[tuple[Path, bool]]:
         yield (test_file, True)
 
     mock_download_streaming.return_value = file_generator()

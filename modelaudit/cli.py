@@ -2999,7 +2999,10 @@ def _resolve_scan_source_for_path(
                 record_download_completed("huggingface", download_duration, 0, display_path)
 
                 if runtime.show_styled_output:
-                    click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
+                    if streaming_result.has_errors or not streaming_result.success:
+                        click.echo(style_text("❌ Streaming scan incomplete", fg="red", bold=True))
+                    else:
+                        click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
 
                 return _SourceDispatchResult(
                     actual_path=path,
