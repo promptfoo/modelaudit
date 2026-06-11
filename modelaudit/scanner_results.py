@@ -23,6 +23,18 @@ RAW_DETECTOR_FAILURES_METADATA_KEY: Final[str] = "raw_detector_analysis_failures
 RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY: Final[str] = "raw_detector_failed_detectors"
 UNCLASSIFIED_SCAN_FAILURE_REASON: Final[str] = "scanner_reported_unsuccessful_without_outcome"
 CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY: Final[str] = "call_graph_source_fingerprints"
+MEMBER_FILE_HASHES_METADATA_KEY: Final[str] = "member_file_hashes"
+FILE_HASHES_COMPLETE_METADATA_KEY: Final[str] = "file_hashes_complete"
+FILE_HASHES_BYTES_HASHED_METADATA_KEY: Final[str] = "file_hashes_bytes_hashed"
+_PARENT_INTEGRITY_METADATA_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "file_hashes",
+        "file_size",
+        FILE_HASHES_COMPLETE_METADATA_KEY,
+        FILE_HASHES_BYTES_HASHED_METADATA_KEY,
+    }
+)
+_HASH_FIELD_NAMES: Final[frozenset[str]] = frozenset({"md5", "sha1", "sha256", "sha512"})
 
 
 def _deep_mutable_copy(value: Any) -> Any:
@@ -33,6 +45,75 @@ def _deep_mutable_copy(value: Any) -> Any:
     if isinstance(value, set | frozenset):
         return [_deep_mutable_copy(item) for item in value]
     return deepcopy(value)
+
+
+def _member_file_hashes_from_metadata(metadata: Mapping[str, Any], scanner_name: str | None) -> dict[str, Any] | None:
+    raw_hashes = metadata.get("file_hashes")
+    if not isinstance(raw_hashes, Mapping):
+        return None
+
+    hashes = {
+        str(algorithm): value
+        for algorithm, value in raw_hashes.items()
+        if algorithm in _HASH_FIELD_NAMES and isinstance(value, str) and value
+    }
+    if not hashes:
+        return None
+
+    hash_complete = metadata.get(FILE_HASHES_COMPLETE_METADATA_KEY)
+    bytes_hashed = metadata.get(FILE_HASHES_BYTES_HASHED_METADATA_KEY)
+    record: dict[str, Any] = {}
+    if scanner_name:
+        record["scanner_name"] = scanner_name
+    if isinstance(metadata.get("file_size"), int):
+        record["file_size"] = metadata["file_size"]
+    elif hash_complete is not False and isinstance(bytes_hashed, int):
+        record["file_size"] = bytes_hashed
+    if isinstance(bytes_hashed, int):
+        record["bytes_hashed"] = bytes_hashed
+
+    if hash_complete is False:
+        record["hash_complete"] = False
+        record["hash_status"] = "partial"
+    else:
+        record["file_hashes"] = _deep_mutable_copy(hashes)
+        if hash_complete is True:
+            record["hash_complete"] = True
+
+    return record
+
+
+def _add_member_file_hash_record(
+    metadata: dict[str, Any],
+    member_path: str,
+    record: Mapping[str, Any],
+) -> None:
+    normalized_member_path = member_path.strip() or "<archive-member>"
+    member_hashes = metadata.setdefault(MEMBER_FILE_HASHES_METADATA_KEY, {})
+    if not isinstance(member_hashes, dict):
+        member_hashes = {}
+        metadata[MEMBER_FILE_HASHES_METADATA_KEY] = member_hashes
+
+    stored_record = _deep_mutable_copy(record)
+    key = normalized_member_path
+    if key in member_hashes and member_hashes[key] != stored_record:
+        stored_record.setdefault("logical_path", normalized_member_path)
+        suffix = 2
+        while f"{normalized_member_path}#{suffix}" in member_hashes:
+            suffix += 1
+        key = f"{normalized_member_path}#{suffix}"
+    member_hashes[key] = stored_record
+
+
+def _iter_child_member_file_hash_records(metadata: Mapping[str, Any]) -> list[tuple[str, Mapping[str, Any]]]:
+    raw_member_hashes = metadata.get(MEMBER_FILE_HASHES_METADATA_KEY)
+    if not isinstance(raw_member_hashes, Mapping):
+        return []
+    records: list[tuple[str, Mapping[str, Any]]] = []
+    for member_path, record in raw_member_hashes.items():
+        if isinstance(member_path, str) and member_path and isinstance(record, Mapping):
+            records.append((member_path, record))
+    return records
 
 
 def _is_source_independent_call_graph_fingerprint_metadata(metadata: Mapping[str, Any]) -> bool:
@@ -499,6 +580,38 @@ class ScanResult:
     def remove_failed_raw_detector_clean_checks(self) -> None:
         """Backward-compatible wrapper for raw-detector check reconciliation."""
         self.reconcile_raw_detector_checks()
+
+    def merge_member_result(self, other: "ScanResult", member_path: str) -> None:
+        """Merge an archive-member scan without letting member hashes become parent hashes."""
+        parent_identity = {
+            key: _deep_mutable_copy(self.metadata[key])
+            for key in _PARENT_INTEGRITY_METADATA_KEYS
+            if key in self.metadata
+        }
+        parent_member_hashes = _deep_mutable_copy(self.metadata.get(MEMBER_FILE_HASHES_METADATA_KEY, {}))
+        if not isinstance(parent_member_hashes, dict):
+            parent_member_hashes = {}
+
+        child_integrity_record = _member_file_hashes_from_metadata(other.metadata, other.scanner_name)
+        child_member_hashes = _iter_child_member_file_hash_records(other.metadata)
+
+        self.merge(other)
+
+        for key in _PARENT_INTEGRITY_METADATA_KEYS:
+            if key in parent_identity:
+                self.metadata[key] = _deep_mutable_copy(parent_identity[key])
+            else:
+                self.metadata.pop(key, None)
+
+        if parent_member_hashes:
+            self.metadata[MEMBER_FILE_HASHES_METADATA_KEY] = parent_member_hashes
+        else:
+            self.metadata.pop(MEMBER_FILE_HASHES_METADATA_KEY, None)
+
+        if child_integrity_record is not None:
+            _add_member_file_hash_record(self.metadata, member_path, child_integrity_record)
+        for child_path, record in child_member_hashes:
+            _add_member_file_hash_record(self.metadata, f"{member_path}:{child_path}", record)
 
     def merge(self, other: "ScanResult") -> None:
         """Merge another scan result into this one"""

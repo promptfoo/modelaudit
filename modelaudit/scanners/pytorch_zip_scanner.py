@@ -13,13 +13,14 @@ import tempfile
 import zipfile
 from collections.abc import Callable
 from contextlib import suppress
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from ..detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
 from ..scanner_results import (
     INCONCLUSIVE_SCAN_OUTCOME,
+    MEMBER_FILE_HASHES_METADATA_KEY,
     RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY,
     RAW_DETECTOR_FAILURES_METADATA_KEY,
     mark_inconclusive_scan_result,
@@ -1516,11 +1517,14 @@ class PyTorchZipScanner(BaseScanner):
     @staticmethod
     def _merge_nested_zip_result(result: ScanResult, nested_result: ScanResult, member_name: str) -> None:
         """Merge nested findings while preserving the parent archive metadata."""
-        parent_metadata = dict(result.metadata)
-        result.merge(nested_result)
+        parent_metadata = deepcopy(result.metadata)
+        result.merge_member_result(nested_result, member_name)
         raw_detector_failures = result.metadata.get(RAW_DETECTOR_FAILURES_METADATA_KEY)
         raw_detector_failed_detectors = result.metadata.get(RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY)
+        member_file_hashes = result.metadata.get(MEMBER_FILE_HASHES_METADATA_KEY)
         result.metadata = parent_metadata
+        if isinstance(member_file_hashes, dict) and member_file_hashes:
+            result.metadata[MEMBER_FILE_HASHES_METADATA_KEY] = member_file_hashes
         if isinstance(raw_detector_failures, list):
             result.metadata[RAW_DETECTOR_FAILURES_METADATA_KEY] = list(raw_detector_failures)
         if isinstance(raw_detector_failed_detectors, list):
@@ -1764,7 +1768,7 @@ class PyTorchZipScanner(BaseScanner):
 
             # Add CVE-2025-32434 specific warnings
             self._add_weights_only_safety_warnings(sub_result, result, path, name)
-            result.merge(sub_result)
+            result.merge_member_result(sub_result, name)
 
         return bytes_scanned
 

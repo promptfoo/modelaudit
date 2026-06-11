@@ -21,6 +21,12 @@ def asset_from_scan_result(
     meta = metadata if metadata is not None else scan_result.metadata
     if "file_size" in meta:
         entry["size"] = meta["file_size"]
+    if "file_hashes" in meta:
+        entry["file_hashes"] = meta["file_hashes"]
+    if "file_hashes_complete" in meta:
+        entry["hash_complete"] = meta["file_hashes_complete"]
+    if "file_hashes_bytes_hashed" in meta:
+        entry["bytes_hashed"] = meta["file_hashes_bytes_hashed"]
     if "tensors" in meta:
         # Handle tensor data - convert dictionaries to string names for AssetModel compatibility
         tensors = meta["tensors"]

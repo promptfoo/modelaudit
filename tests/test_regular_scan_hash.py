@@ -1,6 +1,7 @@
 """Tests for content hash generation in regular scan mode."""
 
 import hashlib
+import json
 import os
 import pickle
 import zipfile
@@ -9,8 +10,33 @@ from pathlib import Path
 
 import pytest
 
+from modelaudit.cache import reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.integrations.sarif_formatter import format_sarif_output
+from modelaudit.integrations.sbom_generator import generate_sbom_pydantic
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
+from tests.helpers import write_mock_pytorch_zip_metadata
+
+
+class _MaliciousPicklePayload:
+    def __reduce__(self) -> tuple[object, tuple[str]]:
+        return (eval, ("__import__('os').system('echo modelaudit-test')",))
+
+
+def _pytorch_zip_with_pickle_members(
+    path: Path,
+    *,
+    members: dict[str, bytes],
+) -> Path:
+    with zipfile.ZipFile(path, "w") as archive:
+        write_mock_pytorch_zip_metadata(archive)
+        for member_name, payload in members.items():
+            archive.writestr(member_name, payload)
+    return path
+
+
+def _member_sha256(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
 
 
 class TestRegularScanContentHash:
@@ -46,6 +72,121 @@ class TestRegularScanContentHash:
         nested_hash = hashlib.sha256(nested_payload).hexdigest()
         assert result.content_hash == compute_aggregate_hash([outer_hash])
         assert result.content_hash != compute_aggregate_hash([nested_hash])
+
+    def test_pytorch_member_hashes_are_namespaced_in_json_sarif_and_sbom(self, tmp_path: Path) -> None:
+        benign_payload = pickle.dumps({"safe": True})
+        malicious_payload = pickle.dumps(_MaliciousPicklePayload())
+        model_path = _pytorch_zip_with_pickle_members(
+            tmp_path / "model.pt",
+            members={
+                "data.pkl": benign_payload,
+                "evil.pkl": malicious_payload,
+            },
+        )
+
+        result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+        outer_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        benign_hash = _member_sha256(benign_payload)
+        malicious_hash = _member_sha256(malicious_payload)
+        metadata = result.file_metadata[str(model_path)].model_dump(mode="json", exclude_none=True)
+
+        assert metadata["file_hashes"]["sha256"] == outer_hash
+        assert "file_hashes_complete" not in metadata
+        assert "file_hashes_bytes_hashed" not in metadata
+        assert metadata["file_hashes"]["sha256"] not in {benign_hash, malicious_hash}
+        assert metadata["member_file_hashes"]["data.pkl"]["file_hashes"]["sha256"] == benign_hash
+        assert metadata["member_file_hashes"]["evil.pkl"]["file_hashes"]["sha256"] == malicious_hash
+        assert any(
+            issue.location is not None
+            and ":evil.pkl" in issue.location
+            and issue.details.get("pickle_filename") == "evil.pkl"
+            for issue in result.issues
+        )
+
+        json_payload = result.model_dump(mode="json", exclude_none=True)
+        json_metadata = json_payload["file_metadata"][str(model_path)]
+        assert json_metadata["file_hashes"]["sha256"] == outer_hash
+        assert json_metadata["member_file_hashes"]["evil.pkl"]["file_hashes"]["sha256"] == malicious_hash
+
+        sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+        artifact = sarif_payload["runs"][0]["artifacts"][0]
+        assert artifact["hashes"]["sha-256"] == outer_hash
+        assert artifact["properties"]["memberFileHashes"]["evil.pkl"]["file_hashes"]["sha256"] == malicious_hash
+
+        sbom_payload = json.loads(generate_sbom_pydantic([str(model_path)], result))
+        component = sbom_payload["components"][0]
+        assert component["hashes"][0]["content"] == outer_hash
+        member_hash_property = next(
+            prop["value"] for prop in component["properties"] if prop["name"] == "modelaudit:member_file_hashes"
+        )
+        assert json.loads(member_hash_property)["evil.pkl"]["file_hashes"]["sha256"] == malicious_hash
+
+    def test_pytorch_member_hashes_survive_cache_round_trip(self, tmp_path: Path) -> None:
+        reset_cache_manager()
+        payload = pickle.dumps({"safe": "cache"})
+        model_path = _pytorch_zip_with_pickle_members(tmp_path / "cached.pt", members={"data.pkl": payload})
+        outer_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        member_hash = _member_sha256(payload)
+        cache_dir = str(tmp_path / "cache")
+        first = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=cache_dir,
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=cache_dir,
+            min_cache_file_size=0,
+        )
+
+        for result in (first, second):
+            metadata = result.file_metadata[str(model_path)].model_dump(mode="json", exclude_none=True)
+            assert metadata["file_hashes"]["sha256"] == outer_hash
+            assert metadata["member_file_hashes"]["data.pkl"]["file_hashes"]["sha256"] == member_hash
+            assert metadata["member_file_hashes"]["data.pkl"]["file_hashes"]["sha256"] != outer_hash
+
+        reset_cache_manager()
+
+    @pytest.mark.integration
+    @pytest.mark.slow
+    def test_real_hf_bert_large_rust_model_member_hash_is_namespaced(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if os.environ.get("MODELAUDIT_RUN_REAL_HF") != "1":
+            pytest.skip("set MODELAUDIT_RUN_REAL_HF=1 to download the pinned Hugging Face artifact")
+
+        from huggingface_hub import hf_hub_download
+
+        repo_id = "google-bert/bert-large-uncased"
+        revision = "6da4b6a26a1877e173fca3225479512db81a5e5b"
+        member_name = "rust_model/code/__torch__.py.debug_pkl"
+        expected_parent_sha = "9db92b28d6fb0e5ab770b24ed27bde941d1f314a3c5e8c28d698025cc1807d7f"
+        expected_member_sha = "326da525ff54021be4bbeb601c3ff4ee74e0cee4e45a0fbe1b9ccde3ca16229c"
+        monkeypatch.setenv("HF_HOME", str(tmp_path / "hf-cache"))
+        model_path = Path(
+            hf_hub_download(
+                repo_id=repo_id,
+                revision=revision,
+                filename="rust_model.ot",
+                local_dir=tmp_path / "hf-model",
+            )
+        )
+
+        with zipfile.ZipFile(model_path) as archive:
+            member_payload = archive.read(member_name)
+        assert hashlib.sha256(model_path.read_bytes()).hexdigest() == expected_parent_sha
+        assert len(member_payload) == 106
+        assert _member_sha256(member_payload) == expected_member_sha
+
+        result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+        metadata = result.file_metadata[str(model_path)].model_dump(mode="json", exclude_none=True)
+
+        assert metadata["file_hashes"]["sha256"] == expected_parent_sha
+        assert metadata["member_file_hashes"][member_name]["file_hashes"]["sha256"] == expected_member_sha
 
     def test_directory_generates_hash(self, tmp_path):
         """Test that scanning a directory generates an aggregate content hash."""

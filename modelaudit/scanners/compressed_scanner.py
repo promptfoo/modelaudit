@@ -973,7 +973,7 @@ class CompressedScanner(BaseScanner):
                 details={"inner_scanner": inner_result.scanner_name, "provenance": provenance},
             )
 
-            result.merge(inner_result)
+            result.merge_member_result(inner_result, inner_display)
             if len(member_temp_paths) > 1:
                 for member_index, member_temp_path in enumerate(member_temp_paths, start=1):
                     member_result = core.scan_file(member_temp_path, nested_config)
@@ -992,7 +992,7 @@ class CompressedScanner(BaseScanner):
                             "provenance": member_provenance,
                         },
                     )
-                    result.merge(member_result)
+                    result.merge_member_result(member_result, member_provenance)
             result.bytes_scanned += self.get_file_size(path)
         except _MissingOptionalDependencyError as exc:
             mark_inconclusive_scan_result(result, self._OPTIONAL_DEPENDENCY_INCONCLUSIVE_REASON)

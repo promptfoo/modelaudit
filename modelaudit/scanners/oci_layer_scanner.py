@@ -349,13 +349,13 @@ class OciLayerScanner(BaseScanner):
         mark_inconclusive_scan_result(result, reason)
 
     @classmethod
-    def _merge_nested_result(cls, result: ScanResult, nested_result: ScanResult) -> None:
+    def _merge_nested_result(cls, result: ScanResult, nested_result: ScanResult, member_path: str) -> None:
         """Merge embedded analysis without replacing manifest identity or incomplete coverage."""
         parent_identity = {
             key: result.metadata[key] for key in cls._PARENT_IDENTITY_METADATA_KEYS if key in result.metadata
         }
         existing_reasons = list(result.metadata.get("scan_outcome_reasons", []))
-        result.merge(nested_result)
+        result.merge_member_result(nested_result, member_path)
         for key in cls._PARENT_IDENTITY_METADATA_KEYS:
             if key in parent_identity:
                 result.metadata[key] = parent_identity[key]
@@ -1196,7 +1196,7 @@ class OciLayerScanner(BaseScanner):
                 if issue.details is None:
                     issue.details = {}
                 issue.details["layer"] = layer_ref
-            self._merge_nested_result(result, file_result)
+            self._merge_nested_result(result, file_result, f"{layer_ref}:{name}")
             return _LayerPayloadScanOutcome(
                 success=file_result.success and not file_result.has_errors,
                 extracted_bytes=payload_size,

@@ -630,6 +630,21 @@ def _create_metadata_properties(metadata: FileMetadataModel) -> list[Property]:
     if metadata.license_files_nearby:
         props.append(Property(name="license_files_found", value=str(len(metadata.license_files_nearby))))
 
+    if metadata.member_file_hashes:
+        props.append(
+            Property(
+                name="modelaudit:member_file_hashes",
+                value=json.dumps(
+                    {
+                        member_path: record.model_dump(mode="json", exclude_none=True)
+                        for member_path, record in metadata.member_file_hashes.items()
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        )
+
     # Security and compliance properties
     props.append(Property(name="security:scanned", value="true"))
     props.append(Property(name="security:scanner", value="ModelAudit"))
@@ -790,6 +805,15 @@ def _component_for_file(
         if license_files:
             props.append(
                 Property(name="license_files_found", value=str(len(license_files))),
+            )
+
+        member_file_hashes = metadata.get("member_file_hashes")
+        if isinstance(member_file_hashes, dict) and member_file_hashes:
+            props.append(
+                Property(
+                    name="modelaudit:member_file_hashes",
+                    value=json.dumps(member_file_hashes, sort_keys=True, separators=(",", ":")),
+                )
             )
 
     # Security and compliance properties (added for all files)

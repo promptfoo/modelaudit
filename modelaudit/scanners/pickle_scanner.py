@@ -19,7 +19,11 @@ from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 from modelaudit.utils.helpers.code_validation import validate_python_syntax
 
-from ..scanner_results import mark_inconclusive_scan_result
+from ..scanner_results import (
+    FILE_HASHES_BYTES_HASHED_METADATA_KEY,
+    FILE_HASHES_COMPLETE_METADATA_KEY,
+    mark_inconclusive_scan_result,
+)
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
 from .picklescan_adapter import pickle_report_to_scan_result, scan_options_from_config
 
@@ -2633,6 +2637,8 @@ class PickleScanner(BaseScanner):
     ) -> None:
         sha256 = hashlib.sha256(payload).hexdigest()
         result.metadata.setdefault("file_hashes", {})["sha256"] = sha256
+        result.metadata[FILE_HASHES_COMPLETE_METADATA_KEY] = hash_complete
+        result.metadata[FILE_HASHES_BYTES_HASHED_METADATA_KEY] = len(payload)
         result.add_check(
             name="File Integrity Check",
             passed=True,
@@ -2678,6 +2684,8 @@ class PickleScanner(BaseScanner):
 
         sha256 = hasher.hexdigest()
         result.metadata.setdefault("file_hashes", {})["sha256"] = sha256
+        result.metadata[FILE_HASHES_COMPLETE_METADATA_KEY] = hash_complete
+        result.metadata[FILE_HASHES_BYTES_HASHED_METADATA_KEY] = bytes_hashed
         result.add_check(
             name="File Integrity Check",
             passed=True,

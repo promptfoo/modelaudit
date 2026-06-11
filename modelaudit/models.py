@@ -306,6 +306,20 @@ class FileHashesModel(BaseModel):
         return None
 
 
+class MemberFileIntegrityModel(BaseModel, DictCompatMixin):
+    """Integrity metadata for a nested archive/member payload."""
+
+    model_config = ConfigDict(validate_assignment=True, extra="allow")
+
+    file_hashes: FileHashesModel | None = Field(None, description="Complete member hashes")
+    file_size: int | None = Field(None, description="Member size in bytes", ge=0)
+    bytes_hashed: int | None = Field(None, description="Bytes covered by the member hash", ge=0)
+    hash_complete: bool | None = Field(None, description="Whether the member hash covered the full payload")
+    hash_status: str | None = Field(None, description="Hash coverage status")
+    scanner_name: str | None = Field(None, description="Scanner that produced the member hash")
+    logical_path: str | None = Field(None, description="Original logical path when duplicate keys are disambiguated")
+
+
 class FileMetadataModel(BaseModel, DictCompatMixin):
     """Enhanced model for individual file metadata with structured validation"""
 
@@ -317,6 +331,10 @@ class FileMetadataModel(BaseModel, DictCompatMixin):
     # Basic file information
     file_size: int | None = Field(None, description="File size in bytes", ge=0)
     file_hashes: FileHashesModel | None = Field(None, description="File hashes with validation")
+    member_file_hashes: dict[str, MemberFileIntegrityModel] = Field(
+        default_factory=dict,
+        description="Nested member integrity metadata keyed by logical member path",
+    )
 
     # Pickle-specific metadata
     max_stack_depth: int | None = Field(None, description="Maximum stack depth for pickle files", ge=0)

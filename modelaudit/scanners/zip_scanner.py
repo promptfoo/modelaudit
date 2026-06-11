@@ -1988,7 +1988,7 @@ class ZipScanner(BaseScanner):
                         if archive_ext == ".mar" and name.lower().endswith(".py") and not is_security_only_member:
                             mar_python_result = self._scan_mar_python_entry(path, name, tmp_path, total_size)
                             if mar_python_result is not None:
-                                result.merge(mar_python_result)
+                                result.merge_member_result(mar_python_result, name)
                                 if not mar_python_result.success:
                                     scan_complete = False
                         else:
@@ -2036,7 +2036,7 @@ class ZipScanner(BaseScanner):
 
                         self._rewrite_nested_result_context(file_result, tmp_path, path, name)
 
-                        result.merge(file_result)
+                        result.merge_member_result(file_result, name)
 
                         asset_entry = asset_from_scan_result(
                             f"{path}:{name}",
