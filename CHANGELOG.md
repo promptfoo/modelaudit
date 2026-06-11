@@ -11,9 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - detect GGUF curl short-option remote fetches, ignore spaced Python attribute calls, and truncate large tokenizer metadata arrays with explicit counts
 - require concrete GGUF metadata evidence for S902 findings instead of flagging benign URLs, chat-template syntax, slashes, or pipes
+- exclude Hugging Face local-dir cache sidecars from scan inventory, routing, issue locations, and SBOM components while preserving hidden artifact scanning
 - keep strongly identified SentencePiece tokenizer `.model` artifacts, including custom-unknown models with disabled special tokens, out of XGBoost routing while preserving fail-closed `.model` ambiguity for malformed tails.
 - tolerate picklescan reports that omit private metadata
 - stream bounded Llamafile runtime coverage across preview gaps and report incomplete runtime reads or bounds
+- omit isolated C&C vocabulary tokens from strongly identified tokenizer vocabularies while preserving active network and command findings
 - downgrade filename/content mismatch findings only after an alternate ONNX scanner validates the protobuf format while keeping malformed, spoofed, polyglot, and incomplete routes actionable
 - restrict Jinja SSTI indicators to executable template spans so prose mentions of request handling do not produce critical findings
 - treat canonical storage persistent IDs as informational only after legacy PyTorch framing, storage tuples, and storage payloads validate completely
