@@ -42,6 +42,7 @@ _PICKLE_MEMBER_SUFFIXES = (".pkl", ".pickle")
 _PICKLE_BINARY_PROTOCOL_PREFIXES = (b"\x80\x01", b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05")
 _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
 _PICKLE_DISCOVERY_LONG_PROBE_BYTES = 64 * 1024
+_TRUSTED_STORAGE_PICKLE_PROBE_BYTES = 4 * 1024
 _PROTO0_1_START_BYTES = b"()]}cilp0FGIJKLMNSTUVX"
 _PROTO0_1_MAX_PROBE_OPCODES = _PICKLE_DISCOVERY_LONG_PROBE_BYTES
 _PROTO0_1_IGNORABLE_TRAILING_BYTES = b" \t\r\n\x00"
@@ -586,7 +587,7 @@ def _discover_pytorch_zip_pickle_entries(
     notices.extend(storage_notices)
 
     for entry in entries:
-        if entry.is_dir() or id(entry) in seen_entries or id(entry) in trusted_storage_entry_ids:
+        if entry.is_dir() or id(entry) in seen_entries:
             continue
         candidates.append(entry)
 
@@ -594,7 +595,15 @@ def _discover_pytorch_zip_pickle_entries(
     probed_member_count = 0
     for candidate_index, entry in enumerate(candidates):
         try:
-            if _zip_entry_looks_like_pickle(archive, entry, probe_bytes_remaining):
+            if id(entry) in trusted_storage_entry_ids:
+                looks_like_pickle = _trusted_storage_zip_entry_looks_like_pickle(
+                    archive,
+                    entry,
+                    probe_bytes_remaining,
+                )
+            else:
+                looks_like_pickle = _zip_entry_looks_like_pickle(archive, entry, probe_bytes_remaining)
+            if looks_like_pickle:
                 add_entry(entry)
             probed_member_count += 1
         except _PickleDiscoveryProbeBudgetExceeded:
@@ -765,6 +774,52 @@ def _zip_entry_looks_like_pickle(
             probe_bytes_remaining,
         )
     return _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=entry.file_size > len(sample))
+
+
+def _trusted_storage_zip_entry_looks_like_pickle(
+    archive: zipfile.ZipFile,
+    entry: zipfile.ZipInfo,
+    probe_bytes_remaining: list[int],
+) -> bool:
+    prefix = _read_zip_entry_probe(
+        archive,
+        entry,
+        _PICKLE_DISCOVERY_SHORT_PROBE_BYTES,
+        probe_bytes_remaining,
+    )
+    if not prefix:
+        return False
+    if not prefix.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES) and prefix[0] not in _PROTO0_1_START_BYTES:
+        return False
+
+    sample = prefix
+    if entry.file_size > len(prefix):
+        sample = _read_zip_entry_probe(
+            archive,
+            entry,
+            _TRUSTED_STORAGE_PICKLE_PROBE_BYTES,
+            probe_bytes_remaining,
+        )
+    return _has_complete_pickle_stream_without_frame_stop_overrun(sample)
+
+
+def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> bool:
+    active_frame_end = 0
+    opcode_count = 0
+    try:
+        for opcode, arg, pos in pickletools.genops(sample):
+            opcode_count += 1
+            if pos is None:
+                continue
+            if opcode.name == "FRAME":
+                if not isinstance(arg, int):
+                    return False
+                active_frame_end = max(active_frame_end, pos + _PICKLE_FRAME_OPCODE_BYTES + arg)
+            elif opcode.name == "STOP":
+                return opcode_count >= 2 and active_frame_end <= len(sample)
+    except Exception:
+        return False
+    return False
 
 
 def _looks_like_binary_pickle_prefix(sample: bytes, *, sample_is_prefix: bool) -> bool:

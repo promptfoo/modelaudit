@@ -27,15 +27,15 @@ from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
 
 _ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
-_PINNED_WHISPER_REPO_ID = "openai/whisper-large-v3"
-_PINNED_WHISPER_REVISION = "06f233fe06e710322aca913c1bc4249a0d71fce1"
-_PINNED_WHISPER_FILENAME = "pytorch_model.bin"
-_PINNED_WHISPER_SIZE = 3_087_394_553
-_PINNED_WHISPER_MEMBERS = {
-    "pytorch_model/data.pkl",
-    "pytorch_model/version",
-    "pytorch_model/byteorder",
-    "pytorch_model/data/379",
+_PINNED_PID_REPO_ID = "nvidia/PiD"
+_PINNED_PID_REVISION = "b4887b3c8fc65277a9b7a084292bf9fc0778c5ac"
+_PINNED_PID_FILENAME = "checkpoints/scale_rae/decoder/siglip2_sop14_i224_web73M_ganw3_decXL.pt"
+_PINNED_PID_SIZE = 1_662_529_538
+_PINNED_PID_MEMBERS = {
+    "siglip2_decoder/data.pkl",
+    "siglip2_decoder/version",
+    "siglip2_decoder/byteorder",
+    "siglip2_decoder/data/356",
 }
 
 
@@ -216,21 +216,21 @@ def _fetch_http_range(session: Any, url: str, start: int, end: int) -> bytes:
     return bytes(response.content)
 
 
-def _pinned_whisper_member_slice(tmp_path: Path) -> Path:
+def _pinned_pid_member_slice(tmp_path: Path) -> Path:
     requests = pytest.importorskip("requests")
     huggingface_hub = pytest.importorskip("huggingface_hub")
 
     url = huggingface_hub.hf_hub_url(
-        _PINNED_WHISPER_REPO_ID,
-        _PINNED_WHISPER_FILENAME,
-        revision=_PINNED_WHISPER_REVISION,
+        _PINNED_PID_REPO_ID,
+        _PINNED_PID_FILENAME,
+        revision=_PINNED_PID_REVISION,
     )
     session = requests.Session()
-    tail_start = max(0, _PINNED_WHISPER_SIZE - (8 * 1024 * 1024))
-    tail = _fetch_http_range(session, url, tail_start, _PINNED_WHISPER_SIZE - 1)
+    tail_start = max(0, _PINNED_PID_SIZE - (8 * 1024 * 1024))
+    tail = _fetch_http_range(session, url, tail_start, _PINNED_PID_SIZE - 1)
     eocd_index = tail.rfind(b"PK\x05\x06")
     if eocd_index < 0:
-        raise RuntimeError("pinned Whisper ZIP EOCD not found")
+        raise RuntimeError("pinned PiD ZIP EOCD not found")
     eocd = tail[eocd_index : eocd_index + 22]
     (
         _signature,
@@ -251,7 +251,7 @@ def _pinned_whisper_member_slice(tmp_path: Path) -> Path:
         or central_directory_offset == 0xFFFFFFFF
         or entry_count == 0xFFFF
     ):
-        raise RuntimeError("pinned Whisper ZIP directory layout is unsupported by bounded QA")
+        raise RuntimeError("pinned PiD ZIP directory layout is unsupported by bounded QA")
 
     central_directory = _fetch_http_range(
         session,
@@ -276,7 +276,7 @@ def _pinned_whisper_member_slice(tmp_path: Path) -> Path:
         name_start = cursor + 46
         name_end = name_start + name_length
         member_name = central_directory[name_start:name_end].decode("utf-8")
-        if member_name in _PINNED_WHISPER_MEMBERS:
+        if member_name in _PINNED_PID_MEMBERS:
             entries[member_name] = {
                 "compression_method": compression_method,
                 "compressed_size": compressed_size,
@@ -285,9 +285,9 @@ def _pinned_whisper_member_slice(tmp_path: Path) -> Path:
             }
         cursor = name_end + extra_length + comment_length
 
-    missing_members = sorted(_PINNED_WHISPER_MEMBERS - set(entries))
+    missing_members = sorted(_PINNED_PID_MEMBERS - set(entries))
     if missing_members:
-        raise RuntimeError(f"pinned Whisper members not found: {missing_members}")
+        raise RuntimeError(f"pinned PiD members not found: {missing_members}")
 
     def read_member(member_name: str) -> bytes:
         entry = entries[member_name]
@@ -317,13 +317,13 @@ def _pinned_whisper_member_slice(tmp_path: Path) -> Path:
             raise RuntimeError(f"size mismatch for {member_name}: {len(data)} != {entry['file_size']}")
         return data
 
-    slice_path = tmp_path / "whisper-large-v3-pinned-data379-slice.pt"
+    slice_path = tmp_path / "pid-pinned-siglip2-data356-slice.pt"
     with zipfile.ZipFile(slice_path, "w", compression=zipfile.ZIP_STORED) as archive:
         for member_name in [
-            "pytorch_model/data.pkl",
-            "pytorch_model/version",
-            "pytorch_model/byteorder",
-            "pytorch_model/data/379",
+            "siglip2_decoder/data.pkl",
+            "siglip2_decoder/version",
+            "siglip2_decoder/byteorder",
+            "siglip2_decoder/data/356",
         ]:
             archive.writestr(member_name, read_member(member_name))
     return slice_path
@@ -501,6 +501,27 @@ def test_pytorch_zip_discovery_skips_referenced_storage_blob_pickleish_bytes(tmp
     assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
 
 
+@pytest.mark.parametrize("payload", [_malicious_proto0_system_payload(), _malicious_eval_pickle_payload()])
+def test_pytorch_zip_discovery_scans_referenced_storage_blob_when_it_is_a_pickle(
+    payload: bytes,
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_storage_payload.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        zip_file.writestr("archive/data/0", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
 @pytest.mark.parametrize(
     ("data_pkl_payload", "include_version", "expected_reason"),
     [
@@ -538,27 +559,27 @@ def test_pytorch_zip_discovery_scans_untrusted_storage_lookalike_pickles(
 
 @pytest.mark.integration
 @pytest.mark.slow
-def test_pytorch_zip_pinned_whisper_storage_member_qa(tmp_path: Path) -> None:
-    """Pinned Whisper storage bytes must not be scanned as a follow-on pickle stream."""
-    model_path = _pinned_whisper_member_slice(tmp_path)
+def test_pytorch_zip_pinned_pid_storage_member_qa(tmp_path: Path) -> None:
+    """Pinned PiD storage bytes must not be scanned as a follow-on pickle stream."""
+    model_path = _pinned_pid_member_slice(tmp_path)
 
     result = PyTorchZipScanner().scan(str(model_path))
 
-    assert result.metadata["pickle_files"] == ["pytorch_model/data.pkl"]
+    assert result.metadata["pickle_files"] == ["siglip2_decoder/data.pkl"]
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "pytorch_zip_storage_reference_missing_members" in result.metadata["scan_outcome_reasons"]
-    assert not any(issue.details.get("pickle_filename") == "pytorch_model/data/379" for issue in result.issues)
-    assert not any(check.details.get("pickle_filename") == "pytorch_model/data/379" for check in result.checks)
+    assert not any(issue.details.get("pickle_filename") == "siglip2_decoder/data/356" for issue in result.issues)
+    assert not any(check.details.get("pickle_filename") == "siglip2_decoder/data/356" for check in result.checks)
     assert not any(
         check.details.get("pickle_rule_code") == "EXTENSION_REF"
         and check.location is not None
-        and "pytorch_model/data/379" in check.location
+        and "siglip2_decoder/data/356" in check.location
         for check in result.checks
     )
     assert not any(
         issue.details.get("pickle_rule_code") == "EXTENSION_REF"
         and issue.location is not None
-        and "pytorch_model/data/379" in issue.location
+        and "siglip2_decoder/data/356" in issue.location
         for issue in result.issues
     )
 

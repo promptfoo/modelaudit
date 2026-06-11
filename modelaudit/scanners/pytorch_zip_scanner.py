@@ -144,6 +144,8 @@ _PICKLE_BINARY_PROTOCOL_PREFIXES: tuple[bytes, ...] = (
     b"\x80\x05",
 )
 _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
+_TRUSTED_STORAGE_PICKLE_PROBE_BYTES = 4 * 1024
+_PICKLE_FRAME_OPCODE_BYTES = 9
 _JIT_SCAN_MEMBER_MAX_BYTES = 32 * 1024 * 1024
 _PICKLE_DISCOVERY_LONG_PROBE_BYTES = PROTO0_1_MAX_PROBE_BYTES
 _NESTED_ZIP_HEADER_PROBE_BYTES = 4
@@ -1279,10 +1281,14 @@ class PyTorchZipScanner(BaseScanner):
         probe_failures: list[dict[str, Any]] = []
         for entry in safe_entries:
             normalized_name = self._get_zip_member_name(entry).replace("\\", "/").lstrip("/")
-            if id(entry) in seen_entries or entry.is_dir() or normalized_name in trusted_storage_blob_members:
+            if id(entry) in seen_entries or entry.is_dir():
                 continue
             try:
-                if self._entry_looks_like_pickle(zip_file, entry, result):
+                if normalized_name in trusted_storage_blob_members:
+                    looks_like_pickle = self._trusted_storage_entry_looks_like_pickle(zip_file, entry, result)
+                else:
+                    looks_like_pickle = self._entry_looks_like_pickle(zip_file, entry, result)
+                if looks_like_pickle:
                     add_pickle_entry(entry)
             except Exception as exc:
                 logger.debug("Unable to inspect ZIP member %s as a pickle: %s", entry.filename, exc)
@@ -1636,6 +1642,57 @@ class PyTorchZipScanner(BaseScanner):
             sample,
             sample_is_prefix=entry.file_size > len(sample),
         )
+
+    def _trusted_storage_entry_looks_like_pickle(
+        self,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        result: ScanResult,
+    ) -> bool:
+        """Return True only for parse-confirmed pickle payloads in referenced tensor storage."""
+        data_start = self._read_member_prefix(
+            zip_file,
+            entry,
+            _PICKLE_DISCOVERY_SHORT_PROBE_BYTES,
+            phase="pickle_discovery",
+            result=result,
+        )
+        if not data_start:
+            return False
+        if not any(data_start.startswith(magic) for magic in _PICKLE_BINARY_PROTOCOL_PREFIXES) and (
+            data_start[0] not in PROTO0_1_START_BYTES
+        ):
+            return False
+
+        sample = data_start
+        if entry.file_size > len(data_start):
+            sample = self._read_member_prefix(
+                zip_file,
+                entry,
+                _TRUSTED_STORAGE_PICKLE_PROBE_BYTES,
+                phase="pickle_discovery",
+                result=result,
+            )
+        return self._has_complete_pickle_stream_without_frame_stop_overrun(sample)
+
+    @staticmethod
+    def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> bool:
+        active_frame_end = 0
+        opcode_count = 0
+        try:
+            for opcode, arg, pos in pickletools.genops(sample):
+                opcode_count += 1
+                if pos is None:
+                    continue
+                if opcode.name == "FRAME":
+                    if not isinstance(arg, int):
+                        return False
+                    active_frame_end = max(active_frame_end, pos + _PICKLE_FRAME_OPCODE_BYTES + arg)
+                elif opcode.name == "STOP":
+                    return opcode_count >= 2 and active_frame_end <= len(sample)
+        except Exception:
+            return False
+        return False
 
     @staticmethod
     def _looks_like_binary_pickle_prefix(sample: bytes, *, sample_is_prefix: bool) -> bool:

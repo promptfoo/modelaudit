@@ -1813,6 +1813,33 @@ def test_scan_file_does_not_route_benign_storage_blob_as_hidden_pickle(tmp_path:
     assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"cposix\nsystem\n(S'echo hidden'\ntR.",
+        pickle.dumps(MaliciousPayload(), protocol=4),
+    ],
+)
+def test_scan_file_scans_referenced_storage_blob_when_it_is_a_pickle(payload: bytes, tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", payload)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
 def test_scan_file_keeps_unreferenced_storage_lookalike_on_hidden_pickle_path(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     hidden_payload = b"cposix\nsystem\n(S'echo hidden'\ntR."
