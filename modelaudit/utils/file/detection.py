@@ -290,6 +290,8 @@ MXNET_SYMBOL_SIGNATURE_READ_BYTES = 10 * 1024 * 1024
 MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT = "mxnet_symbol_routing_inconclusive"
 TOKENIZER_JSON_ROUTING_READ_BYTES = 16 * 1024 * 1024
 TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES = 64 * 1024 * 1024
+_HF_TOKENIZER_STREAM_CHUNK_BYTES = 1024 * 1024
+_HF_TOKENIZER_STREAM_MAX_KEY_BYTES = 4096
 _UTF8_BOM = b"\xef\xbb\xbf"
 _JSON_NUMBER_PREFIX_RE = re.compile(rb"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
 _JSON_HEX_BYTES = frozenset(b"0123456789abcdefABCDEF")
@@ -702,6 +704,15 @@ class _HFTokenizerJSONProbeState:
     incomplete_model_member_key: str | None = None
 
 
+@dataclass
+class _JSONStreamContext:
+    kind: str
+    path: tuple[str, ...]
+    mode: str
+    pending_key: str | None = None
+    skip_templates: bool = False
+
+
 def _json_probe_string_has_template_indicator(probe: bytes, start: int, end: int) -> bool:
     raw_value = probe[start:end]
     for indicator in _JSON_PROBE_TEMPLATE_INDICATORS:
@@ -1027,7 +1038,173 @@ def _hf_tokenizer_suffix_has_structural_route_key(
             continue
         if not require_jax_identity_value or key in _JAX_JSON_CHECKPOINT_MARKER_KEYS:
             return True
+    if keys == _HF_TOKENIZER_TEMPLATE_KEYS and not require_jax_identity_value:
+        return _hf_tokenizer_stream_has_template_route_evidence(file_path)
     return False
+
+
+def _hf_tokenizer_stream_path_skips_templates(path: tuple[str, ...]) -> bool:
+    return len(path) >= 2 and path[0] == "model" and path[1] == "vocab"
+
+
+def _hf_tokenizer_stream_has_template_route_evidence(file_path: Path) -> bool:
+    """Return whether a bounded-memory structural scan finds tokenizer template evidence."""
+    indicator_bytes = tuple(indicator.encode("utf-8") for indicator in _JSON_PROBE_TEMPLATE_INDICATORS)
+    indicator_tail_size = max(len(indicator) for indicator in indicator_bytes) - 1
+    stack: list[_JSONStreamContext] = []
+    in_string = False
+    string_is_key = False
+    string_skip_templates = False
+    string_key_bytes = bytearray()
+    string_tail = b""
+    escaped = False
+    in_primitive = False
+    primitive_done = False
+
+    def current_value_path() -> tuple[str, ...]:
+        if not stack:
+            return ()
+        context = stack[-1]
+        if context.kind == "object" and context.mode == "value" and context.pending_key is not None:
+            return (*context.path, context.pending_key)
+        return context.path
+
+    def current_value_skips_templates() -> bool:
+        inherited = bool(stack and stack[-1].skip_templates)
+        path = current_value_path()
+        return inherited or _hf_tokenizer_stream_path_skips_templates(path)
+
+    def mark_value_complete() -> None:
+        if not stack:
+            return
+        context = stack[-1]
+        context.mode = "after_value"
+        context.pending_key = None
+
+    def push_context(kind: str) -> None:
+        path = current_value_path()
+        stack.append(
+            _JSONStreamContext(
+                kind=kind,
+                path=path,
+                mode="key" if kind == "object" else "value",
+                skip_templates=current_value_skips_templates(),
+            )
+        )
+
+    def handle_structural_byte(byte: int) -> None:
+        nonlocal in_primitive, primitive_done
+        if byte in b" \t\r\n":
+            return
+        if byte == ord("{"):
+            push_context("object")
+            return
+        if byte == ord("["):
+            push_context("array")
+            return
+        if byte in {ord("}"), ord("]")}:
+            if stack:
+                stack.pop()
+                mark_value_complete()
+            return
+        if not stack:
+            return
+        context = stack[-1]
+        if byte == ord(":"):
+            if context.kind == "object" and context.mode == "colon":
+                context.mode = "value"
+            return
+        if byte == ord(","):
+            if context.kind == "object" and context.mode == "after_value":
+                context.mode = "key"
+                context.pending_key = None
+            elif context.kind == "array" and context.mode == "after_value":
+                context.mode = "value"
+            return
+        if (context.kind == "object" and context.mode == "value") or (
+            context.kind == "array" and context.mode == "value"
+        ):
+            in_primitive = True
+            primitive_done = False
+
+    try:
+        with file_path.open("rb") as stream:
+            first_chunk = True
+            while True:
+                chunk = stream.read(_HF_TOKENIZER_STREAM_CHUNK_BYTES)
+                if not chunk:
+                    return False
+                if first_chunk:
+                    first_chunk = False
+                    if chunk.startswith(_UTF8_BOM):
+                        chunk = chunk[len(_UTF8_BOM) :]
+                for byte in chunk:
+                    if in_string:
+                        if string_is_key and len(string_key_bytes) <= _HF_TOKENIZER_STREAM_MAX_KEY_BYTES:
+                            string_key_bytes.append(byte)
+                        if not string_is_key and not string_skip_templates:
+                            combined = string_tail + bytes((byte,))
+                            if any(indicator in combined for indicator in indicator_bytes):
+                                return True
+                            string_tail = combined[-indicator_tail_size:]
+                        if escaped:
+                            escaped = False
+                            continue
+                        if byte == ord("\\"):
+                            escaped = True
+                            continue
+                        if byte != ord('"'):
+                            continue
+
+                        in_string = False
+                        if string_is_key:
+                            key_bytes = bytes(string_key_bytes)
+                            key = (
+                                _json_probe_decode_string(key_bytes, 0, len(key_bytes))
+                                if len(key_bytes) <= _HF_TOKENIZER_STREAM_MAX_KEY_BYTES
+                                else None
+                            )
+                            context = stack[-1] if stack else None
+                            if context and context.kind == "object" and context.mode == "key":
+                                if key in _HF_TOKENIZER_TEMPLATE_KEYS and not context.skip_templates:
+                                    return True
+                                context.pending_key = key
+                                context.mode = "colon"
+                        else:
+                            mark_value_complete()
+                        continue
+
+                    if in_primitive:
+                        if byte in b" \t\r\n":
+                            primitive_done = True
+                            continue
+                        if byte in b",}]":
+                            in_primitive = False
+                            primitive_done = False
+                            mark_value_complete()
+                            handle_structural_byte(byte)
+                            continue
+                        if primitive_done:
+                            return False
+                        continue
+
+                    context = stack[-1] if stack else None
+                    if byte == ord('"') and (
+                        context is None
+                        or (context.kind == "object" and context.mode in {"key", "value"})
+                        or (context.kind == "array" and context.mode == "value")
+                    ):
+                        in_string = True
+                        escaped = False
+                        string_is_key = bool(context and context.kind == "object" and context.mode == "key")
+                        string_skip_templates = current_value_skips_templates()
+                        string_key_bytes = bytearray(b'"') if string_is_key else bytearray()
+                        string_tail = b""
+                        continue
+
+                    handle_structural_byte(byte)
+    except OSError:
+        return False
 
 
 def _hf_tokenizer_json_has_decoded_route_evidence(
