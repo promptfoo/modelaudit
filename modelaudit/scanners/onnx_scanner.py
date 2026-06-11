@@ -12,9 +12,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
+from ..scanner_results import VALIDATED_FORMAT_METADATA_KEY
 from ..utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
 from ._evidence_redaction import redact_untrusted_error_message
-from .base import FORMAT_VALIDATION_CONFIG_KEY, INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
+from .base import (
+    FORMAT_VALIDATION_CONFIG_KEY,
+    INCONCLUSIVE_SCAN_OUTCOME,
+    BaseScanner,
+    CheckStatus,
+    IssueSeverity,
+    ScanResult,
+)
 
 logger = logging.getLogger("modelaudit.scanners")
 
@@ -69,6 +77,14 @@ ONNX_RAW_DETECTION_INCONCLUSIVE_REASON = "onnx_raw_detection_analysis_incomplete
 ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON = "onnx_weight_distribution_analysis_incomplete"
 ONNX_TENTATIVE_CANDIDATE_UNAVAILABLE_REASON = "onnx_tentative_candidate_analysis_unavailable"
 ONNX_TENTATIVE_CANDIDATE_PARSE_INCOMPLETE_REASON = "onnx_tentative_candidate_parse_incomplete"
+_ONNX_FORMAT_INTEGRITY_CHECK_NAMES: frozenset[str] = frozenset(
+    {
+        "ONNX Structure Validation",
+        "Tensor Size Validation",
+        "Tensor Validation",
+        "External Data Size Validation",
+    }
+)
 _PYTHON_OPERATOR_TYPES: frozenset[str] = frozenset(
     {
         "pyfunc",
@@ -2536,6 +2552,14 @@ def _finish_scan_result(result: ScanResult) -> None:
     result.finish(success=success)
 
 
+def _onnx_format_integrity_validated(result: ScanResult) -> bool:
+    """Return True once ONNX ownership is structurally validated."""
+    return not any(
+        check.status == CheckStatus.FAILED and check.name in _ONNX_FORMAT_INTEGRITY_CHECK_NAMES
+        for check in result.checks
+    )
+
+
 class OnnxScanner(BaseScanner):
     """Scanner for ONNX model files."""
 
@@ -2767,6 +2791,8 @@ class OnnxScanner(BaseScanner):
         self._check_custom_ops(model, path, result)
         self._check_external_data(model, path, result)
         self._check_tensor_sizes(model, path, result)
+        if _onnx_format_integrity_validated(result):
+            result.metadata[VALIDATED_FORMAT_METADATA_KEY] = self.name
         self._check_weight_distribution(model, path, result)
 
         _finish_scan_result(result)
