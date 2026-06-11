@@ -1413,6 +1413,41 @@ class TestTarScanner:
         assert traversal_checks[0].details["entry"] == "../evil.txt"
         assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
 
+    def test_rejected_regular_tar_member_counts_against_total_budget(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "rejected_budget.tar.gz"
+        payload = b"A" * 128
+        later_payload = b"later"
+
+        with tarfile.open(archive_path, "w:gz") as archive:
+            info = tarfile.TarInfo("../huge.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+            later_info = tarfile.TarInfo("later.txt")
+            later_info.size = len(later_payload)
+            archive.addfile(later_info, tarfile.io.BytesIO(later_payload))  # type: ignore[attr-defined]
+
+        result = TarScanner(
+            config={
+                "max_tar_total_uncompressed_size": 64,
+                "compressed_max_decompression_ratio": 10_000.0,
+            }
+        ).scan(str(archive_path))
+
+        traversal_checks = [check for check in result.checks if check.name == "Path Traversal Protection"]
+        aggregate_checks = [check for check in result.checks if check.name == "TAR Aggregate Size Limit Check"]
+        assert result.success is False
+        assert len(traversal_checks) == 1
+        assert len(aggregate_checks) == 1
+        assert aggregate_checks[0].status == CheckStatus.FAILED
+        assert aggregate_checks[0].details["entry"] == "../huge.bin"
+        assert "tar_total_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            entry["path"].endswith("../huge.bin") and entry["scan_status"] == "rejected"
+            for entry in result.metadata["contents"]
+        )
+        assert not any(entry["path"].endswith("later.txt") for entry in result.metadata["contents"])
+
     def test_large_tar_oversized_member_records_inventory_after_read_cap_bypass(self, tmp_path: Path) -> None:
         """Large skipped members should produce TAR-specific incomplete coverage and inventory."""
         archive_path = tmp_path / "large_oversized_member.tar"
@@ -2306,6 +2341,42 @@ class TestTarScanner:
         assert len(limit_checks) == 1
         assert limit_checks[0].status == CheckStatus.FAILED
         assert "decompression ratio exceeded" in limit_checks[0].message.lower()
+
+    def test_scan_compressed_tar_ratio_limit_precedes_member_extraction(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        archive_path = tmp_path / "ratio_pre_extract.tar.gz"
+        payload = b"A" * 1_000_000
+
+        with tarfile.open(archive_path, "w:gz") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        scanner = TarScanner(config={"compressed_max_decompression_ratio": 2.0})
+
+        def fail_extract(
+            tar: tarfile.TarFile,
+            member: tarfile.TarInfo,
+            *,
+            suffix: str,
+        ) -> tuple[str, int]:
+            pytest.fail(f"ratio limit should be enforced before extracting {member.name} with {suffix}")
+
+        monkeypatch.setattr(scanner, "_extract_member_to_tempfile", fail_extract)
+
+        result = scanner.scan(str(archive_path))
+
+        limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        assert result.success is False
+        assert len(limit_checks) == 1
+        assert limit_checks[0].status == CheckStatus.FAILED
+        assert "decompression ratio exceeded" in limit_checks[0].message.lower()
+        assert "tar_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert result.metadata["contents"][0]["scan_status"] == "incomplete"
+        assert result.metadata["contents"][0]["scan_outcome_reason"] == "tar_analysis_incomplete"
 
     @pytest.mark.parametrize(
         ("suffix", "mode"),

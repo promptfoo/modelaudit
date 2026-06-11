@@ -694,6 +694,56 @@ class TarScanner(BaseScanner):
             details=details,
         )
 
+    def _project_compressed_stream_size(self, bounded_stream: _TarBoundedStream, member: tarfile.TarInfo) -> int:
+        return self._finalize_tar_stream_size(bounded_stream.bytes_read + _tar_padded_size(member.size))
+
+    def _record_projected_compressed_member_limit(
+        self,
+        result: ScanResult,
+        path: str,
+        member: tarfile.TarInfo,
+        bounded_stream: _TarBoundedStream,
+        *,
+        compression_codec: str | None,
+        compressed_size: int,
+    ) -> bool:
+        if compression_codec is None or compressed_size <= 0:
+            return False
+
+        projected_stream_size = self._project_compressed_stream_size(bounded_stream, member)
+        actual_ratio = projected_stream_size / compressed_size
+        if projected_stream_size > self.max_decompressed_bytes:
+            self._add_compressed_wrapper_limit_check(
+                result,
+                passed=False,
+                path=path,
+                message=f"Decompressed size exceeded limit ({projected_stream_size} > {self.max_decompressed_bytes})",
+                decompressed_size=projected_stream_size,
+                compressed_size=compressed_size,
+                compression_codec=compression_codec,
+                actual_ratio=actual_ratio,
+            )
+            mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
+            return True
+
+        if actual_ratio > self.max_decompression_ratio:
+            self._add_compressed_wrapper_limit_check(
+                result,
+                passed=False,
+                path=path,
+                message=(
+                    f"Decompression ratio exceeded limit ({actual_ratio:.1f}x > {self.max_decompression_ratio:.1f}x)"
+                ),
+                decompressed_size=projected_stream_size,
+                compressed_size=compressed_size,
+                compression_codec=compression_codec,
+                actual_ratio=actual_ratio,
+            )
+            mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
+            return True
+
+        return False
+
     def _record_tar_stream_budget_exceeded(
         self,
         result: ScanResult,
@@ -1058,6 +1108,37 @@ class TarScanner(BaseScanner):
                             details={"entry": name},
                             rule_code="S405",
                         )
+                        if member.isfile():
+                            archive_uncompressed_size += member.size
+                            projected_total = shared_budget.member_bytes_consumed + member.size
+                            if (
+                                shared_budget.max_total_uncompressed_size > 0
+                                and projected_total > shared_budget.max_total_uncompressed_size
+                            ):
+                                scan_complete = False
+                                aggregate_size_check_recorded = True
+                                mark_archive_scan_incomplete(result, TAR_TOTAL_SIZE_INCOMPLETE_REASON)
+                                self._add_tar_aggregate_size_check(
+                                    result,
+                                    path,
+                                    passed=False,
+                                    archive_uncompressed_size=projected_total,
+                                    member_name=name,
+                                )
+                                break
+                            shared_budget.member_bytes_consumed = projected_total
+
+                            if self._record_projected_compressed_member_limit(
+                                result,
+                                path,
+                                member,
+                                bounded_stream,
+                                compression_codec=compression_codec,
+                                compressed_size=compressed_size,
+                            ):
+                                scan_complete = False
+                                stream_budget_failed = True
+                                break
                         continue
 
                     if member.issym() or member.islnk():
@@ -1171,6 +1252,26 @@ class TarScanner(BaseScanner):
                         )
                         break
                     shared_budget.member_bytes_consumed = projected_total
+
+                    if self._record_projected_compressed_member_limit(
+                        result,
+                        path,
+                        member,
+                        bounded_stream,
+                        compression_codec=compression_codec,
+                        compressed_size=compressed_size,
+                    ):
+                        scan_complete = False
+                        stream_budget_failed = True
+                        contents.append(
+                            self._member_inventory_entry(
+                                path,
+                                member,
+                                scan_status="incomplete",
+                                scan_outcome_reason="tar_analysis_incomplete",
+                            )
+                        )
+                        break
 
                     try:
                         name_lower = name.lower()
