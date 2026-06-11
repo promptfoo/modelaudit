@@ -286,10 +286,12 @@ _FLAX_MSGPACK_PROBE_LENGTH_SIZES = {
 }
 VALID_MEDIA_ROUTING_FORMAT = "valid_media"
 MEDIA_ROUTE_READ_BYTES = FLAX_MSGPACK_STRUCTURE_READ_BYTES
+MEDIA_ROUTE_TAIL_READ_BYTES = 64 * 1024
 _MEDIA_ROUTING_SUFFIXES = frozenset({".jpeg", ".jpg", ".png"})
 _MEDIA_TRAILING_PADDING = b"\x00\t\n\r "
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _PNG_IEND_CHUNK = b"IEND"
+_PNG_IEND_TRAILER = b"\x00\x00\x00\x00IEND\xaeB`\x82"
 _JPEG_STANDALONE_MARKERS = frozenset((0x01, 0xD8, 0xD9, *range(0xD0, 0xD8)))
 MXNET_SYMBOL_SIGNATURE_READ_BYTES = 10 * 1024 * 1024
 MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT = "mxnet_symbol_routing_inconclusive"
@@ -5491,6 +5493,37 @@ def _detect_bounded_media_route_from_sample(
         return pickle_route
     if sample_is_prefix:
         return None
+    return VALID_MEDIA_ROUTING_FORMAT
+
+
+def _detect_bounded_media_route_from_edges(file_path: Path, prefix: bytes, tail: bytes) -> str | None:
+    """Return bounded media routing evidence from remote head and tail probes."""
+    ext = file_path.suffix.lower()
+    if ext not in _MEDIA_ROUTING_SUFFIXES or not prefix or not tail:
+        return None
+
+    if prefix.startswith(_PNG_SIGNATURE):
+        if len(prefix) < len(_PNG_SIGNATURE) + 8 or prefix[len(_PNG_SIGNATURE) : len(_PNG_SIGNATURE) + 8] != (
+            b"\x00\x00\x00\rIHDR"
+        ):
+            return None
+        media_end = tail.rfind(_PNG_IEND_TRAILER)
+        if media_end < 0:
+            return None
+        media_end += len(_PNG_IEND_TRAILER)
+    elif prefix.startswith(b"\xff\xd8"):
+        if len(prefix) < 4 or prefix[2] != 0xFF or prefix[3] in {0x00, 0xFF}:
+            return None
+        media_end = tail.rfind(b"\xff\xd9")
+        if media_end < 0:
+            return None
+        media_end += 2
+    else:
+        return None
+
+    pickle_route = _detect_media_pickle_polyglot_route(tail[media_end:], sample_is_prefix=False)
+    if pickle_route is not None:
+        return pickle_route
     return VALID_MEDIA_ROUTING_FORMAT
 
 

@@ -231,6 +231,81 @@ def _read_huggingface_probe(
     return _read_huggingface_prefix(repo_id, filename, revision, budget, max_bytes)
 
 
+def _read_huggingface_tail(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+    max_bytes: int,
+) -> bytes:
+    """Read a bounded remote tail when the earlier prefix proved the file size."""
+    file_size = budget.file_sizes.get(filename)
+    if file_size is None or max_bytes <= 0:
+        return b""
+    if file_size <= len(prefix):
+        return prefix[-max_bytes:]
+
+    read_size = min(file_size, max_bytes)
+    start_offset = file_size - read_size
+    if start_offset == 0:
+        return _read_huggingface_probe(repo_id, filename, revision, budget, prefix, read_size)[-read_size:]
+
+    budget.reserve(repo_id, read_size)
+    try:
+        import re
+
+        import requests
+        from huggingface_hub import hf_hub_url
+        from huggingface_hub.utils import build_hf_headers
+
+        file_url = hf_hub_url(repo_id=repo_id, filename=filename, revision=revision)
+        headers = build_hf_headers(
+            token=None,
+            headers={
+                "Range": f"bytes={start_offset}-{file_size - 1}",
+                "Accept-Encoding": "identity",
+            },
+        )
+        with requests.get(
+            file_url,
+            headers=headers,
+            stream=True,
+            timeout=budget.request_timeout(repo_id),
+            allow_redirects=True,
+        ) as response:
+            response.raise_for_status()
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=read_size):
+                budget.check_deadline(repo_id)
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                total += len(chunk)
+                if total >= read_size:
+                    break
+            tail = b"".join(chunks)[:read_size]
+            content_range = getattr(response, "headers", {}).get("Content-Range", "")
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range.strip(), flags=re.IGNORECASE)
+            if getattr(response, "status_code", None) != 206 or match is None:
+                raise ValueError("tail Hugging Face response omitted a valid Content-Range")
+            reported_start, reported_end, reported_size = (int(value) for value in match.groups())
+            if (
+                reported_start != start_offset
+                or reported_end != file_size - 1
+                or reported_size != file_size
+                or len(tail) != read_size
+            ):
+                raise ValueError("tail Hugging Face response reported an inconsistent Content-Range")
+        return tail
+    except Exception as exc:
+        raise ValueError(
+            "Hugging Face selective filtering incomplete: unable to inspect skipped file "
+            f"{repo_id}/{filename} ({type(exc).__name__})"
+        ) from exc
+
+
 def _looks_like_safetensors_prefix(
     repo_id: str,
     filename: str,
@@ -634,12 +709,12 @@ def _detect_huggingface_content_route_format(
     from modelaudit.utils.file.detection import (
         _MEDIA_ROUTING_SUFFIXES,
         _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS,
-        MEDIA_ROUTE_READ_BYTES,
+        MEDIA_ROUTE_TAIL_READ_BYTES,
         PROTO0_1_MAX_PROBE_BYTES,
         VALID_MEDIA_ROUTING_FORMAT,
         _allows_renamed_binary_content_route,
         _could_start_proto0_or_1_pickle,
-        _detect_bounded_media_route_from_sample,
+        _detect_bounded_media_route_from_edges,
         _is_cntk_signature,
         _is_content_routed_lightgbm_signature,
         _looks_like_proto0_or_1_pickle,
@@ -677,24 +752,15 @@ def _detect_huggingface_content_route_format(
         return mxnet_route
 
     if remote_path.suffix.lower() in _MEDIA_ROUTING_SUFFIXES:
-        media_probe = _read_huggingface_probe(
+        media_tail = _read_huggingface_tail(
             repo_id,
             filename,
             revision,
             budget,
             prefix,
-            MEDIA_ROUTE_READ_BYTES + 1,
+            MEDIA_ROUTE_TAIL_READ_BYTES,
         )
-        media_route = _detect_bounded_media_route_from_sample(
-            remote_path,
-            media_probe,
-            sample_is_prefix=_huggingface_sample_is_prefix(
-                budget,
-                filename,
-                media_probe,
-                MEDIA_ROUTE_READ_BYTES + 1,
-            ),
-        )
+        media_route = _detect_bounded_media_route_from_edges(remote_path, prefix, media_tail)
         if media_route == VALID_MEDIA_ROUTING_FORMAT:
             return None
         if media_route is not None:
