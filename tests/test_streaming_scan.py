@@ -2325,6 +2325,87 @@ def test_scan_model_streaming_critical_findings_do_not_set_operational_errors(
     assert determine_exit_code(result) == 1
 
 
+def test_scan_model_streaming_late_source_failure_preserves_critical_findings(tmp_path: Path) -> None:
+    streamed_file = tmp_path / "synthetic-malicious.pkl"
+    streamed_file.write_bytes(b"synthetic pickle payload")
+
+    def file_generator() -> Iterator[tuple[Path, bool]]:
+        yield streamed_file, False
+        raise RuntimeError("late synthetic stream failure")
+
+    finding = ScanResult(scanner_name="pickle")
+    finding.bytes_scanned = streamed_file.stat().st_size
+    finding.add_issue(
+        "Detected malicious payload before stream failure",
+        severity=IssueSeverity.CRITICAL,
+        location=str(streamed_file),
+    )
+    finding.finish(success=True)
+
+    with patch("modelaudit.core.scan_file", return_value=finding):
+        result = scan_model_streaming(
+            file_generator=file_generator(),
+            timeout=30,
+            delete_after_scan=False,
+        )
+
+    interruption_issues = [issue for issue in result.issues if issue.type == "streaming_source_interrupted"]
+    assert result.files_scanned == 1
+    assert result.bytes_scanned == streamed_file.stat().st_size
+    assert any(
+        issue.message == "Detected malicious payload before stream failure"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.location == str(streamed_file)
+        for issue in result.issues
+    )
+    assert len(interruption_issues) == 1
+    interruption_details = interruption_issues[0].details
+    assert interruption_details["operational_error"] is True
+    assert interruption_details["scan_outcome"] == "inconclusive"
+    assert interruption_details["scan_outcome_reason"] == "streaming_source_interrupted"
+    assert interruption_details["files_scanned_before_failure"] == 1
+    assert "huggingface_acquisition_error" not in interruption_details.get("scan_outcome_reasons", [])
+    assert not any(issue.details.get("acquisition_error") is True for issue in result.issues)
+    assert result.has_errors is True
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+
+
+def test_scan_model_streaming_late_source_failure_after_benign_prefix_fails_closed(tmp_path: Path) -> None:
+    streamed_file = tmp_path / "synthetic-benign.pkl"
+    streamed_file.write_bytes(b"synthetic benign payload")
+
+    def file_generator() -> Iterator[tuple[Path, bool]]:
+        yield streamed_file, False
+        raise OSError("late synthetic stream failure")
+
+    clean_result = ScanResult(scanner_name="pickle")
+    clean_result.bytes_scanned = streamed_file.stat().st_size
+    clean_result.finish(success=True)
+
+    with patch("modelaudit.core.scan_file", return_value=clean_result):
+        result = scan_model_streaming(
+            file_generator=file_generator(),
+            timeout=30,
+            delete_after_scan=False,
+        )
+
+    interruption_issues = [issue for issue in result.issues if issue.type == "streaming_source_interrupted"]
+    assert result.files_scanned == 1
+    assert result.bytes_scanned == streamed_file.stat().st_size
+    assert str(streamed_file) in result.file_metadata
+    assert len(interruption_issues) == 1
+    assert interruption_issues[0].severity == IssueSeverity.INFO
+    assert interruption_issues[0].details["operational_error"] is True
+    assert interruption_issues[0].details["scan_outcome"] == "inconclusive"
+    assert interruption_issues[0].details["scan_outcome_reason"] == "streaming_source_interrupted"
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+    assert not any(issue.details.get("acquisition_error") is True for issue in result.issues)
+    assert result.has_errors is True
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+
+
 def test_scan_model_streaming_informational_failed_scan_does_not_set_operational_errors(
     temp_test_files: list[Path],
 ) -> None:
