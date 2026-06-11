@@ -453,6 +453,50 @@ def test_scan_bytes_static_getattr_decorated_method_descriptor_stays_critical(
     assert all(finding.severity == Severity.CRITICAL for finding in findings)
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "def evil(self):\n"
+            "    return None\n\n"
+            "Detect.forward = evil\n"
+        ),
+        (
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "def evil(self):\n"
+            "    return None\n\n"
+            "Alias = Detect\n"
+            "Alias.forward = evil\n"
+        ),
+        (
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "def evil(self):\n"
+            "    return None\n\n"
+            "setattr(Detect, 'forward', evil)\n"
+        ),
+    ],
+)
+def test_scan_bytes_static_getattr_post_class_method_rewrite_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    _write_ultralytics_head_source(tmp_path, monkeypatch, source)
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="rewritten-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
 def test_scan_bytes_static_getattr_explicit_metaclass_lookup_stays_critical(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -469,6 +513,30 @@ def test_scan_bytes_static_getattr_explicit_metaclass_lookup_stays_critical(
     )
 
     report = scan_bytes(_static_getattr_reduce_payload(), source="metaclass-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_inherited_metaclass_lookup_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class DetectMeta(type):\n"
+        "    def __getattribute__(cls, name):\n"
+        "        return super().__getattribute__(name)\n\n"
+        "class Base(metaclass=DetectMeta):\n"
+        "    pass\n\n"
+        "class Detect(Base):\n"
+        "    def forward(self):\n"
+        "        return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="inherited-metaclass-static-getattr.pkl")
 
     findings = _dangerous_getattr_findings(report)
     assert findings

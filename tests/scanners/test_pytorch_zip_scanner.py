@@ -8235,6 +8235,50 @@ def test_pytorch_zip_static_getattr_decorated_method_descriptor_keeps_s115(
     assert _critical_s115_getattr_issues(result)
 
 
+def test_pytorch_zip_static_getattr_post_class_method_rewrite_keeps_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n"
+        "    def forward(self):\n"
+        "        return None\n\n"
+        "def evil(self):\n"
+        "    return None\n\n"
+        "Detect.forward = evil\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
+def test_pytorch_zip_static_getattr_inherited_metaclass_lookup_keeps_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class DetectMeta(type):\n"
+        "    def __getattribute__(cls, name):\n"
+        "        return super().__getattribute__(name)\n\n"
+        "class Base(metaclass=DetectMeta):\n"
+        "    pass\n\n"
+        "class Detect(Base):\n"
+        "    def forward(self):\n"
+        "        return None\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
 def _legacy_s207_pickle_result(opcode_counts: dict[str, int]) -> ScanResult:
     scanner = PickleScanner()
     result = ScanResult(scanner_name="pickle", scanner=scanner)
