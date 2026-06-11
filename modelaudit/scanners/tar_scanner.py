@@ -45,6 +45,7 @@ DEFAULT_MAX_DECOMPRESSION_RATIO = 250.0
 ARCHIVE_MEMBER_COPY_CHUNK_BYTES = 64 * 1024
 MAX_TAR_PYTHON_ANALYSIS_BYTES = 10 * 1024 * 1024
 TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY = "_tar_security_only_nested_member_entries"
+TAR_SKIP_REACHABLE_NEMO_CONFIG_SCAN_KEY = "_tar_skip_reachable_nemo_config_scan"
 TAR_SHARED_SCAN_BUDGET_CONFIG_KEY = "_tar_shared_scan_budget"
 TAR_ENTRY_EXTRACTION_INCOMPLETE_REASON = "tar_entry_extraction_incomplete"
 TAR_TOTAL_SIZE_INCOMPLETE_REASON = "tar_total_size_limit_exceeded"
@@ -420,6 +421,67 @@ class TarScanner(BaseScanner):
         if callable(nested_scan_callback):
             return nested_scan_callback(path, nested_config)
         return scan_nested_file(path, nested_config)
+
+    def _is_reachable_nemo_root_config(self, member_name: str) -> bool:
+        """Return whether a streamed TAR member is a root NeMo config path."""
+        if self.config.get(TAR_SKIP_REACHABLE_NEMO_CONFIG_SCAN_KEY) is True:
+            return False
+        from .nemo_scanner import NemoScanner
+
+        return NemoScanner._is_root_config_member_name(member_name)
+
+    def _scan_reachable_nemo_config_member(
+        self,
+        *,
+        archive_path: str,
+        member_name: str,
+        member_size: int,
+        tmp_path: str,
+        result: ScanResult,
+    ) -> bool:
+        """Apply NeMo root-config checks to a member reached by generic TAR streaming."""
+        if not self._is_reachable_nemo_root_config(member_name):
+            return True
+
+        from .nemo_scanner import NemoScanner
+
+        nemo_scanner = NemoScanner(config=dict(self.config))
+        with open(tmp_path, "rb") as config_file:
+            raw_config = config_file.read(nemo_scanner.MAX_CONFIG_SIZE + 1)
+        return nemo_scanner.scan_reachable_root_config_bytes(
+            raw_config,
+            config_file=member_name,
+            archive_path=archive_path,
+            result=result,
+            declared_size=member_size,
+        )
+
+    def _record_reachable_nemo_link_incomplete(
+        self,
+        result: ScanResult,
+        *,
+        archive_path: str,
+        member: tarfile.TarInfo,
+    ) -> bool:
+        """Fail closed when generic TAR streaming reaches a linked root NeMo config."""
+        if not self._is_reachable_nemo_root_config(member.name):
+            return False
+
+        mark_archive_scan_incomplete(result, "nemo_link_semantics_incomplete")
+        result.add_check(
+            name="NeMo Link Semantics",
+            passed=False,
+            message="Root NeMo config is link-mediated; generic TAR analysis is conservative",
+            severity=IssueSeverity.INFO,
+            location=f"{archive_path}:{member.name}",
+            details={
+                "entry": member.name,
+                "target": member.linkname,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "nemo_link_semantics_incomplete",
+            },
+        )
+        return True
 
     @staticmethod
     def _rewrite_archive_location(location: str | None, tmp_path: str, archive_location: str) -> str:
@@ -1040,6 +1102,7 @@ class TarScanner(BaseScanner):
         bounded_stream: _TarBoundedStream | None = None
         shared_budget = self._get_or_create_shared_budget()
         stream_budget_failed = False
+        reached_eof = False
 
         try:
             with self._open_tar_stream(path) as (tar, bounded_stream, compression_codec):
@@ -1076,6 +1139,7 @@ class TarScanner(BaseScanner):
                         break
 
                     if member is None:
+                        reached_eof = True
                         break
 
                     entry_count += 1
@@ -1193,6 +1257,12 @@ class TarScanner(BaseScanner):
                                 scan_status="rejected" if link_rejected else "link_validated",
                             )
                         )
+                        if not link_rejected and self._record_reachable_nemo_link_incomplete(
+                            result,
+                            archive_path=path,
+                            member=member,
+                        ):
+                            scan_complete = False
                         continue
 
                     if member.isdir():
@@ -1224,6 +1294,35 @@ class TarScanner(BaseScanner):
                                 "member coverage is incomplete"
                             ),
                         )
+                        if member.size > 0:
+                            archive_uncompressed_size += member.size
+                            projected_total = shared_budget.member_bytes_consumed + member.size
+                            if (
+                                shared_budget.max_total_uncompressed_size > 0
+                                and projected_total > shared_budget.max_total_uncompressed_size
+                            ):
+                                aggregate_size_check_recorded = True
+                                mark_archive_scan_incomplete(result, TAR_TOTAL_SIZE_INCOMPLETE_REASON)
+                                self._add_tar_aggregate_size_check(
+                                    result,
+                                    path,
+                                    passed=False,
+                                    archive_uncompressed_size=projected_total,
+                                    member_name=name,
+                                )
+                            else:
+                                shared_budget.member_bytes_consumed = projected_total
+
+                            if self._record_projected_compressed_member_limit(
+                                result,
+                                path,
+                                member,
+                                bounded_stream,
+                                compression_codec=compression_codec,
+                                compressed_size=compressed_size,
+                            ):
+                                stream_budget_failed = True
+                            break
                         continue
 
                     archive_uncompressed_size += member.size
@@ -1318,6 +1417,15 @@ class TarScanner(BaseScanner):
                                     result.bytes_scanned += total_size
                                     asset_entry = {"path": f"{path}:{name}", "type": "nemo_managed"}
                                 else:
+                                    if not self._scan_reachable_nemo_config_member(
+                                        archive_path=path,
+                                        member_name=name,
+                                        member_size=member.size,
+                                        tmp_path=tmp_path,
+                                        result=result,
+                                    ):
+                                        scan_complete = False
+
                                     nested_config = dict(self.config)
                                     nested_config.pop(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY, None)
                                     nested_config["cache_enabled"] = False
@@ -1405,7 +1513,7 @@ class TarScanner(BaseScanner):
                 compressed_size=compressed_size,
             )
 
-        if not entry_count_check_recorded:
+        if reached_eof and not entry_count_check_recorded:
             result.add_check(
                 name="Entry Count Limit Check",
                 passed=True,

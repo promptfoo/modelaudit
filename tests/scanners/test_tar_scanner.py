@@ -22,6 +22,7 @@ from modelaudit.scanners.tar_scanner import (
     DEFAULT_MAX_TAR_ENTRY_SIZE,
     TarScanner,
 )
+from modelaudit.utils.file import detection as file_detection
 
 
 def _assert_inconclusive_aggregate_not_reused(
@@ -1538,6 +1539,97 @@ class TestTarScanner:
         assert result.success is True
         assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
 
+    def test_compressed_tar_truncated_nemo_route_scans_reachable_root_config(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_BODY_SKIP_BYTES", 64)
+        archive_path = tmp_path / "large-archive.tar.gz"
+
+        with tarfile.open(archive_path, "w:gz") as archive:
+            first_payload = b"x" * 128
+            first_info = tarfile.TarInfo("large-weights.bin")
+            first_info.size = len(first_payload)
+            archive.addfile(first_info, tarfile.io.BytesIO(first_payload))  # type: ignore[attr-defined]
+
+            config_payload = b"model:\n  _target_: os.system\n"
+            config_info = tarfile.TarInfo("model_config.yaml")
+            config_info.size = len(config_payload)
+            archive.addfile(config_info, tarfile.io.BytesIO(config_payload))  # type: ignore[attr-defined]
+
+        result = core.scan_file(str(archive_path), config={"cache_enabled": False})
+
+        assert result.scanner_name == "tar"
+        assert result.success is False
+        assert any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+    def test_compressed_tar_truncated_nemo_route_allows_benign_root_config(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_BODY_SKIP_BYTES", 64)
+        archive_path = tmp_path / "safe-archive.tar.gz"
+
+        with tarfile.open(archive_path, "w:gz") as archive:
+            first_payload = b"x" * 128
+            first_info = tarfile.TarInfo("large-weights.bin")
+            first_info.size = len(first_payload)
+            archive.addfile(first_info, tarfile.io.BytesIO(first_payload))  # type: ignore[attr-defined]
+
+            config_payload = b"model:\n  _target_: torch.nn.Linear\n"
+            config_info = tarfile.TarInfo("model_config.yaml")
+            config_info.size = len(config_payload)
+            archive.addfile(config_info, tarfile.io.BytesIO(config_payload))  # type: ignore[attr-defined]
+
+        result = core.scan_file(str(archive_path), config={"cache_enabled": False})
+
+        assert result.scanner_name == "tar"
+        assert result.success is True
+        assert any(
+            check.name == "Hydra _target_ Safety Check" and check.status == CheckStatus.PASSED
+            for check in result.checks
+        )
+        assert not any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
+
+    def test_compressed_tar_truncated_nemo_route_fails_closed_on_linked_root_config(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_BODY_SKIP_BYTES", 64)
+        archive_path = tmp_path / "linked-config.tar.gz"
+
+        with tarfile.open(archive_path, "w:gz") as archive:
+            first_payload = b"x" * 128
+            first_info = tarfile.TarInfo("large-weights.bin")
+            first_info.size = len(first_payload)
+            archive.addfile(first_info, tarfile.io.BytesIO(first_payload))  # type: ignore[attr-defined]
+
+            link_info = tarfile.TarInfo("model_config.yaml")
+            link_info.type = tarfile.SYMTYPE
+            link_info.linkname = "payload.yaml"
+            archive.addfile(link_info)
+
+            config_payload = b"model:\n  _target_: os.system\n"
+            payload_info = tarfile.TarInfo("payload.yaml")
+            payload_info.size = len(config_payload)
+            archive.addfile(payload_info, tarfile.io.BytesIO(config_payload))  # type: ignore[attr-defined]
+
+        result = core.scan_file(str(archive_path), config={"cache_enabled": False})
+
+        assert result.scanner_name == "tar"
+        assert result.success is False
+        assert "nemo_link_semantics_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "NeMo Link Semantics"
+            and check.status == CheckStatus.FAILED
+            and check.details["scan_outcome_reason"] == "nemo_link_semantics_incomplete"
+            for check in result.checks
+        )
+
     def test_compound_tar_gz_total_budget_stops_before_member_body_reads(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2037,6 +2129,8 @@ class TestTarScanner:
         )
         assert "tar_entry_extraction_incomplete" in result.metadata["scan_outcome_reasons"]
         assert not any(entry["path"].endswith("payload.txt") for entry in result.metadata["contents"])
+        entry_checks = [check for check in result.checks if check.name == "Entry Count Limit Check"]
+        assert not any(check.status == CheckStatus.PASSED for check in entry_checks)
         assert not any(
             issue.severity == IssueSeverity.CRITICAL
             and issue.location == f"{archive_path}:payload.txt"
@@ -2176,6 +2270,30 @@ class TestTarScanner:
         assert coverage_checks[0].details["entry"] == "named_pipe"
         assert coverage_checks[0].details["member_type"] == "tar_fifo"
         assert any(entry["path"] == f"{archive_path}:data.bin" for entry in result.metadata["contents"])
+
+    def test_scan_stops_after_body_carrying_special_member(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "special_body.tar"
+        special_payload = b"A" * 128
+        later_payload = b"later"
+
+        with tarfile.open(archive_path, "w") as archive:
+            special = tarfile.TarInfo("named_pipe")
+            special.type = tarfile.FIFOTYPE
+            special.size = len(special_payload)
+            archive.addfile(special, tarfile.io.BytesIO(special_payload))  # type: ignore[attr-defined]
+
+            later_info = tarfile.TarInfo("later.txt")
+            later_info.size = len(later_payload)
+            archive.addfile(later_info, tarfile.io.BytesIO(later_payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert "tar_special_member_unsupported" in result.metadata["scan_outcome_reasons"]
+        assert any(entry["path"].endswith("named_pipe") for entry in result.metadata["contents"])
+        assert not any(entry["path"].endswith("later.txt") for entry in result.metadata["contents"])
+        entry_checks = [check for check in result.checks if check.name == "Entry Count Limit Check"]
+        assert not any(check.status == CheckStatus.PASSED for check in entry_checks)
 
     @pytest.mark.parametrize(
         ("member_type", "expected_kind"),
