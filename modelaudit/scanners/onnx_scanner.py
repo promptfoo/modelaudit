@@ -93,6 +93,9 @@ _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT = 32
 _ONNX_WEIGHT_RESHAPE_RANK_LIMIT = 64
 _ONNX_WEIGHT_METADATA_TEXT_LIMIT = 256
 _ONNX_WEIGHT_METADATA_SEQUENCE_LIMIT = 64
+_ONNX_CUSTOM_OPERATOR_REPRESENTATIVE_LIMIT = 5
+_ONNX_CUSTOM_OPERATOR_SAMPLE_LIMIT = 20
+_ONNX_CUSTOM_OPERATOR_TEXT_LIMIT = 256
 _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE = 100 * 1024 * 1024
 _STANDARD_NEURAL_NETWORK_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
 _SAME_TYPE_ELEMENTWISE_OPERATORS: frozenset[str] = frozenset(
@@ -406,6 +409,61 @@ def _model_local_function_identifiers(model: Any) -> frozenset[tuple[str, str, s
 def _operator_identifier(node: Any) -> tuple[str, str, str]:
     """Return an ONNX operator's domain, name, and overload identity."""
     return (node.domain or "", node.op_type or "", getattr(node, "overload", "") or "")
+
+
+def _bounded_custom_operator_value(value: Any) -> str:
+    text = str(value or "")
+    if len(text) <= _ONNX_CUSTOM_OPERATOR_TEXT_LIMIT:
+        return text
+    return f"{text[:_ONNX_CUSTOM_OPERATOR_TEXT_LIMIT]}..."
+
+
+@dataclass
+class _CustomOperatorAggregate:
+    occurrence_count: int = 0
+    operator_samples: list[str] = field(default_factory=list)
+    representative_nodes: list[dict[str, str]] = field(default_factory=list)
+    operator_samples_truncated: bool = False
+    _operator_sample_seen: set[str] = field(default_factory=set)
+
+    def add_node(self, node: Any) -> None:
+        self.occurrence_count += 1
+        op_type = _bounded_custom_operator_value(getattr(node, "op_type", ""))
+        if op_type not in self._operator_sample_seen:
+            if len(self.operator_samples) < _ONNX_CUSTOM_OPERATOR_SAMPLE_LIMIT:
+                self.operator_samples.append(op_type)
+                self._operator_sample_seen.add(op_type)
+            else:
+                self.operator_samples_truncated = True
+
+        if len(self.representative_nodes) >= _ONNX_CUSTOM_OPERATOR_REPRESENTATIVE_LIMIT:
+            return
+
+        node_summary = {
+            "op_type": op_type,
+            "domain": _bounded_custom_operator_value(getattr(node, "domain", "")),
+        }
+        node_name = _bounded_custom_operator_value(getattr(node, "name", ""))
+        if node_name:
+            node_summary["name"] = node_name
+        overload = _bounded_custom_operator_value(getattr(node, "overload", ""))
+        if overload:
+            node_summary["overload"] = overload
+        self.representative_nodes.append(node_summary)
+
+    def details(self, *, domain: str, security_note: str) -> dict[str, Any]:
+        details: dict[str, Any] = {
+            "domain": domain,
+            "occurrence_count": self.occurrence_count,
+            "operator_samples": self.operator_samples,
+            "operator_samples_truncated": self.operator_samples_truncated,
+            "representative_nodes": self.representative_nodes,
+            "representative_nodes_truncated": self.occurrence_count > len(self.representative_nodes),
+            "security_note": security_note,
+        }
+        if self.operator_samples:
+            details["op_type"] = self.operator_samples[0]
+        return details
 
 
 def _has_operator_schema(op_type: str, version: int, domain: str) -> bool:
@@ -2801,10 +2859,17 @@ class OnnxScanner(BaseScanner):
     def _check_custom_ops(self, model: Any, path: str, result: ScanResult) -> None:
         custom_domains = set()
         local_function_identifiers = _model_local_function_identifiers(model)
+        custom_domain_findings: dict[str, _CustomOperatorAggregate] = {}
+        explicit_custom_operator_findings: dict[tuple[str, str, str], _CustomOperatorAggregate] = {}
         custom_operators_found = 0
         python_ops_found = False
         safe_nodes = 0
         nodes_checked = 0
+        custom_operator_security_note = (
+            "Custom operators may depend on external operator implementations. "
+            "ONNX files cannot execute code - risk is in runtime environment if malicious "
+            "operators are installed. Verify operator packages before installation."
+        )
 
         for graph, opset_versions in _iter_model_graphs_with_opsets(model):
             for node in _iter_graph_nodes(graph):
@@ -2821,37 +2886,14 @@ class OnnxScanner(BaseScanner):
                 if is_external_custom_operator or is_explicit_custom_operator:
                     custom_operators_found += 1
                     if is_external_custom_operator:
-                        custom_domains.add(node.domain)
-                        message = (
-                            f"Model references custom operator domain '{node.domain}'. "
-                            "This is metadata only - ensure operators are from trusted sources before installation."
-                        )
+                        domain = str(node.domain or "")
+                        custom_domains.add(domain)
+                        custom_domain_findings.setdefault(domain, _CustomOperatorAggregate()).add_node(node)
                     else:
-                        message = (
-                            f"Model references custom operator '{node.op_type}' in the standard ONNX domain. "
-                            "Ensure its implementation is from a trusted source before installation."
-                        )
-
-                    # All custom operators are INFO - they're metadata, not executable code
-                    # Security risk is in runtime environment (installing malicious operators)
-                    # not in the ONNX file itself
-                    result.add_check(
-                        name="Custom Operator Domain Check",
-                        passed=False,
-                        message=message,
-                        severity=IssueSeverity.INFO,
-                        location=f"{path} (node: {node.name})",
-                        rule_code="S1111",
-                        details={
-                            "op_type": node.op_type,
-                            "domain": node.domain,
-                            "security_note": (
-                                "Custom operators may depend on external operator implementations. "
-                                "ONNX files cannot execute code - risk is in runtime environment if malicious "
-                                "operators are installed. Verify operator packages before installation."
-                            ),
-                        },
-                    )
+                        explicit_custom_operator_findings.setdefault(
+                            _operator_identifier(node),
+                            _CustomOperatorAggregate(),
+                        ).add_node(node)
 
                 if is_python_operator:
                     python_ops_found = True
@@ -2866,6 +2908,39 @@ class OnnxScanner(BaseScanner):
                     )
                 elif not is_external_custom_operator and not is_explicit_custom_operator:
                     safe_nodes += 1
+
+        # All custom operators are INFO - they're metadata, not executable code.
+        # Security risk is in runtime environment (installing malicious operators)
+        # not in the ONNX file itself. Emit one bounded aggregate per domain/file.
+        for domain, finding in sorted(custom_domain_findings.items()):
+            result.add_check(
+                name="Custom Operator Domain Check",
+                passed=False,
+                message=(
+                    f"Model references custom operator domain '{domain}' in "
+                    f"{finding.occurrence_count} node(s). This is metadata only - ensure operators are "
+                    "from trusted sources before installation."
+                ),
+                severity=IssueSeverity.INFO,
+                location=path,
+                rule_code="S1111",
+                details=finding.details(domain=domain, security_note=custom_operator_security_note),
+            )
+
+        for (domain, op_type, _overload), finding in sorted(explicit_custom_operator_findings.items()):
+            result.add_check(
+                name="Custom Operator Domain Check",
+                passed=False,
+                message=(
+                    f"Model references custom operator '{op_type}' in the standard ONNX domain in "
+                    f"{finding.occurrence_count} node(s). Ensure its implementation is from a trusted source "
+                    "before installation."
+                ),
+                severity=IssueSeverity.INFO,
+                location=path,
+                rule_code="S1111",
+                details=finding.details(domain=domain, security_note=custom_operator_security_note),
+            )
 
         # Record successful checks for safe operators
         if safe_nodes > 0 and custom_operators_found == 0:

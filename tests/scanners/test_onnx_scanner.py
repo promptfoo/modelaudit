@@ -1,3 +1,4 @@
+import os
 import struct
 import sys
 from pathlib import Path
@@ -2119,6 +2120,61 @@ def _scan_and_extract_custom_domains(model_path: Path) -> tuple[Any, list[Any], 
     return result, _failed_custom_domain_checks(result), custom_domains
 
 
+_PINNED_HF_MULTILINGUAL_E5_LARGE = "intfloat/multilingual-e5-large"
+_PINNED_HF_MULTILINGUAL_E5_LARGE_REVISION = "3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3"
+_PINNED_HF_MULTILINGUAL_E5_LARGE_ONNX = "onnx/model_O4.onnx"
+_PINNED_HF_ONNX_MAX_BYTES = 250 * 1024 * 1024
+
+
+def create_onnx_model_with_custom_nodes(
+    tmp_path: Path,
+    custom_nodes: list[tuple[str, str, str]],
+    *,
+    filename: str = "custom_nodes.onnx",
+    include_custom_opsets: bool = True,
+) -> Path:
+    input_value = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
+    output_value = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
+    previous_output = "input"
+    nodes = []
+    for index, (domain, op_type, node_name) in enumerate(custom_nodes):
+        next_output = "output" if index == len(custom_nodes) - 1 else f"value_{index}"
+        nodes.append(helper.make_node(op_type, [previous_output], [next_output], domain=domain, name=node_name))
+        previous_output = next_output
+
+    opset_imports = [helper.make_opsetid("", 13)]
+    if include_custom_opsets:
+        opset_imports.extend(
+            helper.make_opsetid(domain, 1)
+            for domain in sorted({domain for domain, _op, _name in custom_nodes if domain})
+        )
+    graph = helper.make_graph(nodes, "custom_nodes", [input_value], [output_value])
+    model = helper.make_model(graph, opset_imports=opset_imports)
+    model.ir_version = 8
+    model_path = tmp_path / filename
+    onnx.save(model, str(model_path))
+    return model_path
+
+
+def create_onnx_model_with_repeated_custom_domain_and_missing_external_data(tmp_path: Path) -> Path:
+    input_value = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
+    output_value = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
+    weight = _make_external_tensor("W", TensorProto.FLOAT, [1], "missing-weights.bin")
+    nodes = [
+        helper.make_node("BackdoorOp", ["input", "W"], ["hidden"], domain="com.external", name="backdoor_0"),
+        helper.make_node("BackdoorOp", ["hidden", "W"], ["output"], domain="com.external", name="backdoor_1"),
+    ]
+    graph = helper.make_graph(nodes, "custom_external_data", [input_value], [output_value], initializer=[weight])
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("com.external", 1)],
+    )
+    model.ir_version = 8
+    model_path = tmp_path / "custom_external_data.onnx"
+    onnx.save(model, str(model_path))
+    return model_path
+
+
 def test_onnx_scanner_can_handle(tmp_path):
     model_path = create_onnx_model(tmp_path)
     assert OnnxScanner.can_handle(str(model_path))
@@ -2284,6 +2340,189 @@ def test_onnx_scanner_standard_preview_training_domain_not_flagged(tmp_path: Pat
     assert "ai.onnx.preview.training" not in metadata_custom_domains
     assert result.success is True
     assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+
+
+def test_onnx_scanner_repeated_custom_domain_nodes_emit_one_domain_check(tmp_path: Path) -> None:
+    custom_nodes = [
+        *[("com.microsoft", "Attention", f"attention_{index}") for index in range(4)],
+        ("com.microsoft", "BiasAttention", "bias_attention"),
+        ("com.microsoft", "PackedAttention", "packed_attention"),
+    ]
+    model_path = create_onnx_model_with_custom_nodes(tmp_path, custom_nodes)
+
+    result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    check = custom_domain_checks[0]
+    assert check.rule_code == "S1111"
+    assert check.severity == IssueSeverity.INFO
+    assert check.location == str(model_path)
+    assert check.details["domain"] == "com.microsoft"
+    assert check.details["occurrence_count"] == len(custom_nodes)
+    assert check.details["operator_samples"] == ["Attention", "BiasAttention", "PackedAttention"]
+    assert len(check.details["representative_nodes"]) == 5
+    assert check.details["representative_nodes_truncated"] is True
+    assert result.metadata["custom_domains"] == ["com.microsoft"]
+    assert metadata_custom_domains == ["com.microsoft"]
+    assert len([issue for issue in result.issues if issue.rule_code == "S1111"]) == 1
+
+
+def test_onnx_scanner_repeated_custom_domains_emit_one_check_per_domain(tmp_path: Path) -> None:
+    custom_nodes = [
+        ("com.microsoft", "Attention", "attention_0"),
+        ("com.microsoft", "Attention", "attention_1"),
+        ("com.attacker", "BackdoorOp", "backdoor_0"),
+        ("com.attacker", "BackdoorOp", "backdoor_1"),
+        ("ai.onnx.ml.malicious", "BackdoorOp", "lookalike"),
+    ]
+    model_path = create_onnx_model_with_custom_nodes(tmp_path, custom_nodes)
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    checks_by_domain = {check.details["domain"]: check for check in custom_domain_checks}
+    assert sorted(checks_by_domain) == ["ai.onnx.ml.malicious", "com.attacker", "com.microsoft"]
+    assert checks_by_domain["com.microsoft"].details["occurrence_count"] == 2
+    assert checks_by_domain["com.attacker"].details["occurrence_count"] == 2
+    assert checks_by_domain["ai.onnx.ml.malicious"].details["occurrence_count"] == 1
+    assert metadata_custom_domains == ["ai.onnx.ml.malicious", "com.attacker", "com.microsoft"]
+
+
+def test_onnx_scanner_repeated_custom_domain_without_opset_import_still_flagged(tmp_path: Path) -> None:
+    custom_nodes = [
+        ("com.malformed", "BackdoorOp", "backdoor_0"),
+        ("com.malformed", "BackdoorOp", "backdoor_1"),
+    ]
+    model_path = create_onnx_model_with_custom_nodes(
+        tmp_path,
+        custom_nodes,
+        include_custom_opsets=False,
+    )
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].details["domain"] == "com.malformed"
+    assert custom_domain_checks[0].details["occurrence_count"] == 2
+    assert metadata_custom_domains == ["com.malformed"]
+
+
+def test_onnx_scanner_custom_domain_dedup_preserves_external_data_findings(tmp_path: Path) -> None:
+    model_path = create_onnx_model_with_repeated_custom_domain_and_missing_external_data(tmp_path)
+
+    result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].details["domain"] == "com.external"
+    assert custom_domain_checks[0].details["occurrence_count"] == 2
+    assert metadata_custom_domains == ["com.external"]
+    missing_external_checks = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status == CheckStatus.FAILED
+    ]
+    assert missing_external_checks
+
+
+def test_onnx_scanner_custom_domain_dedup_preserves_python_operator_detection(tmp_path: Path) -> None:
+    custom_nodes = [
+        ("com.attacker", "BackdoorOp", "backdoor_0"),
+        ("com.attacker", "BackdoorOp", "backdoor_1"),
+        ("com.attacker", "PyOp", "evil_pyop"),
+    ]
+    model_path = create_onnx_model_with_custom_nodes(tmp_path, custom_nodes)
+
+    result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert result.success is False
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].details["domain"] == "com.attacker"
+    assert custom_domain_checks[0].details["occurrence_count"] == 3
+    assert metadata_custom_domains == ["com.attacker"]
+    python_operator_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Operator Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_operator_checks) == 1
+    assert python_operator_checks[0].severity == IssueSeverity.CRITICAL
+    assert python_operator_checks[0].details["op_type"] == "PyOp"
+
+
+def test_onnx_scanner_custom_domain_dedup_preserves_multi_file_evidence(tmp_path: Path) -> None:
+    create_onnx_model_with_custom_nodes(
+        tmp_path,
+        [("com.shared", "BackdoorOp", "first_0"), ("com.shared", "BackdoorOp", "first_1")],
+        filename="first.onnx",
+    )
+    create_onnx_model_with_custom_nodes(
+        tmp_path,
+        [("com.shared", "BackdoorOp", "second_0"), ("com.shared", "BackdoorOp", "second_1")],
+        filename="second.onnx",
+    )
+
+    result = scan_model_directory_or_file(
+        str(tmp_path),
+        recursive=False,
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    custom_checks = [
+        check
+        for check in result.checks
+        if check.name == "Custom Operator Domain Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("domain") == "com.shared"
+    ]
+    assert len(custom_checks) == 2
+    assert {Path(str(check.location)).name for check in custom_checks} == {"first.onnx", "second.onnx"}
+    assert all(check.details["occurrence_count"] == 2 for check in custom_checks)
+
+
+@pytest.mark.onnx
+@pytest.mark.slow
+@pytest.mark.integration
+def test_onnx_scanner_pinned_hf_multilingual_e5_large_custom_domains_deduped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.environ.get("MODELAUDIT_RUN_HF_REAL_MODEL_TESTS") != "1":
+        pytest.skip("set MODELAUDIT_RUN_HF_REAL_MODEL_TESTS=1 to download pinned Hugging Face ONNX models")
+
+    monkeypatch.setenv("PROMPTFOO_DISABLE_TELEMETRY", "1")
+    monkeypatch.setenv("HF_HUB_DISABLE_TELEMETRY", "1")
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    cache_dir = tmp_path / "hf-cache"
+    model_path = Path(
+        huggingface_hub.hf_hub_download(
+            repo_id=_PINNED_HF_MULTILINGUAL_E5_LARGE,
+            revision=_PINNED_HF_MULTILINGUAL_E5_LARGE_REVISION,
+            filename=_PINNED_HF_MULTILINGUAL_E5_LARGE_ONNX,
+            cache_dir=str(cache_dir),
+        )
+    )
+    assert model_path.stat().st_size <= _PINNED_HF_ONNX_MAX_BYTES
+
+    model = onnx.load(str(model_path), load_external_data=False)
+    microsoft_node_count = sum(1 for node in model.graph.node if node.domain == "com.microsoft")
+    assert microsoft_node_count == 96
+
+    scanner = OnnxScanner({"check_jit_script": False, "check_network_comm": False, "max_array_size": 1})
+    result = scanner.scan(str(model_path))
+    metadata = scanner.extract_metadata(str(model_path))
+
+    custom_domain_checks = _failed_custom_domain_checks(result)
+    microsoft_domain_checks = [
+        check for check in custom_domain_checks if check.details.get("domain") == "com.microsoft"
+    ]
+    assert len(microsoft_domain_checks) == 1
+    assert microsoft_domain_checks[0].details["occurrence_count"] == microsoft_node_count
+    assert microsoft_domain_checks[0].details["representative_nodes_truncated"] is True
+    assert [check.details["domain"] for check in custom_domain_checks].count("com.microsoft") == 1
+    assert result.metadata["custom_domains"] == ["com.microsoft"]
+    assert metadata["custom_domains"] == ["com.microsoft"]
 
 
 def test_onnx_scanner_registered_ai_onnx_preview_operator_not_flagged(
