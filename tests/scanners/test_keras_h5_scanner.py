@@ -26,7 +26,10 @@ from modelaudit.scanners import keras_utils
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 from modelaudit.utils.file.hdf5 import HDF5_MAGIC, find_hdf5_signature_offset, hdf5_metadata_checksum
-from modelaudit.utils.helpers.cache_decorator import should_bypass_cache_for_missing_h5py
+from modelaudit.utils.helpers.cache_decorator import (
+    should_bypass_cache_for_file_backed_hdf5,
+    should_bypass_cache_for_missing_h5py,
+)
 
 ASSETS_DIR = Path(__file__).parent.parent / "assets" / "samples" / "keras"
 
@@ -843,6 +846,137 @@ def test_large_hdf5_virtual_dataset_source_still_detected(tmp_path: Path) -> Non
             "sources": [{"filename": "virtual_source.h5", "path": "/payload"}],
         },
     ]
+
+
+def test_large_file_backed_hdf5_bypasses_cache_content_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.utils.file.large_file_handler import SMALL_FILE_THRESHOLD
+    from modelaudit.utils.helpers.secure_hasher import SecureFileHasher
+
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        keras_version="3.13.2",
+        file_name="huge_cache_bypass.h5",
+    )
+    inflate_h5_file_to_size(model_path, SMALL_FILE_THRESHOLD + 4096)
+    assert should_bypass_cache_for_file_backed_hdf5(str(model_path)) is True
+
+    def fail_if_cache_hashes_hdf5(self: SecureFileHasher, path: str) -> str:
+        if path == str(model_path):
+            pytest.fail("large file-backed HDF5 was content-hashed for cache lookup")
+        return "a" * 64
+
+    monkeypatch.setattr(SecureFileHasher, "hash_file", fail_if_cache_hashes_hdf5)
+    monkeypatch.setattr(
+        SecureFileHasher,
+        "hash_file_with_stat",
+        lambda self, path, _stat: fail_if_cache_hashes_hdf5(self, path),
+    )
+
+    reset_cache_manager()
+    try:
+        audit_result = core_module.scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+            max_cache_file_size=SMALL_FILE_THRESHOLD * 2,
+            content_hash_threshold=1,
+        )
+    finally:
+        reset_cache_manager()
+
+    assert audit_result.files_scanned == 1
+    assert "keras_h5" in audit_result.scanner_names
+    assert core_module.determine_exit_code(audit_result) == 0
+    metadata = audit_result.file_metadata[str(model_path)]
+    assert "max_file_read_size_exceeded" not in metadata.get("scan_outcome_reasons", [])
+
+
+def test_keras_h5_virtual_dataset_external_source_after_report_cap_still_detected(tmp_path: Path) -> None:
+    late_source = tmp_path / "late_virtual_source.h5"
+    with h5py.File(late_source, "w") as f:
+        f.create_dataset("payload", data=[1.0])
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        keras_version="3.13.1",
+        file_name="late_virtual_dataset.h5",
+    )
+    with h5py.File(model_path, "a") as f:
+        same_file_count = KerasH5Scanner._MAX_HDF5_VIRTUAL_SOURCE_REPORTS
+        f.create_dataset("internal_payload", data=[float(index) for index in range(same_file_count)])
+        dense = f.require_group("model_weights").create_group("dense")
+        dense.attrs["weight_names"] = [b"virtual_kernel"]
+        f["model_weights"].attrs["layer_names"] = [b"dense"]
+        layout = h5py.VirtualLayout(shape=(same_file_count + 1,), dtype="float64")
+        same_file_source = h5py.VirtualSource(".", "/internal_payload", shape=(same_file_count,))
+        for index in range(same_file_count):
+            layout[index] = same_file_source[index]
+        external_source = h5py.VirtualSource(late_source.name, "/payload", shape=(1,))
+        layout[same_file_count] = external_source[0]
+        dense.create_virtual_dataset("virtual_kernel", layout)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert result.success is True
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "virtual_dataset",
+            "hdf5_path": "/model_weights/dense/virtual_kernel",
+            "sources": [{"filename": "late_virtual_source.h5", "path": "/payload"}],
+        },
+    ]
+
+
+def test_keras_h5_virtual_dataset_source_inspection_limit_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        keras_version="3.13.1",
+        file_name="virtual_dataset_inspection_limit.h5",
+    )
+    with h5py.File(model_path, "a") as f:
+        f.create_dataset("internal_payload", data=[1.0, 2.0, 3.0])
+        dense = f.require_group("model_weights").create_group("dense")
+        dense.attrs["weight_names"] = [b"virtual_kernel"]
+        f["model_weights"].attrs["layer_names"] = [b"dense"]
+        layout = h5py.VirtualLayout(shape=(3,), dtype="float64")
+        same_file_source = h5py.VirtualSource(".", "/internal_payload", shape=(3,))
+        for index in range(3):
+            layout[index] = same_file_source[index]
+        dense.create_virtual_dataset("virtual_kernel", layout)
+
+    monkeypatch.setattr(KerasH5Scanner, "_MAX_HDF5_VIRTUAL_SOURCE_INSPECTIONS", 2)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    reason = "keras_h5_external_reference_analysis_limit_exceeded"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert reason in result.metadata["scan_outcome_reasons"]
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    limit_checks = [check for check in result.checks if check.name == "HDF5 External Reference Analysis Limit"]
+    assert len(limit_checks) == 1
+    assert limit_checks[0].status == CheckStatus.FAILED
+    assert limit_checks[0].details["virtual_dataset_sources_truncated"] is True
 
 
 def test_keras_h5_same_file_virtual_dataset_source_stays_clean(tmp_path: Path) -> None:

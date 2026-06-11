@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..helpers.cache_decorator import (
     add_optional_dependency_availability_to_version_context,
+    should_bypass_cache_for_file_backed_hdf5,
     should_bypass_cache_for_safetensors_header_limit,
     should_bypass_cache_for_unavailable_hdf5_analysis,
     should_bypass_cache_for_zip_entry_preflight,
@@ -250,6 +251,10 @@ def scan_large_file(
     if should_bypass_cache_for_safetensors_header_limit(file_path, config):
         logger.debug(f"Bypassing large-file cache for bounded SafeTensors header failure: {file_path}")
         return scanner.scan(file_path)  # type: ignore[no-any-return]
+
+    if should_bypass_cache_for_file_backed_hdf5(file_path):
+        logger.debug(f"Bypassing large-file cache for file-backed HDF5 inspection: {file_path}")
+        return _scan_large_file_internal(file_path, scanner, progress_callback, timeout)
 
     # If caching is disabled, proceed with direct scan
     if not cache_enabled:

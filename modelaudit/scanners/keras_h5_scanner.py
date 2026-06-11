@@ -529,6 +529,7 @@ class KerasH5Scanner(BaseScanner):
     _MAX_HDF5_EXTERNAL_REFERENCE_REPORTS: ClassVar[int] = 20
     _MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS: ClassVar[int] = 20
     _MAX_HDF5_VIRTUAL_SOURCE_REPORTS: ClassVar[int] = 20
+    _MAX_HDF5_VIRTUAL_SOURCE_INSPECTIONS: ClassVar[int] = _MAX_HDF5_LINK_VISITS
     _MAX_HDF5_REFERENCE_TEXT_CHARS: ClassVar[int] = 4096
     _MAX_HDF5_JSON_ATTRIBUTE_BYTES: ClassVar[int] = 10 * 1024 * 1024
     _MAX_HDF5_NAME_ATTRIBUTE_BYTES: ClassVar[int] = 10 * 1024 * 1024
@@ -1828,11 +1829,15 @@ class KerasH5Scanner(BaseScanner):
             if virtual_source_count <= 0:
                 return
 
-            sources = []
-            inspected_source_count = min(virtual_source_count, self._MAX_HDF5_VIRTUAL_SOURCE_REPORTS)
+            sources: list[dict[str, Any]] = []
+            external_source_count = 0
+            inspected_source_count = min(virtual_source_count, self._MAX_HDF5_VIRTUAL_SOURCE_INSPECTIONS)
             for index in range(inspected_source_count):
                 raw_filename = storage_properties.get_virtual_filename(index)
                 if self._is_same_file_virtual_source(raw_filename):
+                    continue
+                external_source_count += 1
+                if len(sources) >= self._MAX_HDF5_VIRTUAL_SOURCE_REPORTS:
                     continue
                 filename, filename_truncated = self._bounded_hdf5_reference_text(raw_filename)
                 dataset_name, dataset_name_truncated = self._bounded_hdf5_reference_text(
@@ -1848,7 +1853,7 @@ class KerasH5Scanner(BaseScanner):
                     source_details["path_truncated"] = True
                 sources.append(source_details)
 
-            sources_truncated = virtual_source_count > inspected_source_count
+            sources_truncated = virtual_source_count > inspected_source_count or external_source_count > len(sources)
             if sources_truncated:
                 virtual_dataset_sources_truncated = True
             if not sources:
