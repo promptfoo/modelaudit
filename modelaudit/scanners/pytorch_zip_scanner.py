@@ -21,6 +21,9 @@ from ..detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
 from ..scanner_results import (
     INCONCLUSIVE_SCAN_OUTCOME,
     MEMBER_FILE_HASHES_METADATA_KEY,
+    MEMBER_FILE_HASHES_OMITTED_METADATA_KEY,
+    MEMBER_FILE_HASHES_TOTAL_METADATA_KEY,
+    MEMBER_FILE_HASHES_TRUNCATED_METADATA_KEY,
     RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY,
     RAW_DETECTOR_FAILURES_METADATA_KEY,
     mark_inconclusive_scan_result,
@@ -1522,9 +1525,19 @@ class PyTorchZipScanner(BaseScanner):
         raw_detector_failures = result.metadata.get(RAW_DETECTOR_FAILURES_METADATA_KEY)
         raw_detector_failed_detectors = result.metadata.get(RAW_DETECTOR_FAILED_DETECTORS_METADATA_KEY)
         member_file_hashes = result.metadata.get(MEMBER_FILE_HASHES_METADATA_KEY)
+        member_file_hash_summary = {
+            key: result.metadata[key]
+            for key in (
+                MEMBER_FILE_HASHES_TOTAL_METADATA_KEY,
+                MEMBER_FILE_HASHES_TRUNCATED_METADATA_KEY,
+                MEMBER_FILE_HASHES_OMITTED_METADATA_KEY,
+            )
+            if key in result.metadata
+        }
         result.metadata = parent_metadata
         if isinstance(member_file_hashes, dict) and member_file_hashes:
             result.metadata[MEMBER_FILE_HASHES_METADATA_KEY] = member_file_hashes
+        result.metadata.update(member_file_hash_summary)
         if isinstance(raw_detector_failures, list):
             result.metadata[RAW_DETECTOR_FAILURES_METADATA_KEY] = list(raw_detector_failures)
         if isinstance(raw_detector_failed_detectors, list):

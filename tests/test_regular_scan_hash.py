@@ -16,6 +16,8 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.integrations.sbom_generator import generate_sbom_pydantic
+from modelaudit.models import AssetModel, FileHashesModel, FileMetadataModel, create_initial_audit_result
+from modelaudit.scanner_results import MAX_MEMBER_FILE_HASH_RECORDS
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from tests.helpers import write_mock_pytorch_zip_metadata
 
@@ -144,6 +146,50 @@ class TestRegularScanContentHash:
             ]["sha256"]
             == malicious_hash
         )
+
+    def test_member_hash_truncation_summary_exports_to_sarif_and_sbom(self, tmp_path: Path) -> None:
+        model_path = tmp_path / "bounded.pt"
+        model_path.write_bytes(b"outer")
+        outer_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
+        member_hash = hashlib.sha256(b"inner").hexdigest()
+        member_identity = json.dumps({"occurrence": 1, "path": ["retained.pkl"]}, sort_keys=True, separators=(",", ":"))
+        result = create_initial_audit_result()
+        result.assets = [AssetModel(path=str(model_path), type="pytorch", size=model_path.stat().st_size)]
+        result.file_metadata[str(model_path)] = FileMetadataModel(
+            file_size=model_path.stat().st_size,
+            file_hashes=FileHashesModel(sha256=outer_hash),
+            member_file_hashes={
+                member_identity: {
+                    "file_hashes": {"sha256": member_hash},
+                    "file_size": len(b"inner"),
+                    "hash_complete": True,
+                    "hash_status": "complete",
+                    "path_segments": ["retained.pkl"],
+                    "occurrence": 1,
+                }
+            },
+            member_file_hashes_total=MAX_MEMBER_FILE_HASH_RECORDS + 2,
+            member_file_hashes_truncated=True,
+            member_file_hashes_omitted=2,
+        )
+
+        sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+        artifact_properties = sarif_payload["runs"][0]["artifacts"][0]["properties"]
+        assert artifact_properties["memberFileHashesTotal"] == MAX_MEMBER_FILE_HASH_RECORDS + 2
+        assert artifact_properties["memberFileHashesTruncated"] is True
+        assert artifact_properties["memberFileHashesOmitted"] == 2
+        assert (
+            _single_member_record({"member_file_hashes": artifact_properties["memberFileHashes"]}, ["retained.pkl"])[
+                "file_hashes"
+            ]["sha256"]
+            == member_hash
+        )
+
+        sbom_payload = json.loads(generate_sbom_pydantic([str(model_path)], result))
+        component_properties = {prop["name"]: prop["value"] for prop in sbom_payload["components"][0]["properties"]}
+        assert component_properties["modelaudit:member_file_hashes_total"] == str(MAX_MEMBER_FILE_HASH_RECORDS + 2)
+        assert component_properties["modelaudit:member_file_hashes_truncated"] == "true"
+        assert component_properties["modelaudit:member_file_hashes_omitted"] == "2"
 
     def test_generic_zip_member_hash_identities_are_collision_free(self, tmp_path: Path) -> None:
         duplicate_payload = pickle.dumps({"duplicate": True})

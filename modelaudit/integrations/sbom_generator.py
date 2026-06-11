@@ -29,6 +29,34 @@ _DESCRIPTOR_WALK_SUPPORTED = (
 )
 
 
+def _sbom_property_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _append_member_file_hash_summary_properties(props: list[Property], metadata: FileMetadataModel) -> None:
+    summary_values = {
+        "modelaudit:member_file_hashes_total": metadata.member_file_hashes_total,
+        "modelaudit:member_file_hashes_truncated": metadata.member_file_hashes_truncated,
+        "modelaudit:member_file_hashes_omitted": metadata.member_file_hashes_omitted,
+    }
+    for name, value in summary_values.items():
+        if value is not None:
+            props.append(Property(name=name, value=_sbom_property_value(value)))
+
+
+def _append_member_file_hash_summary_properties_from_dict(props: list[Property], metadata: dict[str, Any]) -> None:
+    summary_values = {
+        "modelaudit:member_file_hashes_total": metadata.get("member_file_hashes_total"),
+        "modelaudit:member_file_hashes_truncated": metadata.get("member_file_hashes_truncated"),
+        "modelaudit:member_file_hashes_omitted": metadata.get("member_file_hashes_omitted"),
+    }
+    for name, value in summary_values.items():
+        if isinstance(value, (bool, int)):
+            props.append(Property(name=name, value=_sbom_property_value(value)))
+
+
 @dataclass
 class _BomRefState:
     counts: dict[str, int] = field(default_factory=dict)
@@ -644,6 +672,7 @@ def _create_metadata_properties(metadata: FileMetadataModel) -> list[Property]:
                 ),
             )
         )
+    _append_member_file_hash_summary_properties(props, metadata)
 
     # Security and compliance properties
     props.append(Property(name="security:scanned", value="true"))
@@ -815,6 +844,7 @@ def _component_for_file(
                     value=json.dumps(member_file_hashes, sort_keys=True, separators=(",", ":")),
                 )
             )
+        _append_member_file_hash_summary_properties_from_dict(props, metadata)
 
     # Security and compliance properties (added for all files)
     props.append(Property(name="security:scanned", value="true"))

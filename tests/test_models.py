@@ -705,6 +705,26 @@ def test_merge_member_result_uses_reversible_collision_free_member_identity() ->
     assert _single_member_record(parent, ["payload.pkl#2"])["file_hashes"]["sha256"] == "h" * 64
 
 
+def test_merge_member_result_preserves_occurrences_after_nested_child_private_state() -> None:
+    parent = ScanResult(scanner_name="zip")
+    parent.metadata["file_hashes"] = {"sha256": "a" * 64}
+    first_child = ScanResult(scanner_name="zip")
+    second_child = ScanResult(scanner_name="zip")
+    first_child.merge_member_result(_scan_result_with_sha256("b" * 64), "inner.pkl")
+    second_child.merge_member_result(_scan_result_with_sha256("c" * 64), "inner.pkl")
+
+    parent.merge_member_result(first_child, "archive.zip")
+    parent.merge_member_result(second_child, "archive.zip")
+
+    assert parent.metadata["file_hashes"]["sha256"] == "a" * 64
+    records = sorted(
+        _member_records_for_segments(parent, ["archive.zip", "inner.pkl"]),
+        key=lambda record: record["occurrence"],
+    )
+    assert [record["occurrence"] for record in records] == [1, 2]
+    assert [record["file_hashes"]["sha256"] for record in records] == ["b" * 64, "c" * 64]
+
+
 def test_merge_member_result_keeps_partial_and_inconclusive_hashes_child_scoped() -> None:
     parent = ScanResult(scanner_name="zip")
     parent.metadata["file_hashes"] = {"sha256": "a" * 64}

@@ -352,6 +352,14 @@ def _create_artifacts(audit_result: ModelAuditResultModel) -> list[dict[str, Any
                         for member_path, record in member_file_hashes.items()
                     }
                 )
+            member_file_hash_summary = {
+                "memberFileHashesTotal": getattr(metadata, "member_file_hashes_total", None),
+                "memberFileHashesTruncated": getattr(metadata, "member_file_hashes_truncated", None),
+                "memberFileHashesOmitted": getattr(metadata, "member_file_hashes_omitted", None),
+            }
+            for property_name, property_value in member_file_hash_summary.items():
+                if property_value is not None:
+                    artifact["properties"][property_name] = property_value
 
         artifacts.append(artifact)
 

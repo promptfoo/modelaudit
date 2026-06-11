@@ -32,6 +32,12 @@ FILE_HASHES_BYTES_HASHED_METADATA_KEY: Final[str] = "file_hashes_bytes_hashed"
 MAX_MEMBER_FILE_HASH_RECORDS: Final[int] = 4096
 _MEMBER_FILE_HASH_OCCURRENCES_PRIVATE_KEY: Final[str] = "member_file_hash_occurrences"
 _MEMBER_FILE_HASH_STORED_COUNT_PRIVATE_KEY: Final[str] = "member_file_hashes_stored_count"
+_MEMBER_FILE_HASH_PRIVATE_METADATA_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        _MEMBER_FILE_HASH_OCCURRENCES_PRIVATE_KEY,
+        _MEMBER_FILE_HASH_STORED_COUNT_PRIVATE_KEY,
+    }
+)
 _PARENT_INTEGRITY_METADATA_KEYS: Final[frozenset[str]] = frozenset(
     {
         "file_hashes",
@@ -799,6 +805,8 @@ class ScanResult:
             else:
                 self.metadata[key] = value
         for key, value in other._private_metadata.items():
+            if key in _MEMBER_FILE_HASH_PRIVATE_METADATA_KEYS:
+                continue
             if (
                 key == CALL_GRAPH_SOURCE_FINGERPRINTS_METADATA_KEY
                 and isinstance(self._private_metadata.get(key), Mapping)
