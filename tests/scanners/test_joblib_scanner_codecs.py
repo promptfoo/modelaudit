@@ -671,19 +671,60 @@ def test_scan_keeps_untrusted_numpy_dtype_origin_review_after_valid_raw_array(
     assert any(has_numpy_dtype_origin_review(finding) for finding in (*result.issues, *result.checks))
 
 
-def test_scan_preserves_unvalidated_numpy_dtype_origin_review_before_valid_raw_array(tmp_path: Path) -> None:
+def test_scan_preserves_unvalidated_numpy_dtype_origin_review_before_valid_raw_array(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     payload = _joblib_numpy_list_payload(
         leading_ops=b"cnumpy\ndtype\n0",
         resumed_ops=_binunicode("done"),
     )
+    embedded_result = ScanResult("pickle")
+    embedded_result.metadata["analysis_incomplete"] = True
+    embedded_result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    embedded_result.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
+    embedded_result.metadata["pickle_report_status"] = "inconclusive"
+    embedded_result.metadata["pickle_verdict"] = "suspicious"
+    embedded_result.metadata["import_references"] = [
+        {
+            "import_reference": "numpy.dtype",
+            "module": "numpy",
+            "name": "dtype",
+            "position": 4,
+            "requires_origin_verification": True,
+        },
+        {
+            "import_reference": "numpy.dtype",
+            "module": "numpy",
+            "name": "dtype",
+            "position": 128,
+            "requires_origin_verification": True,
+        },
+    ]
+    for position in (4, 128):
+        embedded_result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="dtype origin review",
+            severity=IssueSeverity.WARNING,
+            details={"import_reference": "numpy.dtype", "module": "numpy", "name": "dtype", "position": position},
+            rule_code="NON_ALLOWLISTED_GLOBAL",
+        )
+    embedded_result.finish(success=False)
 
-    result = _scan_payload(
-        tmp_path,
-        payload,
-        "unvalidated_numpy_dtype_origin_review.joblib",
-        trust_numpy_dtype=True,
-        picklescan_trust_numpy_dtype=False,
+    monkeypatch.setattr(
+        "modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted",
+        lambda _module, _name: True,
     )
+    scanner = JoblibScanner()
+    scanner.pickle_scanner = _StaticEmbeddedPickleScanner(embedded_result)
+    result = ScanResult("joblib", scanner=scanner)
+
+    scanner._scan_pickle_payload(
+        payload,
+        result,
+        "unvalidated_numpy_dtype_origin_review.joblib",
+    )
+    result.finish(success=not result.has_errors)
 
     assert result.success is False
     assert "trusted_incomplete_tail" not in result.metadata
