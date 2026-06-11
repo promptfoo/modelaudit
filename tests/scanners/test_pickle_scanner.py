@@ -1798,6 +1798,22 @@ def test_small_non_legacy_pickle_with_legacy_magic_bytes_is_not_inconclusive(tmp
     assert "legacy_pytorch_control_layout_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
 
 
+def test_large_pytorch_suffix_with_only_legacy_preamble_keeps_file_size_limit(tmp_path: Path) -> None:
+    partial_legacy = pickle.dumps(pickle_scanner._PYTORCH_LEGACY_MAGIC_NUMBER, protocol=2) + pickle.dumps(
+        pickle_scanner._PYTORCH_LEGACY_PROTOCOL_VERSION,
+        protocol=2,
+    )
+    path = tmp_path / "legacy-preamble-only.pt"
+    path.write_bytes(partial_legacy + (b"A" * 512))
+
+    result = PickleScanner(config={"max_file_read_size": 64}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "max_file_read_size_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert "legacy_pytorch_control_layout_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+
+
 def test_large_legacy_pytorch_truncated_storage_is_inconclusive_not_file_size(
     tmp_path: Path,
 ) -> None:
@@ -1867,12 +1883,12 @@ def test_large_non_seekable_legacy_pytorch_stream_uses_stream_budget_not_file_ca
 
 
 def test_large_non_seekable_legacy_pytorch_stream_budget_exhaustion_is_inconclusive() -> None:
-    payload, _pickle_end = _make_legacy_pytorch_container(b"A" * 512)
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 512)
 
     result = PickleScanner(
         config={
             "max_file_read_size": 64,
-            "max_known_stream_read_bytes": 160,
+            "max_known_stream_read_bytes": pickle_end,
         }
     ).scan_stream(
         NonSeekableBytesIO(payload),
@@ -1882,11 +1898,11 @@ def test_large_non_seekable_legacy_pytorch_stream_budget_exhaustion_is_inconclus
 
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "legacy_pytorch_control_layout_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "legacy_pytorch_storage_layout_incomplete" in result.metadata["scan_outcome_reasons"]
     assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
-    control_check = next(check for check in result.checks if check.name == "Legacy PyTorch Control Layout")
-    assert control_check.status == CheckStatus.FAILED
-    assert control_check.details["max_control_opcodes"] == pickle_scanner._PYTORCH_LEGACY_MAX_CONTROL_OPCODES
+    storage_check = next(check for check in result.checks if check.name == "Legacy PyTorch Storage Layout")
+    assert storage_check.status == CheckStatus.FAILED
+    assert storage_check.details["max_control_opcodes"] == pickle_scanner._PYTORCH_LEGACY_MAX_CONTROL_OPCODES
 
 
 def test_large_non_seekable_legacy_pytorch_short_read_is_inconclusive() -> None:
