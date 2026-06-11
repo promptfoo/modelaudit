@@ -31,6 +31,7 @@ from modelaudit.config import ModelAuditConfig, set_config
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.rules import Severity
+from modelaudit.scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY, SUPPRESSED_FAILED_CHECKS_METADATA_KEY
 from modelaudit.scanners import (
     archive_dispatch,
     flax_msgpack_scanner,
@@ -74,6 +75,7 @@ from tests.helpers import (
     prefix_mock_onnx_with_unknown_field,
     prefix_mock_onnx_with_unknown_group,
 )
+from tests.helpers.file_creators import valid_jpeg_bytes, valid_png_bytes
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
 
@@ -214,6 +216,25 @@ def _build_malicious_pickle(*, protocol: int | None = None) -> bytes:
     return pickle.dumps(DangerousPayload(), protocol=protocol)
 
 
+def test_scan_file_padded_media_pickle_polyglot_fails_closed(tmp_path: Path) -> None:
+    media_path = tmp_path / "padded-polyglot.png"
+    media_path.write_bytes(
+        valid_png_bytes() + (b"\0" * (file_detection.MEDIA_ROUTE_READ_BYTES + 2)) + _build_malicious_pickle()
+    )
+
+    result = scan_file(str(media_path), config={"cache_scan_results": False})
+
+    assert result.success is False
+    assert result.scanner_name == "unknown"
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(
+        check.name == "Pickle Routing"
+        and check.status == CheckStatus.FAILED
+        and check.details["format"] == file_detection.PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        for check in result.checks
+    )
+
+
 def _build_protocolless_binary_malicious_pickle() -> bytes:
     """Build a binary pickle gadget without the optional PROTO opcode."""
     return b"\x8c\x02os\x94\x8c\x06system\x94\x93\x94\x8c\x02id\x94\x85\x94R\x94."
@@ -336,6 +357,43 @@ def _write_gzip_safetensors_polyglot(
     assert json.loads(payload[8:header_end].decode("utf-8"))
     assert gzip.decompress(gzip_member) == uncompressed
     path.write_bytes(payload)
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [("preview.png", valid_png_bytes()), ("preview.jpg", valid_jpeg_bytes())],
+    ids=["png", "jpg"],
+)
+def test_scan_file_valid_media_is_unknown_not_serialized(tmp_path: Path, filename: str, payload: bytes) -> None:
+    media_path = tmp_path / filename
+    media_path.write_bytes(payload)
+
+    result = scan_file(str(media_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.issues == []
+
+
+def test_directory_scan_skips_valid_media_assets(tmp_path: Path) -> None:
+    (tmp_path / "preview.png").write_bytes(valid_png_bytes())
+    (tmp_path / "teaser.jpg").write_bytes(valid_jpeg_bytes())
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    assert result.files_scanned == 0
+    assert "pickle" not in result.scanner_names
+    assert "flax_msgpack" not in result.scanner_names
+    assert "jax_checkpoint" not in result.scanner_names
+
+
+def test_scan_file_media_pickle_polyglot_detects_system_global(tmp_path: Path) -> None:
+    media_path = tmp_path / "polyglot.png"
+    media_path.write_bytes(valid_png_bytes() + _build_malicious_pickle())
+
+    result = scan_file(str(media_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
 
 
 def _require_tf_protos() -> None:
@@ -2532,7 +2590,9 @@ def test_scan_file_hf_bookkeeping_skip_precedes_zip_preflight(
     monkeypatch.setenv("HF_HOME", str(hf_home))
     metadata_path = hf_home / "download" / "model.metadata"
     metadata_path.parent.mkdir(parents=True)
-    metadata_path.write_text("{}")
+    metadata_path.write_text(
+        "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n"
+    )
 
     def fail_zip_preflight(*_args: Any, **_kwargs: Any) -> bool:
         raise AssertionError("Hugging Face bookkeeping must be skipped before ZIP preflight")
@@ -9988,6 +10048,114 @@ def test_scan_file_routes_tail_marker_llamafile_exe(tmp_path: Path) -> None:
     assert result.scanner_name == "llamafile"
 
 
+def _create_budgeted_onnx_candidate(path: Path, *, op_type: str = "Relu") -> Path:
+    create_mock_onnx(path, op_type=op_type)
+    return prefix_mock_onnx_with_unknown_field(path, value_size=0, count=4097, field_number=8)
+
+
+def _create_truncated_tensor_onnx(path: Path) -> Path:
+    onnx = pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+
+    x_value = helper.make_tensor_value_info("input", TensorProto.FLOAT, [2])
+    y_value = helper.make_tensor_value_info("output", TensorProto.FLOAT, [2])
+    initializer = onnx.TensorProto()
+    initializer.name = "weights"
+    initializer.data_type = TensorProto.FLOAT
+    initializer.dims.extend([2])
+    initializer.raw_data = b"\x00" * 4
+    node = helper.make_node("Add", ["input", "weights"], ["output"], name="add")
+    graph = helper.make_graph([node], "graph", [x_value], [y_value], [initializer])
+    onnx.save(helper.make_model(graph), str(path))
+    return path
+
+
+def _create_future_ir_onnx_candidate(path: Path) -> Path:
+    pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+
+    x_value = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
+    y_value = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
+    node = helper.make_node("Relu", ["input"], ["output"], name="relu")
+    graph = helper.make_graph([node], "graph", [x_value], [y_value])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 999999
+    path.write_bytes(model.SerializeToString())
+    return prefix_mock_onnx_with_unknown_field(path, value_size=0, count=4097, field_number=8)
+
+
+def _create_missing_value_metadata_onnx_candidate(path: Path) -> Path:
+    onnx = pytest.importorskip("onnx")
+
+    model = onnx.ModelProto()
+    model.ir_version = 7
+    model.opset_import.add().version = 13
+    model.graph.name = "graph"
+    node = model.graph.node.add()
+    node.op_type = "Relu"
+    node.input.append("input")
+    node.output.append("output")
+    path.write_bytes(model.SerializeToString())
+    return prefix_mock_onnx_with_unknown_field(path, value_size=0, count=4097, field_number=8)
+
+
+def _create_external_data_onnx_candidate(path: Path) -> Path:
+    onnx = pytest.importorskip("onnx")
+    from onnx import StringStringEntryProto, TensorProto, helper
+
+    weights_path = path.with_name("weights.bin")
+    weights_path.write_bytes(struct.pack("ff", 1.0, 2.0))
+    x_value = helper.make_tensor_value_info("input", TensorProto.FLOAT, [2])
+    y_value = helper.make_tensor_value_info("output", TensorProto.FLOAT, [2])
+    initializer = onnx.TensorProto()
+    initializer.name = "weights"
+    initializer.data_type = TensorProto.FLOAT
+    initializer.dims.extend([2])
+    initializer.data_location = onnx.TensorProto.EXTERNAL
+    location = StringStringEntryProto()
+    location.key = "location"
+    location.value = weights_path.name
+    initializer.external_data.append(location)
+    node = helper.make_node("Add", ["input", "weights"], ["output"], name="add")
+    graph = helper.make_graph([node], "graph", [x_value], [y_value], [initializer])
+    onnx.save(helper.make_model(graph), str(path))
+    return prefix_mock_onnx_with_unknown_field(path, value_size=0, count=4097, field_number=8)
+
+
+def _format_validation_check(result: ScanResult) -> Any:
+    return next(check for check in result.checks if check.name == "Format Validation")
+
+
+def _actionable_s901_issues(result: ScanResult) -> list[Any]:
+    return [
+        issue
+        for issue in result.issues
+        if issue.rule_code == "S901" and issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+
+
+def _assert_schema_rejected_pt_onnx_keeps_s901(path: Path) -> ScanResult:
+    result = scan_file(str(path), config={"cache_enabled": False})
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert "validated_format" not in result.metadata
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "onnx_schema_validation_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "ONNX Schema Validation"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("schema_validation_reason") == "onnx_schema_validation_failed"
+        for check in result.checks
+    )
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+    assert determine_exit_code(aggregate) != 0
+    return result
+
+
 def test_scan_file_routes_misnamed_onnx_by_header(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     disguised_onnx = tmp_path / "model.payload"
@@ -9996,6 +10164,352 @@ def test_scan_file_routes_misnamed_onnx_by_header(tmp_path: Path) -> None:
     result = scan_file(str(disguised_onnx))
 
     assert result.scanner_name == "onnx"
+
+
+def test_scan_file_demotes_pt_onnx_mismatch_after_validated_alternate_format(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "model.pt")
+
+    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert result.metadata["validated_format"] == "onnx"
+    assert format_check.status == CheckStatus.FAILED
+    assert format_check.severity == IssueSeverity.INFO
+    assert format_check.rule_code is None
+    assert format_check.details == {
+        "extension_format": "pickle",
+        "header_format": PROTOBUF_MODEL_CANDIDATE_FORMAT,
+        "file_type_validation_failed": False,
+        "alternate_format_validated": True,
+        "original_file_type_validation_failed": True,
+        "validated_format": "onnx",
+    }
+    assert "Filename and content disagree" in format_check.message
+    assert _actionable_s901_issues(result) == []
+
+
+def test_scan_file_keeps_s901_for_external_data_pt_onnx(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    external_data_onnx = _create_external_data_onnx_candidate(tmp_path / "external-data.pt")
+
+    result = scan_file(str(external_data_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert "validated_format" not in result.metadata
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "onnx_schema_validation_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "External Data Reference Check"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("file") == "weights.bin"
+        for check in result.checks
+    )
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+
+
+def test_scan_file_keeps_s901_for_malicious_valid_pt_onnx(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "malicious.pt", op_type="PythonOp")
+
+    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
+
+
+def test_scan_file_keeps_s901_when_malicious_pt_onnx_finding_is_suppressed(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    rule_config = ModelAuditConfig(suppress={"S902"})
+    set_config(rule_config)
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "suppressed-malicious.pt", op_type="PythonOp")
+
+    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert not any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
+    assert ACTIONABLE_FAILED_CHECKS_METADATA_KEY not in result.metadata
+    assert SUPPRESSED_FAILED_CHECKS_METADATA_KEY not in result.metadata
+    assert {
+        "name": "Python Operator Detection",
+        "rule_code": "S902",
+        "severity": "critical",
+    } in result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY]
+    assert {
+        "name": "Python Operator Detection",
+        "rule_code": "S902",
+        "severity": "critical",
+    } in result._private_metadata[SUPPRESSED_FAILED_CHECKS_METADATA_KEY]
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+
+
+def test_scan_file_keeps_s901_when_malicious_pt_onnx_finding_is_downgraded(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    rule_config = ModelAuditConfig()
+    rule_config.severity = {"S501": Severity.INFO, "S902": Severity.INFO}
+    set_config(rule_config)
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "downgraded-malicious.pt", op_type="PythonOp")
+
+    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert ACTIONABLE_FAILED_CHECKS_METADATA_KEY not in result.metadata
+    assert {
+        "name": "JIT/Script Code Execution Detection",
+        "rule_code": "S501",
+        "severity": "critical",
+    } in result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY]
+    assert {
+        "name": "Python Operator Detection",
+        "rule_code": "S902",
+        "severity": "critical",
+    } in result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY]
+    assert all(issue.severity == IssueSeverity.INFO for issue in result.issues if issue.rule_code in {"S501", "S902"})
+    assert any(
+        issue.severity == IssueSeverity.INFO and issue.details.get("op_type") == "PythonOp" for issue in result.issues
+    )
+    assert not any(
+        issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+
+
+@pytest.mark.parametrize("rule_mode", ["suppressed", "downgraded"])
+def test_scan_file_keeps_s901_for_cached_hidden_onnx_evidence(tmp_path: Path, rule_mode: str) -> None:
+    pytest.importorskip("onnx")
+    if rule_mode == "suppressed":
+        rule_config = ModelAuditConfig(suppress={"S902"})
+    else:
+        rule_config = ModelAuditConfig()
+        rule_config.severity = {"S501": Severity.INFO, "S902": Severity.INFO}
+    set_config(rule_config)
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / f"{rule_mode}-cached-malicious.pt", op_type="PythonOp")
+    cache_dir = tmp_path / f"{rule_mode}-cache"
+    cache_config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+    reset_cache_manager()
+
+    try:
+        first_result = scan_file(str(disguised_onnx), config=cache_config)
+        second_result = scan_file(str(disguised_onnx), config=cache_config)
+        format_checks = [_format_validation_check(first_result), _format_validation_check(second_result)]
+
+        assert [result.scanner_name for result in (first_result, second_result)] == ["onnx", "onnx"]
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        assert all(format_check.severity == IssueSeverity.WARNING for format_check in format_checks)
+        assert all(format_check.rule_code == "S901" for format_check in format_checks)
+        assert all(_actionable_s901_issues(result) for result in (first_result, second_result))
+        assert all(
+            ACTIONABLE_FAILED_CHECKS_METADATA_KEY in result._private_metadata
+            for result in (first_result, second_result)
+        )
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_keeps_s901_for_truncated_pt_onnx(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    truncated_onnx = _create_truncated_tensor_onnx(tmp_path / "truncated.pt")
+    prefix_mock_onnx_with_unknown_field(truncated_onnx, value_size=0, count=4097, field_number=8)
+
+    result = scan_file(str(truncated_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert "validated_format" not in result.metadata
+    assert any(check.name == "Tensor Size Validation" and check.status == CheckStatus.FAILED for check in result.checks)
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+
+
+def test_scan_file_keeps_s901_when_truncated_onnx_integrity_check_is_suppressed(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    rule_config = ModelAuditConfig(suppress={"S703"})
+    set_config(rule_config)
+    truncated_onnx = _create_truncated_tensor_onnx(tmp_path / "suppressed-truncated.pt")
+    prefix_mock_onnx_with_unknown_field(truncated_onnx, value_size=0, count=4097, field_number=8)
+
+    result = scan_file(str(truncated_onnx), config={"cache_enabled": False})
+    aggregate = scan_model_directory_or_file(str(truncated_onnx), cache_scan_results=False)
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert "validated_format" not in result.metadata
+    assert not any(check.name == "Tensor Size Validation" for check in result.checks)
+    assert {
+        "name": "Tensor Size Validation",
+        "rule_code": "S703",
+        "severity": "info",
+    } in result._private_metadata[SUPPRESSED_FAILED_CHECKS_METADATA_KEY]
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+    assert determine_exit_code(aggregate) != 0
+
+
+def test_scan_file_keeps_s901_for_malformed_pt_onnx_candidate(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    malformed_payload = tmp_path / "malformed.pt"
+    malformed_payload.write_bytes((b"\x42\x00" * 4097) + b"\x08")
+
+    result = scan_file(str(malformed_payload), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "unknown"
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "onnx_tentative_candidate_parse_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+
+
+def test_scan_file_keeps_s901_for_checker_rejected_pt_onnx_payload(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    invalid_payload = tmp_path / "checker-rejected.pt"
+    invalid_payload.write_bytes((b"\x42\x00" * 4097) + b"\x08\x01\x3a\x00")
+
+    _assert_schema_rejected_pt_onnx_keeps_s901(invalid_payload)
+
+
+def test_scan_file_keeps_s901_when_schema_failure_is_suppressed(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    rule_config = ModelAuditConfig(suppress={"S902"})
+    set_config(rule_config)
+    invalid_payload = tmp_path / "suppressed-checker-rejected.pt"
+    invalid_payload.write_bytes((b"\x42\x00" * 4097) + b"\x08\x01\x3a\x00")
+
+    result = scan_file(str(invalid_payload), config={"cache_enabled": False})
+    aggregate = scan_model_directory_or_file(str(invalid_payload), cache_scan_results=False)
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert "validated_format" not in result.metadata
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "onnx_schema_validation_failed" in result.metadata["scan_outcome_reasons"]
+    assert not any(check.name == "ONNX Schema Validation" for check in result.checks)
+    assert {
+        "name": "ONNX Schema Validation",
+        "rule_code": "S902",
+        "severity": "info",
+    } in result._private_metadata[SUPPRESSED_FAILED_CHECKS_METADATA_KEY]
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+    assert determine_exit_code(aggregate) != 0
+
+
+def test_scan_file_keeps_s901_for_unsupported_future_ir_pt_onnx(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    future_ir = _create_future_ir_onnx_candidate(tmp_path / "future-ir.pt")
+
+    _assert_schema_rejected_pt_onnx_keeps_s901(future_ir)
+
+
+def test_scan_file_keeps_s901_for_missing_required_graph_metadata_pt_onnx(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    missing_metadata = _create_missing_value_metadata_onnx_candidate(tmp_path / "missing-metadata.pt")
+
+    _assert_schema_rejected_pt_onnx_keeps_s901(missing_metadata)
+
+
+def test_scan_file_keeps_s901_for_spoofed_pt_protobuf_prefix(tmp_path: Path) -> None:
+    spoofed_payload = tmp_path / "spoofed.pt"
+    spoofed_payload.write_bytes(b"\x08\x01" + b"onnx" + (b"\x00" * 32))
+
+    result = scan_file(str(spoofed_payload), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name != "onnx"
+    assert "validated_format" not in result.metadata
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+
+
+def test_scan_file_keeps_s901_for_onnx_pickle_polyglot_candidate(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    polyglot = _create_budgeted_onnx_candidate(tmp_path / "polyglot.pt")
+    polyglot.write_bytes(polyglot.read_bytes() + b"\x80\x04cbuiltins\neval\n(S'1+1'\ntR.")
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "unknown"
+    assert "onnx_tentative_candidate_parse_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+
+
+def test_scan_file_keeps_s901_when_onnx_dependency_unavailable_for_pt_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("onnx")
+    from modelaudit.scanners import onnx_scanner as onnx_scanner_module
+
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "dependency-unavailable.pt")
+    monkeypatch.setattr(onnx_scanner_module, "_check_onnx", lambda: False)
+
+    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "unknown"
+    assert "onnx_tentative_candidate_analysis_unavailable" in result.metadata["scan_outcome_reasons"]
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+
+
+def test_scan_file_keeps_s901_when_alternate_scan_result_is_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("onnx")
+    from modelaudit.scanners.onnx_scanner import OnnxScanner
+
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "incomplete-owner.pt")
+
+    def incomplete_scan(self: OnnxScanner, _path: str) -> ScanResult:
+        result = ScanResult(scanner_name="onnx", scanner=self)
+        result.metadata["validated_format"] = "onnx"
+        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        result.metadata["scan_outcome_reasons"] = ["onnx_structure_validation_failed"]
+        result.finish(success=False)
+        return result
+
+    monkeypatch.setattr(OnnxScanner, "scan", incomplete_scan)
+
+    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert result.success is False
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
 
 
 def test_scan_file_routes_onnx_pb_by_content(tmp_path: Path) -> None:
@@ -10587,6 +11101,28 @@ def test_scan_file_does_not_route_incidental_onnx_pb_string(tmp_path: Path) -> N
 
     assert result.scanner_name != "onnx"
     assert not any(check.name == "Python Operator Detection" for check in result.checks)
+
+
+def test_scan_directory_missing_onnx_dependency_is_operational_without_security_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "model.onnx"
+    model_path.write_bytes(b"not-a-real-onnx-model")
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+    assert result.files_scanned == 1
+    assert result.bytes_scanned == model_path.stat().st_size
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    metadata = result.file_metadata[str(model_path)]
+    assert metadata["scan_outcome"] == "inconclusive"
+    assert metadata["operational_error"] is True
+    assert metadata["operational_error_reason"] == "onnx_dependency_unavailable"
 
 
 def test_scan_file_fails_closed_when_recognized_format_scanner_is_unavailable(

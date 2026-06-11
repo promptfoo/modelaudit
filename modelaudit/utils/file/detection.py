@@ -12,8 +12,9 @@ import tarfile
 import unicodedata
 import zipfile
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from functools import lru_cache
 from io import BytesIO, StringIO
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Literal, cast
@@ -73,6 +74,8 @@ _TensorFlowProtoRoute = Literal[
     "inconclusive",
 ]
 _TensorFlowOuterHint = Literal["unknown", "tf_metagraph", "tf_savedmodel"]
+_SentencePieceModelProtoRoute = Literal["unknown", "strong", "malformed_candidate"]
+_GzipTarTrailingStatus = Literal["invalid", "nonzero"]
 _TORCH7_SIGNATURE_READ_BYTES = 4096
 _TORCH7_ASCII_HEADER_MAX_LINE_BYTES = 4096
 _LIGHTGBM_SIGNATURE_READ_BYTES = 8192
@@ -97,6 +100,65 @@ _ONNX_MODEL_FIELD_WIRE_TYPES = {
 _PROTO_GROUP_MAX_ROUTING_FIELDS = 512
 _PROTO_GROUP_MAX_ROUTING_DEPTH = 8
 _COREML_PROTO_SIGNATURE_READ_BYTES = 1024 * 1024
+_SENTENCEPIECE_MODEL_PROTO_READ_BYTES = 10 * 1024 * 1024
+_SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES = 4096
+_SENTENCEPIECE_MODEL_MAX_FIELDS = 512 * 1024
+_SENTENCEPIECE_MIN_STRONG_PIECES = 8
+_SENTENCEPIECE_MAX_PIECE_FIELDS = 16
+_SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES = 4096
+_SENTENCEPIECE_MAX_PIECE_TEXT_BYTES = 512
+_SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS = 512
+_SENTENCEPIECE_MAX_TRAINER_SPEC_MESSAGE_BYTES = 64 * 1024
+_SENTENCEPIECE_MAX_TRAINER_SPEC_TEXT_BYTES = 4096
+_SENTENCEPIECE_UNKNOWN_PIECE_TYPE = 2
+_SENTENCEPIECE_BYTE_PIECE_TYPE = 6
+_SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT = 256
+_SENTENCEPIECE_IDENTITY_TOKENS = frozenset({"<unk>", "<s>", "</s>", "<pad>", "<bos>", "<eos>"})
+_SENTENCEPIECE_BYTE_FALLBACK_RE = re.compile(r"^<0x[0-9A-Fa-f]{2}>$")
+_SENTENCEPIECE_TRAINER_SPEC_VARINT_FIELDS = frozenset(
+    {
+        3,
+        4,
+        6,
+        11,
+        12,
+        13,
+        14,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        32,
+        33,
+        34,
+        35,
+        40,
+        41,
+        42,
+        43,
+        49,
+        50,
+        52,
+    }
+)
+_SENTENCEPIECE_TRAINER_SPEC_STRING_FIELDS = frozenset({1, 2, 5, 7, 30, 31, 36, 44, 45, 46, 47, 48, 53, 54})
+_SENTENCEPIECE_TRAINER_SPEC_FIXED32_FIELDS = frozenset({10, 15, 51})
+_SENTENCEPIECE_TRAINER_SPEC_FIXED64_FIELDS: frozenset[int] = frozenset()
+_SENTENCEPIECE_NORMALIZER_SPEC_WIRE_TYPES = {
+    1: 2,
+    2: 2,
+    3: 0,
+    4: 0,
+    5: 0,
+    6: 2,
+}
 _COREML_PROTO_PREFIX_WIRE_TYPES = frozenset({0, 1, 2, 3, 5})
 _COREML_GROUP_BUDGET_EXHAUSTED: Literal["budget_exhausted"] = "budget_exhausted"
 _COREML_GROUP_INCOMPLETE: Literal["incomplete"] = "incomplete"
@@ -181,6 +243,9 @@ _TAR_USTAR_MAGIC_SIZE = 5
 _TAR_USTAR_MIN_BYTES = _TAR_USTAR_OFFSET + _TAR_USTAR_MAGIC_SIZE
 _TAR_CHECKSUM_OFFSET = 148
 _TAR_CHECKSUM_SIZE = 8
+_TAR_GZIP_POST_EOF_TRAILING_READ_BYTES = 64 * 1024
+_TAR_GZIP_DEFAULT_MAX_TRAILING_DECOMPRESSED_BYTES = 512 * 1024 * 1024
+_TAR_GZIP_DEFAULT_MAX_TRAILING_DECOMPRESSION_RATIO = 250.0
 _TAR_NUMERIC_FIELD_SLICES = (
     (100, 108),  # mode
     (108, 116),  # uid
@@ -235,6 +300,7 @@ _XML_MODEL_ROOT_FORMATS = {
 }
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
 PROTOBUF_MODEL_CANDIDATE_FORMAT = "protobuf_model_candidate"
+SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT = "sentencepiece_model_proto_inconclusive"
 JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES = 1024 * 1024
 JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES = 2 * JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES
 _JAX_JSON_CHECKPOINT_IDENTITY_KEYS = frozenset(
@@ -294,6 +360,19 @@ _FLAX_MSGPACK_PROBE_LENGTH_SIZES = {
     0xDA: (2, 0),
     0xDB: (4, 0),
 }
+VALID_MEDIA_ROUTING_FORMAT = "valid_media"
+MEDIA_ROUTE_READ_BYTES = FLAX_MSGPACK_STRUCTURE_READ_BYTES
+MEDIA_ROUTE_TAIL_READ_BYTES = 64 * 1024
+_MEDIA_ROUTE_MAX_PNG_CHUNKS = 4096
+_MEDIA_STRUCTURAL_PROOF_READ_BYTES = 10 * 1024 * 1024
+_PNG_CRC_READ_CHUNK_BYTES = 64 * 1024
+_JPEG_SCAN_READ_CHUNK_BYTES = 64 * 1024
+_MEDIA_ROUTING_SUFFIXES = frozenset({".jpeg", ".jpg", ".png"})
+_MEDIA_TRAILING_PADDING = b"\x00\t\n\r "
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_IEND_CHUNK = b"IEND"
+_PNG_IEND_TRAILER = b"\x00\x00\x00\x00IEND\xaeB`\x82"
+_JPEG_STANDALONE_MARKERS = frozenset((0x01, 0xD8, 0xD9, *range(0xD0, 0xD8)))
 MXNET_SYMBOL_SIGNATURE_READ_BYTES = 10 * 1024 * 1024
 MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT = "mxnet_symbol_routing_inconclusive"
 _UTF8_BOM = b"\xef\xbb\xbf"
@@ -1386,6 +1465,810 @@ def _skip_proto_value(data: bytes, offset: int, wire_type: int, end: int | None 
         next_offset = offset + 4
         return next_offset if next_offset <= limit else None
     return None
+
+
+@dataclass
+class _SentencePieceTrainerSpecSignals:
+    model_type: int | None = None
+    vocab_size: int | None = None
+    unk_id: int = 0
+    unk_id_explicit: bool = False
+    unk_piece: str | None = None
+    unk_piece_explicit: bool = False
+    byte_fallback: bool = False
+    byte_fallback_explicit: bool = False
+
+    @property
+    def has_core_metadata(self) -> bool:
+        return self.model_type is not None and self.vocab_size is not None
+
+    def merge_from(self, other: "_SentencePieceTrainerSpecSignals") -> None:
+        if other.model_type is not None:
+            self.model_type = other.model_type
+        if other.vocab_size is not None:
+            self.vocab_size = other.vocab_size
+        if other.unk_id_explicit:
+            self.unk_id = other.unk_id
+            self.unk_id_explicit = True
+        if other.unk_piece_explicit:
+            self.unk_piece = other.unk_piece
+            self.unk_piece_explicit = True
+        if other.byte_fallback_explicit:
+            self.byte_fallback = other.byte_fallback
+            self.byte_fallback_explicit = True
+
+
+@dataclass
+class _SentencePiecePieceProtoSignals:
+    piece_text: str | None = None
+    piece_type: int | None = None
+    decoded_text_bytes: int = 0
+
+
+def _decode_proto_int32_varint(value: int) -> int:
+    """Decode proto2 int32 values that may be sign-extended into a uint64 varint."""
+    if value >= 1 << 63:
+        value -= 1 << 64
+    return value
+
+
+def _decode_bounded_proto_string(data: bytes, start: int, end: int, *, max_bytes: int) -> str | None:
+    if end < start or end - start > max_bytes:
+        return None
+    try:
+        value = data[start:end].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not value or "\x00" in value:
+        return None
+    return value
+
+
+def _parse_sentencepiece_piece_proto(data: bytes, start: int, end: int) -> tuple[str, int | None] | None:
+    """Return the token text and optional type for one SentencePiece piece."""
+    if end - start > _SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES:
+        return None
+
+    offset = start
+    fields_seen = 0
+    piece_text: str | None = None
+    piece_type: int | None = None
+    has_score = False
+    while offset < end and fields_seen < _SENTENCEPIECE_MAX_PIECE_FIELDS:
+        tag_result = _read_proto_varint(data, offset, end)
+        if tag_result is None:
+            return None
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return None
+
+        if field_number == 1 and wire_type == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset, end)
+            if bounds is None:
+                return None
+            length, value_start, _value_end, actual_value_end = bounds
+            if length == 0 or length > _SENTENCEPIECE_MAX_PIECE_TEXT_BYTES or actual_value_end > end:
+                return None
+            piece_text = _decode_bounded_proto_string(
+                data,
+                value_start,
+                actual_value_end,
+                max_bytes=_SENTENCEPIECE_MAX_PIECE_TEXT_BYTES,
+            )
+            if piece_text is None:
+                return None
+            offset = actual_value_end
+        elif field_number == 2 and wire_type == 5:
+            fixed32_end = value_offset + 4
+            if fixed32_end > end:
+                return None
+            has_score = True
+            offset = fixed32_end
+        elif field_number == 3 and wire_type == 0:
+            type_result = _read_proto_varint(data, value_offset, end)
+            if type_result is None:
+                return None
+            piece_type, offset = type_result
+            if not 1 <= piece_type <= 6:
+                return None
+        else:
+            skipped_offset = _skip_proto_value(data, value_offset, wire_type, end)
+            if skipped_offset is None:
+                return None
+            offset = skipped_offset
+        fields_seen += 1
+
+    if offset != end or fields_seen >= _SENTENCEPIECE_MAX_PIECE_FIELDS:
+        return None
+    if piece_text is None or not has_score:
+        return None
+    return piece_text, piece_type
+
+
+def _parse_sentencepiece_trainer_spec_proto(
+    data: bytes,
+    start: int,
+    end: int,
+) -> _SentencePieceTrainerSpecSignals | None:
+    """Parse enough TrainerSpec structure to identify custom unknown-piece models."""
+    if end - start > _SENTENCEPIECE_MAX_TRAINER_SPEC_MESSAGE_BYTES:
+        return None
+
+    offset = start
+    fields_seen = 0
+    signals = _SentencePieceTrainerSpecSignals()
+    while offset < end and fields_seen < _SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS:
+        tag_result = _read_proto_varint(data, offset, end)
+        if tag_result is None:
+            return None
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return None
+
+        if field_number in _SENTENCEPIECE_TRAINER_SPEC_VARINT_FIELDS:
+            if wire_type != 0:
+                return None
+            value_result = _read_proto_varint(data, value_offset, end)
+            if value_result is None:
+                return None
+            value, offset = value_result
+            if field_number == 3 and 1 <= value <= 4:
+                signals.model_type = value
+            elif field_number == 4 and value > 0:
+                signals.vocab_size = value
+            elif field_number == 35:
+                if value not in {0, 1}:
+                    return None
+                signals.byte_fallback = bool(value)
+                signals.byte_fallback_explicit = True
+            elif field_number == 40:
+                signals.unk_id = _decode_proto_int32_varint(value)
+                signals.unk_id_explicit = True
+        elif field_number in _SENTENCEPIECE_TRAINER_SPEC_STRING_FIELDS:
+            if wire_type != 2:
+                return None
+            bounds = _read_length_delimited_proto_value(data, value_offset, end)
+            if bounds is None:
+                return None
+            _length, value_start, _sampled_value_end, actual_value_end = bounds
+            if actual_value_end > end:
+                return None
+            if field_number == 45:
+                signals.unk_piece = _decode_bounded_proto_string(
+                    data,
+                    value_start,
+                    actual_value_end,
+                    max_bytes=_SENTENCEPIECE_MAX_TRAINER_SPEC_TEXT_BYTES,
+                )
+                if signals.unk_piece is None:
+                    return None
+                signals.unk_piece_explicit = True
+            offset = actual_value_end
+        elif field_number in _SENTENCEPIECE_TRAINER_SPEC_FIXED32_FIELDS:
+            if wire_type != 5:
+                return None
+            offset = value_offset + 4
+            if offset > end:
+                return None
+        elif field_number in _SENTENCEPIECE_TRAINER_SPEC_FIXED64_FIELDS:
+            if wire_type != 1:
+                return None
+            offset = value_offset + 8
+            if offset > end:
+                return None
+        else:
+            next_offset = _skip_proto_value(data, value_offset, wire_type, end)
+            if next_offset is None:
+                return None
+            offset = next_offset
+
+        fields_seen += 1
+
+    if offset != end or fields_seen >= _SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS:
+        return None
+    return signals
+
+
+def _is_well_formed_sentencepiece_submessage(
+    data: bytes,
+    start: int,
+    end: int,
+    *,
+    expected_wire_types: dict[int, int] | None = None,
+    max_fields: int = _SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS,
+) -> bool:
+    offset = start
+    fields_seen = 0
+    while offset < end and fields_seen < max_fields:
+        tag_result = _read_proto_varint(data, offset, end)
+        if tag_result is None:
+            return False
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+        if expected_wire_types is not None and expected_wire_types.get(field_number, wire_type) != wire_type:
+            return False
+        next_offset = _skip_proto_value(data, value_offset, wire_type, end)
+        if next_offset is None:
+            return False
+        offset = next_offset
+        fields_seen += 1
+
+    return offset == end and fields_seen < max_fields
+
+
+def _is_well_formed_sentencepiece_submessage_stream(
+    stream: BinaryIO,
+    end_offset: int,
+    *,
+    expected_wire_types: dict[int, int] | None = None,
+    max_fields: int = _SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS,
+) -> bool:
+    fields_seen = 0
+    while stream.tell() < end_offset and fields_seen < max_fields:
+        tag = _read_proto_varint_stream(stream, end_offset)
+        if tag is None:
+            return False
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+        if expected_wire_types is not None and expected_wire_types.get(field_number, wire_type) != wire_type:
+            return False
+        skip_status = _skip_proto_stream_value(
+            stream,
+            wire_type,
+            end_offset,
+            field_number=field_number,
+        )
+        if skip_status is not True:
+            return False
+        fields_seen += 1
+
+    return stream.tell() == end_offset and fields_seen < max_fields
+
+
+def _is_sentencepiece_special_identity_piece(piece: str) -> bool:
+    return piece in _SENTENCEPIECE_IDENTITY_TOKENS
+
+
+def _is_sentencepiece_byte_fallback_piece(piece: str) -> bool:
+    return _SENTENCEPIECE_BYTE_FALLBACK_RE.fullmatch(piece) is not None
+
+
+def _has_strong_sentencepiece_model_proto_evidence(
+    *,
+    piece_count: int,
+    typed_piece_count: int,
+    special_identity_piece_count: int,
+    unknown_piece_count: int,
+    unknown_piece_index: int | None,
+    unknown_piece_text: str | None,
+    byte_piece_count: int,
+    byte_piece_texts: set[str],
+    malformed_byte_piece: bool,
+    trainer_spec: _SentencePieceTrainerSpecSignals | None,
+) -> bool:
+    if unknown_piece_count != 1 or unknown_piece_index is None or unknown_piece_text is None:
+        return False
+    if malformed_byte_piece:
+        return False
+    if byte_piece_count:
+        if trainer_spec is None or not trainer_spec.byte_fallback:
+            return False
+        if (
+            byte_piece_count != _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT
+            or len(byte_piece_texts) != _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT
+        ):
+            return False
+    elif trainer_spec is not None and trainer_spec.byte_fallback:
+        return False
+
+    if (
+        trainer_spec is not None
+        and trainer_spec.has_core_metadata
+        and trainer_spec.vocab_size == piece_count
+        and 0 <= trainer_spec.unk_id < piece_count
+        and trainer_spec.unk_id == unknown_piece_index
+        and (not trainer_spec.unk_piece_explicit or trainer_spec.unk_piece == unknown_piece_text)
+    ):
+        return True
+
+    if piece_count < _SENTENCEPIECE_MIN_STRONG_PIECES:
+        return False
+    return typed_piece_count >= 3 and special_identity_piece_count >= 3
+
+
+def _has_sufficient_sentencepiece_piece_scan_evidence(
+    *,
+    piece_count: int,
+    unknown_piece_count: int,
+    unknown_piece_index: int | None,
+    unknown_piece_text: str | None,
+    byte_piece_count: int,
+    byte_piece_texts: set[str],
+    malformed_byte_piece: bool,
+) -> bool:
+    if piece_count < _SENTENCEPIECE_MIN_STRONG_PIECES:
+        return False
+    if unknown_piece_count != 1 or unknown_piece_index is None or unknown_piece_text is None:
+        return False
+    if malformed_byte_piece:
+        return False
+    return not byte_piece_count or (
+        byte_piece_count == _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT
+        and len(byte_piece_texts) == _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT
+    )
+
+
+def _has_strong_sentencepiece_model_proto_prefix(data: bytes, *, sample_is_prefix: bool = False) -> bool:
+    """Recognize a SentencePiece ModelProto from repeated scored pieces."""
+    offset = 0
+    fields_seen = 0
+    piece_count = 0
+    typed_piece_count = 0
+    special_identity_piece_count = 0
+    unknown_piece_count = 0
+    unknown_piece_index: int | None = None
+    unknown_piece_text: str | None = None
+    byte_piece_count = 0
+    byte_piece_texts: set[str] = set()
+    malformed_byte_piece = False
+    trainer_spec: _SentencePieceTrainerSpecSignals | None = None
+    strong_match = False
+
+    def accept_incomplete_prefix() -> bool:
+        return False
+
+    while offset < len(data) and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            return accept_incomplete_prefix()
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+        if wire_type not in {0, 1, 2, 5}:
+            return False
+        if field_number in {1, 2, 3, 4, 5} and wire_type != 2:
+            return False
+
+        if field_number == 1:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return accept_incomplete_prefix()
+            length, value_start, _sampled_value_end, actual_value_end = bounds
+            if length == 0 or actual_value_end > len(data):
+                return accept_incomplete_prefix()
+            parsed_piece = _parse_sentencepiece_piece_proto(data, value_start, actual_value_end)
+            if parsed_piece is None:
+                return False
+            piece, piece_type = parsed_piece
+            piece_index = piece_count
+            piece_count += 1
+            if piece_type is not None:
+                typed_piece_count += 1
+            if _is_sentencepiece_special_identity_piece(piece):
+                special_identity_piece_count += 1
+            if piece_type == _SENTENCEPIECE_UNKNOWN_PIECE_TYPE:
+                unknown_piece_count += 1
+                unknown_piece_index = piece_index
+                unknown_piece_text = piece
+            elif piece_type == _SENTENCEPIECE_BYTE_PIECE_TYPE:
+                byte_piece_count += 1
+                if _is_sentencepiece_byte_fallback_piece(piece):
+                    byte_piece_texts.add(piece)
+                else:
+                    malformed_byte_piece = True
+            offset = actual_value_end
+        elif field_number == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return accept_incomplete_prefix()
+            _length, value_start, _sampled_value_end, actual_value_end = bounds
+            if actual_value_end > len(data):
+                return accept_incomplete_prefix()
+            parsed_trainer_spec = _parse_sentencepiece_trainer_spec_proto(data, value_start, actual_value_end)
+            if parsed_trainer_spec is None:
+                return False
+            if trainer_spec is None:
+                trainer_spec = parsed_trainer_spec
+            else:
+                trainer_spec.merge_from(parsed_trainer_spec)
+            offset = actual_value_end
+        elif field_number == 3:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return accept_incomplete_prefix()
+            _length, value_start, _sampled_value_end, actual_value_end = bounds
+            if actual_value_end > len(data):
+                return accept_incomplete_prefix()
+            if not _is_well_formed_sentencepiece_submessage(
+                data,
+                value_start,
+                actual_value_end,
+                expected_wire_types=_SENTENCEPIECE_NORMALIZER_SPEC_WIRE_TYPES,
+            ):
+                return False
+            offset = actual_value_end
+        elif field_number in {4, 5}:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return accept_incomplete_prefix()
+            _length, value_start, _sampled_value_end, actual_value_end = bounds
+            if actual_value_end > len(data):
+                return accept_incomplete_prefix()
+            if not _is_well_formed_sentencepiece_submessage(data, value_start, actual_value_end):
+                return False
+            offset = actual_value_end
+        else:
+            return False
+
+        fields_seen += 1
+        strong_match = _has_strong_sentencepiece_model_proto_evidence(
+            piece_count=piece_count,
+            typed_piece_count=typed_piece_count,
+            special_identity_piece_count=special_identity_piece_count,
+            unknown_piece_count=unknown_piece_count,
+            unknown_piece_index=unknown_piece_index,
+            unknown_piece_text=unknown_piece_text,
+            byte_piece_count=byte_piece_count,
+            byte_piece_texts=byte_piece_texts,
+            malformed_byte_piece=malformed_byte_piece,
+            trainer_spec=trainer_spec,
+        )
+
+    return (
+        strong_match and not sample_is_prefix and offset == len(data) and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS
+    )
+
+
+def _read_bounded_sentencepiece_submessage(stream: BinaryIO, value_end: int, *, max_bytes: int) -> bytes | None:
+    length = value_end - stream.tell()
+    if length < 0 or length > max_bytes:
+        return None
+    payload = stream.read(length)
+    return payload if len(payload) == length else None
+
+
+def _parse_sentencepiece_piece_proto_stream(
+    stream: BinaryIO,
+    value_end: int,
+    *,
+    decode_text: bool,
+    max_decoded_text_bytes: int,
+) -> _SentencePiecePieceProtoSignals | None:
+    """Validate one piece submessage while avoiding unnecessary text reads."""
+    if value_end - stream.tell() > _SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES:
+        return None
+
+    fields_seen = 0
+    text_bounds: tuple[int, int] | None = None
+    piece_type: int | None = None
+    has_score = False
+    while stream.tell() < value_end and fields_seen < _SENTENCEPIECE_MAX_PIECE_FIELDS:
+        tag = _read_proto_varint_stream(stream, value_end)
+        if tag is None:
+            return None
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return None
+
+        if field_number == 1 and wire_type == 2:
+            bounds = _read_proto_length_delimited_bounds_stream(stream, value_end)
+            if bounds is None:
+                return None
+            length, value_start, actual_value_end = bounds
+            if length == 0 or length > _SENTENCEPIECE_MAX_PIECE_TEXT_BYTES:
+                return None
+            text_bounds = (value_start, actual_value_end)
+            stream.seek(actual_value_end)
+        elif field_number == 2 and wire_type == 5:
+            fixed32_end = stream.tell() + 4
+            if fixed32_end > value_end:
+                return None
+            has_score = True
+            stream.seek(fixed32_end)
+        elif field_number == 3 and wire_type == 0:
+            parsed_type = _read_proto_varint_stream(stream, value_end)
+            if parsed_type is None or not 1 <= parsed_type <= 6:
+                return None
+            piece_type = parsed_type
+        else:
+            skip_status = _skip_proto_stream_value(
+                stream,
+                wire_type,
+                value_end,
+                field_number=field_number,
+            )
+            if skip_status is not True:
+                return None
+        fields_seen += 1
+
+    if stream.tell() != value_end or fields_seen >= _SENTENCEPIECE_MAX_PIECE_FIELDS:
+        return None
+    if text_bounds is None or not has_score:
+        return None
+
+    should_decode_text = decode_text or piece_type in {
+        _SENTENCEPIECE_UNKNOWN_PIECE_TYPE,
+        _SENTENCEPIECE_BYTE_PIECE_TYPE,
+        3,
+        4,
+        5,
+    }
+    if not should_decode_text:
+        return _SentencePiecePieceProtoSignals(piece_type=piece_type)
+
+    text_start, text_end = text_bounds
+    text_length = text_end - text_start
+    if text_length > max_decoded_text_bytes:
+        return None
+    stream.seek(text_start)
+    payload = stream.read(text_length)
+    if len(payload) != text_length:
+        return None
+    stream.seek(value_end)
+    piece_text = _decode_bounded_proto_string(
+        payload,
+        0,
+        len(payload),
+        max_bytes=_SENTENCEPIECE_MAX_PIECE_TEXT_BYTES,
+    )
+    if piece_text is None:
+        return None
+    return _SentencePiecePieceProtoSignals(
+        piece_text=piece_text,
+        piece_type=piece_type,
+        decoded_text_bytes=text_length,
+    )
+
+
+def _parse_sentencepiece_trainer_spec_proto_stream(
+    stream: BinaryIO,
+    value_end: int,
+) -> _SentencePieceTrainerSpecSignals | None:
+    payload = _read_bounded_sentencepiece_submessage(
+        stream,
+        value_end,
+        max_bytes=_SENTENCEPIECE_MAX_TRAINER_SPEC_MESSAGE_BYTES,
+    )
+    if payload is None:
+        return None
+    return _parse_sentencepiece_trainer_spec_proto(payload, 0, len(payload))
+
+
+def _classify_sentencepiece_model_proto_stream(
+    stream: BinaryIO,
+    file_size: int,
+    *,
+    max_decoded_piece_text_bytes: int = _SENTENCEPIECE_MODEL_PROTO_READ_BYTES,
+) -> _SentencePieceModelProtoRoute:
+    offset = 0
+    fields_seen = 0
+    piece_count = 0
+    typed_piece_count = 0
+    special_identity_piece_count = 0
+    unknown_piece_count = 0
+    unknown_piece_index: int | None = None
+    unknown_piece_text: str | None = None
+    byte_piece_count = 0
+    byte_piece_texts: set[str] = set()
+    malformed_byte_piece = False
+    trainer_spec: _SentencePieceTrainerSpecSignals | None = None
+    strong_match = False
+    decoded_piece_text_bytes = 0
+
+    def reject_candidate() -> _SentencePieceModelProtoRoute:
+        return "malformed_candidate" if piece_count else "unknown"
+
+    while offset < file_size and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS:
+        tag = _read_proto_varint_stream(stream, file_size)
+        if tag is None:
+            return reject_candidate()
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return reject_candidate()
+
+        if field_number == 1:
+            if wire_type != 2:
+                return reject_candidate()
+            bounds = _read_proto_length_delimited_bounds_stream(stream, file_size)
+            if bounds is None:
+                return reject_candidate()
+            _length, _value_start, actual_value_end = bounds
+            decode_piece_text = not _has_sufficient_sentencepiece_piece_scan_evidence(
+                piece_count=piece_count,
+                unknown_piece_count=unknown_piece_count,
+                unknown_piece_index=unknown_piece_index,
+                unknown_piece_text=unknown_piece_text,
+                byte_piece_count=byte_piece_count,
+                byte_piece_texts=byte_piece_texts,
+                malformed_byte_piece=malformed_byte_piece,
+            )
+            parsed_piece = _parse_sentencepiece_piece_proto_stream(
+                stream,
+                actual_value_end,
+                decode_text=decode_piece_text,
+                max_decoded_text_bytes=max_decoded_piece_text_bytes - decoded_piece_text_bytes,
+            )
+            if parsed_piece is None:
+                return reject_candidate()
+            decoded_piece_text_bytes += parsed_piece.decoded_text_bytes
+            piece = parsed_piece.piece_text
+            piece_type = parsed_piece.piece_type
+            piece_index = piece_count
+            piece_count += 1
+            if piece_type is not None:
+                typed_piece_count += 1
+            if piece is not None and _is_sentencepiece_special_identity_piece(piece):
+                special_identity_piece_count += 1
+            if piece_type is not None:
+                if piece_type == _SENTENCEPIECE_UNKNOWN_PIECE_TYPE:
+                    if piece is None:
+                        return reject_candidate()
+                    unknown_piece_count += 1
+                    unknown_piece_index = piece_index
+                    unknown_piece_text = piece
+                elif piece_type == _SENTENCEPIECE_BYTE_PIECE_TYPE:
+                    if piece is None:
+                        return reject_candidate()
+                    byte_piece_count += 1
+                    if _is_sentencepiece_byte_fallback_piece(piece):
+                        byte_piece_texts.add(piece)
+                    else:
+                        malformed_byte_piece = True
+            stream.seek(actual_value_end)
+            offset = actual_value_end
+        elif field_number == 2:
+            if wire_type != 2:
+                return reject_candidate()
+            bounds = _read_proto_length_delimited_bounds_stream(stream, file_size)
+            if bounds is None:
+                return reject_candidate()
+            _length, _value_start, actual_value_end = bounds
+            parsed_trainer_spec = _parse_sentencepiece_trainer_spec_proto_stream(stream, actual_value_end)
+            if parsed_trainer_spec is None:
+                return reject_candidate()
+            if trainer_spec is None:
+                trainer_spec = parsed_trainer_spec
+            else:
+                trainer_spec.merge_from(parsed_trainer_spec)
+            stream.seek(actual_value_end)
+            offset = actual_value_end
+        elif field_number == 3:
+            if wire_type != 2:
+                return reject_candidate()
+            bounds = _read_proto_length_delimited_bounds_stream(stream, file_size)
+            if bounds is None:
+                return reject_candidate()
+            _length, _value_start, actual_value_end = bounds
+            if not _is_well_formed_sentencepiece_submessage_stream(
+                stream,
+                actual_value_end,
+                expected_wire_types=_SENTENCEPIECE_NORMALIZER_SPEC_WIRE_TYPES,
+            ):
+                return reject_candidate()
+            stream.seek(actual_value_end)
+            offset = actual_value_end
+        elif field_number in {4, 5}:
+            if wire_type != 2:
+                return reject_candidate()
+            bounds = _read_proto_length_delimited_bounds_stream(stream, file_size)
+            if bounds is None:
+                return reject_candidate()
+            _length, _value_start, actual_value_end = bounds
+            if not _is_well_formed_sentencepiece_submessage_stream(stream, actual_value_end):
+                return reject_candidate()
+            stream.seek(actual_value_end)
+            offset = actual_value_end
+        else:
+            return reject_candidate()
+
+        fields_seen += 1
+        strong_match = _has_strong_sentencepiece_model_proto_evidence(
+            piece_count=piece_count,
+            typed_piece_count=typed_piece_count,
+            special_identity_piece_count=special_identity_piece_count,
+            unknown_piece_count=unknown_piece_count,
+            unknown_piece_index=unknown_piece_index,
+            unknown_piece_text=unknown_piece_text,
+            byte_piece_count=byte_piece_count,
+            byte_piece_texts=byte_piece_texts,
+            malformed_byte_piece=malformed_byte_piece,
+            trainer_spec=trainer_spec,
+        )
+
+    if strong_match and stream.tell() == file_size and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS:
+        return "strong"
+    return "malformed_candidate" if piece_count else "unknown"
+
+
+@lru_cache(maxsize=1024)
+def _classify_sentencepiece_model_proto_file_cached(
+    path: str,
+    size: int,
+    mtime_ns: int,
+    ctime_ns: int,
+    fingerprint_head: bytes,
+    fingerprint_tail: bytes,
+) -> _SentencePieceModelProtoRoute:
+    del mtime_ns, ctime_ns, fingerprint_head, fingerprint_tail
+    file_path = Path(path)
+    try:
+        with file_path.open("rb") as handle:
+            if size <= _SENTENCEPIECE_MODEL_PROTO_READ_BYTES:
+                payload = handle.read(size)
+                if len(payload) != size:
+                    return "unknown"
+                return _classify_sentencepiece_model_proto_stream(BytesIO(payload), size)
+            return _classify_sentencepiece_model_proto_stream(
+                handle,
+                size,
+                max_decoded_piece_text_bytes=_SENTENCEPIECE_MODEL_PROTO_READ_BYTES,
+            )
+    except OSError:
+        return "unknown"
+
+
+def _sentencepiece_model_proto_cache_fingerprint(file_path: Path, size: int) -> tuple[bytes, bytes]:
+    try:
+        with file_path.open("rb") as handle:
+            head = handle.read(min(size, _SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES))
+            if size <= _SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES:
+                return head, b""
+            handle.seek(max(size - _SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES, 0))
+            tail = handle.read(_SENTENCEPIECE_MODEL_PROTO_CACHE_FINGERPRINT_BYTES)
+            return head, tail
+    except OSError:
+        return b"", b""
+
+
+def _classify_sentencepiece_model_proto_file(path: str | Path) -> _SentencePieceModelProtoRoute:
+    file_path = Path(path)
+    try:
+        if not file_path.is_file():
+            return "unknown"
+        stat = file_path.stat()
+        if stat.st_size < 32:
+            return "unknown"
+        fingerprint_head, fingerprint_tail = _sentencepiece_model_proto_cache_fingerprint(file_path, stat.st_size)
+        return _classify_sentencepiece_model_proto_file_cached(
+            str(file_path.resolve()),
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+            fingerprint_head,
+            fingerprint_tail,
+        )
+    except OSError:
+        return "unknown"
+
+
+def _is_malformed_sentencepiece_model_proto_candidate_file(path: str | Path) -> bool:
+    return _classify_sentencepiece_model_proto_file(path) == "malformed_candidate"
+
+
+def _should_fail_closed_malformed_sentencepiece_model_proto_file(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in {"", ".proto"} and _is_malformed_sentencepiece_model_proto_candidate_file(path)
+
+
+def _should_treat_sentencepiece_model_proto_file_as_unknown(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in {".model", ".proto"} and is_sentencepiece_model_proto_file(path)
+
+
+def is_sentencepiece_model_proto_file(path: str | Path) -> bool:
+    """Return True for strongly identified SentencePiece tokenizer ModelProto files."""
+    return _classify_sentencepiece_model_proto_file(path) == "strong"
 
 
 def _skip_coreml_proto_group(
@@ -3801,6 +4684,103 @@ def _resolve_tar_hardlink_fallback_member(
     return None
 
 
+def _normalize_positive_int(value: Any, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return default
+    return normalized if normalized > 0 else default
+
+
+def _normalize_positive_float(value: Any, default: float) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError):
+        return default
+    return normalized if normalized > 0 else default
+
+
+def _gzip_tar_trailing_data_status(
+    path: Path,
+    *,
+    max_decompressed_bytes: int | None = None,
+    max_decompression_ratio: float | None = None,
+) -> _GzipTarTrailingStatus | None:
+    """Return proven gzip TAR stream-tail status after the TAR EOF padding."""
+    decompressed_limit = _normalize_positive_int(
+        max_decompressed_bytes,
+        _TAR_GZIP_DEFAULT_MAX_TRAILING_DECOMPRESSED_BYTES,
+    )
+    ratio_limit = _normalize_positive_float(
+        max_decompression_ratio,
+        _TAR_GZIP_DEFAULT_MAX_TRAILING_DECOMPRESSION_RATIO,
+    )
+    try:
+        compressed_size = path.stat().st_size
+        with path.open("rb") as raw:
+            if raw.read(len(_GZIP_MAGIC)) != _GZIP_MAGIC:
+                return None
+            try:
+                is_tar = tarfile.is_tarfile(path)
+            except (EOFError, tarfile.TarError):
+                return None
+            if not is_tar:
+                return None
+            raw.seek(0)
+            with tarfile.open(fileobj=raw, mode="r:gz") as archive:
+                archive.getmembers()
+                trailing_size = 0
+                while True:
+                    trailing = archive.fileobj.read(_TAR_GZIP_POST_EOF_TRAILING_READ_BYTES)
+                    if not trailing:
+                        return None
+                    if any(byte != 0 for byte in trailing):
+                        return "nonzero"
+
+                    trailing_size += len(trailing)
+                    if trailing_size > decompressed_limit:
+                        return "invalid"
+                    if compressed_size > 0 and trailing_size / compressed_size > ratio_limit:
+                        return "invalid"
+    except (EOFError, OSError, tarfile.TarError, zlib.error):
+        return "invalid"
+
+
+def has_gzip_tar_nonzero_trailing_data(
+    path: str,
+    *,
+    max_decompressed_bytes: int | None = None,
+    max_decompression_ratio: float | None = None,
+) -> bool:
+    """Return whether a gzip TAR has non-zero trailing data after archive EOF."""
+    return (
+        gzip_tar_trailing_data_status(
+            path,
+            max_decompressed_bytes=max_decompressed_bytes,
+            max_decompression_ratio=max_decompression_ratio,
+        )
+        == "nonzero"
+    )
+
+
+def gzip_tar_trailing_data_status(
+    path: str,
+    *,
+    max_decompressed_bytes: int | None = None,
+    max_decompression_ratio: float | None = None,
+) -> _GzipTarTrailingStatus | None:
+    """Return proven gzip TAR stream-tail status after archive EOF."""
+    return _gzip_tar_trailing_data_status(
+        Path(path),
+        max_decompressed_bytes=max_decompressed_bytes,
+        max_decompression_ratio=max_decompression_ratio,
+    )
+
+
 def _detect_tar_route(path: str) -> str | None:
     """Return the safe content route for a valid TAR-backed artifact."""
     file_path = Path(path)
@@ -3953,7 +4933,10 @@ def is_nemo_archive(path: str) -> bool:
 def _is_tar_archive(path: str) -> bool:
     """Return whether a path is a TAR archive, including compressed wrappers."""
     try:
-        return tarfile.is_tarfile(path)
+        if not tarfile.is_tarfile(path):
+            return False
+        file_path = Path(path)
+        return _gzip_tar_trailing_data_status(file_path) is None
     except Exception:
         return False
 
@@ -5463,6 +6446,417 @@ def _preserve_inconclusive_protobuf_model_routing(file_path: Path, file_size: in
     )
 
 
+def _detect_media_pickle_polyglot_route(trailing: bytes, *, sample_is_prefix: bool) -> str | None:
+    """Return a pickle route only for strong serialized bytes after valid media."""
+    candidate = trailing.lstrip(_MEDIA_TRAILING_PADDING)
+    if not candidate:
+        return None
+    if _looks_like_binary_pickle_protocol(candidate[:4]):
+        if _has_bounded_binary_pickle_security_signal(candidate):
+            return "pickle"
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT if sample_is_prefix else None
+    protocol_less_state = _classify_protocolless_binary_pickle_security_signal(
+        candidate,
+        sample_is_prefix=sample_is_prefix,
+    )
+    if protocol_less_state is True:
+        return "pickle"
+    if protocol_less_state is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    if _looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=sample_is_prefix):
+        return "pickle"
+    return None
+
+
+def _find_bounded_png_end(sample: bytes) -> int | None:
+    """Return the first byte after a complete bounded PNG stream."""
+    if not sample.startswith(_PNG_SIGNATURE):
+        return None
+
+    offset = len(_PNG_SIGNATURE)
+    saw_ihdr = False
+    while offset + 12 <= len(sample):
+        chunk_length = int.from_bytes(sample[offset : offset + 4], "big")
+        chunk_type = sample[offset + 4 : offset + 8]
+        chunk_end = offset + 12 + chunk_length
+        if chunk_end > len(sample):
+            return None
+        if not saw_ihdr:
+            if chunk_type != b"IHDR" or chunk_length != 13:
+                return None
+            saw_ihdr = True
+        elif chunk_type == b"IHDR":
+            return None
+        chunk_payload_start = offset + 8
+        chunk_payload_end = chunk_payload_start + chunk_length
+        expected_crc = int.from_bytes(sample[chunk_payload_end:chunk_end], "big")
+        actual_crc = zlib.crc32(chunk_type + sample[chunk_payload_start:chunk_payload_end]) & 0xFFFFFFFF
+        if actual_crc != expected_crc:
+            return None
+        if chunk_type == _PNG_IEND_CHUNK:
+            return chunk_end if chunk_length == 0 else None
+        offset = chunk_end
+    return None
+
+
+def _png_chunk_crc_matches_with_reader(
+    chunk_type: bytes,
+    chunk_length: int,
+    payload_offset: int,
+    read_at: Callable[[int, int], bytes],
+) -> bool:
+    checksum = zlib.crc32(chunk_type)
+    remaining = chunk_length
+    offset = payload_offset
+    while remaining > 0:
+        read_size = min(remaining, _PNG_CRC_READ_CHUNK_BYTES)
+        payload = read_at(offset, read_size)
+        if len(payload) != read_size:
+            return False
+        checksum = zlib.crc32(payload, checksum)
+        offset += read_size
+        remaining -= read_size
+    expected_crc = read_at(payload_offset + chunk_length, 4)
+    if len(expected_crc) != 4:
+        return False
+    return (checksum & 0xFFFFFFFF) == int.from_bytes(expected_crc, "big")
+
+
+def _find_png_end_with_reader(file_size: int, read_at: Callable[[int, int], bytes]) -> int | None:
+    """Return the first byte after a complete PNG stream using sparse bounded reads."""
+    if file_size < len(_PNG_SIGNATURE) + 12:
+        return None
+    try:
+        if read_at(0, len(_PNG_SIGNATURE)) != _PNG_SIGNATURE:
+            return None
+
+        offset = len(_PNG_SIGNATURE)
+        saw_ihdr = False
+        crc_bytes_checked = 0
+        for _ in range(_MEDIA_ROUTE_MAX_PNG_CHUNKS):
+            if offset + 8 > file_size:
+                return None
+            chunk_header = read_at(offset, 8)
+            if len(chunk_header) != 8:
+                return None
+            chunk_length = int.from_bytes(chunk_header[:4], "big")
+            chunk_type = chunk_header[4:8]
+            chunk_end = offset + 12 + chunk_length
+            if chunk_end > file_size:
+                return None
+            if not saw_ihdr:
+                if chunk_type != b"IHDR" or chunk_length != 13:
+                    return None
+                saw_ihdr = True
+            elif chunk_type == b"IHDR":
+                return None
+            crc_proof_bytes = chunk_length + 4
+            if crc_bytes_checked + crc_proof_bytes > _MEDIA_STRUCTURAL_PROOF_READ_BYTES:
+                return None
+            if not _png_chunk_crc_matches_with_reader(chunk_type, chunk_length, offset + 8, read_at):
+                return None
+            crc_bytes_checked += crc_proof_bytes
+            if chunk_type == _PNG_IEND_CHUNK:
+                return chunk_end if chunk_length == 0 else None
+            offset = chunk_end
+    except OSError:
+        return None
+    return None
+
+
+def _find_jpeg_end_with_reader(file_size: int, read_at: Callable[[int, int], bytes]) -> int | None:
+    """Return the first byte after a complete JPEG stream using bounded reads."""
+    if file_size < 4:
+        return None
+
+    def read_exact(offset: int, size: int) -> bytes:
+        data = read_limited(offset, size)
+        if len(data) != size:
+            raise OSError("short JPEG read")
+        return data
+
+    bytes_requested = 0
+
+    def read_limited(offset: int, size: int) -> bytes:
+        nonlocal bytes_requested
+        if size <= 0:
+            return b""
+        if bytes_requested + size > _MEDIA_STRUCTURAL_PROOF_READ_BYTES:
+            raise OSError("bounded JPEG proof exceeded")
+        data = read_at(offset, size)
+        bytes_requested += size
+        return data
+
+    try:
+        if read_exact(0, 2) != b"\xff\xd8":
+            return None
+
+        offset = 2
+        while offset < file_size:
+            if read_exact(offset, 1) != b"\xff":
+                return None
+            while offset < file_size and read_exact(offset, 1) == b"\xff":
+                offset += 1
+            if offset >= file_size:
+                return None
+            marker = read_exact(offset, 1)[0]
+            offset += 1
+            if marker == 0x00:
+                return None
+            if marker == 0xD9:
+                return offset
+            if marker in _JPEG_STANDALONE_MARKERS:
+                continue
+            if offset + 2 > file_size:
+                return None
+            segment_length = int.from_bytes(read_exact(offset, 2), "big")
+            if segment_length < 2:
+                return None
+            segment_end = offset + segment_length
+            if segment_end > file_size:
+                return None
+            if marker != 0xDA:
+                offset = segment_end
+                continue
+
+            offset = segment_end
+            while offset < file_size:
+                chunk = read_limited(offset, min(_JPEG_SCAN_READ_CHUNK_BYTES, file_size - offset))
+                if not chunk:
+                    return None
+                index = 0
+                advanced_to_next_chunk = False
+                while True:
+                    marker_index = chunk.find(b"\xff", index)
+                    if marker_index < 0:
+                        offset += len(chunk)
+                        advanced_to_next_chunk = True
+                        break
+                    marker_offset = offset + marker_index
+                    if marker_offset + 1 >= file_size:
+                        return None
+                    marker = read_exact(marker_offset + 1, 1)[0]
+                    if marker == 0x00 or 0xD0 <= marker <= 0xD7:
+                        next_index = marker_index + 2
+                        if next_index >= len(chunk):
+                            offset = marker_offset + 2
+                            advanced_to_next_chunk = True
+                            break
+                        index = next_index
+                        continue
+                    if marker == 0xD9:
+                        return marker_offset + 2
+                    if marker == 0xFF:
+                        next_index = marker_index + 1
+                        if next_index >= len(chunk):
+                            offset = marker_offset + 1
+                            advanced_to_next_chunk = True
+                            break
+                        index = next_index
+                        continue
+                    offset = marker_offset
+                    break
+                if not advanced_to_next_chunk:
+                    break
+    except OSError:
+        return None
+    return None
+
+
+def _find_bounded_jpeg_end(sample: bytes) -> int | None:
+    """Return the first byte after a complete bounded JPEG stream."""
+    if not sample.startswith(b"\xff\xd8"):
+        return None
+
+    offset = 2
+    while offset < len(sample):
+        if sample[offset] != 0xFF:
+            return None
+        while offset < len(sample) and sample[offset] == 0xFF:
+            offset += 1
+        if offset >= len(sample):
+            return None
+        marker = sample[offset]
+        offset += 1
+        if marker == 0x00:
+            return None
+        if marker == 0xD9:
+            return offset
+        if marker in _JPEG_STANDALONE_MARKERS:
+            continue
+        if offset + 2 > len(sample):
+            return None
+        segment_length = int.from_bytes(sample[offset : offset + 2], "big")
+        if segment_length < 2:
+            return None
+        segment_end = offset + segment_length
+        if segment_end > len(sample):
+            return None
+        if marker != 0xDA:
+            offset = segment_end
+            continue
+
+        offset = segment_end
+        while offset < len(sample):
+            marker_offset = sample.find(b"\xff", offset)
+            if marker_offset < 0 or marker_offset + 1 >= len(sample):
+                return None
+            marker = sample[marker_offset + 1]
+            if marker == 0x00 or 0xD0 <= marker <= 0xD7:
+                offset = marker_offset + 2
+                continue
+            if marker == 0xD9:
+                return marker_offset + 2
+            if marker == 0xFF:
+                offset = marker_offset + 1
+                continue
+            offset = marker_offset
+            break
+    return None
+
+
+def _detect_complete_media_route_from_trailing(trailing: bytes, *, sample_is_prefix: bool) -> str | None:
+    """Classify bytes after a complete media stream."""
+    pickle_route = _detect_media_pickle_polyglot_route(trailing, sample_is_prefix=sample_is_prefix)
+    if pickle_route is not None:
+        return pickle_route
+    if sample_is_prefix or trailing.lstrip(_MEDIA_TRAILING_PADDING):
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    return VALID_MEDIA_ROUTING_FORMAT
+
+
+def _could_start_bounded_media_route(file_path: Path, sample: bytes) -> bool:
+    """Return whether bounded bytes plausibly begin a supported media stream."""
+    if file_path.suffix.lower() not in _MEDIA_ROUTING_SUFFIXES:
+        return False
+    if sample.startswith(_PNG_SIGNATURE):
+        return (
+            len(sample) >= len(_PNG_SIGNATURE) + 8
+            and sample[len(_PNG_SIGNATURE) : len(_PNG_SIGNATURE) + 8] == b"\x00\x00\x00\rIHDR"
+        )
+    if len(sample) < 3 or not sample.startswith(b"\xff\xd8") or sample[2] != 0xFF:
+        return False
+    marker_offset = 2
+    while marker_offset < len(sample) and sample[marker_offset] == 0xFF:
+        marker_offset += 1
+    return marker_offset >= len(sample) or sample[marker_offset] != 0x00
+
+
+def _detect_bounded_media_route_from_sample(
+    file_path: Path,
+    sample: bytes,
+    *,
+    sample_is_prefix: bool,
+) -> str | None:
+    """Return clean-media or strong media/pickle polyglot routing evidence."""
+    if not _could_start_bounded_media_route(file_path, sample):
+        return None
+    if sample.startswith(_PNG_SIGNATURE):
+        media_end = _find_bounded_png_end(sample)
+    elif sample.startswith(b"\xff\xd8"):
+        media_end = _find_bounded_jpeg_end(sample)
+    else:
+        return None
+    if media_end is None:
+        return None
+    return _detect_complete_media_route_from_trailing(sample[media_end:], sample_is_prefix=sample_is_prefix)
+
+
+def _detect_bounded_media_route_from_edges(file_path: Path, prefix: bytes, tail: bytes) -> str | None:
+    """Return bounded media routing evidence from remote head and tail probes."""
+    if not prefix or not tail or not _could_start_bounded_media_route(file_path, prefix):
+        return None
+
+    prefix_route = _detect_bounded_media_route_from_sample(file_path, prefix, sample_is_prefix=tail != prefix)
+    if prefix_route is not None:
+        return prefix_route
+
+    if prefix.startswith(_PNG_SIGNATURE):
+        media_end = tail.find(_PNG_IEND_TRAILER)
+        if media_end < 0:
+            return None
+        media_end += len(_PNG_IEND_TRAILER)
+    elif prefix.startswith(b"\xff\xd8"):
+        media_end = tail.find(b"\xff\xd9")
+        if media_end < 0:
+            return None
+        media_end += 2
+    else:
+        return None
+
+    pickle_route = _detect_media_pickle_polyglot_route(tail[media_end:], sample_is_prefix=False)
+    if pickle_route is not None:
+        return pickle_route
+    if tail[media_end:].lstrip(_MEDIA_TRAILING_PADDING):
+        return None
+    return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def _read_local_media_range(file_path: Path, sample: bytes, offset: int, size: int) -> bytes:
+    if size <= 0:
+        return b""
+    end = offset + size
+    if offset >= 0 and end <= len(sample):
+        return sample[offset:end]
+    with file_path.open("rb") as handle:
+        handle.seek(offset)
+        return handle.read(size)
+
+
+def _detect_seekable_png_media_route(file_path: Path, file_size: int, sample: bytes) -> str | None:
+    media_end = _find_png_end_with_reader(
+        file_size,
+        lambda offset, size: _read_local_media_range(file_path, sample, offset, size),
+    )
+    if media_end is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    trailing_size = file_size - media_end
+    if trailing_size <= 0:
+        return VALID_MEDIA_ROUTING_FORMAT
+    read_size = min(trailing_size, MEDIA_ROUTE_READ_BYTES + 1)
+    trailing = _read_local_media_range(file_path, sample, media_end, read_size)
+    return _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=trailing_size > len(trailing))
+
+
+def _detect_seekable_jpeg_media_route(file_path: Path, file_size: int, sample: bytes) -> str | None:
+    media_end = _find_jpeg_end_with_reader(
+        file_size,
+        lambda offset, size: _read_local_media_range(file_path, sample, offset, size),
+    )
+    if media_end is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    trailing_size = file_size - media_end
+    if trailing_size <= 0:
+        return VALID_MEDIA_ROUTING_FORMAT
+    read_size = min(trailing_size, MEDIA_ROUTE_READ_BYTES + 1)
+    trailing = _read_local_media_range(file_path, sample, media_end, read_size)
+    return _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=trailing_size > len(trailing))
+
+
+def _detect_bounded_media_route(file_path: Path, file_size: int) -> str | None:
+    """Inspect a bounded complete media sample before serialized fallback routing."""
+    if file_path.suffix.lower() not in _MEDIA_ROUTING_SUFFIXES:
+        return None
+    try:
+        sample = read_magic_bytes(str(file_path), min(file_size, MEDIA_ROUTE_READ_BYTES + 1))
+    except OSError:
+        return None
+    sample_route = _detect_bounded_media_route_from_sample(
+        file_path,
+        sample,
+        sample_is_prefix=file_size > len(sample),
+    )
+    if sample_route is not None:
+        return sample_route
+    if sample.startswith(_PNG_SIGNATURE) and _could_start_bounded_media_route(file_path, sample):
+        return _detect_seekable_png_media_route(file_path, file_size, sample)
+    if sample.startswith(b"\xff\xd8") and _could_start_bounded_media_route(file_path, sample):
+        return _detect_seekable_jpeg_media_route(file_path, file_size, sample)
+    return None
+
+
 def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
     """Route declared Flax formats and renamed candidates without claiming overlaps."""
     ext = file_path.suffix.lower()
@@ -5471,6 +6865,8 @@ def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
     try:
         size = file_path.stat().st_size
     except OSError:
+        return False
+    if _detect_bounded_media_route(file_path, size) is not None:
         return False
     if ext not in _FLAX_MSGPACK_SCANNER_SUFFIXES:
         json_document_probe = _probe_complete_structured_json_document(file_path, size)
@@ -5654,6 +7050,12 @@ def detect_format_from_magic_bytes(
         return safetensors_route
     if structural_torch7_route:
         return "torch7"
+    if file_path is not None:
+        media_route = _detect_bounded_media_route(file_path, file_size)
+        if media_route == VALID_MEDIA_ROUTING_FORMAT:
+            return "unknown"
+        if media_route is not None:
+            return media_route
     if _looks_like_binary_pickle_protocol(magic4) and (
         file_path is None or not _could_be_content_routed_flax_msgpack(file_path)
     ):
@@ -5702,6 +7104,12 @@ def detect_format_from_magic_bytes(
         )
         if xgboost_route is not None:
             return xgboost_route
+
+    if file_path is not None and _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+        return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+
+    if file_path is not None and _should_treat_sentencepiece_model_proto_file_as_unknown(file_path):
+        return "unknown"
 
     renamed_tensorflow_format = "unknown"
     if file_path is not None:
@@ -5819,6 +7227,12 @@ def detect_file_format_from_magic(path: str) -> str:
             if format_result != "unknown":
                 return format_result
 
+            media_route = _detect_bounded_media_route(file_path, size)
+            if media_route == VALID_MEDIA_ROUTING_FORMAT:
+                return "unknown"
+            if media_route is not None:
+                return media_route
+
             # Protocol 0/1 pickle payloads can evade short magic-byte checks.
             # Probe a bounded prefix and require a valid opcode stream.
             pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
@@ -5853,6 +7267,9 @@ def detect_file_format_from_magic(path: str) -> str:
                 if xgboost_route is not None:
                     return xgboost_route
 
+            if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+                return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+
             if (
                 _allows_renamed_binary_content_route(file_path)
                 and _detect_executorch_content_route(file_path, magic8) == "executorch"
@@ -5876,6 +7293,9 @@ def detect_file_format_from_magic(path: str) -> str:
                     return xml_format
             if _could_be_content_routed_flax_msgpack(file_path):
                 return "flax_msgpack"
+
+            if _should_treat_sentencepiece_model_proto_file_as_unknown(file_path):
+                return "unknown"
 
             renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
             if renamed_tensorflow_format != "unknown":
@@ -5993,6 +7413,12 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if format_result != "unknown":
             return format_result
 
+        media_route = _detect_bounded_media_route(file_path, size)
+        if media_route == VALID_MEDIA_ROUTING_FORMAT:
+            return "unknown"
+        if media_route is not None:
+            return media_route
+
         if _could_start_proto0_or_1_pickle(prefix):
             max_probe_size = min(size, PROTO0_1_MAX_PROBE_BYTES)
             if len(prefix) < max_probe_size:
@@ -6028,6 +7454,12 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             xgboost_route = _detect_extensionless_xgboost_ubjson_route(prefix[:xgboost_probe_size])
             if xgboost_route is not None:
                 return xgboost_route
+
+        if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+            return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+
+        if _should_treat_sentencepiece_model_proto_file_as_unknown(file_path):
+            return "unknown"
 
         if (
             _allows_renamed_binary_content_route(file_path)
@@ -6150,6 +7582,11 @@ def detect_file_format(path: str) -> str:
             return safetensors_route
         if structural_torch7_route:
             return "torch7"
+        media_route = _detect_bounded_media_route(file_path, size)
+        if media_route == VALID_MEDIA_ROUTING_FORMAT:
+            return "unknown"
+        if media_route is not None:
+            return media_route
         could_be_flax = _could_be_content_routed_flax_msgpack(file_path)
         if _looks_like_binary_pickle_protocol(magic4) and not could_be_flax:
             return "pickle"
@@ -6234,6 +7671,12 @@ def detect_file_format(path: str) -> str:
         if xgboost_route is not None:
             return xgboost_route
 
+    if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+        return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+
+    if _should_treat_sentencepiece_model_proto_file_as_unknown(file_path):
+        return "unknown"
+
     renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(
         file_path,
         size,
@@ -6288,6 +7731,8 @@ def detect_file_format(path: str) -> str:
         )
         if xgboost_route is not None:
             return xgboost_route
+        if _should_fail_closed_malformed_sentencepiece_model_proto_file(file_path):
+            return SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
         magic64 = read_magic_bytes(path, 64)
@@ -6568,9 +8013,12 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
                 return False
             return header_format == expected_codec
 
-        # NeMo files are TAR archives with a dedicated or structurally recognized route.
-        if ext_format == "nemo" and header_format in {"tar", "nemo"}:
-            return True
+        # NeMo files are TAR archives, commonly carried in gzip-compressed TAR wrappers.
+        if ext_format == "nemo":
+            if header_format in {"tar", "nemo"}:
+                return True
+            if header_format == "gzip":
+                return _is_tar_archive(path)
 
         # ExecuTorch files may be ZIP archives or valid FlatBuffers binaries.
         if ext_format == "executorch":
