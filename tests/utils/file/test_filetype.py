@@ -1725,6 +1725,70 @@ def test_hf_tokenizer_json_key_text_inside_padding_string_does_not_route_jinja(
     assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is False
 
 
+def test_hf_tokenizer_json_mxnet_root_between_probe_and_suffix_routes_mxnet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+            '"arg_nodes":[0],"heads":[[0,0,0]],"tail":"' + ("y" * 256) + '"'
+        ),
+        padding_size=256,
+    )
+
+    assert file_detection.huggingface_tokenizer_json_has_mxnet_or_xgboost_route_evidence(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "mxnet"
+
+
+@pytest.mark.parametrize(
+    ("framework", "expected"),
+    [
+        ("jax", True),
+        ("transformers", False),
+    ],
+)
+def test_hf_tokenizer_json_jax_identity_between_probe_and_suffix_requires_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    framework: str,
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=f',"framework":"{framework}","tail":"' + ("y" * 256) + '"',
+        padding_size=256,
+    )
+
+    assert file_detection.huggingface_tokenizer_json_has_jax_route_evidence(tokenizer_path) is expected
+
+
+def test_hf_tokenizer_json_escaped_jinja_string_between_probe_and_suffix_routes_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"metadata":"\\u007b\\u007b \'\'.__class__.__mro__[1].__subclasses__() \\u007d\\u007d",'
+            '"tail":"' + ("y" * 256) + '"'
+        ),
+        padding_size=256,
+    )
+
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+
+
 def test_hf_tokenizer_json_model_vocab_over_structure_budget_is_not_claimed_across_gap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
