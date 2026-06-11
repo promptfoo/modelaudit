@@ -3198,15 +3198,34 @@ def scan_model_directory_or_file(
                     or not _path_has_part(owner_source, "snapshots")
                 ):
                     return None
+
+                def resolve_raw_link_target() -> Path | None:
+                    if owner_entry.raw_link_target is None:
+                        return None
+                    raw_target = Path(owner_entry.raw_link_target)
+                    if not raw_target.is_absolute():
+                        raw_target = owner_source.parent / raw_target
+                    try:
+                        return raw_target.resolve(strict=True)
+                    except (OSError, RuntimeError):
+                        return None
+
                 try:
                     resolved_target = owner_source.resolve(strict=True)
-                    if resolved_target == owner_source.absolute() and owner_entry.raw_link_target is not None:
-                        raw_target = Path(owner_entry.raw_link_target)
-                        if not raw_target.is_absolute():
-                            raw_target = owner_source.parent / raw_target
-                        resolved_target = raw_target.resolve(strict=True)
-                    target_stat = os.stat(resolved_target, follow_symlinks=False)
                 except (OSError, RuntimeError):
+                    raw_resolved_target = resolve_raw_link_target()
+                    if raw_resolved_target is None:
+                        return None
+                    resolved_target = raw_resolved_target
+                else:
+                    if resolved_target == owner_source.absolute():
+                        raw_resolved_target = resolve_raw_link_target()
+                        if raw_resolved_target is not None:
+                            resolved_target = raw_resolved_target
+
+                try:
+                    target_stat = os.stat(resolved_target, follow_symlinks=False)
+                except OSError:
                     return None
                 if not is_within_directory(str(trusted_hf_blobs_root), str(resolved_target)):
                     return None

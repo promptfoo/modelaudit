@@ -2625,6 +2625,55 @@ def test_orbax_owner_dispatches_trusted_hf_snapshot_alias(
 
 
 @pytest.mark.usefixtures("requires_symlinks")
+def test_orbax_owner_dispatches_trusted_hf_snapshot_alias_when_strict_resolve_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--orbax"
+    snapshot = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs_dir.mkdir()
+    metadata_blob = blobs_dir / "metadata-blob"
+    metadata_blob.write_text('{"version":1,"format":"orbax","restore_fn":"os.system"}', encoding="utf-8")
+    raw_target = Path("../../blobs") / metadata_blob.name
+    raw_target_path = snapshot / raw_target
+    metadata_link = snapshot / "metadata.json"
+    metadata_link.symlink_to(raw_target)
+    original_resolve = Path.resolve
+    alias_strict_resolve_calls = 0
+    raw_strict_resolve_calls = 0
+
+    def reject_strict_alias_resolution(path: Path, strict: bool = False) -> Path:
+        nonlocal alias_strict_resolve_calls, raw_strict_resolve_calls
+        if strict and path == metadata_link:
+            alias_strict_resolve_calls += 1
+            raise OSError("strict alias resolution is unavailable")
+        if strict and path == raw_target_path:
+            raw_strict_resolve_calls += 1
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", reject_strict_alias_resolution)
+
+    result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
+
+    restore_checks = [check for check in result.checks if check.name == "Orbax Restore Function Check"]
+    assert alias_strict_resolve_calls == 1
+    assert raw_strict_resolve_calls == 1
+    assert result.files_scanned == 1
+    assert result.bytes_scanned == metadata_blob.stat().st_size
+    assert result.file_metadata[str(snapshot)]["directory_owner_scan"] is True
+    assert len(restore_checks) == 1
+    assert restore_checks[0].details["restore_fn"] == "os.system"
+    assert not any(
+        issue.message == "Non-regular directory entry was not scanned" and issue.location == str(metadata_link)
+        for issue in result.issues
+    )
+
+
+@pytest.mark.usefixtures("requires_symlinks")
 def test_directory_scan_groups_hf_cache_sharded_symlinks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
