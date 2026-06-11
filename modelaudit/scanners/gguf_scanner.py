@@ -139,6 +139,7 @@ _GGUF_FETCH_OPTIONS_WITH_VALUE = frozenset(
         "--url",
         "-K",
         "--config",
+        "-headers",
         "-method",
         "-uri",
         "-outfile",
@@ -1630,6 +1631,25 @@ class GgufScanner(BaseScanner):
             option_name = option_name.lower()
         return option_name in _GGUF_FETCH_DESTINATION_OPTIONS_WITH_VALUE
 
+    @staticmethod
+    def _is_powershell_hashtable_option(word: str, command: str) -> bool:
+        return command in _GGUF_POWERSHELL_FETCH_COMMANDS and word.lower().split("=", 1)[0] == "-headers"
+
+    @staticmethod
+    def _skip_powershell_hashtable_value(words: list[str], index: int) -> int:
+        if index >= len(words) or not words[index].lstrip().startswith("@{"):
+            return index + 1
+
+        depth = 0
+        while index < len(words):
+            word = words[index]
+            depth += word.count("@{")
+            depth -= word.count("}")
+            index += 1
+            if depth <= 0:
+                return index
+        return index
+
     @classmethod
     def _fetch_segment_has_remote_url(cls, words: list[str], command: str, shell_url_variables: set[str]) -> bool:
         same_segment_url_variables: set[str] = set()
@@ -1674,6 +1694,9 @@ class GgufScanner(BaseScanner):
                             )
                         ):
                             return True
+                        if value_mode == "separate" and cls._is_powershell_hashtable_option(candidate, command):
+                            index = cls._skip_powershell_hashtable_value(words, index)
+                            continue
                         if value_mode == "attached":
                             index += 1
                             continue
@@ -1839,32 +1862,33 @@ class GgufScanner(BaseScanner):
     @staticmethod
     def _network_api_alias_tokens(value: str) -> _GgufNetworkApiAliases:
         tokens: list[str] = []
+        truncated_after_position: int | None = None
+        truncated_tokens: list[str] = []
+
+        def add_token(position: int, token: str) -> None:
+            nonlocal truncated_after_position
+            if len(tokens) < _GGUF_NETWORK_REFERENCE_LIMIT:
+                tokens.append(token)
+                return
+            if truncated_after_position is None:
+                truncated_after_position = position
+            if len(truncated_tokens) < _GGUF_NETWORK_REFERENCE_LIMIT:
+                truncated_tokens.append(token)
+
         for match in _GGUF_NETWORK_CLIENT_ALIAS_PATTERN.finditer(value):
             module = match.group("module")
             alias = match.group("alias")
             for method in _GGUF_NETWORK_CLIENT_ALIAS_METHODS[module]:
-                if len(tokens) >= _GGUF_NETWORK_REFERENCE_LIMIT:
-                    truncated_tokens = tuple(
-                        f"{alias}.{omitted_method}" for omitted_method in _GGUF_NETWORK_CLIENT_ALIAS_METHODS[module]
-                    )
-                    return _GgufNetworkApiAliases(tuple(tokens), match.start(), truncated_tokens)
-                tokens.append(f"{alias}.{method}")
+                add_token(match.start(), f"{alias}.{method}")
 
         for match in _GGUF_URLLIB_REQUEST_ALIAS_PATTERN.finditer(value):
             alias = match.group("alias")
             for method in _GGUF_NETWORK_CLIENT_ALIAS_METHODS["urllib.request"]:
-                if len(tokens) >= _GGUF_NETWORK_REFERENCE_LIMIT:
-                    truncated_tokens = tuple(
-                        f"{alias}.{omitted_method}"
-                        for omitted_method in _GGUF_NETWORK_CLIENT_ALIAS_METHODS["urllib.request"]
-                    )
-                    return _GgufNetworkApiAliases(tuple(tokens), match.start(), truncated_tokens)
-                tokens.append(f"{alias}.{method}")
+                add_token(match.start(), f"{alias}.{method}")
 
         for match in _GGUF_NETWORK_FUNCTION_IMPORT_PATTERN.finditer(value):
             module = match.group("module")
             methods = _GGUF_NETWORK_CLIENT_ALIAS_METHODS[module]
-            omitted_tokens: list[str] = []
             for imported_name in match.group("imports").split(","):
                 parts = imported_name.strip().split()
                 if not parts:
@@ -1872,13 +1896,8 @@ class GgufScanner(BaseScanner):
                 function_name = parts[0]
                 alias = parts[2] if len(parts) >= 3 and parts[1] == "as" else function_name
                 if function_name in methods and _GGUF_SHELL_VARIABLE_NAME_PATTERN.fullmatch(alias):
-                    if len(tokens) >= _GGUF_NETWORK_REFERENCE_LIMIT:
-                        omitted_tokens.append(alias)
-                        continue
-                    tokens.append(alias)
-            if omitted_tokens:
-                return _GgufNetworkApiAliases(tuple(tokens), match.start(), tuple(omitted_tokens))
-        return _GgufNetworkApiAliases(tuple(tokens), None, ())
+                    add_token(match.start(), alias)
+        return _GgufNetworkApiAliases(tuple(tokens), truncated_after_position, tuple(truncated_tokens))
 
     @classmethod
     def _argument_window_has_remote_variable_evidence(

