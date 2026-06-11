@@ -249,6 +249,19 @@ def _is_huggingface_dry_run_preview_path(path: str) -> bool:
     return is_huggingface_file_url(path) or is_huggingface_url(path)
 
 
+def _remaining_huggingface_plan_timeout_seconds(plan: Any) -> float | None:
+    """Return the remaining plan deadline for follow-up metadata requests."""
+    raw_deadline = getattr(plan, "deadline", None)
+    deadline = raw_deadline if isinstance(raw_deadline, (int, float)) and not isinstance(raw_deadline, bool) else None
+    if deadline is None:
+        return None
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        repo_id = getattr(plan, "repo_id", "repository")
+        raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+    return remaining
+
+
 def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeConfig") -> dict[str, Any]:
     """Preview a Hugging Face repository scan without artifact downloads or scanners."""
     from .utils.sources.huggingface import (
@@ -274,7 +287,11 @@ def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeCo
             timeout_seconds=runtime.timeout,
         )
 
-    model_info = get_model_info(path)
+    preview_timeout = _remaining_huggingface_plan_timeout_seconds(plan)
+    model_info_kwargs: dict[str, Any] = {}
+    if preview_timeout is not None:
+        model_info_kwargs["timeout_seconds"] = preview_timeout
+    model_info = get_model_info(path, **model_info_kwargs)
     total_size = model_info.get("total_size")
     return _build_huggingface_dry_run_preview(
         path,
@@ -3144,15 +3161,32 @@ def _resolve_scan_source_for_path(
                 path_state.mark_non_shard_error(audit_result)
                 return None
 
+        hf_stream_kwargs: dict[str, Any] = {}
+        if runtime.scan_and_delete:
+            if runtime.scannable_extensions is not None:
+                hf_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
+            if runtime.scannable_filenames is not None:
+                hf_stream_kwargs["scannable_filenames"] = runtime.scannable_filenames
+            if runtime.scannable_scanner_ids is not None:
+                hf_stream_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
+            if runtime.hf_stream_include_all_files:
+                hf_stream_kwargs["include_all_files"] = True
         if runtime.show_styled_output:
             click.echo(f"\n📥 Preparing to download from {style_text(display_path, fg='cyan')}")
 
             try:
                 from .utils.sources.huggingface import get_model_info
 
-                model_info = get_model_info(path)
-                size_bytes = model_info["total_size"]
-                if size_bytes == 0:
+                preview_kwargs: dict[str, Any] = {"timeout_seconds": runtime.timeout}
+                if runtime.scan_and_delete:
+                    preview_kwargs.update(hf_stream_kwargs)
+                    preview_kwargs["streaming_selection"] = True
+                    preview_kwargs.setdefault("include_all_files", False)
+                model_info = get_model_info(path, **preview_kwargs)
+                size_bytes = int(model_info.get("total_size") or 0)
+                inaccessible_gated_file_count = int(model_info.get("inaccessible_gated_file_count") or 0)
+                unknown_size_count = int(model_info.get("unknown_size_count") or 0)
+                if size_bytes == 0 and unknown_size_count:
                     size_str = "Unknown size"
                 elif size_bytes >= 1024 * 1024 * 1024:
                     size_str = f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
@@ -3160,11 +3194,20 @@ def _resolve_scan_source_for_path(
                     size_str = f"{size_bytes / (1024 * 1024):.2f} MB"
                 else:
                     size_str = f"{size_bytes / 1024:.2f} KB"
+                if size_bytes > 0 and unknown_size_count:
+                    size_str = f"At least {size_str}"
 
                 model_id = _escape_terminal_text(str(model_info["model_id"]))
                 file_count = _escape_terminal_text(str(model_info["file_count"]))
                 click.echo(f"   Model: {model_id}")
                 click.echo(f"   Size: {size_str} ({file_count} files)")
+                if inaccessible_gated_file_count:
+                    gated_file_count = _escape_terminal_text(str(inaccessible_gated_file_count))
+                    click.echo(f"   Access: {gated_file_count} selected file(s) are gated/inaccessible")
+                if unknown_size_count:
+                    click.echo(
+                        f"   Access: {_escape_terminal_text(str(unknown_size_count))} selected file size(s) unavailable"
+                    )
 
                 if runtime.scan_and_delete:
                     click.echo(style_text("   Mode: Streaming (scan and delete to save disk)", fg="cyan"))
@@ -3205,15 +3248,6 @@ def _resolve_scan_source_for_path(
                 if runtime.show_styled_output:
                     click.echo(style_text("🔄 Starting streaming scan...", fg="cyan"))
 
-                hf_stream_kwargs: dict[str, Any] = {}
-                if runtime.scannable_extensions is not None:
-                    hf_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
-                if runtime.scannable_filenames is not None:
-                    hf_stream_kwargs["scannable_filenames"] = runtime.scannable_filenames
-                if runtime.scannable_scanner_ids is not None:
-                    hf_stream_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
-                if runtime.hf_stream_include_all_files:
-                    hf_stream_kwargs["include_all_files"] = True
                 file_generator = _track_huggingface_stream_acquisition(
                     download_model_streaming(
                         path,
