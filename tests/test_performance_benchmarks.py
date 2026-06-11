@@ -209,14 +209,16 @@ class TestPerformanceBenchmarks:
 
         process = psutil.Process(os.getpid())
         warmup_results = scan_model_directory_or_file(str(assets_dir), cache_enabled=False)
-        assert warmup_results.success, "Warm-up scan should succeed"
+        assert warmup_results.files_scanned > 0, "Warm-up scan should process assets"
+        assert warmup_results.has_errors is False, "Warm-up scan should not hit operational errors"
         gc.collect()
         initial_memory = process.memory_info().rss / 1024 / 1024  # MB
 
         # Measure repeated scans after lazy scanner imports and caches are warm.
         for _ in range(5):
             results = scan_model_directory_or_file(str(assets_dir), cache_enabled=False)
-            assert results.success, "Scan should succeed"
+            assert results.files_scanned > 0, "Scan should process assets"
+            assert results.has_errors is False, "Scan should not hit operational errors"
 
         gc.collect()
         final_memory = process.memory_info().rss / 1024 / 1024  # MB
