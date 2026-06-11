@@ -2993,15 +2993,6 @@ def _resolve_scan_source_for_path(
                     click.echo(style_text("🔄 Starting streaming scan...", fg="cyan"))
 
                 stream_repository_file_inventory: list[str] = []
-                hf_stream_kwargs: dict[str, Any] = {}
-                if runtime.scannable_extensions is not None:
-                    hf_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
-                if runtime.scannable_filenames is not None:
-                    hf_stream_kwargs["scannable_filenames"] = runtime.scannable_filenames
-                if runtime.scannable_scanner_ids is not None:
-                    hf_stream_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
-                if runtime.hf_stream_include_all_files:
-                    hf_stream_kwargs["include_all_files"] = True
                 stream_namespace, stream_repo_name, _stream_requested_revision = parse_huggingface_url_with_revision(
                     path
                 )
