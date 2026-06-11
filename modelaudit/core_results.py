@@ -493,6 +493,10 @@ def _group_checks_by_asset(checks_list: list[Any]) -> dict[tuple[str, str], list
         else:
             asset_group = primary_asset
 
+        check_consolidation_key = details.get("check_consolidation_key") if isinstance(details, dict) else None
+        if isinstance(check_consolidation_key, str) and check_consolidation_key:
+            asset_group = f"{asset_group}#{check_consolidation_key}"
+
         group_key = (check_name, asset_group)
         check_groups[group_key].append(check)
 
