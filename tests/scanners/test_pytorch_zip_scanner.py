@@ -1,9 +1,12 @@
 import base64
+import hashlib
 import json
+import os
 import pickle
 import stat
 import struct
 import time
+import urllib.request
 import warnings
 import zipfile
 import zlib
@@ -27,6 +30,67 @@ from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
 
 _ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
+_HF_T10_REPO_ID = "nvidia/LocateAnything-3B"
+_HF_T10_REVISION = "272068e81a31e88a48ea03c20a09decba2b62ed6"
+_HF_T10_FILENAME = "training_args.bin"
+_HF_T10_SHA256 = "995b5f0a2fe72453ddc8ce97e1a93747554ec3ec0ac92d86e82a57050db51b85"
+_HF_T10_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _pickle_global(module: str, name: str) -> bytes:
+    return b"c" + module.encode("ascii") + b"\n" + name.encode("ascii") + b"\n"
+
+
+def _pickle_binunicode(value: bytes) -> bytes:
+    return b"X" + len(value).to_bytes(4, "little") + value
+
+
+def _metadata_reduce_payload(module: str, name: str, value: bytes = b"metadata") -> bytes:
+    return _pickle_global(module, name) + _pickle_binunicode(value) + b"\x85R"
+
+
+def _metadata_newobj_build_payload(module: str, name: str) -> bytes:
+    return _pickle_global(module, name) + b")\x81}b"
+
+
+def _hf_training_args_metadata_payload() -> bytes:
+    items = [
+        _metadata_newobj_build_payload("transformers.training_args", "TrainingArguments"),
+        _metadata_reduce_payload("transformers.trainer_utils", "IntervalStrategy", b"steps"),
+        _metadata_reduce_payload("transformers.trainer_utils", "SchedulerType", b"linear"),
+        _metadata_reduce_payload("transformers.trainer_utils", "SaveStrategy", b"steps"),
+        _metadata_newobj_build_payload("transformers.trainer_pt_utils", "AcceleratorConfig"),
+        _metadata_reduce_payload("transformers.training_args", "OptimizerNames", b"adamw_torch"),
+        _metadata_reduce_payload("transformers.trainer_utils", "HubStrategy", b"every_save"),
+        _metadata_newobj_build_payload("accelerate.state", "PartialState"),
+        _metadata_reduce_payload("torch", "device", b"cpu"),
+        _metadata_reduce_payload("accelerate.utils.dataclasses", "DistributedType", b"NO"),
+        _metadata_newobj_build_payload("accelerate.utils.dataclasses", "DeepSpeedPlugin"),
+        _metadata_newobj_build_payload("transformers.integrations.deepspeed", "HfTrainerDeepSpeedConfig"),
+        _pickle_global("torch", "bfloat16"),
+        _metadata_newobj_build_payload("transformers.integrations.deepspeed", "HfDeepSpeedConfig"),
+    ]
+    return b"\x80\x02](" + b"".join(items) + b"e."
+
+
+def _write_training_args_bin(path: Path, payload: bytes) -> None:
+    with zipfile.ZipFile(path, "w") as zip_file:
+        zip_file.writestr("training_args/data.pkl", payload)
+        zip_file.writestr("training_args/byteorder", "little")
+        zip_file.writestr("training_args/version", "3")
+        zip_file.writestr("training_args/.data/serialization_id", "0" * 40)
+
+
+def _download_pinned_training_args(tmp_path: Path) -> Path:
+    url = f"https://huggingface.co/{_HF_T10_REPO_ID}/resolve/{_HF_T10_REVISION}/{_HF_T10_FILENAME}"
+    request = urllib.request.Request(url, headers={"User-Agent": "modelaudit-test"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        payload = response.read(_HF_T10_MAX_BYTES + 1)
+    assert len(payload) <= _HF_T10_MAX_BYTES
+    assert hashlib.sha256(payload).hexdigest() == _HF_T10_SHA256
+    path = tmp_path / _HF_T10_FILENAME
+    path.write_bytes(payload)
+    return path
 
 
 class _NewObjExImportGadget:
@@ -219,6 +283,38 @@ def test_pytorch_zip_scanner_can_handle(tmp_path):
     test_file = tmp_path / "model.h5"
     test_file.write_bytes(b"not a pytorch file")
     assert PyTorchZipScanner.can_handle(str(test_file)) is False
+
+
+def test_pytorch_zip_training_args_framework_metadata_refs_stay_clean(tmp_path: Path) -> None:
+    model_path = tmp_path / "training_args.bin"
+    _write_training_args_bin(model_path, _hf_training_args_metadata_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata["pickle_files"] == ["training_args/data.pkl"]
+    assert not [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}]
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("MODELAUDIT_RUN_HF_REAL_MODEL_TESTS") != "1",
+    reason="Set MODELAUDIT_RUN_HF_REAL_MODEL_TESTS=1 to download the pinned Hugging Face fixture.",
+)
+def test_real_huggingface_locateanything_training_args_metadata_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PROMPTFOO_DISABLE_TELEMETRY", "1")
+    monkeypatch.setenv("HF_HUB_DISABLE_TELEMETRY", "1")
+    monkeypatch.setenv("MODELAUDIT_CACHE_DIR", str(tmp_path / "modelaudit-cache"))
+    model_path = _download_pinned_training_args(tmp_path)
+
+    result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+
+    assert determine_exit_code(result) == 0
+    assert result.files_scanned == 1
+    assert not [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}]
 
 
 @pytest.mark.parametrize("suffix", [".ckpt", ".pkl", ".bin"])

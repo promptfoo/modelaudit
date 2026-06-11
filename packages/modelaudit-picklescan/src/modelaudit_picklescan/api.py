@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, cast
 
 from .call_graph import (
+    _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES,
     CallGraphFinding,
     StartupHookWriteFinding,
     UnanalyzedCallGraphReference,
@@ -86,12 +87,41 @@ _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES = 512 * 1024 * 1024
 _RUST_EXTENSION_MODULE = "modelaudit_picklescan._rust"
 _MAX_INERT_INITIALIZATION_MODULES = 32
 _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES = frozenset({"BUILD", "NEWOBJ", "NEWOBJ_EX"})
+_TRUSTED_FRAMEWORK_METADATA_RECONSTRUCTION_REFERENCES = frozenset(
+    {
+        ("accelerate.state", "PartialState"),
+        ("accelerate.utils.dataclasses", "DeepSpeedPlugin"),
+        ("transformers.integrations.deepspeed", "HfDeepSpeedConfig"),
+        ("transformers.integrations.deepspeed", "HfTrainerDeepSpeedConfig"),
+        ("transformers.trainer_pt_utils", "AcceleratorConfig"),
+        ("transformers.training_args", "TrainingArguments"),
+    }
+)
 _TRUSTED_REDUCE_REFERENCES = frozenset(
     {
+        ("accelerate.utils.dataclasses", "DistributedType"),
+        ("torch", "device"),
         ("string", "Formatter"),
+        ("transformers.trainer_utils", "HubStrategy"),
+        ("transformers.trainer_utils", "IntervalStrategy"),
+        ("transformers.trainer_utils", "SaveStrategy"),
+        ("transformers.trainer_utils", "SchedulerType"),
+        ("transformers.training_args", "OptimizerNames"),
         ("weakref", "proxy"),
         ("weakref", "ref"),
     }
+)
+_TRUSTED_RECONSTRUCTION_REFERENCES = (
+    _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES
+    | _TRUSTED_FRAMEWORK_METADATA_RECONSTRUCTION_REFERENCES
+    | frozenset(
+        {
+            ("_frozen_importlib", "ModuleSpec"),
+            ("string", "Formatter"),
+            ("weakref", "proxy"),
+            ("weakref", "ref"),
+        }
+    )
 )
 _ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
 _ZIP_EOCD_MIN_SIZE = 22
@@ -1920,7 +1950,11 @@ def _trusted_reconstruction_global_positions(callable_invocations: object) -> fr
         for position, opcodes in opcodes_by_position.items()
         if opcodes
         and (
-            opcodes <= _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES
+            (
+                opcodes <= _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES
+                and references_by_position.get(position)
+                and references_by_position[position] <= _TRUSTED_RECONSTRUCTION_REFERENCES
+            )
             or (
                 opcodes <= {"REDUCE"}
                 and references_by_position.get(position)
@@ -1944,7 +1978,7 @@ def _trusted_reconstruction_references(callable_invocations: object) -> frozense
         for reference, opcodes in opcodes_by_reference.items()
         if opcodes
         and (
-            opcodes <= _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES
+            (opcodes <= _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES and reference in _TRUSTED_RECONSTRUCTION_REFERENCES)
             or (opcodes <= {"REDUCE"} and reference in _TRUSTED_REDUCE_REFERENCES)
         )
     )

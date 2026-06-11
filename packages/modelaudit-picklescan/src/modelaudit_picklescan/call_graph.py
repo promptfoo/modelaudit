@@ -1331,7 +1331,25 @@ _TRUSTED_LOADED_EXTENSION_EXPORT_OWNERS = MappingProxyType(
         ),
     }
 )
-_TRUSTED_IMPORT_ONLY_REFERENCES |= _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES
+_TRUSTED_FRAMEWORK_METADATA_REFERENCES = frozenset(
+    {
+        ("accelerate.state", "PartialState"),
+        ("accelerate.utils.dataclasses", "DeepSpeedPlugin"),
+        ("accelerate.utils.dataclasses", "DistributedType"),
+        ("torch", "bfloat16"),
+        ("torch", "device"),
+        ("transformers.integrations.deepspeed", "HfDeepSpeedConfig"),
+        ("transformers.integrations.deepspeed", "HfTrainerDeepSpeedConfig"),
+        ("transformers.trainer_pt_utils", "AcceleratorConfig"),
+        ("transformers.trainer_utils", "HubStrategy"),
+        ("transformers.trainer_utils", "IntervalStrategy"),
+        ("transformers.trainer_utils", "SaveStrategy"),
+        ("transformers.trainer_utils", "SchedulerType"),
+        ("transformers.training_args", "OptimizerNames"),
+        ("transformers.training_args", "TrainingArguments"),
+    }
+)
+_TRUSTED_IMPORT_ONLY_REFERENCES |= _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES | _TRUSTED_FRAMEWORK_METADATA_REFERENCES
 _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES = (
     frozenset(
         {
@@ -1341,6 +1359,7 @@ _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES = (
         }
     )
     | _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES
+    | _TRUSTED_FRAMEWORK_METADATA_REFERENCES
 )
 # Canonical-looking specs in sys.modules are forgeable. Identity trust is
 # limited to interpreter modules already loaded when this module initializes.

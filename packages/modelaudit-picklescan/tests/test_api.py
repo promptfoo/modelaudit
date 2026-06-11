@@ -141,12 +141,102 @@ def _global(module: bytes, name: bytes) -> bytes:
     return b"c" + module + b"\n" + name + b"\n"
 
 
+_HF_TRAINING_ARGS_METADATA_REFERENCES = frozenset(
+    {
+        ("accelerate.state", "PartialState"),
+        ("accelerate.utils.dataclasses", "DeepSpeedPlugin"),
+        ("accelerate.utils.dataclasses", "DistributedType"),
+        ("torch", "bfloat16"),
+        ("torch", "device"),
+        ("transformers.integrations.deepspeed", "HfDeepSpeedConfig"),
+        ("transformers.integrations.deepspeed", "HfTrainerDeepSpeedConfig"),
+        ("transformers.trainer_pt_utils", "AcceleratorConfig"),
+        ("transformers.trainer_utils", "HubStrategy"),
+        ("transformers.trainer_utils", "IntervalStrategy"),
+        ("transformers.trainer_utils", "SaveStrategy"),
+        ("transformers.trainer_utils", "SchedulerType"),
+        ("transformers.training_args", "OptimizerNames"),
+        ("transformers.training_args", "TrainingArguments"),
+    }
+)
+_HF_TRAINING_ARGS_REDUCE_REFERENCES = frozenset(
+    {
+        ("accelerate.utils.dataclasses", "DistributedType"),
+        ("torch", "device"),
+        ("transformers.trainer_utils", "HubStrategy"),
+        ("transformers.trainer_utils", "IntervalStrategy"),
+        ("transformers.trainer_utils", "SaveStrategy"),
+        ("transformers.trainer_utils", "SchedulerType"),
+        ("transformers.training_args", "OptimizerNames"),
+    }
+)
+_HF_TRAINING_ARGS_RECONSTRUCTION_REFERENCES = frozenset(
+    {
+        ("accelerate.state", "PartialState"),
+        ("accelerate.utils.dataclasses", "DeepSpeedPlugin"),
+        ("transformers.integrations.deepspeed", "HfDeepSpeedConfig"),
+        ("transformers.integrations.deepspeed", "HfTrainerDeepSpeedConfig"),
+        ("transformers.trainer_pt_utils", "AcceleratorConfig"),
+        ("transformers.training_args", "TrainingArguments"),
+    }
+)
+
+
 def _binunicode(data: bytes) -> bytes:
     return b"X" + len(data).to_bytes(4, "little") + data
 
 
 def _binunicode8(data: bytes) -> bytes:
     return b"\x8d" + len(data).to_bytes(8, "little") + data
+
+
+def _reference_global(module: str, name: str) -> bytes:
+    return _global(module.encode("ascii"), name.encode("ascii"))
+
+
+def _metadata_reduce_payload(module: str, name: str, value: bytes = b"metadata") -> bytes:
+    return _reference_global(module, name) + _binunicode(value) + b"\x85R"
+
+
+def _metadata_newobj_build_payload(module: str, name: str) -> bytes:
+    return _reference_global(module, name) + b")\x81}b"
+
+
+def _hf_training_args_metadata_payload() -> bytes:
+    items = [
+        _metadata_newobj_build_payload("transformers.training_args", "TrainingArguments"),
+        _metadata_reduce_payload("transformers.trainer_utils", "IntervalStrategy", b"steps"),
+        _metadata_reduce_payload("transformers.trainer_utils", "SchedulerType", b"linear"),
+        _metadata_reduce_payload("transformers.trainer_utils", "SaveStrategy", b"steps"),
+        _metadata_newobj_build_payload("transformers.trainer_pt_utils", "AcceleratorConfig"),
+        _metadata_reduce_payload("transformers.training_args", "OptimizerNames", b"adamw_torch"),
+        _metadata_reduce_payload("transformers.trainer_utils", "HubStrategy", b"every_save"),
+        _metadata_newobj_build_payload("accelerate.state", "PartialState"),
+        _metadata_reduce_payload("torch", "device", b"cpu"),
+        _metadata_reduce_payload("accelerate.utils.dataclasses", "DistributedType", b"NO"),
+        _metadata_newobj_build_payload("accelerate.utils.dataclasses", "DeepSpeedPlugin"),
+        _metadata_newobj_build_payload("transformers.integrations.deepspeed", "HfTrainerDeepSpeedConfig"),
+        _reference_global("torch", "bfloat16"),
+        _metadata_newobj_build_payload("transformers.integrations.deepspeed", "HfDeepSpeedConfig"),
+    ]
+    return b"\x80\x02](" + b"".join(items) + b"e."
+
+
+def _force_framework_metadata_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._trusted_module_origin_kind",
+        lambda _module_name: "unresolved",
+    )
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._resolve_module_source", lambda _module_name: None)
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._find_module_spec_without_imports",
+        lambda _module_name: None,
+    )
+
+
+def _import_reference_pairs(report: PickleReport) -> set[tuple[str, str]]:
+    references = cast(tuple[collections.abc.Mapping[str, object], ...], report.metadata.get("import_references", ()))
+    return {(str(reference.get("module", "")), str(reference.get("name", ""))) for reference in references}
 
 
 def _concrete_pathlib_class_name() -> str:
@@ -5896,6 +5986,154 @@ def test_scan_bytes_keeps_invoked_unresolved_framework_reconstruction_global_cle
     assert report.verdict == SafetyVerdict.CLEAN
     assert report.findings == ()
     assert all(notice.code != "call_graph_source_unavailable" for notice in report.notices)
+
+
+def test_scan_bytes_keeps_hf_training_args_framework_metadata_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_framework_metadata_unresolved(monkeypatch)
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_bytes(
+            _hf_training_args_metadata_payload(),
+            source="hf-training-args-framework-metadata.pkl",
+        )
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert _import_reference_pairs(report) >= _HF_TRAINING_ARGS_METADATA_REFERENCES
+    assert all(notice.code != "call_graph_source_unavailable" for notice in report.notices)
+
+
+@pytest.mark.parametrize(
+    ("module", "name"),
+    [
+        ("accelerate.state", "EvilState"),
+        ("accelerate.utils.dataclasses", "EvilPlugin"),
+        ("torch", "device.evil"),
+        ("transformers.trainer_utils", "EvilStrategy"),
+        ("transformers.training_args", "EvilArguments"),
+        ("transformers.training_args", "TrainingArguments.__globals__"),
+    ],
+)
+def test_scan_bytes_warns_on_untrusted_hf_framework_metadata_near_match(
+    module: str,
+    name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_framework_metadata_unresolved(monkeypatch)
+
+    report = scan_bytes(_reference_global(module, name) + b".", source="hf-training-args-near-match.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
+    assert any(
+        finding.rule_code in {"DANGEROUS_GLOBAL", "NON_ALLOWLISTED_GLOBAL"}
+        and finding.details.get("import_reference") == f"{module}.{name}"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(("module", "name"), sorted(_HF_TRAINING_ARGS_REDUCE_REFERENCES))
+def test_scan_bytes_keeps_selected_hf_framework_metadata_reduce_clean(
+    module: str,
+    name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_framework_metadata_unresolved(monkeypatch)
+
+    report = scan_bytes(_metadata_reduce_payload(module, name) + b".", source="hf-training-args-reduce.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+@pytest.mark.parametrize(
+    ("module", "name"),
+    sorted(_HF_TRAINING_ARGS_METADATA_REFERENCES - _HF_TRAINING_ARGS_REDUCE_REFERENCES - {("torch", "bfloat16")}),
+)
+def test_scan_bytes_warns_on_untrusted_hf_framework_metadata_reduce(
+    module: str,
+    name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_framework_metadata_unresolved(monkeypatch)
+
+    report = scan_bytes(_metadata_reduce_payload(module, name) + b".", source="hf-training-args-untrusted-reduce.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.{name}"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_rule"),
+    [
+        (
+            _reference_global("builtins", "eval") + _binunicode(b"1+1") + b"\x85R.",
+            "DANGEROUS_CALL",
+        ),
+        (b"\x80\x02\x82\x01)R.", "DANGEROUS_CALL"),
+    ],
+)
+def test_scan_bytes_keeps_malicious_reduce_and_extension_controls_detected(
+    payload: bytes,
+    expected_rule: str,
+) -> None:
+    report = scan_bytes(payload, source="hf-training-args-malicious-control.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == expected_rule for finding in report.findings)
+
+
+def test_scan_bytes_warns_when_hf_metadata_constructor_resolves_to_shadow_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "shadowed-training-args-marker"
+    package_dir = tmp_path / "transformers"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        "\n".join(
+            [
+                "import os",
+                f"open({str(marker)!r}, 'w').write('imported')",
+                "class TrainingArguments:",
+                "    def __new__(cls):",
+                "        os.system('echo constructor')",
+                "        return super().__new__(cls)",
+                "    def __setstate__(self, state):",
+                "        os.system('echo state')",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_bytes(
+            _metadata_newobj_build_payload("transformers.training_args", "TrainingArguments") + b".",
+            source="shadowed-hf-training-args-constructor.pkl",
+        )
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert marker.exists() is False
+    assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) or any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "transformers.training_args.TrainingArguments"
+        for finding in report.findings
+    )
 
 
 def test_scan_bytes_warns_when_framework_reconstruction_reference_resolves_to_shadow_module(
