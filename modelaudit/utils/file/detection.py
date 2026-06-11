@@ -289,8 +289,12 @@ _FLAX_MSGPACK_PROBE_LENGTH_SIZES = {
 MXNET_SYMBOL_SIGNATURE_READ_BYTES = 10 * 1024 * 1024
 MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT = "mxnet_symbol_routing_inconclusive"
 TOKENIZER_JSON_ROUTING_READ_BYTES = 16 * 1024 * 1024
+TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES = 64 * 1024 * 1024
 _UTF8_BOM = b"\xef\xbb\xbf"
 _JSON_NUMBER_PREFIX_RE = re.compile(rb"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
+_JSON_HEX_BYTES = frozenset(b"0123456789abcdefABCDEF")
+_JSON_SIMPLE_ESCAPE_BYTES = frozenset(b'"\\/bfnrt')
+_JSON_VALUE_DELIMITERS = b",}] \t\r\n"
 _MXNET_SYMBOL_PREFIX_MAX_VALUES = 4096
 _MXNET_SYMBOL_MAX_KEY_BYTES = 64
 _MXNET_SYMBOL_ROOT_KEYS = frozenset({"nodes", "arg_nodes", "heads"})
@@ -299,6 +303,7 @@ _HF_TOKENIZER_JSON_FILENAMES = frozenset({"tokenizer.json"})
 _HF_TOKENIZER_ROOT_KEYS = frozenset({"version", "added_tokens"})
 _HF_TOKENIZER_MODEL_TYPES = frozenset({"BPE", "Unigram", "WordPiece", "WordLevel"})
 _HF_TOKENIZER_TEMPLATE_KEYS = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
+_JSON_PROBE_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
 _HF_TOKENIZER_JAX_ROUTE_KEYS = frozenset(
     {
         "framework",
@@ -606,9 +611,20 @@ def _json_probe_skip_string(probe: bytes, offset: int) -> int | None:
         byte = probe[offset]
         if byte == ord('"'):
             return offset + 1
+        if byte < 0x20:
+            return None
         if byte == ord("\\"):
             offset += 1
             if offset >= len(probe):
+                return None
+            escape = probe[offset]
+            if escape == ord("u"):
+                if offset + 4 >= len(probe):
+                    return None
+                if any(hex_byte not in _JSON_HEX_BYTES for hex_byte in probe[offset + 1 : offset + 5]):
+                    return None
+                offset += 4
+            elif escape not in _JSON_SIMPLE_ESCAPE_BYTES:
                 return None
         offset += 1
     return None
@@ -620,6 +636,21 @@ def _json_probe_decode_string(probe: bytes, start: int, end: int) -> str | None:
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
         return None
     return value if isinstance(value, str) else None
+
+
+def _json_probe_skip_primitive(probe: bytes, offset: int) -> int | None:
+    for literal in (b"true", b"false", b"null"):
+        end = offset + len(literal)
+        if probe.startswith(literal, offset) and end < len(probe) and probe[end] in _JSON_VALUE_DELIMITERS:
+            return end
+
+    match = _JSON_NUMBER_PREFIX_RE.match(probe, offset)
+    if match is None:
+        return None
+    end = match.end()
+    if end >= len(probe):
+        return None
+    return end if probe[end] in _JSON_VALUE_DELIMITERS else None
 
 
 def _json_probe_skip_value(probe: bytes, offset: int) -> int | None:
@@ -651,9 +682,7 @@ def _json_probe_skip_value(probe: bytes, offset: int) -> int | None:
             offset += 1
         return None
 
-    while offset < len(probe) and probe[offset] not in b",}] \t\r\n":
-        offset += 1
-    return offset if offset < len(probe) else None
+    return _json_probe_skip_primitive(probe, offset)
 
 
 def _json_probe_has_only_trailing_whitespace(probe: bytes, offset: int) -> bool:
@@ -673,6 +702,26 @@ class _HFTokenizerJSONProbeState:
     has_template_evidence: bool = False
 
 
+def _json_probe_string_has_template_indicator(probe: bytes, start: int, end: int) -> bool:
+    raw_value = probe[start:end]
+    for indicator in _JSON_PROBE_TEMPLATE_INDICATORS:
+        if indicator.encode("utf-8") in raw_value:
+            return True
+
+    value = _json_probe_decode_string(probe, start, end)
+    return bool(value and any(indicator in value for indicator in _JSON_PROBE_TEMPLATE_INDICATORS))
+
+
+def _json_probe_root_string_value_has_jax_identity(probe: bytes, key: str, value_offset: int) -> bool:
+    if key not in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS or value_offset >= len(probe) or probe[value_offset] != ord('"'):
+        return False
+    value_end = _json_probe_skip_string(probe, value_offset)
+    if value_end is None:
+        return False
+    value = _json_probe_decode_string(probe, value_offset, value_end)
+    return bool(value and _JAX_JSON_CHECKPOINT_IDENTITY_RE.search(value))
+
+
 def _json_probe_skip_string_or_raise(probe: bytes, offset: int) -> int:
     end = _json_probe_skip_string(probe, offset)
     if end is None:
@@ -686,6 +735,7 @@ def _json_probe_skip_value_with_template_scan(
     state: _HFTokenizerJSONProbeState,
     *,
     depth: int = 0,
+    scan_string_template_indicators: bool = True,
 ) -> int:
     if depth > 64:
         raise _JSONProbeInvalid
@@ -696,12 +746,27 @@ def _json_probe_skip_value_with_template_scan(
 
     first = probe[offset]
     if first == ord('"'):
-        return _json_probe_skip_string_or_raise(probe, offset)
+        end = _json_probe_skip_string_or_raise(probe, offset)
+        if scan_string_template_indicators and _json_probe_string_has_template_indicator(probe, offset, end):
+            state.has_template_evidence = True
+        return end
 
     if first == ord("{"):
-        return _json_probe_skip_object_with_template_scan(probe, offset, state, depth=depth + 1)
+        return _json_probe_skip_object_with_template_scan(
+            probe,
+            offset,
+            state,
+            depth=depth + 1,
+            scan_string_template_indicators=scan_string_template_indicators,
+        )
     if first == ord("["):
-        return _json_probe_skip_array_with_template_scan(probe, offset, state, depth=depth + 1)
+        return _json_probe_skip_array_with_template_scan(
+            probe,
+            offset,
+            state,
+            depth=depth + 1,
+            scan_string_template_indicators=scan_string_template_indicators,
+        )
 
     next_offset = _json_probe_skip_value(probe, offset)
     if next_offset is None:
@@ -715,6 +780,7 @@ def _json_probe_skip_array_with_template_scan(
     state: _HFTokenizerJSONProbeState,
     *,
     depth: int,
+    scan_string_template_indicators: bool,
 ) -> int:
     if depth > 64:
         raise _JSONProbeInvalid
@@ -726,7 +792,13 @@ def _json_probe_skip_array_with_template_scan(
         return offset + 1
 
     while True:
-        offset = _json_probe_skip_value_with_template_scan(probe, offset, state, depth=depth + 1)
+        offset = _json_probe_skip_value_with_template_scan(
+            probe,
+            offset,
+            state,
+            depth=depth + 1,
+            scan_string_template_indicators=scan_string_template_indicators,
+        )
         offset = _json_probe_skip_whitespace(probe, offset)
         if offset >= len(probe):
             raise _JSONProbeIncomplete
@@ -745,6 +817,7 @@ def _json_probe_skip_object_with_template_scan(
     state: _HFTokenizerJSONProbeState,
     *,
     depth: int,
+    scan_string_template_indicators: bool,
 ) -> int:
     if depth > 64:
         raise _JSONProbeInvalid
@@ -775,6 +848,7 @@ def _json_probe_skip_object_with_template_scan(
             offset + 1,
             state,
             depth=depth + 1,
+            scan_string_template_indicators=scan_string_template_indicators,
         )
         offset = _json_probe_skip_whitespace(probe, offset)
         if offset >= len(probe):
@@ -825,12 +899,11 @@ def _hf_tokenizer_probe_model_object(
         if value_offset >= len(probe):
             return None, saw_model_type and saw_vocab
 
+        model_type_value = False
         if key == "type" and probe[value_offset] == ord('"'):
             value_end = _json_probe_skip_string_or_raise(probe, value_offset)
             model_type = _json_probe_decode_string(probe, value_offset, value_end)
-            saw_model_type = model_type in _HF_TOKENIZER_MODEL_TYPES
-        if key == "vocab":
-            saw_vocab = True
+            model_type_value = model_type in _HF_TOKENIZER_MODEL_TYPES
 
         try:
             next_offset = _json_probe_skip_value_with_template_scan(
@@ -838,9 +911,14 @@ def _hf_tokenizer_probe_model_object(
                 value_offset,
                 state,
                 depth=1,
+                scan_string_template_indicators=False,
             )
         except _JSONProbeIncomplete:
             return None, saw_model_type and saw_vocab
+        if key == "type":
+            saw_model_type = model_type_value
+        if key == "vocab":
+            saw_vocab = True
 
         offset = next_offset
         offset = _json_probe_skip_whitespace(probe, offset)
@@ -918,7 +996,7 @@ def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
         file_size = file_path.stat().st_size
         if file_size < 4:
             return False
-        read_size = min(file_size, TOKENIZER_JSON_ROUTING_READ_BYTES)
+        read_size = min(file_size, TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES)
         probe = read_magic_bytes(str(file_path), read_size)
     except OSError:
         return False
@@ -936,15 +1014,11 @@ def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
     while offset < len(probe):
         offset = _json_probe_skip_whitespace(probe, offset)
         if offset >= len(probe):
-            return (
-                sample_is_prefix
-                and root_keys >= _HF_TOKENIZER_ROOT_KEYS
-                and saw_model_schema
-                and not state.has_template_evidence
-            )
+            return False
         if probe[offset] == ord("}"):
             return (
-                root_keys >= _HF_TOKENIZER_ROOT_KEYS
+                not sample_is_prefix
+                and root_keys >= _HF_TOKENIZER_ROOT_KEYS
                 and saw_model_schema
                 and not state.has_template_evidence
                 and _json_probe_has_only_trailing_whitespace(
@@ -975,6 +1049,7 @@ def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
             or key == "learner"
             or key in _HF_TOKENIZER_TEMPLATE_KEYS
             or key in _HF_TOKENIZER_JAX_ROUTE_KEYS
+            or _json_probe_root_string_value_has_jax_identity(probe, key, value_offset)
         ):
             return False
         if key in _HF_TOKENIZER_ROOT_KEYS:
@@ -988,12 +1063,7 @@ def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
             if state.has_template_evidence:
                 return False
             if next_offset is None:
-                return (
-                    sample_is_prefix
-                    and root_keys >= _HF_TOKENIZER_ROOT_KEYS
-                    and saw_model_schema
-                    and not _hf_tokenizer_suffix_has_route_conflict(file_path, file_size)
-                )
+                return False
         else:
             try:
                 next_offset = _json_probe_skip_value_with_template_scan(
@@ -1003,12 +1073,7 @@ def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
                     depth=1,
                 )
             except _JSONProbeIncomplete:
-                return (
-                    sample_is_prefix
-                    and root_keys >= _HF_TOKENIZER_ROOT_KEYS
-                    and saw_model_schema
-                    and not state.has_template_evidence
-                )
+                return False
             except _JSONProbeInvalid:
                 return False
             if state.has_template_evidence:
@@ -1016,18 +1081,14 @@ def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
 
         offset = _json_probe_skip_whitespace(probe, next_offset)
         if offset >= len(probe):
-            return (
-                sample_is_prefix
-                and root_keys >= _HF_TOKENIZER_ROOT_KEYS
-                and saw_model_schema
-                and not state.has_template_evidence
-            )
+            return False
         if probe[offset] == ord(","):
             offset += 1
             continue
         if probe[offset] == ord("}"):
             return (
-                root_keys >= _HF_TOKENIZER_ROOT_KEYS
+                not sample_is_prefix
+                and root_keys >= _HF_TOKENIZER_ROOT_KEYS
                 and saw_model_schema
                 and not state.has_template_evidence
                 and _json_probe_has_only_trailing_whitespace(
@@ -5466,6 +5527,11 @@ def _probe_jax_json_checkpoint_file(file_path: Path) -> bool | None:
 def is_jax_json_checkpoint_file(path: str | Path) -> bool:
     """Preserve confirmed and bounded-inconclusive JAX JSON candidates for scanning."""
     return _probe_jax_json_checkpoint_file(Path(path)) is not False
+
+
+def is_confirmed_jax_json_checkpoint_file(path: str | Path) -> bool:
+    """Return whether bounded routing positively identifies JAX JSON metadata."""
+    return _probe_jax_json_checkpoint_file(Path(path)) is True
 
 
 def _probe_content_routed_jax_json_checkpoint(file_path: Path) -> bool | None:
