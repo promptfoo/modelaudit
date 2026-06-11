@@ -1766,17 +1766,6 @@ class TextScanner(BaseScanner):
             ),
         )
 
-    @classmethod
-    def _calibrated_documentation_network_severity(
-        cls,
-        representative: dict[str, Any],
-        findings: list[dict[str, Any]],
-    ) -> str:
-        representative_severity = str(representative.get("severity", "WARNING")).upper()
-        if representative.get("type") in {"cloud_storage_url", "network_command"}:
-            return representative_severity
-        return cls._highest_documentation_network_severity(findings)
-
     @staticmethod
     def _documentation_network_evidence_fingerprint(evidence: dict[str, Any]) -> str:
         material = "|".join(
@@ -1886,10 +1875,7 @@ class TextScanner(BaseScanner):
                 entries,
                 key=lambda entry: cls._documentation_network_finding_sort_key(entry[1], entry[0]),
             )
-            severity = cls._calibrated_documentation_network_severity(
-                representative,
-                [entry[1] for entry in entries],
-            )
+            severity = cls._highest_documentation_network_severity([entry[1] for entry in entries])
             if str(representative.get("severity", "WARNING")).upper() != severity:
                 representative = {**representative, "severity": severity}
             related_findings = [
