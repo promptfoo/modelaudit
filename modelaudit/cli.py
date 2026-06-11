@@ -249,6 +249,11 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
     selected_files = _selected_huggingface_preview_files(files, runtime)
     total_size = metadata.get("total_size")
     selected_size = sum(item.get("size", 0) for item in selected_files if isinstance(item.get("size", 0), int))
+    if runtime.max_download_bytes is not None and selected_size > runtime.max_download_bytes:
+        raise ValueError(
+            f"Selected Hugging Face files total {selected_size} bytes exceeds max size "
+            f"{runtime.max_download_bytes} bytes"
+        )
 
     _preview_echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:", err=err)
     _preview_echo("   Type: Hugging Face repository", err=err)

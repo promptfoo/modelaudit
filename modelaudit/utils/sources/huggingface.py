@@ -1544,21 +1544,21 @@ def get_huggingface_file_info(url: str, max_size: int | None = None) -> dict[str
             raise ValueError(f"File not found: {filename}")
 
         file_size = getattr(file_metadata, "size", None)
+        if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
+            raise ValueError(f"Unable to determine file size for {display_url}; refusing dry-run")
+
         size_limit = max_size or None
-        if size_limit is not None:
-            if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
-                raise ValueError(f"Unable to determine file size for {display_url}; refusing capped dry-run")
-            if file_size > size_limit:
-                raise ValueError(
-                    f"File size ({_format_size(file_size)}) exceeds maximum allowed size ({_format_size(size_limit)})"
-                )
+        if size_limit is not None and file_size > size_limit:
+            raise ValueError(
+                f"File size ({_format_size(file_size)}) exceeds maximum allowed size ({_format_size(size_limit)})"
+            )
 
         return {
             "repo_id": repo_id,
             "revision": revision,
             "resolved_revision": resolved_revision,
             "filename": filename,
-            "size": file_size if isinstance(file_size, int) and not isinstance(file_size, bool) else None,
+            "size": file_size,
         }
     except Exception as e:
         raise Exception(f"Failed to get file info for {display_url}: {redact_huggingface_urls_in_text(str(e))}") from e

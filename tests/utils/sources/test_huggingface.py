@@ -3181,6 +3181,16 @@ class TestGetHuggingFaceFileInfo:
         with pytest.raises(Exception, match=r"File not found: missing\.bin"):
             get_huggingface_file_info("https://huggingface.co/test/model/resolve/main/missing.bin")
 
+    @patch("huggingface_hub.HfApi")
+    def test_get_huggingface_file_info_rejects_non_file_metadata(self, mock_hf_api_class: MagicMock) -> None:
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.repo_info.return_value = SimpleNamespace(sha=TEST_COMMIT_SHA)
+        mock_api.get_paths_info.return_value = [SimpleNamespace(path="folder")]
+
+        with pytest.raises(Exception, match="Unable to determine file size"):
+            get_huggingface_file_info("https://huggingface.co/test/model/resolve/main/folder")
+
 
 class TestHuggingFaceFileURLs:
     """Test HuggingFace direct file URL handling."""
