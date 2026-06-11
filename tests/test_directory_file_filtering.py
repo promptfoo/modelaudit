@@ -39,6 +39,7 @@ from tests.helpers import (
     prefix_mock_onnx_with_unknown_field,
     prefix_mock_onnx_with_unknown_group,
 )
+from tests.helpers.file_creators import valid_jpeg_bytes
 
 
 def _require_tf_protos() -> None:
@@ -754,7 +755,7 @@ class TestDirectoryFileFiltering:
     def test_real_images_remain_skipped(self, tmp_path: Path) -> None:
         """Content sniffing should not promote ordinary media files into the scan set."""
         image_path = tmp_path / "cover.jpg"
-        image_path.write_bytes(b"\xff\xd8\xff\xe0" + b"jpeg")
+        image_path.write_bytes(valid_jpeg_bytes())
 
         results = scan_model_directory_or_file(str(tmp_path))
 
