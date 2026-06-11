@@ -82,6 +82,7 @@ from modelaudit.utils.file.detection import (
     ONNX_ROUTING_INCONCLUSIVE_FORMAT,
     PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
     PROTOBUF_MODEL_CANDIDATE_FORMAT,
+    SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
@@ -276,6 +277,7 @@ _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unava
 _FORMAT_DETECTION_READ_FAILED_REASON = "format_detection_read_failed"
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON = "protobuf_model_routing_incomplete"
+_SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON = "sentencepiece_model_proto_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
 _PICKLE_ROUTING_INCOMPLETE_REASON = "pickle_routing_incomplete"
@@ -1480,6 +1482,26 @@ def _make_incomplete_protobuf_model_result(path: str) -> ScanResult:
     )
     _mark_inconclusive_scan_outcome(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
     _mark_operational_scan_error(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_sentencepiece_model_proto_result(path: str) -> ScanResult:
+    """Fail closed when a SentencePiece-like protobuf fails ownership validation."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="SentencePiece ModelProto Routing",
+        passed=False,
+        message=(
+            "SentencePiece ModelProto routing was inconclusive because the payload "
+            "looked like a tokenizer protobuf but failed ownership validation"
+        ),
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON)
     result.finish(success=False)
     return result
 
@@ -3759,6 +3781,14 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
+    if (
+        header_format == SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+        or magic_format == SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+    ):
+        sr = _make_incomplete_sentencepiece_model_proto_result(path)
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
     if header_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT or magic_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT:
         sr = _make_incomplete_pickle_routing_result(path)
         merge_safetensors_overlap_analysis(
@@ -4103,6 +4133,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 sr = _make_incomplete_xgboost_ubjson_routing_result(path)
             elif magic_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_onnx_routing_result(path)
+            elif magic_format == SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_sentencepiece_model_proto_result(path)
             elif magic_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_pickle_routing_result(path)
             elif magic_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:

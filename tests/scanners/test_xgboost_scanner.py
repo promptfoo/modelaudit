@@ -10,8 +10,10 @@ Tests cover various XGBoost model formats and security vulnerabilities:
 """
 
 import copy
+import gzip
 import io
 import json
+import os
 import pickle
 import struct
 import subprocess as real_subprocess
@@ -194,7 +196,7 @@ def _large_real_sentencepiece_model_proto_shape() -> bytes:
         ("[translate]", 4),
     ]
     pieces.extend((f"<0x{byte:02X}>", 6) for byte in range(256))
-    pieces.extend((f"t{index}", 1) for index in range(7000))
+    pieces.extend((f"t{index:05d}-{'x' * 470}", 1) for index in range(24000))
     return b"".join(
         _sentencepiece_piece(piece, piece_type) for piece, piece_type in pieces
     ) + _sentencepiece_trainer_spec(
@@ -227,6 +229,33 @@ def _write_official_sentencepiece_fixture(tmp_path: Path, fixture_name: str) -> 
     tokenizer_model = tmp_path / "tokenizer.model"
     tokenizer_model.write_bytes((_SENTENCEPIECE_FIXTURE_DIR / fixture_name).read_bytes())
     return tokenizer_model
+
+
+def _write_sentencepiece_archive(tmp_path: Path, archive_kind: str, member_name: str, payload: bytes) -> Path:
+    if archive_kind == "zip":
+        archive_file = tmp_path / "tokenizer-bundle.zip"
+        with zipfile.ZipFile(archive_file, "w") as archive:
+            archive.writestr(member_name, payload)
+        return archive_file
+    if archive_kind == "tar":
+        archive_file = tmp_path / "tokenizer-bundle.tar"
+        with tarfile.open(archive_file, "w") as archive:
+            info = tarfile.TarInfo(member_name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+        return archive_file
+    if archive_kind == "tar.gz":
+        archive_file = tmp_path / "tokenizer-bundle.tar.gz"
+        with tarfile.open(archive_file, "w:gz") as archive:
+            info = tarfile.TarInfo(member_name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+        return archive_file
+    if archive_kind == "gz":
+        archive_file = tmp_path / f"{Path(member_name).name}.gz"
+        archive_file.write_bytes(gzip.compress(payload))
+        return archive_file
+    raise AssertionError(f"Unhandled archive kind: {archive_kind}")
 
 
 @pytest.fixture
@@ -1945,31 +1974,151 @@ class TestXGBoostFailClosedEndToEnd:
         assert determine_exit_code(aggregate) == 0
         assert not any(issue.rule_code == "S1004" for issue in aggregate.issues)
 
-    def test_sentencepiece_ownership_probe_is_carried_through_direct_scan(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+    def test_sentencepiece_tokenizer_model_nested_archive_is_not_xgboost_false_positive(
+        self, tmp_path: Path, archive_kind: str
     ) -> None:
+        member_name = "models/tokenizer.model"
+        archive_file = tmp_path / f"tokenizer-bundle.{archive_kind}"
+        payload = _sentencepiece_model_proto()
+        if archive_kind == "zip":
+            with zipfile.ZipFile(archive_file, "w") as archive:
+                archive.writestr(member_name, payload)
+            direct_archive = ZipScanner({"cache_enabled": False}).scan(str(archive_file))
+        else:
+            with tarfile.open(archive_file, "w") as archive:
+                info = tarfile.TarInfo(member_name)
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+            direct_archive = TarScanner({"cache_enabled": False}).scan(str(archive_file))
+
+        aggregate = scan_model_directory_or_file(str(archive_file), cache_enabled=False)
+
+        assert direct_archive.success is True
+        assert not any(issue.rule_code == "S1004" for issue in direct_archive.issues)
+        _assert_no_xgboost_s1004(aggregate)
+
+    def test_sentencepiece_tokenizer_model_cli_xgboost_selection_is_not_false_positive(self, tmp_path: Path) -> None:
         tokenizer_model = tmp_path / "tokenizer.model"
         tokenizer_model.write_bytes(_sentencepiece_model_proto())
-        parse_calls = 0
-        original_parser = file_detection._has_strong_sentencepiece_model_proto_prefix
 
-        def count_sentencepiece_parse(data: bytes, *, sample_is_prefix: bool = False) -> bool:
-            nonlocal parse_calls
-            parse_calls += 1
-            return original_parser(data, sample_is_prefix=sample_is_prefix)
+        cli_result = CliRunner().invoke(
+            cli,
+            ["scan", "--no-cache", "--format", "json", "--scanners", "xgboost", str(tmp_path)],
+            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+        )
+        cli_payload = parse_click_json_output(cli_result.output)
 
-        file_detection._is_sentencepiece_model_proto_file_cached.cache_clear()
-        monkeypatch.setattr(
-            file_detection,
-            "_has_strong_sentencepiece_model_proto_prefix",
-            count_sentencepiece_parse,
+        assert cli_result.exit_code == 0
+        assert "xgboost" not in cli_payload.get("scanner_names", [])
+        assert not any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
+
+    def test_extensionless_sentencepiece_tokenizer_core_is_not_xgboost_false_positive(self, tmp_path: Path) -> None:
+        tokenizer_model = tmp_path / "tokenizer"
+        tokenizer_model.write_bytes(_sentencepiece_model_proto())
+
+        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+        assert detect_file_format(str(tokenizer_model)) == "unknown"
+        assert detect_file_format_from_magic(str(tokenizer_model)) == "unknown"
+        assert detect_file_format_for_skip_filter(str(tokenizer_model)) == "unknown"
+        assert direct.success is True
+        assert direct.scanner_name == "unknown"
+        _assert_no_xgboost_s1004(aggregate)
+
+    @pytest.mark.parametrize("payload_factory", _SENTENCEPIECE_SEMANTIC_MALFORMED_FACTORIES)
+    def test_extensionless_malformed_sentencepiece_model_fails_closed_without_xgboost(
+        self, tmp_path: Path, payload_factory: Callable[[], bytes]
+    ) -> None:
+        tokenizer_model = tmp_path / "tokenizer"
+        tokenizer_model.write_bytes(payload_factory())
+        expected_format = file_detection.SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+        expected_reason = "sentencepiece_model_proto_routing_incomplete"
+
+        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+        streaming = scan_model_streaming(
+            file_generator=iterate_files_streaming(tmp_path),
+            scan_root=str(tmp_path),
+            delete_after_scan=False,
+            cache_enabled=False,
+            skip_file_types=True,
+        )
+        cli_result = CliRunner().invoke(
+            cli,
+            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
+            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+        )
+        cli_payload = parse_click_json_output(cli_result.output)
+
+        assert detect_file_format(str(tokenizer_model)) == expected_format
+        assert detect_file_format_from_magic(str(tokenizer_model)) == expected_format
+        assert detect_file_format_for_skip_filter(str(tokenizer_model)) == expected_format
+        assert direct.success is False
+        assert direct.scanner_name == "unknown"
+        assert expected_reason in direct.metadata["scan_outcome_reasons"]
+        assert not any(issue.rule_code == "S1004" for issue in direct.issues)
+        assert "xgboost" not in aggregate.scanner_names
+        assert "xgboost" not in streaming.scanner_names
+        _assert_inconclusive_metadata(aggregate, tokenizer_model, expected_reason)
+        _assert_inconclusive_metadata(streaming, tokenizer_model, expected_reason)
+        assert determine_exit_code(aggregate) == 2
+        assert determine_exit_code(streaming) == 2
+        assert cli_result.exit_code == 2
+        assert "xgboost" not in cli_payload.get("scanner_names", [])
+        assert any(
+            expected_reason in issue.get("details", {}).get("scan_outcome_reason", "")
+            or "SentencePiece ModelProto routing was inconclusive" in issue.get("message", "")
+            for issue in cli_payload.get("issues", [])
         )
 
-        result = scan_file(str(tokenizer_model), config={"cache_enabled": False})
+    def test_model_card_text_mentions_do_not_trigger_xgboost_sentencepiece_routing(self, tmp_path: Path) -> None:
+        model_card = tmp_path / "README.md"
+        model_card.write_text(
+            "This repository ships a SentencePiece tokenizer.model file. "
+            "The words learner and version are documentation, not an XGBoost model.",
+            encoding="utf-8",
+        )
 
-        assert result.success is True
-        assert result.scanner_name == "unknown"
-        assert parse_calls == 1
+        result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+        assert determine_exit_code(result) == 0
+        assert "xgboost" not in result.scanner_names
+        assert not any(issue.rule_code == "S1004" for issue in result.issues)
+
+    def test_sentencepiece_payload_with_xgboost_only_suffix_still_fails_closed(self, tmp_path: Path) -> None:
+        deceptive_model = tmp_path / "tokenizer.bst"
+        deceptive_model.write_bytes(_sentencepiece_model_proto())
+
+        result = scan_file(str(deceptive_model), config={"cache_enabled": False})
+
+        assert result.success is False
+        assert result.scanner_name == "xgboost"
+        assert "xgboost_binary_structure_unrecognized" in result.metadata["scan_outcome_reasons"]
+        assert any(issue.rule_code == "S1004" for issue in result.issues)
+
+    def test_sentencepiece_ownership_rechecks_same_path_replacement(self, tmp_path: Path) -> None:
+        tokenizer_model = tmp_path / "tokenizer.model"
+        valid_tokenizer = _sentencepiece_model_proto()
+        tokenizer_model.write_bytes(valid_tokenizer)
+        original_stat = tokenizer_model.stat()
+
+        valid_result = scan_file(str(tokenizer_model), config={"cache_enabled": False})
+
+        assert valid_result.success is True
+        assert valid_result.scanner_name == "unknown"
+
+        replacement = b"custom xgboost binary gbtree reg:squarederror"
+        tokenizer_model.write_bytes(replacement.ljust(len(valid_tokenizer), b"\0"))
+        os.utime(tokenizer_model, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+        replaced_result = scan_file(str(tokenizer_model), config={"cache_enabled": False})
+
+        assert replaced_result.success is False
+        assert replaced_result.scanner_name == "xgboost"
+        assert "xgboost_binary_structure_unrecognized" in replaced_result.metadata["scan_outcome_reasons"]
+        assert any(issue.rule_code == "S1004" for issue in replaced_result.issues)
 
     def test_sentencepiece_model_with_proto2_default_unknown_metadata_is_not_xgboost_false_positive(
         self, tmp_path: Path
@@ -2066,7 +2215,7 @@ class TestXGBoostFailClosedEndToEnd:
         self, tmp_path: Path
     ) -> None:
         # Mirrors baidu/NAVA@16c20287... Wan2.2-TI2V-5B/google/umt5-xxl/spiece.model:
-        # a large SentencePiece ModelProto whose bounded prefix has thousands of small piece fields.
+        # a large SentencePiece ModelProto whose full payload exceeds the ownership read cap.
         tokenizer_model = tmp_path / "spiece.model"
         tokenizer_model.write_bytes(_large_real_sentencepiece_model_proto_shape())
 
@@ -2086,6 +2235,7 @@ class TestXGBoostFailClosedEndToEnd:
         )
         cli_payload = parse_click_json_output(cli_result.output)
 
+        assert tokenizer_model.stat().st_size > file_detection._SENTENCEPIECE_MODEL_PROTO_READ_BYTES
         assert detect_file_format(str(tokenizer_model)) == "unknown"
         assert detect_file_format_from_magic(str(tokenizer_model)) == "unknown"
         assert detect_file_format_for_skip_filter(str(tokenizer_model)) == "unknown"
@@ -2126,6 +2276,67 @@ class TestXGBoostFailClosedEndToEnd:
         assert cli_result.exit_code == 0
         assert "xgboost" not in cli_payload.get("scanner_names", [])
         assert not any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
+
+    @pytest.mark.parametrize("archive_kind", ["zip", "tar", "tar.gz", "gz"])
+    def test_archived_sentencepiece_model_is_not_xgboost_false_positive(
+        self, tmp_path: Path, archive_kind: str
+    ) -> None:
+        archive_file = _write_sentencepiece_archive(
+            tmp_path,
+            archive_kind,
+            "models/tokenizer.model",
+            _sentencepiece_model_proto(),
+        )
+
+        result = scan_model_directory_or_file(str(archive_file), cache_enabled=False)
+        cli_result = CliRunner().invoke(
+            cli,
+            ["scan", "--no-cache", "--format", "json", str(archive_file)],
+            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+        )
+        cli_payload = parse_click_json_output(cli_result.output)
+
+        assert determine_exit_code(result) == 0
+        assert "xgboost" not in result.scanner_names
+        assert not any(issue.rule_code == "S1004" for issue in result.issues)
+        assert cli_result.exit_code == 0
+        assert "xgboost" not in cli_payload.get("scanner_names", [])
+        assert not any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
+
+    @pytest.mark.parametrize("archive_kind", ["zip", "tar", "tar.gz", "gz"])
+    @pytest.mark.parametrize("payload_factory", _SENTENCEPIECE_SEMANTIC_MALFORMED_FACTORIES)
+    def test_extensionless_archived_malformed_sentencepiece_model_fails_closed_without_xgboost(
+        self, tmp_path: Path, archive_kind: str, payload_factory: Callable[[], bytes]
+    ) -> None:
+        member_name = "models/tokenizer"
+        archive_file = _write_sentencepiece_archive(tmp_path, archive_kind, member_name, payload_factory())
+        expected_location = f"{archive_file} -> tokenizer" if archive_kind == "gz" else f"{archive_file}:{member_name}"
+        expected_reason = "sentencepiece_model_proto_routing_incomplete"
+
+        result = scan_model_directory_or_file(str(archive_file), cache_enabled=False)
+        cli_result = CliRunner().invoke(
+            cli,
+            ["scan", "--no-cache", "--format", "json", str(archive_file)],
+            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+        )
+        cli_payload = parse_click_json_output(cli_result.output)
+        metadata = result.file_metadata[str(archive_file)]
+
+        assert determine_exit_code(result) == 2
+        assert "xgboost" not in result.scanner_names
+        assert expected_reason in metadata.get("scan_outcome_reasons", [])
+        assert any(
+            issue.location == expected_location
+            and "SentencePiece ModelProto routing was inconclusive" in str(issue.message)
+            for issue in result.issues
+        )
+        assert cli_result.exit_code == 2
+        assert "xgboost" not in cli_payload.get("scanner_names", [])
+        assert any(
+            issue.get("location") == expected_location
+            and "SentencePiece ModelProto routing was inconclusive" in issue.get("message", "")
+            for issue in cli_payload.get("issues", [])
+        )
 
     def test_malformed_sentencepiece_like_model_still_fails_closed_in_xgboost(self, tmp_path: Path) -> None:
         tokenizer_model = tmp_path / "tokenizer.model"
@@ -2171,28 +2382,31 @@ class TestXGBoostFailClosedEndToEnd:
         assert "xgboost" in cli_payload.get("scanner_names", [])
         assert any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
 
-    @pytest.mark.parametrize("archive_kind", ["zip", "tar"])
+    @pytest.mark.parametrize("archive_kind", ["zip", "tar", "tar.gz", "gz"])
     @pytest.mark.parametrize("payload_factory", _SENTENCEPIECE_SEMANTIC_MALFORMED_FACTORIES)
     def test_archived_semantically_malformed_sentencepiece_model_still_fails_closed_in_xgboost(
         self, tmp_path: Path, archive_kind: str, payload_factory: Callable[[], bytes]
     ) -> None:
         member_name = "models/tokenizer.model"
-        archive_file = tmp_path / f"tokenizer-bundle.{archive_kind}"
-        payload = payload_factory()
-        if archive_kind == "zip":
-            with zipfile.ZipFile(archive_file, "w") as archive:
-                archive.writestr(member_name, payload)
-        else:
-            with tarfile.open(archive_file, "w") as archive:
-                info = tarfile.TarInfo(member_name)
-                info.size = len(payload)
-                archive.addfile(info, io.BytesIO(payload))
+        archive_file = _write_sentencepiece_archive(tmp_path, archive_kind, member_name, payload_factory())
 
         result = scan_model_directory_or_file(str(archive_file), cache_enabled=False)
+        cli_result = CliRunner().invoke(
+            cli,
+            ["scan", "--no-cache", "--format", "json", str(archive_file)],
+            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+        )
+        cli_payload = parse_click_json_output(cli_result.output)
+        expected_location = (
+            f"{archive_file} -> tokenizer.model" if archive_kind == "gz" else f"{archive_file}:{member_name}"
+        )
 
         assert determine_exit_code(result) == 2
+        assert any(issue.rule_code == "S1004" and issue.location == expected_location for issue in result.issues)
+        assert cli_result.exit_code == 2
         assert any(
-            issue.rule_code == "S1004" and issue.location == f"{archive_file}:{member_name}" for issue in result.issues
+            issue.get("rule_code") == "S1004" and issue.get("location") == expected_location
+            for issue in cli_payload.get("issues", [])
         )
 
     @pytest.mark.parametrize("tail", _SENTENCEPIECE_MALFORMED_TAILS)
