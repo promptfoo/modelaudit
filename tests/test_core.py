@@ -10,6 +10,7 @@ import io
 import json
 import os
 import pickle
+import stat
 import struct
 import subprocess
 import sys
@@ -19,6 +20,7 @@ import zlib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -77,6 +79,28 @@ from tests.helpers import (
 )
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
+
+
+def test_directory_owner_snapshot_ignores_directory_link_count_drift() -> None:
+    def snapshot_stat(*, mode: int, link_count: int) -> Any:
+        return SimpleNamespace(
+            st_dev=1,
+            st_ino=2,
+            st_mode=mode,
+            st_size=3,
+            st_mtime_ns=4,
+            st_ctime_ns=5,
+            st_nlink=link_count,
+        )
+
+    assert core_module._directory_owner_snapshot_stat_matches(
+        snapshot_stat(mode=stat.S_IFDIR | 0o755, link_count=1),
+        snapshot_stat(mode=stat.S_IFDIR | 0o755, link_count=2),
+    )
+    assert not core_module._directory_owner_snapshot_stat_matches(
+        snapshot_stat(mode=stat.S_IFREG | 0o644, link_count=1),
+        snapshot_stat(mode=stat.S_IFREG | 0o644, link_count=2),
+    )
 
 
 def _mock_weight_distribution_scanner_availability(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1495,6 +1519,50 @@ def test_filtered_savedmodel_owner_asset_updates_aggregate_hash_and_accounting(t
     assert first.bytes_scanned != second.bytes_scanned
     assert determine_exit_code(first) == 0
     assert determine_exit_code(second) == 0
+
+
+def test_savedmodel_owner_snapshot_ignores_directory_link_count_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_tf_protos()
+    model_dir = tmp_path / "saved-model"
+    model_dir.mkdir()
+    saved_model_path = model_dir / "saved_model.pb"
+    _write_safe_savedmodel(saved_model_path)
+    assets_dir = model_dir / "assets"
+    assets_dir.mkdir()
+    asset_path = assets_dir / "notes.txt"
+    asset_path.write_bytes(b"benign asset")
+    original_lstat = Path.lstat
+
+    def drift_directory_link_count(candidate: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+        candidate_stat = original_lstat(candidate, *args, **kwargs)
+        if candidate != assets_dir:
+            return candidate_stat
+        return cast(
+            os.stat_result,
+            SimpleNamespace(
+                st_dev=candidate_stat.st_dev,
+                st_ino=candidate_stat.st_ino,
+                st_mode=candidate_stat.st_mode,
+                st_size=candidate_stat.st_size,
+                st_mtime_ns=candidate_stat.st_mtime_ns,
+                st_ctime_ns=candidate_stat.st_ctime_ns,
+                st_nlink=candidate_stat.st_nlink + 1,
+            ),
+        )
+
+    monkeypatch.setattr(core_module.os, "supports_fd", set())
+    monkeypatch.setattr(core_module.os, "supports_dir_fd", set())
+    monkeypatch.setattr(Path, "lstat", drift_directory_link_count)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+    owner_metadata = result.file_metadata[str(model_dir)]
+
+    assert result.content_hash is not None
+    assert owner_metadata["directory_owner_scan"] is True
+    assert determine_exit_code(result) == 0
 
 
 def test_savedmodel_owner_and_child_sources_share_total_size_budget(tmp_path: Path) -> None:
