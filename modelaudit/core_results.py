@@ -150,6 +150,7 @@ def record_has_incomplete_coverage_for_path(record: Any, file_path: str) -> bool
         if Path(location).resolve(strict=False) == Path(file_path_str).resolve(strict=False):
             return True
     except (OSError, RuntimeError, ValueError):
+        # Malformed or unresolvable locations still use the lexical fallback below.
         pass
 
     return file_path_str in location
