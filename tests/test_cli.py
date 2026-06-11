@@ -4790,7 +4790,7 @@ def test_scan_huggingface_streaming_incomplete_result_reports_failed_progress(
         success=False,
     )
 
-    result = CliRunner().invoke(cli, ["scan", "--stream", "hf://test/model"])
+    result = CliRunner().invoke(cli, ["scan", "--stream", "--format", "text", "hf://test/model"])
     clean_output = strip_ansi(result.output)
 
     assert result.exit_code == 2
@@ -4832,7 +4832,7 @@ def test_scan_huggingface_streaming_security_findings_keep_complete_progress(
         success=True,
     )
 
-    result = CliRunner().invoke(cli, ["scan", "--stream", "hf://test/malicious-model"])
+    result = CliRunner().invoke(cli, ["scan", "--stream", "--format", "text", "hf://test/malicious-model"])
     clean_output = strip_ansi(result.output)
 
     assert result.exit_code == 1
