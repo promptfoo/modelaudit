@@ -1440,9 +1440,10 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 source_changed = initial_identity != opened_identity or opened_identity != final_identity
         except OSError as exc:
             if "identity changed" in str(exc):
-                changed_size = file_stat.st_size
-                with contextlib.suppress(OSError):
+                try:
                     changed_size = file_path.lstat().st_size
+                except OSError:
+                    changed_size = file_stat.st_size
                 mark_inconclusive_scan_result(result, "savedmodel_asset_source_changed")
                 mark_operational_scan_error(result, "savedmodel_asset_source_changed")
                 result.add_check(
