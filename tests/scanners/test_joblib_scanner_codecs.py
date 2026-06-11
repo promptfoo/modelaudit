@@ -12,6 +12,7 @@ import struct
 import zlib
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -47,10 +48,21 @@ def _has_system_reduce_failure(result: ScanResult) -> bool:
     )
 
 
-def _scan_payload(tmp_path: Path, payload: bytes, filename: str) -> ScanResult:
+def _scan_payload(
+    tmp_path: Path,
+    payload: bytes,
+    filename: str,
+    *,
+    trust_numpy_array_wrapper: bool = True,
+) -> ScanResult:
     path = tmp_path / filename
     path.write_bytes(payload)
-    return JoblibScanner().scan(str(path))
+
+    def trust_joblib_wrapper(module: str, name: str) -> bool:
+        return trust_numpy_array_wrapper and (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper")
+
+    with patch("modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted", trust_joblib_wrapper):
+        return JoblibScanner().scan(str(path))
 
 
 def _joblib_numpy_wrapper_stop_prefix() -> bytes:
@@ -511,6 +523,26 @@ def test_scan_trusts_numpy_wrapper_raw_array_tail_after_build_handoff(tmp_path: 
     assert result.metadata["trusted_incomplete_tail_reason"] == "joblib_numpy_array_payload"
     assert result.metadata["joblib_numpy_array_payload_count"] == 1
     assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
+
+
+def test_scan_keeps_untrusted_numpy_wrapper_origin_review_after_valid_raw_array(tmp_path: Path) -> None:
+    payload = _joblib_numpy_list_payload(resumed_ops=_binunicode("done"))
+
+    result = _scan_payload(
+        tmp_path,
+        payload,
+        "untrusted_numpy_array_tail.joblib",
+        trust_numpy_array_wrapper=False,
+    )
+
+    assert result.success is False
+    assert "trusted_incomplete_tail" not in result.metadata
+
+    def has_numpy_wrapper_origin_review(finding: object) -> bool:
+        details = getattr(finding, "details", None)
+        return isinstance(details, dict) and details.get("import_reference") == "joblib.numpy_pickle.NumpyArrayWrapper"
+
+    assert any(has_numpy_wrapper_origin_review(finding) for finding in (*result.issues, *result.checks))
 
 
 def test_scan_accepts_numpy_matrix_array_payload(tmp_path: Path) -> None:

@@ -18,6 +18,7 @@ from importlib.metadata import version as distribution_version
 from typing import Any, ClassVar, cast
 
 import numpy as np
+from modelaudit_picklescan.call_graph import import_only_reference_is_proven_trusted
 
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
 from ..scanner_results import mark_inconclusive_scan_result
@@ -34,7 +35,9 @@ _MAX_JOBLIB_CONTROL_OPCODES = 1000000
 _MAX_JOBLIB_ARRAY_DIMENSIONS = 64
 _NUMPY_DTYPE_HAS_OBJECT_FLAG = 1
 _JOBLIB_COMPRESSED_PREFIXES = (b"x", b"\x1f\x8b", b"]\x00", b"\xfd7zXZ")
-_JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE = "joblib.numpy_pickle.NumpyArrayWrapper"
+_JOBLIB_NUMPY_ARRAY_WRAPPER_MODULE = "joblib.numpy_pickle"
+_JOBLIB_NUMPY_ARRAY_WRAPPER_NAME = "NumpyArrayWrapper"
+_JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE = f"{_JOBLIB_NUMPY_ARRAY_WRAPPER_MODULE}.{_JOBLIB_NUMPY_ARRAY_WRAPPER_NAME}"
 
 
 @dataclass(frozen=True)
@@ -744,7 +747,7 @@ class JoblibScanner(BaseScanner):
         result.merge(sub_result)
         if has_only_validated_codec_encodes:
             self._remove_validated_dtype_codec_findings(result)
-        if raw_array_count:
+        if raw_array_count and self._numpy_array_wrapper_origin_is_trusted():
             self._remove_validated_numpy_array_wrapper_findings(result)
         result.metadata.pop("trusted_incomplete_tail", None)
         result.metadata.pop("trusted_incomplete_tail_reason", None)
@@ -777,6 +780,16 @@ class JoblibScanner(BaseScanner):
 
         result.issues = [issue for issue in result.issues if not is_validated_dtype_codec_finding(issue)]
         result.checks = [check for check in result.checks if not is_validated_dtype_codec_finding(check)]
+
+    @staticmethod
+    def _numpy_array_wrapper_origin_is_trusted() -> bool:
+        try:
+            return import_only_reference_is_proven_trusted(
+                _JOBLIB_NUMPY_ARRAY_WRAPPER_MODULE,
+                _JOBLIB_NUMPY_ARRAY_WRAPPER_NAME,
+            )
+        except Exception:
+            return False
 
     @staticmethod
     def _remove_validated_numpy_array_wrapper_findings(result: ScanResult) -> None:

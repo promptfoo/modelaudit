@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, ClassVar, TextIO, cast
 
 from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
+from modelaudit_picklescan.call_graph import import_only_reference_is_proven_trusted
 
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 from modelaudit.utils.helpers.code_validation import validate_python_syntax
@@ -39,7 +40,9 @@ _MIN_JAX_PICKLE_SCAN_LIMIT_BYTES = 1024
 _ROOT_EXPENSIVE_RAW_SCAN_LIMIT_BYTES = 1 * 1024 * 1024
 _MAX_METADATA_PICKLE_READ_BYTES = 10 * 1024 * 1024
 _KNOWN_PICKLE_EXTENSIONS = frozenset({".pkl", ".pickle", ".dill", ".joblib"})
-_LEGITIMATE_SERIALIZATION_ORIGIN_REVIEW_REFERENCES = frozenset({"joblib.numpy_pickle.NumpyArrayWrapper"})
+_JOBLIB_NUMPY_ARRAY_WRAPPER_MODULE = "joblib.numpy_pickle"
+_JOBLIB_NUMPY_ARRAY_WRAPPER_NAME = "NumpyArrayWrapper"
+_JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE = f"{_JOBLIB_NUMPY_ARRAY_WRAPPER_MODULE}.{_JOBLIB_NUMPY_ARRAY_WRAPPER_NAME}"
 _PYTORCH_CONTAINER_EXTENSIONS = frozenset({".bin", ".pt", ".pth", ".ckpt", ".pkl"})
 _BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{10,}={0,2}(?![A-Za-z0-9+/=])")
 _HEX_TOKEN_RE = re.compile(rb"(?<![A-Fa-f0-9])[A-Fa-f0-9]{20,}(?![A-Fa-f0-9])")
@@ -1782,15 +1785,27 @@ def _is_legitimate_serialization_file(path: str) -> bool:
         report = StandalonePickleScanner().scan_file(path_obj, enrich_call_graph=False)
     except Exception:
         return False
+    joblib_wrapper_origin_is_trusted = _joblib_numpy_array_wrapper_origin_is_trusted()
     security_findings = tuple(
         finding
         for finding in report.findings
         if not (
-            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-            and str(finding.details.get("import_reference", "")) in _LEGITIMATE_SERIALIZATION_ORIGIN_REVIEW_REFERENCES
+            joblib_wrapper_origin_is_trusted
+            and finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+            and str(finding.details.get("import_reference", "")) == _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE
         )
     )
     return not security_findings and report.status.value != "error"
+
+
+def _joblib_numpy_array_wrapper_origin_is_trusted() -> bool:
+    try:
+        return import_only_reference_is_proven_trusted(
+            _JOBLIB_NUMPY_ARRAY_WRAPPER_MODULE,
+            _JOBLIB_NUMPY_ARRAY_WRAPPER_NAME,
+        )
+    except Exception:
+        return False
 
 
 def _path_prefix_looks_like_pickle(path: str) -> bool:

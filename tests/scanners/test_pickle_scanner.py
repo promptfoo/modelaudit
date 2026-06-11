@@ -2662,17 +2662,38 @@ def test_policy_compatibility_exports_cover_required_dangerous_symbols() -> None
     assert is_suspicious_global("json", "loads") is False
 
 
-def test_legitimate_serialization_file_uses_rust_scan(tmp_path: Path) -> None:
+def test_legitimate_serialization_file_uses_rust_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     safe_path = tmp_path / "safe.joblib"
     safe_path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00.")
     malicious_path = tmp_path / "evil.joblib"
     malicious_path.write_bytes(pickle.dumps(MaliciousPayload(), protocol=4))
     text_path = tmp_path / "not-pickle.joblib"
     text_path.write_text("not a pickle", encoding="utf-8")
+    monkeypatch.setattr(
+        "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
+        lambda module, name: (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper"),
+    )
 
     assert _is_legitimate_serialization_file(str(safe_path)) is True
     assert _is_legitimate_serialization_file(str(malicious_path)) is False
     assert _is_legitimate_serialization_file(str(text_path)) is False
+
+
+def test_legitimate_serialization_file_keeps_untrusted_wrapper_origin_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe_path = tmp_path / "safe.joblib"
+    safe_path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00.")
+    monkeypatch.setattr(
+        "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
+        lambda _module, _name: False,
+    )
+
+    assert _is_legitimate_serialization_file(str(safe_path)) is False
 
 
 def test_legitimate_serialization_file_skips_call_graph_enrichment(
@@ -2686,6 +2707,10 @@ def test_legitimate_serialization_file_skips_call_graph_enrichment(
         raise AssertionError("validation helper should use native Rust findings only")
 
     monkeypatch.setattr("modelaudit_picklescan.api._with_call_graph_findings", fail_call_graph_enrichment)
+    monkeypatch.setattr(
+        "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
+        lambda module, name: (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper"),
+    )
 
     assert _is_legitimate_serialization_file(str(safe_path)) is True
 
@@ -2701,6 +2726,10 @@ def test_legitimate_serialization_file_keeps_bounded_file_reads(
         raise AssertionError("validation helper should preserve bounded scanner reads")
 
     monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    monkeypatch.setattr(
+        "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
+        lambda module, name: (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper"),
+    )
 
     assert _is_legitimate_serialization_file(str(safe_path)) is True
 

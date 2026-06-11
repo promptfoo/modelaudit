@@ -37,6 +37,8 @@ _HF_T10_REVISION = "272068e81a31e88a48ea03c20a09decba2b62ed6"
 _HF_T10_FILENAME = "training_args.bin"
 _HF_T10_SHA256 = "995b5f0a2fe72453ddc8ce97e1a93747554ec3ec0ac92d86e82a57050db51b85"
 _HF_T10_MAX_BYTES = 10 * 1024 * 1024
+_HF_TORCHSCRIPT_QA_REPO_ID = "google-bert/bert-large-uncased"
+_HF_TORCHSCRIPT_QA_REVISION = "6da4b6a26a1877e173fca3225479512db81a5e5b"
 
 
 def _pickle_global(module: str, name: str) -> bytes:
@@ -59,6 +61,18 @@ def _metadata_reduce_payload(module: str, name: str, value: bytes = b"metadata")
 
 def _metadata_newobj_build_payload(module: str, name: str) -> bytes:
     return _pickle_global(module, name) + b")\x81}b"
+
+
+def _torchscript_module_build_intlist_payload() -> bytes:
+    return (
+        b"\x80\x02"
+        + _pickle_global("__torch__", "Module")
+        + b")\x81}"
+        + _pickle_binunicode(b"shape")
+        + _pickle_global("torch.jit._pickle", "build_intlist")
+        + b"](K\x01K\x02K\x03e\x85R"
+        + b"sb."
+    )
 
 
 def _hf_training_args_metadata_payload() -> bytes:
@@ -6324,6 +6338,61 @@ def test_pytorch_zip_allows_torchscript_generated_python_files(tmp_path: Path) -
         and "archive/code/__torch__" in issue.location
         and issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]
+
+
+def test_pytorch_zip_hf_google_bert_rust_model_torchscript_reconstruction_control(tmp_path: Path) -> None:
+    model_path = tmp_path / "rust_model.ot"
+    debug_pkl = b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00."
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _torchscript_module_build_intlist_payload())
+        zip_file.writestr(
+            "archive/code/__torch__.py",
+            "\n".join(
+                [
+                    "class Module(Module):",
+                    "  __parameters__ = []",
+                    "  __buffers__ = []",
+                    "  training : bool",
+                    "  def forward(self: __torch__.Module,",
+                    "    x: Tensor) -> Tensor:",
+                    "    return x",
+                    "",
+                ]
+            ),
+        )
+        zip_file.writestr("archive/code/__torch__.py.debug_pkl", debug_pkl)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert not any(check.severity == IssueSeverity.CRITICAL for check in result.checks)
+    assert any(
+        set(issue.details.get("import_analysis", {}).get("found_imports", ()))
+        >= {
+            "__torch__.Module",
+            "torch.jit._pickle.build_intlist",
+        }
+        for issue in result.issues
+    )
+    assert any(
+        issue.details.get("associated_global") == "__torch__.Module"
+        and str(issue.location).startswith(f"{model_path}:archive/data.pkl")
+        for issue in result.issues
+    )
+    assert any(
+        issue.details.get("associated_global") == "torch.jit._pickle.build_intlist"
+        and str(issue.location).startswith(f"{model_path}:archive/data.pkl")
+        for issue in result.issues
+    )
+    assert not any(
+        check.name == "Python Code File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("file") == "archive/code/__torch__.py"
+        for check in result.checks
+    ), f"{_HF_TORCHSCRIPT_QA_REPO_ID}@{_HF_TORCHSCRIPT_QA_REVISION}"
 
 
 def test_pytorch_zip_requires_exact_case_torchscript_debug_pair(tmp_path: Path) -> None:

@@ -226,7 +226,6 @@ def _force_framework_metadata_unresolved(monkeypatch: pytest.MonkeyPatch) -> Non
 
 _SHADOW_FRAMEWORK_MODULE = "transformers.training_args"
 _SHADOW_FRAMEWORK_NAME = "TrainingArguments"
-_SHADOW_FRAMEWORK_REFERENCE = f"{_SHADOW_FRAMEWORK_MODULE}.{_SHADOW_FRAMEWORK_NAME}"
 
 
 def _stack_global_reference_payload(protocol: int) -> bytes:
