@@ -187,6 +187,10 @@ class TestSecretsDetector:
                 f"HTTP_PROXY_AUTH_HEADER=Basic {_basic_auth_token(b'http-proxy-auth-header:pass')}",
                 _basic_auth_token(b"http-proxy-auth-header:pass"),
             ),
+            (
+                f"proxy_authorization_header: Basic {_basic_auth_token(b'proxy-authorization-header:pass')}",
+                _basic_auth_token(b"proxy-authorization-header:pass"),
+            ),
             ("Proxy-Authorization:\tBasic\tQWxhZGRpbjpvcGVuIHNlc2FtZQ==", "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="),
             ("aUtHoRiZaTiOn: bAsIc dTpw", "dTpw"),
             ("GET / HTTP/1.1\r\nHost: example.test\r\nAuthorization: Basic YTo/Pz8/\r\n", "YTo/Pz8/"),
@@ -325,6 +329,10 @@ class TestSecretsDetector:
             (
                 f'const init = {{ headers: [["Authorization", "Basic {_basic_auth_token(b"init-headers:pass")}"]] }}',
                 _basic_auth_token(b"init-headers:pass"),
+            ),
+            (
+                f"headers=[('Authorization', 'Basic {_basic_auth_token(b'assignment-tuple:pass')}')]",
+                _basic_auth_token(b"assignment-tuple:pass"),
             ),
             (
                 'fetch("/model", { headers: [["Accept", "application/json"], '
@@ -470,6 +478,49 @@ class TestSecretsDetector:
         findings = detector.scan_dict(data)
 
         assert _basic_auth_findings(findings)
+
+    @pytest.mark.parametrize(
+        ("name_key", "value_key", "header_name"),
+        [
+            ("name", "value", "Authorization"),
+            ("header", "value", "Proxy-Authorization"),
+            ("header_name", "header_value", "authorization"),
+            ("headerName", "headerValue", "proxy_authorization_header"),
+            ("key", "value", "HTTP_PROXY_AUTHORIZATION_HEADER"),
+        ],
+    )
+    def test_basic_auth_structured_header_objects_are_detected(
+        self,
+        name_key: str,
+        value_key: str,
+        header_name: str,
+    ) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"header-object:pass")
+
+        findings = detector.scan_dict({"headers": [{name_key: header_name, value_key: f"Basic {token}"}]})
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert token not in json.dumps(basic_findings, sort_keys=True)
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"metadata": [{"name": "Authorization", "value": f"Basic {_basic_auth_token(b'object-leak:pass')}"}]},
+            {"headers": [{"name": "Authorization", "description": f"Basic {_basic_auth_token(b'field-leak:pass')}"}]},
+        ],
+    )
+    def test_basic_auth_structured_header_object_context_does_not_leak(
+        self,
+        data: dict[str, object],
+    ) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_dict(data)
+
+        assert _basic_auth_findings(findings) == []
 
     @pytest.mark.parametrize(
         "data",

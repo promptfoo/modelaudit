@@ -356,7 +356,8 @@ BASIC_AUTH_HEADER_PREFIX_PATTERN = re.compile(
     r"(?:^|[^\w-])(?:"
     r"(?:http[-_]?)?(?:"
     r"proxy[-_]?authorization|proxyauthorization|authorization"
-    r"|basic[-_]?auth|auth[-_]?header|authorization[-_]?header|proxy[-_]?auth[-_]?header"
+    r"|basic[-_]?auth|auth[-_]?header|authorization[-_]?header"
+    r"|proxy[-_]?(?:auth|authorization)[-_]?header"
     r")"
     r")"
     r"\s*(?:\\?[\"'])?\s*(?:\\?\])?\s*[:=]\s*"
@@ -375,12 +376,12 @@ BASIC_AUTH_HEADERS_CONSTRUCTOR_START_PATTERN = re.compile(
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADERS_CONSTRUCTOR_TUPLE_PREFIX_PATTERN = re.compile(
-    r"\[\s*\\?[\"']\s*"
+    r"[\[(]\s*\\?[\"']\s*"
     r"(?:proxy-authorization|authorization)\s*\\?[\"']\s*,\s*\\?[\"']?\s*$",
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADERS_INIT_START_PATTERN = re.compile(
-    r"(?:^|[^\w$])(?:\\?[\"']\s*)?headers\s*(?:\\?[\"'])?\s*:\s*\[",
+    r"(?:^|[^\w$])(?:\\?[\"']\s*)?headers\s*(?:\\?[\"'])?\s*[:=]\s*\[",
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS = 256
@@ -392,7 +393,10 @@ BASIC_AUTH_HEADER_NAMES = {
     "authheader": "Authorization",
     "authorizationheader": "Authorization",
     "proxyauthheader": "Proxy-Authorization",
+    "proxyauthorizationheader": "Proxy-Authorization",
 }
+BASIC_AUTH_HEADER_OBJECT_NAME_KEYS = frozenset({"header", "headername", "key", "name"})
+BASIC_AUTH_HEADER_OBJECT_VALUE_KEYS = frozenset({"headervalue", "value"})
 BASIC_AUTH_CONTINUATION_PREFIX_PATTERN = re.compile(r"^\s*(?:-\s*)?[\"']?$")
 BASIC_AUTH_HEADER_VALUE_PATTERN = re.compile(rf"^\s*{BASIC_AUTH_PATTERN}", re.IGNORECASE)
 BASIC_AUTH_VALUE_PREFIX_PATTERN = re.compile(r"^\s*Basic\s+", re.IGNORECASE)
@@ -416,6 +420,15 @@ def _is_basic_auth_header_name(value: str) -> bool:
     return _canonical_basic_auth_header_name(value) is not None
 
 
+def _normalize_basic_auth_structured_key(value: object) -> str | None:
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+    return _normalize_basic_auth_header_name(str(value))
+
+
 def _canonical_basic_auth_header_key(value: object) -> str | None:
     if isinstance(value, bytes):
         try:
@@ -426,12 +439,21 @@ def _canonical_basic_auth_header_key(value: object) -> str | None:
 
 
 def _is_basic_auth_headers_container_key(value: object) -> bool:
-    if isinstance(value, bytes):
-        try:
-            value = value.decode("ascii")
-        except UnicodeDecodeError:
-            return False
-    return _normalize_basic_auth_header_name(str(value)) == "headers"
+    return _normalize_basic_auth_structured_key(value) == "headers"
+
+
+def _is_basic_auth_header_object_name_key(value: object) -> bool:
+    return _normalize_basic_auth_structured_key(value) in BASIC_AUTH_HEADER_OBJECT_NAME_KEYS
+
+
+def _is_basic_auth_header_object_value_key(value: object) -> bool:
+    return _normalize_basic_auth_structured_key(value) in BASIC_AUTH_HEADER_OBJECT_VALUE_KEYS
+
+
+def _canonical_basic_auth_header_object_name_value(value: object) -> str | None:
+    if not isinstance(value, str | bytes):
+        return None
+    return _canonical_basic_auth_header_key(value)
 
 
 class SecretsDetector:
@@ -890,6 +912,36 @@ class SecretsDetector:
             return findings
         return []
 
+    def _scan_basic_auth_structured_header_object(
+        self,
+        data: dict[Any, Any],
+        context: str,
+    ) -> list[dict[str, Any]] | None:
+        header_name = next(
+            (
+                candidate
+                for key, value in data.items()
+                if _is_basic_auth_header_object_name_key(key)
+                for candidate in [_canonical_basic_auth_header_object_name_value(value)]
+                if candidate is not None
+            ),
+            None,
+        )
+        if header_name is None:
+            return None
+
+        findings: list[dict[str, Any]] = []
+        for key, value in data.items():
+            if self._findings_truncated:
+                break
+            key_context = f"{context}/{key}" if context else str(key)
+            findings.extend(self.scan_text(str(key), f"{key_context}[key]"))
+            value_header_name = (
+                header_name if _is_basic_auth_header_object_value_key(key) else _canonical_basic_auth_header_key(key)
+            )
+            findings.extend(self._scan_basic_auth_structured_header_value(value, value_header_name, key_context))
+        return findings
+
     def scan_bytes(self, data: bytes, context: str = "") -> list[dict[str, Any]]:
         """Scan binary data for embedded secrets.
 
@@ -1169,6 +1221,11 @@ class SecretsDetector:
                                     f"{item_context}[1]",
                                 )
                             )
+                            continue
+                    if headers_container and isinstance(item, dict):
+                        header_object_findings = self._scan_basic_auth_structured_header_object(item, item_context)
+                        if header_object_findings is not None:
+                            findings.extend(header_object_findings)
                             continue
                     findings.extend(self._scan_basic_auth_structured_header_value(item, header_name, item_context))
             else:
