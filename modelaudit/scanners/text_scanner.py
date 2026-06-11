@@ -73,6 +73,7 @@ MAX_TOKENIZER_VOCABULARY_TOKEN_BYTES = 256
 MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES = 1024
 TOKENIZER_VOCABULARY_SENTINELS = frozenset({b"[PAD]", b"[UNK]", b"[CLS]", b"[SEP]", b"[MASK]"})
 TOKENIZER_VOCABULARY_SUBWORD_PREFIXES = ("##", "\u0120", "\u2581")
+TOKENIZER_VOCABULARY_SUBWORD_SUFFIXES = ("</w>", "@@")
 BARE_NETWORK_URL_TOKEN_PATTERN = re.compile(rb"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 REQUIREMENTS_RAW_URL_PATTERN = re.compile(rb"https?://\S+", re.IGNORECASE)
 BARE_NETWORK_IPV4_TOKEN_PATTERN = re.compile(
@@ -696,7 +697,16 @@ class TextScanner(BaseScanner):
         nonempty_lines = 0
         sentinel_lines = 0
         subword_lines = 0
-        for raw_line in payload.splitlines():
+        line_start = 0
+        payload_length = len(payload)
+        while line_start < payload_length:
+            line_end = payload.find(b"\n", line_start)
+            if line_end < 0:
+                line_end = payload_length
+            raw_line = payload[line_start:line_end]
+            if raw_line.endswith(b"\r"):
+                raw_line = raw_line[:-1]
+            line_start = line_end + 1 if line_end < payload_length else payload_length
             line = raw_line.strip()
             if not line:
                 continue
@@ -710,7 +720,9 @@ class TextScanner(BaseScanner):
                 line_text = line.decode("utf-8")
             except UnicodeDecodeError:
                 continue
-            if line_text.startswith(TOKENIZER_VOCABULARY_SUBWORD_PREFIXES):
+            if line_text.startswith(TOKENIZER_VOCABULARY_SUBWORD_PREFIXES) or line_text.endswith(
+                TOKENIZER_VOCABULARY_SUBWORD_SUFFIXES
+            ):
                 subword_lines += 1
         return nonempty_lines, token_lines, sentinel_lines, subword_lines
 
@@ -1559,6 +1571,10 @@ class TextScanner(BaseScanner):
         for prefix in ("##", "\u0120", "\u2581"):
             if line_text.startswith(prefix):
                 line_text = line_text[len(prefix) :]
+                break
+        for suffix in TOKENIZER_VOCABULARY_SUBWORD_SUFFIXES:
+            if line_text.endswith(suffix):
+                line_text = line_text[: -len(suffix)]
                 break
 
         pattern_text = pattern.casefold()
