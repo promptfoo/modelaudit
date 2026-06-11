@@ -420,7 +420,7 @@ def _huggingface_stream_preview_enforce_content_route_candidate_limit(
     selected_files: list[dict[str, Any]],
     runtime: "_ScanRuntimeConfig",
 ) -> None:
-    """Mirror the streaming selector's bounded content-probe candidate count."""
+    """Mirror the streaming selector's bounded content-probe candidate budgets."""
     candidates = _huggingface_stream_preview_content_route_candidate_files(metadata, selected_files, runtime)
     from .utils.sources import huggingface as huggingface_source
 
@@ -429,6 +429,13 @@ def _huggingface_stream_preview_enforce_content_route_candidate_limit(
         raise ValueError(
             "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "
             f"for {repo_id} ({huggingface_source._HF_CONTENT_SNIFF_MAX_FILES} files)"
+        )
+    candidate_size = sum(size for item in candidates if (size := _huggingface_preview_file_size(item)) is not None)
+    if candidate_size > huggingface_source._HF_CONTENT_SNIFF_MAX_TOTAL_BYTES:
+        repo_id = str(metadata.get("repo_id") or metadata.get("model_id") or "unknown")
+        raise ValueError(
+            "Hugging Face selective filtering incomplete: skipped file inspection byte limit exceeded "
+            f"for {repo_id} ({huggingface_source._HF_CONTENT_SNIFF_MAX_TOTAL_BYTES} bytes)"
         )
 
 
