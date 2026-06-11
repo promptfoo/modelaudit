@@ -1569,6 +1569,24 @@ class ZipScanner(BaseScanner):
             raise zipfile.BadZipFile("ZIP archive is already closed")
         yield cast(BinaryIO, archive_fp)
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _open_member_temp_file(
+        suffix: str,
+        safe_name: str | None,
+        preserve_nested_routing_basename: bool,
+    ) -> Iterator[tuple[str, BinaryIO, str | None]]:
+        """Yield a writable temporary member path plus its optional parent directory."""
+        if preserve_nested_routing_basename:
+            tmp_dir = tempfile.mkdtemp()
+            tmp_path = os.path.join(tmp_dir, safe_name or "archive-member")
+            with open(tmp_path, "wb") as tmp:
+                yield tmp_path, tmp, tmp_dir
+            return
+
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as named_tmp:
+            yield named_tmp.name, cast(BinaryIO, named_tmp), None
+
     def _scan_nested_archive_entry(self, path: str, nested_config: dict[str, Any]) -> ScanResult:
         """Dispatch a nested archive member through an injected callback or registry fallback."""
         nested_scan_callback = self.config.get(NESTED_SCAN_CALLBACK_CONFIG_KEY)
@@ -1966,6 +1984,7 @@ class ZipScanner(BaseScanner):
                     is_security_only_member = self._is_security_only_member_entry(name)
                     is_content_only_member = self._is_content_only_member_entry(name)
                     preserve_nested_routing_basename = self._preserve_nested_routing_basename(name)
+                    safe_name: str | None = None
 
                     if is_content_only_member:
                         suffix = ""
@@ -1980,24 +1999,11 @@ class ZipScanner(BaseScanner):
                         suffix = f"_{safe_name}"
 
                     try:
-                        with contextlib.ExitStack() as stack:
-                            tmp: BinaryIO
-                            if is_content_only_member:
-                                named_tmp = stack.enter_context(
-                                    tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-                                )
-                                tmp_path = named_tmp.name
-                                tmp = cast(BinaryIO, named_tmp)
-                            elif preserve_nested_routing_basename:
-                                tmp_dir = tempfile.mkdtemp()
-                                tmp_path = os.path.join(tmp_dir, safe_name)
-                                tmp = stack.enter_context(open(tmp_path, "wb"))
-                            else:
-                                named_tmp = stack.enter_context(
-                                    tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-                                )
-                                tmp_path = named_tmp.name
-                                tmp = cast(BinaryIO, named_tmp)
+                        with self._open_member_temp_file(
+                            suffix,
+                            safe_name,
+                            preserve_nested_routing_basename and not is_content_only_member,
+                        ) as (tmp_path, tmp, tmp_dir):
                             total_size = 0
                             with z.open(info) as entry:
                                 while True:
