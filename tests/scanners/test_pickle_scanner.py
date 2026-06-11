@@ -56,6 +56,17 @@ class NonSeekableBytesIO(io.BytesIO):
         return False
 
 
+class CountingNonSeekableBytesIO(NonSeekableBytesIO):
+    def __init__(self, initial_bytes: bytes) -> None:
+        super().__init__(initial_bytes)
+        self.bytes_read = 0
+
+    def read(self, size: int | None = -1) -> bytes:
+        data = super().read(size)
+        self.bytes_read += len(data)
+        return data
+
+
 class BrokenTellStream(io.BytesIO):
     def seekable(self) -> bool:
         return True
@@ -1781,6 +1792,39 @@ def test_large_non_legacy_pytorch_suffix_keeps_file_size_limit(tmp_path: Path) -
     assert any(check.name == "File Size Limit" and check.status == CheckStatus.FAILED for check in result.checks)
 
 
+def test_large_non_seekable_non_legacy_suffix_reads_only_preamble_before_cap() -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4) + (b"A" * 4096)
+    stream = CountingNonSeekableBytesIO(payload)
+
+    result = PickleScanner(
+        config={
+            "max_file_read_size": 256,
+            "max_known_stream_read_bytes": len(payload),
+        }
+    ).scan_stream(stream, len(payload), source="not-legacy.bin")
+
+    assert result.success is False
+    assert "max_file_read_size_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert stream.bytes_read <= pickle_scanner._PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES
+    assert not result.metadata.get("legacy_pytorch_bounded_analysis")
+
+
+def test_large_weak_legacy_preamble_suffix_keeps_file_size_limit(tmp_path: Path) -> None:
+    payload = pickle.dumps(0x1950A86A20F9469CFC6C, protocol=2)
+    payload += pickle.dumps(1001, protocol=2)
+    payload += b"not-complete-legacy-layout"
+    payload += b"A" * 512
+    path = tmp_path / "weak-legacy-preamble.pt"
+    path.write_bytes(payload)
+
+    result = PickleScanner(config={"max_file_read_size": 256}).scan(str(path))
+
+    assert result.success is False
+    assert "max_file_read_size_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert "legacy_pytorch_control_layout_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not result.metadata.get("legacy_pytorch_bounded_analysis")
+
+
 def test_large_legacy_pytorch_truncated_storage_is_inconclusive_not_file_size(
     tmp_path: Path,
 ) -> None:
@@ -1819,6 +1863,39 @@ def test_large_seekable_legacy_pytorch_stream_defers_file_size_limit() -> None:
     assert result.metadata["legacy_pytorch_bounded_analysis"] is True
     assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
     assert stream.tell() == 0
+
+
+def test_large_seekable_legacy_stream_partial_hash_uses_prefix_metadata() -> None:
+    payload_a, pickle_end = _make_legacy_pytorch_container(b"A" * 512)
+    payload_b, _other_pickle_end = _make_legacy_pytorch_container(b"B" * 512)
+    results = [
+        PickleScanner(config={"max_file_read_size": 256}).scan_stream(
+            io.BytesIO(payload),
+            len(payload),
+            source=f"legacy-shard-{index}.pt",
+        )
+        for index, payload in enumerate((payload_a, payload_b), start=1)
+    ]
+
+    assert hashlib.sha256(payload_a).hexdigest() != hashlib.sha256(payload_b).hexdigest()
+    assert results[0].metadata["file_hashes"] == results[1].metadata["file_hashes"]
+    for result in results:
+        file_hashes = result.metadata["file_hashes"]
+        assert "sha256" not in file_hashes
+        assert file_hashes["sha256_prefix"] == hashlib.sha256(payload_a[:pickle_end]).hexdigest()
+        integrity_check = next(check for check in result.checks if check.name == "File Integrity Check")
+        assert integrity_check.details["hash_complete"] is False
+        assert "sha256" not in integrity_check.details
+        assert integrity_check.details["sha256_prefix"] == file_hashes["sha256_prefix"]
+
+    results[0].metadata["file_path"] = "legacy-shard-1.pt"
+    aggregate_result = create_initial_audit_result()
+    merge_scan_result(aggregate_result, results[0])
+    aggregate_metadata = aggregate_result.file_metadata["legacy-shard-1.pt"].model_dump(
+        mode="json",
+        exclude_none=True,
+    )
+    assert aggregate_metadata["file_hashes"] == results[0].metadata["file_hashes"]
 
 
 def test_large_non_seekable_legacy_pytorch_stream_uses_stream_budget_not_file_cap() -> None:
@@ -1866,6 +1943,35 @@ def test_large_non_seekable_legacy_pytorch_stream_budget_exhaustion_is_inconclus
     assert control_check.details["max_control_opcodes"] == pickle_scanner._PYTORCH_LEGACY_MAX_CONTROL_OPCODES
 
 
+def test_large_non_seekable_legacy_pytorch_short_read_fails_closed() -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(
+        b"A" * 128,
+        declared_storage_size=512,
+    )
+    declared_size = len(payload) + (512 - 128)
+
+    result = PickleScanner(
+        config={
+            "max_file_read_size": 64,
+            "max_known_stream_read_bytes": declared_size,
+        }
+    ).scan_stream(
+        NonSeekableBytesIO(payload),
+        declared_size,
+        source="legacy-truncated-nonseekable.pt",
+    )
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "non_seekable_stream_short_read" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["pickle_stream_declared_size"] == declared_size
+    assert result.metadata["pickle_stream_bytes_buffered"] == len(payload)
+    assert not result.metadata.get("legacy_pytorch_bounded_analysis")
+    short_read_check = next(check for check in result.checks if check.name == "Pickle Stream Read")
+    assert short_read_check.status == CheckStatus.FAILED
+    assert short_read_check.details["bytes_requested"] == declared_size
+
+
 @pytest.mark.skipif(os.name == "nt", reason="sparse file hole allocation is platform dependent")
 def test_sparse_multigib_legacy_pytorch_file_uses_prefix_hash(tmp_path: Path) -> None:
     sparse_storage_size = 2 * 1024 * 1024 * 1024
@@ -1892,6 +1998,40 @@ def test_sparse_multigib_legacy_pytorch_file_uses_prefix_hash(tmp_path: Path) ->
     assert integrity_check.details["file_size"] == file_size
     assert "sha256_prefix" in integrity_check.details
     assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+@pytest.mark.skipif(os.name == "nt", reason="sparse file hole allocation is platform dependent")
+def test_sparse_legacy_pytorch_multi_storage_header_beyond_control_probe(tmp_path: Path) -> None:
+    storage_size = pickle_scanner._PYTORCH_LEGACY_MAX_CONTROL_BYTES + 1
+    control_payload, pickle_end = _make_legacy_pytorch_container(
+        b"",
+        declared_storage_size=storage_size,
+        storage_keys=("0", "1"),
+    )
+    control_streams = control_payload[:pickle_end]
+    path = tmp_path / "legacy-multi-storage-large.pt"
+    file_size = pickle_end + (2 * (8 + storage_size))
+
+    with path.open("wb") as handle:
+        handle.write(control_streams)
+        handle.write(storage_size.to_bytes(8, "little"))
+        handle.seek(pickle_end + 8 + storage_size)
+        handle.write(storage_size.to_bytes(8, "little"))
+        handle.truncate(file_size)
+
+    result = PickleScanner(
+        config={
+            "max_file_read_size": 256,
+            "pickle_root_raw_scan_limit_bytes": 4096,
+        }
+    ).scan(str(path))
+
+    assert result.success is True
+    assert result.metadata["legacy_pytorch_container"] is True
+    assert result.metadata["legacy_pytorch_storage_key_count"] == 2
+    assert result.metadata["legacy_pytorch_storage_end"] == file_size
+    assert result.metadata["legacy_pytorch_bounded_analysis_file_size"] == file_size
+    assert "legacy_pytorch_storage_layout_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
 
 
 def test_legacy_pytorch_container_accepts_historical_big_endian_storage_header(tmp_path: Path) -> None:

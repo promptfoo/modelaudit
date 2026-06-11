@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import pickle
 import stat
@@ -247,6 +248,31 @@ def test_pytorch_zip_scanner_safe_model(tmp_path):
     # Check for issues - a safe model might still have some informational issues
     error_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
     assert len(error_issues) == 0
+
+
+def test_oversized_pytorch_zip_uses_bounded_prefix_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "large-model.pt")
+    with model_path.open("ab") as handle:
+        handle.write(b"padding" * 200)
+
+    def reject_full_file_hash(_self: PyTorchZipScanner, _path: str) -> dict[str, str | None]:
+        raise AssertionError("oversized PyTorch ZIP scans must not hash the full file")
+
+    monkeypatch.setattr(PyTorchZipScanner, "calculate_file_hashes", reject_full_file_hash)
+
+    result = PyTorchZipScanner(config={"max_file_read_size": 512}).scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata["file_hashes"] == {
+        "sha256_prefix": hashlib.sha256(model_path.read_bytes()[:512]).hexdigest()
+    }
+    integrity_check = next(check for check in result.checks if check.name == "File Integrity Hash")
+    assert integrity_check.details["hash_complete"] is False
+    assert integrity_check.details["bytes_hashed"] == 512
+    assert "sha256" not in integrity_check.details
 
 
 def test_pytorch_zip_scanner_malicious_model(tmp_path):

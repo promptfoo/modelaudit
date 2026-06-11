@@ -444,6 +444,22 @@ def test_sbom_preserves_recorded_hash_for_remote_identifier() -> None:
     assert _property_value(component, "size") == str(len(recorded_content))
 
 
+def test_sbom_omits_partial_sha256_prefix_for_remote_identifier() -> None:
+    remote_path = "s3://model-bucket/model.pt"
+    metadata = {
+        "file_size": 2048,
+        "file_hashes": {"sha256_prefix": "c" * 64},
+    }
+
+    sbom_data: dict[str, Any] = json.loads(
+        generate_sbom([remote_path], {"issues": [], "file_metadata": {remote_path: metadata}})
+    )
+    component = _component_named(sbom_data, "model.pt")
+
+    assert _sha256_values(component) == []
+    assert _property_value(component, "size") == "2048"
+
+
 def test_sbom_preserves_recorded_hash_for_trusted_streamed_asset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

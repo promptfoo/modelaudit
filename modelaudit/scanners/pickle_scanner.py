@@ -55,6 +55,7 @@ _PYTORCH_LEGACY_PROTOCOL_VERSION = 1001
 _PYTORCH_LEGACY_STREAM_COUNT = 5
 _PYTORCH_LEGACY_MAGIC_BINARY = _PYTORCH_LEGACY_MAGIC_NUMBER.to_bytes(10, "little")
 _PYTORCH_LEGACY_MAGIC_DECIMAL = str(_PYTORCH_LEGACY_MAGIC_NUMBER).encode("ascii")
+_PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES = 128
 _PYTORCH_LEGACY_SYS_INFO_KEYS = frozenset({"protocol_version", "little_endian", "type_sizes"})
 _PYTORCH_LEGACY_MAX_CONTROL_BYTES = 10 * 1024 * 1024
 _PYTORCH_LEGACY_MAX_STORAGE_KEYS = 10_000
@@ -431,6 +432,8 @@ class _RootStreamPayloadRead:
     payload: bytes
     truncated: bool
     read_limit: int
+    requested_bytes: int
+    short_read: bool
 
 
 @dataclass(frozen=True)
@@ -2092,13 +2095,21 @@ class PickleScanner(BaseScanner):
         ):
             result = self._create_result()
             result.metadata["file_size"] = normalized_size
+            result.metadata["analysis_incomplete"] = True
+            result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+            result.metadata["scan_outcome_reasons"] = ["max_file_read_size_exceeded"]
             result.add_check(
                 name="File Size Limit",
                 passed=False,
                 message=f"File too large: {normalized_size} bytes (max: {self.max_file_read_size})",
                 severity=IssueSeverity.INFO,
                 location=source,
-                details={"file_size": normalized_size, "max_file_read_size": self.max_file_read_size},
+                details={
+                    "file_size": normalized_size,
+                    "max_file_read_size": self.max_file_read_size,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "max_file_read_size_exceeded",
+                },
             )
             result.finish(success=False)
             return result
@@ -2643,6 +2654,7 @@ class PickleScanner(BaseScanner):
         file_size: int | None,
         *,
         ignore_file_read_size: bool = False,
+        initial_payload: bytes = b"",
     ) -> _RootStreamPayloadRead:
         if file_size is not None:
             limit = self._standalone_pickle_scanner.options.max_known_stream_read_bytes
@@ -2656,13 +2668,29 @@ class PickleScanner(BaseScanner):
             if not ignore_file_read_size and self.max_file_read_size and self.max_file_read_size > 0:
                 limit = min(limit, self.max_file_read_size)
         if limit <= 0:
-            return _RootStreamPayloadRead(payload=b"", truncated=False, read_limit=0)
+            return _RootStreamPayloadRead(
+                payload=initial_payload,
+                truncated=False,
+                read_limit=0,
+                requested_bytes=0,
+                short_read=False,
+            )
 
         read_target = limit if file_size is None else min(file_size, limit)
         if read_target <= 0:
-            return _RootStreamPayloadRead(payload=b"", truncated=False, read_limit=limit)
+            return _RootStreamPayloadRead(
+                payload=initial_payload,
+                truncated=False,
+                read_limit=limit,
+                requested_bytes=0,
+                short_read=False,
+            )
 
-        payload = self._read_stream_bytes(file_obj, read_target)
+        remaining_target = max(read_target - len(initial_payload), 0)
+        payload = initial_payload
+        if remaining_target > 0:
+            payload += self._read_stream_bytes(file_obj, remaining_target)
+        short_read = file_size is not None and len(payload) < read_target
         truncated = file_size is not None and file_size > read_target and len(payload) >= read_target
         if file_size is None and len(payload) >= read_target:
             truncated = True
@@ -2670,6 +2698,8 @@ class PickleScanner(BaseScanner):
             payload=payload,
             truncated=truncated,
             read_limit=limit,
+            requested_bytes=read_target,
+            short_read=short_read,
         )
 
     @staticmethod
@@ -2687,13 +2717,19 @@ class PickleScanner(BaseScanner):
         hash_complete: bool = True,
     ) -> None:
         sha256 = hashlib.sha256(payload).hexdigest()
-        result.metadata.setdefault("file_hashes", {})["sha256"] = sha256
+        hash_key = "sha256" if hash_complete else "sha256_prefix"
+        result.metadata.setdefault("file_hashes", {})[hash_key] = sha256
+        details: dict[str, Any] = {
+            hash_key: sha256,
+            "bytes_hashed": len(payload),
+            "hash_complete": hash_complete,
+        }
         result.add_check(
             name="File Integrity Check",
             passed=True,
-            message="Stream SHA256 hash calculated",
+            message="Stream SHA256 hash calculated" if hash_complete else "Stream SHA256 prefix hash calculated",
             location=source,
-            details={"sha256": sha256, "bytes_hashed": len(payload), "hash_complete": hash_complete},
+            details=details,
         )
 
     def _add_bounded_file_integrity_check(
@@ -2754,17 +2790,19 @@ class PickleScanner(BaseScanner):
                 file_obj.seek(start_position)
 
         sha256 = hasher.hexdigest()
-        result.metadata.setdefault("file_hashes", {})["sha256"] = sha256
+        hash_key = "sha256" if hash_complete else "sha256_prefix"
+        result.metadata.setdefault("file_hashes", {})[hash_key] = sha256
+        details: dict[str, Any] = {
+            hash_key: sha256,
+            "bytes_hashed": bytes_hashed,
+            "hash_complete": hash_complete,
+        }
         result.add_check(
             name="File Integrity Check",
             passed=True,
-            message="Stream SHA256 hash calculated",
+            message="Stream SHA256 hash calculated" if hash_complete else "Stream SHA256 prefix hash calculated",
             location=source,
-            details={
-                "sha256": sha256,
-                "bytes_hashed": bytes_hashed,
-                "hash_complete": hash_complete,
-            },
+            details=details,
         )
 
     def _add_stream_truncation_check(
@@ -2799,6 +2837,43 @@ class PickleScanner(BaseScanner):
                 "declared_size": declared_size,
                 "read_limit": read_result.read_limit,
                 "analysis_incomplete": True,
+            },
+            rule_code="S902",
+        )
+        result.finish(success=False)
+
+    @staticmethod
+    def _add_stream_short_read_check(
+        read_result: _RootStreamPayloadRead,
+        result: ScanResult,
+        source: str,
+        declared_size: int | None,
+    ) -> None:
+        if not read_result.short_read:
+            return
+
+        reason = "non_seekable_stream_short_read"
+        mark_inconclusive_scan_result(result, reason)
+        result.metadata["pickle_stream_short_read"] = True
+        result.metadata["pickle_stream_root_scan_read_limit"] = read_result.read_limit
+        result.metadata["pickle_stream_root_scan_requested_bytes"] = read_result.requested_bytes
+        result.metadata["pickle_stream_bytes_buffered"] = len(read_result.payload)
+        if declared_size is not None:
+            result.metadata["pickle_stream_declared_size"] = declared_size
+        result.add_check(
+            name="Pickle Stream Read",
+            passed=False,
+            message="Known-size non-seekable pickle stream ended before declared bytes were available",
+            severity=IssueSeverity.WARNING,
+            location=source,
+            details={
+                "source": "pickle_stream_buffer",
+                "bytes_buffered": len(read_result.payload),
+                "bytes_requested": read_result.requested_bytes,
+                "declared_size": declared_size,
+                "read_limit": read_result.read_limit,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
             },
             rule_code="S902",
         )
@@ -3746,48 +3821,69 @@ class PickleScanner(BaseScanner):
                 start_position = file_obj.tell()
             except (AttributeError, OSError, ValueError) as error:
                 return self._stream_position_error_result(source, error)
-            result = self._scan_standalone_stream(file_obj, standalone_size, source=source)
-            if result.metadata.get("operational_error"):
-                return result
-            try:
-                file_obj.seek(start_position)
-            except (AttributeError, OSError, ValueError) as error:
-                reason = "stream_rewind_failed"
-                self._mark_operational_incomplete(result, reason)
-                result.add_check(
-                    name="Pickle Stream Position",
-                    passed=False,
-                    message=f"Error rewinding pickle stream after native scan: {error!s}",
-                    severity=IssueSeverity.INFO,
-                    location=source,
-                    details={
-                        "category": reason,
-                        "exception": str(error),
-                        "exception_type": type(error).__name__,
-                        "operational_error": True,
-                        "analysis_incomplete": True,
-                        "scan_outcome_reason": reason,
-                    },
-                    rule_code="S902",
-                )
-                result.finish(success=False)
-                return result
-            try:
-                raw_data = self._read_root_raw_scan_window_from_stream(file_obj, standalone_size)
-            except (AttributeError, OSError, ValueError) as error:
-                self._record_stream_coverage_failure(result, source, error)
-                return result
 
             control_probe_size = self._legacy_pytorch_control_probe_size(standalone_size)
-            if len(raw_data) >= control_probe_size:
+            if deferred_size_check is None:
+                result = self._scan_standalone_stream(file_obj, standalone_size, source=source)
+                if result.metadata.get("operational_error"):
+                    return result
+                try:
+                    file_obj.seek(start_position)
+                except (AttributeError, OSError, ValueError) as error:
+                    reason = "stream_rewind_failed"
+                    self._mark_operational_incomplete(result, reason)
+                    result.add_check(
+                        name="Pickle Stream Position",
+                        passed=False,
+                        message=f"Error rewinding pickle stream after native scan: {error!s}",
+                        severity=IssueSeverity.INFO,
+                        location=source,
+                        details={
+                            "category": reason,
+                            "exception": str(error),
+                            "exception_type": type(error).__name__,
+                            "operational_error": True,
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": reason,
+                        },
+                        rule_code="S902",
+                    )
+                    result.finish(success=False)
+                    return result
+                try:
+                    raw_data = self._read_root_raw_scan_window_from_stream(file_obj, standalone_size)
+                except (AttributeError, OSError, ValueError) as error:
+                    self._record_stream_coverage_failure(result, source, error)
+                    return result
+            else:
+                try:
+                    file_obj.seek(start_position)
+                    preamble_probe = self._read_stream_bytes(
+                        file_obj,
+                        min(control_probe_size, _PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES),
+                    )
+                except (AttributeError, OSError, ValueError) as error:
+                    self._record_stream_coverage_failure(deferred_size_check, source, error)
+                    return deferred_size_check
+                if not _matches_legacy_pytorch_preamble(preamble_probe):
+                    with suppress(AttributeError, OSError, ValueError):
+                        file_obj.seek(start_position)
+                    return deferred_size_check
+                raw_data = b""
+
+            if deferred_size_check is None and len(raw_data) >= control_probe_size:
                 control_probe = raw_data[:control_probe_size]
             else:
                 try:
                     file_obj.seek(start_position)
                     control_probe = self._read_stream_bytes(file_obj, control_probe_size)
                 except (AttributeError, OSError, ValueError) as error:
-                    self._record_stream_coverage_failure(result, source, error)
-                    return result
+                    self._record_stream_coverage_failure(
+                        result if deferred_size_check is None else deferred_size_check,
+                        source,
+                        error,
+                    )
+                    return result if deferred_size_check is None else deferred_size_check
 
             def read_at(local_offset: int, size: int) -> bytes:
                 file_obj.seek(start_position + local_offset)
@@ -3798,11 +3894,21 @@ class PickleScanner(BaseScanner):
                 total_size=standalone_size,
                 read_at=read_at,
             )
+            if deferred_size_check is not None:
+                if legacy_layout is None:
+                    with suppress(AttributeError, OSError, ValueError):
+                        file_obj.seek(start_position)
+                    return deferred_size_check
+                raw_data = control_probe[: self._root_raw_scan_limit()]
             try:
                 file_obj.seek(start_position)
             except (AttributeError, OSError, ValueError) as error:
-                self._record_stream_coverage_failure(result, source, error)
-                return result
+                self._record_stream_coverage_failure(
+                    result if deferred_size_check is None else deferred_size_check,
+                    source,
+                    error,
+                )
+                return result if deferred_size_check is None else deferred_size_check
             if legacy_layout is not None:
                 result = self._scan_standalone_bytes(
                     control_probe[: legacy_layout.pickle_end],
@@ -3866,10 +3972,22 @@ class PickleScanner(BaseScanner):
             raw_position_offset = start_position
         else:
             try:
+                initial_payload = b""
+                if deferred_size_check is not None:
+                    initial_payload = self._read_stream_bytes(
+                        file_obj,
+                        min(
+                            self._legacy_pytorch_control_probe_size(standalone_size),
+                            _PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES,
+                        ),
+                    )
+                    if not _matches_legacy_pytorch_preamble(initial_payload):
+                        return deferred_size_check
                 stream_read = self._read_stream_payload_for_root(
                     file_obj,
                     standalone_size,
                     ignore_file_read_size=deferred_size_check is not None,
+                    initial_payload=initial_payload,
                 )
             except (AttributeError, OSError, ValueError) as error:
                 return self._stream_read_error_result(source, error)
@@ -3881,7 +3999,11 @@ class PickleScanner(BaseScanner):
             if legacy_layout is not None:
                 result = self._scan_standalone_bytes(payload[: legacy_layout.pickle_end], source=source)
                 legacy_storage_valid = legacy_storage_valid and self._legacy_pytorch_control_scan_complete(result)
-                if legacy_storage_valid:
+                if legacy_storage_valid and stream_read.short_read:
+                    self._add_stream_short_read_check(stream_read, result, source, standalone_size)
+                    legacy_storage_valid = False
+                    allow_binary_tail_scan = False
+                elif legacy_storage_valid:
                     assert legacy_layout.storage_end is not None
                     self._annotate_legacy_pytorch_layout(result, legacy_layout)
                     self._add_legacy_pytorch_bounded_analysis_check(
@@ -3903,6 +4025,8 @@ class PickleScanner(BaseScanner):
                 rust_stream_size = len(payload) if stream_read.truncated else standalone_size
                 result = self._scan_standalone_stream(io.BytesIO(payload), rust_stream_size, source=source)
                 if _matches_legacy_pytorch_preamble(payload):
+                    if deferred_size_check is not None and not (stream_read.truncated or stream_read.short_read):
+                        return deferred_size_check
                     self._mark_legacy_pytorch_control_layout_incomplete(result, source)
                     allow_binary_tail_scan = False
                 elif deferred_size_check is not None:
@@ -3912,17 +4036,20 @@ class PickleScanner(BaseScanner):
                 payload,
                 result,
                 source,
-                hash_complete=not stream_read.truncated,
+                hash_complete=not stream_read.truncated and not stream_read.short_read,
             )
             storage_only_omitted = (
                 legacy_layout is not None
                 and legacy_storage_valid
                 and legacy_layout.storage_end is not None
                 and stream_read.truncated
+                and not stream_read.short_read
                 and standalone_size is not None
                 and legacy_layout.storage_end == standalone_size
             )
-            if storage_only_omitted:
+            if stream_read.short_read and not result.metadata.get("pickle_stream_short_read"):
+                self._add_stream_short_read_check(stream_read, result, source, standalone_size)
+            elif storage_only_omitted:
                 assert legacy_layout is not None and legacy_layout.storage_end is not None
                 result.metadata["legacy_pytorch_storage_scan_bounded"] = True
                 result.metadata["legacy_pytorch_storage_bytes_buffered"] = max(
@@ -4018,8 +4145,21 @@ class PickleScanner(BaseScanner):
         suffix_raw_data = b""
 
         try:
-            raw_data = self._read_root_raw_scan_window(path, file_size)
+            raw_data = b""
             with open(path, "rb") as layout_handle:
+                if deferred_size_check is not None:
+                    preamble_probe = self._read_stream_bytes(
+                        layout_handle,
+                        min(
+                            self._legacy_pytorch_control_probe_size(file_size),
+                            _PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES,
+                        ),
+                    )
+                    if not _matches_legacy_pytorch_preamble(preamble_probe):
+                        return deferred_size_check
+                    layout_handle.seek(0)
+                else:
+                    raw_data = self._read_root_raw_scan_window(path, file_size)
                 control_probe = self._read_stream_bytes(
                     layout_handle,
                     self._legacy_pytorch_control_probe_size(file_size),
@@ -4029,14 +4169,16 @@ class PickleScanner(BaseScanner):
                     layout_handle.seek(local_offset)
                     return self._read_stream_bytes(layout_handle, size)
 
-            legacy_layout, legacy_storage_valid = self._legacy_pytorch_layout_for_scan(
-                control_probe,
-                total_size=file_size,
-                read_at=read_at,
-            )
+                legacy_layout, legacy_storage_valid = self._legacy_pytorch_layout_for_scan(
+                    control_probe,
+                    total_size=file_size,
+                    read_at=read_at,
+                )
             legacy_preamble_matched = _matches_legacy_pytorch_preamble(control_probe)
-            if deferred_size_check is not None and legacy_layout is None and not legacy_preamble_matched:
+            if deferred_size_check is not None and legacy_layout is None:
                 return deferred_size_check
+            if deferred_size_check is not None:
+                raw_data = control_probe[: self._root_raw_scan_limit()]
 
             if deferred_size_check is not None and (legacy_layout is not None or legacy_preamble_matched):
                 self._add_bounded_file_integrity_check(raw_data, result, path, file_size)

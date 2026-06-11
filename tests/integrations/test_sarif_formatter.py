@@ -742,6 +742,16 @@ class TestCreateArtifacts:
         assert "sha-256" in artifacts[0]["hashes"]
         assert "md5" in artifacts[0]["hashes"]
 
+    def test_artifact_omits_partial_sha256_prefix_hash(self):
+        """Partial prefix hashes must not be emitted as complete SARIF hashes."""
+        result = create_initial_audit_result()
+        result.assets = [AssetModel(path="/test/model.pt", type="pickle")]
+        result.file_metadata["/test/model.pt"] = FileMetadataModel(file_hashes=FileHashesModel(sha256_prefix="c" * 64))
+
+        artifacts = _create_artifacts(result)
+
+        assert "hashes" not in artifacts[0]
+
 
 class TestHelperFunctions:
     """Tests for helper functions."""

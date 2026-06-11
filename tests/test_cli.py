@@ -224,6 +224,21 @@ def test_format_scan_json_preserves_pydantic_json_serialization() -> None:
     }
 
 
+def test_format_scan_json_preserves_partial_sha256_prefix_only() -> None:
+    result = create_mock_scan_result(
+        file_metadata={
+            "/models/legacy.pt": {
+                "file_size": 2048,
+                "file_hashes": {"sha256_prefix": "c" * 64},
+            }
+        }
+    )
+
+    payload = json.loads(_format_scan_output(result, [], output_format="json", verbose=True))
+
+    assert payload["file_metadata"]["/models/legacy.pt"]["file_hashes"] == {"sha256_prefix": "c" * 64}
+
+
 def test_cli_help():
     """Test the CLI help command."""
     runner = CliRunner()
