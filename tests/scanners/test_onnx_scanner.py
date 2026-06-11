@@ -1,3 +1,4 @@
+import os
 import struct
 import sys
 from pathlib import Path
@@ -2107,6 +2108,74 @@ def _scan_and_extract_custom_domains(model_path: Path) -> tuple[Any, list[Any], 
     return result, _failed_custom_domain_checks(result), custom_domains
 
 
+_PINNED_HF_ONNX_O4_CASES = (
+    (
+        "rank2_all_minilm_l6_v2",
+        "sentence-transformers/all-MiniLM-L6-v2",
+        "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+    ),
+    (
+        "rank5_ms_marco_minilm_l6_v2",
+        "cross-encoder/ms-marco-MiniLM-L6-v2",
+        "c5ee24cb16019beea0893ab7796b1df96625c6b8",
+    ),
+    (
+        "rank20_all_mpnet_base_v2",
+        "sentence-transformers/all-mpnet-base-v2",
+        "e8c3b32edf5434bc2275fc9bab85f82640a19130",
+    ),
+)
+_PINNED_HF_ONNX_O4_FILENAME = "onnx/model_O4.onnx"
+_PINNED_HF_ONNX_MAX_BYTES = 250 * 1024 * 1024
+
+
+def create_onnx_model_with_mixed_custom_domains(tmp_path: Path) -> Path:
+    X = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
+    Z = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
+    nodes = [
+        helper.make_node("FastGelu", ["input"], ["hidden"], domain="com.microsoft", name="ort_fast_gelu"),
+        helper.make_node("BackdoorOp", ["hidden"], ["output"], domain="com.acme.ops", name="backdoor"),
+    ]
+    graph = helper.make_graph(nodes, "mixed_custom_domains", [X], [Z])
+    model = helper.make_model(
+        graph,
+        opset_imports=[
+            helper.make_opsetid("", 13),
+            helper.make_opsetid("com.microsoft", 1),
+            helper.make_opsetid("com.acme.ops", 1),
+        ],
+    )
+    path = tmp_path / "mixed_custom_domains.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def create_onnx_model_with_function_microsoft_operator(tmp_path: Path, *, op_type: str) -> Path:
+    function = helper.make_function(
+        "local",
+        "MicrosoftWrapper",
+        ["X"],
+        ["Y"],
+        [helper.make_node(op_type, ["X"], ["Y"], domain="com.microsoft")],
+        [helper.make_opsetid("", 13), helper.make_opsetid("com.microsoft", 1)],
+    )
+    graph = helper.make_graph(
+        [helper.make_node("MicrosoftWrapper", ["X"], ["Y"], domain="local")],
+        "graph",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+    )
+    model = helper.make_model(
+        graph,
+        functions=[function],
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+    )
+    model.ir_version = 10
+    path = tmp_path / f"function_microsoft_{op_type}.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
 def test_onnx_scanner_can_handle(tmp_path):
     model_path = create_onnx_model(tmp_path)
     assert OnnxScanner.can_handle(str(model_path))
@@ -2290,6 +2359,228 @@ def test_onnx_scanner_standard_preview_training_domain_not_flagged(tmp_path: Pat
     assert "ai.onnx.preview.training" not in metadata_custom_domains
     assert result.success is True
     assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+
+
+@pytest.mark.parametrize("op_type", ["FastGelu", "SkipLayerNormalization"])
+def test_onnx_scanner_known_microsoft_runtime_ops_not_flagged(tmp_path: Path, op_type: str) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="com.microsoft",
+        custom_op_type=op_type,
+        custom_opset_version=1,
+    )
+
+    result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert custom_domain_checks == []
+    assert "com.microsoft" not in result.metadata.get("custom_domains", [])
+    assert "com.microsoft" not in metadata_custom_domains
+    assert not [issue for issue in result.issues if issue.rule_code == "S1111"]
+
+
+def test_onnx_scanner_mixed_microsoft_and_unknown_domains_flags_only_unknown(tmp_path: Path) -> None:
+    model_path = create_onnx_model_with_mixed_custom_domains(tmp_path)
+
+    result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].rule_code == "S1111"
+    assert custom_domain_checks[0].details["domain"] == "com.acme.ops"
+    assert custom_domain_checks[0].details["op_type"] == "BackdoorOp"
+    assert result.metadata["custom_domains"] == ["com.acme.ops"]
+    assert metadata_custom_domains == ["com.acme.ops"]
+
+
+def test_onnx_scanner_unknown_microsoft_runtime_op_still_flagged(tmp_path: Path) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="com.microsoft",
+        custom_op_type="BackdoorOp",
+        custom_opset_version=1,
+    )
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].rule_code == "S1111"
+    assert custom_domain_checks[0].details["domain"] == "com.microsoft"
+    assert custom_domain_checks[0].details["op_type"] == "BackdoorOp"
+    assert metadata_custom_domains == ["com.microsoft"]
+
+
+@pytest.mark.parametrize(
+    "domain",
+    ["com.microsoft.evil", "com.microsoftx", "microsoft.com", "COM.MICROSOFT", "com.microsoft "],
+)
+def test_onnx_scanner_microsoft_domain_lookalikes_still_flagged(tmp_path: Path, domain: str) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain=domain,
+        custom_op_type="FastGelu",
+        custom_opset_version=1,
+    )
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].rule_code == "S1111"
+    assert custom_domain_checks[0].details["domain"] == domain
+    assert metadata_custom_domains == [domain]
+
+
+@pytest.mark.parametrize(
+    ("custom_opset_version", "overload"),
+    [(None, ""), (999, ""), (1, "evil")],
+    ids=["missing-opset", "unsupported-opset", "nonempty-overload"],
+)
+def test_onnx_scanner_microsoft_runtime_policy_fails_closed_when_ambiguous(
+    tmp_path: Path,
+    custom_opset_version: int | None,
+    overload: str,
+) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="com.microsoft",
+        custom_op_type="FastGelu",
+        custom_opset_version=custom_opset_version,
+    )
+    if overload:
+        model = onnx.load(str(model_path))
+        model.graph.node[0].overload = overload
+        onnx.save(model, str(model_path))
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].rule_code == "S1111"
+    assert custom_domain_checks[0].details["domain"] == "com.microsoft"
+    assert custom_domain_checks[0].details["op_type"] == "FastGelu"
+    assert metadata_custom_domains == ["com.microsoft"]
+
+
+def test_onnx_scanner_microsoft_runtime_policy_fails_closed_on_conflicting_opsets(tmp_path: Path) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="com.microsoft",
+        custom_op_type="FastGelu",
+        custom_opset_version=1,
+    )
+    model = onnx.load(str(model_path))
+    model = helper.make_model(
+        model.graph,
+        opset_imports=[
+            helper.make_opsetid("", 13),
+            helper.make_opsetid("com.microsoft", 999),
+            helper.make_opsetid("com.microsoft", 1),
+        ],
+    )
+    onnx.save(model, str(model_path))
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].rule_code == "S1111"
+    assert custom_domain_checks[0].details["domain"] == "com.microsoft"
+    assert metadata_custom_domains == ["com.microsoft"]
+
+
+def test_onnx_scanner_microsoft_python_operator_still_critical(tmp_path: Path) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="com.microsoft",
+        custom_op_type="PythonOp",
+        custom_opset_version=1,
+    )
+
+    result = OnnxScanner().scan(str(model_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Operator Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert result.success is False
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S902"
+    assert python_checks[0].severity == IssueSeverity.CRITICAL
+    assert python_checks[0].details["domain"] == "com.microsoft"
+    assert python_checks[0].details["op_type"] == "PythonOp"
+
+
+def test_onnx_scanner_function_body_microsoft_runtime_op_uses_function_opset(tmp_path: Path) -> None:
+    model_path = create_onnx_model_with_function_microsoft_operator(tmp_path, op_type="FastGelu")
+
+    result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert custom_domain_checks == []
+    assert "com.microsoft" not in result.metadata.get("custom_domains", [])
+    assert "com.microsoft" not in metadata_custom_domains
+
+
+def test_onnx_scanner_function_body_unknown_microsoft_op_still_flagged(tmp_path: Path) -> None:
+    model_path = create_onnx_model_with_function_microsoft_operator(tmp_path, op_type="BackdoorOp")
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    assert custom_domain_checks[0].rule_code == "S1111"
+    assert custom_domain_checks[0].details["domain"] == "com.microsoft"
+    assert custom_domain_checks[0].details["op_type"] == "BackdoorOp"
+    assert metadata_custom_domains == ["com.microsoft"]
+
+
+@pytest.mark.slow
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("case_id", "repo_id", "revision"),
+    _PINNED_HF_ONNX_O4_CASES,
+    ids=[case[0] for case in _PINNED_HF_ONNX_O4_CASES],
+)
+def test_onnx_scanner_pinned_hf_microsoft_runtime_domains_are_low_noise(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case_id: str,
+    repo_id: str,
+    revision: str,
+) -> None:
+    if os.environ.get("MODELAUDIT_RUN_HF_REAL_MODEL_TESTS") != "1":
+        pytest.skip("set MODELAUDIT_RUN_HF_REAL_MODEL_TESTS=1 to download pinned Hugging Face ONNX models")
+
+    monkeypatch.setenv("PROMPTFOO_DISABLE_TELEMETRY", "1")
+    monkeypatch.setenv("HF_HUB_DISABLE_TELEMETRY", "1")
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    cache_dir = tmp_path / "hf-cache"
+
+    model_path = Path(
+        huggingface_hub.hf_hub_download(
+            repo_id=repo_id,
+            revision=revision,
+            filename=_PINNED_HF_ONNX_O4_FILENAME,
+            cache_dir=str(cache_dir),
+        )
+    )
+    assert model_path.stat().st_size <= _PINNED_HF_ONNX_MAX_BYTES
+
+    model = onnx.load(str(model_path), load_external_data=False)
+    microsoft_ops = {node.op_type for node in model.graph.node if node.domain == "com.microsoft"}
+    assert {"FastGelu", "SkipLayerNormalization"}.issubset(microsoft_ops), case_id
+
+    scanner = OnnxScanner({"check_jit_script": False, "check_network_comm": False, "max_array_size": 1})
+    result = scanner.scan(str(model_path))
+    metadata = scanner.extract_metadata(str(model_path))
+
+    microsoft_domain_checks = [
+        check for check in _failed_custom_domain_checks(result) if check.details.get("domain") == "com.microsoft"
+    ]
+    assert microsoft_domain_checks == []
+    assert "com.microsoft" not in result.metadata.get("custom_domains", [])
+    assert "com.microsoft" not in metadata.get("custom_domains", [])
 
 
 def test_onnx_scanner_registered_ai_onnx_preview_operator_not_flagged(
