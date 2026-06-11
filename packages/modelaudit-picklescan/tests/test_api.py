@@ -4357,9 +4357,13 @@ def test_scan_bytes_does_not_treat_benign_stdlib_module_references_as_dangerous(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module_name, _, reference_name = expected_reference.partition(".")
+    reference_key = (module_name, reference_name)
     with monkeypatch.context() as patch:
-        if (module_name, reference_name) not in _TRUSTED_LOADED_REFERENCE_BASELINES:
+        baseline = _TRUSTED_LOADED_REFERENCE_BASELINES.get(reference_key)
+        if baseline is None:
             patch.delitem(sys.modules, module_name, raising=False)
+        elif type(baseline[0][1]) is ModuleType:
+            patch.setitem(sys.modules, module_name, baseline[0][1])
         _clear_source_sensitive_caches()
         report = scan_bytes(payload, source=f"{expected_reference}.pkl")
     _clear_source_sensitive_caches()
