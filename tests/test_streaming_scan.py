@@ -52,6 +52,18 @@ def _create_streaming_pytorch_zip(path: Path, members: dict[str, bytes]) -> Path
     return path
 
 
+def _streaming_member_record(metadata: dict[str, Any], path_segments: list[str]) -> dict[str, Any]:
+    member_hashes = metadata.get("member_file_hashes")
+    assert isinstance(member_hashes, dict)
+    records = [
+        record
+        for record in member_hashes.values()
+        if isinstance(record, dict) and record.get("path_segments") == path_segments
+    ]
+    assert len(records) == 1
+    return records[0]
+
+
 @pytest.fixture
 def temp_test_files() -> Iterator[list[Path]]:
     """Create temporary test files for streaming."""
@@ -2139,8 +2151,9 @@ def test_scan_model_streaming_keeps_member_hashes_separate_from_parent(tmp_path:
     metadata = result.file_metadata[str(model_path)].model_dump(mode="json", exclude_none=True)
     assert result.content_hash == compute_aggregate_hash([outer_hash])
     assert metadata["file_hashes"]["sha256"] == outer_hash
-    assert metadata["member_file_hashes"]["evil.pkl"]["file_hashes"]["sha256"] == malicious_hash
-    assert metadata["member_file_hashes"]["evil.pkl"]["file_hashes"]["sha256"] != outer_hash
+    malicious_record = _streaming_member_record(metadata, ["evil.pkl"])
+    assert malicious_record["file_hashes"]["sha256"] == malicious_hash
+    assert malicious_record["file_hashes"]["sha256"] != outer_hash
     assert any(
         issue.location is not None
         and ":evil.pkl" in issue.location

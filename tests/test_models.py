@@ -1,6 +1,7 @@
 """Tests for modelaudit.models module."""
 
 import time
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -30,7 +31,10 @@ from modelaudit.models import (
     create_initial_audit_result,
     rebuild_models,
 )
-from modelaudit.scanner_results import mark_inconclusive_scan_result
+from modelaudit.scanner_results import (
+    MAX_MEMBER_FILE_HASH_RECORDS,
+    mark_inconclusive_scan_result,
+)
 from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 
 
@@ -647,32 +651,58 @@ def _scan_result_with_sha256(sha256: str, *, complete: bool = True, size: int = 
     return result
 
 
+def _member_records_for_segments(result: ScanResult, path_segments: list[str]) -> list[dict[str, Any]]:
+    member_hashes = result.metadata.get("member_file_hashes")
+    assert isinstance(member_hashes, dict)
+    records = [
+        record
+        for record in member_hashes.values()
+        if isinstance(record, dict) and record.get("path_segments") == path_segments
+    ]
+    return records
+
+
+def _single_member_record(result: ScanResult, path_segments: list[str]) -> dict[str, Any]:
+    records = _member_records_for_segments(result, path_segments)
+    assert len(records) == 1
+    return records[0]
+
+
 def test_merge_member_result_namespaces_duplicate_member_hashes() -> None:
     parent = ScanResult(scanner_name="zip")
     parent.metadata["file_hashes"] = {"sha256": "a" * 64}
     parent.metadata["file_size"] = 100
 
     parent.merge_member_result(_scan_result_with_sha256("b" * 64), "payload.pkl")
+    parent.merge_member_result(_scan_result_with_sha256("b" * 64), "payload.pkl")
     parent.merge_member_result(_scan_result_with_sha256("c" * 64), "payload.pkl")
 
     assert parent.metadata["file_hashes"]["sha256"] == "a" * 64
     assert parent.metadata["file_size"] == 100
-    assert parent.metadata["member_file_hashes"]["payload.pkl"]["file_hashes"]["sha256"] == "b" * 64
-    duplicate = parent.metadata["member_file_hashes"]["payload.pkl#2"]
-    assert duplicate["file_hashes"]["sha256"] == "c" * 64
-    assert duplicate["logical_path"] == "payload.pkl"
+    records = sorted(_member_records_for_segments(parent, ["payload.pkl"]), key=lambda record: record["occurrence"])
+    assert [record["occurrence"] for record in records] == [1, 2, 3]
+    assert [record["file_hashes"]["sha256"] for record in records] == ["b" * 64, "b" * 64, "c" * 64]
+    assert all(record["logical_path"] == "payload.pkl" for record in records)
 
 
-def test_merge_member_result_prefixes_nested_and_malformed_member_paths() -> None:
+def test_merge_member_result_uses_reversible_collision_free_member_identity() -> None:
     parent = ScanResult(scanner_name="zip")
     parent.metadata["file_hashes"] = {"sha256": "a" * 64}
     child = ScanResult(scanner_name="zip")
-    child.metadata["member_file_hashes"] = {"inner.pkl": {"file_hashes": {"sha256": "d" * 64}, "hash_complete": True}}
+    child.merge_member_result(_scan_result_with_sha256("d" * 64), "inner.pkl")
 
     parent.merge_member_result(child, "../nested.zip")
+    parent.merge_member_result(_scan_result_with_sha256("e" * 64), "../nested.zip:inner.pkl")
+    parent.merge_member_result(_scan_result_with_sha256("f" * 64), " payload.pkl")
+    parent.merge_member_result(_scan_result_with_sha256("g" * 64), "payload.pkl")
+    parent.merge_member_result(_scan_result_with_sha256("h" * 64), "payload.pkl#2")
 
     assert parent.metadata["file_hashes"]["sha256"] == "a" * 64
-    assert parent.metadata["member_file_hashes"]["../nested.zip:inner.pkl"]["file_hashes"]["sha256"] == "d" * 64
+    assert _single_member_record(parent, ["../nested.zip", "inner.pkl"])["file_hashes"]["sha256"] == "d" * 64
+    assert _single_member_record(parent, ["../nested.zip:inner.pkl"])["file_hashes"]["sha256"] == "e" * 64
+    assert _single_member_record(parent, [" payload.pkl"])["file_hashes"]["sha256"] == "f" * 64
+    assert _single_member_record(parent, ["payload.pkl"])["file_hashes"]["sha256"] == "g" * 64
+    assert _single_member_record(parent, ["payload.pkl#2"])["file_hashes"]["sha256"] == "h" * 64
 
 
 def test_merge_member_result_keeps_partial_and_inconclusive_hashes_child_scoped() -> None:
@@ -690,13 +720,29 @@ def test_merge_member_result_keeps_partial_and_inconclusive_hashes_child_scoped(
     parent.merge_member_result(skipped, "skipped.pkl")
 
     assert parent.metadata["file_hashes"]["sha256"] == "a" * 64
-    partial_record = parent.metadata["member_file_hashes"]["partial.pkl"]
+    partial_record = _single_member_record(parent, ["partial.pkl"])
     assert partial_record["hash_status"] == "partial"
     assert partial_record["hash_complete"] is False
     assert "file_hashes" not in partial_record
-    assert "skipped.pkl" not in parent.metadata["member_file_hashes"]
+    assert _member_records_for_segments(parent, ["skipped.pkl"]) == []
     assert "zip_entry_scan_incomplete" in parent.metadata["scan_outcome_reasons"]
     assert "configured_archive_member_skip" in parent.metadata["scan_outcome_reasons"]
+
+
+def test_merge_member_result_bounds_retained_member_hashes_without_quadratic_copying() -> None:
+    parent = ScanResult(scanner_name="zip")
+    parent.metadata["file_hashes"] = {"sha256": "a" * 64}
+
+    for index in range(MAX_MEMBER_FILE_HASH_RECORDS + 2):
+        parent.merge_member_result(_scan_result_with_sha256(f"{index:064x}"[-64:]), "payload.pkl")
+
+    assert len(parent.metadata["member_file_hashes"]) == MAX_MEMBER_FILE_HASH_RECORDS
+    assert parent.metadata["member_file_hashes_total"] == MAX_MEMBER_FILE_HASH_RECORDS + 2
+    assert parent.metadata["member_file_hashes_truncated"] is True
+    assert parent.metadata["member_file_hashes_omitted"] == 2
+    records = _member_records_for_segments(parent, ["payload.pkl"])
+    assert records[0]["occurrence"] == 1
+    assert records[-1]["occurrence"] == MAX_MEMBER_FILE_HASH_RECORDS
 
 
 class TestScanConfigModel:

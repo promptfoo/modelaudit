@@ -4,13 +4,15 @@ import hashlib
 import json
 import os
 import pickle
+import tarfile
 import zipfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from modelaudit.cache import reset_cache_manager
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.integrations.sbom_generator import generate_sbom_pydantic
@@ -37,6 +39,22 @@ def _pytorch_zip_with_pickle_members(
 
 def _member_sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def _member_records_for_segments(metadata: dict[str, Any], path_segments: list[str]) -> list[dict[str, Any]]:
+    member_hashes = metadata.get("member_file_hashes")
+    assert isinstance(member_hashes, dict)
+    return [
+        record
+        for record in member_hashes.values()
+        if isinstance(record, dict) and record.get("path_segments") == path_segments
+    ]
+
+
+def _single_member_record(metadata: dict[str, Any], path_segments: list[str]) -> dict[str, Any]:
+    records = _member_records_for_segments(metadata, path_segments)
+    assert len(records) == 1
+    return records[0]
 
 
 class TestRegularScanContentHash:
@@ -94,8 +112,8 @@ class TestRegularScanContentHash:
         assert "file_hashes_complete" not in metadata
         assert "file_hashes_bytes_hashed" not in metadata
         assert metadata["file_hashes"]["sha256"] not in {benign_hash, malicious_hash}
-        assert metadata["member_file_hashes"]["data.pkl"]["file_hashes"]["sha256"] == benign_hash
-        assert metadata["member_file_hashes"]["evil.pkl"]["file_hashes"]["sha256"] == malicious_hash
+        assert _single_member_record(metadata, ["data.pkl"])["file_hashes"]["sha256"] == benign_hash
+        assert _single_member_record(metadata, ["evil.pkl"])["file_hashes"]["sha256"] == malicious_hash
         assert any(
             issue.location is not None
             and ":evil.pkl" in issue.location
@@ -106,12 +124,13 @@ class TestRegularScanContentHash:
         json_payload = result.model_dump(mode="json", exclude_none=True)
         json_metadata = json_payload["file_metadata"][str(model_path)]
         assert json_metadata["file_hashes"]["sha256"] == outer_hash
-        assert json_metadata["member_file_hashes"]["evil.pkl"]["file_hashes"]["sha256"] == malicious_hash
+        assert _single_member_record(json_metadata, ["evil.pkl"])["file_hashes"]["sha256"] == malicious_hash
 
         sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
         artifact = sarif_payload["runs"][0]["artifacts"][0]
         assert artifact["hashes"]["sha-256"] == outer_hash
-        assert artifact["properties"]["memberFileHashes"]["evil.pkl"]["file_hashes"]["sha256"] == malicious_hash
+        sarif_member_metadata = {"member_file_hashes": artifact["properties"]["memberFileHashes"]}
+        assert _single_member_record(sarif_member_metadata, ["evil.pkl"])["file_hashes"]["sha256"] == malicious_hash
 
         sbom_payload = json.loads(generate_sbom_pydantic([str(model_path)], result))
         component = sbom_payload["components"][0]
@@ -119,7 +138,59 @@ class TestRegularScanContentHash:
         member_hash_property = next(
             prop["value"] for prop in component["properties"] if prop["name"] == "modelaudit:member_file_hashes"
         )
-        assert json.loads(member_hash_property)["evil.pkl"]["file_hashes"]["sha256"] == malicious_hash
+        assert (
+            _single_member_record({"member_file_hashes": json.loads(member_hash_property)}, ["evil.pkl"])[
+                "file_hashes"
+            ]["sha256"]
+            == malicious_hash
+        )
+
+    def test_generic_zip_member_hash_identities_are_collision_free(self, tmp_path: Path) -> None:
+        duplicate_payload = pickle.dumps({"duplicate": True})
+        literal_colon_payload = pickle.dumps({"literal": "colon"})
+        inner_payload = pickle.dumps({"nested": True})
+        malicious_payload = pickle.dumps(_MaliciousPicklePayload())
+        inner_zip_path = tmp_path / "inner.zip"
+        with zipfile.ZipFile(inner_zip_path, "w") as inner_zip:
+            inner_zip.writestr("inner.pkl", inner_payload)
+        archive_path = tmp_path / "collision.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("dup.pkl", duplicate_payload)
+            archive.writestr("dup.pkl", duplicate_payload)
+            archive.writestr("nested.zip:inner.pkl", literal_colon_payload)
+            archive.write(inner_zip_path, "nested.zip")
+            archive.writestr("evil.pkl", malicious_payload)
+
+        result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+        metadata = result.file_metadata[str(archive_path)].model_dump(mode="json", exclude_none=True)
+
+        duplicate_records = sorted(
+            _member_records_for_segments(metadata, ["dup.pkl"]),
+            key=lambda record: record["occurrence"],
+        )
+        assert [record["occurrence"] for record in duplicate_records] == [1, 2]
+        assert all(record["file_hashes"]["sha256"] == _member_sha256(duplicate_payload) for record in duplicate_records)
+        assert _single_member_record(metadata, ["nested.zip:inner.pkl"])["file_hashes"]["sha256"] == _member_sha256(
+            literal_colon_payload
+        )
+        assert _single_member_record(metadata, ["nested.zip", "inner.pkl"])["file_hashes"]["sha256"] == _member_sha256(
+            inner_payload
+        )
+        assert any(issue.location is not None and ":evil.pkl" in issue.location for issue in result.issues)
+
+    def test_tar_member_hashes_are_child_scoped(self, tmp_path: Path) -> None:
+        payload = pickle.dumps({"safe": "tar"})
+        archive_path = tmp_path / "model.tar"
+        payload_path = tmp_path / "payload.pkl"
+        payload_path.write_bytes(payload)
+        with tarfile.open(archive_path, "w") as archive:
+            archive.add(payload_path, arcname="payload.pkl")
+
+        result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+        metadata = result.file_metadata[str(archive_path)].model_dump(mode="json", exclude_none=True)
+
+        assert metadata["file_hashes"]["sha256"] == hashlib.sha256(archive_path.read_bytes()).hexdigest()
+        assert _single_member_record(metadata, ["payload.pkl"])["file_hashes"]["sha256"] == _member_sha256(payload)
 
     def test_pytorch_member_hashes_survive_cache_round_trip(self, tmp_path: Path) -> None:
         reset_cache_manager()
@@ -134,18 +205,22 @@ class TestRegularScanContentHash:
             cache_dir=cache_dir,
             min_cache_file_size=0,
         )
+        cache_manager = get_cache_manager(cache_dir, enabled=True)
+        stats_after_first = cache_manager.get_stats()
         second = scan_model_directory_or_file(
             str(model_path),
             cache_enabled=True,
             cache_dir=cache_dir,
             min_cache_file_size=0,
         )
+        stats_after_second = cache_manager.get_stats()
+        assert stats_after_second["cache_hits"] == stats_after_first["cache_hits"] + 1
 
         for result in (first, second):
             metadata = result.file_metadata[str(model_path)].model_dump(mode="json", exclude_none=True)
             assert metadata["file_hashes"]["sha256"] == outer_hash
-            assert metadata["member_file_hashes"]["data.pkl"]["file_hashes"]["sha256"] == member_hash
-            assert metadata["member_file_hashes"]["data.pkl"]["file_hashes"]["sha256"] != outer_hash
+            assert _single_member_record(metadata, ["data.pkl"])["file_hashes"]["sha256"] == member_hash
+            assert _single_member_record(metadata, ["data.pkl"])["file_hashes"]["sha256"] != outer_hash
 
         reset_cache_manager()
 
@@ -186,7 +261,7 @@ class TestRegularScanContentHash:
         metadata = result.file_metadata[str(model_path)].model_dump(mode="json", exclude_none=True)
 
         assert metadata["file_hashes"]["sha256"] == expected_parent_sha
-        assert metadata["member_file_hashes"][member_name]["file_hashes"]["sha256"] == expected_member_sha
+        assert _single_member_record(metadata, [member_name])["file_hashes"]["sha256"] == expected_member_sha
 
     def test_directory_generates_hash(self, tmp_path):
         """Test that scanning a directory generates an aggregate content hash."""
