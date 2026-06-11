@@ -132,7 +132,7 @@ _GGUF_FETCH_OPTIONS_WITH_VALUE = frozenset(
 _GGUF_FETCH_DESTINATION_OPTIONS_WITH_VALUE = frozenset({"--url", "-uri"})
 _GGUF_CURL_FETCH_SHORT_OPTIONS_WITH_VALUE = frozenset({"a", "d", "F", "H", "K", "m", "o", "u", "x", "X"})
 _GGUF_WGET_FETCH_SHORT_OPTIONS_WITH_VALUE = frozenset({"O", "a", "d", "h", "m", "o", "u", "x"})
-_GGUF_POWERSHELL_FETCH_SHORT_OPTIONS_WITH_VALUE = frozenset()
+_GGUF_POWERSHELL_FETCH_SHORT_OPTIONS_WITH_VALUE: frozenset[str] = frozenset()
 _GGUF_PYTHON_EXEC_CALLS = ("eval", "exec", "__import__")
 _GGUF_METADATA_NETWORK_APIS = (
     "httpx.get",
