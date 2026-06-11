@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from collections.abc import Iterator
 from io import BytesIO
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any, ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_STRING_PATTERNS
+from modelaudit.scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -51,6 +53,30 @@ def _is_contained_in(child: Path, parent: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _companion_filename_key(filename: str) -> str:
+    return unicodedata.normalize("NFC", filename).casefold()
+
+
+def _same_stem_companion(path: Path, suffix: str) -> Path:
+    expected_path = path.with_suffix(suffix)
+    if expected_path.exists() or expected_path.is_symlink():
+        return expected_path
+
+    expected_key = _companion_filename_key(expected_path.name)
+    try:
+        candidates = [
+            child
+            for child in path.parent.iterdir()
+            if _companion_filename_key(child.name) == expected_key and (child.exists() or child.is_symlink())
+        ]
+    except OSError:
+        return expected_path
+
+    if len(candidates) == 1:
+        return candidates[0]
+    return expected_path
 
 
 def _skip_doctype_declaration(xml_prefix: bytes, start_offset: int) -> int | None:
@@ -185,6 +211,35 @@ def _redact_url_reference(value: str) -> str:
     return _URL_REFERENCE_PATTERN.sub(replace_url, value)
 
 
+def openvino_xml_companion_for_weights(path: str | os.PathLike[str]) -> Path | None:
+    """Return the owning OpenVINO XML path for a same-stem weights sidecar."""
+    weights_path = Path(path)
+    if weights_path.suffix.lower() != ".bin":
+        return None
+
+    xml_path = _same_stem_companion(weights_path, ".xml")
+    if not xml_path.is_file():
+        return None
+    if not OpenVinoScanner.can_handle(str(xml_path)):
+        return None
+    return xml_path
+
+
+def openvino_weights_companion_for_xml(
+    path: str | os.PathLike[str],
+    *,
+    require_existing: bool = True,
+) -> Path | None:
+    """Return the same-stem OpenVINO weights sidecar for an XML path."""
+    xml_path = Path(path)
+    if xml_path.suffix.lower() != ".xml":
+        return None
+    weights_path = _same_stem_companion(xml_path, ".bin")
+    if require_existing and not (weights_path.exists() or weights_path.is_symlink()):
+        return None
+    return weights_path
+
+
 class OpenVinoScanner(BaseScanner):
     """Scanner for OpenVINO IR (.xml/.bin) model files."""
 
@@ -192,6 +247,95 @@ class OpenVinoScanner(BaseScanner):
     description = "Scans OpenVINO IR models for suspicious layers and external references"
     supported_extensions: ClassVar[list[str]] = [".xml"]
     CAN_HANDLE_MAX_PARSE_BYTES: ClassVar[int] = 1024 * 1024
+
+    def _record_bin_size(self, result: ScanResult, bin_path: Path) -> None:
+        bin_size = self.get_file_size(str(bin_path))
+        result.metadata["bin_size"] = bin_size
+
+        configured_limit = self.config.get("max_file_size", 0)
+        max_file_size = configured_limit if isinstance(configured_limit, int) and configured_limit > 0 else 0
+        if max_file_size and bin_size > max_file_size:
+            reason = "openvino_weights_file_size_exceeded"
+            result.metadata["operational_error"] = True
+            result.metadata["operational_error_reason"] = reason
+            result.metadata["analysis_incomplete"] = True
+            result.metadata["scan_outcome"] = "inconclusive"
+            result.metadata["scan_outcome_reason"] = reason
+            result.metadata["scan_outcome_reasons"] = [reason]
+            result.add_check(
+                name="OpenVINO Weights File Size Limit",
+                passed=False,
+                message=f"Associated .bin weights file too large to scan: {bin_size} bytes (max: {max_file_size})",
+                severity=IssueSeverity.INFO,
+                location=str(bin_path),
+                details={
+                    "file_size": bin_size,
+                    "max_file_size": max_file_size,
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": reason,
+                },
+            )
+            return
+
+        self._scan_pickle_payload_sidecar(result, bin_path, bin_size)
+
+    def _scan_pickle_payload_sidecar(self, result: ScanResult, bin_path: Path, bin_size: int) -> None:
+        """Scan an OpenVINO weights sidecar when its content is actually pickle-formatted."""
+        try:
+            from modelaudit.utils.file.detection import detect_file_format_from_magic
+
+            if detect_file_format_from_magic(str(bin_path)) != "pickle":
+                return
+
+            from .pickle_scanner import PickleScanner
+
+            pickle_scanner, scanner_selection = embedded_pickle_scanner(
+                self.config,
+                lambda config: PickleScanner(config=config),
+            )
+            if pickle_scanner is None:
+                add_scanner_selection_skip_check(
+                    result,
+                    str(bin_path),
+                    "pickle",
+                    scanner_selection,
+                    context="OpenVINO weights sidecar",
+                )
+                result.metadata["openvino_weights_pickle_payload_skipped"] = True
+                return
+
+            with bin_path.open("rb") as bin_file:
+                pickle_result = pickle_scanner.scan_stream(
+                    bin_file,
+                    bin_size,
+                    source=str(bin_path),
+                )
+        except Exception as exc:
+            reason = "openvino_weights_pickle_scan_failed"
+            result.metadata["operational_error"] = True
+            result.metadata["operational_error_reason"] = reason
+            result.metadata["analysis_incomplete"] = True
+            result.metadata["scan_outcome"] = "inconclusive"
+            result.metadata["scan_outcome_reason"] = reason
+            result.add_check(
+                name="OpenVINO Weights Pickle Payload Scan",
+                passed=False,
+                message=f"Unable to inspect pickle-formatted OpenVINO weights sidecar: {exc}",
+                severity=IssueSeverity.INFO,
+                location=str(bin_path),
+                details={
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": reason,
+                },
+            )
+            return
+
+        pickle_result.bytes_scanned = 0
+        result.metadata["openvino_weights_pickle_payload_scanned"] = True
+        result.merge(pickle_result)
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -221,7 +365,9 @@ class OpenVinoScanner(BaseScanner):
         result.metadata["xml_size"] = self.get_file_size(path)
 
         model_dir = Path(path).resolve().parent
-        bin_path = Path(os.path.splitext(path)[0] + ".bin")
+        bin_path = openvino_weights_companion_for_xml(path, require_existing=False)
+        if bin_path is None:
+            bin_path = Path(os.path.splitext(path)[0] + ".bin")
         if bin_path.is_symlink():
             resolved_bin_path = bin_path.resolve(strict=False)
             if not _is_contained_in(resolved_bin_path, model_dir):
@@ -244,9 +390,9 @@ class OpenVinoScanner(BaseScanner):
                     ),
                 )
             elif bin_path.is_file():
-                result.metadata["bin_size"] = self.get_file_size(str(bin_path))
+                self._record_bin_size(result, bin_path)
         elif bin_path.is_file():
-            result.metadata["bin_size"] = self.get_file_size(str(bin_path))
+            self._record_bin_size(result, bin_path)
         else:
             result.add_check(
                 name="OpenVINO Weights File Check",
@@ -331,5 +477,5 @@ class OpenVinoScanner(BaseScanner):
                         rule_code="S902",
                     )
 
-        result.finish(success=not result.has_errors)
+        result.finish(success=not result.has_errors and not bool(result.metadata.get("operational_error")))
         return result
