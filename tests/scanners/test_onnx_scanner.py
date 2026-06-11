@@ -20,6 +20,7 @@ from modelaudit.detectors.jit_script import JITScriptDetector
 from modelaudit.detectors.network_comm import NetworkCommDetector
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.onnx_scanner import (
+    ONNX_SCHEMA_INCONCLUSIVE_REASON,
     ONNX_STRUCTURE_INCONCLUSIVE_REASON,
     ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON,
     OnnxScanner,
@@ -78,15 +79,7 @@ def create_onnx_model(
 
     initializers: list[Any] = []
     if include_initializer and external:
-        value_count = 1
-        for dim in tensor_shape:
-            value_count *= dim
-        tensor = helper.make_tensor("W", TensorProto.FLOAT, list(tensor_shape), vals=[1.0] * max(1, value_count))
-        tensor.data_location = onnx.TensorProto.EXTERNAL
-        entry = StringStringEntryProto()
-        entry.key = "location"
-        entry.value = external_path
-        tensor.external_data.append(entry)
+        tensor = _make_external_tensor("W", TensorProto.FLOAT, list(tensor_shape), external_path)
         for key, value in (external_metadata or {}).items():
             extra_entry = StringStringEntryProto()
             extra_entry.key = key
@@ -1735,12 +1728,7 @@ def create_onnx_model_with_nested_external_initializer(
     external_path: str,
     missing_external: bool = False,
 ) -> Path:
-    tensor = helper.make_tensor("nested_W", TensorProto.FLOAT, [1], vals=[1.0])
-    tensor.data_location = onnx.TensorProto.EXTERNAL
-    entry = StringStringEntryProto()
-    entry.key = "location"
-    entry.value = external_path
-    tensor.external_data.append(entry)
+    tensor = _make_external_tensor("nested_W", TensorProto.FLOAT, [1], external_path)
 
     then_branch = helper.make_graph(
         [helper.make_node("Identity", ["nested_W"], ["Z"])],
@@ -2329,6 +2317,7 @@ def test_onnx_scanner_standard_ai_onnx_ml_domain_not_flagged(tmp_path: Path) -> 
         custom=True,
         custom_domain="ai.onnx.ml",
         custom_op_type="LinearRegressor",
+        custom_opset_version=1,
     )
     result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
     assert len(custom_domain_checks) == 0, (
@@ -2340,12 +2329,29 @@ def test_onnx_scanner_standard_ai_onnx_ml_domain_not_flagged(tmp_path: Path) -> 
 
 
 def test_onnx_scanner_standard_preview_training_domain_not_flagged(tmp_path: Path) -> None:
-    model_path = create_onnx_model(
-        tmp_path,
-        custom=True,
-        custom_domain="ai.onnx.preview.training",
-        custom_op_type="Adam",
+    r_value = helper.make_tensor_value_info("R", TensorProto.FLOAT, [])
+    t_value = helper.make_tensor_value_info("T", TensorProto.INT64, [])
+    x_value = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1])
+    y_value = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])
+    node = helper.make_node(
+        "Adam",
+        ["R", "T", "X"],
+        ["Y"],
+        domain="ai.onnx.preview.training",
+        name="adam",
     )
+    graph = helper.make_graph([node], "graph", [r_value, t_value, x_value], [y_value])
+    model = helper.make_model(
+        graph,
+        opset_imports=[
+            helper.make_opsetid("", 13),
+            helper.make_opsetid("ai.onnx.preview.training", 1),
+        ],
+    )
+    model.ir_version = 8
+    model_path = tmp_path / "model.onnx"
+    onnx.save(model, str(model_path))
+
     result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
     assert len(custom_domain_checks) == 0, (
         f"Expected no custom-domain finding for ai.onnx.preview.training. Checks: {[c.message for c in result.checks]}"
@@ -3480,6 +3486,33 @@ def test_onnx_scanner_external_data_exists(tmp_path: Path) -> None:
     assert resolved_checks[0].status.value == "passed"
 
 
+def test_onnx_scanner_skips_path_schema_validation_for_external_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_onnx_model(tmp_path, external=True, external_path="weights.bin")
+
+    def fail_if_called(_model_or_path: Any, *args: Any, **kwargs: Any) -> None:
+        raise AssertionError("external_data schema validation must not resolve through check_model")
+
+    monkeypatch.setattr(onnx.checker, "check_model", fail_if_called)
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    schema_checks = [c for c in result.checks if c.name == "ONNX Schema Validation"]
+    assert len(schema_checks) == 1
+    assert schema_checks[0].details["external_data_present"] is True
+    assert any(
+        c.name == "External Data Reference Check"
+        and c.status == CheckStatus.PASSED
+        and c.details.get("file") == "weights.bin"
+        for c in result.checks
+    )
+
+
 def test_onnx_scanner_corrupted(tmp_path: Path) -> None:
     model_path = create_onnx_model(tmp_path)
     data = model_path.read_bytes()
@@ -3560,7 +3593,9 @@ def test_onnx_scanner_python_substring_near_match_not_flagged(tmp_path: Path) ->
 
     result = OnnxScanner().scan(str(model_path))
 
-    assert result.success is True
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
     assert not [c for c in result.checks if c.name == "Python Operator Detection" and c.status == CheckStatus.FAILED]
 
 
@@ -3591,7 +3626,9 @@ def test_onnx_scanner_uppercase_snake_python_near_match_not_flagged(tmp_path: Pa
 
     result = OnnxScanner().scan(str(model_path))
 
-    assert result.success is True
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
     assert not [c for c in result.checks if c.name == "Python Operator Detection" and c.status == CheckStatus.FAILED]
 
 
@@ -4047,7 +4084,9 @@ class TestCVE202634447SymlinkTraversal:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
         traversal_checks = [
             c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
@@ -4069,7 +4108,9 @@ class TestCVE202634447SymlinkTraversal:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
         assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2025-51480"]
         missing_checks = [
@@ -4318,7 +4359,9 @@ class TestCVE202427318NestedPathTraversal:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         traversal_checks = [
             c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
         ]
@@ -4337,7 +4380,9 @@ class TestCVE202427318NestedPathTraversal:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         traversal_checks = [
             c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
         ]
@@ -4357,7 +4402,9 @@ class TestCVE202427318NestedPathTraversal:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         traversal_checks = [
             c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
         ]
@@ -4377,7 +4424,9 @@ class TestCVE202427318NestedPathTraversal:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         traversal_checks = [
             c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
         ]
@@ -4495,7 +4544,9 @@ class TestExternalDataSizeValidation:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         size_checks = [
             c for c in result.checks if c.name == "External Data Size Validation" and c.status == CheckStatus.PASSED
         ]
