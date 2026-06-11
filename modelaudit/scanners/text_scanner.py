@@ -21,6 +21,7 @@ TEXT_CONTENT_SECURITY_FINDING_LIMIT_REASON = "text_content_security_finding_limi
 TEXT_CONTENT_SECURITY_CLASSIFICATION_LIMIT_REASON = "text_content_security_classification_limit"
 DEFAULT_TEXT_CONTENT_SECURITY_SCAN_BYTES = 100 * 1024 * 1024
 DEFAULT_TEXT_CONTENT_SECURITY_MAX_FINDINGS = 1024
+DOCUMENTATION_NETWORK_REPORTING_MAX_FINDINGS = 24
 DETECTOR_FINDING_LIMIT_TYPE = "detector_finding_limit"
 FSTRING_MIDDLE_TOKEN_TYPE = getattr(token, "FSTRING_MIDDLE", None)
 DOCUMENTATION_TEXT_FILENAMES = frozenset(
@@ -513,6 +514,12 @@ DOCUMENTATION_FENCED_NETWORK_FUNCTION_ALIAS_ASSIGNMENT_PATTERN = re.compile(
     rb"(?:requests\.(?:get|head|post|put|patch|delete|request)|urllib\.request\.urlopen|urlopen)\b(?!\s*\()",
     re.IGNORECASE,
 )
+DOCUMENTATION_FENCED_BOUND_NETWORK_METHOD_ALIAS_ASSIGNMENT_PATTERN = re.compile(
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+    rb"(?P<receiver>(?:requests\.)?Session\s*\([^)]*\)|[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*"
+    rb"(?:get|head|post|put|patch|delete|request)\b(?!\s*\()",
+    re.IGNORECASE,
+)
 DOCUMENTATION_FENCED_VARIABLE_HTTP_CALL_PATTERN = re.compile(
     rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*"
     rb"(?:get|head|post|put|patch|delete|request)\s*\(",
@@ -534,6 +541,14 @@ DOCUMENTATION_FENCED_NETWORK_FUNCTION_PATTERN = re.compile(
     rb"\b(?:urlopen|urlretrieve|socket\.connect|socket\.create_connection|requests\.(?:get|post|put|delete)|"
     rb"http\.request|ftp\.connect|ssh\.connect|telnet\.open|smtp\.connect|imap\.login|redis\.connect|"
     rb"mongo\.connect|getaddrinfo|gethostbyname|gethostbyaddr|dns\.resolver)\b",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_NETWORK_FUNCTION_IMPORT_PATTERN = re.compile(
+    rb"\bfrom\s+(?:requests|urllib\.request)\s+import\s+(?P<imports>[^\r\n#;]+)",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_EXECUTED_FETCH_PATTERN = re.compile(
+    rb"\b(?:exec|eval|compile)\s*\([^()\r\n]*(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_BIBLIOGRAPHY_URL_FIELD_PATTERN = re.compile(
@@ -1643,18 +1658,86 @@ class TextScanner(BaseScanner):
             return False
         return cls._documentation_fenced_passive_assigned_url_is_informational(url)
 
+    @classmethod
+    def _documentation_fenced_match_is_line_comment(cls, fenced_code: bytes, position: int) -> bool:
+        line_start = fenced_code.rfind(b"\n", 0, position) + 1
+        line_end = fenced_code.find(b"\n", position)
+        if line_end == -1:
+            line_end = len(fenced_code)
+        return cls._documentation_shell_comment_before_position(
+            fenced_code[line_start:line_end],
+            position - line_start,
+        )
+
     @staticmethod
+    def _span_overlaps_any(start: int, end: int, spans: tuple[tuple[int, int], ...]) -> bool:
+        return any(start < span_end and span_start < end for span_start, span_end in spans)
+
+    @classmethod
     def _documentation_fenced_has_call_after_assignment(
+        cls,
         fenced_code: bytes,
         assignment_pattern: re.Pattern[bytes],
         call_pattern: re.Pattern[bytes],
     ) -> bool:
         assignment_positions: dict[bytes, list[int]] = {}
         for match in assignment_pattern.finditer(fenced_code):
+            if cls._documentation_fenced_match_is_line_comment(fenced_code, match.start()):
+                continue
             assignment_positions.setdefault(match.group("target"), []).append(match.start())
         return any(
             any(position < call_match.start() for position in assignment_positions.get(call_match.group("target"), []))
             for call_match in call_pattern.finditer(fenced_code)
+            if not cls._documentation_fenced_match_is_line_comment(fenced_code, call_match.start())
+        )
+
+    @classmethod
+    def _documentation_fenced_has_imported_network_call(cls, fenced_code: bytes) -> bool:
+        imported_targets: dict[bytes, list[int]] = {}
+        network_names = {b"get", b"head", b"post", b"put", b"patch", b"delete", b"request", b"urlopen", b"urlretrieve"}
+        for match in DOCUMENTATION_FENCED_NETWORK_FUNCTION_IMPORT_PATTERN.finditer(fenced_code):
+            if cls._documentation_fenced_match_is_line_comment(fenced_code, match.start()):
+                continue
+            for import_part in match.group("imports").split(b","):
+                name_part = import_part.strip()
+                if not name_part:
+                    continue
+                alias_parts = re.split(rb"\s+as\s+", name_part, maxsplit=1, flags=re.IGNORECASE)
+                imported_name = alias_parts[0].strip()
+                if imported_name not in network_names:
+                    continue
+                target = (alias_parts[-1] if len(alias_parts) == 2 else imported_name).strip()
+                if re.fullmatch(rb"[A-Za-z_][A-Za-z0-9_]*", target) is not None:
+                    imported_targets.setdefault(target, []).append(match.start())
+        return any(
+            any(position < call_match.start() for position in imported_targets.get(call_match.group("target"), []))
+            for call_match in DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN.finditer(fenced_code)
+            if not cls._documentation_fenced_match_is_line_comment(fenced_code, call_match.start())
+        )
+
+    @classmethod
+    def _documentation_fenced_has_bound_session_alias_call(cls, fenced_code: bytes) -> bool:
+        session_assignment_positions: dict[bytes, list[int]] = {}
+        for match in DOCUMENTATION_FENCED_SESSION_ASSIGNMENT_PATTERN.finditer(fenced_code):
+            if cls._documentation_fenced_match_is_line_comment(fenced_code, match.start()):
+                continue
+            session_assignment_positions.setdefault(match.group("target"), []).append(match.start())
+
+        alias_positions: dict[bytes, list[int]] = {}
+        for match in DOCUMENTATION_FENCED_BOUND_NETWORK_METHOD_ALIAS_ASSIGNMENT_PATTERN.finditer(fenced_code):
+            if cls._documentation_fenced_match_is_line_comment(fenced_code, match.start()):
+                continue
+            receiver = match.group("receiver")
+            receiver_is_session = b"Session" in receiver or any(
+                position < match.start() for position in session_assignment_positions.get(receiver, [])
+            )
+            if receiver_is_session:
+                alias_positions.setdefault(match.group("target"), []).append(match.start())
+
+        return any(
+            any(position < call_match.start() for position in alias_positions.get(call_match.group("target"), []))
+            for call_match in DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN.finditer(fenced_code)
+            if not cls._documentation_fenced_match_is_line_comment(fenced_code, call_match.start())
         )
 
     @classmethod
@@ -1663,6 +1746,9 @@ class TextScanner(BaseScanner):
             DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN.search(fenced_code)
             or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(fenced_code)
             or DOCUMENTATION_FENCED_SESSION_HTTP_CALL_PATTERN.search(fenced_code)
+            or DOCUMENTATION_FENCED_EXECUTED_FETCH_PATTERN.search(fenced_code)
+            or cls._documentation_fenced_has_imported_network_call(fenced_code)
+            or cls._documentation_fenced_has_bound_session_alias_call(fenced_code)
             or cls._documentation_fenced_has_call_after_assignment(
                 fenced_code,
                 DOCUMENTATION_FENCED_SESSION_ASSIGNMENT_PATTERN,
@@ -1698,16 +1784,22 @@ class TextScanner(BaseScanner):
             for match in DOCUMENTATION_FENCED_NETWORK_FUNCTION_PATTERN.finditer(fenced_code)
         ):
             return False
-        safe_assigned_urls = {
-            (match.group("target"), match.start()): match.group("url").decode("utf-8", errors="ignore")
-            for pattern in (
-                DOCUMENTATION_FENCED_URL_ASSIGNMENT_PATTERN,
-                DOCUMENTATION_FENCED_URL_REQUEST_ASSIGNMENT_PATTERN,
-            )
-            for match in pattern.finditer(fenced_code)
-        }
+        safe_assigned_urls: dict[tuple[bytes, int], str] = {}
+        for pattern in (
+            DOCUMENTATION_FENCED_URL_ASSIGNMENT_PATTERN,
+            DOCUMENTATION_FENCED_URL_REQUEST_ASSIGNMENT_PATTERN,
+        ):
+            for match in pattern.finditer(fenced_code):
+                if cls._documentation_fenced_match_is_line_comment(fenced_code, match.start()):
+                    continue
+                safe_assigned_urls[(match.group("target"), match.start())] = match.group("url").decode(
+                    "utf-8",
+                    errors="ignore",
+                )
         assignment_positions: dict[bytes, list[int]] = {}
         for match in DOCUMENTATION_FENCED_VARIABLE_ASSIGNMENT_PATTERN.finditer(fenced_code):
+            if cls._documentation_fenced_match_is_line_comment(fenced_code, match.start()):
+                continue
             assignment_positions.setdefault(match.group("target"), []).append(match.start())
         call_target_urls: list[str] = []
         for match in variable_call_matches:
@@ -2156,6 +2248,7 @@ class TextScanner(BaseScanner):
         for raw_line in payload.splitlines(keepends=True):
             line = raw_line.rstrip(b"\r\n")
             url_matches = tuple(BARE_NETWORK_URL_TOKEN_PATTERN.finditer(line))
+            url_spans = tuple((match.start(), match.end()) for match in url_matches)
             for match in url_matches:
                 position = offset + match.start()
                 if cls._documentation_position_is_fenced_code(fenced_code_ranges, position) and (
@@ -2183,28 +2276,29 @@ class TextScanner(BaseScanner):
                     fenced_passive_network_example_ranges,
                 ):
                     return False
-            if not url_matches:
-                for pattern, finding_type, value_key in (
-                    (BARE_NETWORK_IPV4_TOKEN_PATTERN, "ipv4_address", "ip"),
-                    (BARE_NETWORK_IPV6_TOKEN_PATTERN, "ipv6_address", "ip"),
-                    (BARE_NETWORK_DOMAIN_TOKEN_PATTERN, "domain", "domain"),
-                ):
-                    for match in pattern.finditer(line):
-                        if not cls._documentation_bare_network_token_candidate_is_relevant(line, match.start()):
-                            continue
-                        finding = {
-                            "type": finding_type,
-                            value_key: cls._documentation_network_token_value(match),
-                            "position": offset + match.start(),
-                        }
-                        if not cls._sidecar_network_finding_is_informational(
-                            path,
-                            payload,
-                            finding,
-                            fenced_code_ranges,
-                            fenced_passive_network_example_ranges,
-                        ):
-                            return False
+            for pattern, finding_type, value_key in (
+                (BARE_NETWORK_IPV4_TOKEN_PATTERN, "ipv4_address", "ip"),
+                (BARE_NETWORK_IPV6_TOKEN_PATTERN, "ipv6_address", "ip"),
+                (BARE_NETWORK_DOMAIN_TOKEN_PATTERN, "domain", "domain"),
+            ):
+                for match in pattern.finditer(line):
+                    if cls._span_overlaps_any(match.start(), match.end(), url_spans):
+                        continue
+                    if not cls._documentation_bare_network_token_candidate_is_relevant(line, match.start()):
+                        continue
+                    finding = {
+                        "type": finding_type,
+                        value_key: cls._documentation_network_token_value(match),
+                        "position": offset + match.start(),
+                    }
+                    if not cls._sidecar_network_finding_is_informational(
+                        path,
+                        payload,
+                        finding,
+                        fenced_code_ranges,
+                        fenced_passive_network_example_ranges,
+                    ):
+                        return False
             for match in DOCUMENTATION_FENCED_NETWORK_FUNCTION_PATTERN.finditer(line):
                 function = match.group().decode("utf-8", errors="ignore")
                 finding = {"type": "network_function", "function": function, "position": offset + match.start()}
@@ -2261,7 +2355,7 @@ class TextScanner(BaseScanner):
         finding_limit: dict[str, Any],
     ) -> bool:
         truncated_finding_type = finding_limit.get("truncated_finding_type")
-        if truncated_finding_type not in PASSIVE_NETWORK_FINDING_TYPES | {"endpoint_redaction_classification"}:
+        if truncated_finding_type not in PASSIVE_NETWORK_FINDING_TYPES:
             return False
         if not cls._is_documentation_sidecar(path) or any(finding.get("severity") != "INFO" for finding in findings):
             return False
@@ -2530,11 +2624,16 @@ class TextScanner(BaseScanner):
 
         if check_network:
             try:
+                network_max_findings = (
+                    min(max_findings, DOCUMENTATION_NETWORK_REPORTING_MAX_FINDINGS)
+                    if self._is_documentation_sidecar(path)
+                    else max_findings
+                )
                 network_findings = self.collect_network_communication_findings(
                     inspected_payload,
                     path,
                     raise_on_error=True,
-                    max_findings=max_findings,
+                    max_findings=network_max_findings,
                 )
                 network_findings, finding_limit = self._split_detector_finding_limit(network_findings)
                 network_findings, classification_incomplete = self._downgrade_sidecar_network_findings(

