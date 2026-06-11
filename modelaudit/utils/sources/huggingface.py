@@ -1989,9 +1989,7 @@ def _build_huggingface_model_info(
         allow_inaccessible_probe_errors=allow_inaccessible_probe_errors,
         inaccessible_probe_files=inaccessible_probe_files if allow_inaccessible_probe_errors else None,
     )
-    inventory_files = model_files
-    if not inventory_files and inaccessible_probe_files:
-        inventory_files = list(dict.fromkeys(inaccessible_probe_files))
+    inventory_files = list(dict.fromkeys([*model_files, *inaccessible_probe_files]))
     inaccessible_probe_file_set = set(inaccessible_probe_files)
     repo_metadata_sizes = _extract_huggingface_repo_file_sizes(repo_info)
 
