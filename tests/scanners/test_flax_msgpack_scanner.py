@@ -1337,6 +1337,28 @@ def test_flax_msgpack_binary_anchor_scanner_fails_closed_for_unclosed_split_geta
     assert coverage_check.details["pattern"] == _UNBOUNDED_GETATTR_PATTERN
 
 
+def test_flax_msgpack_binary_anchor_scanner_fails_closed_for_same_window_unclosed_getattr_dunder() -> None:
+    first_chunk = (b"\x00" * 128) + b"getattr(object, '__" + (b"a" * 5000)
+    remaining = (b"a" * (64 * 1024)) + b"__')"
+    cursor = _MsgpackStreamCursor(io.BytesIO(remaining), len(remaining))
+    scanner = FlaxMsgpackScanner()
+    result = ScanResult("flax_msgpack")
+
+    scanner._analyze_streamed_binary_anchor_chunks(
+        first_chunk,
+        cursor,
+        len(remaining),
+        len(first_chunk) + len(remaining),
+        "root.params.blob",
+        result,
+    )
+
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    coverage_check = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
+    assert coverage_check.details["pattern"] == _UNBOUNDED_GETATTR_PATTERN
+
+
 def test_flax_msgpack_large_binary_fails_closed_for_split_stream_unsafe_custom_pattern(tmp_path: Path) -> None:
     path = tmp_path / "large_binary_custom_stream_unsafe_pattern.msgpack"
     payload = (b"\x00" * 128) + b"foo" + (b"x" * (64 * 1024 + 4096 + 100)) + b"bar"
@@ -1349,6 +1371,18 @@ def test_flax_msgpack_large_binary_fails_closed_for_split_stream_unsafe_custom_p
     assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
     coverage_check = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
     assert coverage_check.details["pattern"] == r"foo.*bar"
+
+
+def test_flax_msgpack_large_binary_does_not_fail_closed_for_reversed_custom_pattern_anchors(tmp_path: Path) -> None:
+    path = tmp_path / "large_binary_reversed_custom_pattern.msgpack"
+    payload = (b"\x00" * 128) + b"bar" + (b"x" * (64 * 1024 + 4096 + 100)) + b"foo"
+    create_msgpack_file(path, {"params": {"blob": payload}})
+
+    result = FlaxMsgpackScanner(config={"suspicious_patterns": [r"foo.*bar"]}).scan(str(path))
+
+    assert result.success is True
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON not in result.metadata.get("scan_outcome_reasons", [])
+    assert all(check.name != "Flax MessagePack Binary Pattern Coverage" for check in result.checks)
 
 
 @pytest.mark.parametrize(

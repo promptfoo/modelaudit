@@ -368,24 +368,28 @@ def _contains_suspicious_getattr(value: str) -> bool:
     return False
 
 
-def _contains_getattr_call_anchor(value: str) -> bool:
+def _find_getattr_call_end(value: str) -> int | None:
     lowered = value.lower()
     search_offset = 0
     while search_offset < len(value):
         getattr_index = lowered.find("getattr", search_offset)
         if getattr_index == -1:
-            return False
+            return None
         open_index = getattr_index + len("getattr")
         while open_index < len(value) and value[open_index].isspace():
             open_index += 1
         if open_index < len(value) and value[open_index] == "(":
-            return True
+            return open_index + 1
         search_offset = getattr_index + len("getattr")
-    return False
+    return None
 
 
-def _contains_quoted_dunder_attribute_after_comma(value: str) -> bool:
-    search_offset = 0
+def _contains_getattr_call_anchor(value: str) -> bool:
+    return _find_getattr_call_end(value) is not None
+
+
+def _contains_quoted_dunder_attribute_after_comma(value: str, start: int = 0) -> bool:
+    search_offset = start
     while search_offset < len(value):
         comma_index = value.find(",", search_offset)
         if comma_index == -1:
@@ -405,6 +409,22 @@ def _contains_quoted_dunder_attribute_after_comma(value: str) -> bool:
                     return True
         search_offset = comma_index + 1
     return False
+
+
+def _advance_ordered_literal_anchors(
+    value: str,
+    anchor_matchers: tuple[tuple[str, re.Pattern[str]], ...],
+    start_index: int,
+) -> int:
+    search_offset = 0
+    index = start_index
+    while index < len(anchor_matchers):
+        match = anchor_matchers[index][1].search(value, search_offset)
+        if match is None:
+            break
+        search_offset = match.end()
+        index += 1
+    return index
 
 
 def _get_regex_parser() -> Any:
@@ -2195,7 +2215,7 @@ class FlaxMsgpackScanner(BaseScanner):
         matched_patterns: dict[str, tuple[str, str]] = {}
         matched_transforms: dict[str, str] = {}
         unresolved_pattern_candidates: set[str] = set()
-        seen_pattern_anchors: dict[str, set[str]] = {}
+        seen_pattern_anchor_counts: dict[str, int] = {}
 
         def inspect_windows(raw_window: str, normalized_window: str) -> None:
             raw_window_lower = raw_window.lower()
@@ -2206,21 +2226,20 @@ class FlaxMsgpackScanner(BaseScanner):
             for pattern, compiled_pattern, lowered_pattern in self._compiled_suspicious_patterns:
                 if pattern in self._stream_unsafe_pattern_anchors:
                     anchors = self._stream_unsafe_pattern_anchors[pattern]
-                    anchor_matchers = self._stream_unsafe_anchor_matchers[pattern]
                     if anchors is None:
                         unresolved_pattern_candidates.add(pattern)
                         window_has_all_anchors = True
                     else:
-                        seen_anchors = seen_pattern_anchors.setdefault(pattern, set())
+                        anchor_matchers = self._stream_unsafe_anchor_matchers[pattern]
                         assert anchor_matchers is not None
-                        window_anchors = {
-                            anchor
-                            for anchor, matcher in anchor_matchers
-                            if matcher.search(normalized_window) is not None
-                        }
-                        seen_anchors.update(window_anchors)
-                        window_has_all_anchors = len(window_anchors) == len(anchors)
-                        if len(seen_anchors) == len(anchors):
+                        window_has_all_anchors = _advance_ordered_literal_anchors(
+                            normalized_window, anchor_matchers, 0
+                        ) == len(anchor_matchers)
+                        next_anchor_index = _advance_ordered_literal_anchors(
+                            normalized_window, anchor_matchers, seen_pattern_anchor_counts.get(pattern, 0)
+                        )
+                        seen_pattern_anchor_counts[pattern] = next_anchor_index
+                        if next_anchor_index == len(anchor_matchers):
                             unresolved_pattern_candidates.add(pattern)
 
                     if (
@@ -2520,7 +2539,7 @@ class FlaxMsgpackScanner(BaseScanner):
         matched_patterns: dict[str, tuple[str, str]] = {}
         matched_transforms: dict[str, str] = {}
         unresolved_pattern_candidates: set[str] = set()
-        seen_pattern_anchors: dict[str, set[str]] = {}
+        seen_pattern_anchor_counts: dict[str, int] = {}
         track_split_getattr_pattern = any(
             pattern == _UNBOUNDED_GETATTR_PATTERN for _, pattern, _, _ in self._binary_stream_pattern_matchers
         )
@@ -2565,11 +2584,28 @@ class FlaxMsgpackScanner(BaseScanner):
             normalized_window = _WHITESPACE_RUN_PATTERN.sub(" ", raw_window)
             if inspect_split_getattr_candidate:
                 previously_saw_getattr_call = saw_getattr_call_candidate
-                if _contains_getattr_call_anchor(raw_window) or _contains_getattr_call_anchor(normalized_window):
+                raw_getattr_call_end = _find_getattr_call_end(raw_window)
+                normalized_getattr_call_end = _find_getattr_call_end(normalized_window)
+                if raw_getattr_call_end is not None or normalized_getattr_call_end is not None:
                     saw_getattr_call_candidate = True
-                if previously_saw_getattr_call and (
-                    _contains_quoted_dunder_attribute_after_comma(raw_window)
-                    or _contains_quoted_dunder_attribute_after_comma(normalized_window)
+                if (
+                    (
+                        previously_saw_getattr_call
+                        and (
+                            _contains_quoted_dunder_attribute_after_comma(raw_window)
+                            or _contains_quoted_dunder_attribute_after_comma(normalized_window)
+                        )
+                    )
+                    or (
+                        raw_getattr_call_end is not None
+                        and _contains_quoted_dunder_attribute_after_comma(raw_window, raw_getattr_call_end)
+                    )
+                    or (
+                        normalized_getattr_call_end is not None
+                        and _contains_quoted_dunder_attribute_after_comma(
+                            normalized_window, normalized_getattr_call_end
+                        )
+                    )
                 ):
                     saw_getattr_dunder_candidate = True
             for transform in transform_candidates:
@@ -2594,12 +2630,11 @@ class FlaxMsgpackScanner(BaseScanner):
 
                 anchor_matchers = self._stream_unsafe_anchor_matchers[pattern]
                 assert anchor_matchers is not None
-                seen_anchors = seen_pattern_anchors.setdefault(pattern, set())
-                window_anchors = {
-                    anchor for anchor, matcher in anchor_matchers if matcher.search(normalized_window) is not None
-                }
-                seen_anchors.update(window_anchors)
-                if len(seen_anchors) == len(anchors):
+                next_anchor_index = _advance_ordered_literal_anchors(
+                    normalized_window, anchor_matchers, seen_pattern_anchor_counts.get(pattern, 0)
+                )
+                seen_pattern_anchor_counts[pattern] = next_anchor_index
+                if next_anchor_index == len(anchor_matchers):
                     unresolved_pattern_candidates.add(pattern)
 
             for pattern, compiled_pattern, lowered_pattern in pattern_candidates:
