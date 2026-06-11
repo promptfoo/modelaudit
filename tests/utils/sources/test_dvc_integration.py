@@ -11,7 +11,7 @@ import pytest
 from modelaudit import core as core_module
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.models import create_initial_audit_result
-from modelaudit.scanner_results import Check, CheckStatus, Issue, IssueSeverity, ScanResult
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, Issue, IssueSeverity, ScanResult
 from modelaudit.utils.sources.dvc import (
     DVC_ANALYSIS_INCOMPLETE_REASON,
     DVC_OUTPUT_LIMIT_EXCEEDED_REASON,
@@ -50,6 +50,7 @@ def _patch_metadata_only_incomplete_scan(
         result = ScanResult(scanner_name="synthetic_incomplete")
         result.bytes_scanned = Path(path).stat().st_size
         result.metadata["analysis_incomplete"] = True
+        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
         result.metadata["scan_outcome_reasons"] = [reason]
         return result
 
@@ -1524,7 +1525,11 @@ class TestDvcSecurity:
         )
         assert not any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
 
-    def test_dvc_directory_output_keeps_security_exit_when_nested_coverage_incomplete(self, tmp_path: Path) -> None:
+    def test_dvc_directory_output_keeps_security_exit_when_nested_coverage_incomplete(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Nested DVC coverage gaps should not mask security findings as operational errors."""
         output_dir = tmp_path / "model"
         output_dir.mkdir()
@@ -1535,6 +1540,11 @@ class TestDvcSecurity:
 
         incomplete = output_dir / "preview.png"
         _write_incomplete_png_payload(incomplete)
+        _patch_metadata_only_incomplete_scan(
+            monkeypatch,
+            incomplete.name,
+            reason="synthetic_nested_coverage_incomplete",
+        )
 
         dvc_file = tmp_path / "model.dvc"
         dvc_file.write_text("outs:\n- path: model\n")
@@ -1552,7 +1562,7 @@ class TestDvcSecurity:
         incomplete_metadata = result.file_metadata[str(incomplete)]
         assert incomplete_metadata["scan_outcome"] == "inconclusive"
         assert incomplete_metadata["analysis_incomplete"] is True
-        assert "pickle_analysis_incomplete" in incomplete_metadata["scan_outcome_reasons"]
+        assert "synthetic_nested_coverage_incomplete" in incomplete_metadata["scan_outcome_reasons"]
 
     def test_directory_scan_accepts_fully_covered_tail_past_verification_window(self, tmp_path: Path) -> None:
         """A large in-tree DVC tail is covered by the already completed directory walk."""
