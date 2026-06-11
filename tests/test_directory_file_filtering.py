@@ -31,6 +31,7 @@ from modelaudit.utils.file.detection import (
 from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.helpers import (
+    create_malicious_pickle,
     create_mock_mxnet_symbol,
     create_mock_onnx,
     prefix_mock_onnx_with_unknown_field,
@@ -111,6 +112,23 @@ def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
         central_offset = name_end + extra_length + comment_length
 
     path.write_bytes(data)
+
+
+def _write_hf_download_metadata(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n",
+        encoding="utf-8",
+    )
+
+
+def _write_hf_cachedir_tag(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "Signature: 8a477f597d28d172789f06886806bc55\n"
+        "# This file is a cache directory tag created by huggingface_hub.\n",
+        encoding="utf-8",
+    )
 
 
 def _write_malicious_cntk(path: Path, include_structure: bool = True) -> None:
@@ -1134,6 +1152,7 @@ class TestDirectoryFileFiltering:
         )
         hf_cache_metadata = hf_home / "hub" / "models--org--repo" / "snapshots" / "abc123" / "model.metadata"
         hf_download_metadata = hf_home / "download" / "model.metadata"
+        _write_hf_download_metadata(hf_download_metadata)
 
         assert _is_huggingface_cache_file(str(local_metadata)) is False
         assert _is_huggingface_cache_file(str(local_cache_shaped_metadata)) is False
@@ -1172,6 +1191,9 @@ class TestDirectoryFileFiltering:
         hf_cache_lock = hf_home / "hub" / "models--org--repo" / "snapshots" / "abc123" / "payload.pkl.lock"
         hf_download_gitignore = hf_home / "download" / ".gitignore"
         hf_download_gitattributes = hf_home / "download" / ".gitattributes"
+        hf_download_gitignore.parent.mkdir(parents=True)
+        hf_download_gitignore.write_text("*\n", encoding="utf-8")
+        hf_download_gitattributes.write_text("*.bin filter=lfs diff=lfs merge=lfs -text\n", encoding="utf-8")
 
         assert _is_huggingface_cache_file(str(local_lock)) is False
         assert _is_huggingface_cache_file(str(local_gitignore)) is False
@@ -1202,6 +1224,10 @@ class TestDirectoryFileFiltering:
         monkeypatch.setenv("HF_HOME", str(hf_home))
         trusted_gitignore = hf_home / "download" / ".gitignore"
         spoofed_gitignore = tmp_path / "project" / ".cache" / "huggingface" / "download" / ".gitignore"
+        trusted_gitignore.parent.mkdir(parents=True)
+        trusted_gitignore.write_text("*\n", encoding="utf-8")
+        spoofed_gitignore.parent.mkdir(parents=True)
+        spoofed_gitignore.write_text("*\n", encoding="utf-8")
 
         assert _is_huggingface_cache_file(str(trusted_gitignore)) is True
         assert _is_huggingface_cache_file(str(spoofed_gitignore)) is False
@@ -1217,7 +1243,87 @@ class TestDirectoryFileFiltering:
 
         assert _is_huggingface_cache_file(str(local_gitignore)) is True
 
-    @pytest.mark.parametrize("filename", ["payload.pkl.lock", ".gitignore", ".gitattributes"])
+    def test_real_local_download_metadata_sidecars_are_excluded_from_inventory(self, tmp_path: Path) -> None:
+        """Real huggingface_hub local_dir metadata must not inflate scan inventory."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        config_path = model_dir / "config.json"
+        config_path.write_text('{"model_type":"bert"}', encoding="utf-8")
+        nested_model = model_dir / "nested" / "model.pkl"
+        nested_model.parent.mkdir()
+        nested_model.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+        vocab_path = model_dir / "vocab.txt"
+        vocab_path.write_text("[PAD]\n[UNK]\n", encoding="utf-8")
+
+        download_root = model_dir / ".cache" / "huggingface" / "download"
+        _write_hf_download_metadata(download_root / "config.json.metadata")
+        _write_hf_download_metadata(download_root / "nested" / "model.pkl.metadata")
+        _write_hf_download_metadata(download_root / "vocab.txt.metadata")
+        config_lock = download_root / "config.json.lock"
+        config_lock.touch()
+        _write_hf_cachedir_tag(model_dir / ".cache" / "huggingface" / "CACHEDIR.TAG")
+
+        results = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+        cache_fragment = ".cache/huggingface"
+
+        assert results.files_scanned == 3
+        assert {Path(asset.path).relative_to(model_dir).as_posix() for asset in results.assets} == {
+            "config.json",
+            "nested/model.pkl",
+            "vocab.txt",
+        }
+        assert not any(cache_fragment in path for path in results.file_metadata)
+        assert not any(cache_fragment in (check.location or "") for check in results.checks)
+        assert not any(cache_fragment in (issue.location or "") for issue in results.issues)
+
+    def test_malicious_local_download_metadata_sidecar_is_scanned(self, tmp_path: Path) -> None:
+        """Scannable bytes with a sidecar name must not be hidden by local_dir filtering."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
+        payload = model_dir / ".cache" / "huggingface" / "download" / "config.json.metadata"
+        payload.parent.mkdir(parents=True)
+        create_malicious_pickle(payload)
+
+        results = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+        assert results.files_scanned == 2
+        assert str(payload) in results.file_metadata
+        assert any(issue.rule_code == "S201" and issue.location == str(payload) for issue in results.issues)
+
+    def test_hidden_model_artifact_under_local_download_cache_is_scanned(self, tmp_path: Path) -> None:
+        """Only bookkeeping sidecars are skipped; hidden model payloads remain in scope."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
+        download_root = model_dir / ".cache" / "huggingface" / "download"
+        _write_hf_download_metadata(download_root / "config.json.metadata")
+        hidden_payload = download_root / ".hidden.pkl"
+        create_malicious_pickle(hidden_payload)
+
+        results = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+        assert results.files_scanned == 2
+        assert str(hidden_payload) in results.file_metadata
+        assert str(download_root / "config.json.metadata") not in results.file_metadata
+        assert any(issue.rule_code == "S201" and issue.location == str(hidden_payload) for issue in results.issues)
+
+    def test_malicious_hf_cachedir_tag_is_scanned(self, tmp_path: Path) -> None:
+        """A cache-tag filename must not suppress scannable content."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
+        payload = model_dir / ".cache" / "huggingface" / "CACHEDIR.TAG"
+        payload.parent.mkdir(parents=True)
+        create_malicious_pickle(payload)
+
+        results = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+        assert results.files_scanned == 2
+        assert str(payload) in results.file_metadata
+        assert any(issue.rule_code == "S201" and issue.location == str(payload) for issue in results.issues)
+
+    @pytest.mark.parametrize("filename", ["payload.pkl.lock", "payload.pkl.metadata", ".gitignore", ".gitattributes"])
     def test_local_download_bookkeeping_rejects_spoofed_payloads(self, tmp_path: Path, filename: str) -> None:
         """Local cache-looking paths must not skip pickle payloads."""
 
