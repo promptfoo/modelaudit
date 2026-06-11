@@ -450,7 +450,8 @@ DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN = re.compile(
-    rb"\|\s*(?:sudo\s+)?(?:(?:/[A-Za-z0-9._-]+)*/)?"
+    rb"\|\s*(?:sudo\s+)?(?:(?:(?:/[A-Za-z0-9._-]+)*/)?env\s+"
+    rb"(?:(?:-[A-Za-z0-9_=-]+|[A-Za-z_][A-Za-z0-9_]*=[^\s]+)\s+)*)?(?:(?:/[A-Za-z0-9._-]+)*/)?"
     rb"(?:bash|sh|zsh|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh|python(?:\d+(?:\.\d+)*)?|perl|ruby|node|php)\b",
     re.IGNORECASE,
 )
@@ -487,6 +488,24 @@ DOCUMENTATION_FENCED_DIRECT_URL_CALL_PATTERN = re.compile(
 )
 DOCUMENTATION_FENCED_ALLOWED_NETWORK_CALL_PATTERN = re.compile(
     rb"\b(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_SESSION_ASSIGNMENT_PATTERN = re.compile(
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:requests\.)?Session\s*\(",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_NETWORK_FUNCTION_ALIAS_ASSIGNMENT_PATTERN = re.compile(
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+    rb"(?:requests\.(?:get|head|post|put|patch|delete|request)|urllib\.request\.urlopen|urlopen)\b(?!\s*\()",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_VARIABLE_HTTP_CALL_PATTERN = re.compile(
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*"
+    rb"(?:get|head|post|put|patch|delete|request)\s*\(",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN = re.compile(
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_VARIABLE_ASSIGNMENT_PATTERN = re.compile(
@@ -1610,12 +1629,36 @@ class TextScanner(BaseScanner):
             return False
         return cls._documentation_fenced_passive_assigned_url_is_informational(url)
 
+    @staticmethod
+    def _documentation_fenced_has_call_after_assignment(
+        fenced_code: bytes,
+        assignment_pattern: re.Pattern[bytes],
+        call_pattern: re.Pattern[bytes],
+    ) -> bool:
+        assignment_positions: dict[bytes, list[int]] = {}
+        for match in assignment_pattern.finditer(fenced_code):
+            assignment_positions.setdefault(match.group("target"), []).append(match.start())
+        return any(
+            any(position < call_match.start() for position in assignment_positions.get(call_match.group("target"), []))
+            for call_match in call_pattern.finditer(fenced_code)
+        )
+
     @classmethod
     def _documentation_fenced_passive_network_example_is_informational(cls, fenced_code: bytes) -> bool:
         if (
             DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN.search(fenced_code)
             or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(fenced_code)
             or DOCUMENTATION_FENCED_SESSION_HTTP_CALL_PATTERN.search(fenced_code)
+            or cls._documentation_fenced_has_call_after_assignment(
+                fenced_code,
+                DOCUMENTATION_FENCED_SESSION_ASSIGNMENT_PATTERN,
+                DOCUMENTATION_FENCED_VARIABLE_HTTP_CALL_PATTERN,
+            )
+            or cls._documentation_fenced_has_call_after_assignment(
+                fenced_code,
+                DOCUMENTATION_FENCED_NETWORK_FUNCTION_ALIAS_ASSIGNMENT_PATTERN,
+                DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN,
+            )
         ):
             return False
         if any(
