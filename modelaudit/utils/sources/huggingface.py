@@ -2443,6 +2443,8 @@ def download_model_streaming(
         downloaded_total_size = 0
         prefetched_selected_paths: dict[str, Path] = {}
         downloaded_selected_paths: dict[str, Path] = {}
+        downloaded_context_paths: dict[str, Path] = {}
+        context_cleanup_paths: set[Path] = set()
         consumed_filenames: set[str] = set()
 
         def emit_file(path: Path, cleanup_paths: list[Path], is_last: bool) -> Iterator[tuple[Path, bool]]:
@@ -2545,6 +2547,10 @@ def download_model_streaming(
                         external_filename
                         for external_filename in external_data_files
                         if external_filename not in selected_file_set
+                        and not (
+                            (downloaded_context_path := downloaded_context_paths.get(external_filename)) is not None
+                            and downloaded_context_path.is_file()
+                        )
                     ]
                     external_data_sizes: dict[str, int] = {}
                     if size_limit is not None and external_context_files:
@@ -2587,6 +2593,9 @@ def download_model_streaming(
                                     )
                                 active_total_size = projected_total
                             continue
+                        external_path = downloaded_context_paths.get(external_filename)
+                        if external_path is not None and external_path.is_file():
+                            continue
                         if size_limit is not None:
                             advertised_size = external_data_sizes[external_filename]
                             projected_total = active_total_size + advertised_size
@@ -2612,36 +2621,42 @@ def download_model_streaming(
                                 )
                             active_total_size = projected_total
                             downloaded_total_size += external_file_size
+                        downloaded_context_paths[external_filename] = external_path
                         if _should_cleanup_hf_streaming_context_file(cache_dir, download_path, external_path):
-                            onnx_external_data_cleanup_paths.append(external_path)
+                            context_cleanup_paths.add(external_path)
 
             return downloaded_file, onnx_external_data_cleanup_paths
 
-        for idx, filename in enumerate(model_files):
-            if filename in consumed_filenames:
-                continue
-
-            if filename in openvino_xml_by_companion:
-                # Wait for the XML so we can prove it is an OpenVINO model
-                # before suppressing standalone analysis of the same-stem .bin.
-                continue
-
-            downloaded_file, cleanup_paths = prepare_stream_yield(filename)
-            companion = openvino_companion_by_xml.get(filename)
-            if companion is not None:
-                from modelaudit.scanners.openvino_scanner import OpenVinoScanner
-
-                if OpenVinoScanner.can_handle(str(downloaded_file)):
-                    download_selected_file(companion)
-                    consumed_filenames.add(companion)
-                else:
-                    companion_path, companion_cleanup_paths = prepare_stream_yield(companion)
-                    consumed_filenames.add(companion)
-                    yield from emit_file(downloaded_file, cleanup_paths, False)
-                    yield from emit_file(companion_path, companion_cleanup_paths, not has_future_yield(idx))
+        try:
+            for idx, filename in enumerate(model_files):
+                if filename in consumed_filenames:
                     continue
 
-            yield from emit_file(downloaded_file, cleanup_paths, not has_future_yield(idx))
+                if filename in openvino_xml_by_companion:
+                    # Wait for the XML so we can prove it is an OpenVINO model
+                    # before suppressing standalone analysis of the same-stem .bin.
+                    continue
+
+                downloaded_file, cleanup_paths = prepare_stream_yield(filename)
+                companion = openvino_companion_by_xml.get(filename)
+                if companion is not None:
+                    from modelaudit.scanners.openvino_scanner import OpenVinoScanner
+
+                    if OpenVinoScanner.can_handle(str(downloaded_file)):
+                        download_selected_file(companion)
+                        consumed_filenames.add(companion)
+                    else:
+                        companion_path, companion_cleanup_paths = prepare_stream_yield(companion)
+                        consumed_filenames.add(companion)
+                        yield from emit_file(downloaded_file, cleanup_paths, False)
+                        yield from emit_file(companion_path, companion_cleanup_paths, not has_future_yield(idx))
+                        continue
+
+                yield from emit_file(downloaded_file, cleanup_paths, not has_future_yield(idx))
+        finally:
+            for external_path in context_cleanup_paths:
+                with suppress(OSError):
+                    external_path.unlink()
 
     except Exception as e:
         raise Exception(

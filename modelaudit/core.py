@@ -127,6 +127,7 @@ from modelaudit.utils.helpers.types import (
 from modelaudit.utils.lfs import check_lfs_pointer, get_lfs_issue_details, get_lfs_remediation_steps
 from modelaudit.utils.sources._huggingface_cache import (
     _find_hf_cache_root,
+    _get_hf_cache_root_spellings,
     _get_hf_cache_roots,
     _is_hf_cache_snapshot_alias,
     _path_has_part,
@@ -652,6 +653,81 @@ def _is_openvino_xml_path(path: Path) -> bool:
         return OpenVinoScanner.can_handle(str(path))
     except Exception:
         return False
+
+
+def _is_streamed_onnx_external_data_hash_candidate(path: Path) -> bool:
+    """Return whether a streamed path may declare ONNX external_data sidecars."""
+    suffix = path.suffix.lower()
+    if suffix == ".onnx":
+        return True
+    if suffix:
+        return False
+    try:
+        return detect_file_format_for_skip_filter(str(path)) == "onnx"
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _streamed_onnx_external_data_hash_paths(path: Path) -> list[Path]:
+    """Return safe, present ONNX external_data sidecars that should join the stream hash."""
+    if not _is_streamed_onnx_external_data_hash_candidate(path):
+        return []
+
+    try:
+        import onnx
+
+        from modelaudit.scanners.onnx_scanner import (
+            _is_windows_absolute_path,
+            _iter_model_external_data_tensor_groups,
+            _resolve_external_location,
+            _resolve_external_location_lexically,
+        )
+    except Exception:
+        return []
+
+    try:
+        model = onnx.load(str(path), load_external_data=False)
+    except Exception:
+        return []
+
+    model_dir = path.parent
+    lexical_model_dir = Path(os.path.abspath(model_dir))
+    try:
+        resolved_model_dir = model_dir.resolve()
+    except OSError:
+        return []
+
+    external_paths: list[Path] = []
+    seen_external_paths: set[Path] = set()
+    for tensors in _iter_model_external_data_tensor_groups(model):
+        for tensor in tensors:
+            if not getattr(tensor, "external_data", ()):
+                continue
+            info = {entry.key: entry.value for entry in tensor.external_data}
+            location = info.get("location")
+            if (
+                not isinstance(location, str)
+                or not location
+                or "\x00" in location
+                or _is_windows_absolute_path(location)
+            ):
+                continue
+
+            lexical_external_path = _resolve_external_location_lexically(model_dir, location)
+            try:
+                lexical_external_path.relative_to(lexical_model_dir)
+            except ValueError:
+                continue
+
+            external_path = _resolve_external_location(model_dir, location)
+            if not is_within_directory(str(resolved_model_dir), str(external_path)) or not external_path.is_file():
+                continue
+            if external_path in seen_external_paths:
+                continue
+            seen_external_paths.add(external_path)
+            external_paths.append(external_path)
+
+    return external_paths
 
 
 def _openvino_xml_companion_key(path: Path) -> str:
@@ -2104,19 +2180,27 @@ def _hf_cache_snapshot_alias_has_safe_parent_components(snapshot_path: Path, hf_
         return False
 
     absolute_path = Path(os.path.abspath(snapshot_path.expanduser()))
-    cache_root = Path(os.path.abspath(hf_cache_root.expanduser()))
-    try:
-        relative_parts = absolute_path.relative_to(cache_root).parts
-    except ValueError:
-        return False
-    if len(relative_parts) < 3 or relative_parts[0].lower() != "snapshots" or relative_parts[1] in {"", ".", ".."}:
-        return False
-    current = cache_root
-    for part in relative_parts[:-1]:
-        current = current / part
-        if current.is_symlink():
+    resolved_cache_root = _resolve_hf_cache_path(hf_cache_root)
+    cache_root_spellings = [Path(os.path.abspath(hf_cache_root.expanduser()))]
+    for hub_root in _get_hf_cache_root_spellings():
+        model_cache_root = hub_root / resolved_cache_root.name
+        if _resolve_hf_cache_path(model_cache_root) == resolved_cache_root:
+            cache_root_spellings.append(model_cache_root)
+
+    for cache_root in dict.fromkeys(cache_root_spellings):
+        try:
+            relative_parts = absolute_path.relative_to(cache_root).parts
+        except ValueError:
+            continue
+        if len(relative_parts) < 3 or relative_parts[0].lower() != "snapshots" or relative_parts[1] in {"", ".", ".."}:
             return False
-    return True
+        current = cache_root
+        for part in relative_parts[:-1]:
+            current = current / part
+            if current.is_symlink():
+                return False
+        return True
+    return False
 
 
 def _should_scan_hf_cache_alias_lexically_for_onnx(snapshot_path: Path, hf_cache_root: Path | None) -> bool:
@@ -4800,6 +4884,7 @@ def scan_model_streaming(
             openvino_scan_companion_key: Path | None = None
             openvino_companion_pre_scan_identity: _FileIdentitySnapshot | None = None
             openvino_companion_bytes_scanned = 0
+            onnx_external_data_pre_scan_identities: dict[Path, _FileIdentitySnapshot] = {}
 
             # Check for interruption before starting work on the yielded file.
             try:
@@ -4956,6 +5041,16 @@ def scan_model_streaming(
                         openvino_scan_companion_path,
                         scan_config,
                     )
+                if scanner_selection.allows("onnx"):
+                    for onnx_external_data_path in _streamed_onnx_external_data_hash_paths(scan_path):
+                        external_data_identity = _snapshot_file_identity(onnx_external_data_path)
+                        if external_data_identity is not None:
+                            onnx_external_data_pre_scan_identities[onnx_external_data_path] = external_data_identity
+                        append_streamed_file_hash(
+                            onnx_external_data_path,
+                            scan_config,
+                            progress_label=onnx_external_data_path.name,
+                        )
 
                 # Scan the file
                 if progress_callback:
@@ -4977,6 +5072,11 @@ def scan_model_streaming(
                         "openvino_weights_changed_during_xml_scan",
                     )
                     preserve_shard_reconciliation_errors = True
+                    aggregate_hash_complete = False
+                if any(
+                    _snapshot_file_identity(onnx_external_data_path) != pre_scan_identity
+                    for onnx_external_data_path, pre_scan_identity in onnx_external_data_pre_scan_identities.items()
+                ):
                     aggregate_hash_complete = False
                 if pre_scan_shard_target:
                     _ensure_streamed_shard_coverage_placeholder(scan_result, source_path)

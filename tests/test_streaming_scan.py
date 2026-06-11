@@ -877,6 +877,60 @@ def test_scan_model_directory_hf_cache_onnx_external_data_accepts_symlinked_cach
     assert determine_exit_code(result) == 0
 
 
+def test_scan_model_directory_hf_cache_content_routed_onnx_external_data_accepts_symlinked_cache_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Extensionless ONNX aliases under symlinked HF cache roots should keep snapshot sidecar context."""
+    real_hub = tmp_path / "real-hub"
+    link_hub = tmp_path / "link-hub"
+    real_hub.mkdir()
+    link_hub.symlink_to(real_hub, target_is_directory=True)
+    monkeypatch.setenv("HF_HUB_CACHE", str(link_hub))
+
+    cache_root = link_hub / "models--test--model"
+    blobs_dir = cache_root / "blobs"
+    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    (snapshot_dir / "renamed").symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    (snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+
+    result = scan_model_directory_or_file(
+        str(snapshot_dir),
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    failed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status.value == "failed"
+    ]
+    passed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check"
+        and check.status.value == "passed"
+        and check.details.get("file") == "model.onnx_data"
+    ]
+    symlink_traversal_checks = [
+        check for check in result.checks if check.name == "CVE-2026-34447: External Data Symlink Traversal"
+    ]
+
+    assert failed_external == []
+    assert len(passed_external) == 1
+    assert symlink_traversal_checks == []
+    assert determine_exit_code(result) == 0
+
+
 def test_scan_model_directory_hf_cache_onnx_external_data_rejects_nested_cache_lookalike(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1911,6 +1965,41 @@ def test_scan_model_streaming_openvino_prefetched_companion_changes_content_hash
     assert first_result.content_hash is not None
     assert second_result.content_hash is not None
     assert first_result.content_hash != second_result.content_hash
+
+
+def test_scan_model_streaming_onnx_external_data_contributes_content_hash(tmp_path: Path) -> None:
+    """A staged ONNX external_data sidecar must remain part of the streaming aggregate hash."""
+    model_path = tmp_path / "model.onnx"
+    sidecar_path = tmp_path / "model.onnx_data"
+    model_path.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_path.write_bytes(struct.pack("f", 1.0))
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path)])
+
+    result = scan_model_streaming(
+        file_generator=iter([(model_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert determine_exit_code(result) == 0
+    assert result.content_hash == expected_hash
+
+    sidecar_path.write_bytes(struct.pack("f", 2.0))
+    changed_hash = compute_aggregate_hash([compute_sha256_hash(model_path), compute_sha256_hash(sidecar_path)])
+    changed_result = scan_model_streaming(
+        file_generator=iter([(model_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert changed_result.content_hash == changed_hash
+    assert changed_result.content_hash != result.content_hash
 
 
 def test_scan_model_streaming_hashes_reused_path_file_instances(tmp_path: Path) -> None:
