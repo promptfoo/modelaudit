@@ -475,7 +475,7 @@ DOCUMENTATION_FENCED_ALLOWED_NETWORK_CALL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_VARIABLE_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)",
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?://=|<<=|>>=|[+\-*/%@&|^]=|=(?!=))",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_REQUESTS_CALL_PATTERN = re.compile(
@@ -488,6 +488,11 @@ DOCUMENTATION_FENCED_NETWORK_FUNCTION_PATTERN = re.compile(
     rb"mongo\.connect|getaddrinfo|gethostbyname|gethostbyaddr|dns\.resolver)\b",
     re.IGNORECASE,
 )
+DOCUMENTATION_FENCED_BIBLIOGRAPHY_URL_FIELD_PATTERN = re.compile(
+    rb"^\s*(?:url|biburl|bibsource)\s*=\s*\{",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_BIBLIOGRAPHY_URL_HOSTS = frozenset({"arxiv.org", "www.arxiv.org", "dblp.org", "www.dblp.org"})
 DOCUMENTATION_PIP_OPTION_WITH_ARGUMENT = (
     rb"--(?:cache-dir|cert|client-cert|exists-action|keyring-provider|log|proxy|python|retries|"
     rb"resume-retries|root-user-action|timeout|trusted-host|use-deprecated|use-feature)"
@@ -1371,6 +1376,8 @@ class TextScanner(BaseScanner):
             return True
         if cls._documentation_fenced_package_index_url_is_informational(line, position, finding):
             return True
+        if cls._documentation_fenced_bibliography_url_is_informational(line, finding):
+            return True
         if cls._documentation_finding_is_actionable(payload, finding):
             return False
         if finding.get("type") in {
@@ -1488,6 +1495,37 @@ class TextScanner(BaseScanner):
         return cls._trusted_package_index_url_is_informational(raw_url_match.group().decode("utf-8", errors="ignore"))
 
     @staticmethod
+    def _documentation_fenced_bibliography_url_is_informational(
+        line: bytes,
+        finding: dict[str, Any],
+    ) -> bool:
+        if (
+            finding.get("type") != "url_detected"
+            or DOCUMENTATION_FENCED_BIBLIOGRAPHY_URL_FIELD_PATTERN.match(line) is None
+        ):
+            return False
+        url = finding.get("url")
+        if not isinstance(url, str):
+            return False
+        try:
+            parsed_url = urlsplit(url.rstrip(").,}"))
+            if parsed_url.username is not None or parsed_url.password is not None:
+                return False
+            if any(
+                key.casefold().replace("-", "_") in SENSITIVE_REQUIREMENTS_QUERY_KEYS
+                for key, _value in parse_qsl(parsed_url.query, keep_blank_values=True)
+            ):
+                return False
+        except ValueError:
+            return False
+        hostname = parsed_url.hostname
+        return (
+            parsed_url.scheme.casefold() in {"http", "https"}
+            and isinstance(hostname, str)
+            and hostname.casefold() in DOCUMENTATION_FENCED_BIBLIOGRAPHY_URL_HOSTS
+        )
+
+    @staticmethod
     def _documentation_loopback_api_url_is_informational(url: str) -> bool:
         try:
             parsed_url = urlsplit(url)
@@ -1506,6 +1544,13 @@ class TextScanner(BaseScanner):
     def _documentation_fenced_passive_media_url_is_informational(url: str) -> bool:
         try:
             parsed_url = urlsplit(url)
+            if parsed_url.username is not None or parsed_url.password is not None:
+                return False
+            if any(
+                key.casefold().replace("-", "_") in SENSITIVE_REQUIREMENTS_QUERY_KEYS
+                for key, _value in parse_qsl(parsed_url.query, keep_blank_values=True)
+            ):
+                return False
         except ValueError:
             return False
         return (
@@ -1528,7 +1573,7 @@ class TextScanner(BaseScanner):
         except ValueError:
             return False
         if parsed_url.scheme.casefold() not in {"http", "https"}:
-            return True
+            return False
         return cls._documentation_fenced_passive_assigned_url_is_informational(url)
 
     @classmethod
