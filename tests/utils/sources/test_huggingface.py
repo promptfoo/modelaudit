@@ -3109,25 +3109,43 @@ class TestGetModelInfo:
         model_info = SimpleNamespace(
             modelId="test/model",
             author="test-author",
+            sha=TEST_COMMIT_SHA,
         )
         mock_api.model_info.return_value = model_info
 
         # Mock list_repo_tree which is used to get accurate file sizes
-        # (implementation skips .gitattributes and README.md)
+        # (implementation skips .gitattributes and folder entries)
         mock_api.list_repo_tree.return_value = [
             SimpleNamespace(path="nested"),
             SimpleNamespace(path="config.json", size=100),
             SimpleNamespace(path="nested/model.safetensors", size=200),
-            SimpleNamespace(path="README.md", size=50),  # This will be skipped
+            SimpleNamespace(path="README.md", size=50),
         ]
 
         info = get_model_info("https://huggingface.co/test/model")
 
         assert info["author"] == "test-author"
-        assert info["total_size"] == 300
-        assert info["file_count"] == 2
-        assert {file["name"] for file in info["files"]} == {"config.json", "nested/model.safetensors"}
-        mock_api.list_repo_tree.assert_called_once_with("test/model", recursive=True)
+        assert info["revision"] == TEST_COMMIT_SHA
+        assert info["total_size"] == 350
+        assert info["file_count"] == 3
+        assert {file["name"] for file in info["files"]} == {
+            "README.md",
+            "config.json",
+            "nested/model.safetensors",
+        }
+        mock_api.list_repo_tree.assert_called_once_with("test/model", recursive=True, revision=TEST_COMMIT_SHA)
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_info_passes_timeout_to_revision_lookup(self, mock_hf_api_class: MagicMock) -> None:
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.model_info.return_value = SimpleNamespace(modelId="test/model", sha=TEST_COMMIT_SHA, siblings=[])
+        mock_api.list_repo_tree.return_value = []
+
+        get_model_info("https://huggingface.co/test/model", timeout_seconds=7)
+
+        mock_api.model_info.assert_called_once_with("test/model", timeout=7)
+        mock_api.list_repo_tree.assert_called_once_with("test/model", recursive=True, revision=TEST_COMMIT_SHA)
 
     @patch("huggingface_hub.HfApi")
     def test_get_model_info_without_author(self, mock_hf_api_class: MagicMock) -> None:
@@ -3169,6 +3187,24 @@ class TestGetHuggingFaceFileInfo:
             "size": 512,
         }
         mock_api.repo_info.assert_called_once_with("test/model", revision="main", files_metadata=False)
+        mock_api.get_paths_info.assert_called_once_with("test/model", "model.bin", revision=TEST_COMMIT_SHA)
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_huggingface_file_info_passes_timeout_to_revision_lookup(
+        self,
+        mock_hf_api_class: MagicMock,
+    ) -> None:
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.repo_info.return_value = SimpleNamespace(sha=TEST_COMMIT_SHA)
+        mock_api.get_paths_info.return_value = [SimpleNamespace(path="model.bin", size=512)]
+
+        get_huggingface_file_info(
+            "https://huggingface.co/test/model/resolve/main/model.bin",
+            timeout_seconds=7,
+        )
+
+        mock_api.repo_info.assert_called_once_with("test/model", revision="main", files_metadata=False, timeout=7)
         mock_api.get_paths_info.assert_called_once_with("test/model", "model.bin", revision=TEST_COMMIT_SHA)
 
     @patch("huggingface_hub.HfApi")

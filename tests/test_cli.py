@@ -4726,6 +4726,28 @@ def test_scan_cloud_url_dry_run_failure_redacts_signed_url() -> None:
     assert "X-Amz-Signature" not in result.output
 
 
+def test_scan_cloud_url_dry_run_empty_preview_preserves_no_files_exit_code() -> None:
+    """Cloud dry-run previews should not inherit Hugging Face preview-only success semantics."""
+    runner = CliRunner()
+
+    with (
+        patch("modelaudit.cli.is_cloud_url", return_value=True),
+        patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock) as mock_analyze,
+    ):
+        mock_analyze.return_value = {
+            "type": "directory",
+            "file_count": 0,
+            "files": [],
+            "human_size": "0 B",
+            "estimated_time": "unknown",
+        }
+        result = runner.invoke(cli, ["scan", "--dry-run", "--format", "json", "s3://bucket/empty/"])
+
+    assert result.exit_code == 2
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 0
+
+
 @patch("modelaudit.cli.is_cloud_url")
 @patch("modelaudit.cli.download_from_cloud")
 def test_scan_cloud_url_download_failure_sbom_redacts_signed_url(

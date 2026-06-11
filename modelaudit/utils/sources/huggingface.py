@@ -759,11 +759,15 @@ def _select_huggingface_model_files(
     model_extensions: Collection[str],
     *,
     deadline: float | None = None,
+    sniff_content: bool = True,
 ) -> list[str]:
     """Select extension-matching files plus bounded content-routed renamed model files."""
     model_files = list(
         dict.fromkeys(filename for filename in repo_files if _is_scannable_hf_file(filename, model_extensions))
     )
+    if not sniff_content:
+        return model_files
+
     selected_files = set(model_files)
     inspected_files = 0
     probe_budget = _HuggingFaceProbeBudget(
@@ -966,6 +970,7 @@ def _select_streamable_hf_files(
     *,
     include_all_files: bool = False,
     deadline: float | None = None,
+    sniff_content: bool = True,
 ) -> list[str]:
     """Select bounded remotely scannable files without treating ``""`` as a wildcard."""
     selected_route_formats: set[str] | None = None
@@ -1047,7 +1052,7 @@ def _select_streamable_hf_files(
                 )
             model_files.append(file_name)
 
-    if sniff_renamed_files:
+    if sniff_renamed_files and sniff_content:
         inspected_files = 0
         probe_budget = _HuggingFaceProbeBudget(
             remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
@@ -1455,7 +1460,7 @@ def _verify_huggingface_selection_within_max_size(
     return total_size
 
 
-def get_model_info(url: str) -> dict:
+def get_model_info(url: str, timeout_seconds: float | None = None) -> dict:
     """Get information about a HuggingFace model without downloading it.
 
     Args:
@@ -1479,17 +1484,22 @@ def get_model_info(url: str) -> dict:
     api = HfApi()
     try:
         # Get model info for metadata
-        model_info = api.model_info(repo_id)
+        model_info_kwargs: dict[str, Any] = {}
+        if timeout_seconds is not None:
+            model_info_kwargs["timeout"] = timeout_seconds
+        model_info = api.model_info(repo_id, **model_info_kwargs)
+        resolved_revision = getattr(model_info, "sha", None)
+        list_revision = resolved_revision if isinstance(resolved_revision, str) and resolved_revision else None
 
         # Use list_repo_tree to get accurate file sizes
         # (model_info.siblings often returns None for size)
         total_size = 0
         files = []
         try:
-            repo_files = api.list_repo_tree(repo_id, recursive=True)
+            repo_files = api.list_repo_tree(repo_id, recursive=True, revision=list_revision)
             for item in repo_files:
                 # Skip metadata files and folder entries returned by recursive listings.
-                if hasattr(item, "path") and hasattr(item, "size") and item.path not in [".gitattributes", "README.md"]:
+                if hasattr(item, "path") and hasattr(item, "size") and item.path != ".gitattributes":
                     file_size = getattr(item, "size", 0) or 0
                     total_size += file_size
                     files.append({"name": item.path, "size": file_size})
@@ -1500,12 +1510,12 @@ def get_model_info(url: str) -> dict:
             # Still try to get file count from siblings
             siblings = model_info.siblings or []
             for sibling in siblings:
-                if sibling.rfilename not in [".gitattributes", "README.md"]:
+                if sibling.rfilename != ".gitattributes":
                     files.append({"name": sibling.rfilename, "size": 0})
 
         return {
             "repo_id": repo_id,
-            "revision": getattr(model_info, "sha", None),
+            "revision": resolved_revision,
             "total_size": total_size,
             "file_count": len(files),
             "files": files,
@@ -1516,7 +1526,11 @@ def get_model_info(url: str) -> dict:
         raise Exception(f"Failed to get model info for {display_url}: {redact_huggingface_urls_in_text(str(e))}") from e
 
 
-def get_huggingface_file_info(url: str, max_size: int | None = None) -> dict[str, Any]:
+def get_huggingface_file_info(
+    url: str,
+    max_size: int | None = None,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
     """Validate a direct Hugging Face file URL without downloading file contents."""
     repo_id, revision, filename = parse_huggingface_file_url(url)
     display_url = redact_huggingface_url_for_display(url)
@@ -1534,7 +1548,10 @@ def get_huggingface_file_info(url: str, max_size: int | None = None) -> dict[str
             raise ValueError("Maximum file size must be non-negative")
 
         api = HfApi()
-        repo_info = api.repo_info(repo_id, revision=revision, files_metadata=False)
+        repo_info_kwargs: dict[str, Any] = {"revision": revision, "files_metadata": False}
+        if timeout_seconds is not None:
+            repo_info_kwargs["timeout"] = timeout_seconds
+        repo_info = api.repo_info(repo_id, **repo_info_kwargs)
         resolved_revision = getattr(repo_info, "sha", revision)
         if not isinstance(resolved_revision, str) or not resolved_revision:
             resolved_revision = revision
