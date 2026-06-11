@@ -141,6 +141,35 @@ def _global(module: bytes, name: bytes) -> bytes:
     return b"c" + module + b"\n" + name + b"\n"
 
 
+def _pytorch_storage_persistent_id_payload(key: str) -> bytes:
+    key_bytes = key.encode("ascii")
+    return (
+        b"\x80\x04("
+        + _short_binunicode(b"storage")
+        + _short_binunicode(b"torch")
+        + _short_binunicode(b"FloatStorage")
+        + b"\x93"
+        + _short_binunicode(key_bytes)
+        + _short_binunicode(b"cpu")
+        + b"K\x01tQ."
+    )
+
+
+def _fake_byte_storage_persistent_id_payload(key: str) -> bytes:
+    return (
+        b"\x80\x04("
+        + b"C\x07storage\x94"
+        + b"C\x0bFakeStorage\x94"
+        + _short_binunicode(key.encode("ascii"))
+        + _short_binunicode(b"cpu")
+        + b"K\x01tQ."
+    )
+
+
+def _pickleish_tensor_storage_bytes() -> bytes:
+    return b"Vtensor bytes that resemble protocol zero\n2\x85." + (b"\x00" * 128)
+
+
 def _binunicode(data: bytes) -> bytes:
     return b"X" + len(data).to_bytes(4, "little") + data
 
@@ -1769,17 +1798,79 @@ def test_scan_file_detects_hidden_pytorch_zip_pickle_member_with_data_pickle(tmp
 def test_scan_file_does_not_route_benign_storage_blob_as_hidden_pickle(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
         archive.writestr("archive/version", "3\n")
         archive.writestr("archive/byteorder", "little")
-        archive.writestr("archive/data/0", b"\x00" * 1024)
+        archive.writestr("archive/data/0", _pickleish_tensor_storage_bytes())
         archive.writestr("archive/notes", b"cat is a category label, not a GLOBAL opcode stream")
 
     report = scan_file(archive_path)
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
+
+
+def test_scan_file_keeps_unreferenced_storage_lookalike_on_hidden_pickle_path(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    hidden_payload = b"cposix\nsystem\n(S'echo hidden'\ntR."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", b"\x00" * 1024)
+        archive.writestr("archive/data/999", hidden_payload)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/999"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/999" in finding.location
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("data_pkl_payload", "include_version", "expected_notice_code"),
+    [
+        (_pytorch_storage_persistent_id_payload("1"), True, "pytorch_zip_storage_reference_missing_members"),
+        (_fake_byte_storage_persistent_id_payload("0"), True, None),
+        (_pytorch_storage_persistent_id_payload("0")[:-1], True, "pytorch_zip_storage_reference_validation_failed"),
+        (_pytorch_storage_persistent_id_payload("0"), False, None),
+    ],
+)
+def test_scan_file_keeps_untrusted_storage_lookalikes_on_hidden_pickle_path(
+    data_pkl_payload: bytes,
+    include_version: bool,
+    expected_notice_code: str | None,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "model.pt"
+    hidden_payload = b"cposix\nsystem\n(S'echo hidden'\ntR."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl_payload)
+        if include_version:
+            archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert "archive/data/0" in report.metadata["pickle_files"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+    if expected_notice_code is not None:
+        assert any(notice.code == expected_notice_code for notice in report.notices)
 
 
 def test_scan_file_does_not_route_large_trivial_proto0_text_as_hidden_pickle(tmp_path: Path) -> None:

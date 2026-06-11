@@ -27,6 +27,16 @@ from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
 
 _ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
+_PINNED_WHISPER_REPO_ID = "openai/whisper-large-v3"
+_PINNED_WHISPER_REVISION = "06f233fe06e710322aca913c1bc4249a0d71fce1"
+_PINNED_WHISPER_FILENAME = "pytorch_model.bin"
+_PINNED_WHISPER_SIZE = 3_087_394_553
+_PINNED_WHISPER_MEMBERS = {
+    "pytorch_model/data.pkl",
+    "pytorch_model/version",
+    "pytorch_model/byteorder",
+    "pytorch_model/data/379",
+}
 
 
 class _NewObjExImportGadget:
@@ -121,6 +131,10 @@ def _fake_byte_storage_persistent_id_payload(key: str) -> bytes:
     )
 
 
+def _pickleish_tensor_storage_bytes() -> bytes:
+    return b"Vtensor bytes that resemble protocol zero\n2\x85." + (b"\x00" * 128)
+
+
 def _write_zip_with_duplicate_data_pkl(zip_path: Path, first_payload: bytes, second_payload: bytes) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
@@ -191,6 +205,127 @@ def _patch_zip_member_central_target_prefix(zip_path: Path, member_name: str, pr
         cursor = filename_end + extra_len + comment_len
 
     raise AssertionError(f"Unable to locate central directory entry for {member_name}")
+
+
+def _fetch_http_range(session: Any, url: str, start: int, end: int) -> bytes:
+    response = session.get(url, headers={"Range": f"bytes={start}-{end}"}, timeout=120)
+    response.raise_for_status()
+    if response.status_code != 206:
+        raise RuntimeError(f"expected HTTP 206 for range {start}-{end}, got {response.status_code}")
+    return bytes(response.content)
+
+
+def _pinned_whisper_member_slice(tmp_path: Path) -> Path:
+    requests = pytest.importorskip("requests")
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+
+    url = huggingface_hub.hf_hub_url(
+        _PINNED_WHISPER_REPO_ID,
+        _PINNED_WHISPER_FILENAME,
+        revision=_PINNED_WHISPER_REVISION,
+    )
+    session = requests.Session()
+    tail_start = max(0, _PINNED_WHISPER_SIZE - (8 * 1024 * 1024))
+    tail = _fetch_http_range(session, url, tail_start, _PINNED_WHISPER_SIZE - 1)
+    eocd_index = tail.rfind(b"PK\x05\x06")
+    if eocd_index < 0:
+        raise RuntimeError("pinned Whisper ZIP EOCD not found")
+    eocd = tail[eocd_index : eocd_index + 22]
+    (
+        _signature,
+        disk_number,
+        central_directory_disk,
+        entry_count_on_disk,
+        entry_count,
+        central_directory_size,
+        central_directory_offset,
+        comment_length,
+    ) = struct.unpack("<IHHHHIIH", eocd)
+    if (
+        disk_number
+        or central_directory_disk
+        or comment_length
+        or entry_count_on_disk != entry_count
+        or central_directory_size == 0xFFFFFFFF
+        or central_directory_offset == 0xFFFFFFFF
+        or entry_count == 0xFFFF
+    ):
+        raise RuntimeError("pinned Whisper ZIP directory layout is unsupported by bounded QA")
+
+    central_directory = _fetch_http_range(
+        session,
+        url,
+        central_directory_offset,
+        central_directory_offset + central_directory_size - 1,
+    )
+    entries: dict[str, dict[str, int]] = {}
+    cursor = 0
+    while cursor < len(central_directory):
+        if central_directory[cursor : cursor + 4] != b"PK\x01\x02":
+            raise RuntimeError(f"bad central directory signature at offset {cursor}")
+        header = central_directory[cursor : cursor + 46]
+        fields = struct.unpack("<IHHHHHHIIIHHHHHII", header)
+        compression_method = fields[4]
+        compressed_size = fields[8]
+        file_size = fields[9]
+        name_length = fields[10]
+        extra_length = fields[11]
+        comment_length = fields[12]
+        local_header_offset = fields[16]
+        name_start = cursor + 46
+        name_end = name_start + name_length
+        member_name = central_directory[name_start:name_end].decode("utf-8")
+        if member_name in _PINNED_WHISPER_MEMBERS:
+            entries[member_name] = {
+                "compression_method": compression_method,
+                "compressed_size": compressed_size,
+                "file_size": file_size,
+                "local_header_offset": local_header_offset,
+            }
+        cursor = name_end + extra_length + comment_length
+
+    missing_members = sorted(_PINNED_WHISPER_MEMBERS - set(entries))
+    if missing_members:
+        raise RuntimeError(f"pinned Whisper members not found: {missing_members}")
+
+    def read_member(member_name: str) -> bytes:
+        entry = entries[member_name]
+        local_header = _fetch_http_range(
+            session,
+            url,
+            entry["local_header_offset"],
+            entry["local_header_offset"] + 29,
+        )
+        if local_header[:4] != b"PK\x03\x04":
+            raise RuntimeError(f"bad local header for {member_name}")
+        name_length, extra_length = struct.unpack_from("<HH", local_header, 26)
+        data_offset = entry["local_header_offset"] + 30 + name_length + extra_length
+        compressed = _fetch_http_range(
+            session,
+            url,
+            data_offset,
+            data_offset + entry["compressed_size"] - 1,
+        )
+        if entry["compression_method"] == zipfile.ZIP_STORED:
+            data = compressed
+        elif entry["compression_method"] == zipfile.ZIP_DEFLATED:
+            data = zlib.decompress(compressed, -15)
+        else:
+            raise RuntimeError(f"unsupported compression for {member_name}: {entry['compression_method']}")
+        if len(data) != entry["file_size"]:
+            raise RuntimeError(f"size mismatch for {member_name}: {len(data)} != {entry['file_size']}")
+        return data
+
+    slice_path = tmp_path / "whisper-large-v3-pinned-data379-slice.pt"
+    with zipfile.ZipFile(slice_path, "w", compression=zipfile.ZIP_STORED) as archive:
+        for member_name in [
+            "pytorch_model/data.pkl",
+            "pytorch_model/version",
+            "pytorch_model/byteorder",
+            "pytorch_model/data/379",
+        ]:
+            archive.writestr(member_name, read_member(member_name))
+    return slice_path
 
 
 def _assert_standard_cve_details(details: dict[str, object], cve_id: str, detected_version: str) -> None:
@@ -343,6 +478,86 @@ def test_pytorch_zip_discovery_finds_hidden_storage_pickle_with_data_pkl(tmp_pat
     assert result.metadata["pickle_files"] == ["archive/data.pkl", "archive/data/0"]
     assert any(
         issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_skips_referenced_storage_blob_pickleish_bytes(tmp_path: Path) -> None:
+    """A data.pkl-referenced tensor blob is raw storage, not a follow-on pickle stream."""
+    model_path = tmp_path / "referenced_storage_pickleish_bytes.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        zip_file.writestr("archive/data/0", _pickleish_tensor_storage_bytes())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+
+
+@pytest.mark.parametrize(
+    ("data_pkl_payload", "include_version", "expected_reason"),
+    [
+        (_pytorch_storage_persistent_id_payload("1"), True, "pytorch_zip_storage_reference_missing_members"),
+        (_fake_byte_storage_persistent_id_payload("0"), True, None),
+        (_pytorch_storage_persistent_id_payload("0")[:-1], True, "pytorch_zip_storage_reference_validation_incomplete"),
+        (_pytorch_storage_persistent_id_payload("0"), False, None),
+    ],
+)
+def test_pytorch_zip_discovery_scans_untrusted_storage_lookalike_pickles(
+    data_pkl_payload: bytes,
+    include_version: bool,
+    expected_reason: str | None,
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "untrusted_storage_pickle.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        if include_version:
+            zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", data_pkl_payload)
+        zip_file.writestr("archive/data/0", _malicious_proto0_system_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+    if expected_reason is not None:
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert expected_reason in result.metadata["scan_outcome_reasons"]
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_pytorch_zip_pinned_whisper_storage_member_qa(tmp_path: Path) -> None:
+    """Pinned Whisper storage bytes must not be scanned as a follow-on pickle stream."""
+    model_path = _pinned_whisper_member_slice(tmp_path)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.metadata["pickle_files"] == ["pytorch_model/data.pkl"]
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_storage_reference_missing_members" in result.metadata["scan_outcome_reasons"]
+    assert not any(issue.details.get("pickle_filename") == "pytorch_model/data/379" for issue in result.issues)
+    assert not any(check.details.get("pickle_filename") == "pytorch_model/data/379" for check in result.checks)
+    assert not any(
+        check.details.get("pickle_rule_code") == "EXTENSION_REF"
+        and check.location is not None
+        and "pytorch_model/data/379" in check.location
+        for check in result.checks
+    )
+    assert not any(
+        issue.details.get("pickle_rule_code") == "EXTENSION_REF"
+        and issue.location is not None
+        and "pytorch_model/data/379" in issue.location
         for issue in result.issues
     )
 

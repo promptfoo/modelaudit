@@ -310,12 +310,19 @@ class PyTorchZipScanner(BaseScanner):
     DEFAULT_VERSION_PICKLE_PROBE_BYTES: ClassVar[int] = 1024 * 1024
     DEFAULT_MAX_NESTED_ZIP_DEPTH: ClassVar[int] = 5
     DEFAULT_MAX_BLACKLIST_SCAN_BYTES: ClassVar[int] = 100 * 1024 * 1024
+    MAX_STORAGE_REFERENCE_DATA_PICKLE_BYTES: ClassVar[int] = 10 * 1024 * 1024
     BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_blacklist_member_size_limit"
     BLACKLIST_READ_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_blacklist_member_read_failed"
     ENTRY_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_entry_limit"
     LOCAL_ENTRY_LIMIT_METADATA_KEY: ClassVar[str] = "pytorch_zip_local_entry_limit_exceeded"
     VERSION_METADATA_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_version_metadata_size_limit"
     VERSION_METADATA_READ_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_version_metadata_read_failed"
+    STORAGE_REFERENCE_VALIDATION_INCONCLUSIVE_REASON: ClassVar[str] = (
+        "pytorch_zip_storage_reference_validation_incomplete"
+    )
+    STORAGE_REFERENCE_MISSING_MEMBERS_INCONCLUSIVE_REASON: ClassVar[str] = (
+        "pytorch_zip_storage_reference_missing_members"
+    )
     SCAN_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_scan_incomplete"
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -1258,6 +1265,12 @@ class PyTorchZipScanner(BaseScanner):
             if name.endswith(".pkl") or name == "data.pkl" or name.endswith("/data.pkl"):
                 add_pickle_entry(entry)
 
+        trusted_storage_blob_members = self._trusted_pytorch_storage_blob_members_from_data_pickle(
+            zip_file,
+            safe_entries,
+            result,
+        )
+
         # Second pass: always sniff unselected members. A benign data.pkl must not
         # hide an extensionless pickle payload or one placed under data/<n>.
         # Aggregate probe failures into a single summary check so an
@@ -1265,7 +1278,8 @@ class PyTorchZipScanner(BaseScanner):
         # checks list with one INFO finding apiece.
         probe_failures: list[dict[str, Any]] = []
         for entry in safe_entries:
-            if id(entry) in seen_entries or entry.is_dir():
+            normalized_name = self._get_zip_member_name(entry).replace("\\", "/").lstrip("/")
+            if id(entry) in seen_entries or entry.is_dir() or normalized_name in trusted_storage_blob_members:
                 continue
             try:
                 if self._entry_looks_like_pickle(zip_file, entry, result):
@@ -1827,6 +1841,129 @@ class PyTorchZipScanner(BaseScanner):
             trusted_blobs.update(f"{prefix}data/{storage_key}" for storage_key in storage_keys & referenced_keys)
         return trusted_blobs
 
+    def _trusted_pytorch_storage_blob_members_from_data_pickle(
+        self,
+        zip_file: zipfile.ZipFile,
+        safe_entries: list[zipfile.ZipInfo],
+        result: ScanResult,
+    ) -> set[str]:
+        """Return tensor storage blobs referenced by same-prefix ``data.pkl`` before pickle discovery."""
+        members = [
+            (self._get_zip_member_name(entry).replace("\\", "/").lstrip("/"), entry)
+            for entry in safe_entries
+            if not entry.is_dir()
+        ]
+        entries_by_name: dict[str, list[zipfile.ZipInfo]] = {}
+        for name, entry in members:
+            entries_by_name.setdefault(name, []).append(entry)
+
+        trusted_blobs: set[str] = set()
+        for data_pkl_member, data_pkl_entries in entries_by_name.items():
+            if data_pkl_member.rsplit("/", 1)[-1] != "data.pkl":
+                continue
+            prefix = data_pkl_member[: -len("data.pkl")]
+            if f"{prefix}version" not in entries_by_name or len(data_pkl_entries) != 1:
+                continue
+
+            data_prefix = f"{prefix}data/"
+            storage_entries_by_key: dict[str, zipfile.ZipInfo] = {}
+            for candidate_name, candidate_entries in entries_by_name.items():
+                if not candidate_name.startswith(data_prefix) or len(candidate_entries) != 1:
+                    continue
+                storage_key = candidate_name[len(data_prefix) :]
+                if self._is_ascii_decimal_digits(storage_key):
+                    storage_entries_by_key[storage_key] = candidate_entries[0]
+            if not storage_entries_by_key:
+                continue
+
+            data_pkl_entry = data_pkl_entries[0]
+            if data_pkl_entry.file_size > self.MAX_STORAGE_REFERENCE_DATA_PICKLE_BYTES:
+                self._record_storage_reference_validation_incomplete(
+                    result,
+                    data_pkl_member=data_pkl_member,
+                    message=(
+                        f"PyTorch storage reference validation skipped oversized data.pkl member {data_pkl_member}"
+                    ),
+                    reason=self.STORAGE_REFERENCE_VALIDATION_INCONCLUSIVE_REASON,
+                    details={
+                        "member_size": data_pkl_entry.file_size,
+                        "max_member_size": self.MAX_STORAGE_REFERENCE_DATA_PICKLE_BYTES,
+                    },
+                )
+                continue
+
+            try:
+                pickle_data = self._read_member_bytes(
+                    zip_file,
+                    data_pkl_entry,
+                    phase="pytorch_storage_pickle_discovery",
+                    result=result,
+                )
+            except Exception as exc:
+                self._record_storage_reference_validation_incomplete(
+                    result,
+                    data_pkl_member=data_pkl_member,
+                    message=f"Could not inspect PyTorch storage references in {data_pkl_member}: {exc!s}",
+                    reason=self.STORAGE_REFERENCE_VALIDATION_INCONCLUSIVE_REASON,
+                    details={"exception_type": type(exc).__name__},
+                )
+                continue
+
+            referenced_keys, parse_complete = self._trusted_storage_keys_from_pickle_bytes(pickle_data)
+            if not parse_complete:
+                self._record_storage_reference_validation_incomplete(
+                    result,
+                    data_pkl_member=data_pkl_member,
+                    message=f"Could not parse PyTorch storage references in {data_pkl_member}",
+                    reason=self.STORAGE_REFERENCE_VALIDATION_INCONCLUSIVE_REASON,
+                    details={},
+                )
+                continue
+
+            existing_storage_keys = set(storage_entries_by_key)
+            missing_storage_keys = referenced_keys - existing_storage_keys
+            if missing_storage_keys:
+                self._record_storage_reference_validation_incomplete(
+                    result,
+                    data_pkl_member=data_pkl_member,
+                    message=f"PyTorch data.pkl references missing tensor storage members in {data_pkl_member}",
+                    reason=self.STORAGE_REFERENCE_MISSING_MEMBERS_INCONCLUSIVE_REASON,
+                    details={
+                        "missing_storage_keys": sorted(missing_storage_keys)[:10],
+                        "missing_storage_key_count": len(missing_storage_keys),
+                    },
+                )
+
+            trusted_blobs.update(
+                f"{data_prefix}{storage_key}" for storage_key in referenced_keys & existing_storage_keys
+            )
+
+        return trusted_blobs
+
+    def _record_storage_reference_validation_incomplete(
+        self,
+        result: ScanResult,
+        *,
+        data_pkl_member: str,
+        message: str,
+        reason: str,
+        details: dict[str, Any],
+    ) -> None:
+        mark_inconclusive_scan_result(result, reason)
+        result.add_check(
+            name="PyTorch Storage Reference Validation",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=f"{self.current_file_path}:{data_pkl_member}",
+            details={
+                "data_pkl_member": data_pkl_member,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+                **details,
+            },
+        )
+
     @staticmethod
     def _coerce_pickle_string_arg(value: Any) -> str | None:
         if isinstance(value, str):
@@ -1842,13 +1979,13 @@ class PyTorchZipScanner(BaseScanner):
     def _trusted_storage_keys_from_pickle_bytes(
         cls,
         pickle_data: bytes,
-        trusted_storage_keys: set[str],
-    ) -> set[str]:
+        trusted_storage_keys: set[str] | None = None,
+    ) -> tuple[set[str], bool]:
         """Extract validated PyTorch storage keys without running the embedded pickle scanner."""
         try:
             opcodes = list(pickletools.genops(pickle_data))
         except Exception:
-            return set()
+            return set(), False
 
         marker = object()
         memo: dict[int, Any] = {}
@@ -1886,7 +2023,7 @@ class PyTorchZipScanner(BaseScanner):
             if (
                 storage_key is not None
                 and cls._is_ascii_decimal_digits(storage_key)
-                and storage_key in trusted_storage_keys
+                and (trusted_storage_keys is None or storage_key in trusted_storage_keys)
             ):
                 return storage_key
             return None
@@ -1971,7 +2108,7 @@ class PyTorchZipScanner(BaseScanner):
                 stack.append(None)
             else:
                 stack.clear()
-        return referenced_keys
+        return referenced_keys, True
 
     def _record_trusted_storage_persistent_ids_without_pickle_scanner(
         self,
@@ -2004,7 +2141,13 @@ class PyTorchZipScanner(BaseScanner):
             return
 
         normalized_name = pickle_name.replace("\\", "/").lstrip("/")
-        for storage_key in sorted(self._trusted_storage_keys_from_pickle_bytes(pickle_data, trusted_storage_keys)):
+        referenced_storage_keys, parse_complete = self._trusted_storage_keys_from_pickle_bytes(
+            pickle_data,
+            trusted_storage_keys,
+        )
+        if not parse_complete:
+            return
+        for storage_key in sorted(referenced_storage_keys):
             result.add_check(
                 name="PyTorch Storage Persistent ID Trust",
                 passed=True,
