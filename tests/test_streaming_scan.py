@@ -1563,7 +1563,7 @@ def test_scan_model_directory_or_file_openvino_bin_sidecar_not_pytorch(tmp_path:
 )
 def test_openvino_bin_sidecar_respects_scanner_selection(
     tmp_path: Path,
-    scanner_selection: dict[str, list[str]],
+    scanner_selection: dict[str, Any],
 ) -> None:
     """A filtered OpenVINO XML must not hide a selected malicious .bin scanner route."""
     _xml_path, bin_path = _write_openvino_pair(tmp_path)
