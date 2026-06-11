@@ -8,7 +8,7 @@ import re
 import struct
 from collections.abc import Iterator
 from typing import Any, ClassVar
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
 
@@ -260,7 +260,34 @@ _LICENSE_REFERENCE_HOST_SUFFIXES = (
     "opensource.org",
     "spdx.org",
 )
-_SUSPICIOUS_LICENSE_URL_MARKERS = ("payload", "exfil", "webhook", "callback", "/raw/", ".sh", ".ps1", ".cmd")
+_LICENSE_REFERENCE_PATH_MARKERS = (
+    "/copying",
+    "/legal",
+    "/licence",
+    "/license",
+    "/licenses",
+    "/notice",
+    "/policies",
+    "/policy",
+    "/terms",
+    "legalcode",
+)
+_LICENSE_REFERENCE_FILE_MARKERS = ("copying", "legalcode", "licence", "license", "notice", "policy", "terms")
+_SUSPICIOUS_LICENSE_URL_MARKERS = ("payload", "exfil", "webhook", "callback")
+_SUSPICIOUS_LICENSE_URL_PATH_MARKERS = (
+    "/download/",
+    "/raw/",
+    "/releases/",
+    ".bin",
+    ".cmd",
+    ".dll",
+    ".dylib",
+    ".exe",
+    ".ps1",
+    ".sh",
+    ".so",
+    ".whl",
+)
 
 
 class SafeTensorsScanner(BaseScanner):
@@ -447,6 +474,28 @@ class SafeTensorsScanner(BaseScanner):
     def _url_host_matches_suffix(hostname: str, suffix: str) -> bool:
         return hostname == suffix or hostname.endswith(f".{suffix}")
 
+    @staticmethod
+    def _url_path_segments(path: str) -> list[str]:
+        return [segment for segment in unquote(path).lower().strip("/").split("/") if segment]
+
+    @classmethod
+    def _url_path_looks_like_license_reference(cls, hostname: str, path: str) -> bool:
+        normalized_path = unquote(path).lower()
+        slash_padded_path = f"/{normalized_path.strip('/')}"
+        segments = cls._url_path_segments(path)
+
+        if cls._url_host_matches_suffix(hostname, "github.com") and len(segments) == 2:
+            return True
+
+        if any(marker in slash_padded_path for marker in _LICENSE_REFERENCE_PATH_MARKERS):
+            return True
+
+        return any(
+            segment in _LICENSE_REFERENCE_FILE_MARKERS
+            or any(segment.startswith(f"{marker}.") for marker in _LICENSE_REFERENCE_FILE_MARKERS)
+            for segment in segments
+        )
+
     @classmethod
     def _url_looks_like_license_reference(cls, raw_url: str) -> bool:
         cleaned_url = raw_url.rstrip(").,;:]}")
@@ -461,8 +510,14 @@ class SafeTensorsScanner(BaseScanner):
         lowered_url = cleaned_url.lower()
         if any(marker in lowered_url for marker in _SUSPICIOUS_LICENSE_URL_MARKERS):
             return False
+        normalized_path = unquote(parsed.path).lower()
+        slash_padded_path = f"/{normalized_path.strip('/')}"
+        if any(marker in slash_padded_path for marker in _SUSPICIOUS_LICENSE_URL_PATH_MARKERS):
+            return False
 
-        return any(cls._url_host_matches_suffix(hostname, suffix) for suffix in _LICENSE_REFERENCE_HOST_SUFFIXES)
+        return any(cls._url_host_matches_suffix(hostname, suffix) for suffix in _LICENSE_REFERENCE_HOST_SUFFIXES) and (
+            cls._url_path_looks_like_license_reference(hostname, parsed.path)
+        )
 
     @classmethod
     def _license_document_urls_are_documentary(cls, value: str) -> bool:

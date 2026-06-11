@@ -71,6 +71,8 @@ distribution as defined by Sections 1 through 9 of this document.
 Contributor hereby grants You a perpetual, worldwide, non-exclusive, no-charge,
 royalty-free, irrevocable copyright license to reproduce, prepare Derivative
 Works of, publicly display, publicly perform, sublicense, and distribute the Work.
+
+Source reference: https://github.com/Lightricks/LTX-Video
 """
     return body + ("\nThis paragraph is ordinary license text and contains no executable metadata." * 10)
 
@@ -408,6 +410,7 @@ def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -
     [
         "https://evil.example/payload",
         "https://evil.example/license",
+        "https://github.com/Lightricks/LTX-Video/releases/download/v1/license.txt",
         "https://[",
     ],
 )
