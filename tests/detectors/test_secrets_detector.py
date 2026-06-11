@@ -18,6 +18,10 @@ def _basic_auth_findings(findings: list[dict[str, object]]) -> list[dict[str, ob
     return [finding for finding in findings if finding.get("secret_type") == "Basic Auth Credentials"]
 
 
+def _padded_basic_auth_header_pairs(count: int = 20) -> str:
+    return ", ".join(f'["X-Filler-{index}", "application/json"]' for index in range(count))
+
+
 class TestSecretsDetector:
     """Test the SecretsDetector class."""
 
@@ -343,6 +347,45 @@ class TestSecretsDetector:
         assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
         serialized = json.dumps(basic_findings, sort_keys=True)
         assert token not in serialized
+
+    @pytest.mark.parametrize(
+        ("text", "token", "opener"),
+        [
+            (
+                "new Headers(["
+                + _padded_basic_auth_header_pairs()
+                + ', ["Authorization", "Basic '
+                + _basic_auth_token(b"padded-headers-constructor:pass")
+                + '"]])',
+                _basic_auth_token(b"padded-headers-constructor:pass"),
+                "new Headers([",
+            ),
+            (
+                'fetch("/model", { headers: ['
+                + _padded_basic_auth_header_pairs()
+                + ', ["Authorization", "Basic '
+                + _basic_auth_token(b"padded-fetch-headers:pass")
+                + '"]] })',
+                _basic_auth_token(b"padded-fetch-headers:pass"),
+                "headers: [",
+            ),
+        ],
+    )
+    def test_basic_auth_padded_headers_tuple_arrays_are_detected(
+        self,
+        text: str,
+        token: str,
+        opener: str,
+    ) -> None:
+        detector = SecretsDetector()
+
+        assert text.index("Basic ") - text.index(opener) > 256
+        findings = detector.scan_text(text, context="headers.txt")
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert token not in json.dumps(basic_findings, sort_keys=True)
 
     @pytest.mark.parametrize(
         "text",

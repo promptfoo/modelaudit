@@ -384,6 +384,7 @@ BASIC_AUTH_HEADERS_INIT_START_PATTERN = re.compile(
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS = 256
+BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS = 4096
 BASIC_AUTH_HEADER_NAMES = {
     "authorization": "Authorization",
     "proxyauthorization": "Proxy-Authorization",
@@ -656,6 +657,14 @@ class SecretsDetector:
             return True
         if SecretsDetector._basic_auth_prefix_has_headers_init_context(bounded_prefix):
             return True
+        if BASIC_AUTH_HEADERS_CONSTRUCTOR_TUPLE_PREFIX_PATTERN.search(bounded_prefix) is not None:
+            collection_search_start = max(0, position - BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS)
+            if collection_search_start < search_start:
+                collection_prefix = text[collection_search_start:position]
+                if SecretsDetector._basic_auth_prefix_has_headers_constructor_context(collection_prefix):
+                    return True
+                if SecretsDetector._basic_auth_prefix_has_headers_init_context(collection_prefix):
+                    return True
         if BASIC_AUTH_CONTINUATION_PREFIX_PATTERN.fullmatch(line_prefix) is None:
             return False
 
