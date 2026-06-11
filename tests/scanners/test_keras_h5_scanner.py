@@ -19,7 +19,6 @@ import h5py
 import modelaudit.core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import build_cache_version_context
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.scanners import keras_h5_scanner as keras_h5_scanner_module
 from modelaudit.scanners import keras_utils
@@ -598,7 +597,7 @@ def test_large_benign_keras_h5_scans_file_backed_without_default_read_cap(
     )
 
     result = KerasH5Scanner().scan(str(model_path))
-    audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    audit_result = core_module.scan_model_directory_or_file(str(model_path), cache_enabled=False)
 
     assert model_path.stat().st_size > DEFAULT_MAX_FILE_READ_SIZE
     assert result.success is True
@@ -638,7 +637,7 @@ def test_large_keras_h5_directory_scan_defers_core_hashing(
         lambda _self, _path: pytest.fail("Keras H5 scanner must not hash large HDF5"),
     )
 
-    audit_result = scan_model_directory_or_file(str(model_dir), cache_enabled=False)
+    audit_result = core_module.scan_model_directory_or_file(str(model_dir), cache_enabled=False)
     metadata = audit_result.file_metadata[str(model_path)]
 
     assert audit_result.success is True
@@ -671,7 +670,7 @@ def test_large_malicious_keras_h5_still_detects_lambda_payload(tmp_path: Path) -
     inflate_h5_file_to_size(model_path)
 
     result = KerasH5Scanner().scan(str(model_path))
-    audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    audit_result = core_module.scan_model_directory_or_file(str(model_path), cache_enabled=False)
 
     assert_not_rejected_by_read_cap(result)
     assert any(
@@ -681,7 +680,7 @@ def test_large_malicious_keras_h5_still_detects_lambda_payload(tmp_path: Path) -
         issue.details.get("cve_id") == "CVE-2025-9905" and issue.severity == IssueSeverity.CRITICAL
         for issue in result.issues
     )
-    assert determine_exit_code(audit_result) == 1
+    assert core_module.determine_exit_code(audit_result) == 1
 
 
 def test_large_malformed_keras_h5_fails_closed_without_size_limit(tmp_path: Path) -> None:
@@ -693,7 +692,7 @@ def test_large_malformed_keras_h5_fails_closed_without_size_limit(tmp_path: Path
     inflate_h5_file_to_size(model_path)
 
     result = KerasH5Scanner().scan(str(model_path))
-    audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    audit_result = core_module.scan_model_directory_or_file(str(model_path), cache_enabled=False)
 
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
@@ -701,7 +700,7 @@ def test_large_malformed_keras_h5_fails_closed_without_size_limit(tmp_path: Path
     assert_not_rejected_by_read_cap(result)
     assert any(check.name == "Keras H5 Config Parse" and check.status == CheckStatus.FAILED for check in result.checks)
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
-    assert determine_exit_code(audit_result) == 2
+    assert core_module.determine_exit_code(audit_result) == 2
 
 
 def test_large_hdf5_external_link_still_detected_without_target_resolution(tmp_path: Path) -> None:
@@ -942,7 +941,7 @@ def test_real_hf_xlm_roberta_large_h5_reaches_keras_scan_without_read_cap(tmp_pa
         )
     )
 
-    audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    audit_result = core_module.scan_model_directory_or_file(str(model_path), cache_enabled=False)
     metadata = audit_result.file_metadata[str(model_path)]
     metadata_extra = getattr(metadata, "model_extra", {}) or {}
 
@@ -954,7 +953,7 @@ def test_real_hf_xlm_roberta_large_h5_reaches_keras_scan_without_read_cap(tmp_pa
     assert any(
         check.name == "Keras Model Format Check" and check.status == CheckStatus.PASSED for check in audit_result.checks
     )
-    assert determine_exit_code(audit_result) == 0
+    assert core_module.determine_exit_code(audit_result) == 0
 
 
 def test_missing_h5py_returns_inconclusive_exit2_without_cache(
@@ -1103,16 +1102,16 @@ def test_broken_h5py_import_still_fails_closed_for_extensionless_userblock(tmp_p
 
         sys.meta_path.insert(0, BrokenH5pyFinder())
 
-        from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+        import modelaudit.core as core_module
 
         model_path = sys.argv[1]
-        result = scan_model_directory_or_file(model_path, cache_enabled=False)
+        result = core_module.scan_model_directory_or_file(model_path, cache_enabled=False)
         metadata = result.file_metadata[model_path]
         print(
             json.dumps(
                 {
                     "success": result.success,
-                    "exit_code": determine_exit_code(result),
+                    "exit_code": core_module.determine_exit_code(result),
                     "check_names": [check.name for check in result.checks],
                     "scan_outcome_reasons": metadata.get("scan_outcome_reasons", []),
                 }
@@ -1276,13 +1275,13 @@ def test_h5py_runtime_failure_bypasses_stale_clean_cache(
         assert raw_secret not in failed_result.to_json()
         assert cache_manager.get_stats()["total_entries"] == 1
 
-        audit_result = scan_model_directory_or_file(
+        audit_result = core_module.scan_model_directory_or_file(
             str(model_path),
             cache_enabled=True,
             cache_dir=str(cache_dir),
             min_cache_file_size=0,
         )
-        assert determine_exit_code(audit_result) == 2
+        assert core_module.determine_exit_code(audit_result) == 2
         assert "keras_h5_scan_failed" in audit_result.file_metadata[str(model_path)]["scan_outcome_reasons"]
     finally:
         reset_cache_manager()
@@ -1345,25 +1344,25 @@ def _assert_inconclusive_keras_h5_scan(
         for check in result.checks
     )
 
-    audit_result = scan_model_directory_or_file(str(model_path))
+    audit_result = core_module.scan_model_directory_or_file(str(model_path))
     metadata = audit_result.file_metadata[str(model_path)]
 
     assert audit_result.has_errors is False
     assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     assert reason in metadata.get("scan_outcome_reasons")
-    assert determine_exit_code(audit_result) == 2
+    assert core_module.determine_exit_code(audit_result) == 2
 
 
 def _assert_inconclusive_keras_h5_scan_not_cached(model_path: Path, reason: str, cache_dir: Path) -> None:
     reset_cache_manager()
     try:
-        first_result = scan_model_directory_or_file(
+        first_result = core_module.scan_model_directory_or_file(
             str(model_path),
             cache_enabled=True,
             cache_dir=str(cache_dir),
             min_cache_file_size=0,
         )
-        second_result = scan_model_directory_or_file(
+        second_result = core_module.scan_model_directory_or_file(
             str(model_path),
             cache_enabled=True,
             cache_dir=str(cache_dir),
@@ -1372,7 +1371,7 @@ def _assert_inconclusive_keras_h5_scan_not_cached(model_path: Path, reason: str,
 
         for audit_result in (first_result, second_result):
             metadata = audit_result.file_metadata[str(model_path)]
-            assert determine_exit_code(audit_result) == 2
+            assert core_module.determine_exit_code(audit_result) == 2
             assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
             assert reason in metadata.get("scan_outcome_reasons")
             assert not any(
@@ -1611,12 +1610,12 @@ def test_keras_h5_inconclusive_training_config_preserves_security_exit1(tmp_path
     )
 
     result = KerasH5Scanner().scan(str(model_path))
-    audit_result = scan_model_directory_or_file(str(model_path))
+    audit_result = core_module.scan_model_directory_or_file(str(model_path))
 
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "keras_h5_training_config_parse_failed" in result.metadata["scan_outcome_reasons"]
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-    assert determine_exit_code(audit_result) == 1
+    assert core_module.determine_exit_code(audit_result) == 1
 
 
 def test_keras_h5_inconclusive_scan_outcome_uncached_rerun_preserves_exit2(tmp_path: Path) -> None:
@@ -1629,13 +1628,13 @@ def test_keras_h5_inconclusive_scan_outcome_uncached_rerun_preserves_exit2(tmp_p
     cache_dir = tmp_path / "cache"
 
     reset_cache_manager()
-    first_result = scan_model_directory_or_file(
+    first_result = core_module.scan_model_directory_or_file(
         str(model_path),
         cache_enabled=True,
         cache_dir=str(cache_dir),
         min_cache_file_size=0,
     )
-    second_result = scan_model_directory_or_file(
+    second_result = core_module.scan_model_directory_or_file(
         str(model_path),
         cache_enabled=True,
         cache_dir=str(cache_dir),
@@ -1643,8 +1642,8 @@ def test_keras_h5_inconclusive_scan_outcome_uncached_rerun_preserves_exit2(tmp_p
     )
     metadata = second_result.file_metadata[str(model_path)]
 
-    assert determine_exit_code(first_result) == 2
-    assert determine_exit_code(second_result) == 2
+    assert core_module.determine_exit_code(first_result) == 2
+    assert core_module.determine_exit_code(second_result) == 2
     assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     assert "keras_h5_model_config_invalid_type" in metadata.get("scan_outcome_reasons")
     assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
@@ -2197,8 +2196,8 @@ def test_keras_h5_scanner_external_reference_traversal_limit_fails_closed(
     assert limit_checks[0].details["visited_link_count"] == 2
     assert limit_checks[0].details["link_visits_truncated"] is True
 
-    audit_result = scan_model_directory_or_file(str(weights_path), cache_enabled=False)
-    assert determine_exit_code(audit_result) == 2
+    audit_result = core_module.scan_model_directory_or_file(str(weights_path), cache_enabled=False)
+    assert core_module.determine_exit_code(audit_result) == 2
     _assert_inconclusive_keras_h5_scan_not_cached(weights_path, reason, tmp_path / f"cache-{legacy_h5py}")
 
 
@@ -2228,8 +2227,8 @@ def test_keras_h5_scanner_external_reference_reports_are_bounded(
     assert cve_issues[0].details["external_reference_count"] == 3
     assert cve_issues[0].details["external_references_truncated"] is True
 
-    audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
-    assert determine_exit_code(audit_result) == 1
+    audit_result = core_module.scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    assert core_module.determine_exit_code(audit_result) == 1
 
 
 def test_keras_h5_scanner_external_storage_segment_reports_are_bounded(
@@ -3065,7 +3064,7 @@ def test_lambda_code_details_omit_sensitive_previews_in_json_and_sarif(tmp_path:
         for check in scanner_result.checks
     )
 
-    audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    audit_result = core_module.scan_model_directory_or_file(str(model_path), cache_enabled=False)
     json_output = audit_result.model_dump_json(indent=2, exclude_none=True)
     sarif_output = format_sarif_output(audit_result, [str(model_path)])
 
@@ -3178,7 +3177,7 @@ def test_lambda_nested_metadata_omits_artifact_controlled_keys_and_fake_wrapped_
     assert suspicious_checks[0].details.get("context") == "Lambda"
     assert not any(check.name == "Custom Layer Class Detection" for check in scanner_result.checks)
 
-    audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    audit_result = core_module.scan_model_directory_or_file(str(model_path), cache_enabled=False)
     json_output = audit_result.model_dump_json(indent=2, exclude_none=True)
     sarif_output = format_sarif_output(audit_result, [str(model_path)])
 
@@ -3246,8 +3245,8 @@ def test_lambda_scalar_function_metadata_fails_closed_without_echoing_value(tmp_
     assert "function" not in malformed_checks[0].details
     assert result.success is True
 
-    audit_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
-    assert determine_exit_code(audit_result) == 1
+    audit_result = core_module.scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    assert core_module.determine_exit_code(audit_result) == 1
 
 
 def test_lambda_null_function_placeholder_is_not_treated_as_malformed(tmp_path: Path) -> None:
@@ -6137,8 +6136,8 @@ class TestCVE20251550H5ModuleReferences:
         assert not any(issue.details.get("cve_id") == "CVE-2025-1550" for issue in result.issues)
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        audit_result = scan_model_directory_or_file(str(model_path), scanner_config={})
-        assert determine_exit_code(audit_result) == 2
+        audit_result = core_module.scan_model_directory_or_file(str(model_path), scanner_config={})
+        assert core_module.determine_exit_code(audit_result) == 2
 
     def test_nested_non_lambda_serialized_function_is_critical(self, tmp_path: Path) -> None:
         model_path = create_custom_h5_file(
