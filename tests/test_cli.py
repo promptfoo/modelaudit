@@ -4641,7 +4641,7 @@ def test_scan_huggingface_streaming_omits_multilingual_vocab_cc_token(
         and check.get("details", {}).get("type") == "cc_pattern"
     ]
     assert mock_download_streaming.call_args.kwargs["scannable_extensions"] == frozenset(
-        {".txt", ".md", ".markdown", ".rst"}
+        {".txt", ".md", ".markdown", ".rst", ".env"}
     )
 
 
