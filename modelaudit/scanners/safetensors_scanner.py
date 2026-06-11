@@ -223,6 +223,32 @@ _LICENSE_DOCUMENT_MARKERS = (
     "mozilla public license",
 )
 _LICENSE_DOCUMENT_MIN_CHARS = 500
+_LICENSE_DOCUMENT_MAX_CHARS = 128 * 1024
+_LICENSE_DOCUMENT_MAX_LINE_CHARS = 2000
+_LICENSE_DOCUMENT_LINE_MARKERS = (
+    "agreement",
+    "arbitration",
+    "copyright",
+    "derivative",
+    "distribute",
+    "entity",
+    "grant",
+    "law",
+    "liability",
+    "license",
+    "licensor",
+    "may",
+    "must",
+    "output",
+    "patent",
+    "permission",
+    "reproduce",
+    "restriction",
+    "shall",
+    "terms",
+    "trademark",
+    "use",
+)
 _DUPLICATE_JSON_KEY_DETAIL_LIMIT = 20
 _URL_METADATA_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 _LICENSE_REFERENCE_HOST_SUFFIXES = (
@@ -234,7 +260,6 @@ _LICENSE_REFERENCE_HOST_SUFFIXES = (
     "opensource.org",
     "spdx.org",
 )
-_LICENSE_REFERENCE_PATH_MARKERS = ("license", "licence", "licensing", "legal", "terms", "policy")
 _SUSPICIOUS_LICENSE_URL_MARKERS = ("payload", "exfil", "webhook", "callback", "/raw/", ".sh", ".ps1", ".cmd")
 
 
@@ -396,7 +421,27 @@ class SafeTensorsScanner(BaseScanner):
         lower_value = value.lower()
         if len(value) < _LICENSE_DOCUMENT_MIN_CHARS:
             return False
-        return "license" in lower_value and any(marker in lower_value for marker in _LICENSE_DOCUMENT_MARKERS)
+        return (
+            "license" in lower_value
+            and any(marker in lower_value for marker in _LICENSE_DOCUMENT_MARKERS)
+            and cls._license_document_body_is_bounded_and_coherent(value)
+        )
+
+    @staticmethod
+    def _license_document_line_looks_documentary(line: str) -> bool:
+        return any(marker in line for marker in _LICENSE_DOCUMENT_LINE_MARKERS)
+
+    @classmethod
+    def _license_document_body_is_bounded_and_coherent(cls, value: str) -> bool:
+        if len(value) > _LICENSE_DOCUMENT_MAX_CHARS:
+            return False
+
+        lines = [line.strip().lower() for line in value.splitlines() if line.strip()]
+        if not lines or any(len(line) > _LICENSE_DOCUMENT_MAX_LINE_CHARS for line in lines):
+            return False
+
+        documentary_lines = sum(cls._license_document_line_looks_documentary(line) for line in lines)
+        return documentary_lines / len(lines) > 0.5
 
     @staticmethod
     def _url_host_matches_suffix(hostname: str, suffix: str) -> bool:
@@ -405,8 +450,11 @@ class SafeTensorsScanner(BaseScanner):
     @classmethod
     def _url_looks_like_license_reference(cls, raw_url: str) -> bool:
         cleaned_url = raw_url.rstrip(").,;:]}")
-        parsed = urlparse(cleaned_url)
-        hostname = parsed.hostname.lower() if parsed.hostname else ""
+        try:
+            parsed = urlparse(cleaned_url)
+            hostname = parsed.hostname.lower() if parsed.hostname else ""
+        except ValueError:
+            return False
         if parsed.scheme.lower() not in {"http", "https"} or not hostname:
             return False
 
@@ -414,9 +462,6 @@ class SafeTensorsScanner(BaseScanner):
         if any(marker in lowered_url for marker in _SUSPICIOUS_LICENSE_URL_MARKERS):
             return False
 
-        path = parsed.path.lower()
-        if any(marker in path for marker in _LICENSE_REFERENCE_PATH_MARKERS):
-            return True
         return any(cls._url_host_matches_suffix(hostname, suffix) for suffix in _LICENSE_REFERENCE_HOST_SUFFIXES)
 
     @classmethod

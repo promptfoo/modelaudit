@@ -403,9 +403,17 @@ def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -
     )
 
 
-def test_license_metadata_untrusted_url_is_not_suppressed(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.example/payload",
+        "https://evil.example/license",
+        "https://[",
+    ],
+)
+def test_license_metadata_untrusted_url_is_not_suppressed(tmp_path: Path, url: str) -> None:
     file_path = tmp_path / "license_metadata_untrusted_url.safetensors"
-    payload = ordinary_license_text_with_url() + "\nAdditional terms: https://evil.example/payload"
+    payload = ordinary_license_text_with_url() + f"\nAdditional terms: {url}"
     write_raw_safetensors(
         file_path,
         {
@@ -423,6 +431,32 @@ def test_license_metadata_untrusted_url_is_not_suppressed(tmp_path: Path) -> Non
         check.name == "Metadata Pattern Check"
         and check.status == CheckStatus.FAILED
         and check.details == {"key": "license", "pattern": "https?://"}
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "SafeTensors File Scan" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_license_metadata_padded_blob_keeps_length_check(tmp_path: Path) -> None:
+    file_path = tmp_path / "license_metadata_padded_blob.safetensors"
+    payload = ordinary_license_text_with_url() + "\n" + ("A" * 5000)
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert "unusually_long_value" in result.metadata["custom_metadata_security_flags"]
+    assert any(
+        check.name == "Metadata Length Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("key") == "license"
         for check in result.checks
     )
 
