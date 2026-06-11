@@ -2776,6 +2776,7 @@ def _resolve_scan_source_for_path(
                     hf_stream_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
                 if runtime.hf_stream_include_all_files:
                     hf_stream_kwargs["include_all_files"] = True
+                hf_stream_kwargs["scanner_config"] = runtime.config
                 file_generator = download_model_streaming(
                     path,
                     cache_dir=hf_cache_dir,

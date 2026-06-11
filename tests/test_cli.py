@@ -4202,6 +4202,8 @@ def test_scan_huggingface_streaming_passes_max_size_to_download(
     assert result.exit_code == 0
     assert mock_download_streaming.call_args.kwargs["max_size"] == 2048
     assert mock_download_streaming.call_args.kwargs["timeout_seconds"] == 7
+    assert mock_download_streaming.call_args.kwargs["scanner_config"]["timeout"] == 7
+    assert mock_download_streaming.call_args.kwargs["scanner_config"]["max_file_size"] == 2048
 
 
 @patch("modelaudit.cli.is_huggingface_url")

@@ -44,6 +44,18 @@ _HF_SAFETENSORS_STRICT_RANGE_REDIRECTS = 5
 _HF_SAFETENSORS_RANGE_ATTEMPTS = 3
 _MAX_HF_SAFETENSORS_INDEX_BYTES = 32 * 1024 * 1024
 _MAX_HF_SAFETENSORS_INDEX_TOTAL_BYTES = 64 * 1024 * 1024
+_HF_SAFETENSORS_REMOTE_OVERLAP_REASON = "remote_safetensors_overlap_coverage_incomplete"
+_HF_SAFETENSORS_OVERLAP_SIGNATURES: tuple[tuple[str, bytes], ...] = (
+    ("zip", b"PK\x03\x04"),
+    ("zip", b"PK\x01\x02"),
+    ("zip", b"PK\x05\x06"),
+    ("zip", b"PK\x06\x06"),
+    ("zip", b"PK\x06\x07"),
+    ("zip", b"PK\x07\x08"),
+    ("compressed", b"\x1f\x8b"),
+    ("torch7", b"T7\x00\x00"),
+)
+_HF_SAFETENSORS_PAYLOAD_OVERLAP_SCANNER_IDS: frozenset[str] = frozenset({"compressed", "torch7", "zip"})
 _HF_DOWNLOAD_WORKER_RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
 _POSIX_TERMINATE_SIGNAL = getattr(signal, "SIGTERM", 15)
 _POSIX_KILL_SIGNAL = getattr(signal, "SIGKILL", 9)
@@ -367,6 +379,63 @@ def _remote_safetensors_failure_result(
     return result
 
 
+def _remote_safetensors_overlap_scanner_ids(
+    prefix: bytes,
+    active_scanner_ids: Collection[str] | None,
+) -> list[str]:
+    matched_scanner_ids = sorted(
+        {scanner_id for scanner_id, signature in _HF_SAFETENSORS_OVERLAP_SIGNATURES if prefix.startswith(signature)}
+    )
+    if active_scanner_ids is None:
+        return matched_scanner_ids
+
+    active = {str(scanner_id).lower() for scanner_id in active_scanner_ids}
+    return [scanner_id for scanner_id in matched_scanner_ids if scanner_id in active]
+
+
+def _remote_safetensors_payload_overlap_gap_scanner_ids(
+    *,
+    header_len: int,
+    declared_size: int,
+    active_scanner_ids: Collection[str] | None,
+) -> list[str]:
+    if header_len <= 0 or header_len > declared_size - 8 or declared_size <= 8 + header_len:
+        return []
+    if active_scanner_ids is None:
+        return sorted(_HF_SAFETENSORS_PAYLOAD_OVERLAP_SCANNER_IDS)
+
+    active = {str(scanner_id).lower() for scanner_id in active_scanner_ids}
+    return sorted(_HF_SAFETENSORS_PAYLOAD_OVERLAP_SCANNER_IDS.intersection(active))
+
+
+def _mark_remote_safetensors_overlap_incomplete(
+    result: Any,
+    *,
+    source_path: str,
+    overlap_scanner_ids: list[str],
+) -> None:
+    from ...core_results import mark_operational_scan_error
+    from ...scanner_results import mark_inconclusive_scan_result
+    from ...scanners.base import IssueSeverity
+
+    result.add_check(
+        name="Remote SafeTensors Overlap Coverage",
+        passed=False,
+        message="Remote SafeTensors header-only scan could not cover overlapping payload scanner evidence",
+        severity=IssueSeverity.INFO,
+        location=source_path,
+        details={
+            "remote_overlap_scanner_ids": overlap_scanner_ids,
+            "analysis_incomplete": True,
+            "scan_outcome_reason": _HF_SAFETENSORS_REMOTE_OVERLAP_REASON,
+            "tensor_payload_bytes_downloaded": 0,
+        },
+    )
+    mark_inconclusive_scan_result(result, _HF_SAFETENSORS_REMOTE_OVERLAP_REASON)
+    mark_operational_scan_error(result, _HF_SAFETENSORS_REMOTE_OVERLAP_REASON)
+    result.finish(success=False)
+
+
 def _scan_remote_huggingface_safetensors_header(
     repo_id: str,
     filename: str,
@@ -376,6 +445,8 @@ def _scan_remote_huggingface_safetensors_header(
     deadline: float | None,
     shard_details: dict[str, Any] | None = None,
     max_transferred_bytes: int | None = None,
+    scanner_config: dict[str, Any] | None = None,
+    active_scanner_ids: Collection[str] | None = None,
 ) -> Any:
     """Inspect one remote SafeTensors header without downloading tensor payload bytes."""
     from ...scanners.safetensors_scanner import (
@@ -387,6 +458,8 @@ def _scan_remote_huggingface_safetensors_header(
     )
 
     source_path = _remote_safetensors_source_path(repo_id, revision, filename)
+    caller_scanner_config = dict(scanner_config or {})
+    max_header_bytes = int(caller_scanner_config.get("max_safetensors_header_bytes", MAX_HEADER_BYTES))
     total_bytes_transferred = 0
     for attempt in range(_HF_SAFETENSORS_RANGE_ATTEMPTS):
         attempt_bytes_transferred = 0
@@ -410,7 +483,17 @@ def _scan_remote_huggingface_safetensors_header(
             header_payload = first_range.data
             final_url = first_range.final_url
             validator = first_range.validator
-            if 0 < header_len <= MAX_HEADER_BYTES and header_len <= declared_size - 8:
+            overlap_scanner_ids = sorted(
+                {
+                    *_remote_safetensors_overlap_scanner_ids(first_range.data, active_scanner_ids),
+                    *_remote_safetensors_payload_overlap_gap_scanner_ids(
+                        header_len=header_len,
+                        declared_size=declared_size,
+                        active_scanner_ids=active_scanner_ids,
+                    ),
+                }
+            )
+            if 0 < header_len <= max_header_bytes and header_len <= declared_size - 8:
                 projected_bytes = total_bytes_transferred + attempt_bytes_transferred + 8 + header_len
                 if max_transferred_bytes is not None and projected_bytes > max_transferred_bytes:
                     raise _HuggingFaceRangeBudgetExceeded("remote SafeTensors header range exceeds max-size budget")
@@ -455,12 +538,16 @@ def _scan_remote_huggingface_safetensors_header(
                 "range_semantics": "strict_206_content_range",
                 "range_attempts": attempt + 1,
             }
-            scanner = SafeTensorsScanner(
-                config={
+            remote_scanner_config = dict(caller_scanner_config)
+            remote_scanner_config.update(
+                {
                     _REMOTE_HEADER_ONLY_CONFIG_KEY: True,
                     _REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY: bytes_transferred,
                     _REMOTE_HEADER_INTEGRITY_CONFIG_KEY: integrity_details,
                 }
+            )
+            scanner = SafeTensorsScanner(
+                config=remote_scanner_config,
             )
             result = scanner.scan(temp_path)
             for record in [*result.checks, *result.issues]:
@@ -495,6 +582,13 @@ def _scan_remote_huggingface_safetensors_header(
 
                     mark_inconclusive_scan_result(result, "remote_safetensors_shard_coverage_incomplete")
                     result.finish(success=False)
+            if overlap_scanner_ids:
+                result.metadata["remote_overlap_scanner_ids"] = overlap_scanner_ids
+                _mark_remote_safetensors_overlap_incomplete(
+                    result,
+                    source_path=source_path,
+                    overlap_scanner_ids=overlap_scanner_ids,
+                )
             result.bytes_scanned = bytes_transferred
             return result
         except Exception as exc:
@@ -1779,19 +1873,11 @@ def _select_streamable_hf_files(
         selected_route_formats = _get_selected_hf_content_route_formats(authoritative_extensions, None)
     else:
         selected_route_formats = _get_selected_hf_content_route_formats(scannable_extensions, scannable_filenames)
-    safetensors_suffix_only = (
-        selected_route_scanner_ids == {"safetensors"}
-        and scannable_extensions is not None
-        and {str(extension).lower() for extension in scannable_extensions} == {".safetensors"}
-        and not scannable_filenames
-    )
     sniff_renamed_files = not include_all_files and (
         bool(selected_route_scanner_ids)
         if selected_route_scanner_ids is not None
         else selected_route_formats is None or bool(selected_route_formats)
     )
-    if safetensors_suffix_only:
-        sniff_renamed_files = False
     if scannable_extensions is None:
         extensions = _get_default_hf_streaming_extensions()
         filenames = (
@@ -1854,6 +1940,8 @@ def _select_streamable_hf_files(
         selected_files = set(model_files)
         for file_name in repo_files:
             if file_name in selected_files:
+                continue
+            if _is_safetensors_index_file(file_name):
                 continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
@@ -2597,6 +2685,7 @@ def download_model_streaming(
     scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
     include_all_files: bool = False,
+    scanner_config: dict[str, Any] | None = None,
 ) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any]]:
     """Download a model from HuggingFace one file at a time (streaming mode).
 
@@ -2613,6 +2702,7 @@ def download_model_streaming(
         scannable_filenames: Optional exact remote prefilter basenames from scanner selection policy
         scannable_scanner_ids: Optional exact scanner IDs from scanner selection policy
         include_all_files: Include otherwise-unrecognized files under a bounded fail-closed limit
+        scanner_config: Optional scanner configuration to preserve in remote native scans
 
     Yields:
         Tuple of (Path, bool) for downloaded files, or (Path, bool, ScanResult)
@@ -2774,6 +2864,8 @@ def download_model_streaming(
                     deadline=deadline,
                     shard_details=shard_details_by_file.get(filename),
                     max_transferred_bytes=(size_limit - downloaded_total_size if size_limit is not None else None),
+                    scanner_config=scanner_config,
+                    active_scanner_ids=scannable_scanner_ids,
                 )
                 transferred = scan_result.metadata.get("remote_bytes_transferred", scan_result.bytes_scanned)
                 transferred_bytes = (
