@@ -1132,20 +1132,15 @@ def _select_streamable_hf_files(
                 selected_route_scanner_ids,
                 selected_route_formats,
             )
-            if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES and not may_skip_detected_safetensors_shard:
-                raise ValueError(
-                    "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "
-                    f"for {repo_id} ({_HF_CONTENT_SNIFF_MAX_FILES} files)"
-                )
-            detected_format = _detect_huggingface_content_route_format(repo_id, file_name, revision, probe_budget)
-            if detected_format == "safetensors" and may_skip_detected_safetensors_shard:
-                continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
                     "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "
                     f"for {repo_id} ({_HF_CONTENT_SNIFF_MAX_FILES} files)"
                 )
             inspected_files += 1
+            detected_format = _detect_huggingface_content_route_format(repo_id, file_name, revision, probe_budget)
+            if detected_format == "safetensors" and may_skip_detected_safetensors_shard:
+                continue
             if detected_format is None:
                 continue
             if selected_route_scanner_ids is not None:
