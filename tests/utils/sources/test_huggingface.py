@@ -3208,6 +3208,24 @@ class TestGetHuggingFaceFileInfo:
         mock_api.get_paths_info.assert_called_once_with("test/model", "model.bin", revision=TEST_COMMIT_SHA)
 
     @patch("huggingface_hub.HfApi")
+    def test_get_huggingface_file_info_rejects_missing_immutable_revision_with_size_cap(
+        self,
+        mock_hf_api_class: MagicMock,
+    ) -> None:
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.repo_info.return_value = SimpleNamespace(sha=None)
+
+        with pytest.raises(Exception, match="Unable to determine immutable revision"):
+            get_huggingface_file_info(
+                "https://huggingface.co/test/model/resolve/main/model.bin",
+                max_size=1024,
+            )
+
+        mock_api.repo_info.assert_called_once_with("test/model", revision="main", files_metadata=False)
+        mock_api.get_paths_info.assert_not_called()
+
+    @patch("huggingface_hub.HfApi")
     def test_get_huggingface_file_info_rejects_missing_file(self, mock_hf_api_class: MagicMock) -> None:
         mock_api = MagicMock()
         mock_hf_api_class.return_value = mock_api

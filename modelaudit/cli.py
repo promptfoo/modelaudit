@@ -331,6 +331,17 @@ def _huggingface_direct_preview_matches_metadata_route(filename: str, runtime: "
     name_lower = remote_path.name.lower()
     filename_lower = filename.lower()
 
+    def text_like_route_is_proven() -> bool:
+        from .scanners.metadata_scanner import MetadataScanner
+        from .scanners.text_scanner import TextScanner
+
+        return TextScanner.can_handle(name_lower) or MetadataScanner.can_handle(name_lower)
+
+    text_like_extensions = {".txt", ".md", ".markdown", ".rst"}
+    suffix = remote_path.suffix.lower()
+    if suffix in text_like_extensions and not text_like_route_is_proven():
+        return False
+
     if runtime.scanner_selection_metadata is not None:
         filenames = {str(value).lower() for value in runtime.scannable_filenames or ()}
         if name_lower in filenames:
@@ -340,7 +351,15 @@ def _huggingface_direct_preview_matches_metadata_route(filename: str, runtime: "
         extensions = {str(extension).lower() for extension in runtime.scannable_extensions if str(extension)}
         return any(filename_lower.endswith(extension) for extension in extensions)
 
-    return not (runtime.skip_non_model_files and remote_path.suffix.lower() in {".py", ".js", ".html", ".css"})
+    if runtime.skip_non_model_files and suffix in {".py", ".js", ".html", ".css"}:
+        return False
+    if text_like_route_is_proven():
+        return True
+
+    from .utils.sources import huggingface as huggingface_source
+
+    model_extensions = {str(extension).lower() for extension in huggingface_source._get_model_extensions() if extension}
+    return any(filename_lower.endswith(extension) for extension in model_extensions)
 
 
 def _preview_huggingface_file_source(
@@ -383,9 +402,7 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
     if runtime.scanner_selection_metadata is not None and not selected_files:
         raise ValueError("No metadata-routed Hugging Face files match the active scanner selection; refusing dry-run")
     download_files: list[dict[str, Any]] | None = None
-    if not runtime.scan_and_delete and (
-        runtime.scanner_selection_metadata is None or runtime.max_download_bytes is not None
-    ):
+    if not runtime.scan_and_delete:
         download_files = _huggingface_preview_download_files(metadata)
     if runtime.scanner_selection_metadata is None and not runtime.scan_and_delete and not download_files:
         raise ValueError("No metadata-routed ModelAudit-scannable Hugging Face files found; refusing dry-run")
@@ -398,14 +415,12 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
     if runtime.max_download_bytes is not None and any(size is None for size in budget_sizes):
         raise ValueError("Selected Hugging Face file sizes are unknown; refusing dry-run with max size")
     if (
-        runtime.max_download_bytes is not None
-        and not runtime.scan_and_delete
+        not runtime.scan_and_delete
         and download_files is not None
         and _huggingface_preview_has_unselected_files(files, download_files)
     ):
         raise ValueError(
-            "Hugging Face dry-run max-size cannot account for content-routed files without reading model bytes; "
-            "refusing dry-run"
+            "Hugging Face dry-run cannot account for content-routed files without reading model bytes; refusing dry-run"
         )
     if runtime.max_download_bytes is not None and budget_size > runtime.max_download_bytes:
         raise ValueError(

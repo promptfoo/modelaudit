@@ -1552,7 +1552,10 @@ def get_huggingface_file_info(
         if timeout_seconds is not None:
             repo_info_kwargs["timeout"] = timeout_seconds
         repo_info = api.repo_info(repo_id, **repo_info_kwargs)
-        resolved_revision = getattr(repo_info, "sha", revision)
+        size_limit = max_size or None
+        resolved_revision = getattr(repo_info, "sha", None)
+        if size_limit is not None and not _is_huggingface_commit_sha(resolved_revision):
+            raise ValueError(f"Unable to determine immutable revision for {display_url}; refusing capped dry-run")
         if not isinstance(resolved_revision, str) or not resolved_revision:
             resolved_revision = revision
 
@@ -1565,7 +1568,6 @@ def get_huggingface_file_info(
         if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
             raise ValueError(f"Unable to determine file size for {display_url}; refusing dry-run")
 
-        size_limit = max_size or None
         if size_limit is not None and file_size > size_limit:
             raise ValueError(
                 f"File size ({_format_size(file_size)}) exceeds maximum allowed size ({_format_size(size_limit)})"

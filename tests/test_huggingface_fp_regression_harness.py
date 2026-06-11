@@ -590,6 +590,46 @@ def test_hf_repo_dry_run_max_size_refuses_unselected_content_route_candidates() 
     mock_scan.assert_not_called()
 
 
+def test_hf_repo_dry_run_refuses_unselected_content_route_candidates_without_size_cap() -> None:
+    runner = CliRunner()
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": "a" * 40,
+        "total_size": 40,
+        "file_count": 2,
+        "files": [
+            {"name": "model.safetensors", "size": 20},
+            {"name": "renamed.payload", "size": 20},
+        ],
+    }
+
+    with (
+        _mock_hf_model_info(return_value=metadata),
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+        patch("modelaudit.utils.sources.huggingface._read_huggingface_prefix") as mock_read_prefix,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--format",
+                "json",
+                "--scanners",
+                "safetensors",
+                "hf://test/model",
+            ],
+        )
+
+    assert result.exit_code == 2
+    assert "cannot account for content-routed files without reading model bytes" in result.output
+    mock_read_prefix.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
 def test_hf_stream_dry_run_preview_enforces_unfiltered_file_limit() -> None:
     runner = CliRunner()
     metadata = {
@@ -681,6 +721,32 @@ def test_hf_file_dry_run_preview_rejects_metadata_only_unscannable_file() -> Non
     mock_scan.assert_not_called()
 
 
+def test_hf_file_dry_run_preview_rejects_generic_text_file() -> None:
+    url = "https://huggingface.co/test/model/resolve/main/notes.txt"
+    runner = CliRunner()
+
+    with (
+        patch(
+            "modelaudit.cli.get_huggingface_file_info",
+            return_value={
+                "repo_id": "test/model",
+                "revision": "main",
+                "resolved_revision": "b" * 40,
+                "filename": "notes.txt",
+                "size": 123,
+            },
+        ),
+        patch("modelaudit.cli.download_file_from_hf") as mock_download_file,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+    ):
+        result = runner.invoke(cli, ["scan", "--dry-run", "--format", "json", url])
+
+    assert result.exit_code == 2
+    assert "cannot prove this file would be scanned from metadata" in result.output
+    mock_download_file.assert_not_called()
+    mock_scan.assert_not_called()
+
+
 def test_hf_file_dry_run_preview_rejects_scanner_excluded_file() -> None:
     url = "https://huggingface.co/test/model/resolve/main/pytorch_model.bin"
     runner = CliRunner()
@@ -703,6 +769,26 @@ def test_hf_file_dry_run_preview_rejects_scanner_excluded_file() -> None:
 
     assert result.exit_code == 2
     assert "cannot prove this file would be scanned from metadata" in result.output
+    mock_download_file.assert_not_called()
+    mock_scan.assert_not_called()
+
+
+def test_hf_file_dry_run_preview_rejects_missing_immutable_revision_with_size_cap() -> None:
+    url = "https://huggingface.co/test/model/resolve/main/model.safetensors"
+    runner = CliRunner()
+
+    with (
+        patch(
+            "modelaudit.cli.get_huggingface_file_info",
+            side_effect=Exception("Unable to determine immutable revision for test/model; refusing capped dry-run"),
+        ),
+        patch("modelaudit.cli.download_file_from_hf") as mock_download_file,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+    ):
+        result = runner.invoke(cli, ["scan", "--dry-run", "--format", "json", "--max-size", "1MB", url])
+
+    assert result.exit_code == 2
+    assert "Unable to determine immutable revision" in result.output
     mock_download_file.assert_not_called()
     mock_scan.assert_not_called()
 
