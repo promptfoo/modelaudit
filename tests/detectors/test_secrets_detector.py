@@ -193,6 +193,30 @@ class TestSecretsDetector:
                 f"headers['Proxy-Authorization'] = 'Basic {_basic_auth_token(b'proxy-bracket:pass')}'",
                 _basic_auth_token(b"proxy-bracket:pass"),
             ),
+            (
+                f"proxy_authorization: Basic {_basic_auth_token(b'raw-alias:pass')}",
+                _basic_auth_token(b"raw-alias:pass"),
+            ),
+            (
+                f"proxyAuthorization: Basic {_basic_auth_token(b'raw-camel:pass')}",
+                _basic_auth_token(b"raw-camel:pass"),
+            ),
+            (
+                f'"proxy_authorization": "Basic {_basic_auth_token(b"json-alias:pass")}"',
+                _basic_auth_token(b"json-alias:pass"),
+            ),
+            (
+                f'payload = {{\\"Authorization\\": \\"Basic {_basic_auth_token(b"escaped-json:pass")}\\"}}',
+                _basic_auth_token(b"escaped-json:pass"),
+            ),
+            (
+                f'headers[\\"Authorization\\"] = \\"Basic {_basic_auth_token(b"escaped-bracket:pass")}\\"',
+                _basic_auth_token(b"escaped-bracket:pass"),
+            ),
+            (
+                f"Authorization: Basic {_basic_auth_token(bytes.fromhex('ceb4cebfcebaceb9cebcceae3a70c3a47373'))}",
+                _basic_auth_token(bytes.fromhex("ceb4cebfcebaceb9cebcceae3a70c3a47373")),
+            ),
         ],
     )
     def test_basic_auth_valid_headers_are_detected(self, text: str, token: str) -> None:
@@ -220,11 +244,18 @@ class TestSecretsDetector:
             "Proxy-Authorization: Basic Og==",
             "X-Authorization: Basic dXNlcjpwYXNz",
             "Authorization: Basic dXNlcjpwYXNz-extra",
+            "Authorization: Basic%20dXNlcjpwYXNz",
+            "Authorization%3A%20Basic%20dXNlcjpwYXNz",
+            "Authorization: \u0412asic dXNlcjpwYXNz",
             f"Authorization notes:\n  Basic {_basic_auth_token(b'wrapped:pass')}",
             f"Authorization: documented value\n  Basic {_basic_auth_token(b'wrapped:pass')}",
             f"Authorization notes:\n  - Basic {_basic_auth_token(b'listed:pass')}",
             f"Authorization:\n\n  Basic {_basic_auth_token(b'gap:pass')}",
             f"Authorization: Basic {'A' * (BASIC_AUTH_TOKEN_MAX_LENGTH + 1)}",
+            "https://user:pass@example.test/model.bin",
+            f"https://example.test/?header=Authorization%3A%20Basic%20{_basic_auth_token(b'percent:pass')}",
+            f"\u0391uthorization: Basic {_basic_auth_token(b'confusable-alpha:pass')}",
+            f"Authorizati\u043en: Basic {_basic_auth_token(b'confusable-o:pass')}",
         ],
     )
     def test_basic_auth_malformed_or_unbounded_values_are_ignored(self, text: str) -> None:
@@ -257,6 +288,17 @@ class TestSecretsDetector:
         findings = detector.scan_dict(data)
 
         assert _basic_auth_findings(findings)
+
+    def test_basic_auth_structured_long_bytes_header_value_is_detected(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"long-bytes:pass")
+        value = b"Basic " + token.encode("ascii") + b" " + (b"x" * 9000)
+
+        findings = detector.scan_dict({"Authorization": value})
+
+        basic_findings = _basic_auth_findings(findings)
+        assert basic_findings
+        assert token not in json.dumps(basic_findings, sort_keys=True)
 
     def test_basic_auth_full_value_whitelist_still_suppresses_detection(self) -> None:
         token = _basic_auth_token(b"user:pass")
@@ -298,6 +340,17 @@ class TestSecretsDetector:
         findings = detector.scan_dict({"audio_tokenizer": f"Basic {token}"})
 
         assert _basic_auth_findings(findings) == []
+
+    def test_basic_auth_near_match_does_not_suppress_url_userinfo_credentials(self) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_text(
+            "Basic links:\nmongodb+srv://username:password123@cluster.mongodb.net/database\n",
+            context="README.md",
+        )
+
+        assert _basic_auth_findings(findings) == []
+        assert any(finding["secret_type"] == "MongoDB Connection String" for finding in findings)
 
     def test_basic_auth_binary_polyglot_header_is_detected(self) -> None:
         detector = SecretsDetector()
@@ -689,3 +742,21 @@ def test_secret_finding_limit_is_explicit() -> None:
     assert findings[-1]["type"] == "detector_finding_limit"
     assert findings[-1]["max_findings"] == 2
     assert findings[-1]["analysis_incomplete"] is True
+
+
+def test_basic_auth_finding_limit_is_explicit_and_redacted() -> None:
+    detector = SecretsDetector({"max_findings": 2})
+    tokens = [_basic_auth_token(f"user{index}:pass{index}".encode()) for index in range(5)]
+
+    findings = detector.scan_model_weights(
+        "\n".join(f"Authorization: Basic {token}" for token in tokens),
+        "headers.txt",
+    )
+
+    reported = _basic_auth_findings(findings)
+    assert len(reported) == 2
+    assert findings[-1]["type"] == "detector_finding_limit"
+    assert findings[-1]["max_findings"] == 2
+    assert findings[-1]["analysis_incomplete"] is True
+    serialized = json.dumps(findings, sort_keys=True)
+    assert all(token not in serialized for token in tokens)

@@ -10934,6 +10934,35 @@ class TestZipScanner:
         assert failed_secret_checks[0].rule_code == "S702"
         assert failed_secret_checks[0].details.get("zip_entry") == "README.md"
 
+    def test_scan_nested_zip_text_member_detects_valid_basic_auth_header(self, tmp_path: Path) -> None:
+        inner_payload = io.BytesIO()
+        with zipfile.ZipFile(inner_payload, "w") as inner_archive:
+            inner_archive.writestr("README.md", "Authorization: Basic dXNlcjpwYXNz\n")
+
+        archive_path = tmp_path / "nested_headers.zip"
+        with zipfile.ZipFile(archive_path, "w") as outer_archive:
+            outer_archive.writestr("nested/inner.zip", inner_payload.getvalue())
+
+        result = core.scan_file(
+            str(archive_path),
+            config={
+                "cache_scan_results": False,
+                "check_network_comm": False,
+            },
+        )
+
+        failed_secret_checks = [
+            check
+            for check in result.checks
+            if check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("secret_type") == "Basic Auth Credentials"
+        ]
+        assert result.success is False
+        assert failed_secret_checks
+        assert failed_secret_checks[0].rule_code == "S702"
+        assert failed_secret_checks[0].details.get("zip_entry") == "nested/inner.zip:README.md"
+
     def test_scan_zip_with_proto0_pickle_with_single_comment_token_bypass_regression(self, tmp_path: Path) -> None:
         """Single comment-token prefix must not suppress proto0 payload detection."""
         archive_path = tmp_path / "proto0_comment_prefixed_payload.zip"

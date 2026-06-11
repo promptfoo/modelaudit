@@ -18,7 +18,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 BASIC_AUTH_SECRET_TYPE = "Basic Auth Credentials"
 BASIC_AUTH_TOKEN_MAX_LENGTH = 8192
 BASIC_AUTH_CONFIDENCE = 0.8
-BASIC_AUTH_TOKEN_TERMINATOR = r"(?=$|[\s\"'`,;<\]\)}])"
+BASIC_AUTH_TOKEN_TERMINATOR = r"(?=$|[\s\"'`,;<\]\)}]|\\[\"'])"
 BASIC_AUTH_PATTERN = (
     rf"\bBasic\s+([A-Za-z0-9+/]{{2,{BASIC_AUTH_TOKEN_MAX_LENGTH}}}={{0,2}}){BASIC_AUTH_TOKEN_TERMINATOR}"
 )
@@ -353,8 +353,9 @@ BINARY_FALSE_POSITIVE_TYPES = frozenset(
 FLOAT_LIKE_PATTERN = re.compile(r"[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?")
 REDACTED_CONTEXT_SECRET = "<redacted-secret>"
 BASIC_AUTH_HEADER_PREFIX_PATTERN = re.compile(
-    r"(?:^|[^\w-])(?:proxy-authorization|authorization)\s*[\"']?\s*\]?\s*[:=]\s*"
-    r"(?:[\"']|\[\s*[\"']?|\(\s*[\"']?)?\s*(?:[>|][+-]?\s*)?$",
+    r"(?:^|[^\w-])(?:proxy[-_]?authorization|proxyauthorization|authorization)"
+    r"\s*(?:\\?[\"'])?\s*(?:\\?\])?\s*[:=]\s*"
+    r"(?:\\?[\"']|\[\s*(?:\\?[\"'])?|\(\s*(?:\\?[\"'])?)?\s*(?:[>|][+-]?\s*)?$",
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS = 256
@@ -701,12 +702,8 @@ class SecretsDetector:
         header_name: str | None,
         context: str,
     ) -> list[dict[str, Any]]:
-        if (
-            header_name is not None
-            and len(value) <= BASIC_AUTH_HEADER_VALUE_CONTEXT_MAX_BYTES
-            and BASIC_AUTH_VALUE_PREFIX_BYTES_PATTERN.match(value)
-        ):
-            value_text = value.decode("ascii", errors="ignore")
+        if header_name is not None and BASIC_AUTH_VALUE_PREFIX_BYTES_PATTERN.match(value):
+            value_text = value[:BASIC_AUTH_HEADER_VALUE_CONTEXT_MAX_BYTES].decode("ascii", errors="ignore")
             return self.scan_text(f"{header_name}: {value_text}", context, is_binary_source=False)
         return self.scan_bytes(value, context)
 

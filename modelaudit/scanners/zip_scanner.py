@@ -269,6 +269,20 @@ class ZipScanner(BaseScanner):
     def _is_content_only_member_entry(self, name: str) -> bool:
         return self._normalize_skip_entry_name(name) in self.content_only_member_entries
 
+    @staticmethod
+    def _preserve_nested_routing_basename(name: str) -> bool:
+        """Return True when nested scanner routing depends on the exact basename."""
+        basename = os.path.basename(name).lower()
+        ext = os.path.splitext(basename)[1]
+        if ext in {".zip", ".npz", ".mar"}:
+            return True
+        return (
+            basename == "readme"
+            or (basename.startswith("readme.") and ext in {".txt", ".md", ".markdown", ".rst"})
+            or basename == "model_card"
+            or (basename.startswith(("model_card.", "modelcard.")) and ext in {".txt", ".md", ".markdown", ".rst"})
+        )
+
     def _is_known_unreadable_archive_entry(self, info: zipfile.ZipInfo) -> bool:
         return info.header_offset in self.known_unreadable_archive_entry_offsets
 
@@ -1945,27 +1959,45 @@ class ZipScanner(BaseScanner):
                     continue
 
                 # Extract and scan the file
+                tmp_dir: str | None = None
                 tmp_path: str | None = None
                 try:
                     max_entry_size = self._get_max_entry_size()
                     is_security_only_member = self._is_security_only_member_entry(name)
                     is_content_only_member = self._is_content_only_member_entry(name)
+                    preserve_nested_routing_basename = self._preserve_nested_routing_basename(name)
 
                     if is_content_only_member:
                         suffix = ""
-                    elif name.lower().endswith(".zip"):
-                        suffix = ".zip"
                     else:
                         safe_name = re.sub(
                             r"[^a-zA-Z0-9_.-]",
                             "_",
                             os.path.basename(name),
-                        )
+                        ).strip("._")
+                        if not safe_name:
+                            safe_name = "archive-member"
                         suffix = f"_{safe_name}"
 
                     try:
-                        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                            tmp_path = tmp.name
+                        with contextlib.ExitStack() as stack:
+                            tmp: BinaryIO
+                            if is_content_only_member:
+                                named_tmp = stack.enter_context(
+                                    tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+                                )
+                                tmp_path = named_tmp.name
+                                tmp = cast(BinaryIO, named_tmp)
+                            elif preserve_nested_routing_basename:
+                                tmp_dir = tempfile.mkdtemp()
+                                tmp_path = os.path.join(tmp_dir, safe_name)
+                                tmp = stack.enter_context(open(tmp_path, "wb"))
+                            else:
+                                named_tmp = stack.enter_context(
+                                    tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+                                )
+                                tmp_path = named_tmp.name
+                                tmp = cast(BinaryIO, named_tmp)
                             total_size = 0
                             with z.open(info) as entry:
                                 while True:
@@ -2052,6 +2084,9 @@ class ZipScanner(BaseScanner):
                         if tmp_path is not None:
                             with contextlib.suppress(FileNotFoundError):
                                 os.unlink(tmp_path)
+                        if tmp_dir is not None:
+                            with contextlib.suppress(OSError):
+                                os.rmdir(tmp_dir)
 
                 except Exception as e:
                     scan_complete = False
