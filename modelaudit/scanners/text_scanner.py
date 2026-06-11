@@ -68,6 +68,7 @@ BARE_NETWORK_TOKEN_PATTERNS = (
 )
 MAX_TEXT_FINDING_CONTEXT_BYTES = 4096
 MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES = 1024
+MAX_DOCUMENTATION_FENCE_MARKERS = 4096
 DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
     rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
     rb"[\s(\[{\\]{0,4096}[rubfRUBF]*[\"']?$"
@@ -1222,31 +1223,76 @@ class TextScanner(BaseScanner):
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
         )
 
-    @staticmethod
-    def _documentation_position_is_fenced_code(payload: bytes, position: int) -> bool:
-        if position < 0 or position > len(payload):
-            return False
-
+    @classmethod
+    def _documentation_fenced_code_ranges(cls, payload: bytes) -> tuple[tuple[tuple[int, int], ...], bool]:
+        fenced_code_ranges: list[tuple[int, int]] = []
         opening_marker: bytes | None = None
+        opening_end: int | None = None
+        fence_markers_seen = 0
         for match in DOCUMENTATION_FENCE_LINE_PATTERN.finditer(payload):
-            if match.start() > position:
-                break
+            fence_markers_seen += 1
+            if fence_markers_seen > MAX_DOCUMENTATION_FENCE_MARKERS:
+                return (), True
             marker = match.group("marker")
             suffix = match.group("suffix")
             if opening_marker is None:
-                if not TextScanner._documentation_fence_match_can_open_code(match):
+                if not cls._documentation_fence_match_can_open_code(match):
                     continue
                 opening_marker = marker
+                opening_end = match.end()
                 continue
             if marker[:1] != opening_marker[:1] or len(marker) < len(opening_marker) or suffix.strip():
                 continue
+            if opening_end is not None and opening_end < match.start():
+                fenced_code_ranges.append((opening_end, match.start()))
             opening_marker = None
-        if opening_marker is None:
-            return False
-        current_line_end = payload.find(b"\n", position)
-        current_line_end = len(payload) if current_line_end < 0 else current_line_end
-        current_line = payload[max(payload.rfind(b"\n", 0, position) + 1, 0) : current_line_end]
-        return DOCUMENTATION_FENCE_LINE_PATTERN.fullmatch(current_line) is None
+            opening_end = None
+        if opening_end is not None and opening_end < len(payload):
+            fenced_code_ranges.append((opening_end, len(payload)))
+        return tuple(fenced_code_ranges), False
+
+    @staticmethod
+    def _documentation_position_is_fenced_code(
+        fenced_code_ranges: tuple[tuple[int, int], ...],
+        position: int,
+    ) -> bool:
+        return any(range_start <= position < range_end for range_start, range_end in fenced_code_ranges)
+
+    @classmethod
+    def _documentation_fenced_passive_finding_is_informational(
+        cls,
+        payload: bytes,
+        finding: dict[str, Any],
+    ) -> bool:
+        line = cls._finding_line(payload, finding)
+        if line is None:
+            return True
+        return not any(
+            pattern.match(line) is not None
+            for pattern in (
+                DOCUMENTATION_SHELL_COMMAND_PATTERN,
+                DOCUMENTATION_COMMAND_ARRAY_PATTERN,
+                DOCUMENTATION_SHELL_COMMAND_ARRAY_PATTERN,
+                DOCUMENTATION_FIND_EXEC_DOWNLOADER_PATTERN,
+                DOCUMENTATION_DOCKER_ADD_PATTERN,
+                DOCUMENTATION_CERTUTIL_COMMAND_PATTERN,
+                DOCUMENTATION_NETCAT_COMMAND_PATTERN,
+                DOCUMENTATION_SSH_COMMAND_PATTERN,
+                DOCUMENTATION_POWERSHELL_COMMAND_PATTERN,
+            )
+        )
+
+    @classmethod
+    def _documentation_fenced_finding_is_informational(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        finding_type = finding.get("type")
+        if finding_type == "network_command":
+            return finding.get("command_type") in {"docker_pull", "git_clone"}
+        if finding_type in PASSIVE_NETWORK_FINDING_TYPES:
+            return cls._documentation_fenced_passive_finding_is_informational(payload, finding)
+        return finding_type in {
+            "cc_pattern",
+            "suspicious_port",
+        }
 
     @staticmethod
     def _documentation_finding_tokens(finding: dict[str, Any]) -> tuple[bytes, ...]:
@@ -1290,7 +1336,7 @@ class TextScanner(BaseScanner):
         payload: bytes,
         lowered_payload: bytes,
         finding: dict[str, Any],
-        markdown_fences: bool,
+        fenced_code_ranges: tuple[tuple[int, int], ...],
         remaining_occurrences: int,
         allow_exhaustion_probe: bool,
     ) -> tuple[dict[str, Any], bool, int]:
@@ -1329,7 +1375,9 @@ class TextScanner(BaseScanner):
             if finding_type == "network_library":
                 candidate["pattern"] = token_bytes.decode()
             if cls._documentation_comment_contains_position(payload, position) or (
-                markdown_fences and cls._documentation_position_is_fenced_code(payload, position)
+                fenced_code_ranges
+                and cls._documentation_position_is_fenced_code(fenced_code_ranges, position)
+                and cls._documentation_fenced_finding_is_informational(payload, candidate)
             ):
                 actionable = False
             elif finding_type == "network_function":
@@ -1564,7 +1612,7 @@ class TextScanner(BaseScanner):
         path: str,
         payload: bytes,
         finding: dict[str, Any],
-        markdown_fences: bool = False,
+        fenced_code_ranges: tuple[tuple[int, int], ...] = (),
     ) -> bool:
         if cls._is_documentation_sidecar(path):
             finding_type = finding.get("type")
@@ -1573,8 +1621,9 @@ class TextScanner(BaseScanner):
                 return True
             if (
                 isinstance(position, int)
-                and markdown_fences
-                and cls._documentation_position_is_fenced_code(payload, position)
+                and fenced_code_ranges
+                and cls._documentation_position_is_fenced_code(fenced_code_ranges, position)
+                and cls._documentation_fenced_finding_is_informational(payload, finding)
             ):
                 return True
             return (
@@ -1616,6 +1665,10 @@ class TextScanner(BaseScanner):
         documentation_sidecar = cls._is_documentation_sidecar(path)
         lowered_payload = payload.lower() if documentation_sidecar else b""
         markdown_fences = documentation_sidecar and cls._documentation_uses_markdown_fences(path, payload)
+        fenced_code_ranges: tuple[tuple[int, int], ...] = ()
+        if markdown_fences:
+            fenced_code_ranges, fence_classification_incomplete = cls._documentation_fenced_code_ranges(payload)
+            classification_incomplete = classification_incomplete or fence_classification_incomplete
         last_retargetable_index = max(
             (index for index, finding in enumerate(findings) if cls._documentation_finding_tokens(finding)),
             default=-1,
@@ -1627,7 +1680,7 @@ class TextScanner(BaseScanner):
                     payload,
                     lowered_payload,
                     finding,
-                    markdown_fences,
+                    fenced_code_ranges,
                     remaining_occurrences,
                     index == last_retargetable_index,
                 )
@@ -1636,7 +1689,7 @@ class TextScanner(BaseScanner):
                 path,
                 payload,
                 finding,
-                markdown_fences,
+                fenced_code_ranges,
             ):
                 finding = {**finding, "severity": "INFO"}
             classified_findings.append(finding)

