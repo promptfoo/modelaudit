@@ -207,7 +207,14 @@ def test_pickle_report_to_scan_result_preserves_legacy_report_findings_without_p
     assert len(result.issues) == 1
     assert result.issues[0].rule_code == "S201"
     assert result.issues[0].details["pickle_rule_code"] == "DANGEROUS_CALL"
-    assert "_private_metadata" not in result.to_dict(include_private_metadata=True)
+    assert "_private_metadata" not in result.to_dict()
+    assert result.to_dict(include_private_metadata=True)["_private_metadata"]["actionable_failed_checks"] == [
+        {
+            "name": "REDUCE Opcode Safety Check",
+            "rule_code": "S201",
+            "severity": "critical",
+        }
+    ]
 
 
 def test_pickle_report_to_scan_result_treats_malformed_private_metadata_as_absent() -> None:
