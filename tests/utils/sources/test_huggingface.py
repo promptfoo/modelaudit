@@ -2544,8 +2544,9 @@ class TestModelDownloadStreaming:
     ) -> None:
         """Pinned phi-4 LICENSE should be selected without downloading model weights."""
         license_path = tmp_path / "LICENSE"
-        license_path.write_text(_PHI4_LICENSE_TEXT, encoding="utf-8")
-        license_size = len(_PHI4_LICENSE_TEXT.encode("utf-8"))
+        license_payload = _PHI4_LICENSE_TEXT.encode("utf-8")
+        license_path.write_bytes(license_payload)
+        license_size = len(license_payload)
         mock_hf_hub_download.return_value = str(license_path)
         mock_get_paths_info.return_value = [SimpleNamespace(path="LICENSE", size=license_size)]
 
