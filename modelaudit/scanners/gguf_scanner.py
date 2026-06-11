@@ -175,6 +175,10 @@ _GGUF_NETWORK_URL_ASSIGNMENT_PATTERN = re.compile(
     r"""(?is)\b(?P<name>[a-z_][a-z0-9_]*)\s*=\s*(?:[rubf]{0,2})?(?P<quote>['"])(?:https?|ftp)://[^'"\s<>]+(?P=quote)""",
 )
 _GGUF_REMOTE_URL_PATTERN = re.compile(r"(?i)\b(?:https?|ftp)://[^\s'\"<>)\]}]+")
+_GGUF_FETCH_EXECUTION_SINK_PATTERN = re.compile(
+    r"(?i)\|\s*(?:(?:[a-z]:)?[\\/](?:[^\\/\s]+[\\/])*)?"
+    r"(?:bash|sh|zsh|fish|cmd(?:\.exe)?|powershell|pwsh|python(?:3)?|perl|ruby|node)\b",
+)
 _GGUF_DOCUMENTATION_URL_HOSTS = frozenset({"hf.co", "huggingface.co", "www.huggingface.co"})
 _GGUF_SHELL_IFS_PATTERN = re.compile(r"(?i)\$\{ifs(?:[^}]*)?\}|\$ifs\b")
 _GGUF_SHELL_VARIABLE_NAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_]*$")
@@ -1174,13 +1178,12 @@ class GgufScanner(BaseScanner):
 
         return not any(cls._line_contains_security_evidence(line) for line in possible_evidence_lines)
 
-    @staticmethod
-    def _line_may_contain_security_evidence(lowered_line: str) -> bool:
-        return any(
+    @classmethod
+    def _line_may_contain_security_evidence(cls, lowered_line: str) -> bool:
+        if any(
             marker in lowered_line
             for marker in (
                 "..",
-                "rm ",
                 "curl",
                 "wget",
                 "invoke-webrequest",
@@ -1205,6 +1208,12 @@ class GgufScanner(BaseScanner):
                 "pwsh",
                 "cmd",
             )
+        ):
+            return True
+
+        return any(
+            cls._has_token_boundary(lowered_line, position, "rm")
+            for position in cls._iter_substring_positions(lowered_line, "rm")
         )
 
     @classmethod
@@ -1229,6 +1238,7 @@ class GgufScanner(BaseScanner):
             cls._contains_path_traversal(text)
             or cls._destructive_rm_pattern(text)
             or cls._metadata_command_pattern(text) is not None
+            or _GGUF_FETCH_EXECUTION_SINK_PATTERN.search(text) is not None
         ):
             return False
         if cls._shell_remote_fetch_pattern(text) is None and cls._network_api_remote_fetch_pattern(text) is None:
