@@ -132,7 +132,8 @@ def _fake_byte_storage_persistent_id_payload(key: str) -> bytes:
 
 
 def _pickleish_tensor_storage_bytes() -> bytes:
-    return b"Vtensor bytes that resemble protocol zero\n2\x85." + (b"\x00" * 128)
+    # Minimal prefix from pinned PiD raw tensor storage that looks like a pickle FRAME crossing STOP.
+    return bytes.fromhex("478727be61f70dbd70953cbd09b996bd5c7a2ebe") + (b"\x00" * 128)
 
 
 def _write_zip_with_duplicate_data_pkl(zip_path: Path, first_payload: bytes, second_payload: bytes) -> None:
