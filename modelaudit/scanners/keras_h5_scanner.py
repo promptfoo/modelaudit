@@ -982,6 +982,20 @@ class KerasH5Scanner(BaseScanner):
                 if isinstance(layer_group, h5py.Group) and not add_weight_names(layer_group, layer_path):
                     return
 
+        def add_keras3_auxiliary_roots() -> None:
+            if h5_file.get("vars", getlink=True) is not None:
+                add_root("vars")
+
+            optimizer_link = h5_file.get("optimizer", getlink=True)
+            if isinstance(optimizer_link, (h5py.ExternalLink, h5py.SoftLink)):
+                add_root("optimizer")
+                return
+            if not isinstance(optimizer_link, h5py.HardLink):
+                return
+            optimizer_group = h5_file.get("optimizer", getlink=False)
+            if isinstance(optimizer_group, h5py.Group) and optimizer_group.get("vars", getlink=True) is not None:
+                add_root("optimizer/vars")
+
         if "model_config" in h5_file.attrs:
             for root_name in cls._KERAS_WEIGHT_ROOT_GROUPS:
                 root_link = h5_file.get(root_name, getlink=True)
@@ -1008,6 +1022,7 @@ class KerasH5Scanner(BaseScanner):
         layers_link = h5_file.get("layers", getlink=True)
         if isinstance(layers_link, (h5py.ExternalLink, h5py.SoftLink)):
             add_root("layers")
+            add_keras3_auxiliary_roots()
             return roots, roots_truncated
         if not isinstance(layers_link, h5py.HardLink):
             return roots, False
@@ -1016,6 +1031,7 @@ class KerasH5Scanner(BaseScanner):
         if not isinstance(layers, h5py.Group):
             return roots, False
 
+        add_keras3_auxiliary_roots()
         for layer_name in layers:
             if not consume_name_budget():
                 break
@@ -1037,6 +1053,13 @@ class KerasH5Scanner(BaseScanner):
                 break
 
         return roots, roots_truncated
+
+    @staticmethod
+    def _is_same_file_virtual_source(filename: Any) -> bool:
+        try:
+            return os.fsdecode(filename) in {"", "."}
+        except TypeError:
+            return False
 
     @staticmethod
     def _has_group_or_external_link(group: Any, name: str) -> bool:
@@ -1277,14 +1300,13 @@ class KerasH5Scanner(BaseScanner):
             if virtual_source_count <= 0:
                 return
 
-            external_reference_count += 1
-            if len(findings) >= self._MAX_HDF5_EXTERNAL_REFERENCE_REPORTS:
-                return
             sources = []
-            for index in range(min(virtual_source_count, self._MAX_HDF5_VIRTUAL_SOURCE_REPORTS)):
-                filename, filename_truncated = self._bounded_hdf5_reference_text(
-                    storage_properties.get_virtual_filename(index)
-                )
+            inspected_source_count = min(virtual_source_count, self._MAX_HDF5_VIRTUAL_SOURCE_REPORTS)
+            for index in range(inspected_source_count):
+                raw_filename = storage_properties.get_virtual_filename(index)
+                if self._is_same_file_virtual_source(raw_filename):
+                    continue
+                filename, filename_truncated = self._bounded_hdf5_reference_text(raw_filename)
                 dataset_name, dataset_name_truncated = self._bounded_hdf5_reference_text(
                     storage_properties.get_virtual_dsetname(index)
                 )
@@ -1298,6 +1320,17 @@ class KerasH5Scanner(BaseScanner):
                     source_details["path_truncated"] = True
                 sources.append(source_details)
 
+            sources_truncated = virtual_source_count > inspected_source_count
+            if sources_truncated:
+                virtual_dataset_sources_truncated = True
+            if not sources:
+                if sources_truncated:
+                    external_reference_count += 1
+                return
+
+            external_reference_count += 1
+            if len(findings) >= self._MAX_HDF5_EXTERNAL_REFERENCE_REPORTS:
+                return
             hdf5_path, hdf5_path_truncated = self._bounded_hdf5_reference_text(f"/{name}".replace("//", "/"))
             virtual_dataset_finding: dict[str, Any] = {
                 "kind": "virtual_dataset",
@@ -1306,8 +1339,7 @@ class KerasH5Scanner(BaseScanner):
             }
             if hdf5_path_truncated:
                 virtual_dataset_finding["hdf5_path_truncated"] = True
-            if virtual_source_count > len(sources):
-                virtual_dataset_sources_truncated = True
+            if sources_truncated:
                 virtual_dataset_finding["source_count"] = virtual_source_count
                 virtual_dataset_finding["sources_truncated"] = True
             findings.append(virtual_dataset_finding)

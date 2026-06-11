@@ -844,6 +844,80 @@ def test_large_hdf5_virtual_dataset_source_still_detected(tmp_path: Path) -> Non
     ]
 
 
+def test_keras_h5_same_file_virtual_dataset_source_stays_clean(tmp_path: Path) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        keras_version="3.13.1",
+        file_name="same_file_virtual_dataset.h5",
+    )
+    with h5py.File(model_path, "a") as f:
+        f.create_dataset("internal_payload", data=[1.0, 2.0])
+        dense = f.require_group("model_weights").create_group("dense")
+        dense.attrs["weight_names"] = [b"virtual_kernel"]
+        f["model_weights"].attrs["layer_names"] = [b"dense"]
+        layout = h5py.VirtualLayout(shape=(2,), dtype="float64")
+        layout[:] = h5py.VirtualSource(".", "/internal_payload", shape=(2,))
+        dense.create_virtual_dataset("virtual_kernel", layout)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+@pytest.mark.parametrize("root_path", ["vars", "optimizer/vars"])
+def test_keras_h5_scanner_flags_keras3_root_vars_external_link(tmp_path: Path, root_path: str) -> None:
+    weights_path = tmp_path / "keras3_root_vars.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        f.create_group("layers").create_group("dense").create_group("vars").create_dataset("0", data=[1.0])
+        vars_group = f.require_group(root_path)
+        vars_group["0"] = h5py.ExternalLink("missing_external_source.h5", "/payload")
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": f"/{root_path}/0",
+            "filename": "missing_external_source.h5",
+            "path": "/payload",
+        },
+    ]
+
+
+@pytest.mark.parametrize("root_path", ["vars", "optimizer/vars"])
+def test_keras_h5_scanner_flags_keras3_root_vars_virtual_dataset_source(tmp_path: Path, root_path: str) -> None:
+    virtual_source = tmp_path / "root_virtual_source.h5"
+    with h5py.File(virtual_source, "w") as f:
+        f.create_dataset("payload", data=[1.0, 2.0])
+    weights_path = tmp_path / "keras3_root_virtual_vars.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        f.create_group("layers").create_group("dense").create_group("vars").create_dataset("0", data=[1.0])
+        vars_group = f.require_group(root_path)
+        layout = h5py.VirtualLayout(shape=(2,), dtype="float64")
+        layout[:] = h5py.VirtualSource(virtual_source.name, "/payload", shape=(2,))
+        vars_group.create_virtual_dataset("0", layout)
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "virtual_dataset",
+            "hdf5_path": f"/{root_path}/0",
+            "sources": [{"filename": "root_virtual_source.h5", "path": "/payload"}],
+        },
+    ]
+
+
 def test_large_hdf5_soft_link_cycle_fails_closed_without_size_limit(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
