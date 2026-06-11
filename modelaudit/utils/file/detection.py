@@ -313,13 +313,26 @@ _UTF8_BOM = b"\xef\xbb\xbf"
 _JSON_NUMBER_PREFIX_RE = re.compile(rb"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
 _JSON_HEX_BYTES = frozenset(b"0123456789abcdefABCDEF")
 _JSON_SIMPLE_ESCAPE_BYTES = frozenset(b'"\\/bfnrt')
+_JSON_SIMPLE_ESCAPE_DECODED_CHARS = {
+    ord('"'): '"',
+    ord("\\"): "\\",
+    ord("/"): "/",
+    ord("b"): "\b",
+    ord("f"): "\f",
+    ord("n"): "\n",
+    ord("r"): "\r",
+    ord("t"): "\t",
+}
 _JSON_VALUE_DELIMITERS = b",}] \t\r\n"
 _MXNET_SYMBOL_PREFIX_MAX_VALUES = 4096
 _MXNET_SYMBOL_MAX_KEY_BYTES = 64
 _MXNET_SYMBOL_ROOT_KEYS = frozenset({"nodes", "arg_nodes", "heads"})
 _MXNET_SYMBOL_STREAM_CHUNK_BYTES = 64 * 1024
 _HF_TOKENIZER_JSON_FILENAMES = frozenset({"tokenizer.json"})
-_HF_TOKENIZER_JSON_ROUTE_FILENAMES = frozenset({"tokenizer", "tokenizer.json", "tokenizer.txt", "tokenizer.bin"})
+_HF_TOKENIZER_JSON_ROUTE_FILENAMES = frozenset(
+    {"tokenizer", "tokenizer.json", "tokenizer.txt", "tokenizer.bin", "tokenizer_config.json"}
+)
+_HF_TOKENIZER_STREAM_DECODED_TAIL_CHARS = 64
 _HF_TOKENIZER_ROOT_KEYS = frozenset({"version", "added_tokens"})
 _HF_TOKENIZER_MODEL_TYPES = frozenset({"BPE", "Unigram", "WordPiece", "WordLevel"})
 _HF_TOKENIZER_TEMPLATE_KEYS = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
@@ -756,6 +769,10 @@ def _json_probe_root_string_value_has_jax_identity(probe: bytes, key: str, value
     return bool(value and _JAX_JSON_CHECKPOINT_IDENTITY_RE.search(value))
 
 
+def _decoded_tail_has_complete_jax_identity(decoded_tail: str) -> bool:
+    return any(match.end() < len(decoded_tail) for match in _JAX_JSON_CHECKPOINT_IDENTITY_RE.finditer(decoded_tail))
+
+
 def _json_probe_skip_string_or_raise(probe: bytes, offset: int) -> int:
     end = _json_probe_skip_string(probe, offset)
     if end is None:
@@ -868,7 +885,7 @@ def _json_probe_skip_object_with_template_scan(
         key = _json_probe_decode_string(probe, key_start, key_end)
         if key is None:
             raise _JSONProbeInvalid
-        if key in _HF_TOKENIZER_TEMPLATE_KEYS:
+        if scan_string_template_indicators and key in _HF_TOKENIZER_TEMPLATE_KEYS:
             state.has_template_evidence = True
 
         offset = _json_probe_skip_whitespace(probe, key_end)
@@ -945,8 +962,15 @@ def _hf_tokenizer_probe_model_object(
             if probe[value_offset] not in {ord("{"), ord("[")}:
                 raise _JSONProbeInvalid
             saw_vocab = True
-            next_offset = _json_probe_skip_value(probe, value_offset)
-            if next_offset is None:
+            try:
+                next_offset = _json_probe_skip_value_with_template_scan(
+                    probe,
+                    value_offset,
+                    state,
+                    depth=1,
+                    scan_string_template_indicators=False,
+                )
+            except _JSONProbeIncomplete:
                 state.incomplete_model_member_key = key
                 return None, saw_model_type and saw_vocab
         else:
@@ -1090,6 +1114,12 @@ def _hf_tokenizer_stream_has_structural_route_key(
     string_key_bytes = bytearray()
     string_value_bytes = bytearray()
     string_tail = b""
+    string_jax_identity_tail = ""
+    string_jax_unicode_escape: bytearray | None = None
+    string_jax_utf8_decoder: codecs.IncrementalDecoder | None = None
+    string_jax_escape_pending = False
+    string_jax_decode_invalid = False
+    string_value_has_jax_identity = False
     escaped = False
     in_primitive = False
     primitive_done = False
@@ -1125,6 +1155,75 @@ def _hf_tokenizer_stream_has_structural_route_key(
                 skip_templates=current_value_skips_templates(),
             )
         )
+
+    def append_jax_identity_text(text: str) -> None:
+        nonlocal string_jax_identity_tail, string_value_has_jax_identity
+        if not text:
+            return
+        combined_identity = string_jax_identity_tail + text
+        if _decoded_tail_has_complete_jax_identity(combined_identity):
+            string_value_has_jax_identity = True
+        string_jax_identity_tail = combined_identity[-_HF_TOKENIZER_STREAM_DECODED_TAIL_CHARS:]
+
+    def jax_identity_utf8_boundary_is_clean() -> bool:
+        nonlocal string_jax_decode_invalid
+        if string_jax_utf8_decoder is None:
+            string_jax_decode_invalid = True
+            return False
+        if string_jax_utf8_decoder.getstate()[0]:
+            string_jax_decode_invalid = True
+            return False
+        return True
+
+    def feed_jax_identity_byte(byte: int) -> None:
+        nonlocal string_jax_decode_invalid, string_jax_escape_pending, string_jax_unicode_escape
+        if string_jax_decode_invalid:
+            return
+        if string_jax_unicode_escape is not None:
+            if byte not in _JSON_HEX_BYTES:
+                string_jax_decode_invalid = True
+                return
+            string_jax_unicode_escape.append(byte)
+            if len(string_jax_unicode_escape) == 4:
+                append_jax_identity_text(chr(int(bytes(string_jax_unicode_escape), 16)))
+                string_jax_unicode_escape = None
+            return
+        if string_jax_escape_pending:
+            string_jax_escape_pending = False
+            if byte == ord("u"):
+                string_jax_unicode_escape = bytearray()
+                return
+            decoded_char = _JSON_SIMPLE_ESCAPE_DECODED_CHARS.get(byte)
+            if decoded_char is None:
+                string_jax_decode_invalid = True
+                return
+            append_jax_identity_text(decoded_char)
+            return
+        if byte == ord("\\"):
+            if jax_identity_utf8_boundary_is_clean():
+                string_jax_escape_pending = True
+            return
+        if byte < 0x20 or string_jax_utf8_decoder is None:
+            string_jax_decode_invalid = True
+            return
+        try:
+            append_jax_identity_text(string_jax_utf8_decoder.decode(bytes((byte,)), final=False))
+        except UnicodeDecodeError:
+            string_jax_decode_invalid = True
+
+    def finish_jax_identity_string() -> None:
+        nonlocal string_jax_decode_invalid, string_value_has_jax_identity
+        if string_jax_decode_invalid or string_jax_escape_pending or string_jax_unicode_escape is not None:
+            string_jax_decode_invalid = True
+            return
+        if string_jax_utf8_decoder is not None:
+            try:
+                append_jax_identity_text(string_jax_utf8_decoder.decode(b"", final=True))
+            except UnicodeDecodeError:
+                string_jax_decode_invalid = True
+                return
+        if _decoded_tail_has_complete_jax_identity(f'{string_jax_identity_tail}"'):
+            string_value_has_jax_identity = True
 
     def handle_structural_byte(byte: int) -> None:
         nonlocal in_primitive, primitive_done
@@ -1182,6 +1281,11 @@ def _hf_tokenizer_stream_has_structural_route_key(
                             and len(string_value_bytes) <= _HF_TOKENIZER_STREAM_MAX_KEY_BYTES
                         ):
                             string_value_bytes.append(byte)
+                        if not string_is_key and string_route_key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS:
+                            if byte == ord('"') and not escaped:
+                                finish_jax_identity_string()
+                            else:
+                                feed_jax_identity_byte(byte)
                         if scan_template_values and not string_is_key and not string_skip_templates:
                             combined = string_tail + bytes((byte,))
                             if any(indicator in combined for indicator in indicator_bytes) or (
@@ -1229,6 +1333,8 @@ def _hf_tokenizer_stream_has_structural_route_key(
                                 context.mode = "colon"
                         else:
                             if string_route_key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS:
+                                if string_value_has_jax_identity and not string_jax_decode_invalid:
+                                    return True
                                 value_bytes = bytes(string_value_bytes)
                                 value = (
                                     _json_probe_decode_string(value_bytes, 0, len(value_bytes))
@@ -1272,6 +1378,16 @@ def _hf_tokenizer_stream_has_structural_route_key(
                         string_key_bytes = bytearray(b'"') if string_is_key else bytearray()
                         string_value_bytes = bytearray(b'"') if string_route_key is not None else bytearray()
                         string_tail = b""
+                        string_jax_identity_tail = ""
+                        string_jax_unicode_escape = None
+                        string_jax_utf8_decoder = (
+                            codecs.getincrementaldecoder("utf-8")("strict")
+                            if string_route_key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS
+                            else None
+                        )
+                        string_jax_escape_pending = False
+                        string_jax_decode_invalid = False
+                        string_value_has_jax_identity = False
                         continue
 
                     handle_structural_byte(byte)

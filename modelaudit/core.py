@@ -93,6 +93,7 @@ from modelaudit.utils.file.detection import (
     detect_pytorch_binary_supplemental_format,
     detect_xgboost_ubjson_content_route,
     gzip_tar_trailing_data_status,
+    huggingface_tokenizer_json_has_jax_route_evidence,
     huggingface_tokenizer_json_has_template_route_evidence,
     is_confirmed_jax_json_checkpoint_file,
     is_executorch_archive,
@@ -1394,6 +1395,12 @@ def _select_non_hdf5_preferred_scanner_id(
     if tokenizer_template_route and scanner_policy is not None and scanner_policy.allows("jinja2_template"):
         return "jinja2_template"
 
+    tokenizer_jax_route = (
+        config is not None
+        and ext == ".json"
+        and header_format == "unknown"
+        and huggingface_tokenizer_json_has_jax_route_evidence(path)
+    )
     if (
         config is not None
         and ext == ".json"
@@ -1402,7 +1409,7 @@ def _select_non_hdf5_preferred_scanner_id(
         and scanner_policy.allows("jax_checkpoint")
         and not is_huggingface_tokenizer_json_file(path)
         and (not tokenizer_template_route or not scanner_policy.allows("jinja2_template"))
-        and is_confirmed_jax_json_checkpoint_file(path)
+        and (is_confirmed_jax_json_checkpoint_file(path) or tokenizer_jax_route)
     ):
         return "jax_checkpoint"
 

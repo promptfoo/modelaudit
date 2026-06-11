@@ -10166,6 +10166,21 @@ def test_scan_file_tokenizer_model_vocab_after_structure_probe_fails_closed(
     assert any(check.name == "MXNet Symbol Routing" for check in result.checks)
 
 
+def test_scan_file_malformed_tokenizer_model_vocab_container_fails_closed(tmp_path: Path) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0 "world":1},"merges":[]}}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert file_detection.is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "MXNet Symbol Routing" for check in result.checks)
+
+
 def test_scan_file_tokenizer_route_key_after_value_ending_at_probe_boundary_preserves_jinja(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -10611,6 +10626,41 @@ def test_scan_file_tokenizer_json_jax_identity_composes_jinja_template_analysis(
     )
 
 
+def test_scan_file_tokenizer_json_escaped_long_jax_identity_value_composes_jinja_template_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    jax_identity_json = (
+        f'"{"x" * (file_detection._HF_TOKENIZER_STREAM_MAX_KEY_BYTES + 16)}'
+        r"\n\u006a\u0061\u0078"
+        '"'
+    )
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+            f'"framework":{jax_identity_json},'
+            '"payload":"jax.experimental.host_callback.call(os.system, \'id\')"'
+        ),
+        padding_size=256,
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert set(result.metadata["scanner_dependency_ids"]) >= {"jinja2_template", "jax_checkpoint"}
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
 def test_scan_file_extensionless_tokenizer_jax_identity_composes_jinja_template_analysis(tmp_path: Path) -> None:
     tokenizer_path = _write_ordered_hf_tokenizer_json(
         tmp_path / "tokenizer",
@@ -10642,6 +10692,32 @@ def test_scan_file_tokenizer_json_jax_library_identity_composes_jinja_template_a
             '"payload":"jax.experimental.host_callback.call(os.system, \'id\')",'
             '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"'
         ),
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert set(result.metadata["scanner_dependency_ids"]) >= {"jinja2_template", "jax_checkpoint"}
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_config_template_jax_identity_composes_jax_analysis(tmp_path: Path) -> None:
+    tokenizer_path = tmp_path / "tokenizer_config.json"
+    tokenizer_path.write_text(
+        json.dumps(
+            {
+                "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+                "framework": "jax",
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+            }
+        ),
+        encoding="utf-8",
     )
 
     result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
@@ -10690,6 +10766,33 @@ def test_scan_file_tokenizer_json_jax_without_template_does_not_self_merge_jinja
         )
         == 1
     )
+
+
+@pytest.mark.parametrize("framework_json", ['"jax"', r'"\u006a\u0061\u0078"'])
+def test_scan_file_oversized_tokenizer_json_late_jax_without_template_routes_jax(
+    tmp_path: Path,
+    framework_json: str,
+) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            f',"framework":{framework_json},"payload":"jax.experimental.host_callback.call(os.system, \'id\')"'
+        ),
+        padding_size=JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 16,
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+    registry_scanner = core_module._registry.get_scanner_for_path(str(tokenizer_path))
+
+    assert tokenizer_path.stat().st_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES
+    assert file_detection.huggingface_tokenizer_json_has_jax_route_evidence(tokenizer_path) is True
+    assert registry_scanner is not None
+    assert registry_scanner.name == "jax_checkpoint"
+    assert result.success is False
+    assert result.scanner_name == "jax_checkpoint"
+    assert "jax_json_checkpoint_analysis_size_limit" in result.metadata.get("scan_outcome_reasons", [])
+    assert any(check.name == "JSON Checkpoint Analysis Limit" for check in result.checks)
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
 
 
 def test_scan_file_tokenizer_json_xgboost_jax_jinja_overlap_does_not_recurse(tmp_path: Path) -> None:

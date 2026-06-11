@@ -788,6 +788,7 @@ class Jinja2TemplateScanner(BaseScanner):
         if Path(path).name.lower() not in {
             "tokenizer",
             "tokenizer.json",
+            "tokenizer_config.json",
             "tokenizer.txt",
             "tokenizer.bin",
         } or not huggingface_tokenizer_json_has_jax_route_evidence(path):

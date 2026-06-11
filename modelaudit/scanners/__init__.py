@@ -327,9 +327,15 @@ class ScannerRegistry:
                     and scanner_id == "jax_checkpoint"
                     and candidate_extension in content_routed_extensions
                 ):
-                    from modelaudit.utils.file.detection import is_confirmed_jax_json_checkpoint_file
+                    from modelaudit.utils.file.detection import (
+                        huggingface_tokenizer_json_has_jax_route_evidence,
+                        is_confirmed_jax_json_checkpoint_file,
+                    )
 
-                    if not is_confirmed_jax_json_checkpoint_file(path):
+                    if not (
+                        is_confirmed_jax_json_checkpoint_file(path)
+                        or (candidate_extension == ".json" and huggingface_tokenizer_json_has_jax_route_evidence(path))
+                    ):
                         continue
 
                 scanner_class = self._load_scanner(scanner_id)
