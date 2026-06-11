@@ -82,6 +82,19 @@ BARE_NETWORK_TOKEN_PATTERNS = (
     BARE_NETWORK_IPV6_TOKEN_PATTERN,
     BARE_NETWORK_DOMAIN_TOKEN_PATTERN,
 )
+DOCUMENTATION_NETWORK_LIBRARY_NAMES_PATTERN = (
+    rb"socket|urllib|requests|httplib|http\.client|ftplib|telnetlib|smtplib|poplib|imaplib|paramiko|"
+    rb"pycurl|aiohttp|tornado|twisted|httpx|websocket|websockets|grpc|zeromq|paho\.mqtt|redis|"
+    rb"pymongo|psycopg2|mysql\.connector"
+)
+DOCUMENTATION_NETWORK_LIBRARY_IMPORT_PATTERN = re.compile(
+    rb"\b(?P<pattern>(?:import|from)\s+(?P<library>" + DOCUMENTATION_NETWORK_LIBRARY_NAMES_PATTERN + rb"))\b",
+    re.IGNORECASE,
+)
+DOCUMENTATION_NETWORK_LIBRARY_USAGE_PATTERN = re.compile(
+    rb"\b(?P<library>" + DOCUMENTATION_NETWORK_LIBRARY_NAMES_PATTERN + rb")\.(?:connect|request|__init__)\b",
+    re.IGNORECASE,
+)
 MAX_TEXT_FINDING_CONTEXT_BYTES = 4096
 MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES = 1024
 MAX_DOCUMENTATION_FENCE_MARKERS = 4096
@@ -106,6 +119,7 @@ DOCUMENTATION_FENCE_LINE_PATTERN = re.compile(
 DOCUMENTATION_CODE_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$")
 DOCUMENTATION_MARKDOWN_PREFIX_PATTERN = re.compile(rb"(?:(?:[-*+>]|[0-9]{1,9}[.)])\s+){1,8}")
 DOCUMENTATION_CONFIG_NETWORK_KEY = rb"(?:endpoint|callback|webhook)(?:s|[_-][A-Za-z0-9_.-]{1,128}|(?:url|uri)s?)?"
+DOCUMENTATION_CONFIG_NETWORK_KEY_PATTERN = re.compile(rb"\b" + DOCUMENTATION_CONFIG_NETWORK_KEY + rb"\b", re.IGNORECASE)
 DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
     rb"(?:^|[\s{[(,;])(?:[\"']"
     + DOCUMENTATION_CONFIG_NETWORK_KEY
@@ -2106,6 +2120,18 @@ class TextScanner(BaseScanner):
         return True
 
     @staticmethod
+    def _documentation_network_token_value(match: re.Match[bytes]) -> str:
+        return match.group().rstrip(b"`.,;:!?)\"'>]}").decode("utf-8", errors="ignore")
+
+    @classmethod
+    def _documentation_bare_network_token_candidate_is_relevant(cls, line: bytes, position: int) -> bool:
+        return (
+            not cls._documentation_line_is_code_shaped(line, position)
+            or DOCUMENTATION_CONFIG_NETWORK_KEY_PATTERN.search(line) is not None
+            or DOCUMENTATION_CONFIG_TAG_PATTERN.search(line) is not None
+        )
+
+    @staticmethod
     def _split_detector_finding_limit(
         findings: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
@@ -2119,6 +2145,150 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
+    def _documentation_network_candidates_are_informational(
+        cls,
+        path: str,
+        payload: bytes,
+        fenced_code_ranges: tuple[tuple[int, int], ...],
+        fenced_passive_network_example_ranges: tuple[tuple[int, int], ...],
+    ) -> bool:
+        offset = 0
+        for raw_line in payload.splitlines(keepends=True):
+            line = raw_line.rstrip(b"\r\n")
+            url_matches = tuple(BARE_NETWORK_URL_TOKEN_PATTERN.finditer(line))
+            for match in url_matches:
+                position = offset + match.start()
+                if cls._documentation_position_is_fenced_code(fenced_code_ranges, position) and (
+                    cls._documentation_fenced_network_command_is_informational(
+                        payload,
+                        {
+                            "type": "network_command",
+                            "command_type": "git_clone",
+                            "destination": cls._documentation_network_token_value(match),
+                            "position": position,
+                        },
+                    )
+                ):
+                    continue
+                finding = {
+                    "type": "url_detected",
+                    "url": cls._documentation_network_token_value(match),
+                    "position": position,
+                }
+                if not cls._sidecar_network_finding_is_informational(
+                    path,
+                    payload,
+                    finding,
+                    fenced_code_ranges,
+                    fenced_passive_network_example_ranges,
+                ):
+                    return False
+            if not url_matches:
+                for pattern, finding_type, value_key in (
+                    (BARE_NETWORK_IPV4_TOKEN_PATTERN, "ipv4_address", "ip"),
+                    (BARE_NETWORK_IPV6_TOKEN_PATTERN, "ipv6_address", "ip"),
+                    (BARE_NETWORK_DOMAIN_TOKEN_PATTERN, "domain", "domain"),
+                ):
+                    for match in pattern.finditer(line):
+                        if not cls._documentation_bare_network_token_candidate_is_relevant(line, match.start()):
+                            continue
+                        finding = {
+                            "type": finding_type,
+                            value_key: cls._documentation_network_token_value(match),
+                            "position": offset + match.start(),
+                        }
+                        if not cls._sidecar_network_finding_is_informational(
+                            path,
+                            payload,
+                            finding,
+                            fenced_code_ranges,
+                            fenced_passive_network_example_ranges,
+                        ):
+                            return False
+            for match in DOCUMENTATION_FENCED_NETWORK_FUNCTION_PATTERN.finditer(line):
+                function = match.group().decode("utf-8", errors="ignore")
+                finding = {"type": "network_function", "function": function, "position": offset + match.start()}
+                if not cls._sidecar_network_finding_is_informational(
+                    path,
+                    payload,
+                    finding,
+                    fenced_code_ranges,
+                    fenced_passive_network_example_ranges,
+                ):
+                    return False
+            for match in DOCUMENTATION_NETWORK_LIBRARY_IMPORT_PATTERN.finditer(line):
+                library = match.group("library").decode("utf-8", errors="ignore")
+                import_pattern = match.group("pattern").decode("utf-8", errors="ignore")
+                finding = {
+                    "type": "network_library",
+                    "library": library,
+                    "pattern": import_pattern,
+                    "position": offset + match.start("pattern"),
+                }
+                if not cls._sidecar_network_finding_is_informational(
+                    path,
+                    payload,
+                    finding,
+                    fenced_code_ranges,
+                    fenced_passive_network_example_ranges,
+                ):
+                    return False
+            for match in DOCUMENTATION_NETWORK_LIBRARY_USAGE_PATTERN.finditer(line):
+                library = match.group("library").decode("utf-8", errors="ignore")
+                finding = {
+                    "type": "network_library",
+                    "library": library,
+                    "pattern": match.group().decode("utf-8", errors="ignore"),
+                    "position": offset + match.start(),
+                }
+                if not cls._sidecar_network_finding_is_informational(
+                    path,
+                    payload,
+                    finding,
+                    fenced_code_ranges,
+                    fenced_passive_network_example_ranges,
+                ):
+                    return False
+            offset += len(raw_line)
+        return True
+
+    @classmethod
+    def _documentation_passive_network_reporting_limit(
+        cls,
+        path: str,
+        payload: bytes,
+        findings: list[dict[str, Any]],
+        finding_limit: dict[str, Any],
+    ) -> bool:
+        truncated_finding_type = finding_limit.get("truncated_finding_type")
+        if truncated_finding_type not in PASSIVE_NETWORK_FINDING_TYPES | {"endpoint_redaction_classification"}:
+            return False
+        if not cls._is_documentation_sidecar(path) or any(finding.get("severity") != "INFO" for finding in findings):
+            return False
+        fenced_code_ranges, fence_classification_incomplete = cls._documentation_fenced_code_ranges(payload)
+        if fence_classification_incomplete:
+            return False
+        fenced_passive_network_example_ranges = cls._documentation_fenced_passive_network_example_ranges(
+            payload,
+            fenced_code_ranges,
+        )
+        truncated_finding = finding_limit.get("truncated_finding")
+        if isinstance(truncated_finding, dict) and not cls._sidecar_network_finding_is_informational(
+            path,
+            payload,
+            truncated_finding,
+            fenced_code_ranges,
+            fenced_passive_network_example_ranges,
+        ):
+            return False
+        return cls._documentation_network_candidates_are_informational(
+            path,
+            payload,
+            fenced_code_ranges,
+            fenced_passive_network_example_ranges,
+        )
+
+    @classmethod
     def _passive_network_reporting_limit(
         cls,
         path: str,
@@ -2126,9 +2296,11 @@ class TextScanner(BaseScanner):
         findings: list[dict[str, Any]],
         finding_limit: dict[str, Any],
     ) -> bool:
+        truncated_finding = finding_limit.get("truncated_finding")
+        if cls._documentation_passive_network_reporting_limit(path, payload, findings, finding_limit):
+            return True
         if finding_limit.get("truncated_finding_type") not in PASSIVE_NETWORK_FINDING_TYPES:
             return False
-        truncated_finding = finding_limit.get("truncated_finding")
         return (
             cls._is_passive_data_sidecar(path)
             and all(finding.get("severity") == "INFO" for finding in findings)

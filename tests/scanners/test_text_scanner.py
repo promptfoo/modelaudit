@@ -1629,6 +1629,97 @@ def test_text_scanner_pinned_qwen2_vl_requests_example_executable_text_remains_a
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_pinned_unsloth_gemma_gguf_readme_reporting_limit_is_informational(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        (
+            "<!-- unsloth/gemma-4-E2B-it-qat-GGUF@db01ae3ceeca98487bf3569814f832f5023cd48c -->\n"
+            "# Gemma 4 E2B QAT GGUF\n\n"
+            "Model card: https://huggingface.co/unsloth/gemma-4-E2B-it-qat-GGUF\n"
+            "Base model: https://huggingface.co/google/gemma-4-E2B-it\n"
+            "Quantization notes: https://github.com/unslothai/unsloth\n"
+            "Documentation: https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md\n"
+            "Paper: http://arxiv.org/abs/2403.08295\n\n"
+            "```bash\n"
+            "git clone https://github.com/ggml-org/llama.cpp\n"
+            "cd llama.cpp\n"
+            "cmake -B build\n"
+            "```\n\n"
+            "More references: https://huggingface.co/docs/hub/models-cards\n"
+            "License: https://ai.google.dev/gemma/terms\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = TextScanner(
+        config={
+            "check_secrets": False,
+            "text_content_max_findings": 4,
+        }
+    ).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        cache_enabled=False,
+        check_secrets=False,
+        text_content_max_findings=4,
+    )
+
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert any(
+        check.name == "Network Communication Reporting Limit"
+        and check.severity == IssueSeverity.INFO
+        and check.details.get("analysis_incomplete") is False
+        and check.details.get("reporting_incomplete") is True
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Text Content Security Coverage" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_pinned_hunyuan3d_model_cards_are_informational(tmp_path: Path) -> None:
+    model_dir = tmp_path / "tencent_hunyuan3d_2"
+    model_dir.mkdir()
+    (model_dir / "README.md").write_text(
+        (
+            "<!-- tencent/Hunyuan3D-2@9cd649ba6913f7a852e3286bad86bfa9a2d83dcf -->\n"
+            "# Hunyuan3D-2\n\n"
+            "Project page: https://github.com/Tencent-Hunyuan/Hunyuan3D-2\n"
+            "Paper: https://arxiv.org/abs/2501.12202\n"
+            "Demo: https://huggingface.co/spaces/tencent/Hunyuan3D-2\n"
+            "Documentation: https://huggingface.co/docs/diffusers/index\n"
+            "Dataset notes: https://huggingface.co/datasets/tencent/Hunyuan3D-2\n"
+        ),
+        encoding="utf-8",
+    )
+    (model_dir / "model_card.md").write_text(
+        (
+            "Additional references for Hunyuan3D-2:\n"
+            "- https://github.com/Tencent-Hunyuan/Hunyuan3D-2/blob/main/README.md\n"
+            "- https://huggingface.co/tencent/Hunyuan3D-2\n"
+            "- https://huggingface.co/tencent/Hunyuan3D-2mv\n"
+            "- https://github.com/Tencent-Hunyuan/Hunyuan3D-2/tree/main/docs\n"
+            "- https://huggingface.co/papers/2501.12202\n"
+        ),
+        encoding="utf-8",
+    )
+
+    aggregate = scan_model_directory_or_file(
+        str(model_dir),
+        cache_enabled=False,
+        check_secrets=False,
+        text_content_max_findings=4,
+    )
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
 @pytest.mark.parametrize(
     ("content", "command_type"),
     [
@@ -3698,7 +3789,7 @@ def test_text_scanner_network_finding_limit_fails_closed_and_preserves_high_sign
     )
 
 
-def test_text_scanner_documentation_network_limit_fails_closed(tmp_path: Path) -> None:
+def test_text_scanner_documentation_network_limit_is_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text("https://docs.example.com/reference\n" * 10, encoding="utf-8")
 
@@ -3709,15 +3800,14 @@ def test_text_scanner_documentation_network_limit_fails_closed(tmp_path: Path) -
         }
     ).scan(str(text_path))
 
-    assert result.success is False
-    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
     assert any(
-        check.name == "Text Content Security Coverage"
+        check.name == "Network Communication Reporting Limit"
         and check.severity == IssueSeverity.INFO
         and check.details.get("truncated_finding_type") == "url_detected"
-        and check.details.get("analysis_incomplete") is True
-        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
+        and check.details.get("analysis_incomplete") is False
+        and check.details.get("reporting_incomplete") is True
         for check in result.checks
     )
 
