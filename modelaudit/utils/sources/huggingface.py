@@ -15,7 +15,7 @@ from glob import escape as escape_glob
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from ..helpers.disk_space import check_disk_space
 from .huggingface_paths import (
@@ -39,6 +39,9 @@ _TFLITE_MAGIC_BYTES = b"TFL3"
 _MAX_HF_STREAMING_EXTENSIONLESS_FILES = 128
 _MAX_HF_REPOSITORY_INVENTORY_FILES = 8192
 _MAX_HF_REPOSITORY_INVENTORY_PAGES = 128
+_MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES = 10 * 1024 * 1024
+_MAX_HF_REPOSITORY_PATH_CHARS = 4096
+_HF_REPOSITORY_TREE_RESPONSE_CHUNK_BYTES = 64 * 1024
 _HF_PATH_INFO_BATCH_SIZE = 512
 _HF_DOWNLOAD_WORKER_RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
 _POSIX_TERMINATE_SIGNAL = getattr(signal, "SIGTERM", 15)
@@ -816,6 +819,11 @@ def _extract_huggingface_repo_files(repo_info: Any) -> list[str] | None:
 
 def _validate_huggingface_repo_filename(repo_id: str, filename: str) -> str:
     """Return a safe POSIX repository filename or fail closed."""
+    if len(filename) > _MAX_HF_REPOSITORY_PATH_CHARS:
+        raise ValueError(
+            "Hugging Face repository inventory incomplete: repository filename exceeds "
+            f"the bounded path length ({_MAX_HF_REPOSITORY_PATH_CHARS}) for {repo_id}"
+        )
     if not filename or filename.startswith("/") or "\x00" in filename or "\\" in filename:
         raise ValueError(f"Hugging Face repository inventory incomplete: unsafe repository filename for {repo_id}")
     if any(ord(character) < 32 or ord(character) == 127 for character in filename):
@@ -1353,28 +1361,70 @@ def _extract_huggingface_tree_page_files(repo_id: str, page_items: object) -> li
     return files
 
 
+def _read_bounded_huggingface_tree_response(response: Any, repo_id: str) -> object:
+    """Read and decode one bounded Hugging Face tree API page."""
+    headers = getattr(response, "headers", {})
+    content_length = headers.get("Content-Length") if hasattr(headers, "get") else None
+    if content_length is not None:
+        try:
+            response_size = int(content_length)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Hugging Face repository inventory incomplete: invalid tree page size for {repo_id}"
+            ) from exc
+        if response_size < 0 or response_size > _MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES:
+            raise ValueError(
+                "Hugging Face repository inventory incomplete: tree page response exceeds "
+                f"the bounded response limit ({_MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES} bytes) for {repo_id}"
+            )
+
+    payload = bytearray()
+    for chunk in response.iter_content(chunk_size=_HF_REPOSITORY_TREE_RESPONSE_CHUNK_BYTES):
+        if not chunk:
+            continue
+        payload.extend(chunk)
+        if len(payload) > _MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES:
+            raise ValueError(
+                "Hugging Face repository inventory incomplete: tree page response exceeds "
+                f"the bounded response limit ({_MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES} bytes) for {repo_id}"
+            )
+
+    try:
+        return json.loads(bytes(payload))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Hugging Face repository inventory incomplete: invalid tree page JSON for {repo_id}") from exc
+
+
+def _canonical_huggingface_tree_page_url(url: str) -> str:
+    """Normalize tree page URLs enough to detect equivalent pagination loops."""
+    parts = urlsplit(url)
+    query = urlencode(sorted(parse_qsl(parts.query, keep_blank_values=True)), doseq=True)
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, query, ""))
+
+
 def _list_huggingface_repo_files_paginated(
     repo_id: str,
     revision: str,
     timeout_seconds: float = 30,
 ) -> list[str]:
     """Return a complete bounded repository file inventory at an immutable revision."""
-    import requests
     from huggingface_hub import HfApi
-    from huggingface_hub.utils import build_hf_headers
+    from huggingface_hub.utils import build_hf_headers, get_session
 
     api = HfApi()
     next_url: str | None = f"{api.endpoint}/api/models/{repo_id}/tree/{quote(revision, safe='')}"
     params: dict[str, bool] | None = {"recursive": True, "expand": False}
     headers = build_hf_headers(token=None)
+    session = get_session()
     seen_page_urls: set[str] = set()
     files: set[str] = set()
     page_count = 0
 
     while next_url is not None:
-        if next_url in seen_page_urls:
+        canonical_next_url = _canonical_huggingface_tree_page_url(next_url)
+        if canonical_next_url in seen_page_urls:
             raise ValueError(f"Hugging Face repository inventory incomplete: pagination cursor repeated for {repo_id}")
-        seen_page_urls.add(next_url)
+        seen_page_urls.add(canonical_next_url)
         page_count += 1
         if page_count > _MAX_HF_REPOSITORY_INVENTORY_PAGES:
             raise ValueError(
@@ -1382,9 +1432,11 @@ def _list_huggingface_repo_files_paginated(
                 f"the bounded pagination limit ({_MAX_HF_REPOSITORY_INVENTORY_PAGES}) for {repo_id}"
             )
 
-        response = requests.get(next_url, headers=headers, params=params, timeout=timeout_seconds)
-        response.raise_for_status()
-        for filename in _extract_huggingface_tree_page_files(repo_id, response.json()):
+        with session.get(next_url, headers=headers, params=params, timeout=timeout_seconds, stream=True) as response:
+            response.raise_for_status()
+            page_items = _read_bounded_huggingface_tree_response(response, repo_id)
+
+        for filename in _extract_huggingface_tree_page_files(repo_id, page_items):
             files.add(_validate_huggingface_repo_filename(repo_id, filename))
             if len(files) > _MAX_HF_REPOSITORY_INVENTORY_FILES:
                 raise ValueError(
