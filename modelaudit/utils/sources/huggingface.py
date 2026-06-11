@@ -1450,7 +1450,7 @@ def _list_huggingface_repo_files_paginated(
                 timeout=timeout_seconds,
             )
         else:
-            response_context = session.get(
+            response_context = cast(Any, session).get(
                 next_url, headers=headers, params=params, timeout=timeout_seconds, stream=True
             )
         with response_context as response:
