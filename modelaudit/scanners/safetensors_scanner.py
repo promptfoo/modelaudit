@@ -316,7 +316,13 @@ _BASE64_LICENSE_WRAP_LINE_MIN_CHARS = 32
 _BASE64_LICENSE_WRAP_MAX_LINES = 128
 _BASE64_LICENSE_WRAP_MAX_CHARS = 8192
 _BASE64_LICENSE_WRAP_MAX_DECODED_BYTES = 6144
+_BASE64_LICENSE_WRAP_MAX_SEPARATOR_LINES = 4
 _BASE64_LICENSE_WRAP_LINE_PATTERN = re.compile(r"^[A-Za-z0-9+/_-]+={0,2}$")
+_BASE64_LICENSE_WRAP_TOKEN_PATTERN = re.compile(r"\b[A-Za-z0-9+/_-]{32,}={0,2}\b")
+_BASE64_LICENSE_WRAP_SEPARATOR_PATTERN = re.compile(
+    r"^(?:[#>;]|//|--|\*)\s*(?:continued|continuation|wrapped|base64|license(?:\s+terms?)?)?\s*$",
+    re.IGNORECASE,
+)
 _SUSPICIOUS_LICENSE_URL_MARKERS = ("payload", "exfil", "webhook", "callback")
 _URL_PATH_NORMALIZATION_PASSES = 4
 _PERCENT_ENCODED_BYTE_PATTERN = re.compile(r"%[0-9a-fA-F]{2}")
@@ -503,6 +509,19 @@ class SafeTensorsScanner(BaseScanner):
         )
 
     @staticmethod
+    def _license_document_line_base64_fragments(line: str) -> list[str]:
+        if SafeTensorsScanner._license_document_line_is_wrapped_base64_fragment(line):
+            return [line]
+        return [match.group(0) for match in _BASE64_LICENSE_WRAP_TOKEN_PATTERN.finditer(line)]
+
+    @staticmethod
+    def _license_document_line_is_wrapped_base64_separator(line: str) -> bool:
+        return (
+            len(line) <= _LICENSE_DOCUMENT_MAX_LINE_CHARS
+            and _BASE64_LICENSE_WRAP_SEPARATOR_PATTERN.fullmatch(line) is not None
+        )
+
+    @staticmethod
     def _base64_candidate_decodes(candidate: str) -> bool:
         if len(candidate) < _OPAQUE_LICENSE_TOKEN_MIN_CHARS:
             return False
@@ -530,17 +549,30 @@ class SafeTensorsScanner(BaseScanner):
         chunks: list[str] = []
         total_chars = 0
         total_lines = 0
+        separator_lines = 0
 
         def flush() -> bool:
             return total_chars >= _OPAQUE_LICENSE_TOKEN_MIN_CHARS and cls._base64_candidate_decodes("".join(chunks))
 
         for line in [*lines, ""]:
-            if cls._license_document_line_is_wrapped_base64_fragment(line):
+            fragments = cls._license_document_line_base64_fragments(line)
+            if fragments:
                 total_lines += 1
-                total_chars += len(line)
+                separator_lines = 0
+                total_chars += sum(len(fragment) for fragment in fragments)
                 if total_lines > _BASE64_LICENSE_WRAP_MAX_LINES or total_chars > _BASE64_LICENSE_WRAP_MAX_CHARS:
                     return True
-                chunks.append(line)
+                chunks.extend(fragments)
+                continue
+
+            if chunks and cls._license_document_line_is_wrapped_base64_separator(line):
+                total_lines += 1
+                separator_lines += 1
+                if (
+                    total_lines > _BASE64_LICENSE_WRAP_MAX_LINES
+                    or separator_lines > _BASE64_LICENSE_WRAP_MAX_SEPARATOR_LINES
+                ):
+                    return True
                 continue
 
             if flush():
@@ -548,6 +580,7 @@ class SafeTensorsScanner(BaseScanner):
             chunks = []
             total_chars = 0
             total_lines = 0
+            separator_lines = 0
 
         return False
 
@@ -591,8 +624,10 @@ class SafeTensorsScanner(BaseScanner):
         segments, has_residual_encoding = cls._url_path_segments(path)
         if has_residual_encoding:
             return True
-        return any(segment in _SUSPICIOUS_LICENSE_URL_PATH_COMPONENTS for segment in segments) or any(
-            segment.endswith(suffix) for segment in segments for suffix in _SUSPICIOUS_LICENSE_URL_PATH_SUFFIXES
+        return (
+            any(segment in _SUSPICIOUS_LICENSE_URL_PATH_COMPONENTS for segment in segments)
+            or any(marker in segment for segment in segments for marker in _SUSPICIOUS_LICENSE_URL_MARKERS)
+            or any(segment.endswith(suffix) for segment in segments for suffix in _SUSPICIOUS_LICENSE_URL_PATH_SUFFIXES)
         )
 
     @classmethod
@@ -623,6 +658,10 @@ class SafeTensorsScanner(BaseScanner):
             return False
         if parsed.scheme.lower() not in {"http", "https"} or not hostname:
             return False
+        if parsed.username or parsed.password:
+            return False
+        if not parsed.netloc.isascii() or not parsed.path.isascii():
+            return False
         if parsed.query or parsed.fragment:
             return False
 
@@ -640,6 +679,18 @@ class SafeTensorsScanner(BaseScanner):
     def _license_document_urls_are_documentary(cls, value: str) -> bool:
         urls = _URL_METADATA_PATTERN.findall(value)
         return all(cls._url_looks_like_license_reference(url) for url in urls)
+
+    @classmethod
+    def _looks_like_ordinary_license_reference_value(cls, value: str) -> bool:
+        stripped = value.strip()
+        if not stripped or any(char.isspace() for char in stripped):
+            return False
+        urls = _URL_METADATA_PATTERN.findall(stripped)
+        if len(urls) != 1:
+            return False
+        return urls[0].rstrip(").,;:]}") == stripped.rstrip(").,;:]}") and cls._url_looks_like_license_reference(
+            urls[0]
+        )
 
     @classmethod
     def _metadata_value_has_active_risk(cls, value: str) -> bool:
@@ -679,11 +730,11 @@ class SafeTensorsScanner(BaseScanner):
             return False
         if key.strip().lower() not in _LICENSE_METADATA_KEYS:
             return False
+        if cls._metadata_value_has_active_risk(value):
+            return False
         return (
-            cls._looks_like_ordinary_license_document(value)
-            and cls._license_document_urls_are_documentary(value)
-            and not cls._metadata_value_has_active_risk(value)
-        )
+            cls._looks_like_ordinary_license_document(value) and cls._license_document_urls_are_documentary(value)
+        ) or cls._looks_like_ordinary_license_reference_value(value)
 
     @classmethod
     def _summarize_custom_metadata(cls, custom_metadata: Any) -> dict[str, Any]:
