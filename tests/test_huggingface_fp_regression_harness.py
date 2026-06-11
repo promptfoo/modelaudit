@@ -6,6 +6,7 @@ import json
 import os
 import struct
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -83,6 +84,22 @@ def _generate_malicious_control(path: Path, control: Mapping[str, Any]) -> Path:
 
 def _scanner_config(scanners: Sequence[str]) -> dict[str, Any]:
     return scanner_selection_config_from_inputs(scanners=tuple(scanners))
+
+
+@contextmanager
+def _mock_hf_model_info(
+    *,
+    return_value: Mapping[str, Any] | None = None,
+    side_effect: Exception | None = None,
+) -> Iterator[Any]:
+    patch_kwargs: dict[str, Any] = {"return_value": return_value}
+    if side_effect is not None:
+        patch_kwargs = {"side_effect": side_effect}
+    with (
+        patch("modelaudit.cli.get_model_info", **patch_kwargs) as mock_get_model_info,
+        patch("modelaudit.utils.sources.huggingface.get_model_info", **patch_kwargs),
+    ):
+        yield mock_get_model_info
 
 
 def _noisy_issue_messages(result: Any) -> list[str]:
@@ -251,7 +268,7 @@ def test_hf_repo_dry_run_preview_does_not_download_or_scan() -> None:
     }
 
     with (
-        patch("modelaudit.cli.get_model_info", return_value=metadata) as mock_get_model_info,
+        _mock_hf_model_info(return_value=metadata) as mock_get_model_info,
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
     ):
@@ -282,7 +299,7 @@ def test_hf_repo_dry_run_preview_enforces_max_size() -> None:
     }
 
     with (
-        patch("modelaudit.cli.get_model_info", return_value=metadata),
+        _mock_hf_model_info(return_value=metadata),
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
     ):
@@ -318,7 +335,7 @@ def test_hf_repo_dry_run_preview_rejects_unknown_selected_size_with_max_size() -
     }
 
     with (
-        patch("modelaudit.cli.get_model_info", return_value=metadata),
+        _mock_hf_model_info(return_value=metadata),
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
     ):
@@ -357,7 +374,7 @@ def test_hf_repo_dry_run_preview_uses_non_streaming_download_set_for_max_size() 
     }
 
     with (
-        patch("modelaudit.cli.get_model_info", return_value=metadata),
+        _mock_hf_model_info(return_value=metadata),
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
     ):
@@ -396,7 +413,7 @@ def test_hf_repo_dry_run_preview_keeps_scannable_size_scanner_selected() -> None
     }
 
     with (
-        patch("modelaudit.cli.get_model_info", return_value=metadata),
+        _mock_hf_model_info(return_value=metadata),
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
     ):
@@ -434,7 +451,7 @@ def test_hf_repo_dry_run_preview_rejects_empty_scanner_selection() -> None:
     }
 
     with (
-        patch("modelaudit.cli.get_model_info", return_value=metadata),
+        _mock_hf_model_info(return_value=metadata),
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
     ):
@@ -472,7 +489,7 @@ def test_hf_repo_dry_run_preview_uses_content_routed_download_selection() -> Non
         return "pytorch_zip" if filename == "renamed.payload" else None
 
     with (
-        patch("modelaudit.cli.get_model_info", return_value=metadata),
+        _mock_hf_model_info(return_value=metadata),
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
         patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", detect_format),
@@ -509,7 +526,7 @@ def test_hf_stream_dry_run_preview_enforces_unfiltered_file_limit() -> None:
     }
 
     with (
-        patch("modelaudit.cli.get_model_info", return_value=metadata),
+        _mock_hf_model_info(return_value=metadata),
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
     ):
@@ -566,8 +583,7 @@ def test_hf_dry_run_gated_error_redacts_credentials() -> None:
     url = "https://hf_user:hunter2@huggingface.co/meta-llama/Llama-3.1-8B-Instruct?token=secret-query"
     runner = CliRunner()
 
-    with patch("modelaudit.cli.get_model_info") as mock_get_model_info:
-        mock_get_model_info.side_effect = Exception(f"403 gated while opening {url}")
+    with _mock_hf_model_info(side_effect=Exception(f"403 gated while opening {url}")):
         result = runner.invoke(cli, ["scan", "--dry-run", url])
 
     assert result.exit_code == 2
