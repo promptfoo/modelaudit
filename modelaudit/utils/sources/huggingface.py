@@ -911,6 +911,7 @@ def _get_hf_content_route_formats() -> set[str]:
             "onnx",
             "openvino",
             "pmml",
+            "text",
             "tf_metagraph",
             "tf_savedmodel",
             "xgboost",

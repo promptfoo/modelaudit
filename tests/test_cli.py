@@ -4,6 +4,7 @@ import importlib
 import json
 import logging
 import os
+import pickle
 import re
 import stat
 import struct
@@ -43,6 +44,13 @@ from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.cli_output import parse_click_json_output
 from tests.helpers import create_mock_pytorch_zip
+
+
+class _CliDangerousPayload:
+    def __reduce__(self) -> tuple[Any, tuple[str]]:
+        import os as os_module
+
+        return (os_module.system, ("echo modelaudit-cli-pickle",))
 
 
 def test_local_txt_zip_prefilter_uses_bounded_zip_probe(
@@ -418,8 +426,6 @@ def test_scan_json_subprocess_scans_tensorflow_metagraph_named_python(tmp_path: 
 
 def test_scan_json_subprocess_mixed_directory_keeps_stdout_parseable(tmp_path: Path) -> None:
     """Directory scans should remain valid JSON when non-model files are skipped."""
-    import pickle
-
     skipped_file = tmp_path / "skip.py"
     skipped_file.write_text("print('hello')\n")
     model_file = tmp_path / "safe.pkl"
@@ -439,6 +445,110 @@ def test_scan_json_subprocess_mixed_directory_keeps_stdout_parseable(tmp_path: P
     output_payload = json.loads(completed.stdout)
     assert output_payload["files_scanned"] >= 1
     assert any(asset.get("path") == str(model_file) for asset in output_payload.get("assets", []))
+
+
+def _invoke_scan_json(path: Path) -> dict[str, Any]:
+    result = CliRunner().invoke(
+        cli,
+        ["scan", str(path), "--format", "json", "--no-cache"],
+        env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+        catch_exceptions=False,
+    )
+    payload = parse_click_json_output(result.output)
+    payload["_cli_exit_code"] = result.exit_code
+    return payload
+
+
+def _payload_rule_codes(payload: dict[str, Any]) -> set[str]:
+    return {
+        rule_code
+        for record in [*payload.get("issues", []), *payload.get("checks", [])]
+        if isinstance((rule_code := record.get("rule_code")), str)
+    }
+
+
+def test_scan_cli_routes_legal_license_text_without_pickle_failures(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_text(
+        "MIT License\nCopyright (c) Example\nPermission is hereby granted for documentation use.\n",
+        encoding="utf-8",
+    )
+
+    payload = _invoke_scan_json(path)
+
+    assert payload["_cli_exit_code"] == 0
+    assert payload["success"] is True
+    assert payload["files_scanned"] == 1
+    assert payload["scanner_names"] == ["text"]
+    assert not (_payload_rule_codes(payload) & {"S901", "S902"})
+
+
+def test_scan_cli_keeps_protocol0_webbrowser_license_on_pickle_route(tmp_path: Path) -> None:
+    path = tmp_path / "NOTICE"
+    path.write_bytes(b"cwebbrowser\nopen\n(S'https://example.invalid'\ntR.")
+
+    payload = _invoke_scan_json(path)
+
+    assert payload["_cli_exit_code"] == 1
+    assert "pickle" in payload["scanner_names"]
+    assert "text" not in payload["scanner_names"]
+    assert "S201" in _payload_rule_codes(payload)
+
+
+@pytest.mark.parametrize("protocol", [1, 2, 3, 4, 5])
+def test_scan_cli_keeps_binary_pickle_protocols_named_license_on_pickle_route(
+    tmp_path: Path,
+    protocol: int,
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(pickle.dumps(_CliDangerousPayload(), protocol=protocol))
+
+    payload = _invoke_scan_json(path)
+
+    assert payload["_cli_exit_code"] == 1
+    assert "pickle" in payload["scanner_names"]
+    assert "text" not in payload["scanner_names"]
+    assert "S201" in _payload_rule_codes(payload)
+
+
+def test_scan_cli_keeps_pickle_shaped_legal_prose_on_text_route(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_text(
+        "Apache License\n"
+        "Copyright 2026 Example.\n"
+        "The documentation may mention cwebbrowser\n"
+        "open\n"
+        "as prose without containing a complete pickle stream.\n",
+        encoding="utf-8",
+    )
+
+    payload = _invoke_scan_json(path)
+
+    assert payload["_cli_exit_code"] == 0
+    assert payload["scanner_names"] == ["text"]
+    assert not (_payload_rule_codes(payload) & {"S901", "S902"})
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [
+        ("LICENSE", b"MIT License\nCopyright \xe2\x82"),
+        ("NOTICE", b"NOTICE\nCopyright\x00"),
+        ("LICENSE.pkl", b"MIT License\nCopyright (c) Example\n"),
+    ],
+)
+def test_scan_cli_does_not_let_invalid_or_misleading_legal_names_route_as_text(
+    tmp_path: Path,
+    filename: str,
+    payload: bytes,
+) -> None:
+    path = tmp_path / filename
+    path.write_bytes(payload)
+
+    output = _invoke_scan_json(path)
+
+    assert output["scanner_names"] != ["text"]
+    assert "text" not in output["scanner_names"]
 
 
 def test_scan_sarif_subprocess_single_skipped_file_reports_cli_exit_code(tmp_path: Path) -> None:

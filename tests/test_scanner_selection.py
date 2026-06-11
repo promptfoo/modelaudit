@@ -12,9 +12,9 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
-from modelaudit.cache import reset_cache_manager
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cli import cli
-from modelaudit.core import scan_file, scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanner_registry_metadata import get_scanner_registry_metadata
 from modelaudit.scanner_selection import (
     allows_zip_content_analysis,
@@ -54,6 +54,15 @@ def _build_malicious_pickle() -> bytes:
             return (os.system, ("echo scanner-selection-test",))
 
     return pickle.dumps(DangerousPayload())
+
+
+def _long_embedded_protocol0_pickle_in_legal_text() -> bytes:
+    return (
+        b"MIT License\nCopyright (c) Example\nPermission is hereby granted.\n"
+        + b"cposix\nsystem\n(S'"
+        + (b"id #" + b"A" * 70000)
+        + b"'\ntR."
+    )
 
 
 def _build_malicious_skops_schema() -> bytes:
@@ -612,6 +621,42 @@ def test_scan_file_fails_closed_for_binary_pickle_embedded_in_license_text(tmp_p
     assert result.success is False
     assert result.metadata["operational_error_reason"] == "pickle_routing_incomplete"
     assert any(check.name == "Pickle Routing" for check in result.checks)
+
+
+def test_scan_file_fails_closed_for_long_embedded_protocol0_license_text_and_does_not_cache(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(_long_embedded_protocol0_pickle_in_legal_text())
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for result in (first, second):
+            assert result.success is False
+            assert determine_exit_code(result) == 2
+            assert result.scanner_names == []
+            assert any(check.name == "Pickle Routing" for check in result.checks)
+            assert result.file_metadata[str(path)]["scan_outcome"] == "inconclusive"
+
+        stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+        assert stats["cache_hits"] == 0
+        assert stats["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_cache_key_includes_scanner_selection_policy(tmp_path: Path) -> None:

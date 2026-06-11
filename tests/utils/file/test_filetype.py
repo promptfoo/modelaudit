@@ -52,6 +52,22 @@ from tests.helpers import (
 from tests.helpers.file_creators import _coreml_field_bytes, _coreml_field_varint, create_v7_tar_archive
 
 
+class _FiletypeDangerousPayload:
+    def __reduce__(self) -> tuple[Callable[..., Any], tuple[str]]:
+        import os as os_module
+
+        return (os_module.system, ("echo filetype-protocol-test",))
+
+
+def _long_embedded_protocol0_pickle_in_legal_text() -> bytes:
+    return (
+        b"MIT License\nCopyright (c) Example\nPermission is hereby granted.\n"
+        + b"cposix\nsystem\n(S'"
+        + (b"id #" + b"A" * 70000)
+        + b"'\ntR."
+    )
+
+
 def _ubjson_key(key: bytes) -> bytes:
     return b"U" + bytes([len(key)]) + key
 
@@ -2583,6 +2599,29 @@ def test_detect_file_format_does_not_treat_license_prose_as_encoded_payload_budg
     assert detect_file_format_for_skip_filter(str(path)) == "text"
 
 
+def test_detect_file_format_accepts_legal_text_at_exact_route_size_limit(tmp_path: Path) -> None:
+    path = tmp_path / "NOTICE"
+    prefix = b"NOTICE\nCopyright (c) Example\nPermission is hereby granted.\n"
+    path.write_bytes(prefix + (b"A" * (file_detection._LEGAL_TEXT_ROUTE_MAX_BYTES - len(prefix))))
+
+    assert detect_file_format(str(path)) == "text"
+    assert detect_file_format_from_magic(str(path)) == "text"
+    assert detect_file_format_for_skip_filter(str(path)) == "text"
+
+
+def test_detect_file_format_keeps_opcode_shaped_license_prose_on_text_route(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(
+        b"copyright\nnotice\n.\n"
+        b"MIT License\nPermission is hereby granted.\n"
+        b"The documentation may mention cwebbrowser\nopen\nas prose.\n"
+    )
+
+    assert detect_file_format(str(path)) == "text"
+    assert detect_file_format_from_magic(str(path)) == "text"
+    assert detect_file_format_for_skip_filter(str(path)) == "text"
+
+
 @pytest.mark.parametrize(
     ("filename", "payload"),
     [
@@ -2608,12 +2647,43 @@ def test_detect_file_format_keeps_malicious_legal_names_on_pickle_route(
     assert detect_file_format_from_magic(str(path)) == "pickle"
 
 
+@pytest.mark.parametrize("protocol", [0, 1, 2, 3, 4, 5])
+def test_detect_file_format_keeps_legal_named_pickle_protocols_on_pickle_route(
+    tmp_path: Path,
+    protocol: int,
+) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(pickle.dumps(_FiletypeDangerousPayload(), protocol=protocol))
+
+    assert detect_file_format(str(path)) == "pickle"
+    assert detect_file_format_from_magic(str(path)) == "pickle"
+    assert detect_file_format_for_skip_filter(str(path)) == "pickle"
+
+
 def test_detect_file_format_fails_closed_for_binary_pickle_embedded_in_legal_text(tmp_path: Path) -> None:
     payload = tmp_path / "LICENSE"
     payload.write_bytes(b"MIT License\nCopyright (c) Example\n" + b"\x80\x04cposix\nsystem\n(S'id'\ntR.")
 
     assert detect_file_format(str(payload)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     assert detect_file_format_from_magic(str(payload)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_fails_closed_for_long_embedded_protocol0_legal_name(tmp_path: Path) -> None:
+    payload = tmp_path / "LICENSE"
+    payload.write_bytes(_long_embedded_protocol0_pickle_in_legal_text())
+
+    assert detect_file_format(str(payload)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(payload)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(payload)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_fails_closed_for_truncated_embedded_protocol0_legal_name(tmp_path: Path) -> None:
+    payload = tmp_path / "NOTICE"
+    payload.write_bytes(b"NOTICE\nCopyright (c) Example\ncwebbrowser\nopen\n(S'https://example.invalid'\ntR")
+
+    assert detect_file_format(str(payload)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(payload)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(payload)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
 
 
 def test_detect_file_format_does_not_text_route_malformed_or_misleading_legal_names(tmp_path: Path) -> None:

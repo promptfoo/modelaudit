@@ -2574,6 +2574,98 @@ class TestModelDownloadStreaming:
         )
         assert all("safetensors" not in str(call_args) for call_args in mock_hf_hub_download.mock_calls)
 
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["LICENSE", "weights.bin"], _PHI4_LICENSE_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_sniffs_phi4_license_as_text_without_exact_filename_selection(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Content sniffing should retain legal text sidecars when only the text scanner is selected."""
+        license_path = tmp_path / "LICENSE"
+        license_payload = _PHI4_LICENSE_TEXT.encode("utf-8")
+        license_path.write_bytes(license_payload)
+        mock_hf_hub_download.return_value = str(license_path)
+
+        def get_side_effect(url: str, **_kwargs: object) -> _FakeRangeResponse:
+            if url.endswith("/LICENSE"):
+                return _FakeRangeResponse(license_payload)
+            return _FakeRangeResponse(b"not model content\n")
+
+        mock_requests_get.side_effect = get_side_effect
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/microsoft/phi-4",
+                scannable_extensions={".txt"},
+                scannable_filenames=set(),
+                scannable_scanner_ids={"text"},
+            )
+        )
+
+        assert results == [(license_path, True)]
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="microsoft/phi-4",
+            filename="LICENSE",
+            revision=_PHI4_LICENSE_REVISION,
+        )
+        assert mock_requests_get.call_count == 2
+        assert all(
+            call_args.kwargs["headers"]["Range"] == "bytes=0-8191" for call_args in mock_requests_get.call_args_list
+        )
+        assert all(
+            call_args.kwargs["headers"]["Accept-Encoding"] == "identity"
+            for call_args in mock_requests_get.call_args_list
+        )
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["LICENSE", "weights.bin"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_sniffs_malicious_license_as_pickle_candidate(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Remote legal-name sniffing must not drop executable pickle evidence."""
+        license_path = tmp_path / "LICENSE"
+        payload = b"cwebbrowser\nopen\n(S'https://example.invalid'\ntR."
+        license_path.write_bytes(payload)
+        mock_hf_hub_download.return_value = str(license_path)
+
+        def get_side_effect(url: str, **_kwargs: object) -> _FakeRangeResponse:
+            if url.endswith("/LICENSE"):
+                return _FakeRangeResponse(payload)
+            return _FakeRangeResponse(b"not a pickle\n")
+
+        mock_requests_get.side_effect = get_side_effect
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                scannable_extensions={".pkl"},
+                scannable_filenames=set(),
+                scannable_scanner_ids={"pickle"},
+            )
+        )
+
+        assert results == [(license_path, True)]
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="LICENSE",
+            revision=_HF_TEST_REVISION,
+        )
+
     @patch("huggingface_hub.hf_hub_download")
     def test_download_model_streaming_selected_filename_ignores_unrelated_extensionless_files(
         self,

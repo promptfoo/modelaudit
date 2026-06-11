@@ -10888,6 +10888,24 @@ class TestZipScanner:
             for check in result.checks
         )
 
+    def test_scan_zip_fails_closed_for_long_embedded_protocol0_license_member(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "long_embedded_license_member.zip"
+        payload = (
+            b"MIT License\nCopyright (c) Example\nPermission is hereby granted.\n"
+            + b"cposix\nsystem\n(S'"
+            + (b"id #" + b"A" * 70000)
+            + b"'\ntR."
+        )
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("LICENSE", payload)
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert any(
+            check.name == "Pickle Routing" and check.details.get("zip_entry") == "LICENSE" for check in result.checks
+        )
+
     def test_scan_npz_with_object_member_recurses_into_pickle(self, tmp_path: Path) -> None:
         import numpy as np
 

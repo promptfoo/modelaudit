@@ -336,6 +336,25 @@ _LEGAL_TEXT_ENCODED_EXECUTION_PATTERNS = (
 )
 _LEGAL_TEXT_PROTO0_GLOBAL_RE = re.compile(rb"(?=#?[ci][A-Za-z_][A-Za-z0-9_.]{0,127}\n[A-Za-z_][A-Za-z0-9_.]{0,127}\n)")
 _LEGAL_TEXT_MAX_EMBEDDED_PICKLE_CANDIDATES = 4096
+_LEGAL_TEXT_PROTO0_PICKLE_CONTINUATION_START_BYTES = frozenset(
+    {
+        ord("("),  # MARK: common start for callable argument tuples.
+        ord("S"),  # STRING
+        ord("V"),  # UNICODE
+        ord("I"),  # INT / BOOL
+        ord("F"),  # FLOAT
+        ord("N"),  # NONE
+        ord("L"),  # LONG
+        ord("J"),  # BININT
+        ord("K"),  # BININT1
+        ord("M"),  # BININT2
+        ord("T"),  # BINSTRING
+        ord("U"),  # SHORT_BINSTRING
+        ord("X"),  # BINUNICODE
+        ord("R"),  # REDUCE
+        ord("o"),  # OBJ
+    }
+)
 
 
 def _is_supported_llamafile_executable_header(header: bytes) -> bool:
@@ -3208,15 +3227,62 @@ def _is_plain_alphabetic_base64_word(token: bytes) -> bool:
     return b"=" not in token and token.isalpha()
 
 
-def _validated_pickle_prefix_opcode_names(candidate: bytes) -> frozenset[str] | None:
+def _pickletools_global_argument(argument: object) -> tuple[str, str] | None:
+    if not isinstance(argument, str):
+        return None
+    module, separator, name = argument.partition(" ")
+    if not separator or not module or not name:
+        return None
+    return module, name
+
+
+def _is_suspicious_pickle_global(module: str, name: str) -> bool:
+    try:
+        from modelaudit.scanners.pickle_scanner import is_suspicious_global
+
+        return is_suspicious_global(module, name)
+    except Exception:
+        return True
+
+
+def _initial_proto0_global_argument(candidate: bytes) -> tuple[str, str] | None:
+    if not candidate or candidate[:1] not in {b"c", b"i"}:
+        return None
+    lines = candidate[1:].split(b"\n", 2)
+    if len(lines) < 2 or not lines[0] or not lines[1]:
+        return None
+    encoding = "ascii" if candidate[:1] == b"i" else "utf-8"
+    try:
+        return lines[0].decode(encoding), lines[1].decode(encoding)
+    except UnicodeDecodeError:
+        return None
+
+
+def _proto0_global_continuation_looks_pickled(candidate: bytes) -> bool:
+    lines = candidate[1:].split(b"\n", 2)
+    if len(lines) < 3:
+        return True
+    continuation = lines[2].lstrip(b" \t\r\n")
+    if not continuation:
+        return True
+    return continuation[0] in _LEGAL_TEXT_PROTO0_PICKLE_CONTINUATION_START_BYTES
+
+
+def _validated_pickle_prefix_details(candidate: bytes) -> tuple[frozenset[str], tuple[tuple[str, str], ...]] | None:
     opcode_names: set[str] = set()
+    global_arguments: list[tuple[str, str]] = []
     try:
         for opcode_count, (opcode, _arg, position) in enumerate(pickletools.genops(candidate), start=1):
             opcode_names.add(opcode.name)
+            if (
+                opcode.name in {"GLOBAL", "INST"}
+                and (global_argument := _pickletools_global_argument(_arg)) is not None
+            ):
+                global_arguments.append(global_argument)
             if opcode.name == "STOP":
                 stop_position = 0 if position is None else position
                 pickletools.dis(candidate[: stop_position + 1], out=StringIO())
-                return frozenset(opcode_names)
+                return frozenset(opcode_names), tuple(global_arguments)
             if opcode_count >= PROTO0_1_MAX_PROBE_OPCODES:
                 return None
     except (UnicodeError, ValueError):
@@ -3228,12 +3294,45 @@ def _validated_pickle_prefix_opcode_names(candidate: bytes) -> frozenset[str] | 
     return None
 
 
+def _validated_pickle_prefix_opcode_names(candidate: bytes) -> frozenset[str] | None:
+    details = _validated_pickle_prefix_details(candidate)
+    return None if details is None else details[0]
+
+
+def _legal_text_pickle_prefix_route(
+    candidate: bytes,
+    *,
+    embedded: bool,
+) -> str | None:
+    details = _validated_pickle_prefix_details(candidate)
+    if details is None:
+        global_argument = _initial_proto0_global_argument(candidate)
+        if (
+            global_argument is None
+            or not _is_suspicious_pickle_global(*global_argument)
+            or not _proto0_global_continuation_looks_pickled(candidate)
+        ):
+            return None
+        route = _classify_pickle_security_payload(candidate)
+        if route is None:
+            return None
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT if embedded else route
+
+    opcodes, global_arguments = details
+    has_suspicious_global = any(_is_suspicious_pickle_global(module, name) for module, name in global_arguments)
+    has_invocation = bool(opcodes & _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES.difference({"GLOBAL"}))
+    has_non_global_nontrivial_opcode = any(
+        opcode != "STOP" and opcode != "GLOBAL" and opcode not in PROTO0_1_TRIVIAL_LEADING_OPCODES for opcode in opcodes
+    )
+    if has_invocation or has_suspicious_global or has_non_global_nontrivial_opcode:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT if embedded else "pickle"
+    return None
+
+
 def _structural_legal_text_pickle_route(payload: bytes) -> str | None:
-    initial_opcodes = _validated_pickle_prefix_opcode_names(payload[:PROTO0_1_MAX_PROBE_BYTES])
-    if initial_opcodes is not None and any(
-        opcode != "STOP" and opcode not in PROTO0_1_TRIVIAL_LEADING_OPCODES for opcode in initial_opcodes
-    ):
-        return "pickle"
+    initial_route = _legal_text_pickle_prefix_route(payload[:PROTO0_1_MAX_PROBE_BYTES], embedded=False)
+    if initial_route is not None:
+        return initial_route
 
     for candidate_count, match in enumerate(_LEGAL_TEXT_PROTO0_GLOBAL_RE.finditer(payload), start=1):
         if candidate_count > _LEGAL_TEXT_MAX_EMBEDDED_PICKLE_CANDIDATES:
@@ -3241,14 +3340,9 @@ def _structural_legal_text_pickle_route(payload: bytes) -> str | None:
         offset = match.start()
         parse_offset = offset + 1 if payload[offset : offset + 1] == b"#" else offset
         candidate = payload[parse_offset : parse_offset + PROTO0_1_MAX_PROBE_BYTES]
-        opcodes = _validated_pickle_prefix_opcode_names(candidate)
-        if opcodes is None:
-            continue
-        if "GLOBAL" not in opcodes and "INST" not in opcodes:
-            continue
-        has_invocation = bool(opcodes & _BINARY_PICKLE_PRE_STOP_SECURITY_OPCODES.difference({"GLOBAL"}))
-        if has_invocation or parse_offset == 0:
-            return "pickle" if offset == 0 else PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        route = _legal_text_pickle_prefix_route(candidate, embedded=offset != 0)
+        if route is not None:
+            return route
     return None
 
 

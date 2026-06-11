@@ -655,6 +655,75 @@ class TestTarScanner:
         assert python_checks[0].status == CheckStatus.FAILED
         assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
+    def test_scan_tar_routes_legal_text_member_to_text_scanner(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "legal_text_member.tar"
+        payload = b"MIT License\n\nCopyright (c) 2026 Example\nPermission is hereby granted.\n"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("LICENSE")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert any(
+            check.name == "File Type Identification"
+            and check.details.get("file_type") == "license"
+            and check.details.get("tar_entry") == "LICENSE"
+            for check in result.checks
+        )
+        assert not any(issue.rule_code in {"S901", "S902"} for issue in result.issues)
+
+    def test_scan_tar_keeps_webbrowser_pickle_named_notice_on_pickle_route(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "webbrowser_notice_member.tar"
+        payload = b"cwebbrowser\nopen\n(S'http://example.com'\ntR."
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("NOTICE")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert any(issue.rule_code == "S201" and issue.details.get("tar_entry") == "NOTICE" for issue in result.issues)
+
+    def test_scan_tar_does_not_text_route_invalid_legal_member(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "invalid_legal_member.tar"
+        payload = b"MIT License\nCopyright\x00"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("LICENSE")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert not any(
+            check.name == "File Type Identification"
+            and check.details.get("file_type") == "license"
+            and check.details.get("tar_entry") == "LICENSE"
+            for check in result.checks
+        )
+
+    def test_scan_tar_fails_closed_for_long_embedded_protocol0_license_member(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "long_embedded_license_member.tar"
+        payload = (
+            b"MIT License\nCopyright (c) Example\nPermission is hereby granted.\n"
+            + b"cposix\nsystem\n(S'"
+            + (b"id #" + b"A" * 70000)
+            + b"'\ntR."
+        )
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("LICENSE")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert any(
+            check.name == "Pickle Routing" and check.details.get("tar_entry") == "LICENSE" for check in result.checks
+        )
+
     def test_scan_tar_empty_loop_target_does_not_hide_later_dangerous_call(self, tmp_path: Path) -> None:
         """Loop targets should not unconditionally shadow imports after a maybe-empty loop."""
         archive_path = tmp_path / "model_bundle.tar"
