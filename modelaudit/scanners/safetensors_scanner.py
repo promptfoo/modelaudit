@@ -506,6 +506,8 @@ class SafeTensorsScanner(BaseScanner):
             return False
         if parsed.scheme.lower() not in {"http", "https"} or not hostname:
             return False
+        if parsed.query or parsed.fragment:
+            return False
 
         lowered_url = cleaned_url.lower()
         if any(marker in lowered_url for marker in _SUSPICIOUS_LICENSE_URL_MARKERS):

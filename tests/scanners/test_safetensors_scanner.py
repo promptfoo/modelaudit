@@ -411,6 +411,7 @@ def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -
         "https://evil.example/payload",
         "https://evil.example/license",
         "https://github.com/Lightricks/LTX-Video/releases/download/v1/license.txt",
+        "https://opensource.org/licenses/MIT?u=https://evil.example/x",
         "https://[",
     ],
 )
