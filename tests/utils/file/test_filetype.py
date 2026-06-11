@@ -1685,6 +1685,46 @@ def test_hf_tokenizer_json_completed_value_at_probe_boundary_checks_suffix_route
     assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
 
 
+def test_hf_tokenizer_json_root_template_between_probe_and_suffix_routes_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}","tail":"' + ("y" * 256) + '"',
+        padding_size=256,
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+
+
+def test_hf_tokenizer_json_key_text_inside_padding_string_does_not_route_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"tail":"' + ("y" * 256) + '"',
+        padding_size=0,
+        model_fields=(
+            '"type":"BPE","vocab":{"hello":0},"merges":[],'
+            '"metadata":"padding,\\"chat_template\\":\\"not a structural key\\"' + ("x" * 256) + '"'
+        ),
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is False
+
+
 def test_hf_tokenizer_json_model_vocab_over_structure_budget_is_not_claimed_across_gap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
