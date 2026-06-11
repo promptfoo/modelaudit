@@ -106,6 +106,9 @@ _ONNX_STRUCTURE_MAX_NODE_ATTRIBUTES = 4096
 _ONNX_STRUCTURE_MAX_EXTERNAL_DATA_ENTRIES = 1024
 _ONNX_STRUCTURE_MAX_STRING_DATA_FIELDS = 100_000
 _ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES = 100_000
+_ONNX_STRUCTURE_MAX_FIELD_NUMBER = (1 << 29) - 1
+_ONNX_STRUCTURE_MAX_RETAINED_OBJECTS = 1_000_000
+_ONNX_STRUCTURE_MAX_RETAINED_STRING_BYTES = 64 * 1024 * 1024
 _STANDARD_NEURAL_NETWORK_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
 _SAME_TYPE_ELEMENTWISE_OPERATORS: frozenset[str] = frozenset(
     {
@@ -2666,12 +2669,13 @@ class _OnnxLiteFunction:
     name: str = ""
     domain: str = ""
     overload: str = ""
+    input: list[str] = field(default_factory=list)
+    output: list[str] = field(default_factory=list)
+    attribute: list[str] = field(default_factory=list)
     opset_import: list[_OnnxLiteOpsetImport] = field(default_factory=list)
     attribute_proto: list[_OnnxLiteAttribute] = field(default_factory=list)
     initializer: list[_OnnxLiteTensor] = field(default_factory=list)
     sparse_initializer: list[_OnnxLiteSparseTensor] = field(default_factory=list)
-    input: list[_OnnxLiteValueInfo] = field(default_factory=list)
-    output: list[_OnnxLiteValueInfo] = field(default_factory=list)
     value_info: list[_OnnxLiteValueInfo] = field(default_factory=list)
 
 
@@ -2679,6 +2683,8 @@ class _OnnxLiteFunction:
 class _OnnxLiteTrainingInfo:
     initialization: _OnnxLiteGraph = field(default_factory=_OnnxLiteGraph)
     algorithm: _OnnxLiteGraph = field(default_factory=_OnnxLiteGraph)
+    initialization_binding: list[_OnnxLiteStringEntry] = field(default_factory=list)
+    update_binding: list[_OnnxLiteStringEntry] = field(default_factory=list)
 
 
 @dataclass
@@ -2702,16 +2708,47 @@ class _OnnxLiteModel:
 
 @dataclass
 class _OnnxStructureParseState:
+    interrupt_check: Callable[[], None] | None = field(default=None, repr=False, compare=False)
     omitted_raw_data_fields: int = 0
     omitted_raw_data_bytes: int = 0
     node_count: int = 0
     tensor_count: int = 0
     graph_count: int = 0
+    retained_object_count: int = 0
+    retained_string_bytes: int = 0
     string_fields_skipped: int = 0
+    fields_seen: int = 0
     coverage_gaps: dict[str, int] = field(default_factory=dict)
+
+    def check_interrupted(self) -> None:
+        self.fields_seen += 1
+        if self.interrupt_check is not None:
+            self.interrupt_check()
 
     def record_gap(self, reason: str, count: int = 1) -> None:
         self.coverage_gaps[reason] = self.coverage_gaps.get(reason, 0) + count
+
+    def record_retained_object(self, reason: str = "retained_object_limit_exceeded") -> None:
+        if self.retained_object_count >= _ONNX_STRUCTURE_MAX_RETAINED_OBJECTS:
+            self.record_gap(reason)
+            raise _OnnxStructureParseError(
+                reason,
+                f"ONNX structural parser retained object count exceeds limit ({_ONNX_STRUCTURE_MAX_RETAINED_OBJECTS})",
+            )
+        self.retained_object_count += 1
+
+    def record_retained_string(self, length: int, field_name: str) -> None:
+        if length < 0 or length > _ONNX_STRUCTURE_MAX_RETAINED_STRING_BYTES - self.retained_string_bytes:
+            reason = "retained_string_bytes_limit_exceeded"
+            self.record_gap(reason)
+            raise _OnnxStructureParseError(
+                reason,
+                (
+                    "ONNX structural parser retained string bytes exceed aggregate limit "
+                    f"({_ONNX_STRUCTURE_MAX_RETAINED_STRING_BYTES}) at {field_name}"
+                ),
+            )
+        self.retained_string_bytes += length
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -2721,7 +2758,10 @@ class _OnnxStructureParseState:
             "node_count": self.node_count,
             "tensor_count": self.tensor_count,
             "graph_count": self.graph_count,
+            "retained_object_count": self.retained_object_count,
+            "retained_string_bytes": self.retained_string_bytes,
             "string_fields_skipped": self.string_fields_skipped,
+            "fields_seen": self.fields_seen,
             "coverage_gaps": dict(self.coverage_gaps),
         }
 
@@ -2759,11 +2799,17 @@ def _read_onnx_varint(handle: BinaryIO, end: int) -> int:
     raise _OnnxStructureParseError("varint_too_long", "ONNX protobuf varint exceeds 10 bytes")
 
 
-def _read_onnx_key(handle: BinaryIO, end: int) -> tuple[int, int]:
+def _read_onnx_key(handle: BinaryIO, end: int, state: _OnnxStructureParseState) -> tuple[int, int]:
+    state.check_interrupted()
     key = _read_onnx_varint(handle, end)
     field_number = key >> 3
     if field_number == 0:
         raise _OnnxStructureParseError("invalid_field_number_zero", "ONNX protobuf field number 0 is invalid")
+    if field_number > _ONNX_STRUCTURE_MAX_FIELD_NUMBER:
+        raise _OnnxStructureParseError(
+            "field_number_out_of_range",
+            f"ONNX protobuf field number exceeds maximum ({_ONNX_STRUCTURE_MAX_FIELD_NUMBER})",
+        )
     return field_number, key & 0x07
 
 
@@ -2821,6 +2867,7 @@ def _read_onnx_string(
         handle.seek(payload_end)
         return ""
     raw = _read_onnx_exact(handle, length, payload_end)
+    state.record_retained_string(length, field_name)
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -2836,10 +2883,49 @@ def _append_onnx_sequence_value(
     reason: str,
     limit: int = _ONNX_STRUCTURE_MAX_SEQUENCE_VALUES,
 ) -> None:
+    _ensure_onnx_sequence_capacity(values, state, reason=reason, limit=limit)
+    values.append(value)
+
+
+def _ensure_onnx_sequence_capacity(
+    values: list[Any],
+    state: _OnnxStructureParseState,
+    *,
+    reason: str,
+    limit: int = _ONNX_STRUCTURE_MAX_SEQUENCE_VALUES,
+) -> None:
     if len(values) >= limit:
         state.record_gap(reason)
         raise _OnnxStructureParseError(reason, f"ONNX protobuf repeated field exceeds limit ({limit})")
-    values.append(value)
+
+
+def _append_onnx_string_value(
+    values: list[str],
+    handle: BinaryIO,
+    end: int,
+    state: _OnnxStructureParseState,
+    *,
+    field_name: str,
+    reason: str,
+    limit: int = _ONNX_STRUCTURE_MAX_SEQUENCE_VALUES,
+) -> None:
+    _ensure_onnx_sequence_capacity(values, state, reason=reason, limit=limit)
+    values.append(_read_onnx_string(handle, end, state, field_name=field_name))
+
+
+def _append_onnx_submessage_value(
+    values: list[Any],
+    handle: BinaryIO,
+    end: int,
+    state: _OnnxStructureParseState,
+    depth: int,
+    parser: Callable[[BinaryIO, int, _OnnxStructureParseState, int], Any],
+    *,
+    reason: str,
+    limit: int = _ONNX_STRUCTURE_MAX_SEQUENCE_VALUES,
+) -> None:
+    _ensure_onnx_sequence_capacity(values, state, reason=reason, limit=limit)
+    values.append(_read_onnx_submessage(handle, end, state, depth, parser))
 
 
 def _append_onnx_dimension(values: list[int], value: int, state: _OnnxStructureParseState) -> None:
@@ -2882,6 +2968,7 @@ def _read_onnx_packed_varints(
     limit: int = _ONNX_STRUCTURE_MAX_SEQUENCE_VALUES,
 ) -> None:
     while handle.tell() < payload_end:
+        state.check_interrupted()
         raw_value = _read_onnx_varint(handle, payload_end)
         value = _decode_int64_varint(raw_value) if signed else raw_value
         _append_onnx_sequence_value(values, value, state, reason=reason, limit=limit)
@@ -2908,9 +2995,10 @@ def _parse_onnx_string_entry(
     depth: int,
 ) -> _OnnxLiteStringEntry:
     _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
     entry = _OnnxLiteStringEntry()
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end)
+        field_number, wire_type = _read_onnx_key(handle, end, state)
         if field_number == 1 and wire_type == 2:
             entry.key = _read_onnx_string(handle, end, state, field_name="external_data_key")
         elif field_number == 2 and wire_type == 2:
@@ -2927,6 +3015,7 @@ def _parse_onnx_tensor(
     depth: int,
 ) -> _OnnxLiteTensor:
     _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
     state.tensor_count += 1
     if state.tensor_count > _ONNX_STRUCTURE_MAX_TENSORS:
         raise _OnnxStructureParseError(
@@ -2944,13 +3033,14 @@ def _parse_onnx_tensor(
     string_data_count = 0
     string_data_bytes = 0
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end)
+        field_number, wire_type = _read_onnx_key(handle, end, state)
         if field_number == 1:
             if wire_type == 0:
                 _append_onnx_dimension(tensor.dims, _decode_int64_varint(_read_onnx_varint(handle, end)), state)
             elif wire_type == 2:
                 _length, payload_end = _read_onnx_length_bounds(handle, end)
                 while handle.tell() < payload_end:
+                    state.check_interrupted()
                     _append_onnx_dimension(
                         tensor.dims,
                         _decode_int64_varint(_read_onnx_varint(handle, payload_end)),
@@ -2993,6 +3083,7 @@ def _parse_onnx_tensor(
             elif wire_type == 2:
                 _length, payload_end = _read_onnx_length_bounds(handle, end)
                 while handle.tell() < payload_end:
+                    state.check_interrupted()
                     _read_onnx_varint(handle, payload_end)
                     counts[key_name] = _increment_onnx_count(
                         counts[key_name],
@@ -3048,10 +3139,13 @@ def _parse_onnx_tensor(
             else:
                 _skip_onnx_unknown_field(handle, wire_type, end)
         elif field_number == 13 and wire_type == 2:
-            _append_onnx_sequence_value(
+            _append_onnx_submessage_value(
                 tensor.external_data,
-                _read_onnx_submessage(handle, end, state, depth, _parse_onnx_string_entry),
+                handle,
+                end,
                 state,
+                depth,
+                _parse_onnx_string_entry,
                 reason="external_data_entry_limit_exceeded",
                 limit=_ONNX_STRUCTURE_MAX_EXTERNAL_DATA_ENTRIES,
             )
@@ -3075,11 +3169,12 @@ def _parse_onnx_sparse_tensor(
     depth: int,
 ) -> _OnnxLiteSparseTensor:
     _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
     sparse = _OnnxLiteSparseTensor()
     seen_values = False
     seen_indices = False
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end)
+        field_number, wire_type = _read_onnx_key(handle, end, state)
         if field_number == 1 and wire_type == 2:
             if seen_values:
                 _raise_duplicate_onnx_singular_message("SparseTensorProto.values")
@@ -3096,6 +3191,7 @@ def _parse_onnx_sparse_tensor(
             elif wire_type == 2:
                 _length, payload_end = _read_onnx_length_bounds(handle, end)
                 while handle.tell() < payload_end:
+                    state.check_interrupted()
                     _append_onnx_dimension(
                         sparse.dims,
                         _decode_int64_varint(_read_onnx_varint(handle, payload_end)),
@@ -3116,9 +3212,10 @@ def _parse_onnx_attribute(
     depth: int,
 ) -> _OnnxLiteAttribute:
     _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
     attribute = _OnnxLiteAttribute()
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end)
+        field_number, wire_type = _read_onnx_key(handle, end, state)
         if field_number == 1 and wire_type == 2:
             attribute.name = _read_onnx_string(handle, end, state, field_name="attribute_name")
         elif field_number == 21 and wire_type == 2:
@@ -3155,18 +3252,24 @@ def _parse_onnx_attribute(
             else:
                 _skip_onnx_unknown_field(handle, wire_type, end)
         elif field_number == 10 and wire_type == 2:
-            _append_onnx_sequence_value(
+            _append_onnx_submessage_value(
                 attribute.tensors,
-                _read_onnx_submessage(handle, end, state, depth, _parse_onnx_tensor),
+                handle,
+                end,
                 state,
+                depth,
+                _parse_onnx_tensor,
                 reason="attribute_tensors_limit_exceeded",
                 limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
             )
         elif field_number == 11 and wire_type == 2:
-            _append_onnx_sequence_value(
+            _append_onnx_submessage_value(
                 attribute.graphs,
-                _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph),
+                handle,
+                end,
                 state,
+                depth,
+                _parse_onnx_graph,
                 reason="attribute_graphs_limit_exceeded",
                 limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
             )
@@ -3175,10 +3278,13 @@ def _parse_onnx_attribute(
                 _raise_duplicate_onnx_singular_message("AttributeProto.sparse_tensor")
             attribute.sparse_tensor = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_sparse_tensor)
         elif field_number == 23 and wire_type == 2:
-            _append_onnx_sequence_value(
+            _append_onnx_submessage_value(
                 attribute.sparse_tensors,
-                _read_onnx_submessage(handle, end, state, depth, _parse_onnx_sparse_tensor),
+                handle,
+                end,
                 state,
+                depth,
+                _parse_onnx_sparse_tensor,
                 reason="attribute_sparse_tensors_limit_exceeded",
                 limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
             )
@@ -3194,6 +3300,7 @@ def _parse_onnx_node(
     depth: int,
 ) -> _OnnxLiteNode:
     _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
     state.node_count += 1
     if state.node_count > _ONNX_STRUCTURE_MAX_NODES:
         raise _OnnxStructureParseError(
@@ -3202,19 +3309,23 @@ def _parse_onnx_node(
         )
     node = _OnnxLiteNode()
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end)
+        field_number, wire_type = _read_onnx_key(handle, end, state)
         if field_number == 1 and wire_type == 2:
-            _append_onnx_sequence_value(
+            _append_onnx_string_value(
                 node.input,
-                _read_onnx_string(handle, end, state, field_name="node_input"),
+                handle,
+                end,
                 state,
+                field_name="node_input",
                 reason="node_input_limit_exceeded",
             )
         elif field_number == 2 and wire_type == 2:
-            _append_onnx_sequence_value(
+            _append_onnx_string_value(
                 node.output,
-                _read_onnx_string(handle, end, state, field_name="node_output"),
+                handle,
+                end,
                 state,
+                field_name="node_output",
                 reason="node_output_limit_exceeded",
             )
         elif field_number == 3 and wire_type == 2:
@@ -3222,10 +3333,13 @@ def _parse_onnx_node(
         elif field_number == 4 and wire_type == 2:
             node.op_type = _read_onnx_string(handle, end, state, field_name="node_op_type")
         elif field_number == 5 and wire_type == 2:
-            _append_onnx_sequence_value(
+            _append_onnx_submessage_value(
                 node.attribute,
-                _read_onnx_submessage(handle, end, state, depth, _parse_onnx_attribute),
+                handle,
+                end,
                 state,
+                depth,
+                _parse_onnx_attribute,
                 reason="node_attribute_limit_exceeded",
                 limit=_ONNX_STRUCTURE_MAX_NODE_ATTRIBUTES,
             )
@@ -3245,9 +3359,10 @@ def _parse_onnx_value_info(
     depth: int,
 ) -> _OnnxLiteValueInfo:
     _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
     value_info = _OnnxLiteValueInfo()
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end)
+        field_number, wire_type = _read_onnx_key(handle, end, state)
         if field_number == 1 and wire_type == 2:
             value_info.name = _read_onnx_string(handle, end, state, field_name="value_info_name")
         else:
@@ -3262,6 +3377,7 @@ def _parse_onnx_graph(
     depth: int,
 ) -> _OnnxLiteGraph:
     _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
     state.graph_count += 1
     if state.graph_count > _ONNX_STRUCTURE_MAX_GRAPHS:
         raise _OnnxStructureParseError(
@@ -3270,54 +3386,72 @@ def _parse_onnx_graph(
         )
     graph = _OnnxLiteGraph()
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end)
+        field_number, wire_type = _read_onnx_key(handle, end, state)
         if field_number == 1 and wire_type == 2:
-            _append_onnx_sequence_value(
+            _append_onnx_submessage_value(
                 graph.node,
-                _read_onnx_submessage(handle, end, state, depth, _parse_onnx_node),
+                handle,
+                end,
                 state,
+                depth,
+                _parse_onnx_node,
                 reason="graph_node_limit_exceeded",
                 limit=_ONNX_STRUCTURE_MAX_NODES,
             )
         elif field_number == 2 and wire_type == 2:
             graph.name = _read_onnx_string(handle, end, state, field_name="graph_name")
         elif field_number == 5 and wire_type == 2:
-            _append_onnx_sequence_value(
+            _append_onnx_submessage_value(
                 graph.initializer,
-                _read_onnx_submessage(handle, end, state, depth, _parse_onnx_tensor),
+                handle,
+                end,
                 state,
+                depth,
+                _parse_onnx_tensor,
                 reason="graph_initializer_limit_exceeded",
                 limit=_ONNX_STRUCTURE_MAX_TENSORS,
             )
         elif field_number == 15 and wire_type == 2:
-            _append_onnx_sequence_value(
+            _append_onnx_submessage_value(
                 graph.sparse_initializer,
-                _read_onnx_submessage(handle, end, state, depth, _parse_onnx_sparse_tensor),
+                handle,
+                end,
                 state,
+                depth,
+                _parse_onnx_sparse_tensor,
                 reason="graph_sparse_initializer_limit_exceeded",
                 limit=_ONNX_STRUCTURE_MAX_TENSORS,
             )
         elif field_number == 11 and wire_type == 2:
-            _append_onnx_sequence_value(
+            _append_onnx_submessage_value(
                 graph.input,
-                _read_onnx_submessage(handle, end, state, depth, _parse_onnx_value_info),
+                handle,
+                end,
                 state,
+                depth,
+                _parse_onnx_value_info,
                 reason="graph_input_limit_exceeded",
                 limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
             )
         elif field_number == 12 and wire_type == 2:
-            _append_onnx_sequence_value(
+            _append_onnx_submessage_value(
                 graph.output,
-                _read_onnx_submessage(handle, end, state, depth, _parse_onnx_value_info),
+                handle,
+                end,
                 state,
+                depth,
+                _parse_onnx_value_info,
                 reason="graph_output_limit_exceeded",
                 limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
             )
         elif field_number == 13 and wire_type == 2:
-            _append_onnx_sequence_value(
+            _append_onnx_submessage_value(
                 graph.value_info,
-                _read_onnx_submessage(handle, end, state, depth, _parse_onnx_value_info),
+                handle,
+                end,
                 state,
+                depth,
+                _parse_onnx_value_info,
                 reason="graph_value_info_limit_exceeded",
                 limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
             )
@@ -3333,9 +3467,10 @@ def _parse_onnx_opset_import(
     depth: int,
 ) -> _OnnxLiteOpsetImport:
     _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
     opset = _OnnxLiteOpsetImport()
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end)
+        field_number, wire_type = _read_onnx_key(handle, end, state)
         if field_number == 1 and wire_type == 2:
             opset.domain = _read_onnx_string(handle, end, state, field_name="opset_domain")
         elif field_number == 2 and wire_type == 0:
@@ -3352,36 +3487,84 @@ def _parse_onnx_function(
     depth: int,
 ) -> _OnnxLiteFunction:
     _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
     function = _OnnxLiteFunction()
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end)
+        field_number, wire_type = _read_onnx_key(handle, end, state)
         if field_number == 1 and wire_type == 2:
             function.name = _read_onnx_string(handle, end, state, field_name="function_name")
-        elif field_number == 7 and wire_type == 2:
-            _append_onnx_sequence_value(
-                function.node,
-                _read_onnx_submessage(handle, end, state, depth, _parse_onnx_node),
+        elif field_number == 4 and wire_type == 2:
+            _append_onnx_string_value(
+                function.input,
+                handle,
+                end,
                 state,
+                field_name="function_input",
+                reason="function_input_limit_exceeded",
+            )
+        elif field_number == 5 and wire_type == 2:
+            _append_onnx_string_value(
+                function.output,
+                handle,
+                end,
+                state,
+                field_name="function_output",
+                reason="function_output_limit_exceeded",
+            )
+        elif field_number == 6 and wire_type == 2:
+            _append_onnx_string_value(
+                function.attribute,
+                handle,
+                end,
+                state,
+                field_name="function_attribute",
+                reason="function_attribute_limit_exceeded",
+            )
+        elif field_number == 7 and wire_type == 2:
+            _append_onnx_submessage_value(
+                function.node,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_node,
                 reason="function_node_limit_exceeded",
                 limit=_ONNX_STRUCTURE_MAX_NODES,
             )
         elif field_number == 9 and wire_type == 2:
-            _append_onnx_sequence_value(
+            _append_onnx_submessage_value(
                 function.opset_import,
-                _read_onnx_submessage(handle, end, state, depth, _parse_onnx_opset_import),
+                handle,
+                end,
                 state,
+                depth,
+                _parse_onnx_opset_import,
                 reason="function_opset_import_limit_exceeded",
                 limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
             )
         elif field_number == 10 and wire_type == 2:
             function.domain = _read_onnx_string(handle, end, state, field_name="function_domain")
         elif field_number == 11 and wire_type == 2:
-            _append_onnx_sequence_value(
+            _append_onnx_submessage_value(
                 function.attribute_proto,
-                _read_onnx_submessage(handle, end, state, depth, _parse_onnx_attribute),
+                handle,
+                end,
                 state,
+                depth,
+                _parse_onnx_attribute,
                 reason="function_attribute_proto_limit_exceeded",
                 limit=_ONNX_STRUCTURE_MAX_NODE_ATTRIBUTES,
+            )
+        elif field_number == 12 and wire_type == 2:
+            _append_onnx_submessage_value(
+                function.value_info,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_value_info,
+                reason="function_value_info_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
             )
         elif field_number == 13 and wire_type == 2:
             function.overload = _read_onnx_string(handle, end, state, field_name="function_overload")
@@ -3397,11 +3580,12 @@ def _parse_onnx_training_info(
     depth: int,
 ) -> _OnnxLiteTrainingInfo:
     _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
     training_info = _OnnxLiteTrainingInfo()
     seen_initialization = False
     seen_algorithm = False
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end)
+        field_number, wire_type = _read_onnx_key(handle, end, state)
         if field_number == 1 and wire_type == 2:
             if seen_initialization:
                 _raise_duplicate_onnx_singular_message("TrainingInfoProto.initialization")
@@ -3412,6 +3596,28 @@ def _parse_onnx_training_info(
                 _raise_duplicate_onnx_singular_message("TrainingInfoProto.algorithm")
             seen_algorithm = True
             training_info.algorithm = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph)
+        elif field_number == 3 and wire_type == 2:
+            _append_onnx_submessage_value(
+                training_info.initialization_binding,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_string_entry,
+                reason="training_initialization_binding_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
+            )
+        elif field_number == 4 and wire_type == 2:
+            _append_onnx_submessage_value(
+                training_info.update_binding,
+                handle,
+                end,
+                state,
+                depth,
+                _parse_onnx_string_entry,
+                reason="training_update_binding_limit_exceeded",
+                limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
+            )
         else:
             _skip_onnx_unknown_field(handle, wire_type, end)
     return training_info
@@ -3424,9 +3630,10 @@ def _parse_onnx_model(
     depth: int,
 ) -> _OnnxLiteModel:
     _ensure_onnx_parse_depth(depth)
+    state.record_retained_object()
     model = _OnnxLiteModel()
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end)
+        field_number, wire_type = _read_onnx_key(handle, end, state)
         if field_number == 1 and wire_type == 0:
             model.ir_version = _decode_int64_varint(_read_onnx_varint(handle, end))
         elif field_number == 2 and wire_type == 2:
@@ -3436,26 +3643,35 @@ def _parse_onnx_model(
                 _raise_duplicate_onnx_singular_message("ModelProto.graph")
             model._graph = _read_onnx_submessage(handle, end, state, depth, _parse_onnx_graph)
         elif field_number == 8 and wire_type == 2:
-            _append_onnx_sequence_value(
+            _append_onnx_submessage_value(
                 model.opset_import,
-                _read_onnx_submessage(handle, end, state, depth, _parse_onnx_opset_import),
+                handle,
+                end,
                 state,
+                depth,
+                _parse_onnx_opset_import,
                 reason="model_opset_import_limit_exceeded",
                 limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
             )
         elif field_number == 20 and wire_type == 2:
-            _append_onnx_sequence_value(
+            _append_onnx_submessage_value(
                 model.training_info,
-                _read_onnx_submessage(handle, end, state, depth, _parse_onnx_training_info),
+                handle,
+                end,
                 state,
+                depth,
+                _parse_onnx_training_info,
                 reason="model_training_info_limit_exceeded",
                 limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
             )
         elif field_number == 25 and wire_type == 2:
-            _append_onnx_sequence_value(
+            _append_onnx_submessage_value(
                 model.functions,
-                _read_onnx_submessage(handle, end, state, depth, _parse_onnx_function),
+                handle,
+                end,
                 state,
+                depth,
+                _parse_onnx_function,
                 reason="model_functions_limit_exceeded",
                 limit=_ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES,
             )
@@ -3464,8 +3680,12 @@ def _parse_onnx_model(
     return model
 
 
-def _load_onnx_structure_file_backed(path: str, file_size: int) -> tuple[_OnnxLiteModel, _OnnxStructureParseState]:
-    state = _OnnxStructureParseState()
+def _load_onnx_structure_file_backed(
+    path: str,
+    file_size: int,
+    interrupt_check: Callable[[], None] | None = None,
+) -> tuple[_OnnxLiteModel, _OnnxStructureParseState]:
+    state = _OnnxStructureParseState(interrupt_check=interrupt_check)
     with open(path, "rb") as handle:
         model = _parse_onnx_model(handle, file_size, state, 0)
         if handle.tell() != file_size:
@@ -3653,7 +3873,11 @@ class OnnxScanner(BaseScanner):
             file_backed_parse_state: _OnnxStructureParseState | None = None
             model: Any
             if model_data is None:
-                model, file_backed_parse_state = _load_onnx_structure_file_backed(path, file_size)
+                model, file_backed_parse_state = _load_onnx_structure_file_backed(
+                    path,
+                    file_size,
+                    self.check_interrupted,
+                )
                 result.metadata["onnx_structure_parse"] = file_backed_parse_state.metadata()
                 self._mark_structure_parse_coverage_gaps(result, path, state=file_backed_parse_state)
             else:
