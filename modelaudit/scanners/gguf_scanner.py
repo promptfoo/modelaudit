@@ -47,6 +47,7 @@ GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON = "gguf_duplicate_metadata_keys"
 GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON = "gguf_metadata_limit_exceeded"
 GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON = "gguf_tensor_limit_exceeded"
 _GGUF_MAX_METADATA_VALUE_SECURITY_CHECKS = 64
+_GGUF_INERT_TOKENIZER_ARRAY_KEYS = frozenset({"tokenizer.ggml.merges", "tokenizer.ggml.tokens"})
 _GGUF_METADATA_COMMAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "python_command_api",
@@ -972,8 +973,8 @@ class GgufScanner(BaseScanner):
         return key == "tokenizer.chat_template" or key.startswith("tokenizer.chat_template.")
 
     @staticmethod
-    def _is_tokenizer_vocabulary_key(key: str, value: Any) -> bool:
-        return key == "tokenizer.ggml.tokens" and isinstance(value, list)
+    def _is_inert_tokenizer_array_key(key: str, value: Any) -> bool:
+        return key in _GGUF_INERT_TOKENIZER_ARRAY_KEYS and isinstance(value, list)
 
     @staticmethod
     def _metadata_decode_variants(value: str) -> tuple[str, ...]:
@@ -1552,7 +1553,7 @@ class GgufScanner(BaseScanner):
                     stack.append((item_path, item))
 
     def _report_metadata_value_security_checks(self, key: str, value: Any, result: ScanResult) -> None:
-        if self._is_tokenizer_vocabulary_key(key, value):
+        if self._is_inert_tokenizer_array_key(key, value):
             return
 
         reported = sum(
