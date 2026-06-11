@@ -48,6 +48,7 @@ from .core import (
 )
 from .core_results import (
     details_have_incomplete_coverage,
+    details_match_shard_family_paths,
     metadata_has_incomplete_coverage,
     records_have_incomplete_coverage_for_path,
     results_have_inconclusive_outcome,
@@ -1435,8 +1436,15 @@ class _ScanPathState:
                 self.scanned_paths.append(_display_scan_path(asset.path))
                 added_path = True
 
-        if not added_path and fallback_path is not None:
+        if not added_path and fallback_path is not None and not os.path.exists(fallback_path):
             self.scanned_paths.append(_display_scan_path(fallback_path))
+
+    def track_directory_paths_for_sbom(self, scan_result: ModelAuditResultModel) -> None:
+        """Track completed directory scan assets, including an authoritative empty set."""
+        self.sbom_paths_resolved = True
+        for asset in scan_result.assets:
+            if asset.path:
+                self.scanned_paths.append(_display_scan_path(asset.path))
 
     def defer_temp_cleanup(self, temp_path: str | None, *, cache_enabled: bool, verbose: bool) -> None:
         """Track temporary artifacts for post-SBOM cleanup."""
@@ -1494,7 +1502,11 @@ class _ScanPathState:
 
         scan_records: tuple[Any, ...] = (*scan_result.checks, *scan_result.issues)
 
-        def shard_family_has_incomplete_coverage(shard_paths: set[Path]) -> bool:
+        def shard_family_has_incomplete_coverage(
+            shard_paths: set[Path],
+            *,
+            only_detected_shard_family: bool,
+        ) -> bool:
             for metadata_path, metadata in scan_result.file_metadata.items():
                 if not (metadata.get("operational_error") is True or metadata_has_incomplete_coverage(metadata)):
                     continue
@@ -1515,7 +1527,12 @@ class _ScanPathState:
                     continue
                 if path_matches_shard_family(getattr(record, "location", None), shard_paths):
                     return True
-                if getattr(record, "name", None) in incomplete_shard_checks:
+                if details_match_shard_family_paths(
+                    details,
+                    lambda candidate: path_matches_shard_family(candidate, shard_paths),
+                ):
+                    return True
+                if only_detected_shard_family and getattr(record, "name", None) in incomplete_shard_checks:
                     return True
 
             return False
@@ -1532,6 +1549,7 @@ class _ScanPathState:
                 continue
             record_covered_file(asset.path)
 
+        sharded_detection_families: list[tuple[list[Any], set[Path]]] = []
         for check in scan_result.checks:
             shard_paths = check.details.get("shards") if isinstance(check.details, dict) else None
             if check.name != "Sharded Model Detection" or not isinstance(shard_paths, list):
@@ -1541,7 +1559,13 @@ class _ScanPathState:
                 for shard_path in shard_paths
                 if isinstance(shard_path, str) and (resolved_path := resolve_coverage_path(shard_path)) is not None
             }
-            if shard_family_has_incomplete_coverage(resolved_shard_paths):
+            sharded_detection_families.append((shard_paths, resolved_shard_paths))
+        only_detected_shard_family = len(sharded_detection_families) <= 1
+        for shard_paths, resolved_shard_paths in sharded_detection_families:
+            if shard_family_has_incomplete_coverage(
+                resolved_shard_paths,
+                only_detected_shard_family=only_detected_shard_family,
+            ):
                 continue
             for shard_path in shard_paths:
                 if isinstance(shard_path, str):
@@ -2427,7 +2451,7 @@ def _write_scan_sbom(
     asset_paths = list(
         dict.fromkeys(asset.path for asset in audit_result.assets if asset.path and asset.type != "skipped")
     )
-    if asset_paths and scan_and_delete:
+    if asset_paths and (scan_and_delete or not path_state.sbom_paths_resolved):
         paths_for_sbom = [_display_scan_path(path) for path in asset_paths]
     elif path_state.sbom_paths_resolved:
         paths_for_sbom = path_state.scanned_paths
@@ -2798,6 +2822,8 @@ def _scan_local_or_downloaded_path(
         path_state.record_dvc_coverage(actual_path, scan_results, scanner_config=runtime.config)
         if is_dvc_pointer:
             path_state.track_streaming_paths_for_sbom(scan_results, None)
+        elif os.path.isdir(actual_path):
+            path_state.track_directory_paths_for_sbom(scan_results)
         else:
             path_state.scanned_paths.append(_display_scan_path(actual_path))
 
