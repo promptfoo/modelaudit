@@ -1462,7 +1462,7 @@ def _legacy_pytorch_tail_metadata(*, follow_on_opcode_counts: dict[str, int] | N
     }
 
 
-def test_pickle_report_to_scan_result_trusts_legacy_pytorch_storage_tail() -> None:
+def test_pickle_report_to_scan_result_escalates_forged_legacy_pytorch_storage_tail() -> None:
     report = PickleReport(
         source="pytorch_model.bin",
         status=ScanStatus.INCONCLUSIVE,
@@ -1487,18 +1487,12 @@ def test_pickle_report_to_scan_result_trusts_legacy_pytorch_storage_tail() -> No
 
     result = pickle_report_to_scan_result(report)
 
-    assert result.metadata["trusted_incomplete_tail"] is True
-    assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
-    assert any(
-        issue.severity == IssueSeverity.INFO
-        and issue.rule_code == "S902"
-        and issue.message == "Pickle parsing stopped before the stream was fully consumed: ValueError"
-        for issue in result.issues
-    )
+    assert "trusted_incomplete_tail" not in result.metadata
+    assert any(issue.rule_code == "S901" for issue in result.issues)
 
 
 @pytest.mark.parametrize("protocol", [0, 1, 2, 3, 4, 5])
-def test_pickle_report_to_scan_result_trusts_real_legacy_pytorch_storage_tail(protocol: int) -> None:
+def test_pickle_report_to_scan_result_escalates_legacy_pytorch_tail_without_raw_layout_context(protocol: int) -> None:
     report = scan_bytes(
         _legacy_pytorch_storage_tail_payload(protocol),
         source=f"legacy-pytorch-protocol{protocol}.bin",
@@ -1525,17 +1519,11 @@ def test_pickle_report_to_scan_result_trusts_real_legacy_pytorch_storage_tail(pr
             and finding.details.get("pytorch_storage_persistent_id") is True
             for finding in report.findings
         )
-    assert result.metadata["trusted_incomplete_tail"] is True
-    assert not any(issue.rule_code == "S901" for issue in result.issues)
-    assert any(
-        issue.severity == IssueSeverity.INFO
-        and issue.rule_code == "S902"
-        and issue.details["notice_code"] == "parse_incomplete"
-        for issue in result.issues
-    )
+    assert "trusted_incomplete_tail" not in result.metadata
+    assert any(issue.rule_code == "S901" for issue in result.issues)
 
 
-def test_pickle_report_to_scan_result_trusts_windows_data_pkl_file_path() -> None:
+def test_pickle_report_to_scan_result_escalates_windows_data_pkl_file_path_without_raw_layout_context() -> None:
     report = scan_bytes(
         _legacy_pytorch_storage_tail_payload(2),
         source=r"C:\models\data.pkl",
@@ -1543,8 +1531,8 @@ def test_pickle_report_to_scan_result_trusts_windows_data_pkl_file_path() -> Non
 
     result = pickle_report_to_scan_result(report)
 
-    assert result.metadata["trusted_incomplete_tail"] is True
-    assert not any(issue.rule_code == "S901" for issue in result.issues)
+    assert "trusted_incomplete_tail" not in result.metadata
+    assert any(issue.rule_code == "S901" for issue in result.issues)
 
 
 def test_pickle_report_to_scan_result_escalates_non_legacy_protocol0_persid_unknown_tail() -> None:
@@ -1619,7 +1607,7 @@ def test_pickle_report_to_scan_result_escalates_concatenated_pickle_after_storag
     assert any(issue.rule_code == "S901" for issue in result.issues)
 
 
-def test_pickle_report_to_scan_result_trusts_nested_legacy_pytorch_storage_tail() -> None:
+def test_pickle_report_to_scan_result_escalates_nested_legacy_pytorch_tail_without_raw_layout_context() -> None:
     report = PickleReport(
         source="bundle.zip:pytorch_model.bin",
         status=ScanStatus.INCONCLUSIVE,
@@ -1644,8 +1632,8 @@ def test_pickle_report_to_scan_result_trusts_nested_legacy_pytorch_storage_tail(
 
     result = pickle_report_to_scan_result(report)
 
-    assert result.metadata["trusted_incomplete_tail"] is True
-    assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
+    assert "trusted_incomplete_tail" not in result.metadata
+    assert any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
 
 
 def test_pickle_report_to_scan_result_escalates_unknown_tail_for_unrelated_torch_import() -> None:
