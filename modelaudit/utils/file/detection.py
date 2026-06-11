@@ -65,6 +65,10 @@ _CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES = (
 )
 _CONTENT_ROUTE_UTF8_SCALAR_STREAM_MIN_CHARS = 64
 _CONTENT_ROUTE_UTF8_SCALAR_STREAM_MAX_UNIQUE_CHARS = 2
+_CONTENT_ROUTE_DECLARED_TEXT_ASSET_FILENAMES = frozenset(TEXT_CONTENT_ROUTED_FILENAMES) | {
+    "model_card.md",
+    "readme.md",
+}
 _TensorFlowProtoRoute = Literal[
     "unknown",
     "tf_metagraph",
@@ -7643,7 +7647,7 @@ def _is_complete_declared_text_payload(payload: bytes) -> bool:
 
 def _is_complete_declared_text_asset(file_path: Path, file_size: int) -> bool:
     """Return whether an exact declared tokenizer/text asset owns the file."""
-    if file_path.name.lower() not in TEXT_CONTENT_ROUTED_FILENAMES:
+    if file_path.name.lower() not in _CONTENT_ROUTE_DECLARED_TEXT_ASSET_FILENAMES:
         return False
     if file_size > _CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES:
         return False

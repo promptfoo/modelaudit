@@ -265,6 +265,21 @@ def _bpe_merges_payload(min_bytes: int = 3 * 1024 * 1024) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
+def _large_model_card_payload(min_bytes: int = 3 * 1024 * 1024) -> bytes:
+    lines = ["# Model Card"]
+    total_bytes = len(lines[0]) + 1
+    index = 0
+    while total_bytes <= min_bytes:
+        line = (
+            f"Documentation line {index} describes model usage, limits, evaluation notes, "
+            "and dataset provenance in complete UTF-8 prose."
+        )
+        lines.append(line)
+        total_bytes += len(line) + 1
+        index += 1
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 def test_detect_file_format_directory(tmp_path):
     """Test detecting a directory format."""
     # Create a regular directory
@@ -597,6 +612,20 @@ def test_detect_large_bpe_merges_text_does_not_route_as_flax(tmp_path: Path) -> 
     assert detect_file_format_from_magic(str(merges)) == "unknown"
     assert detect_file_format_for_skip_filter(str(merges)) == "unknown"
     assert detect_file_format(str(merges)) == "unknown"
+
+
+@pytest.mark.parametrize("filename", ["README.md", "model_card.md"])
+def test_detect_large_declared_model_docs_do_not_route_as_flax(tmp_path: Path, filename: str) -> None:
+    document = tmp_path / filename
+    payload = _large_model_card_payload()
+    document.write_bytes(payload)
+
+    assert len(payload) > file_detection._CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+    assert len(payload) < file_detection._CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES
+    assert file_detection._is_complete_declared_text_asset(document, document.stat().st_size) is True
+    assert detect_file_format_from_magic(str(document)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(document)) == "unknown"
+    assert detect_file_format(str(document)) == "unknown"
 
 
 def test_detect_ascii_scalar_merges_still_fails_closed_as_flax(tmp_path: Path) -> None:

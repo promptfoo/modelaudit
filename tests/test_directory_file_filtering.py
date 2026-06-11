@@ -113,6 +113,21 @@ def _bpe_merges_text(min_bytes: int = 3 * 1024 * 1024) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _large_model_card_text(min_bytes: int = 3 * 1024 * 1024) -> str:
+    lines = ["# Model Card"]
+    total_bytes = len(lines[0]) + 1
+    index = 0
+    while total_bytes <= min_bytes:
+        line = (
+            f"Documentation line {index} describes model usage, limits, evaluation notes, "
+            "and dataset provenance in complete UTF-8 prose."
+        )
+        lines.append(line)
+        total_bytes += len(line) + 1
+        index += 1
+    return "\n".join(lines) + "\n"
+
+
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
     """Patch a ZIP member CRC so full scanning sees a malformed entry."""
     with zipfile.ZipFile(path) as archive:
@@ -525,6 +540,23 @@ class TestDirectoryFileFiltering:
         assert file_detection.detect_file_format_from_magic(str(readme)) == "unknown"
         assert file_detection.detect_file_format_for_skip_filter(str(readme)) == "unknown"
         assert file_detection.detect_file_format(str(readme)) == "unknown"
+
+        results = scan_model_directory_or_file(str(readme), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["text"]
+        assert determine_exit_code(results) == 0
+        metadata = results.file_metadata[str(readme)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["text"]
+        assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
+        assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    def test_large_readme_stays_on_text_route(self, tmp_path: Path) -> None:
+        readme = tmp_path / "README.md"
+        readme.write_text(_large_model_card_text(), encoding="utf-8")
+
+        assert readme.stat().st_size > file_detection._CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+        assert readme.stat().st_size < file_detection._CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES
 
         results = scan_model_directory_or_file(str(readme), cache_scan_results=False)
 
