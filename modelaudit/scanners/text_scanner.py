@@ -584,8 +584,10 @@ DOCUMENTATION_FENCED_MODULE_ALIAS_NETWORK_CALL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_RESPONSE_EXECUTOR = (
-    rb"(?:exec|eval|compile|os\.system|subprocess\.(?:run|call|check_call|check_output|Popen))"
+    rb"(?:exec|eval|compile|os\.system|subprocess\.(?:run|call|check_call|check_output|Popen)|"
+    rb"(?:pickle|cloudpickle|dill|marshal)\.loads?|torch\.load|joblib\.load)"
 )
+DOCUMENTATION_FENCED_RESPONSE_INDEX_ACCESS = rb"(?:\s*\[[^\]\r\n]{1,256}\]){0,8}"
 DOCUMENTATION_FENCED_EXECUTED_FETCH_PATTERN = re.compile(
     rb"\b"
     + DOCUMENTATION_FENCED_RESPONSE_EXECUTOR
@@ -628,7 +630,8 @@ DOCUMENTATION_FENCED_IMPORTED_NETWORK_FUNCTION_ALIAS_ASSIGNMENT_PATTERN = re.com
 DOCUMENTATION_FENCED_RESPONSE_CONTENT_ALIAS_ASSIGNMENT_PATTERN = re.compile(
     rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*=\s*"
     rb"(?P<source>[A-Za-z_][A-Za-z0-9_]*)"
-    rb"(?:\s*\.\s*(?:text|content)|\s*\.\s*read\s*\(\s*\))",
+    + DOCUMENTATION_FENCED_RESPONSE_INDEX_ACCESS
+    + rb"(?:\s*\.\s*(?:text|content)|\s*\.\s*read\s*\(\s*\))",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_EXECUTED_RESPONSE_PATTERN = re.compile(
@@ -2164,6 +2167,7 @@ class TextScanner(BaseScanner):
                     call_match,
                     imported_name,
                     string_spans,
+                    string_span_starts,
                 ):
                     continue
                 return True
@@ -2176,6 +2180,7 @@ class TextScanner(BaseScanner):
         call_match: re.Match[bytes],
         imported_name: bytes,
         string_spans: tuple[tuple[int, int, str, bool], ...],
+        string_span_starts: tuple[int, ...],
     ) -> bool:
         if imported_name not in {b"get", b"head", b"urlopen"}:
             return False
@@ -2187,9 +2192,20 @@ class TextScanner(BaseScanner):
         if parsed_argument is None:
             return False
         direct_url, variable_target = parsed_argument
-        if variable_target is not None:
+        if direct_url is not None:
+            return cls._documentation_fenced_passive_assigned_url_is_informational(direct_url)
+        if variable_target is None:
             return False
-        return direct_url is not None and cls._documentation_fenced_passive_assigned_url_is_informational(direct_url)
+        assigned_url = cls._documentation_fenced_preceding_safe_assigned_url(
+            fenced_code,
+            variable_target,
+            call_match.start(),
+            string_spans,
+            string_span_starts,
+        )
+        return assigned_url is not None and cls._documentation_fenced_passive_assigned_url_is_informational(
+            assigned_url
+        )
 
     @classmethod
     def _documentation_fenced_has_executed_imported_fetch_response(
@@ -2402,6 +2418,54 @@ class TextScanner(BaseScanner):
         return None
 
     @classmethod
+    def _documentation_fenced_preceding_safe_assigned_url(
+        cls,
+        fenced_code: bytes,
+        target: bytes,
+        call_position: int,
+        string_spans: tuple[tuple[int, int, str, bool], ...],
+        string_span_starts: tuple[int, ...],
+    ) -> str | None:
+        safe_assigned_urls: dict[int, str] = {}
+        for pattern in (
+            DOCUMENTATION_FENCED_URL_ASSIGNMENT_PATTERN,
+            DOCUMENTATION_FENCED_URL_REQUEST_ASSIGNMENT_PATTERN,
+        ):
+            for match in pattern.finditer(fenced_code):
+                if match.group("target") != target or match.start() >= call_position:
+                    continue
+                if cls._documentation_fenced_match_is_line_comment(
+                    fenced_code,
+                    match.start(),
+                ) or cls._documentation_python_string_spans_contain_absolute_position(
+                    fenced_code,
+                    match.start(),
+                    string_spans,
+                    string_span_starts,
+                ):
+                    continue
+                safe_assigned_urls[match.start()] = match.group("url").decode("utf-8", errors="ignore")
+
+        assignment_positions: list[int] = []
+        for match in DOCUMENTATION_FENCED_VARIABLE_ASSIGNMENT_PATTERN.finditer(fenced_code):
+            if match.group("target") != target or match.start() >= call_position:
+                continue
+            if cls._documentation_fenced_match_is_line_comment(
+                fenced_code,
+                match.start(),
+            ) or cls._documentation_python_string_spans_contain_absolute_position(
+                fenced_code,
+                match.start(),
+                string_spans,
+                string_span_starts,
+            ):
+                continue
+            assignment_positions.append(match.start())
+        if not assignment_positions:
+            return None
+        return safe_assigned_urls.get(max(assignment_positions))
+
+    @classmethod
     def _documentation_fenced_has_executed_fetch_response(
         cls,
         fenced_code: bytes,
@@ -2526,7 +2590,11 @@ class TextScanner(BaseScanner):
                 if not any(position < exec_match.start() for position in positions):
                     continue
                 target_pattern = re.compile(
-                    rb"\b" + re.escape(target) + rb"\b(?:\s*\.\s*(?:text|content)|\s*\.\s*read\s*\(\s*\))?",
+                    rb"\b"
+                    + re.escape(target)
+                    + rb"\b"
+                    + DOCUMENTATION_FENCED_RESPONSE_INDEX_ACCESS
+                    + rb"(?:\s*\.\s*(?:text|content)|\s*\.\s*read\s*\(\s*\))?",
                     re.IGNORECASE,
                 )
                 for target_match in target_pattern.finditer(executor_arguments):
