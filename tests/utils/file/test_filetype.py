@@ -1775,6 +1775,26 @@ def test_hf_tokenizer_json_vocab_template_token_is_claimed(tmp_path: Path) -> No
     assert detect_file_format_for_skip_filter(str(tokenizer_path)) == "unknown"
 
 
+def test_hf_tokenizer_json_model_template_after_vocab_probe_boundary_routes_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    vocab_entries = ",".join(f'"piece_{index}":{index}' for index in range(80))
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        model_fields=(
+            f'"type":"BPE","vocab":{{{vocab_entries}}},'
+            '"template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}","merges":[]'
+        ),
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+
+
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
 @pytest.mark.parametrize("filename", ["model.json", "model.jpg"])
 def test_detect_mxnet_symbol_with_python_json_nonfinite_constant_routes_mxnet(
