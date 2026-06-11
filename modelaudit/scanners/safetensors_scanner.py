@@ -207,6 +207,22 @@ _CREDENTIAL_METADATA_PATTERNS = (
     r"xox[boaprs]-[0-9]{12}-[0-9]{12}-[0-9a-zA-Z]{24}",
     r"ghp_[a-zA-Z0-9]{36}",
 )
+_GENERIC_URL_METADATA_PATTERN = r"https?://"
+_LICENSE_METADATA_KEYS = frozenset({"license"})
+_LICENSE_DOCUMENT_MARKERS = (
+    "license agreement",
+    "terms and conditions",
+    "permission is hereby granted",
+    "grant of license",
+    "apache license",
+    "mit license",
+    "gnu general public license",
+    "creative commons",
+    "bsd license",
+    "mozilla public license",
+)
+_LICENSE_DOCUMENT_MIN_CHARS = 500
+_DUPLICATE_JSON_KEY_DETAIL_LIMIT = 20
 
 
 class SafeTensorsScanner(BaseScanner):
@@ -346,10 +362,75 @@ class SafeTensorsScanner(BaseScanner):
         return first_matches, total_matches
 
     @classmethod
+    def _load_json_header(cls, header_bytes: bytes) -> tuple[Any, list[str]]:
+        """Parse a SafeTensors header while tracking duplicate object keys."""
+        duplicate_keys: list[str] = []
+
+        def track_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            parsed: dict[str, Any] = {}
+            seen: set[str] = set()
+            for key, value in pairs:
+                if key in seen and len(duplicate_keys) < _DUPLICATE_JSON_KEY_DETAIL_LIMIT:
+                    duplicate_keys.append(key)
+                seen.add(key)
+                parsed[key] = value
+            return parsed
+
+        return json.loads(header_bytes.decode("utf-8"), object_pairs_hook=track_duplicate_keys), duplicate_keys
+
+    @classmethod
+    def _looks_like_ordinary_license_document(cls, value: str) -> bool:
+        lower_value = value.lower()
+        if len(value) < _LICENSE_DOCUMENT_MIN_CHARS:
+            return False
+        return "license" in lower_value and any(marker in lower_value for marker in _LICENSE_DOCUMENT_MARKERS)
+
+    @classmethod
+    def _metadata_value_has_active_risk(cls, value: str) -> bool:
+        lower_value = value.lower()
+        if any(marker in lower_value for marker in ("import ", "#!/")):
+            return True
+        if cls._find_html_tag_matches(value)[1] or cls._find_html_event_handler_matches(value)[1]:
+            return True
+
+        active_pattern_groups = (
+            _HTML_METADATA_PATTERNS,
+            _CODE_METADATA_PATTERNS,
+            _PATH_TRAVERSAL_METADATA_PATTERNS,
+            _CREDENTIAL_METADATA_PATTERNS,
+        )
+        if any(
+            re.search(pattern, value, re.IGNORECASE)
+            for pattern_group in active_pattern_groups
+            for pattern in pattern_group
+        ):
+            return True
+
+        return any(
+            pattern != _GENERIC_URL_METADATA_PATTERN and re.search(pattern, value)
+            for pattern in SUSPICIOUS_METADATA_PATTERNS
+        )
+
+    @classmethod
+    def _is_ordinary_license_metadata_value(
+        cls,
+        key: str,
+        value: str,
+        *,
+        metadata_is_valid: bool,
+    ) -> bool:
+        if not metadata_is_valid:
+            return False
+        if key.strip().lower() not in _LICENSE_METADATA_KEYS:
+            return False
+        return cls._looks_like_ordinary_license_document(value) and not cls._metadata_value_has_active_risk(value)
+
+    @classmethod
     def _summarize_custom_metadata(cls, custom_metadata: Any) -> dict[str, Any]:
         """Return a privacy-safe structural and security summary for custom metadata."""
         summary = cls._summarize_custom_metadata_structure(custom_metadata)
         flags: set[str] = set()
+        metadata_is_valid = summary["custom_metadata_valid"] is True
         serialized = json.dumps(custom_metadata, ensure_ascii=False)
         _, html_tag_match_count = cls._find_html_tag_matches(serialized)
         _, event_handler_match_count = cls._find_html_event_handler_matches(serialized)
@@ -366,12 +447,20 @@ class SafeTensorsScanner(BaseScanner):
         if any(re.search(pattern, serialized, re.IGNORECASE) for pattern in _CREDENTIAL_METADATA_PATTERNS):
             flags.add("credential_exposure")
 
-        for _, value in cls._iter_custom_metadata_strings(custom_metadata):
-            if len(value) > 1000:
+        for key, value in cls._iter_custom_metadata_strings(custom_metadata):
+            is_ordinary_license = cls._is_ordinary_license_metadata_value(
+                key,
+                value,
+                metadata_is_valid=metadata_is_valid,
+            )
+            if len(value) > 1000 and not is_ordinary_license:
                 flags.add("unusually_long_value")
             if any(marker in value.lower() for marker in ("import ", "#!/")):
                 flags.add("code_like_value")
-            if any(re.search(pattern, value) for pattern in SUSPICIOUS_METADATA_PATTERNS):
+            if any(
+                (pattern != _GENERIC_URL_METADATA_PATTERN or not is_ordinary_license) and re.search(pattern, value)
+                for pattern in SUSPICIOUS_METADATA_PATTERNS
+            ):
                 flags.add("suspicious_pattern")
 
         summary["custom_metadata_security_flags"] = sorted(flags)
@@ -523,7 +612,7 @@ class SafeTensorsScanner(BaseScanner):
                     )
 
                 try:
-                    header = json.loads(header_bytes.decode("utf-8"))
+                    header, duplicate_keys = self._load_json_header(header_bytes)
                 except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as e:
                     result.add_check(
                         name="SafeTensors JSON Parse",
@@ -533,6 +622,22 @@ class SafeTensorsScanner(BaseScanner):
                         location=path,
                         details={"exception": str(e), "exception_type": type(e).__name__},
                         why="SafeTensors header contained invalid JSON.",
+                    )
+                    self._mark_inconclusive(result, SAFETENSORS_HEADER_INCONCLUSIVE_REASON)
+                    result.finish(success=False)
+                    return result
+
+                if duplicate_keys:
+                    result.add_check(
+                        name="SafeTensors Duplicate Key Detection",
+                        passed=False,
+                        message="SafeTensors header contains duplicate JSON keys",
+                        severity=IssueSeverity.INFO,
+                        location=path,
+                        details={
+                            "duplicate_keys": duplicate_keys,
+                            "duplicate_key_count": len(duplicate_keys),
+                        },
                     )
                     self._mark_inconclusive(result, SAFETENSORS_HEADER_INCONCLUSIVE_REASON)
                     result.finish(success=False)
@@ -797,8 +902,14 @@ class SafeTensorsScanner(BaseScanner):
 
                 # Check metadata
                 metadata = header.get("__metadata__", {})
+                metadata_is_valid = result.metadata.get("custom_metadata_valid") is True
                 for key, value in self._iter_custom_metadata_strings(metadata):
-                    if len(value) > 1000:
+                    is_ordinary_license = self._is_ordinary_license_metadata_value(
+                        key,
+                        value,
+                        metadata_is_valid=metadata_is_valid,
+                    )
+                    if len(value) > 1000 and not is_ordinary_license:
                         custom_metadata_security_flags.add("unusually_long_value")
                         result.add_check(
                             name="Metadata Length Check",
@@ -835,6 +946,8 @@ class SafeTensorsScanner(BaseScanner):
 
                     # Check for regex-based suspicious patterns (independent of above check)
                     for pattern in SUSPICIOUS_METADATA_PATTERNS:
+                        if pattern == _GENERIC_URL_METADATA_PATTERN and is_ordinary_license:
+                            continue
                         if re.search(pattern, value):
                             custom_metadata_security_flags.add("suspicious_pattern")
                             result.add_check(
@@ -1113,7 +1226,11 @@ class SafeTensorsScanner(BaseScanner):
                 if len(header_bytes) != header_len:
                     metadata["extraction_error"] = "Truncated SafeTensors header"
                     return metadata
-                header = json.loads(header_bytes)
+                header, duplicate_keys = self._load_json_header(header_bytes)
+                if duplicate_keys:
+                    metadata["extraction_error"] = "Duplicate SafeTensors header keys"
+                    metadata["duplicate_header_keys"] = duplicate_keys
+                    return metadata
 
                 # Extract tensor info
                 tensors: dict[str, dict[str, Any]] = {}
