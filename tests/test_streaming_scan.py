@@ -35,7 +35,7 @@ from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYT
 from modelaudit.utils.helpers.file_hash import compute_sha256_hash
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
-from tests.helpers import create_malicious_pickle
+from tests.helpers import create_malicious_pickle, create_mock_pytorch_zip
 
 
 @pytest.fixture
@@ -1420,6 +1420,52 @@ def test_scan_model_streaming_preserves_openvino_companion_when_bin_arrives_firs
     assert result.file_metadata[str(xml_path)]["bin_size"] == 16
     assert not any(check.rule_code == "S701" for check in result.checks)
     assert not any(check.rule_code == "S901" for check in result.checks)
+
+
+def test_scan_model_streaming_preserves_executable_openvino_bin_sidecar_route(tmp_path: Path) -> None:
+    """Executable same-stem .bin content must not be consumed only by OpenVINO XML scanning."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+    create_mock_pytorch_zip(bin_path, malicious=True)
+
+    result = scan_model_streaming(
+        file_generator=iter([(bin_path, False), (xml_path, True)]),
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+        skip_file_types=True,
+    )
+
+    assert determine_exit_code(result) == 1
+    assert result.files_scanned == 2
+    assert "openvino" in result.scanner_names
+    assert "pytorch_zip" in result.scanner_names
+    assert not xml_path.exists()
+    assert not bin_path.exists()
+    assert result.file_metadata[str(xml_path)]["bin_size"] > 0
+    assert any(
+        issue.location and str(bin_path) in issue.location and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
+
+
+def test_scan_model_streaming_keeps_benign_openvino_sidecar_accounting(tmp_path: Path) -> None:
+    """Benign OpenVINO weights remain accounted without standalone .bin scanner routing."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(xml_path), compute_sha256_hash(bin_path)])
+
+    result = scan_model_streaming(
+        file_generator=iter([(bin_path, False), (xml_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+        skip_file_types=True,
+    )
+
+    assert determine_exit_code(result) == 0
+    assert result.scanner_names == ["openvino"]
+    assert result.file_metadata[str(xml_path)]["bin_size"] == bin_path.stat().st_size
+    assert result.bytes_scanned == xml_path.stat().st_size + bin_path.stat().st_size
+    assert result.content_hash == expected_hash
 
 
 def test_scan_model_streaming_preserves_path_sensitive_openvino_companions_with_duplicate_basenames(

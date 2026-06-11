@@ -5973,6 +5973,8 @@ def scan_model_streaming(
             openvino_scan_companion_key: Path | None = None
             openvino_companion_pre_scan_identity: _FileIdentitySnapshot | None = None
             openvino_companion_bytes_scanned = 0
+            independent_openvino_sidecar_result: ScanResult | None = None
+            independent_openvino_sidecar_path: Path | None = None
 
             # Check for interruption before starting work on the yielded file.
             try:
@@ -6151,6 +6153,15 @@ def scan_model_streaming(
                     )
                     preserve_shard_reconciliation_errors = True
                     aggregate_hash_complete = False
+                if openvino_scan_companion_path is not None and _openvino_weights_sidecar_needs_independent_scan(
+                    openvino_scan_companion_path,
+                    scanner_selection,
+                ):
+                    independent_openvino_sidecar_path = openvino_scan_companion_path
+                    independent_openvino_sidecar_result = scan_file(
+                        str(openvino_scan_companion_path),
+                        config=scan_config,
+                    )
                 if pre_scan_shard_target:
                     _ensure_streamed_shard_coverage_placeholder(scan_result, source_path)
 
@@ -6237,6 +6248,47 @@ def scan_model_streaming(
 
                     # Add asset
                     asset = asset_from_scan_result(report_path, scan_result, metadata=metadata_dict)
+                    if asset:
+                        asset["is_streamed"] = True
+                        results.assets.extend(convert_assets_to_models([asset]))
+
+                if independent_openvino_sidecar_result is not None and independent_openvino_sidecar_path is not None:
+                    _normalize_unclassified_scan_failure(independent_openvino_sidecar_result)
+                    operational_scan_failure = _scan_result_has_operational_error(independent_openvino_sidecar_result)
+                    if operational_scan_failure:
+                        preserve_shard_reconciliation_errors = True
+                    sidecar_report_path = str(independent_openvino_sidecar_path)
+                    sidecar_metadata = dict(independent_openvino_sidecar_result.metadata or {})
+                    sidecar_metadata.setdefault("file_size", independent_openvino_sidecar_path.stat().st_size)
+                    results.aggregate_scan_result(
+                        {
+                            "bytes_scanned": independent_openvino_sidecar_result.bytes_scanned,
+                            "files_scanned": 1,
+                            "has_errors": operational_scan_failure,
+                            "success": independent_openvino_sidecar_result.success,
+                            "issues": _serialize_streamed_records(
+                                list(independent_openvino_sidecar_result.issues or []),
+                                sidecar_report_path,
+                                sidecar_report_path,
+                            ),
+                            "checks": _serialize_streamed_records(
+                                list(independent_openvino_sidecar_result.checks or []),
+                                sidecar_report_path,
+                                sidecar_report_path,
+                            ),
+                            "scanners": (
+                                [independent_openvino_sidecar_result.scanner_name]
+                                if independent_openvino_sidecar_result.scanner_name
+                                else []
+                            ),
+                            "file_metadata": {sidecar_report_path: sidecar_metadata},
+                        }
+                    )
+                    asset = asset_from_scan_result(
+                        sidecar_report_path,
+                        independent_openvino_sidecar_result,
+                        metadata=sidecar_metadata,
+                    )
                     if asset:
                         asset["is_streamed"] = True
                         results.assets.extend(convert_assets_to_models([asset]))
