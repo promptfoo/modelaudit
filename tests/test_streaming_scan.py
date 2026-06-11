@@ -821,6 +821,66 @@ def test_scan_model_directory_hf_cache_onnx_external_data_uses_snapshot_alias(
     assert determine_exit_code(result) == 0
 
 
+def test_scan_model_directory_hf_cache_onnx_external_data_keeps_snapshot_alias_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Shared ONNX blobs must scan once per snapshot alias when sidecar aliases differ."""
+    cache_hub = tmp_path / "hf-hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+    cache_root = cache_hub / "models--test--model"
+    blobs_dir = cache_root / "blobs"
+    blobs_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    valid_sidecar_blob = blobs_dir / "sidecar-valid"
+    short_sidecar_blob = blobs_dir / "sidecar-short"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    valid_sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    short_sidecar_blob.write_bytes(b"\x00")
+
+    valid_snapshot = cache_root / "snapshots" / ("a" * 40) / "onnx"
+    missing_snapshot = cache_root / "snapshots" / ("b" * 40) / "onnx"
+    short_snapshot = cache_root / "snapshots" / ("c" * 40) / "onnx"
+    for snapshot_dir in (valid_snapshot, missing_snapshot, short_snapshot):
+        snapshot_dir.mkdir(parents=True)
+        (snapshot_dir / "model.onnx").symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    (valid_snapshot / "model.onnx_data").symlink_to(os.path.relpath(valid_sidecar_blob, valid_snapshot))
+    (short_snapshot / "model.onnx_data").symlink_to(os.path.relpath(short_sidecar_blob, short_snapshot))
+
+    result = scan_model_directory_or_file(
+        str(cache_root / "snapshots"),
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    failed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status.value == "failed"
+    ]
+    passed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check"
+        and check.status.value == "passed"
+        and check.details.get("file") == "model.onnx_data"
+    ]
+    failed_sizes = [
+        check
+        for check in result.checks
+        if check.name == "External Data Size Validation" and check.status.value == "failed"
+    ]
+    assert len(passed_external) == 2
+    assert len(failed_external) == 1
+    assert failed_external[0].location == str(missing_snapshot / "model.onnx_data")
+    assert len(failed_sizes) == 1
+    assert failed_sizes[0].details["actual_size"] == 1
+    assert determine_exit_code(result) == 1
+
+
 @pytest.mark.parametrize("delete_after_scan", [False, True])
 def test_scan_model_streaming_reconciles_cross_directory_shard_coverage(
     delete_after_scan: bool,

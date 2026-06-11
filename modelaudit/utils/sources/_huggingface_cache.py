@@ -53,6 +53,29 @@ def _path_has_part(path: Path, part: str) -> bool:
     return any(segment.lower() == part_lower for segment in path.parts)
 
 
+def _hf_cache_snapshot_revision(path: Path, cache_root: Path | None = None) -> str | None:
+    """Return the lexical HF snapshot revision for ``snapshots/<revision>/...`` aliases."""
+    absolute_path = Path(os.path.abspath(path.expanduser()))
+    for index, segment in enumerate(absolute_path.parts):
+        if not segment.lower().startswith("models--"):
+            continue
+        if cache_root is not None and segment != cache_root.name:
+            continue
+        relative_parts = absolute_path.parts[index + 1 :]
+        if (
+            len(relative_parts) >= 3
+            and relative_parts[0].lower() == "snapshots"
+            and relative_parts[1] not in {"", ".", ".."}
+        ):
+            return relative_parts[1]
+    return None
+
+
+def _is_hf_cache_snapshot_alias(path: Path, cache_root: Path | None = None) -> bool:
+    """Return True only for lexical aliases below ``snapshots/<revision>/...``."""
+    return _hf_cache_snapshot_revision(path, cache_root) is not None
+
+
 def _find_hf_cache_root(path: Path) -> Path | None:
     """Return the HuggingFace cache root containing models--* if present."""
     resolved_path = _resolve_hf_cache_path(path)

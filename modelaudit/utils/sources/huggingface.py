@@ -2027,6 +2027,7 @@ def download_model_streaming(
         total_files = len(model_files)
         downloaded_total_size = 0
         prefetched_selected_paths: dict[str, Path] = {}
+        downloaded_selected_paths: dict[str, Path] = {}
         for idx, filename in enumerate(model_files):
             is_last = idx == total_files - 1
 
@@ -2054,6 +2055,7 @@ def download_model_streaming(
                         f"Cannot download {repo_id}: downloaded selected Hugging Face files total "
                         f"{downloaded_total_size} bytes exceeds max size {size_limit} bytes"
                     )
+            downloaded_selected_paths[filename] = downloaded_file
 
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
@@ -2087,6 +2089,8 @@ def download_model_streaming(
                         if deadline is not None and time.monotonic() >= deadline:
                             raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
                         if external_filename in selected_file_set:
+                            if external_filename in downloaded_selected_paths:
+                                continue
                             external_path = prefetched_selected_paths.get(external_filename)
                             if external_path is None:
                                 external_path = download_stream_file(external_filename)

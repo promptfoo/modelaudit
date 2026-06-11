@@ -2266,6 +2266,65 @@ class TestModelDownloadStreaming:
             revision=_HF_TEST_REVISION,
         )
 
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["onnx/model.onnx_data", "onnx/model.onnx"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_include_all_reuses_selected_onnx_sidecar_before_parent(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Previously yielded selected sidecars should not be downloaded or budgeted twice."""
+        payload = _make_external_onnx_payload(tmp_path)
+        sidecar_bytes = struct.pack("f", 1.0)
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload if filename == "onnx/model.onnx" else sidecar_bytes)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_get_paths_info.return_value = [
+            SimpleNamespace(path="onnx/model.onnx_data", size=len(sidecar_bytes)),
+            SimpleNamespace(path="onnx/model.onnx", size=len(payload)),
+        ]
+
+        cache_dir = tmp_path / "cache"
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=cache_dir,
+                max_size=len(payload) + len(sidecar_bytes),
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+                include_all_files=True,
+            )
+        )
+
+        download_root = cache_dir / "huggingface" / "test" / "model"
+        assert results == [
+            (download_root / "onnx" / "model.onnx_data", False),
+            (download_root / "onnx" / "model.onnx", True),
+        ]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "onnx/model.onnx_data",
+            "onnx/model.onnx",
+        ]
+        mock_get_paths_info.assert_called_once_with(
+            "test/model",
+            ["onnx/model.onnx_data", "onnx/model.onnx"],
+            revision=_HF_TEST_REVISION,
+        )
+
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
     @patch(

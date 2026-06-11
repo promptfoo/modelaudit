@@ -126,6 +126,7 @@ from modelaudit.utils.lfs import check_lfs_pointer, get_lfs_issue_details, get_l
 from modelaudit.utils.sources._huggingface_cache import (
     _find_hf_cache_root,
     _get_hf_cache_roots,
+    _is_hf_cache_snapshot_alias,
     _path_has_part,
     _resolve_hf_cache_path,
     _trusted_hf_blobs_root,
@@ -1912,7 +1913,7 @@ def _resolve_directory_scan_target(
 
     # Check if this is a HuggingFace cache symlink scenario
     is_hf_cache_symlink = False
-    if is_symlink and is_hf_cache and _path_has_part(file_path, "snapshots"):
+    if is_symlink and is_hf_cache and _is_hf_cache_snapshot_alias(file_path, hf_cache_root):
         # Reuse the canonical target resolved above. On Windows, os.readlink()
         # may expose a device-path spelling that cannot safely be rejoined.
         resolved_target = resolved_file
@@ -2328,7 +2329,8 @@ def scan_model_directory_or_file(
                     route_hf_shard_alias = (
                         is_hf_cache_symlink and resolved_file.exists() and snapshot_shard_family_key is not None
                     )
-                    scan_source = snapshot_path if is_hf_cache_symlink else resolved_file
+                    route_hf_onnx_alias = is_hf_cache_symlink and snapshot_path.suffix.lower() == ".onnx"
+                    scan_source = snapshot_path if route_hf_shard_alias or route_hf_onnx_alias else resolved_file
 
                     # Skip non-model files early if filtering is enabled
                     # Note: skip_file_types parameter already contains the correct value
@@ -2386,15 +2388,23 @@ def scan_model_directory_or_file(
                         shard_family_key = _shard_family_key_for_path(target_str)
                         is_hf_shard_alias = route_hf_shard_alias and target_path == scan_source
                         exclusion_path = (
-                            str(resolved_file) if is_hf_shard_alias else _resolve_or_absolute_path(target_str)
+                            str(resolved_file)
+                            if is_hf_cache_symlink and target_path == scan_source
+                            else _resolve_or_absolute_path(target_str)
                         )
                         if exclusion_path in dvc_excluded_paths:
                             continue
                         if is_hf_shard_alias:
                             hf_shard_blob_paths.add(str(resolved_file))
+                        is_hf_onnx_alias = route_hf_onnx_alias and target_path == scan_source
                         dedupe_target_str = (
                             str(resolved_file)
-                            if is_hf_cache_symlink and target_path == scan_source and shard_family_key is None
+                            if (
+                                is_hf_cache_symlink
+                                and target_path == scan_source
+                                and shard_family_key is None
+                                and not is_hf_onnx_alias
+                            )
                             else target_str
                         )
                         if dedupe_target_str in scanned_paths:

@@ -621,12 +621,20 @@ def _is_trusted_huggingface_cache_external_alias(
 ) -> bool:
     """Return True for Hugging Face snapshot symlinks that resolve to the model cache blobs directory."""
     try:
-        from ..utils.sources._huggingface_cache import _find_hf_cache_root, _trusted_hf_blobs_root
+        from ..utils.sources._huggingface_cache import (
+            _find_hf_cache_root,
+            _hf_cache_snapshot_revision,
+            _trusted_hf_blobs_root,
+        )
     except Exception:
         return False
 
     model_cache_root = _find_hf_cache_root(model_path)
     if model_cache_root is None or _find_hf_cache_root(lexical_external_path) != model_cache_root:
+        return False
+    model_revision = _hf_cache_snapshot_revision(model_path, model_cache_root)
+    external_revision = _hf_cache_snapshot_revision(lexical_external_path, model_cache_root)
+    if model_revision is None or external_revision != model_revision:
         return False
     blobs_root = _trusted_hf_blobs_root(model_cache_root)
     if blobs_root is None:
