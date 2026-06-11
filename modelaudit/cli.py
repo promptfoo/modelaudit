@@ -15,7 +15,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 import click
 from pydantic import TypeAdapter
@@ -94,8 +94,10 @@ from .utils.sources.huggingface import (
     download_file_from_hf,
     download_model,
     extract_model_id_from_path,
+    get_model_info,
     is_huggingface_file_url,
     is_huggingface_url,
+    parse_huggingface_file_url,
     redact_huggingface_url_for_display,
     redact_huggingface_urls_in_text,
 )
@@ -2645,6 +2647,21 @@ def _resolve_scan_source_for_path(
 
     if is_huggingface_file_url(path):
         display_path = _display_path(path)
+        if dry_run:
+            try:
+                repo_id, revision, filename = parse_huggingface_file_url(path)
+                click.echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:")
+                click.echo("   Type: HuggingFace file")
+                click.echo(f"   Repository: {_escape_terminal_text(repo_id)}")
+                click.echo(f"   Revision: {_escape_terminal_text(revision)}")
+                click.echo(f"   File: {_escape_terminal_text(filename)}")
+                return _SourceDispatchResult(actual_path=path, local_scan_required=False)
+            except Exception as exc:
+                error_msg = _display_error(exc, path)
+                click.echo(f"Error analyzing {display_path}: {error_msg}", err=True)
+                path_state.mark_non_shard_error(audit_result)
+                return None
+
         download_spinner = None
         temp_dir = None
         if runtime.show_styled_output and should_show_spinner():
@@ -2706,12 +2723,36 @@ def _resolve_scan_source_for_path(
 
     if is_huggingface_url(path):
         display_path = _display_path(path)
+        if dry_run:
+            try:
+                model_info = get_model_info(path)
+                size_bytes = model_info["total_size"]
+                if size_bytes == 0:
+                    size_str = "Unknown size"
+                elif size_bytes >= 1024 * 1024 * 1024:
+                    size_str = f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+                elif size_bytes >= 1024 * 1024:
+                    size_str = f"{size_bytes / (1024 * 1024):.2f} MB"
+                else:
+                    size_str = f"{size_bytes / 1024:.2f} KB"
+
+                click.echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:")
+                click.echo("   Type: HuggingFace model")
+                click.echo(f"   Model: {_escape_terminal_text(str(model_info['model_id']))}")
+                click.echo(f"   Size: {size_str} ({_escape_terminal_text(str(model_info['file_count']))} files)")
+                if runtime.scan_and_delete:
+                    click.echo(style_text("   Mode: Streaming (scan and delete to save disk)", fg="cyan"))
+                return _SourceDispatchResult(actual_path=path, local_scan_required=False)
+            except Exception as exc:
+                error_msg = _display_error(exc, path)
+                click.echo(f"Error analyzing {display_path}: {error_msg}", err=True)
+                path_state.mark_non_shard_error(audit_result)
+                return None
+
         if runtime.show_styled_output:
             click.echo(f"\n📥 Preparing to download from {style_text(display_path, fg='cyan')}")
 
             try:
-                from .utils.sources.huggingface import get_model_info
-
                 model_info = get_model_info(path)
                 size_bytes = model_info["total_size"]
                 if size_bytes == 0:
@@ -3955,6 +3996,8 @@ def scan_command(
     from .models import create_initial_audit_result
 
     audit_result = create_initial_audit_result()
+    if dry_run:
+        cast(Any, audit_result).dry_run = True
     if runtime.scanner_selection_metadata is not None:
         audit_result.scanner_selection = dict(runtime.scanner_selection_metadata)
     path_state = _ScanPathState(
@@ -4356,7 +4399,11 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     else:
         # Check if no files were scanned to show appropriate message
         files_scanned = results.get("files_scanned", 0)
-        if files_scanned == 0:
+        if results.get("dry_run"):
+            output_lines.append(
+                "  " + style_text("✅ Dry-run preview complete; no files were scanned", fg="green", bold=True),
+            )
+        elif files_scanned == 0:
             output_lines.append(
                 "  " + style_text("⚠️  No model files found to scan", fg="yellow", bold=True),
             )
@@ -4373,6 +4420,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     # Check if scan had operational errors first (highest priority in exit code)
     has_operational_errors = bool(results.get("has_errors"))
     files_scanned = results.get("files_scanned", 0)
+    is_dry_run = bool(results.get("dry_run"))
     has_critical_findings = any(_get_issue_attr(issue, "severity") == "critical" for issue in visible_issues)
     has_warning_findings = any(_get_issue_attr(issue, "severity") == "warning" for issue in visible_issues)
     has_security_findings = has_critical_findings or has_warning_findings
@@ -4396,6 +4444,8 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             status_color = "yellow"
         status_line = style_text(f"{status_icon} {status_msg}", fg=status_color, bold=True)
         output_lines.append(f"  {status_line}")
+    elif is_dry_run:
+        output_lines.append(f"  {style_text('✅ DRY RUN PREVIEW COMPLETE', fg='green', bold=True)}")
     # Check if no files were scanned
     elif files_scanned == 0:
         status_icon = "❌"

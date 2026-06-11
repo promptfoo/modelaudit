@@ -3398,7 +3398,7 @@ def test_scan_huggingface_metadata_preview_escapes_model_id(tmp_path: Path) -> N
     with (
         patch("modelaudit.cli.is_huggingface_url", return_value=True),
         patch(
-            "modelaudit.utils.sources.huggingface.get_model_info",
+            "modelaudit.cli.get_model_info",
             return_value={
                 "model_id": "org/model\nFORGED\u202e",
                 "total_size": 1024,
@@ -3432,7 +3432,7 @@ def test_scan_huggingface_metadata_preflight_verbose_log_is_sanitized(
     with (
         patch("modelaudit.cli.is_huggingface_url", return_value=True),
         patch(
-            "modelaudit.utils.sources.huggingface.get_model_info",
+            "modelaudit.cli.get_model_info",
             side_effect=RuntimeError(f"metadata failed for {url}\nFORGED"),
         ),
         patch("modelaudit.cli.download_model", return_value=downloaded_dir),
@@ -3537,6 +3537,93 @@ def test_scan_huggingface_file_passes_max_size_and_cleans_temp_dir(
     assert result.exit_code == 0
     assert mock_download_file.call_args.kwargs["max_size"] == 2048
     mock_rmtree.assert_called()
+
+
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_huggingface_direct_file_stream_selection_bypasses_repo_stream_selector(
+    mock_scan: MagicMock,
+    mock_download_file: MagicMock,
+    mock_download_streaming: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Direct HF file URLs are explicit inventory and must not enter repository streaming selection."""
+    downloaded_file = tmp_path / "model-00001-of-00002.safetensors"
+    downloaded_file.write_bytes(b"weights")
+    mock_download_file.return_value = downloaded_file
+    mock_scan.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--stream",
+            "--scanners",
+            "metadata",
+            "--quiet",
+            "https://huggingface.co/test/model/resolve/main/model-00001-of-00002.safetensors",
+        ],
+    )
+
+    assert result.exit_code == 0
+    mock_download_file.assert_called_once()
+    mock_download_streaming.assert_not_called()
+    mock_scan.assert_called_once()
+
+
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_huggingface_direct_file_dry_run_does_not_download(
+    mock_scan: MagicMock,
+    mock_download_file: MagicMock,
+) -> None:
+    """Direct HF dry runs should parse and preview the explicit file without SDK download."""
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--dry-run",
+            "https://huggingface.co/test/model/resolve/main/model-00001-of-00002.safetensors",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Preview for" in result.output
+    assert "model-00001-of-00002.safetensors" in result.output
+    mock_download_file.assert_not_called()
+    mock_scan.assert_not_called()
+
+
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.get_model_info")
+def test_scan_huggingface_streaming_dry_run_uses_metadata_preview_without_download_or_probe(
+    mock_get_model_info: MagicMock,
+    mock_download_file: MagicMock,
+    mock_download_model: MagicMock,
+    mock_download_streaming: MagicMock,
+) -> None:
+    """HF model dry runs should not enter download or selective content-probe paths."""
+    mock_get_model_info.return_value = {
+        "model_id": "test/model",
+        "total_size": 4096,
+        "file_count": 258,
+    }
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--dry-run", "--stream", "--scanners", "xgboost", "--quiet", "hf://test/model"],
+    )
+
+    assert result.exit_code == 0
+    assert "Preview for" in result.output
+    assert "test/model" in result.output
+    mock_get_model_info.assert_called_once_with("hf://test/model")
+    mock_download_file.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_download_streaming.assert_not_called()
 
 
 @patch("modelaudit.cli.download_file_from_hf")

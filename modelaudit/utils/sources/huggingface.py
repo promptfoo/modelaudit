@@ -46,6 +46,10 @@ _HF_SAFETENSORS_SHARD_PATTERN = re.compile(
     r"(?P<stem>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})\.safetensors",
     re.IGNORECASE,
 )
+_HF_SAFETENSORS_SHARD_SHAPE_PATTERN = re.compile(
+    r".+-\d+-of-\d+\.safetensors",
+    re.IGNORECASE,
+)
 
 __all__ = [
     "download_file_from_hf",
@@ -387,7 +391,7 @@ def _detect_huggingface_xgboost_ubjson_route(
     prefix: bytes,
 ) -> str | None:
     """Return a bounded XGBoost UBJSON route for a suffix-skipped remote file."""
-    if Path(filename).suffix and _parse_hf_safetensors_shard(filename) is None:
+    if Path(filename).suffix and not _has_hf_safetensors_shard_shape(filename):
         return None
 
     from modelaudit.utils.file.detection import (
@@ -958,9 +962,13 @@ def _parse_hf_safetensors_shard(filename: str) -> tuple[str, int, int] | None:
         return None
     index = int(match.group("index"))
     total = int(match.group("total"))
-    if index < 1 or total < 1 or index > total:
+    if index < 1 or total < 2 or index > total:
         return None
     return match.group("stem"), index, total
+
+
+def _has_hf_safetensors_shard_shape(filename: str) -> bool:
+    return _HF_SAFETENSORS_SHARD_SHAPE_PATTERN.fullmatch(filename) is not None
 
 
 def _get_declared_hf_safetensors_shard_families(repo_files: Collection[str]) -> frozenset[tuple[str, int]]:
