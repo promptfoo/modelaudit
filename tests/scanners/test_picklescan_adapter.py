@@ -1535,6 +1535,18 @@ def test_pickle_report_to_scan_result_trusts_real_legacy_pytorch_storage_tail(pr
     )
 
 
+def test_pickle_report_to_scan_result_trusts_windows_data_pkl_file_path() -> None:
+    report = scan_bytes(
+        _legacy_pytorch_storage_tail_payload(2),
+        source=r"C:\models\data.pkl",
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.metadata["trusted_incomplete_tail"] is True
+    assert not any(issue.rule_code == "S901" for issue in result.issues)
+
+
 def test_pickle_report_to_scan_result_escalates_non_legacy_protocol0_persid_unknown_tail() -> None:
     report = scan_bytes(b"Pexternal-storage-key\n.\x00RAW", source="legacy-pytorch-protocol0.bin")
 
@@ -1738,6 +1750,7 @@ def test_pickle_report_to_scan_result_escalates_unknown_tail_when_import_referen
         "pytorch_model.bin:archive/data.pkl",
         "model.pt:archive/data.pkl (decompressed)",
         "model.pt:archive\\data.pkl",
+        r"C:\models\model.pt:archive\data.pkl",
     ],
 )
 def test_pickle_report_to_scan_result_escalates_pytorch_zip_data_pkl_tail(source: str) -> None:

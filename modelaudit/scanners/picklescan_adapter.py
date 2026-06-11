@@ -63,6 +63,7 @@ _INT_TEXT_RE = re.compile(r"[+-]?\d+")
 _LEGACY_RULE_CODE_RE = re.compile(r"^S\d+$")
 _LOCATION_POSITION_RE = re.compile(r"\(pos\s+(?P<position>\d+)\)\s*$")
 _UNKNOWN_OPCODE_POSITION_RE = re.compile(r"at position (?P<position>\d+), opcode b[\"']")
+_WINDOWS_DRIVE_ARCHIVE_PREFIX_RE = re.compile(r"^[A-Za-z]$")
 _LEGACY_PYTORCH_PROTOCOL0_STORAGE_PREVIEW_RE = re.compile(
     r"^str:\"\('storage', <class 'torch\.(?P<storage_name>[A-Za-z0-9_]+Storage)'>, "
     r"'(?P<storage_key>[0-9]{1,128})', '[^']+', (?P<element_count>[0-9]+), "
@@ -794,7 +795,9 @@ def _is_pytorch_zip_pickle_member_source(source: str) -> bool:
         source = source[: -len(" (decompressed)")]
     if ":" not in source:
         return False
-    _archive_path, member_name = source.rsplit(":", 1)
+    archive_path, member_name = source.rsplit(":", 1)
+    if _WINDOWS_DRIVE_ARCHIVE_PREFIX_RE.match(archive_path) and member_name.startswith(("\\", "/")):
+        return False
     normalized_member = member_name.replace("\\", "/").lstrip("/")
     return normalized_member == "data.pkl" or normalized_member.endswith("/data.pkl")
 
