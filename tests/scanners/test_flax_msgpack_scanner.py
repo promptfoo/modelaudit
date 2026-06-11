@@ -115,16 +115,18 @@ def _write_sparse_large_flax_ndarray_ext(
     shape_values: list[int] | None = None,
     body_prefix: bytes = b"",
     trailing_body: bytes = b"",
+    wrap_in_params: bool = True,
 ) -> None:
     shape_values = [tensor_size // 4] if shape_values is None else shape_values
     metadata_size = 1 + 1 + sum(_msgpack_uint_size(dimension) for dimension in shape_values)
     metadata_size += _msgpack_str_size(dtype) + 5
     ext_size = metadata_size + tensor_size + len(trailing_body)
     with path.open("wb") as output:
-        output.write(b"\x81")
-        _write_msgpack_str(output, "params")
-        output.write(b"\x81")
-        _write_msgpack_str(output, "embedding")
+        if wrap_in_params:
+            output.write(b"\x81")
+            _write_msgpack_str(output, "params")
+            output.write(b"\x81")
+            _write_msgpack_str(output, "embedding")
         output.write(b"\xc9" + struct.pack(">I", ext_size) + b"\x01")
         output.write(b"\x93")
         if len(shape_values) > 15:
@@ -1501,9 +1503,13 @@ def test_flax_msgpack_flax_ndarray_ext_above_reduced_decode_budget_uses_ndarray_
     assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
 
 
-def test_flax_msgpack_flax_ndarray_ext_accepts_float8_dtype_metadata(tmp_path: Path) -> None:
-    path = tmp_path / "float8_ndarray_ext.msgpack"
-    _write_sparse_large_flax_ndarray_ext(path, 64, dtype="float8_e4m3fn", shape_values=[64])
+@pytest.mark.parametrize("dtype", ["float8_e4m3fn", "float4_e2m1fn", "float6_e3m2fn", "int4", "uint4"])
+def test_flax_msgpack_flax_ndarray_ext_accepts_one_byte_ml_dtypes_metadata(
+    tmp_path: Path,
+    dtype: str,
+) -> None:
+    path = tmp_path / f"{dtype}_ndarray_ext.msgpack"
+    _write_sparse_large_flax_ndarray_ext(path, 64, dtype=dtype, shape_values=[64])
 
     result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
 
@@ -1524,20 +1530,34 @@ def test_flax_msgpack_flax_ndarray_ext_accepts_zero_dimension_after_nonzero(tmp_
     assert all(check.name != "Msgpack Parse Check" for check in result.checks)
 
 
-def test_flax_msgpack_large_flax_ndarray_ext_detects_hidden_text_body(tmp_path: Path) -> None:
-    path = tmp_path / "hidden_tail_ndarray_ext.msgpack"
+def test_flax_msgpack_large_flax_ndarray_ext_treats_valid_tensor_bytes_as_data(tmp_path: Path) -> None:
+    path = tmp_path / "text_like_tensor_bytes_ndarray_ext.msgpack"
     body_prefix = (b"\0" * (64 * 1024)) + b"eval('x')"
     body_prefix += b"\0" * (-len(body_prefix) % 4)
     _write_sparse_large_flax_ndarray_ext(path, len(body_prefix), body_prefix=body_prefix)
 
     result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
 
-    assert result.success is False
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.message == r"Suspicious code pattern detected: eval\s*\("
-        for issue in result.issues
-    )
-    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON not in result.metadata.get("scan_outcome_reasons", [])
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["jax_metadata"]["tensor_count"] == 1
+    assert all(issue.message != r"Suspicious code pattern detected: eval\s*\(" for issue in result.issues)
+    assert all(check.name != "Msgpack Parse Check" for check in result.checks)
+
+
+def test_flax_msgpack_direct_ndarray_ext_treats_valid_tensor_bytes_as_data(tmp_path: Path) -> None:
+    path = tmp_path / "direct_text_like_tensor_bytes_ndarray_ext.msgpack"
+    body_prefix = b"eval('x')" + (b"\0" * 24)
+    body_prefix += b"\0" * (-len(body_prefix) % 4)
+    _write_sparse_large_flax_ndarray_ext(path, len(body_prefix), body_prefix=body_prefix, wrap_in_params=False)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["jax_metadata"]["tensor_count"] == 1
+    assert all(issue.message != r"Suspicious code pattern detected: eval\s*\(" for issue in result.issues)
+    assert all(check.name != "Msgpack Parse Check" for check in result.checks)
 
 
 def test_flax_msgpack_large_flax_ndarray_ext_scans_dtype_metadata(tmp_path: Path) -> None:

@@ -45,6 +45,9 @@ _FLAX_NDARRAY_DTYPE_ITEM_SIZES = {
     "bool": 1,
     "bool_": 1,
     "byte": 1,
+    "float4_e2m1fn": 1,
+    "float6_e2m3fn": 1,
+    "float6_e3m2fn": 1,
     "float8_e3m4": 1,
     "float8_e4m3": 1,
     "float8_e4m3b11fnuz": 1,
@@ -54,7 +57,11 @@ _FLAX_NDARRAY_DTYPE_ITEM_SIZES = {
     "float8_e5m2fnuz": 1,
     "float8_e8m0fnu": 1,
     "int8": 1,
+    "int2": 1,
+    "int4": 1,
     "uint8": 1,
+    "uint2": 1,
+    "uint4": 1,
     "i1": 1,
     "u1": 1,
     "float16": 2,
@@ -2371,6 +2378,7 @@ class FlaxMsgpackScanner(BaseScanner):
     ) -> None:
         def recorded_chunks() -> Iterable[str]:
             for chunk in chunks:
+                self._check_timeout()
                 self._record_stream_text(chunk, summary)
                 yield chunk
 
@@ -2443,6 +2451,7 @@ class FlaxMsgpackScanner(BaseScanner):
             while remaining > 0:
                 raw_chunk = cursor._read_exact(min(remaining, _STREAM_TEXT_CHUNK_BYTES))
                 remaining -= len(raw_chunk)
+                self._check_timeout()
                 decoded = decoder.decode(raw_chunk, final=False)
                 if decoded:
                     yield decoded
@@ -2524,6 +2533,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 break
             chunk = cursor._read_exact(min(remaining, _STREAM_TEXT_CHUNK_BYTES))
             remaining -= len(chunk)
+            self._check_timeout()
 
         for transform, context in matched_transforms.items():
             self._add_jax_transform_check(transform, context, location, result)
@@ -2688,6 +2698,7 @@ class FlaxMsgpackScanner(BaseScanner):
         sample_size = min(length, _STREAM_TEXT_CHUNK_BYTES)
         sample = cursor._read_exact(sample_size)
         remaining = length - sample_size
+        self._check_timeout()
         if _is_text_like_short_binary(sample):
             self._analyze_streamed_binary_chunks(sample, cursor, remaining, length, location, result)
         else:
@@ -2701,6 +2712,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     message="Tensor-like binary payload was not text-scanned after a bounded probe",
                 )
             cursor.skip(remaining)
+            self._check_timeout()
         return _StreamValue("bytes", value=None)
 
     def _consume_flax_ndarray_ext_scalar(
@@ -2722,7 +2734,10 @@ class FlaxMsgpackScanner(BaseScanner):
         shape_count = cursor.read_array_header()
         if shape_count > 32:
             raise _MsgpackStreamFormatError("Flax ndarray extension shape rank exceeds metadata limit")
-        shape_values = [self._read_stream_metadata_int(cursor) for _ in range(shape_count)]
+        shape_values = []
+        for _ in range(shape_count):
+            shape_values.append(self._read_stream_metadata_int(cursor))
+            self._check_timeout()
         self._check_stream_shape_values(shape_values, location, result)
 
         dtype = self._read_stream_metadata_string(cursor)
@@ -2735,10 +2750,9 @@ class FlaxMsgpackScanner(BaseScanner):
 
         value_location = f"{location}[2]"
         self._record_stream_tensor_size(data_length, value_location, summary)
-        sample_size = min(data_length, _STREAM_TEXT_CHUNK_BYTES)
-        sample = cursor._read_exact(sample_size)
-        remaining = data_length - sample_size
-        self._analyze_streamed_binary_chunks(sample, cursor, remaining, data_length, value_location, result)
+        self._check_timeout()
+        cursor.skip(data_length)
+        self._check_timeout()
 
         if cursor.tell() != body_end:
             raise _MsgpackStreamFormatError("Flax ndarray extension contains trailing bytes after tensor payload")
@@ -3306,6 +3320,7 @@ class FlaxMsgpackScanner(BaseScanner):
             }
 
             for index in range(visible_items):
+                self._check_timeout()
                 declared_key_length = cursor.peek_declared_data_bytes()
                 if declared_key_length is not None and declared_key_length > self.max_stream_key_length:
                     summary.analysis_complete = False
@@ -3418,6 +3433,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 )
             sequence_summary = _StreamSequenceSummary(item_count=array_length) if capture_sequence else None
             for index in range(visible_items):
+                self._check_timeout()
                 value = self._read_stream_value(
                     cursor,
                     result,
@@ -3505,6 +3521,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 stream_size = os.fstat(source.fileno()).st_size
                 cursor = _MsgpackStreamCursor(source, stream_size)
                 while True:
+                    self._check_timeout()
                     previous_offset = cursor.tell()
                     if len(object_types) >= self.max_msgpack_stream_objects:
                         if previous_offset == stream_size:
@@ -3567,6 +3584,8 @@ class FlaxMsgpackScanner(BaseScanner):
                     object_types.append(value.type_name)
                     if object_index == 0:
                         primary_summary.top_level_type = value.type_name
+        except TimeoutError:
+            raise
         except _StreamCoverageStopped:
             result.finish(success=False)
             return None
@@ -3603,8 +3622,11 @@ class FlaxMsgpackScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
 
+        self._start_scan_timer()
+
         # Add file integrity check for compliance
         self.add_file_integrity_check(path, result)
+        self._check_timeout()
 
         self.current_file_path = path
 
@@ -3658,6 +3680,8 @@ class FlaxMsgpackScanner(BaseScanner):
                 self._validate_flax_structure(summary, result, ml_analysis=ml_analysis)
 
             result.bytes_scanned = file_size
+        except TimeoutError:
+            raise
         except MemoryError:
             result.add_check(
                 name="File Size Safety Check",

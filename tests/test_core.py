@@ -604,6 +604,18 @@ def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
             archive.writestr(name, data)
 
 
+def _pack_flax_ndarray_ext_checkpoint(tensor_bytes: bytes, *, dtype: str = "float32") -> bytes:
+    shape = (len(tensor_bytes) // 4,)
+    ndarray_body = flax_msgpack_scanner.msgpack.packb((shape, dtype, tensor_bytes), use_bin_type=True)
+    return cast(
+        bytes,
+        flax_msgpack_scanner.msgpack.packb(
+            {"params": {"embedding": flax_msgpack_scanner.msgpack.ExtType(1, ndarray_body)}},
+            use_bin_type=True,
+        ),
+    )
+
+
 def _promote_small_zip_to_zip64(path: Path) -> None:
     """Rewrite a small fixture with ZIP64 EOCD metadata while preserving its entries."""
     archive_bytes = bytearray(path.read_bytes())
@@ -4061,6 +4073,88 @@ def test_scan_file_does_not_route_native_flax_suffix_lightgbm_near_match(tmp_pat
 
     assert result.scanner_name == "flax_msgpack"
     assert not any(check.name == "Command/Network Correlation Check" for check in result.checks)
+
+
+def test_scan_file_treats_valid_flax_ndarray_tensor_bytes_as_data(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "flax_model.msgpack"
+    checkpoint.write_bytes(_pack_flax_ndarray_ext_checkpoint(b"eval('x')" + (b"\0" * 27)))
+
+    result = scan_file(
+        str(checkpoint),
+        config={"cache_scan_results": False, "max_msgpack_decode_bytes": 16},
+    )
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is True
+    assert not any(issue.message == r"Suspicious code pattern detected: eval\s*\(" for issue in result.issues)
+
+
+def test_scan_file_treats_nested_flax_ndarray_tensor_bytes_as_data(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = _pack_flax_ndarray_ext_checkpoint(b"eval('x')" + (b"\0" * 27))
+    archive = tmp_path / "flax-bundle.zip"
+    _create_misnamed_zip(archive, {"flax_model.msgpack": checkpoint})
+
+    result = scan_file(
+        str(archive),
+        config={"cache_scan_results": False, "max_msgpack_decode_bytes": 16},
+    )
+
+    assert result.scanner_name == "zip"
+    assert result.success is True
+    assert not any(issue.message == r"Suspicious code pattern detected: eval\s*\(" for issue in result.issues)
+
+
+def test_scan_file_flax_ndarray_timeout_fails_closed_and_is_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "timeout_flax_model.msgpack"
+    checkpoint.write_bytes(_pack_flax_ndarray_ext_checkpoint(b"\0" * 32))
+    cache_dir = tmp_path / "cache"
+    skipped_tensor_payload = False
+    original_skip = flax_msgpack_scanner._MsgpackStreamCursor.skip
+
+    def skip_and_timeout_afterwards(cursor: Any, size: int) -> None:
+        nonlocal skipped_tensor_payload
+        original_skip(cursor, size)
+        skipped_tensor_payload = True
+
+    def forced_timeout_after_tensor_skip(scanner: Any, allow_partial: bool = False) -> bool:
+        if skipped_tensor_payload:
+            raise TimeoutError("forced Flax MessagePack timeout after tensor skip")
+        return False
+
+    monkeypatch.setattr(flax_msgpack_scanner._MsgpackStreamCursor, "skip", skip_and_timeout_afterwards)
+    monkeypatch.setattr(flax_msgpack_scanner.FlaxMsgpackScanner, "_check_timeout", forced_timeout_after_tensor_skip)
+    reset_cache_manager()
+    try:
+        result = scan_file(
+            str(checkpoint),
+            config={
+                "cache_enabled": True,
+                "cache_dir": str(cache_dir),
+                "min_cache_file_size": 0,
+                "max_msgpack_decode_bytes": 16,
+            },
+        )
+
+        assert skipped_tensor_payload is True
+        assert result.scanner_name == "flax_msgpack"
+        assert result.success is False
+        assert result.metadata["operational_error_reason"] == "scan_timeout"
+        assert any(check.name == "Scan Timeout Check" for check in result.checks)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 @pytest.mark.parametrize("foreign_format", ["rknn", "torch7", "cntk", "lightgbm"])
