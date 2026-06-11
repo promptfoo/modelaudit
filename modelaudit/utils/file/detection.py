@@ -316,6 +316,11 @@ _HF_TOKENIZER_JAX_ROUTE_KEYS = frozenset(
 _HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_KEYS = (
     _HF_TOKENIZER_TEMPLATE_KEYS | _MXNET_SYMBOL_ROOT_KEYS | {"learner"} | _HF_TOKENIZER_JAX_ROUTE_KEYS
 )
+_HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_RE = re.compile(
+    rb'}\s*,\s*"(?:'
+    + b"|".join(re.escape(key.encode("utf-8")) for key in sorted(_HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_KEYS))
+    + rb')"\s*:'
+)
 LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT = "llamafile_routing_inconclusive"
 NEMO_ROUTING_INCONCLUSIVE_FORMAT = "nemo_routing_inconclusive"
 XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT = "xgboost_ubjson_routing_inconclusive"
@@ -905,16 +910,20 @@ def _hf_tokenizer_probe_model_object(
             model_type = _json_probe_decode_string(probe, value_offset, value_end)
             model_type_value = model_type in _HF_TOKENIZER_MODEL_TYPES
 
-        try:
-            next_offset = _json_probe_skip_value_with_template_scan(
-                probe,
-                value_offset,
-                state,
-                depth=1,
-                scan_string_template_indicators=False,
-            )
-        except _JSONProbeIncomplete:
-            return None, saw_model_type and saw_vocab
+        if key == "vocab":
+            next_offset = _json_probe_skip_value(probe, value_offset)
+            if next_offset is None:
+                return None, saw_model_type and saw_vocab
+        else:
+            try:
+                next_offset = _json_probe_skip_value_with_template_scan(
+                    probe,
+                    value_offset,
+                    state,
+                    depth=1,
+                )
+            except _JSONProbeIncomplete:
+                return None, saw_model_type and saw_vocab
         if key == "type":
             saw_model_type = model_type_value
         if key == "vocab":
@@ -947,7 +956,7 @@ def _hf_tokenizer_suffix_has_route_conflict(file_path: Path, file_size: int) -> 
     except OSError:
         return True
 
-    return any(f'"{key}"'.encode() in suffix for key in _HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_KEYS)
+    return _HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_RE.search(suffix) is not None
 
 
 def _hf_tokenizer_json_has_bounded_key_evidence(path: str | Path, keys: frozenset[str]) -> bool:
@@ -977,11 +986,15 @@ def _hf_tokenizer_json_has_bounded_key_evidence(path: str | Path, keys: frozense
 
 def huggingface_tokenizer_json_has_template_route_evidence(path: str | Path) -> bool:
     """Return whether bounded tokenizer JSON evidence should route to Jinja scanning."""
+    if is_huggingface_tokenizer_json_file(path):
+        return False
     return _hf_tokenizer_json_has_bounded_key_evidence(path, _HF_TOKENIZER_TEMPLATE_KEYS)
 
 
 def huggingface_tokenizer_json_has_jax_route_evidence(path: str | Path) -> bool:
     """Return whether bounded tokenizer JSON evidence should route to JAX scanning."""
+    if is_huggingface_tokenizer_json_file(path):
+        return False
     return _hf_tokenizer_json_has_bounded_key_evidence(path, _HF_TOKENIZER_JAX_ROUTE_KEYS)
 
 

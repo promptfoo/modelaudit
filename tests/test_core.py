@@ -9766,8 +9766,15 @@ def test_scan_file_large_hf_tokenizer_json_with_vocab_jinja_tokens_is_benign_for
         tokenizer_dir / "tokenizer.json",
         {
             "model": {
-                "type": "Unigram",
-                "vocab": [["{{", -1.0], *[[f"piece_{index}", -float(index)] for index in range(80)]],
+                "type": "BPE",
+                "vocab": {
+                    "{{": 0,
+                    "template": 1,
+                    "framework": 2,
+                    "nodes": 3,
+                    **{f"piece_{index}": index + 4 for index in range(80)},
+                },
+                "merges": [],
             },
         },
     )
