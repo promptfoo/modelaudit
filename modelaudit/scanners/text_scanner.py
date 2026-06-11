@@ -588,7 +588,7 @@ DOCUMENTATION_FENCED_RESPONSE_EXECUTOR = (
 DOCUMENTATION_FENCED_EXECUTED_FETCH_PATTERN = re.compile(
     rb"\b"
     + DOCUMENTATION_FENCED_RESPONSE_EXECUTOR
-    + rb"\s*\([^()\r\n]*(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
+    + rb"\s*\([^\r\n]{0,4096}(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_FETCH_RESPONSE_ASSIGNMENT_PATTERN = re.compile(
@@ -1628,12 +1628,30 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
+    def _documentation_fenced_line_executes_inside_clone_checkout(cls, line: bytes) -> bool:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(b"#"):
+            return False
+        prefix = cls._documentation_fenced_shell_command_prefix_pattern()
+        return any(
+            re.match(pattern, stripped, flags=re.IGNORECASE) is not None
+            for pattern in (
+                prefix + rb"\./[A-Za-z0-9_./\-]{1,4096}(?:\s|$)",
+                prefix
+                + rb"(?:python(?:[0-9.]+)?|py)\s+(?:-[A-Za-z0-9_.=\-]+\s+){0,8}"
+                + rb"(?:setup\.py|[A-Za-z0-9_./\-]+\.py)(?:\s|$)",
+                prefix + rb"(?:bash|sh|zsh|node|ruby|perl)\s+" + rb"[A-Za-z0-9_./\-]+\.(?:sh|js|rb|pl)(?:\s|$)",
+                prefix + rb"(?:make|cmake|npm|yarn|pnpm|pip|uv)\b",
+            )
+        )
+
+    @classmethod
     def _documentation_fenced_line_executes_clone_checkout(cls, line: bytes, checkout_path: bytes) -> bool:
         stripped = line.strip()
         if not stripped or stripped.startswith(b"#"):
             return False
         if checkout_path == b".":
-            return cls._documentation_fenced_line_executes_relative_checkout_path(stripped)
+            return cls._documentation_fenced_line_executes_inside_clone_checkout(stripped)
         path_reference = rb"(?:\./)?" + re.escape(checkout_path)
         prefix = cls._documentation_fenced_shell_command_prefix_pattern()
         return any(
@@ -1676,7 +1694,7 @@ class TextScanner(BaseScanner):
             return False
         inside_checkout = False
         for raw_line in payload[line_end + 1 : range_end].splitlines():
-            if inside_checkout and cls._documentation_fenced_line_executes_relative_checkout_path(raw_line):
+            if inside_checkout and cls._documentation_fenced_line_executes_inside_clone_checkout(raw_line):
                 return True
             if cls._documentation_fenced_line_executes_clone_checkout(raw_line, checkout_path):
                 return True

