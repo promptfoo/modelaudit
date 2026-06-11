@@ -270,9 +270,13 @@ class ZipScanner(BaseScanner):
         return self._normalize_skip_entry_name(name) in self.content_only_member_entries
 
     @staticmethod
-    def _preserve_nested_routing_basename(name: str) -> bool:
+    def _archive_entry_basename(name: str) -> str:
+        return name.replace("\\", "/").rsplit("/", 1)[-1]
+
+    @classmethod
+    def _preserve_nested_routing_basename(cls, name: str) -> bool:
         """Return True when nested scanner routing depends on the exact basename."""
-        basename = os.path.basename(name).lower()
+        basename = cls._archive_entry_basename(name).lower()
         ext = os.path.splitext(basename)[1]
         if ext in {".zip", ".npz", ".mar"}:
             return True
@@ -1993,7 +1997,7 @@ class ZipScanner(BaseScanner):
                         raw_safe_name = re.sub(
                             r"[^a-zA-Z0-9_.-]",
                             "_",
-                            os.path.basename(name),
+                            self._archive_entry_basename(name),
                         )
                         safe_name = raw_safe_name if preserve_nested_routing_basename else raw_safe_name.strip("._")
                         if not safe_name:

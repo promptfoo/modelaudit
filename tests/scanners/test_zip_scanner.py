@@ -10934,6 +10934,31 @@ class TestZipScanner:
         assert failed_secret_checks[0].rule_code == "S702"
         assert failed_secret_checks[0].details.get("zip_entry") == "README.md"
 
+    def test_scan_zip_backslash_readme_member_detects_basic_auth_header(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "backslash_headers.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("docs\\README", "Authorization: Basic YmFja3NsYXNoOnBhc3M=\n")
+
+        result = core.scan_file(
+            str(archive_path),
+            config={
+                "cache_scan_results": False,
+                "check_network_comm": False,
+            },
+        )
+
+        failed_secret_checks = [
+            check
+            for check in result.checks
+            if check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("secret_type") == "Basic Auth Credentials"
+        ]
+        assert result.success is False
+        assert failed_secret_checks
+        assert failed_secret_checks[0].rule_code == "S702"
+        assert failed_secret_checks[0].details.get("zip_entry") == "docs\\README"
+
     def test_scan_nested_zip_text_member_detects_valid_basic_auth_header(self, tmp_path: Path) -> None:
         inner_payload = io.BytesIO()
         with zipfile.ZipFile(inner_payload, "w") as inner_archive:

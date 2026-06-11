@@ -152,6 +152,12 @@ class TestSecretsDetector:
         [
             ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
             (f"Authorization: Basic {_basic_auth_token(b'sentence:pass')}.", _basic_auth_token(b"sentence:pass")),
+            (f'BASIC_AUTH="Basic {_basic_auth_token(b"basic-var:pass")}"', _basic_auth_token(b"basic-var:pass")),
+            (f'auth_header = "Basic {_basic_auth_token(b"auth-header:pass")}"', _basic_auth_token(b"auth-header:pass")),
+            (
+                f"Authorization: Basic {_basic_auth_token(b'escaped-crlf:pass')}\\r\\n",
+                _basic_auth_token(b"escaped-crlf:pass"),
+            ),
             (f"HTTP_AUTHORIZATION=Basic {_basic_auth_token(b'env-user:pass')}", _basic_auth_token(b"env-user:pass")),
             (
                 f"HTTP_PROXY_AUTHORIZATION=Basic {_basic_auth_token(b'proxy-env:pass')}",
