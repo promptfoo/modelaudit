@@ -2045,7 +2045,7 @@ def download_model_streaming(
 
             # Download single file
             downloaded_file = prefetched_selected_paths.pop(filename, None)
-            if downloaded_file is None:
+            if downloaded_file is None or not downloaded_file.is_file():
                 downloaded_file = download_stream_file(filename)
             if size_limit is not None:
                 downloaded_file_size = _get_downloaded_huggingface_file_size(repo_id, downloaded_file, filename)
@@ -2089,12 +2089,19 @@ def download_model_streaming(
                         if deadline is not None and time.monotonic() >= deadline:
                             raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
                         if external_filename in selected_file_set:
-                            if external_filename in downloaded_selected_paths:
+                            downloaded_selected_path = downloaded_selected_paths.get(external_filename)
+                            if downloaded_selected_path is not None and downloaded_selected_path.is_file():
                                 continue
                             external_path = prefetched_selected_paths.get(external_filename)
-                            if external_path is None:
+                            if external_path is None or not external_path.is_file():
                                 external_path = download_stream_file(external_filename)
-                                prefetched_selected_paths[external_filename] = external_path
+                                if downloaded_selected_path is None:
+                                    prefetched_selected_paths[external_filename] = external_path
+                            if downloaded_selected_path is not None:
+                                downloaded_selected_paths[external_filename] = external_path
+                                if _should_cleanup_hf_streaming_context_file(cache_dir, download_path, external_path):
+                                    onnx_external_data_cleanup_paths.append(external_path)
+                                continue
                             if size_limit is not None:
                                 external_file_size = _get_downloaded_huggingface_file_size(
                                     repo_id,

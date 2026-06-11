@@ -3824,6 +3824,40 @@ class TestCVE202634447SymlinkTraversal:
             c for c in result.checks if c.name == "External Data Reference Check" and c.status == CheckStatus.FAILED
         ]
 
+    def test_huggingface_cache_snapshot_directory_symlink_to_blob_still_flagged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        cache_hub = tmp_path / "hf-hub"
+        monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+        cache_root = cache_hub / "models--FacebookAI--xlm-roberta-large"
+        blobs_dir = cache_root / "blobs"
+        snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+        blobs_dir.mkdir(parents=True)
+        snapshot_dir.mkdir(parents=True)
+
+        source_dir = tmp_path / "source-dir-symlink"
+        source_dir.mkdir()
+        source_model = create_onnx_model(source_dir, external=True, external_path="nested/model.onnx_data")
+        model_blob = blobs_dir / "model-dir-symlink-blob"
+        sidecar_blob = blobs_dir / "model.onnx_data"
+        model_blob.write_bytes(source_model.read_bytes())
+        sidecar_blob.write_bytes((source_dir / "nested" / "model.onnx_data").read_bytes())
+
+        model_path = snapshot_dir / "model.onnx"
+        model_path.symlink_to(os.path.relpath(model_blob, snapshot_dir))
+        (snapshot_dir / "nested").symlink_to(os.path.relpath(blobs_dir, snapshot_dir))
+
+        result = OnnxScanner().scan(str(model_path))
+
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
+        assert result.success is False
+        assert len(cve_checks) == 1
+        assert cve_checks[0].details["file"] == "nested/model.onnx_data"
+        assert cve_checks[0].details["resolved_path"] == str(sidecar_blob.resolve())
+
     def test_huggingface_cache_snapshot_malicious_external_data_traversal_still_flagged(
         self,
         tmp_path: Path,
