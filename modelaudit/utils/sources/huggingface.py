@@ -42,7 +42,10 @@ _MAX_HF_STREAMING_UNFILTERED_FILES = 128
 _HF_DOWNLOAD_WORKER_RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
 _POSIX_TERMINATE_SIGNAL = getattr(signal, "SIGTERM", 15)
 _POSIX_KILL_SIGNAL = getattr(signal, "SIGKILL", 9)
-_HF_SAFETENSORS_SHARD_PATTERN = re.compile(r"(^|/).+-\d{5}-of-\d{5}\.safetensors$", re.IGNORECASE)
+_HF_SAFETENSORS_SHARD_PATTERN = re.compile(
+    r"(^|/)(?P<stem>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})\.safetensors$",
+    re.IGNORECASE,
+)
 
 __all__ = [
     "download_file_from_hf",
@@ -949,6 +952,44 @@ def _hf_safetensors_shard_excluded_by_selection(
     return not selected_format_route_scanner_ids.intersection(safetensors_route_scanner_ids)
 
 
+def _parse_hf_safetensors_shard(filename: str) -> tuple[str, int, int] | None:
+    match = _HF_SAFETENSORS_SHARD_PATTERN.search(filename)
+    if match is None:
+        return None
+    index = int(match.group("index"))
+    total = int(match.group("total"))
+    if index < 1 or total < 1 or index > total:
+        return None
+    return match.group("stem"), index, total
+
+
+def _get_declared_hf_safetensors_shard_families(repo_files: Collection[str]) -> frozenset[tuple[str, int]]:
+    shard_indices_by_family: dict[tuple[str, int], set[int]] = {}
+    for filename in dict.fromkeys(repo_files):
+        parsed_shard = _parse_hf_safetensors_shard(filename)
+        if parsed_shard is None:
+            continue
+        stem, index, total = parsed_shard
+        shard_indices_by_family.setdefault((stem, total), set()).add(index)
+
+    return frozenset(
+        family_key
+        for family_key, shard_indices in shard_indices_by_family.items()
+        if len(shard_indices) == family_key[1]
+    )
+
+
+def _is_declared_hf_safetensors_shard(
+    filename: str,
+    declared_safetensors_shard_families: frozenset[tuple[str, int]],
+) -> bool:
+    parsed_shard = _parse_hf_safetensors_shard(filename)
+    if parsed_shard is None:
+        return False
+    stem, _index, total = parsed_shard
+    return (stem, total) in declared_safetensors_shard_families
+
+
 def _hf_detected_format_excluded_by_selected_route_formats(
     detected_format: str,
     selected_route_formats: set[str],
@@ -1123,15 +1164,22 @@ def _select_streamable_hf_files(
             remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
             deadline=deadline,
         )
-        selected_files = set(model_files)
+        processed_files = set(model_files)
+        declared_safetensors_shard_families = _get_declared_hf_safetensors_shard_families(repo_files)
         for file_name in repo_files:
-            if file_name in selected_files:
+            if file_name in processed_files:
                 continue
+            processed_files.add(file_name)
             may_skip_detected_safetensors_shard = _hf_safetensors_shard_excluded_by_selection(
                 file_name,
                 selected_route_scanner_ids,
                 selected_route_formats,
             )
+            if may_skip_detected_safetensors_shard and _is_declared_hf_safetensors_shard(
+                file_name,
+                declared_safetensors_shard_families,
+            ):
+                continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
                     "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "
@@ -1154,7 +1202,6 @@ def _select_streamable_hf_files(
             ):
                 continue
             model_files.append(file_name)
-            selected_files.add(file_name)
 
     if not model_files:
         _raise_no_scannable_hf_files(repo_id)
