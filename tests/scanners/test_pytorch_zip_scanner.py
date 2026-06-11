@@ -8048,7 +8048,11 @@ def test_pytorch_zip_unknown_runtime_with_producer_version_fails_closed_and_is_n
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.0.1")
-    monkeypatch.setattr(PyTorchZipScanner, "_trusted_python_package_roots", staticmethod(lambda: ()))
+    monkeypatch.setattr(
+        PyTorchZipScanner,
+        "_resolve_installed_pytorch_version",
+        lambda self: (None, None),
+    )
 
     _assert_pytorch_zip_inconclusive_not_cached(
         model_path,
