@@ -210,7 +210,7 @@ DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_NESTED_CONFIG_VALUE_LINE_PATTERN = re.compile(
-    rb"[ \t]+[\"']?(?:url|uri)[\"']?\s*:\s*[\"']?",
+    rb"[ \t]+(?:[-*+]\s+)?[\"']?(?:url|uri)[\"']?\s*:\s*[\"']?",
     re.IGNORECASE,
 )
 DOCUMENTATION_CONFIG_TAG_PATTERN = re.compile(

@@ -2922,6 +2922,38 @@ def test_text_scanner_documentation_endpoint_redaction_limit_with_nested_config_
     )
 
 
+def test_text_scanner_documentation_endpoint_redaction_limit_with_list_nested_config_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", lambda text: text)
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "api_key references below are documentation-only.\n"
+        + "\n".join(f"Reference {index}: https://cdn.openai.com/papers/{index}.pdf" for index in range(40))
+        + "\nendpoint:\n  - url: https://evil.example/payload.sh\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_secrets": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        config={"check_secrets": False},
+        cache_enabled=False,
+    )
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert determine_exit_code(aggregate) == 2
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
+        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
+        for check in result.checks
+    )
+
+
 def test_text_scanner_documentation_classification_limit_is_inconclusive(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text("No malware is present.\n" * 1_025, encoding="utf-8")
