@@ -699,6 +699,7 @@ class _JSONProbeInvalid(Exception):
 @dataclass
 class _HFTokenizerJSONProbeState:
     has_template_evidence: bool = False
+    incomplete_model_member_key: str | None = None
 
 
 def _json_probe_string_has_template_indicator(probe: bytes, start: int, end: int) -> bool:
@@ -867,6 +868,7 @@ def _hf_tokenizer_probe_model_object(
     state: _HFTokenizerJSONProbeState,
 ) -> tuple[int | None, bool]:
     """Return the model-object end offset when complete plus schema evidence."""
+    state.incomplete_model_member_key = None
     offset = _json_probe_skip_whitespace(probe, offset)
     if offset >= len(probe) or probe[offset] != ord("{"):
         raise _JSONProbeInvalid
@@ -896,6 +898,7 @@ def _hf_tokenizer_probe_model_object(
             raise _JSONProbeInvalid
         value_offset = _json_probe_skip_whitespace(probe, offset + 1)
         if value_offset >= len(probe):
+            state.incomplete_model_member_key = key
             return None, saw_model_type and saw_vocab
 
         model_type_value = False
@@ -910,6 +913,7 @@ def _hf_tokenizer_probe_model_object(
             saw_vocab = True
             next_offset = _json_probe_skip_value(probe, value_offset)
             if next_offset is None:
+                state.incomplete_model_member_key = key
                 return None, saw_model_type and saw_vocab
         else:
             try:
@@ -920,6 +924,7 @@ def _hf_tokenizer_probe_model_object(
                     depth=1,
                 )
             except _JSONProbeIncomplete:
+                state.incomplete_model_member_key = key
                 return None, saw_model_type and saw_vocab
         if key == "type":
             saw_model_type = model_type_value
@@ -927,9 +932,13 @@ def _hf_tokenizer_probe_model_object(
         offset = next_offset
         offset = _json_probe_skip_whitespace(probe, offset)
         if offset >= len(probe):
+            state.incomplete_model_member_key = key
             return None, saw_model_type and saw_vocab
         if probe[offset] == ord(","):
             offset += 1
+            if offset >= len(probe):
+                state.incomplete_model_member_key = key
+                return None, saw_model_type and saw_vocab
             continue
         if probe[offset] == ord("}"):
             return offset + 1, saw_model_type and saw_vocab
@@ -1107,23 +1116,27 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
                         depth=1,
                     )
             except (_JSONProbeIncomplete, _JSONProbeInvalid):
+                model_member_key = state.incomplete_model_member_key if key == "model" else None
                 return sample_is_prefix and _hf_tokenizer_suffix_has_structural_route_key(
                     file_path,
                     file_size,
                     keys,
-                    allow_after_any_value=key != "model",
-                    allow_after_vocab_array=scan_nested_templates and key == "model",
+                    allow_after_any_value=key != "model"
+                    or (scan_nested_templates and key == "model" and model_member_key not in {None, "vocab"}),
+                    allow_after_vocab_array=scan_nested_templates and key == "model" and model_member_key == "vocab",
                     require_jax_identity_value=require_jax_identity_value,
                 )
             if state.has_template_evidence:
                 return True
             if next_offset is None:
+                model_member_key = state.incomplete_model_member_key if key == "model" else None
                 return sample_is_prefix and _hf_tokenizer_suffix_has_structural_route_key(
                     file_path,
                     file_size,
                     keys,
-                    allow_after_any_value=key != "model",
-                    allow_after_vocab_array=scan_nested_templates and key == "model",
+                    allow_after_any_value=key != "model"
+                    or (scan_nested_templates and key == "model" and model_member_key not in {None, "vocab"}),
+                    allow_after_vocab_array=scan_nested_templates and key == "model" and model_member_key == "vocab",
                     require_jax_identity_value=require_jax_identity_value,
                 )
         else:

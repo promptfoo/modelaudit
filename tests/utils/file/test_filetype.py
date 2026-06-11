@@ -1875,6 +1875,44 @@ def test_hf_tokenizer_json_model_template_after_vocab_probe_boundary_routes_jinj
     assert detect_file_format(str(tokenizer_path)) == "unknown"
 
 
+def test_hf_tokenizer_json_model_template_after_merges_probe_boundary_routes_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 256)
+    merges = ",".join(json.dumps(f"piece_{index} piece_{index + 1}") for index in range(80))
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        model_fields=(
+            f'"type":"BPE","vocab":{{"hello":0}},"merges":[{merges}],'
+            '"template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"'
+        ),
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+
+
+def test_hf_tokenizer_json_vocab_template_token_after_array_value_does_not_route_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 256)
+    vocab_entries = '"piece":[],"template":0,' + ",".join(f'"tok_{index}":{index}' for index in range(80))
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        model_fields=f'"type":"BPE","vocab":{{{vocab_entries}}},"merges":[]',
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is False
+
+
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
 @pytest.mark.parametrize("filename", ["model.json", "model.jpg"])
 def test_detect_mxnet_symbol_with_python_json_nonfinite_constant_routes_mxnet(
