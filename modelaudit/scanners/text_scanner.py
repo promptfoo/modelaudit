@@ -487,7 +487,7 @@ DOCUMENTATION_FENCED_PROCESS_SUBSTITUTION_EXECUTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN = re.compile(
-    rb"\|\s*(?:sudo\s+)?(?:(?:(?:/[A-Za-z0-9._-]+)*/)?env\s+"
+    rb"\|&?\s*(?:sudo\s+)?(?:(?:(?:/[A-Za-z0-9._-]+)*/)?env\s+"
     rb"(?:(?:-[A-Za-z0-9_=-]+|[A-Za-z_][A-Za-z0-9_]*=[^\s]+)\s+)*)?(?:(?:/[A-Za-z0-9._-]+)*/)?"
     rb"(?:bash|sh|zsh|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh|python(?:\d+(?:\.\d+)*)?|perl|ruby|node|php)\b",
     re.IGNORECASE,
@@ -594,6 +594,11 @@ DOCUMENTATION_FENCED_EXECUTED_FETCH_PATTERN = re.compile(
 DOCUMENTATION_FENCED_FETCH_RESPONSE_ASSIGNMENT_PATTERN = re.compile(
     rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
     rb"(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_RESPONSE_CONTENT_ALIAS_ASSIGNMENT_PATTERN = re.compile(
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<source>[A-Za-z_][A-Za-z0-9_]*)"
+    rb"(?:\s*\.\s*(?:text|content)|\s*\.\s*read\s*\(\s*\))",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_EXECUTED_RESPONSE_PATTERN = re.compile(
@@ -2054,6 +2059,20 @@ class TextScanner(BaseScanner):
             ):
                 continue
             response_assignments.setdefault(match.group("target"), []).append(match.start())
+
+        for match in DOCUMENTATION_FENCED_RESPONSE_CONTENT_ALIAS_ASSIGNMENT_PATTERN.finditer(fenced_code):
+            if cls._documentation_fenced_match_is_line_comment(
+                fenced_code,
+                match.start(),
+            ) or cls._documentation_python_string_spans_contain_absolute_position(
+                fenced_code,
+                match.start(),
+                string_spans,
+                string_span_starts,
+            ):
+                continue
+            if any(position < match.start() for position in response_assignments.get(match.group("source"), [])):
+                response_assignments.setdefault(match.group("target"), []).append(match.start())
 
         return any(
             any(position < exec_match.start() for position in response_assignments.get(exec_match.group("target"), []))
