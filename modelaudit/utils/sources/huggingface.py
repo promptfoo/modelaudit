@@ -104,6 +104,12 @@ class _HuggingFaceProbeBudget:
         self.file_sizes[filename] = file_size
 
 
+@dataclass
+class _HuggingFaceStreamingSelection:
+    filenames: list[str]
+    content_route_formats: dict[str, str] = field(default_factory=dict)
+
+
 def _parse_huggingface_response_file_size(response: Any, bytes_read: int, max_bytes: int) -> int | None:
     """Return the total remote file size when the bounded response proves it."""
     headers = getattr(response, "headers", {})
@@ -968,7 +974,7 @@ def _select_streamable_hf_files(
     *,
     include_all_files: bool = False,
     deadline: float | None = None,
-) -> list[str]:
+) -> _HuggingFaceStreamingSelection:
     """Select bounded remotely scannable files without treating ``""`` as a wildcard."""
     selected_route_formats: set[str] | None = None
     selected_route_scanner_ids: set[str] | None = None
@@ -1009,6 +1015,7 @@ def _select_streamable_hf_files(
             set() if scannable_filenames is None else {str(filename).lower() for filename in scannable_filenames}
         )
     model_files: list[str] = []
+    content_route_formats: dict[str, str] = {}
     extensionless_count = 0
     unfiltered_count = 0
     seen_files: set[str] = set()
@@ -1076,17 +1083,18 @@ def _select_streamable_hf_files(
             elif selected_route_formats is not None and detected_format not in selected_route_formats:
                 continue
             model_files.append(file_name)
+            content_route_formats[file_name] = detected_format
             selected_files.add(file_name)
 
     if not model_files:
         _raise_no_scannable_hf_files(repo_id)
 
-    return model_files
+    return _HuggingFaceStreamingSelection(model_files, content_route_formats)
 
 
-def _is_hf_streaming_onnx_candidate(filename: str) -> bool:
+def _is_hf_streaming_onnx_candidate(filename: str, *, content_route_format: str | None = None) -> bool:
     """Return whether a selected remote file should be checked for ONNX sidecars."""
-    return PurePosixPath(filename).suffix.lower() == ".onnx"
+    return PurePosixPath(filename).suffix.lower() == ".onnx" or content_route_format == "onnx"
 
 
 def _resolve_hf_onnx_external_data_path(onnx_filename: str, location: str) -> str | None:
@@ -1550,6 +1558,35 @@ def _verify_huggingface_selection_within_max_size(
     return total_size
 
 
+def _get_downloaded_huggingface_file_size(repo_id: str, file_path: Path, filename: str) -> int:
+    """Return a downloaded file's exact size or fail closed with remote filename context."""
+    if not file_path.is_file():
+        raise ValueError(f"Cannot verify max-size for {repo_id}: downloaded selected file missing: {filename}")
+    try:
+        return file_path.stat().st_size
+    except OSError as exc:
+        raise ValueError(
+            f"Cannot verify max-size for {repo_id}: downloaded selected file unreadable: {filename}"
+        ) from exc
+
+
+def _should_cleanup_hf_streaming_context_file(
+    cache_dir: Path | None,
+    download_path: Path | None,
+    file_path: Path,
+) -> bool:
+    """Return whether a context-only sidecar is in ModelAudit's disposable HF staging tree."""
+    if cache_dir is None or download_path is None:
+        return False
+    try:
+        resolved_cache_dir = cache_dir.resolve()
+    except OSError:
+        return False
+    if not resolved_cache_dir.name.startswith("modelaudit_hf_"):
+        return False
+    return _is_within_directory(download_path, file_path)
+
+
 def get_model_info(url: str) -> dict:
     """Get information about a HuggingFace model without downloading it.
 
@@ -1927,7 +1964,7 @@ def download_model_streaming(
                 f"{repo_listing_error or 'repository listing did not include an immutable commit SHA'}"
             )
 
-        model_files = _select_streamable_hf_files(
+        selection = _select_streamable_hf_files(
             repo_id,
             repo_files,
             repo_revision,
@@ -1937,6 +1974,7 @@ def download_model_streaming(
             include_all_files=include_all_files,
             deadline=deadline,
         )
+        model_files = selection.filenames
         revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
             repo_id,
             model_files,
@@ -1946,6 +1984,7 @@ def download_model_streaming(
         )
         download_revision = revision or repo_revision
         repo_file_set = set(repo_files)
+        selected_file_set = set(model_files)
         onnx_external_data_enabled = scannable_scanner_ids is None or "onnx" in {
             str(scanner_id).lower() for scanner_id in scannable_scanner_ids
         }
@@ -1987,6 +2026,7 @@ def download_model_streaming(
         # Download each file one at a time
         total_files = len(model_files)
         downloaded_total_size = 0
+        prefetched_selected_paths: dict[str, Path] = {}
         for idx, filename in enumerate(model_files):
             is_last = idx == total_files - 1
 
@@ -2003,40 +2043,72 @@ def download_model_streaming(
                     )
 
             # Download single file
-            downloaded_file = download_stream_file(filename)
-            downloaded_total_size = _verify_huggingface_selection_within_max_size(
-                repo_id,
-                downloaded_file.parent,
-                [downloaded_file.name],
-                size_limit,
-                initial_size=downloaded_total_size,
-            )
+            downloaded_file = prefetched_selected_paths.pop(filename, None)
+            if downloaded_file is None:
+                downloaded_file = download_stream_file(filename)
+            if size_limit is not None:
+                downloaded_file_size = _get_downloaded_huggingface_file_size(repo_id, downloaded_file, filename)
+                downloaded_total_size += downloaded_file_size
+                if downloaded_total_size > size_limit:
+                    raise ValueError(
+                        f"Cannot download {repo_id}: downloaded selected Hugging Face files total "
+                        f"{downloaded_total_size} bytes exceeds max size {size_limit} bytes"
+                    )
 
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
 
-            onnx_external_data_paths: list[Path] = []
-            if onnx_external_data_enabled and _is_hf_streaming_onnx_candidate(filename):
+            onnx_external_data_cleanup_paths: list[Path] = []
+            if onnx_external_data_enabled and _is_hf_streaming_onnx_candidate(
+                filename,
+                content_route_format=selection.content_route_formats.get(filename),
+            ):
                 external_data_files = _discover_hf_onnx_external_data_files(
                     downloaded_file,
                     filename,
                     repo_file_set,
                 )
                 if external_data_files:
+                    external_context_files = [
+                        external_filename
+                        for external_filename in external_data_files
+                        if external_filename not in selected_file_set
+                    ]
                     external_data_sizes: dict[str, int] = {}
-                    if size_limit is not None:
+                    if size_limit is not None and external_context_files:
                         external_data_sizes = _get_hf_onnx_external_data_sizes(
                             repo_id,
-                            external_data_files,
+                            external_context_files,
                             revision=download_revision,
                             deadline=deadline,
                         )
+                    active_total_size = downloaded_total_size
                     for external_filename in external_data_files:
                         if deadline is not None and time.monotonic() >= deadline:
                             raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+                        if external_filename in selected_file_set:
+                            external_path = prefetched_selected_paths.get(external_filename)
+                            if external_path is None:
+                                external_path = download_stream_file(external_filename)
+                                prefetched_selected_paths[external_filename] = external_path
+                            if size_limit is not None:
+                                external_file_size = _get_downloaded_huggingface_file_size(
+                                    repo_id,
+                                    external_path,
+                                    external_filename,
+                                )
+                                projected_total = active_total_size + external_file_size
+                                if projected_total > size_limit:
+                                    raise ValueError(
+                                        f"Cannot download {repo_id}: downloaded bytes plus selected ONNX "
+                                        f"external_data file {external_filename} would total {projected_total} "
+                                        f"bytes, exceeding max size {size_limit} bytes"
+                                    )
+                                active_total_size = projected_total
+                            continue
                         if size_limit is not None:
                             advertised_size = external_data_sizes[external_filename]
-                            projected_total = downloaded_total_size + advertised_size
+                            projected_total = active_total_size + advertised_size
                             if projected_total > size_limit:
                                 raise ValueError(
                                     f"Cannot download {repo_id}: downloaded bytes plus ONNX external_data file "
@@ -2044,19 +2116,28 @@ def download_model_streaming(
                                     f"{size_limit} bytes"
                                 )
                         external_path = download_stream_file(external_filename)
-                        downloaded_total_size = _verify_huggingface_selection_within_max_size(
-                            repo_id,
-                            external_path.parent,
-                            [external_path.name],
-                            size_limit,
-                            initial_size=downloaded_total_size,
-                        )
-                        onnx_external_data_paths.append(external_path)
+                        if size_limit is not None:
+                            external_file_size = _get_downloaded_huggingface_file_size(
+                                repo_id,
+                                external_path,
+                                external_filename,
+                            )
+                            projected_total = active_total_size + external_file_size
+                            if projected_total > size_limit:
+                                raise ValueError(
+                                    f"Cannot download {repo_id}: downloaded bytes plus ONNX external_data file "
+                                    f"{external_filename} would total {projected_total} bytes, exceeding max size "
+                                    f"{size_limit} bytes"
+                                )
+                            active_total_size = projected_total
+                            downloaded_total_size += external_file_size
+                        if _should_cleanup_hf_streaming_context_file(cache_dir, download_path, external_path):
+                            onnx_external_data_cleanup_paths.append(external_path)
 
             try:
                 yield (downloaded_file, is_last)
             finally:
-                for external_path in onnx_external_data_paths:
+                for external_path in onnx_external_data_cleanup_paths:
                     with suppress(OSError):
                         external_path.unlink()
 
