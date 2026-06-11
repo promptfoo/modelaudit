@@ -242,6 +242,7 @@ def test_hf_preview_filename_selection_uses_posix_hub_paths() -> None:
     runtime: Any = SimpleNamespace(
         scannable_extensions=frozenset({".missing"}),
         scannable_filenames=frozenset({"config.json"}),
+        scanner_selection_metadata=None,
     )
     files = [
         {"name": "nested/config.json", "size": 10},
@@ -283,7 +284,12 @@ def test_hf_repo_dry_run_preview_does_not_download_or_scan() -> None:
     assert parsed["files_scanned"] == 0
     assert "Download: skipped (--dry-run)" in result.stderr
     assert "Scannable files: 1 of 3" in result.stderr
-    mock_get_model_info.assert_called_once_with("hf://test/model", timeout_seconds=3600)
+    mock_get_model_info.assert_called_once_with(
+        "hf://test/model",
+        timeout_seconds=3600,
+        include_metadata_files=True,
+        sniff_content=False,
+    )
     mock_download_model.assert_not_called()
     mock_scan.assert_not_called()
 
@@ -404,7 +410,12 @@ def test_hf_repo_dry_run_with_max_size_rejects_non_immutable_metadata_revision(r
     assert result.exit_code == 2
     assert "get_model_info() metadata revision for test/model is not an immutable commit SHA" in result.output
     assert "Download: skipped (--dry-run)" not in result.output
-    mock_get_model_info.assert_called_once_with("hf://test/model", timeout_seconds=3600)
+    mock_get_model_info.assert_called_once_with(
+        "hf://test/model",
+        timeout_seconds=3600,
+        include_metadata_files=True,
+        sniff_content=False,
+    )
     mock_download_model.assert_not_called()
     mock_scan.assert_not_called()
 
@@ -941,6 +952,91 @@ def test_hf_stream_dry_run_does_not_select_unverified_openvino_companion() -> No
     mock_scan.assert_not_called()
 
 
+def test_hf_stream_dry_run_exact_generic_scanner_selects_proven_zip_route() -> None:
+    runner = CliRunner()
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": "a" * 40,
+        "total_size": 60,
+        "file_count": 2,
+        "files": [
+            {"name": "model.zip", "size": 20},
+            {"name": "preview.png", "size": 40},
+        ],
+    }
+
+    with (
+        _mock_hf_model_info(return_value=metadata),
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+        patch("modelaudit.utils.sources.huggingface._read_huggingface_prefix") as mock_read_prefix,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--stream",
+                "--format",
+                "json",
+                "--scanners",
+                "zip",
+                "hf://test/model",
+            ],
+        )
+
+    parsed = parse_click_json_output(result.stdout)
+    assert result.exit_code == 0, result.output
+    assert parsed["files_scanned"] == 0
+    assert "Scannable files: 1 of 2" in result.stderr
+    assert "Scannable size: 20 B" in result.stderr
+    mock_read_prefix.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
+def test_hf_stream_dry_run_exact_generic_scanner_rejects_unproven_metadata_files() -> None:
+    runner = CliRunner()
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": "a" * 40,
+        "total_size": 60,
+        "file_count": 2,
+        "files": [
+            {"name": "README.md", "size": 20},
+            {"name": "preview.png", "size": 40},
+        ],
+    }
+
+    with (
+        _mock_hf_model_info(return_value=metadata),
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+        patch("modelaudit.utils.sources.huggingface._read_huggingface_prefix") as mock_read_prefix,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--stream",
+                "--format",
+                "json",
+                "--scanners",
+                "zip",
+                "hf://test/model",
+            ],
+        )
+
+    assert result.exit_code == 2
+    assert "No metadata-routed Hugging Face files match the active scanner selection" in result.output
+    mock_read_prefix.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
 def test_hf_stream_dry_run_max_size_budgets_unselected_content_route_candidates() -> None:
     runner = CliRunner()
     metadata = {
@@ -1210,6 +1306,35 @@ def test_hf_file_dry_run_preview_allows_exclude_only_selection() -> None:
     mock_scan.assert_not_called()
 
 
+def test_hf_file_dry_run_preview_rejects_exclude_only_suffix_owner() -> None:
+    url = "https://huggingface.co/test/model/resolve/main/model.safetensors"
+    runner = CliRunner()
+
+    with (
+        patch(
+            "modelaudit.cli.get_huggingface_file_info",
+            return_value={
+                "repo_id": "test/model",
+                "revision": "main",
+                "resolved_revision": "b" * 40,
+                "filename": "model.safetensors",
+                "size": 123,
+            },
+        ),
+        patch("modelaudit.cli.download_file_from_hf") as mock_download_file,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+    ):
+        result = runner.invoke(
+            cli,
+            ["scan", "--dry-run", "--format", "json", "--exclude-scanner", "safetensors", url],
+        )
+
+    assert result.exit_code == 2
+    assert "cannot prove this file would be scanned from metadata" in result.output
+    mock_download_file.assert_not_called()
+    mock_scan.assert_not_called()
+
+
 def test_hf_file_dry_run_preview_rejects_missing_immutable_revision_with_size_cap() -> None:
     url = "https://huggingface.co/test/model/resolve/main/model.safetensors"
     runner = CliRunner()
@@ -1244,7 +1369,12 @@ def test_hf_repo_dry_run_preview_honors_timeout_in_metadata_lookup() -> None:
         result = runner.invoke(cli, ["scan", "--dry-run", "--timeout", "7", "--format", "json", "hf://test/model"])
 
     assert result.exit_code == 0
-    mock_get_model_info.assert_called_once_with("hf://test/model", timeout_seconds=7)
+    mock_get_model_info.assert_called_once_with(
+        "hf://test/model",
+        timeout_seconds=7,
+        include_metadata_files=True,
+        sniff_content=False,
+    )
 
 
 def test_hf_dry_run_gated_error_redacts_credentials() -> None:

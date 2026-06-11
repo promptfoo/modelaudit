@@ -173,11 +173,11 @@ def _display_error(error: object, path: str) -> str:
     return _escape_terminal_text(display_error)
 
 
-def get_model_info(path: str, *, timeout_seconds: float | None = None) -> dict[str, Any]:
+def get_model_info(path: str, **kwargs: Any) -> dict[str, Any]:
     """Delegate Hugging Face metadata lookup through the source module."""
     from .utils.sources import huggingface as huggingface_source
 
-    return huggingface_source.get_model_info(path, timeout_seconds=timeout_seconds)
+    return huggingface_source.get_model_info(path, **kwargs)
 
 
 def get_huggingface_file_info(
@@ -368,6 +368,9 @@ def _huggingface_preview_download_files(metadata: dict[str, Any]) -> list[dict[s
 def _huggingface_preview_stream_files(metadata: dict[str, Any], runtime: "_ScanRuntimeConfig") -> list[dict[str, Any]]:
     """Return metadata entries that the streaming Hugging Face downloader would select."""
     files = metadata.get("files", [])
+    if runtime.scanner_selection_metadata is not None and runtime.scannable_extensions is None:
+        return _selected_huggingface_preview_files(files, runtime)
+
     file_names = _huggingface_preview_file_names(files)
     repo_id = str(metadata.get("repo_id") or metadata.get("model_id") or "unknown")
     revision = str(metadata.get("revision") or "")
@@ -402,6 +405,7 @@ def _selected_huggingface_preview_files(files: object, runtime: "_ScanRuntimeCon
     if runtime.scannable_extensions is not None:
         extensions = {str(extension).lower() for extension in runtime.scannable_extensions if str(extension)}
     filenames = {str(filename).lower() for filename in runtime.scannable_filenames or ()}
+    scanner_route_ids = _huggingface_preview_scanner_route_ids(runtime)
 
     selected: list[dict[str, Any]] = []
     for item in files:
@@ -412,11 +416,16 @@ def _selected_huggingface_preview_files(files: object, runtime: "_ScanRuntimeCon
             continue
         name_lower = name.lower()
         if extensions is None:
-            selected.append(item)
+            if runtime.scanner_selection_metadata is None or _huggingface_preview_filename_matches_scanner_route(
+                name,
+                scanner_route_ids,
+            ):
+                selected.append(item)
             continue
         if (
             any(name_lower.endswith(extension) for extension in extensions)
             or PurePosixPath(name_lower).name in filenames
+            or _huggingface_preview_filename_matches_scanner_route(name, scanner_route_ids)
         ):
             selected.append(item)
     return selected
@@ -427,6 +436,49 @@ def _scanner_selection_metadata_id_set(value: object) -> set[str]:
     if not isinstance(value, (list, tuple, set, frozenset)):
         return set()
     return {str(item).lower() for item in value if str(item)}
+
+
+def _huggingface_preview_scanner_route_ids(runtime: "_ScanRuntimeConfig") -> set[str]:
+    """Return scanner IDs whose registry routes may prove metadata-only HF previews."""
+    scanner_selection_metadata = getattr(runtime, "scanner_selection_metadata", None)
+    if scanner_selection_metadata is None:
+        return set()
+    enabled_scanners = _scanner_selection_metadata_id_set(scanner_selection_metadata.get("enabled_scanner_ids"))
+    requested_scanners = _scanner_selection_metadata_id_set(scanner_selection_metadata.get("requested_scanner_ids"))
+    return requested_scanners.intersection(enabled_scanners) if requested_scanners else enabled_scanners
+
+
+def _huggingface_preview_filename_matches_scanner_route(filename: str, scanner_ids: set[str]) -> bool:
+    """Return whether selected scanner metadata proves a Hugging Face filename route."""
+    if not scanner_ids:
+        return False
+
+    from .scanner_registry_metadata import get_scanner_registry_metadata
+
+    filename_lower = filename.lower()
+    basename = PurePosixPath(filename_lower).name
+    scanner_metadata = get_scanner_registry_metadata()
+    for scanner_id in scanner_ids:
+        scanner_info = scanner_metadata.get(scanner_id, {})
+        remote_excluded_extensions = {
+            str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])
+        }
+        for known_name in scanner_info.get("content_routed_filenames", ()):
+            if basename == str(known_name).lower():
+                return True
+        for prefix in scanner_info.get("content_routed_filename_prefixes", ()):
+            if basename.startswith(str(prefix).lower()):
+                return True
+        for key in ("extensions", "content_routed_extensions", "scanner_only_extensions"):
+            for extension in scanner_info.get(key, ()):
+                extension_text = str(extension).lower()
+                if (
+                    extension_text
+                    and extension_text not in remote_excluded_extensions
+                    and filename_lower.endswith(extension_text)
+                ):
+                    return True
+    return False
 
 
 def _huggingface_direct_preview_matches_exact_selected_scanner(
@@ -442,21 +494,7 @@ def _huggingface_direct_preview_matches_exact_selected_scanner(
     )
     enabled_scanners = _scanner_selection_metadata_id_set(runtime.scanner_selection_metadata.get("enabled_scanner_ids"))
     scanner_ids = requested_scanners.intersection(enabled_scanners)
-    if not scanner_ids:
-        return False
-
-    from .scanner_registry_metadata import get_scanner_registry_metadata
-
-    filename_lower = filename.lower()
-    scanner_metadata = get_scanner_registry_metadata()
-    for scanner_id in scanner_ids:
-        scanner_info = scanner_metadata.get(scanner_id, {})
-        for key in ("extensions", "content_routed_extensions", "scanner_only_extensions"):
-            for extension in scanner_info.get(key, ()):
-                extension_text = str(extension).lower()
-                if extension_text and filename_lower.endswith(extension_text):
-                    return True
-    return False
+    return _huggingface_preview_filename_matches_scanner_route(filename, scanner_ids)
 
 
 def _huggingface_direct_preview_matches_metadata_route(filename: str, runtime: "_ScanRuntimeConfig") -> bool:
@@ -489,6 +527,10 @@ def _huggingface_direct_preview_matches_metadata_route(filename: str, runtime: "
         excluded_scanners = runtime.scanner_selection_metadata.get("excluded_scanner_ids")
         if requested_scanners or not excluded_scanners:
             return False
+        return _huggingface_preview_filename_matches_scanner_route(
+            filename,
+            _huggingface_preview_scanner_route_ids(runtime),
+        )
 
     if runtime.skip_non_model_files and suffix in {".py", ".js", ".html", ".css"}:
         return False
@@ -543,7 +585,12 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
     """Print a no-download preview for a Hugging Face repository URL."""
     display_path = _display_path(path)
     max_download_bytes = _huggingface_preview_size_limit(runtime.max_download_bytes)
-    metadata = get_model_info(path, timeout_seconds=runtime.timeout)
+    metadata = get_model_info(
+        path,
+        timeout_seconds=runtime.timeout,
+        include_metadata_files=True,
+        sniff_content=False,
+    )
     if max_download_bytes is not None:
         _require_huggingface_preview_immutable_revision(metadata)
     files = metadata.get("files", [])
@@ -1865,8 +1912,15 @@ class _ScanPathState:
                 self.scanned_paths.append(_display_scan_path(asset.path))
                 added_path = True
 
-        if not added_path and fallback_path is not None:
+        if not added_path and fallback_path is not None and not os.path.exists(fallback_path):
             self.scanned_paths.append(_display_scan_path(fallback_path))
+
+    def track_directory_paths_for_sbom(self, scan_result: ModelAuditResultModel) -> None:
+        """Track completed directory scan assets, including an authoritative empty set."""
+        self.sbom_paths_resolved = True
+        for asset in scan_result.assets:
+            if asset.path:
+                self.scanned_paths.append(_display_scan_path(asset.path))
 
     def defer_temp_cleanup(self, temp_path: str | None, *, cache_enabled: bool, verbose: bool) -> None:
         """Track temporary artifacts for post-SBOM cleanup."""
@@ -2800,7 +2854,7 @@ def _write_scan_sbom(
     asset_paths = list(
         dict.fromkeys(asset.path for asset in audit_result.assets if asset.path and asset.type != "skipped")
     )
-    if asset_paths and scan_and_delete:
+    if asset_paths and (scan_and_delete or not path_state.sbom_paths_resolved):
         paths_for_sbom = [_display_scan_path(path) for path in asset_paths]
     elif path_state.sbom_paths_resolved:
         paths_for_sbom = path_state.scanned_paths
@@ -3186,6 +3240,8 @@ def _scan_local_or_downloaded_path(
         path_state.record_dvc_coverage(actual_path, scan_results, scanner_config=runtime.config)
         if is_dvc_pointer:
             path_state.track_streaming_paths_for_sbom(scan_results, None)
+        elif os.path.isdir(actual_path):
+            path_state.track_directory_paths_for_sbom(scan_results)
         else:
             path_state.scanned_paths.append(_display_scan_path(actual_path))
 
@@ -3355,13 +3411,32 @@ def _resolve_scan_source_for_path(
                 path_state.mark_non_shard_error(audit_result)
             return _SourceDispatchResult(actual_path=path, local_scan_required=False)
 
+        hf_stream_kwargs: dict[str, Any] = {}
+        if runtime.scan_and_delete:
+            if runtime.scannable_extensions is not None:
+                hf_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
+            if runtime.scannable_filenames is not None:
+                hf_stream_kwargs["scannable_filenames"] = runtime.scannable_filenames
+            if runtime.scannable_scanner_ids is not None:
+                hf_stream_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
+            if runtime.hf_stream_include_all_files:
+                hf_stream_kwargs["include_all_files"] = True
         if runtime.show_styled_output:
             click.echo(f"\n📥 Preparing to download from {style_text(display_path, fg='cyan')}")
 
             try:
-                model_info = get_model_info(path, timeout_seconds=runtime.timeout)
-                size_bytes = model_info["total_size"]
-                if size_bytes == 0:
+                from .utils.sources.huggingface import get_model_info
+
+                preview_kwargs: dict[str, Any] = {"timeout_seconds": runtime.timeout}
+                if runtime.scan_and_delete:
+                    preview_kwargs.update(hf_stream_kwargs)
+                    preview_kwargs["streaming_selection"] = True
+                    preview_kwargs.setdefault("include_all_files", False)
+                model_info = get_model_info(path, **preview_kwargs)
+                size_bytes = int(model_info.get("total_size") or 0)
+                inaccessible_gated_file_count = int(model_info.get("inaccessible_gated_file_count") or 0)
+                unknown_size_count = int(model_info.get("unknown_size_count") or 0)
+                if size_bytes == 0 and unknown_size_count:
                     size_str = "Unknown size"
                 elif size_bytes >= 1024 * 1024 * 1024:
                     size_str = f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
@@ -3369,11 +3444,20 @@ def _resolve_scan_source_for_path(
                     size_str = f"{size_bytes / (1024 * 1024):.2f} MB"
                 else:
                     size_str = f"{size_bytes / 1024:.2f} KB"
+                if size_bytes > 0 and unknown_size_count:
+                    size_str = f"At least {size_str}"
 
                 model_id = _escape_terminal_text(str(model_info["model_id"]))
                 file_count = _escape_terminal_text(str(model_info["file_count"]))
                 click.echo(f"   Model: {model_id}")
                 click.echo(f"   Size: {size_str} ({file_count} files)")
+                if inaccessible_gated_file_count:
+                    gated_file_count = _escape_terminal_text(str(inaccessible_gated_file_count))
+                    click.echo(f"   Access: {gated_file_count} selected file(s) are gated/inaccessible")
+                if unknown_size_count:
+                    click.echo(
+                        f"   Access: {_escape_terminal_text(str(unknown_size_count))} selected file size(s) unavailable"
+                    )
 
                 if runtime.scan_and_delete:
                     click.echo(style_text("   Mode: Streaming (scan and delete to save disk)", fg="cyan"))
@@ -3414,15 +3498,6 @@ def _resolve_scan_source_for_path(
                 if runtime.show_styled_output:
                     click.echo(style_text("🔄 Starting streaming scan...", fg="cyan"))
 
-                hf_stream_kwargs: dict[str, Any] = {}
-                if runtime.scannable_extensions is not None:
-                    hf_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
-                if runtime.scannable_filenames is not None:
-                    hf_stream_kwargs["scannable_filenames"] = runtime.scannable_filenames
-                if runtime.scannable_scanner_ids is not None:
-                    hf_stream_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
-                if runtime.hf_stream_include_all_files:
-                    hf_stream_kwargs["include_all_files"] = True
                 file_generator = _track_huggingface_stream_acquisition(
                     download_model_streaming(
                         path,
