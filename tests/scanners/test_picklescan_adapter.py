@@ -33,9 +33,8 @@ from modelaudit.scanners.picklescan_adapter import (
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
 
-_PINNED_DISTILBERT_URL = (
-    "https://huggingface.co/distilbert/distilbert-base-uncased/resolve/"
-    "12040accade4e8a0f71eabdb258fecc2e7e948be/pytorch_model.bin"
+_PINNED_BGE_SMALL_ZH_URL = (
+    "https://huggingface.co/BAAI/bge-small-zh-v1.5/resolve/7999e1d3359715c523056ef9478215996d62a620/pytorch_model.bin"
 )
 
 
@@ -2093,7 +2092,7 @@ def test_apply_pickle_member_context_prepends_member_location_without_position_m
 
 @pytest.mark.integration
 @pytest.mark.slow
-def test_pinned_distilbert_hf_scan_completes_without_private_metadata_error(tmp_path: Path) -> None:
+def test_pinned_bge_small_zh_hf_scan_completes_without_private_metadata_error(tmp_path: Path) -> None:
     if os.environ.get("MODELAUDIT_RUN_HF_INTEGRATION") != "1":
         pytest.skip("set MODELAUDIT_RUN_HF_INTEGRATION=1 to run the pinned Hugging Face scan")
 
@@ -2101,7 +2100,7 @@ def test_pinned_distilbert_hf_scan_completes_without_private_metadata_error(tmp_
 
     from modelaudit.cli import cli
 
-    output_path = tmp_path / "distilbert-report.json"
+    output_path = tmp_path / "bge-small-zh-report.json"
     result = CliRunner().invoke(
         cli,
         [
@@ -2117,7 +2116,7 @@ def test_pinned_distilbert_hf_scan_completes_without_private_metadata_error(tmp_
             "json",
             "--output",
             str(output_path),
-            _PINNED_DISTILBERT_URL,
+            _PINNED_BGE_SMALL_ZH_URL,
         ],
         env={
             "PROMPTFOO_DISABLE_TELEMETRY": "1",
@@ -2129,9 +2128,16 @@ def test_pinned_distilbert_hf_scan_completes_without_private_metadata_error(tmp_
     assert result.exit_code in {0, 1}, result.output[-2000:]
     assert "AttributeError" not in result.output
     assert "private_metadata" not in result.output
+    assert "pytorch_zip_scan_incomplete" not in result.output
 
     report = json.loads(output_path.read_text(encoding="utf-8"))
+    serialized_report = json.dumps(report)
     assert report["success"] is True
     assert report["has_errors"] is False
     assert report["files_scanned"] == 1
-    assert "12040accade4e8a0f71eabdb258fecc2e7e948be" in json.dumps(report)
+    assert report["issues"] == []
+    assert "BAAI--bge-small-zh-v1.5" in serialized_report
+    assert "7999e1d3359715c523056ef9478215996d62a620" in serialized_report
+    assert "pytorch_model/data.pkl" in serialized_report
+    assert "pytorch_zip_scan_incomplete" not in serialized_report
+    assert "analysis_incomplete" not in serialized_report
