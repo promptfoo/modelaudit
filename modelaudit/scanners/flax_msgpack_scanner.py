@@ -2447,6 +2447,20 @@ class FlaxMsgpackScanner(BaseScanner):
         if _is_text_like_short_binary(sample):
             self._analyze_streamed_binary_chunks(sample, cursor, remaining, length, location, result)
         else:
+            if is_tensor_like and length > _STREAM_TEXT_CHUNK_BYTES:
+                summary.analysis_complete = False
+                self._add_incomplete_check(
+                    result,
+                    reason=self.BINARY_PATTERN_INCONCLUSIVE_REASON,
+                    name="Flax MessagePack Binary Pattern Coverage",
+                    message="Large tensor-like binary payload was skipped after a bounded text probe",
+                    location=location,
+                    details={
+                        "binary_size": length,
+                        "sampled_bytes": sample_size,
+                        "stream_text_chunk_bytes": _STREAM_TEXT_CHUNK_BYTES,
+                    },
+                )
             cursor.skip(remaining)
         return _StreamValue("bytes", value=None)
 
@@ -2538,9 +2552,6 @@ class FlaxMsgpackScanner(BaseScanner):
         if not analyze_scalar:
             return _StreamValue("bytes", value=cursor._read_exact(length))
 
-        if length > _STREAM_TEXT_CHUNK_BYTES and self._is_tensor_like_binary_size(length):
-            return self._consume_large_binary_scalar(cursor, length, location, result, summary, state, path=path)
-
         if length > self.max_msgpack_decode_bytes:
             return self._consume_large_binary_scalar(cursor, length, location, result, summary, state, path=path)
 
@@ -2570,10 +2581,6 @@ class FlaxMsgpackScanner(BaseScanner):
 
         if code == 1 and length > _STREAM_TEXT_CHUNK_BYTES:
             return self._consume_flax_ndarray_ext_scalar(cursor, length, location, result, summary, path=path)
-
-        if length > _STREAM_TEXT_CHUNK_BYTES and self._is_tensor_like_binary_size(length):
-            self._consume_large_binary_scalar(cursor, length, value_location, result, summary, state, path=path)
-            return _StreamValue("ExtType", value=None)
 
         if length > self.max_msgpack_decode_bytes:
             self._consume_large_binary_scalar(cursor, length, value_location, result, summary, state, path=path)

@@ -1419,11 +1419,9 @@ def test_flax_msgpack_large_tensor_above_decode_budget_scans_without_bufferfull(
         }
     ).scan(str(path))
 
-    assert result.success is True
-    assert "scan_outcome" not in result.metadata
+    assert result.success is False
+    assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON]
     assert result.metadata["top_level_keys"] == ["params"]
-    assert result.metadata["estimated_parameters"] == tensor_size // 4
-    assert result.metadata["jax_metadata"]["tensor_count"] == 1
     assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
     blob_check = next(check for check in result.checks if check.name == "Binary Blob Size Check")
     assert blob_check.details["size"] == tensor_size
@@ -1449,6 +1447,22 @@ def test_flax_msgpack_large_flax_ndarray_ext_above_decode_budget_skips_tensor_bo
     assert all(check.name != "Binary Blob Size Check" for check in result.checks)
 
 
+def test_flax_msgpack_non_text_tensor_like_raw_bin_with_hidden_text_tail_is_incomplete(tmp_path: Path) -> None:
+    path = tmp_path / "hidden_tail_tensor_like_bin.msgpack"
+    payload = (b"\0" * (64 * 1024)) + b"eval('x')" + (b"\0" * 3)
+    create_msgpack_file(path, {"params": {"blob": payload}})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON]
+    assert all(
+        issue.message != r"Suspicious code pattern detected: eval\s*\("
+        for issue in result.issues
+        if issue.severity == IssueSeverity.CRITICAL
+    )
+
+
 def test_flax_msgpack_large_tensor_skip_continues_to_later_security_finding(tmp_path: Path) -> None:
     path = tmp_path / "sparse_large_tensor_then_reduce.msgpack"
     tensor_size = (512 * 1024 * 1024) + 4
@@ -1457,7 +1471,7 @@ def test_flax_msgpack_large_tensor_skip_continues_to_later_security_finding(tmp_
     result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
 
     assert result.success is False
-    assert "scan_outcome" not in result.metadata
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
     assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
     assert any(
         issue.severity == IssueSeverity.CRITICAL
