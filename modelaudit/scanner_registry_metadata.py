@@ -278,7 +278,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "content_routed_filenames": [
             "config.json",
             "model.json",
-            "tokenizer.json",
             "params.json",
             "hyperparams.yaml",
             "training_args.json",
@@ -288,7 +287,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
             "requirements.txt",
             "metadata.json",
             "index.json",
-            "tokenizer_config.json",
             "model_config.json",
         ],
         "priority": 12,

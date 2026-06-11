@@ -30,7 +30,7 @@ import tempfile
 from typing import Any, ClassVar, cast
 
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
-from ..utils.file.detection import has_jax_json_checkpoint_structure
+from ..utils.file.detection import has_jax_json_checkpoint_structure, is_huggingface_tokenizer_json_file
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
@@ -511,6 +511,8 @@ class XGBoostScanner(BaseScanner):
 
         # For .json files, validate it's actually an XGBoost model
         if file_ext == ".json":
+            if is_huggingface_tokenizer_json_file(path):
+                return False
             return cls._is_xgboost_json(path) or cls._is_probable_xgboost_json_candidate(path)
 
         # For .model files, accept (generic extension)

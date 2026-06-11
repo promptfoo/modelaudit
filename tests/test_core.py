@@ -104,6 +104,22 @@ def _valid_elf64_header() -> bytes:
     return bytes(header)
 
 
+def _write_hf_tokenizer_json(path: Path, extra_fields: dict[str, Any] | None = None) -> Path:
+    payload: dict[str, Any] = {
+        "version": "1.0",
+        "added_tokens": [],
+        "model": {
+            "type": "BPE",
+            "vocab": {"hello": 0},
+            "merges": [],
+        },
+    }
+    if extra_fields:
+        payload.update(extra_fields)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
 def test_multi_file_directory_scan_shares_one_pickle_source_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -9671,6 +9687,102 @@ def test_scan_file_inconclusive_mxnet_tokenizer_config_preserves_direct_jinja_an
         check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
         for check in result.checks
     )
+
+
+def test_scan_file_large_hf_tokenizer_json_does_not_run_binary_json_scanners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    monkeypatch.setattr(core_module, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {"padding": "x" * 256},
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is True
+    assert result.scanner_name not in {"manifest", "jinja2_template", "mxnet", "xgboost"}
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+    assert not any(check.name == "JSON Content Analysis" for check in result.checks)
+
+
+def test_scan_file_tokenizer_json_late_chat_template_preserves_jinja_detection(tmp_path: Path) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {"chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}"},
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_late_xgboost_markers_preserve_xgboost_detection(tmp_path: Path) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "version": [1, 7, 4],
+            "learner": {"gradient_booster": {}, "malicious_code": "os.system()"},
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert any(check.name == "JSON Content Analysis" and check.status == CheckStatus.FAILED for check in result.checks)
+
+
+def test_scan_file_tokenizer_json_late_mxnet_markers_preserve_mxnet_detection(tmp_path: Path) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "nodes": [{"op": "Custom", "name": "load", "attrs": {"library": "../../tmp/libevil.so"}}],
+            "arg_nodes": [0],
+            "heads": [[0, 0, 0]],
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
+def test_scan_file_config_json_with_tokenizer_schema_still_runs_manifest_controls(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_name": "blocked-tokenizer-model",
+                "download_url": "https://evil.example/model.bin",
+                "sha1": "a" * 40,
+                "tokenizer": {
+                    "version": "1.0",
+                    "added_tokens": [],
+                    "model": {"type": "BPE", "vocab": {"hello": 0}},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(config_path), config={"blacklist_patterns": ["blocked"], "cache_scan_results": False})
+
+    assert result.scanner_name == "manifest"
+    assert any(
+        check.name == "Blacklist Pattern Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(check.name == "Untrusted URL Check" and check.status == CheckStatus.FAILED for check in result.checks)
+    assert any(check.name == "Weak Hash Detection" and check.status == CheckStatus.FAILED for check in result.checks)
 
 
 def test_scan_file_inconclusive_mxnet_generation_config_runs_selected_jinja_when_manifest_excluded(

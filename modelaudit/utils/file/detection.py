@@ -286,12 +286,17 @@ _FLAX_MSGPACK_PROBE_LENGTH_SIZES = {
 }
 MXNET_SYMBOL_SIGNATURE_READ_BYTES = 10 * 1024 * 1024
 MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT = "mxnet_symbol_routing_inconclusive"
+TOKENIZER_JSON_ROUTING_READ_BYTES = 16 * 1024 * 1024
 _UTF8_BOM = b"\xef\xbb\xbf"
 _JSON_NUMBER_PREFIX_RE = re.compile(rb"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
 _MXNET_SYMBOL_PREFIX_MAX_VALUES = 4096
 _MXNET_SYMBOL_MAX_KEY_BYTES = 64
 _MXNET_SYMBOL_ROOT_KEYS = frozenset({"nodes", "arg_nodes", "heads"})
 _MXNET_SYMBOL_STREAM_CHUNK_BYTES = 64 * 1024
+_HF_TOKENIZER_JSON_FILENAMES = frozenset({"tokenizer.json"})
+_HF_TOKENIZER_ROOT_KEYS = frozenset({"version", "added_tokens"})
+_HF_TOKENIZER_MODEL_TYPES = frozenset({"BPE", "Unigram", "WordPiece", "WordLevel"})
+_HF_TOKENIZER_TEMPLATE_KEYS = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
 LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT = "llamafile_routing_inconclusive"
 NEMO_ROUTING_INCONCLUSIVE_FORMAT = "nemo_routing_inconclusive"
 XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT = "xgboost_ubjson_routing_inconclusive"
@@ -571,6 +576,221 @@ def inspect_mxnet_symbol_root_keys(handle: BinaryIO) -> set[str]:
                 expecting_key = True
 
     return duplicates if seen >= _MXNET_SYMBOL_ROOT_KEYS else set()
+
+
+def _json_probe_skip_whitespace(probe: bytes, offset: int) -> int:
+    while offset < len(probe) and probe[offset] in b" \t\r\n":
+        offset += 1
+    return offset
+
+
+def _json_probe_skip_string(probe: bytes, offset: int) -> int | None:
+    if offset >= len(probe) or probe[offset] != ord('"'):
+        return None
+    offset += 1
+    while offset < len(probe):
+        byte = probe[offset]
+        if byte == ord('"'):
+            return offset + 1
+        if byte == ord("\\"):
+            offset += 1
+            if offset >= len(probe):
+                return None
+        offset += 1
+    return None
+
+
+def _json_probe_decode_string(probe: bytes, start: int, end: int) -> str | None:
+    try:
+        value = json.JSONDecoder().decode(probe[start:end].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _json_probe_skip_value(probe: bytes, offset: int) -> int | None:
+    offset = _json_probe_skip_whitespace(probe, offset)
+    if offset >= len(probe):
+        return None
+
+    first = probe[offset]
+    if first == ord('"'):
+        return _json_probe_skip_string(probe, offset)
+
+    if first in {ord("{"), ord("[")}:
+        stack = [ord("}") if first == ord("{") else ord("]")]
+        offset += 1
+        while offset < len(probe):
+            byte = probe[offset]
+            if byte == ord('"'):
+                string_end = _json_probe_skip_string(probe, offset)
+                if string_end is None:
+                    return None
+                offset = string_end
+                continue
+            if byte in {ord("{"), ord("[")}:
+                stack.append(ord("}") if byte == ord("{") else ord("]"))
+            elif stack and byte == stack[-1]:
+                stack.pop()
+                if not stack:
+                    return offset + 1
+            offset += 1
+        return None
+
+    while offset < len(probe) and probe[offset] not in b",}] \t\r\n":
+        offset += 1
+    return offset if offset < len(probe) else None
+
+
+def _json_probe_has_only_trailing_whitespace(probe: bytes, offset: int) -> bool:
+    return _json_probe_skip_whitespace(probe, offset) == len(probe)
+
+
+def _hf_tokenizer_model_object_has_schema(probe: bytes, offset: int) -> bool:
+    """Return whether a bounded direct model-object probe proves tokenizer schema."""
+    offset = _json_probe_skip_whitespace(probe, offset)
+    if offset >= len(probe) or probe[offset] != ord("{"):
+        return False
+
+    saw_model_type = False
+    saw_vocab = False
+    offset += 1
+    while offset < len(probe):
+        offset = _json_probe_skip_whitespace(probe, offset)
+        if offset >= len(probe):
+            return False
+        if probe[offset] == ord("}"):
+            return False
+        if probe[offset] != ord('"'):
+            return False
+
+        key_start = offset
+        key_end = _json_probe_skip_string(probe, offset)
+        if key_end is None:
+            return False
+        key = _json_probe_decode_string(probe, key_start, key_end)
+        if key is None:
+            return False
+
+        offset = _json_probe_skip_whitespace(probe, key_end)
+        if offset >= len(probe) or probe[offset] != ord(":"):
+            return False
+        value_offset = _json_probe_skip_whitespace(probe, offset + 1)
+        if value_offset >= len(probe):
+            return False
+
+        next_offset = _json_probe_skip_value(probe, value_offset)
+        if next_offset is None:
+            return False
+
+        if key == "type" and probe[value_offset] == ord('"'):
+            value_end = _json_probe_skip_string(probe, value_offset)
+            if value_end is None:
+                return False
+            model_type = _json_probe_decode_string(probe, value_offset, value_end)
+            saw_model_type = model_type in _HF_TOKENIZER_MODEL_TYPES
+        elif key == "vocab":
+            saw_vocab = True
+
+        if saw_model_type and saw_vocab:
+            return True
+
+        offset = next_offset
+        offset = _json_probe_skip_whitespace(probe, offset)
+        if offset >= len(probe):
+            return False
+        if probe[offset] == ord(","):
+            offset += 1
+            continue
+        if probe[offset] == ord("}"):
+            return False
+        return False
+
+    return False
+
+
+def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
+    """Return whether bounded filename and schema evidence proves tokenizer JSON ownership."""
+    file_path = Path(path)
+    if file_path.name.lower() not in _HF_TOKENIZER_JSON_FILENAMES or file_path.suffix.lower() != ".json":
+        return False
+    try:
+        if not file_path.is_file():
+            return False
+        file_size = file_path.stat().st_size
+        if file_size < 4 or file_size > TOKENIZER_JSON_ROUTING_READ_BYTES:
+            return False
+        probe = read_magic_bytes(str(file_path), file_size)
+    except OSError:
+        return False
+
+    probe = probe[len(_UTF8_BOM) :] if probe.startswith(_UTF8_BOM) else probe
+    offset = _json_probe_skip_whitespace(probe, 0)
+    if offset >= len(probe) or probe[offset] != ord("{"):
+        return False
+
+    root_keys: set[str] = set()
+    saw_model_schema = False
+    offset += 1
+    while offset < len(probe):
+        offset = _json_probe_skip_whitespace(probe, offset)
+        if offset >= len(probe):
+            return False
+        if probe[offset] == ord("}"):
+            return (
+                root_keys >= _HF_TOKENIZER_ROOT_KEYS
+                and saw_model_schema
+                and _json_probe_has_only_trailing_whitespace(
+                    probe,
+                    offset + 1,
+                )
+            )
+        if probe[offset] != ord('"'):
+            return False
+
+        key_start = offset
+        key_end = _json_probe_skip_string(probe, offset)
+        if key_end is None:
+            return False
+        key = _json_probe_decode_string(probe, key_start, key_end)
+        if key is None:
+            return False
+
+        offset = _json_probe_skip_whitespace(probe, key_end)
+        if offset >= len(probe) or probe[offset] != ord(":"):
+            return False
+        value_offset = _json_probe_skip_whitespace(probe, offset + 1)
+        if value_offset >= len(probe):
+            return False
+
+        if key in _MXNET_SYMBOL_ROOT_KEYS or key == "learner" or key in _HF_TOKENIZER_TEMPLATE_KEYS:
+            return False
+        if key in _HF_TOKENIZER_ROOT_KEYS:
+            root_keys.add(key)
+        if key == "model":
+            saw_model_schema = _hf_tokenizer_model_object_has_schema(probe, value_offset)
+
+        next_offset = _json_probe_skip_value(probe, value_offset)
+        if next_offset is None:
+            return False
+        offset = _json_probe_skip_whitespace(probe, next_offset)
+        if offset >= len(probe):
+            return False
+        if probe[offset] == ord(","):
+            offset += 1
+            continue
+        if probe[offset] == ord("}"):
+            return (
+                root_keys >= _HF_TOKENIZER_ROOT_KEYS
+                and saw_model_schema
+                and _json_probe_has_only_trailing_whitespace(
+                    probe,
+                    offset + 1,
+                )
+            )
+        return False
+
+    return False
 
 
 def _detect_mxnet_symbol_prefix_route(
@@ -879,6 +1099,8 @@ def _could_be_renamed_mxnet_symbol(file_path: Path, prefix: bytes) -> bool:
 
 def _detect_content_routed_mxnet_symbol(file_path: Path, prefix: bytes) -> str | None:
     """Route plausible JSON symbol content or preserve bounded ambiguity."""
+    if is_huggingface_tokenizer_json_file(file_path):
+        return None
     if file_path.name.lower().endswith("-symbol.json"):
         # Canonical symbol names already belong to MXNetScanner; do not let a
         # discovery budget prevent its bounded fail-closed analysis from running.

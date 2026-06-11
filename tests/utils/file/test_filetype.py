@@ -35,6 +35,7 @@ from modelaudit.utils.file.detection import (
     detect_flax_msgpack_overlap_routes,
     detect_format_from_extension,
     find_sharded_files,
+    is_huggingface_tokenizer_json_file,
     is_zipfile,
     validate_file_type,
 )
@@ -71,6 +72,22 @@ def _create_mar_archive(
         archive.writestr("handler.py", b"def handle(data, context):\n    return data\n")
         archive.writestr("weights.bin", b"weights")
     return mar_path
+
+
+def _write_hf_tokenizer_json(path: Path, extra_fields: dict[str, Any] | None = None) -> Path:
+    payload: dict[str, Any] = {
+        "version": "1.0",
+        "added_tokens": [],
+        "model": {
+            "type": "BPE",
+            "vocab": {"hello": 0},
+            "merges": [],
+        },
+    }
+    if extra_fields:
+        payload.update(extra_fields)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
 
 
 def _build_tf_metagraph_bytes() -> bytes:
@@ -1405,6 +1422,56 @@ def test_detect_generic_json_value_budget_before_mxnet_structure_routes_mxnet_wi
     assert detect_file_format(str(model_path)) == "mxnet"
     assert detect_file_format_from_magic(str(model_path)) == "mxnet"
     assert detect_file_format_for_skip_filter(str(model_path)) == "mxnet"
+
+
+def test_detect_large_hf_tokenizer_json_is_not_binary_json_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {"padding": "x" * 256},
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+    assert detect_file_format_from_magic(str(tokenizer_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(tokenizer_path)) == "unknown"
+
+
+@pytest.mark.parametrize(
+    "extra_fields",
+    [
+        {"chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}"},
+        {"learner": {"gradient_booster": {}, "malicious_code": "os.system()"}},
+        {
+            "nodes": [{"op": "Custom", "name": "load", "attrs": {"library": "../../tmp/libevil.so"}}],
+            "arg_nodes": [0],
+            "heads": [[0, 0, 0]],
+        },
+    ],
+)
+def test_hf_tokenizer_json_does_not_hide_late_security_root_keys(
+    tmp_path: Path,
+    extra_fields: dict[str, Any],
+) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(tmp_path / "tokenizer.json", extra_fields)
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+
+
+def test_hf_tokenizer_json_over_routing_budget_is_not_claimed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {"padding": "x" * 256},
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
 
 
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
