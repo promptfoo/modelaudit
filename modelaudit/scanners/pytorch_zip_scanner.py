@@ -40,6 +40,7 @@ from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .pickle_scanner import (
     PickleScanner,
     _pickle_literal_url_stripped_scan_view,
+    executable_pickle_literal_network_findings,
     filter_inert_pickle_literal_network_findings,
 )
 from .picklescan_adapter import apply_pickle_member_context
@@ -2136,6 +2137,9 @@ class PyTorchZipScanner(BaseScanner):
                             result=result,
                         )
                         network_findings = filter_inert_pickle_literal_network_findings(network_findings, file_data)
+                        network_findings.extend(
+                            executable_pickle_literal_network_findings(file_data, context=f"{path}:{name}")
+                        )
                         all_network_findings.extend(network_findings)
 
             except Exception as e:

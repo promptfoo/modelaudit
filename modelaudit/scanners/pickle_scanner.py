@@ -16,6 +16,7 @@ from typing import Any, BinaryIO, ClassVar, TextIO, cast
 
 from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
 
+from modelaudit.detectors.network_comm import redact_url_for_finding
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 from modelaudit.utils.helpers.code_validation import validate_python_syntax
 
@@ -271,7 +272,10 @@ _NETWORK_SCAN_SEEDS: tuple[bytes, ...] = (
     b"websocket",
     b"zombie",
 )
-_PICKLE_LITERAL_URL_RE = re.compile(rb"(?i)https?://[A-Za-z0-9\-._~:/?#[\]@!$&()*+,;=%-]+")
+_PICKLE_LITERAL_URL_RE = re.compile(
+    rb"(?i)https?://(?:[A-Za-z0-9\-._~:/?#[\]@!$&()*+,;=%-]|"
+    rb"'(?=[A-Za-z0-9\-._~:/?#[\]@!$&*+,=%-]))+"
+)
 _PICKLE_LITERAL_URL_NETWORK_FUNCTION_TOKENS: tuple[bytes, ...] = (
     b"dns.resolver",
     b"ftp.connect",
@@ -328,6 +332,26 @@ _EXECUTABLE_NETWORK_LITERAL_SEEDS: tuple[bytes, ...] = (
 _EXECUTABLE_NETWORK_LITERAL_COMMAND_RE = re.compile(
     rb"(?i)(?<![A-Za-z0-9_./-])(?:bash|curl|nc|netcat|pwsh|powershell|sh|wget)(?:\.exe)?(?=$|[\s;&|'\")])"
 )
+_PYTHON_IDENTIFIER_RE = re.compile(rb"[A-Za-z_][A-Za-z0-9_]*")
+_NETWORK_IMPORT_ALIAS_RE = re.compile(
+    rb"(?i)(?<![A-Za-z0-9_.])import\s+"
+    rb"(?P<module>requests|httpx|aiohttp|socket|urllib(?:\.request)?|http\.client)\s+as\s+"
+    rb"(?P<alias>[A-Za-z_][A-Za-z0-9_]*)"
+)
+_NETWORK_FROM_IMPORT_RE = re.compile(
+    rb"(?i)(?<![A-Za-z0-9_.])from\s+"
+    rb"(?P<module>requests|httpx|aiohttp|socket|urllib\.request|http\.client)\s+import\s+"
+    rb"(?P<imports>[^;\r\n]+)"
+)
+_NETWORK_IMPORTABLE_MODULE_CALLS: dict[bytes, tuple[bytes, ...]] = {
+    b"aiohttp": (b"delete", b"get", b"head", b"options", b"patch", b"post", b"put", b"request"),
+    b"http.client": (b"connect", b"request", b"send"),
+    b"httpx": (b"delete", b"get", b"head", b"options", b"patch", b"post", b"put", b"request", b"stream"),
+    b"requests": (b"delete", b"get", b"head", b"options", b"patch", b"post", b"put", b"request", b"session"),
+    b"socket": (b"connect", b"create_connection", b"getaddrinfo", b"gethostbyaddr", b"gethostbyname", b"socket"),
+    b"urllib": (b"urlopen", b"urlretrieve"),
+    b"urllib.request": (b"urlopen", b"urlretrieve"),
+}
 _EXECUTABLE_PICKLE_GLOBAL_FULL_NAMES = frozenset(
     {
         "huggingface_hub.hf_hub_download",
@@ -547,6 +571,7 @@ class _PickleStackValue:
     record_indexes: tuple[int, ...] = ()
     global_module: str | None = None
     global_name: str | None = None
+    opaque_extension: bool = False
 
 
 @dataclass(frozen=True)
@@ -1256,6 +1281,8 @@ def _pickle_literal_record_value(*values: _PickleStackValue) -> _PickleStackValu
 
 
 def _pickle_stack_value_is_executable_network_consumer(value: _PickleStackValue) -> bool:
+    if value.opaque_extension:
+        return True
     if value.global_module is None or value.global_name is None:
         return False
 
@@ -1535,7 +1562,11 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
                     continue
 
                 if opcode_name == "BUILD":
-                    pop_value()
+                    mark_literal_result_consumers(pop_value())
+                    continue
+
+                if opcode_name in {"EXT1", "EXT2", "EXT4"}:
+                    push(_PickleStackValue(opaque_extension=True))
                     continue
 
                 if opcode_name in {
@@ -1546,9 +1577,6 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
                     "BININT1",
                     "BININT2",
                     "BYTEARRAY8",
-                    "EXT1",
-                    "EXT2",
-                    "EXT4",
                     "FLOAT",
                     "INT",
                     "LONG",
@@ -1586,11 +1614,63 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
     return build_records()
 
 
+def _pickle_network_from_import_aliases(context: bytes) -> set[bytes]:
+    aliases: set[bytes] = set()
+    for match in _NETWORK_FROM_IMPORT_RE.finditer(context):
+        module = match.group("module").lower()
+        call_names = _NETWORK_IMPORTABLE_MODULE_CALLS.get(module, ())
+        for raw_import in match.group("imports").split(b","):
+            words = raw_import.strip().split()
+            if not words:
+                continue
+            imported_name = words[0].strip(b"()").lower()
+            if imported_name == b"*":
+                aliases.update(call_names)
+                continue
+            if imported_name not in call_names:
+                continue
+            alias = imported_name
+            if len(words) >= 3 and words[1].lower() == b"as":
+                alias = words[2].strip(b"()").lower()
+            if _PYTHON_IDENTIFIER_RE.fullmatch(alias):
+                aliases.add(alias)
+    return aliases
+
+
+def _pickle_network_module_import_aliases(context: bytes) -> dict[bytes, tuple[bytes, ...]]:
+    aliases: dict[bytes, tuple[bytes, ...]] = {}
+    for match in _NETWORK_IMPORT_ALIAS_RE.finditer(context):
+        module = match.group("module").lower()
+        alias = match.group("alias").lower()
+        call_names = _NETWORK_IMPORTABLE_MODULE_CALLS.get(module)
+        if call_names is None or _PYTHON_IDENTIFIER_RE.fullmatch(alias) is None:
+            continue
+        aliases[alias] = call_names
+    return aliases
+
+
+def _pickle_literal_contains_imported_network_alias_call(context: bytes) -> bool:
+    for alias in _pickle_network_from_import_aliases(context):
+        if re.search(rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*\(", context):
+            return True
+
+    for alias, call_names in _pickle_network_module_import_aliases(context).items():
+        escaped_calls = b"|".join(re.escape(call_name) for call_name in call_names)
+        if re.search(
+            rb"(?<![A-Za-z0-9_])" + re.escape(alias) + rb"\s*\.\s*(?:" + escaped_calls + rb")\s*\(",
+            context,
+        ):
+            return True
+    return False
+
+
 def _pickle_literal_has_executable_network_context(literal: bytes) -> bool:
     context = _PICKLE_LITERAL_URL_RE.sub(b" ", literal)
     lowered = context.lower()
     compact = re.sub(rb"\s+", b"", lowered)
     if any(seed in lowered or seed in compact for seed in _EXECUTABLE_NETWORK_LITERAL_SEEDS):
+        return True
+    if _pickle_literal_contains_imported_network_alias_call(lowered):
         return True
     return _EXECUTABLE_NETWORK_LITERAL_COMMAND_RE.search(context) is not None
 
@@ -1611,6 +1691,8 @@ def _network_finding_is_inert_pickle_literal_network_evidence(
     if finding_type == "explicit_network_pattern":
         if finding.get("pattern_type") != "url":
             return False
+    elif finding_type == "url_detected":
+        pass
     elif finding_type not in {"network_function", "network_library"}:
         return False
     position = finding.get("position")
@@ -1624,8 +1706,45 @@ def _network_finding_is_inert_pickle_literal_network_evidence(
                 return False
             if finding_type in {"network_function", "network_library"}:
                 return _position_is_within_pickle_literal_url_span(data, record, position)
-            return True
+            return _position_is_within_pickle_literal_url_span(data, record, position)
     return False
+
+
+def executable_pickle_literal_network_findings(
+    data: bytes,
+    *,
+    context: str,
+    position_offset: int = 0,
+) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    for record in _pickle_literal_records(data):
+        if not record.executable_consumer:
+            continue
+        for match in _PICKLE_LITERAL_URL_RE.finditer(data, record.start, record.end):
+            absolute_position = position_offset + match.start()
+            raw_url = match.group().decode("utf-8", errors="ignore")
+            if not raw_url:
+                continue
+            matched_text = redact_url_for_finding(raw_url)
+            key = (absolute_position, matched_text)
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(
+                {
+                    "type": "explicit_network_pattern",
+                    "severity": "CRITICAL",
+                    "confidence": 0.95,
+                    "message": f"Executable pickle call argument contains URL: {matched_text[:100]}",
+                    "pattern_type": "url",
+                    "matched_text": matched_text[:200],
+                    "position": absolute_position,
+                    "context": context,
+                    "source": "pickle_executable_literal_consumer",
+                }
+            )
+    return findings
 
 
 def filter_inert_pickle_literal_network_findings(
@@ -3346,6 +3465,13 @@ class PickleScanner(BaseScanner):
                 result=result,
             )
             network_findings = filter_inert_pickle_literal_network_findings(network_findings, expensive_data)
+            network_findings.extend(
+                executable_pickle_literal_network_findings(
+                    expensive_data,
+                    context=source,
+                    position_offset=position_offset,
+                )
+            )
             self.add_network_communication_findings(network_findings, result, context=source)
         else:
             result.metadata["pickle_network_raw_detector_skipped"] = True

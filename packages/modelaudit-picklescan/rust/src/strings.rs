@@ -191,8 +191,20 @@ fn find_http_url_start(bytes: &[u8]) -> Option<usize> {
 
 fn http_url_end(bytes: &[u8], start: usize) -> usize {
     let mut end = start;
-    while end < bytes.len() && is_http_url_byte(bytes[end]) {
-        end += 1;
+    while end < bytes.len() {
+        if is_http_url_byte(bytes[end]) {
+            end += 1;
+            continue;
+        }
+        if bytes[end] == b'\''
+            && bytes
+                .get(end + 1)
+                .is_some_and(|next| is_http_url_apostrophe_continuation(*next))
+        {
+            end += 1;
+            continue;
+        }
+        break;
     }
     end
 }
@@ -203,6 +215,31 @@ fn ascii_eq_ignore_case(candidate: &[u8], expected: &[u8]) -> bool {
             .iter()
             .zip(expected.iter())
             .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn is_http_url_apostrophe_continuation(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b':'
+                | b'/'
+                | b'?'
+                | b'#'
+                | b'['
+                | b']'
+                | b'@'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'*'
+                | b'+'
+                | b','
+                | b'='
+                | b'%'
+        )
 }
 
 fn is_http_url_byte(byte: u8) -> bool {
@@ -1432,6 +1469,7 @@ mod tests {
             "https://example.invalid/path?x=1,handler=requests.get(url)"
         )
         .is_empty());
+        assert!(suspicious_string_matches("https://example.invalid/a'b/os.system(cmd)").is_empty());
         assert!(suspicious_string_matches("__reduce__ is a pickle protocol hook").is_empty());
     }
 

