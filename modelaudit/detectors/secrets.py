@@ -361,6 +361,13 @@ BASIC_AUTH_HEADER_PREFIX_PATTERN = re.compile(
     r"(?:\\?[\"']|\[\s*(?:\\?[\"'])?|\(\s*(?:\\?[\"'])?)?\s*(?:[>|][+-]?\s*)?$",
     re.IGNORECASE,
 )
+BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN = re.compile(
+    r"(?:^|[^\w$])(?:"
+    r"(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*setRequestHeader"
+    r"|(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)+(?:set|append)"
+    r")\s*\(\s*\\?[\"']\s*(?:proxy-authorization|authorization)\s*\\?[\"']\s*,\s*\\?[\"']?\s*$",
+    re.IGNORECASE,
+)
 BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS = 256
 BASIC_AUTH_HEADER_NAMES = {
     "authorization": "Authorization",
@@ -371,6 +378,7 @@ BASIC_AUTH_HEADER_NAMES = {
     "proxyauthheader": "Proxy-Authorization",
 }
 BASIC_AUTH_CONTINUATION_PREFIX_PATTERN = re.compile(r"^\s*(?:-\s*)?[\"']?$")
+BASIC_AUTH_HEADER_VALUE_PATTERN = re.compile(rf"^\s*{BASIC_AUTH_PATTERN}", re.IGNORECASE)
 BASIC_AUTH_VALUE_PREFIX_PATTERN = re.compile(r"^\s*Basic\s+", re.IGNORECASE)
 BASIC_AUTH_VALUE_PREFIX_BYTES_PATTERN = re.compile(rb"^\s*Basic\s+", re.IGNORECASE)
 
@@ -615,6 +623,8 @@ class SecretsDetector:
             return False
         if BASIC_AUTH_HEADER_PREFIX_PATTERN.search(line_prefix) is not None:
             return True
+        if BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(line_prefix) is not None:
+            return True
         if BASIC_AUTH_CONTINUATION_PREFIX_PATTERN.fullmatch(line_prefix) is None:
             return False
 
@@ -634,7 +644,10 @@ class SecretsDetector:
         previous_line = text[previous_start:previous_end]
         if len(previous_line) > BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS:
             return False
-        return BASIC_AUTH_HEADER_PREFIX_PATTERN.search(previous_line) is not None
+        return (
+            BASIC_AUTH_HEADER_PREFIX_PATTERN.search(previous_line) is not None
+            or BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(previous_line) is not None
+        )
 
     @staticmethod
     def _basic_auth_token_decodes_to_credentials(token: str) -> bool:
@@ -715,9 +728,16 @@ class SecretsDetector:
     ) -> list[dict[str, Any]]:
         if header_name is not None and BASIC_AUTH_VALUE_PREFIX_BYTES_PATTERN.match(value):
             value_text = value[:BASIC_AUTH_HEADER_VALUE_CONTEXT_MAX_BYTES].decode("ascii", errors="ignore")
-            findings = self.scan_text(f"{header_name}: {value_text}", context, is_binary_source=False)
-            if self._findings_truncated:
-                return findings
+            header_value_match = BASIC_AUTH_HEADER_VALUE_PATTERN.match(value_text)
+            findings: list[dict[str, Any]] = []
+            if header_value_match is not None:
+                findings = self.scan_text(
+                    f"{header_name}: {value_text[: header_value_match.end()]}",
+                    context,
+                    is_binary_source=False,
+                )
+                if self._findings_truncated:
+                    return findings
             findings.extend(self.scan_bytes(value, context))
             return findings
         return self.scan_bytes(value, context)

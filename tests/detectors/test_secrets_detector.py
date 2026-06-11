@@ -254,6 +254,18 @@ class TestSecretsDetector:
                 _basic_auth_token(b"escaped-bracket:pass"),
             ),
             (
+                f'headers.set("Authorization", "Basic {_basic_auth_token(b"headers-set:pass")}")',
+                _basic_auth_token(b"headers-set:pass"),
+            ),
+            (
+                f"request.setRequestHeader('Authorization', 'Basic {_basic_auth_token(b'set-request-header:pass')}')",
+                _basic_auth_token(b"set-request-header:pass"),
+            ),
+            (
+                f'headers.append("Proxy-Authorization", "Basic {_basic_auth_token(b"headers-append:pass")}")',
+                _basic_auth_token(b"headers-append:pass"),
+            ),
+            (
                 f"Authorization: Basic {_basic_auth_token(bytes.fromhex('ceb4cebfcebaceb9cebcceae3a70c3a47373'))}",
                 _basic_auth_token(bytes.fromhex("ceb4cebfcebaceb9cebcceae3a70c3a47373")),
             ),
@@ -296,6 +308,8 @@ class TestSecretsDetector:
             f"Authorization: Basic {'A' * (BASIC_AUTH_TOKEN_MAX_LENGTH + 1)}",
             "https://user:pass@example.test/model.bin",
             f"https://example.test/?header=Authorization%3A%20Basic%20{_basic_auth_token(b'percent:pass')}",
+            f'("Authorization", "Basic {_basic_auth_token(b"tuple:pass")}")',
+            f'notes.append("Authorization notes", "Basic {_basic_auth_token(b"notes:pass")}")',
             f"\u0391uthorization: Basic {_basic_auth_token(b'confusable-alpha:pass')}",
             f"Authorizati\u043en: Basic {_basic_auth_token(b'confusable-o:pass')}",
         ],
@@ -369,6 +383,19 @@ class TestSecretsDetector:
         assert _basic_auth_findings(findings)
         assert any(finding.get("secret_type") == "AWS Access Key" for finding in findings)
         assert aws_key not in json.dumps(findings, sort_keys=True)
+
+    def test_basic_auth_structured_bytes_header_value_scans_adjacent_secret_once(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"bytes:pass")
+        password = "super_secret_password_123"
+        value = f"Basic {token} password={password}".encode("ascii")
+
+        findings = detector.scan_dict({"Authorization": value})
+
+        assert _basic_auth_findings(findings)
+        password_findings = [finding for finding in findings if finding.get("secret_type") == "Hardcoded Password"]
+        assert len(password_findings) == 1
+        assert password not in json.dumps(findings, sort_keys=True)
 
     def test_basic_auth_full_value_whitelist_still_suppresses_detection(self) -> None:
         token = _basic_auth_token(b"user:pass")
