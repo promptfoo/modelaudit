@@ -61,6 +61,29 @@ def _write_msgpack_uint(output: Any, value: int) -> None:
         output.write(b"\xcf" + struct.pack(">Q", value))
 
 
+def _msgpack_str_size(value: str) -> int:
+    length = len(value.encode())
+    if length <= 31:
+        return 1 + length
+    if length <= 0xFF:
+        return 2 + length
+    if length <= 0xFFFF:
+        return 3 + length
+    return 5 + length
+
+
+def _msgpack_uint_size(value: int) -> int:
+    if value <= 0x7F:
+        return 1
+    if value <= 0xFF:
+        return 2
+    if value <= 0xFFFF:
+        return 3
+    if value <= 0xFFFFFFFF:
+        return 5
+    return 9
+
+
 def _write_sparse_large_flax_tensor(
     path: Path,
     tensor_size: int,
@@ -84,8 +107,14 @@ def _write_sparse_large_flax_tensor(
             _write_msgpack_str(output, "os.system")
 
 
-def _write_sparse_large_flax_ndarray_ext(path: Path, tensor_size: int) -> None:
-    metadata_size = 1 + 1 + 5 + 8 + 5
+def _write_sparse_large_flax_ndarray_ext(
+    path: Path,
+    tensor_size: int,
+    *,
+    dtype: str = "float32",
+    body_prefix: bytes = b"",
+) -> None:
+    metadata_size = 1 + 1 + _msgpack_uint_size(tensor_size // 4) + _msgpack_str_size(dtype) + 5
     ext_size = metadata_size + tensor_size
     with path.open("wb") as output:
         output.write(b"\x81")
@@ -96,10 +125,15 @@ def _write_sparse_large_flax_ndarray_ext(path: Path, tensor_size: int) -> None:
         output.write(b"\x93")
         output.write(b"\x91")
         _write_msgpack_uint(output, tensor_size // 4)
-        _write_msgpack_str(output, "float32")
+        _write_msgpack_str(output, dtype)
         output.write(b"\xc6" + struct.pack(">I", tensor_size))
-        output.seek(tensor_size - 1, os.SEEK_CUR)
-        output.write(b"\0")
+        if len(body_prefix) > tensor_size:
+            raise ValueError("body_prefix cannot exceed tensor_size")
+        output.write(body_prefix)
+        remaining = tensor_size - len(body_prefix)
+        if remaining:
+            output.seek(remaining - 1, os.SEEK_CUR)
+            output.write(b"\0")
 
 
 def _assert_inconclusive_aggregate_not_cached(
@@ -1427,9 +1461,9 @@ def test_flax_msgpack_large_tensor_above_decode_budget_scans_without_bufferfull(
     assert blob_check.details["size"] == tensor_size
 
 
-def test_flax_msgpack_large_flax_ndarray_ext_above_decode_budget_skips_tensor_body(tmp_path: Path) -> None:
+def test_flax_msgpack_large_flax_ndarray_ext_above_decode_budget_streams_tensor_body(tmp_path: Path) -> None:
     path = tmp_path / "sparse_large_ndarray_ext.msgpack"
-    tensor_size = (512 * 1024 * 1024) + 4
+    tensor_size = (1024 * 1024) + 4
     _write_sparse_large_flax_ndarray_ext(path, tensor_size)
 
     result = FlaxMsgpackScanner(
@@ -1447,6 +1481,36 @@ def test_flax_msgpack_large_flax_ndarray_ext_above_decode_budget_skips_tensor_bo
     assert all(check.name != "Binary Blob Size Check" for check in result.checks)
 
 
+def test_flax_msgpack_large_flax_ndarray_ext_detects_hidden_text_body(tmp_path: Path) -> None:
+    path = tmp_path / "hidden_tail_ndarray_ext.msgpack"
+    body_prefix = (b"\0" * (64 * 1024)) + b"eval('x')"
+    body_prefix += b"\0" * (-len(body_prefix) % 4)
+    _write_sparse_large_flax_ndarray_ext(path, len(body_prefix), body_prefix=body_prefix)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.message == r"Suspicious code pattern detected: eval\s*\("
+        for issue in result.issues
+    )
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_flax_msgpack_large_flax_ndarray_ext_scans_dtype_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "malicious_dtype_ndarray_ext.msgpack"
+    tensor_size = (64 * 1024) + 4
+    _write_sparse_large_flax_ndarray_ext(path, tensor_size, dtype="eval('x')")
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.message == r"Suspicious code pattern detected: eval\s*\("
+        for issue in result.issues
+    )
+
+
 def test_flax_msgpack_non_text_tensor_like_raw_bin_with_hidden_text_tail_is_incomplete(tmp_path: Path) -> None:
     path = tmp_path / "hidden_tail_tensor_like_bin.msgpack"
     payload = (b"\0" * (64 * 1024)) + b"eval('x')" + (b"\0" * 3)
@@ -1461,6 +1525,20 @@ def test_flax_msgpack_non_text_tensor_like_raw_bin_with_hidden_text_tail_is_inco
         for issue in result.issues
         if issue.severity == IssueSeverity.CRITICAL
     )
+
+
+def test_flax_msgpack_over_budget_tensor_like_raw_bin_probe_is_incomplete(tmp_path: Path) -> None:
+    path = tmp_path / "over_budget_probe_tensor_like_bin.msgpack"
+    create_msgpack_file(path, {"params": {"blob": b"\0" * 1024}})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON]
+    coverage = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
+    assert coverage.details["binary_size"] == 1024
+    assert coverage.details["sampled_bytes"] == 1024
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
 
 
 def test_flax_msgpack_large_tensor_skip_continues_to_later_security_finding(tmp_path: Path) -> None:

@@ -676,6 +676,23 @@ class FlaxMsgpackScanner(BaseScanner):
         self._compiled_suspicious_patterns = tuple(
             (pattern, re.compile(pattern, re.IGNORECASE), pattern.lower()) for pattern in self.suspicious_patterns
         )
+        binary_stream_requires_full_scan = False
+        binary_stream_pattern_matchers: list[tuple[bytes, str, re.Pattern[str], str]] = []
+        for pattern, compiled_pattern, lowered_pattern in self._compiled_suspicious_patterns:
+            anchors = _pattern_literal_anchors(pattern)
+            if anchors is None:
+                binary_stream_requires_full_scan = True
+                continue
+            anchor = max(anchors, key=len)
+            if len(anchor) < 3:
+                binary_stream_requires_full_scan = True
+                continue
+            binary_stream_pattern_matchers.append((anchor.encode("utf-8"), pattern, compiled_pattern, lowered_pattern))
+        self._binary_stream_requires_full_scan = binary_stream_requires_full_scan
+        self._binary_stream_pattern_matchers = tuple(binary_stream_pattern_matchers)
+        self._binary_stream_transform_matchers = tuple(
+            (transform.encode("utf-8"), transform) for transform in _DANGEROUS_JAX_TRANSFORMS
+        )
         self._stream_unsafe_pattern_anchors = {
             pattern: _pattern_literal_anchors(pattern)
             for pattern in self.suspicious_patterns
@@ -1987,6 +2004,30 @@ class FlaxMsgpackScanner(BaseScanner):
             rule_code="S902",
         )
 
+    def _add_binary_pattern_incomplete_check(
+        self,
+        result: ScanResult,
+        summary: _FlaxStreamSummary,
+        *,
+        location: str,
+        binary_size: int,
+        sampled_bytes: int,
+        message: str,
+    ) -> None:
+        summary.analysis_complete = False
+        self._add_incomplete_check(
+            result,
+            reason=self.BINARY_PATTERN_INCONCLUSIVE_REASON,
+            name="Flax MessagePack Binary Pattern Coverage",
+            message=message,
+            location=location,
+            details={
+                "binary_size": binary_size,
+                "sampled_bytes": sampled_bytes,
+                "stream_text_chunk_bytes": _STREAM_TEXT_CHUNK_BYTES,
+            },
+        )
+
     def _record_stream_tensor_size(self, size: int, location: str, summary: _FlaxStreamSummary) -> None:
         if size >= 16 and size % 4 == 0:
             summary.parameter_count += size // 4
@@ -2327,6 +2368,24 @@ class FlaxMsgpackScanner(BaseScanner):
         location: str,
         result: ScanResult,
     ) -> None:
+        if not first_chunk and remaining == 0:
+            return
+
+        if _is_text_like_short_binary(first_chunk) or self._binary_stream_requires_full_scan:
+            self._analyze_streamed_binary_text_chunks(first_chunk, cursor, remaining, length, location, result)
+            return
+
+        self._analyze_streamed_binary_anchor_chunks(first_chunk, cursor, remaining, length, location, result)
+
+    def _analyze_streamed_binary_text_chunks(
+        self,
+        first_chunk: bytes,
+        cursor: _MsgpackStreamCursor,
+        remaining: int,
+        length: int,
+        location: str,
+        result: ScanResult,
+    ) -> None:
         def decoded_chunks() -> Iterable[str]:
             nonlocal remaining
             decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -2352,6 +2411,100 @@ class FlaxMsgpackScanner(BaseScanner):
             coverage_details={"binary_size": length},
             check_jax_transform=True,
         )
+
+    def _analyze_streamed_binary_anchor_chunks(
+        self,
+        first_chunk: bytes,
+        cursor: _MsgpackStreamCursor,
+        remaining: int,
+        length: int,
+        location: str,
+        result: ScanResult,
+    ) -> None:
+        matched_patterns: dict[str, tuple[str, str]] = {}
+        matched_transforms: dict[str, str] = {}
+        unresolved_pattern_candidates: set[str] = set()
+        raw_tail = b""
+
+        def inspect_window(raw_bytes: bytes) -> None:
+            raw_window_lower = raw_bytes.lower()
+            transform_candidates = [
+                transform for anchor, transform in self._binary_stream_transform_matchers if anchor in raw_window_lower
+            ]
+            pattern_candidates = [
+                (pattern, compiled_pattern, lowered_pattern)
+                for anchor, pattern, compiled_pattern, lowered_pattern in self._binary_stream_pattern_matchers
+                if pattern not in matched_patterns and anchor in raw_window_lower
+            ]
+            if not transform_candidates and not pattern_candidates:
+                return
+
+            raw_window = raw_bytes.decode("utf-8", errors="replace")
+            normalized_window = _WHITESPACE_RUN_PATTERN.sub(" ", raw_window)
+            lowered_raw_window = raw_window.lower()
+            for transform in transform_candidates:
+                if transform not in matched_transforms:
+                    matched_transforms[transform] = raw_window
+
+            for pattern, compiled_pattern, lowered_pattern in pattern_candidates:
+                if pattern in self._stream_unsafe_pattern_anchors:
+                    if pattern == _UNBOUNDED_GETATTR_PATTERN:
+                        match_sample: str | None = None
+                        if _contains_suspicious_getattr(raw_window):
+                            match_sample = raw_window
+                        elif _contains_suspicious_getattr(normalized_window):
+                            match_sample = normalized_window
+                        if match_sample is not None:
+                            matched_patterns[pattern] = (lowered_pattern, match_sample)
+                        elif lowered_pattern.split("\\s", 1)[0] in lowered_raw_window:
+                            unresolved_pattern_candidates.add(pattern)
+                    continue
+
+                match_sample = None
+                if compiled_pattern.search(raw_window):
+                    match_sample = raw_window
+                elif "\\s" in pattern and compiled_pattern.search(normalized_window):
+                    match_sample = normalized_window
+                if match_sample is not None:
+                    matched_patterns[pattern] = (lowered_pattern, match_sample)
+
+        chunk = first_chunk
+        while True:
+            inspect_window(raw_tail + chunk)
+            raw_tail = (raw_tail + chunk)[-_STREAM_TEXT_OVERLAP_CHARS:]
+            if remaining <= 0:
+                break
+            chunk = cursor._read_exact(min(remaining, _STREAM_TEXT_CHUNK_BYTES))
+            remaining -= len(chunk)
+
+        for transform, context in matched_transforms.items():
+            self._add_jax_transform_check(transform, context, location, result)
+        for pattern, (lowered_pattern, sample) in matched_patterns.items():
+            self._add_suspicious_string_check(
+                pattern,
+                lowered_pattern,
+                sample,
+                length,
+                f"{location}[decoded_binary]",
+                result,
+            )
+
+        unresolved_patterns = sorted(unresolved_pattern_candidates - set(matched_patterns))
+        existing_reasons = result.metadata.get("scan_outcome_reasons", [])
+        if unresolved_patterns and self.BINARY_PATTERN_INCONCLUSIVE_REASON not in existing_reasons:
+            self._add_incomplete_check(
+                result,
+                reason=self.BINARY_PATTERN_INCONCLUSIVE_REASON,
+                name="Flax MessagePack Binary Pattern Coverage",
+                message="Large binary payload contained an unresolved pattern beyond the streaming overlap",
+                location=location,
+                details={
+                    "pattern": unresolved_patterns[0],
+                    "patterns": unresolved_patterns,
+                    "binary_size": length,
+                    "stream_overlap_chars": _STREAM_TEXT_OVERLAP_CHARS,
+                },
+            )
 
     def _read_stream_metadata_int(self, cursor: _MsgpackStreamCursor) -> int:
         marker = cursor.read_marker()
@@ -2447,19 +2600,14 @@ class FlaxMsgpackScanner(BaseScanner):
         if _is_text_like_short_binary(sample):
             self._analyze_streamed_binary_chunks(sample, cursor, remaining, length, location, result)
         else:
-            if is_tensor_like and length > _STREAM_TEXT_CHUNK_BYTES:
-                summary.analysis_complete = False
-                self._add_incomplete_check(
+            if is_tensor_like:
+                self._add_binary_pattern_incomplete_check(
                     result,
-                    reason=self.BINARY_PATTERN_INCONCLUSIVE_REASON,
-                    name="Flax MessagePack Binary Pattern Coverage",
-                    message="Large tensor-like binary payload was skipped after a bounded text probe",
+                    summary,
                     location=location,
-                    details={
-                        "binary_size": length,
-                        "sampled_bytes": sample_size,
-                        "stream_text_chunk_bytes": _STREAM_TEXT_CHUNK_BYTES,
-                    },
+                    binary_size=length,
+                    sampled_bytes=sample_size,
+                    message="Tensor-like binary payload was not text-scanned after a bounded probe",
                 )
             cursor.skip(remaining)
         return _StreamValue("bytes", value=None)
@@ -2487,21 +2635,18 @@ class FlaxMsgpackScanner(BaseScanner):
         self._check_stream_shape_values(shape_values, location, result)
 
         dtype = self._read_stream_metadata_string(cursor)
-        self._record_stream_text(dtype, summary)
+        self._analyze_stream_scalar(dtype, f"{location}[1]", result, summary)
 
         data_length = self._read_stream_binary_header(cursor)
         if cursor.tell() + data_length > body_end:
             raise OutOfData
 
-        value_location = f"{location}[1]"
+        value_location = f"{location}[2]"
         self._record_stream_tensor_size(data_length, value_location, summary)
         sample_size = min(data_length, _STREAM_TEXT_CHUNK_BYTES)
         sample = cursor._read_exact(sample_size)
         remaining = data_length - sample_size
-        if _is_text_like_short_binary(sample):
-            self._analyze_streamed_binary_chunks(sample, cursor, remaining, data_length, value_location, result)
-        else:
-            cursor.skip(remaining)
+        self._analyze_streamed_binary_chunks(sample, cursor, remaining, data_length, value_location, result)
 
         if cursor.tell() > body_end:
             raise _MsgpackStreamFormatError("Flax ndarray extension consumed beyond declared length")
