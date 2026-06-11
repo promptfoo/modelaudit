@@ -9,7 +9,6 @@ from typing import Any
 import pytest
 
 import modelaudit.core as core_module
-from modelaudit.core import scan_model_directory_or_file
 from modelaudit.scanner_results import CheckStatus
 from modelaudit.scanners.base import IssueSeverity
 
@@ -55,7 +54,7 @@ class TestHuggingFaceSymlinks:
     def test_hf_cache_symlinks_no_path_traversal_warnings(self, mock_hf_cache):
         """Test that HuggingFace cache symlinks don't trigger path traversal warnings."""
         # Scan the snapshots directory
-        results = scan_model_directory_or_file(str(mock_hf_cache))
+        results = core_module.scan_model_directory_or_file(str(mock_hf_cache))
 
         # Check that files were scanned
         assert results.files_scanned == 2
@@ -84,7 +83,7 @@ class TestHuggingFaceSymlinks:
         model_link = snapshots_dir / "model.safetensors"
         os.symlink("../../blobs/blob1234567890", model_link)
 
-        results = scan_model_directory_or_file(str(snapshots_dir))
+        results = core_module.scan_model_directory_or_file(str(snapshots_dir))
 
         path_traversal_issues = [
             issue for issue in results.issues if "path traversal" in getattr(issue, "message", "").lower()
@@ -115,7 +114,7 @@ class TestHuggingFaceSymlinks:
         metadata_link = snapshots_dir / "metadata.json"
         os.symlink("../../blobs/metadata-blob", metadata_link)
 
-        results = scan_model_directory_or_file(str(snapshots_dir))
+        results = core_module.scan_model_directory_or_file(str(snapshots_dir))
 
         restore_checks = [check for check in results.checks if check.name == "Orbax Restore Function Check"]
         assert results.files_scanned == 1
@@ -207,7 +206,7 @@ class TestHuggingFaceSymlinks:
         monkeypatch.setattr(os, "walk", walk_without_reparse_file)
         monkeypatch.setattr(core_module, "_unclassified_symlink_names", unclassified_without_reparse_file)
 
-        results = scan_model_directory_or_file(str(snapshots_dir))
+        results = core_module.scan_model_directory_or_file(str(snapshots_dir))
 
         restore_checks = [check for check in results.checks if check.name == "Orbax Restore Function Check"]
         assert results.files_scanned == 1
@@ -234,7 +233,7 @@ class TestHuggingFaceSymlinks:
         os.symlink(str(outside_file), symlink)
 
         # Scan the directory
-        results = scan_model_directory_or_file(str(scan_dir))
+        results = core_module.scan_model_directory_or_file(str(scan_dir))
 
         # Should have path traversal warning
         path_traversal_issues = [
@@ -279,7 +278,7 @@ class TestHuggingFaceSymlinks:
             f.write("commit123456")
 
         # Scan
-        results = scan_model_directory_or_file(str(snapshots_dir))
+        results = core_module.scan_model_directory_or_file(str(snapshots_dir))
 
         # Should scan the actual model files, not refs
         assert results.files_scanned == 3
@@ -312,7 +311,7 @@ class TestHuggingFaceSymlinks:
 
         monkeypatch.setattr(os, "readlink", _raise)
 
-        results = scan_model_directory_or_file(str(snapshots))
+        results = core_module.scan_model_directory_or_file(str(snapshots))
 
         broken_issues = [i for i in results.issues if "broken symlink" in getattr(i, "message", "").lower()]
         assert len(broken_issues) == 1
