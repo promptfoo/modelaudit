@@ -121,6 +121,10 @@ def short_executable_base64_tail() -> str:
     return base64.b64encode(b"import os\nos.system('id')\n").decode("ascii")
 
 
+def short_import_gadget_base64_tail() -> str:
+    return base64.b64encode(b"__import__('os').system('id')").decode("ascii")
+
+
 def comment_separated_executable_wrapped_base64_tail() -> str:
     return "\n# continued\n".join(executable_wrapped_base64_lines())
 
@@ -502,14 +506,26 @@ def test_license_document_reconstructs_short_active_base64_tail() -> None:
     assert not SafeTensorsScanner._looks_like_ordinary_license_document(payload)
 
 
+def test_license_document_reconstructs_short_import_gadget_base64_tail() -> None:
+    license_text = ordinary_license_text_with_url()
+    payload = f"{license_text}\nLicense grant {short_import_gadget_base64_tail()} under terms"
+
+    assert SafeTensorsScanner._looks_like_ordinary_license_document(license_text)
+    assert not SafeTensorsScanner._looks_like_ordinary_license_document(payload)
+
+
 def test_license_document_rejects_encoded_url_tail() -> None:
     license_text = ordinary_license_text_with_url()
     payload = f"{license_text}\nEncoded reference: https%3A%2F%2Fevil.example%2Fx"
     mixed_payload = f"{license_text}\nEncoded reference: https%3A//evil.example/x"
+    partially_encoded_payload = f"{license_text}\nEncoded reference: h%74tps%3A%2F%2Fevil.example/x"
 
     assert SafeTensorsScanner._is_ordinary_license_metadata_value("license", license_text, metadata_is_valid=True)
     assert not SafeTensorsScanner._is_ordinary_license_metadata_value("license", payload, metadata_is_valid=True)
     assert not SafeTensorsScanner._is_ordinary_license_metadata_value("license", mixed_payload, metadata_is_valid=True)
+    assert not SafeTensorsScanner._is_ordinary_license_metadata_value(
+        "license", partially_encoded_payload, metadata_is_valid=True
+    )
 
 
 def test_license_url_residual_encoding_fails_closed() -> None:
@@ -532,6 +548,9 @@ def test_license_url_residual_encoding_fails_closed() -> None:
     assert not SafeTensorsScanner._url_looks_like_license_reference("https://github.com/Lightricks/LTX-2;payload")
     assert not SafeTensorsScanner._url_looks_like_license_reference(
         "https://github.com/Lightricks/LTX-2/blob/main/license.py%00.txt"
+    )
+    assert not SafeTensorsScanner._url_looks_like_license_reference(
+        "https://github.com/Lightricks/LTX-2/blob/main/license.pkl"
     )
     assert not SafeTensorsScanner._url_looks_like_license_reference(
         "https://github.com/Lightricks/LTX-2/%5Creleases%5Cdownload%5Cv1/license"
@@ -605,6 +624,8 @@ def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -
         "https://opensource.org/licenses/MIT,https://evil.example/x",
         "https%3A%2F%2Fevil.example%2Fx",
         "https%3A//evil.example/x",
+        "h%74tps%3A%2F%2Fevil.example/x",
+        "https://github.com/Lightricks/LTX-2/blob/main/license.pkl",
         "https://opensource.org/licenses/MIT?u=https://evil.example/x",
         "https://[",
     ],
@@ -812,6 +833,10 @@ def test_license_metadata_standard_wrapped_base64_tail_keeps_length_and_s905(tmp
             "short_active",
         ),
         (
+            f"License grant {short_import_gadget_base64_tail()} under terms",
+            "short_import_gadget",
+        ),
+        (
             "\nThis license paragraph continues under applicable law.\n".join(executable_wrapped_base64_lines((76,))),
             "legal_separator",
         ),
@@ -861,6 +886,45 @@ def test_license_metadata_annotated_wrapped_base64_tail_keeps_length_and_s905(
         and check.status == CheckStatus.FAILED
         and check.details == {"key": "license", "pattern": "https?://"}
         for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload_tail", "file_stem"),
+    [
+        (f"License grant {short_import_gadget_base64_tail()} under terms", "short_import_gadget"),
+        ("Additional terms: h%74tps%3A%2F%2Fevil.example/x", "partially_encoded_url"),
+        ("Additional terms: https://github.com/Lightricks/LTX-2/blob/main/license.pkl", "license_pkl_url"),
+    ],
+)
+def test_license_metadata_review_regressions_route_in_nested_archive(
+    tmp_path: Path,
+    payload_tail: str,
+    file_stem: str,
+) -> None:
+    source_file = tmp_path / f"{file_stem}.safetensors"
+    archive_path = tmp_path / f"{file_stem}.zip"
+    payload = f"{ordinary_license_text_with_url()}\n{payload_tail}"
+    write_raw_safetensors(
+        source_file,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.write(source_file, arcname="nested/model.safetensors")
+    source_file.unlink()
+
+    result = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
+
+    assert any(
+        issue.rule_code == "S905"
+        and "license" in issue.message
+        and str(archive_path) in (issue.location or "")
+        and "nested/model.safetensors" in (issue.location or "")
+        for issue in result.issues
     )
 
 

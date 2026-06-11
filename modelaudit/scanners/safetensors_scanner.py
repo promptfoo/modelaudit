@@ -291,24 +291,49 @@ _LICENSE_REFERENCE_FILE_MARKERS = (
 _SUSPICIOUS_LICENSE_URL_PATH_COMPONENTS = frozenset({"download", "raw", "releases"})
 _SUSPICIOUS_LICENSE_URL_PATH_SUFFIXES = (
     ".bin",
+    ".bz2",
     ".cjs",
     ".cmd",
+    ".ckpt",
     ".dll",
     ".dylib",
     ".exe",
+    ".gguf",
+    ".gz",
+    ".h5",
     ".js",
+    ".joblib",
     ".jsx",
+    ".keras",
     ".mjs",
+    ".model",
+    ".msgpack",
+    ".npy",
+    ".npz",
+    ".onnx",
     ".php",
+    ".pickle",
+    ".pkl",
     ".pl",
     ".ps1",
+    ".pt",
+    ".pth",
     ".py",
+    ".rar",
     ".rb",
+    ".safetensors",
+    ".safetensors.index.json",
     ".sh",
     ".so",
+    ".tar",
+    ".tar.bz2",
+    ".tar.gz",
+    ".tgz",
     ".ts",
     ".tsx",
+    ".xz",
     ".whl",
+    ".zip",
 )
 _OPAQUE_LICENSE_TOKEN_MIN_CHARS = 128
 _OPAQUE_LICENSE_TOKEN_PATTERN = re.compile(rf"\b[A-Za-z0-9+/=_-]{{{_OPAQUE_LICENSE_TOKEN_MIN_CHARS},}}\b")
@@ -343,8 +368,16 @@ _BASE64_LICENSE_DECODED_ACTIVE_MARKERS = (
 )
 _URL_PATH_NORMALIZATION_PASSES = 4
 _PERCENT_ENCODED_BYTE_PATTERN = re.compile(r"%[0-9a-fA-F]{2}")
+_ENCODED_URL_SCHEME_LETTERS = (
+    r"(?:h|%(?:25)*68)",
+    r"(?:t|%(?:25)*74)",
+    r"(?:t|%(?:25)*74)",
+    r"(?:p|%(?:25)*70)",
+    r"(?:s|%(?:25)*73)?",
+)
 _ENCODED_URL_DELIMITER_PATTERN = re.compile(
-    r"https?(?P<colon>%(?:25)*3a|:)(?P<slash1>%(?:25)*2f|/)(?P<slash2>%(?:25)*2f|/)",
+    rf"(?P<scheme>{''.join(_ENCODED_URL_SCHEME_LETTERS)})(?P<colon>%(?:25)*3a|:)"
+    r"(?P<slash1>%(?:25)*2f|/)(?P<slash2>%(?:25)*2f|/)",
     re.IGNORECASE,
 )
 
@@ -355,7 +388,7 @@ def _url_path_has_unsafe_decoded_char(path: str) -> bool:
 
 def _value_has_encoded_url_delimiter(value: str) -> bool:
     return any(
-        "%" in f"{match.group('colon')}{match.group('slash1')}{match.group('slash2')}"
+        "%" in f"{match.group('scheme')}{match.group('colon')}{match.group('slash1')}{match.group('slash2')}"
         for match in _ENCODED_URL_DELIMITER_PATTERN.finditer(value)
     )
 
@@ -593,6 +626,12 @@ class SafeTensorsScanner(BaseScanner):
         )
 
     @staticmethod
+    def _decoded_license_blob_has_active_pattern(decoded_text: str) -> bool:
+        return any(marker in decoded_text for marker in _BASE64_LICENSE_DECODED_ACTIVE_MARKERS) or any(
+            re.search(pattern, decoded_text, re.IGNORECASE) for pattern in _CODE_METADATA_PATTERNS
+        )
+
+    @staticmethod
     def _base64_candidate_decodes(candidate: str) -> bool:
         if len(candidate) < _BASE64_LICENSE_WRAP_MIN_DECODE_CHARS:
             return False
@@ -615,7 +654,7 @@ class SafeTensorsScanner(BaseScanner):
             return False
         if len(candidate) < _OPAQUE_LICENSE_TOKEN_MIN_CHARS:
             decoded_text = decoded.decode("utf-8", errors="ignore").lower()
-            return any(marker in decoded_text for marker in _BASE64_LICENSE_DECODED_ACTIVE_MARKERS)
+            return SafeTensorsScanner._decoded_license_blob_has_active_pattern(decoded_text)
         return len(decoded) >= (_OPAQUE_LICENSE_TOKEN_MIN_CHARS * 3) // 4
 
     @classmethod
