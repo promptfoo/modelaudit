@@ -1139,7 +1139,14 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
 
         offset = _json_probe_skip_whitespace(probe, next_offset)
         if offset >= len(probe):
-            return False
+            return sample_is_prefix and _hf_tokenizer_suffix_has_structural_route_key(
+                file_path,
+                file_size,
+                keys,
+                allow_after_any_value=key != "model",
+                allow_after_vocab_array=scan_nested_templates and key == "model",
+                require_jax_identity_value=require_jax_identity_value,
+            )
         if probe[offset] == ord(","):
             offset += 1
             continue
@@ -1258,16 +1265,7 @@ def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
             if state.has_template_evidence:
                 return False
             if next_offset is None:
-                return (
-                    sample_is_prefix
-                    and root_keys >= _HF_TOKENIZER_ROOT_KEYS
-                    and saw_model_schema
-                    and not _hf_tokenizer_suffix_has_route_conflict(
-                        file_path,
-                        file_size,
-                        allow_after_vocab_array=True,
-                    )
-                )
+                return False
         else:
             try:
                 next_offset = _json_probe_skip_value_with_template_scan(

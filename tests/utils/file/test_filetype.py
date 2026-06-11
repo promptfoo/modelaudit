@@ -1668,7 +1668,7 @@ def test_hf_tokenizer_json_over_routing_budget_is_claimed_after_schema_probe(
     assert detect_file_format(str(tokenizer_path)) == "unknown"
 
 
-def test_hf_tokenizer_json_model_vocab_over_structure_budget_is_claimed_after_schema_probe(
+def test_hf_tokenizer_json_model_vocab_over_structure_budget_is_not_claimed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1684,8 +1684,28 @@ def test_hf_tokenizer_json_model_vocab_over_structure_budget_is_claimed_after_sc
     )
 
     assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
-    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
     assert detect_file_format(str(tokenizer_path)) == "unknown"
+
+
+def test_hf_tokenizer_json_route_key_after_value_ending_at_probe_boundary_routes_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe_limit = 256
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", probe_limit)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", probe_limit)
+    tokenizer_path = tmp_path / "tokenizer.json"
+    prefix = '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},"padding":"'
+    padding_size = probe_limit - len(prefix.encode("utf-8")) - 1
+    assert padding_size > 0
+    tokenizer_path.write_text(
+        prefix + ("x" * padding_size) + '","chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"}',
+        encoding="utf-8",
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
 
 
 @pytest.mark.parametrize(

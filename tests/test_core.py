@@ -9937,7 +9937,7 @@ def test_scan_file_oversized_tokenizer_model_template_after_vocab_preserves_jinj
     )
 
 
-def test_scan_file_oversized_tokenizer_model_vocab_after_structure_probe_stays_benign(
+def test_scan_file_oversized_tokenizer_model_vocab_after_structure_probe_is_not_claimed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9954,12 +9954,38 @@ def test_scan_file_oversized_tokenizer_model_vocab_after_structure_probe_stays_b
 
     result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
 
+    assert file_detection.is_huggingface_tokenizer_json_file(tokenizer_path) is False
     assert result.success is True
     assert result.scanner_name == "unknown"
     assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
     assert "jax_json_checkpoint_analysis_size_limit" not in result.metadata.get("scan_outcome_reasons", [])
     assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
     assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
+
+
+def test_scan_file_tokenizer_route_key_after_value_ending_at_probe_boundary_preserves_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe_limit = 256
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", probe_limit)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", probe_limit)
+    tokenizer_path = tmp_path / "tokenizer.json"
+    prefix = '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},"padding":"'
+    padding_size = probe_limit - len(prefix.encode("utf-8")) - 1
+    assert padding_size > 0
+    tokenizer_path.write_text(
+        prefix + ("x" * padding_size) + '","chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
 
 
 def test_scan_file_tokenizer_template_preserves_explicit_jax_selection(tmp_path: Path) -> None:
