@@ -4521,6 +4521,8 @@ def test_scan_huggingface_streaming_omits_multilingual_vocab_cc_token(
             "--quiet",
             "--format",
             "json",
+            "--cache-dir",
+            str(tmp_path),
             "--scanners",
             "text",
             "hf://google-bert/bert-base-multilingual-uncased",
