@@ -2021,7 +2021,7 @@ def test_large_non_seekable_legacy_pytorch_stream_uses_stream_budget_not_file_ca
 
     result = PickleScanner(
         config={
-            "max_file_read_size": 64,
+            "max_file_read_size": pickle_end,
             "max_known_stream_read_bytes": len(payload),
         }
     ).scan_stream(
@@ -2034,7 +2034,7 @@ def test_large_non_seekable_legacy_pytorch_stream_uses_stream_budget_not_file_ca
     assert result.metadata["legacy_pytorch_container"] is True
     assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
     assert result.metadata["pickle_stream_bytes_buffered"] == len(payload)
-    assert result.metadata["pickle_stream_bytes_buffered"] > 64
+    assert result.metadata["pickle_stream_bytes_buffered"] > pickle_end
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "legacy_pytorch_storage_payload_skipped" in result.metadata["scan_outcome_reasons"]
     assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
@@ -2067,12 +2067,43 @@ def test_large_non_seekable_legacy_preamble_without_layout_keeps_file_size_limit
     assert stream.tell() == min(len(payload), pickle_scanner._PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES)
 
 
+def test_large_non_seekable_truncated_legacy_control_keeps_file_size_limit() -> None:
+    partial_legacy = pickle.dumps(pickle_scanner._PYTORCH_LEGACY_MAGIC_NUMBER, protocol=2) + pickle.dumps(
+        pickle_scanner._PYTORCH_LEGACY_PROTOCOL_VERSION,
+        protocol=2,
+    )
+    payload = partial_legacy + b"\x80\x02X" + (4096).to_bytes(4, "little") + (b"A" * 4096)
+    stream = NonSeekableBytesIO(payload)
+
+    assert pickle_scanner._legacy_pytorch_control_probe_needs_more_bytes(
+        payload[: pickle_scanner._PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES]
+    )
+
+    result = PickleScanner(
+        config={
+            "max_file_read_size": 64,
+            "max_known_stream_read_bytes": len(payload),
+        }
+    ).scan_stream(
+        stream,
+        len(payload),
+        source="legacy-truncated-control.pt",
+    )
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "max_file_read_size_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert "legacy_pytorch_control_layout_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert any(check.name == "File Size Limit" and check.rule_code == "S904" for check in result.checks)
+    assert stream.tell() == min(len(payload), pickle_scanner._PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES)
+
+
 def test_large_non_seekable_legacy_pytorch_stream_budget_exhaustion_is_inconclusive() -> None:
     payload, pickle_end = _make_legacy_pytorch_container(b"A" * 512)
 
     result = PickleScanner(
         config={
-            "max_file_read_size": 64,
+            "max_file_read_size": pickle_end,
             "max_known_stream_read_bytes": pickle_end,
         }
     ).scan_stream(
@@ -2091,12 +2122,12 @@ def test_large_non_seekable_legacy_pytorch_stream_budget_exhaustion_is_inconclus
 
 
 def test_large_non_seekable_legacy_pytorch_short_read_is_inconclusive() -> None:
-    payload, _pickle_end = _make_legacy_pytorch_container(b"A" * 512)
-    truncated_payload = payload[: _pickle_end + 8]
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 512)
+    truncated_payload = payload[: pickle_end + 8]
 
     result = PickleScanner(
         config={
-            "max_file_read_size": 64,
+            "max_file_read_size": pickle_end,
             "max_known_stream_read_bytes": len(payload),
         }
     ).scan_stream(
@@ -2119,7 +2150,7 @@ def test_large_non_seekable_legacy_pytorch_short_read_is_inconclusive() -> None:
 
 
 def test_large_non_seekable_legacy_pytorch_short_read_fails_closed() -> None:
-    payload, _pickle_end = _make_legacy_pytorch_container(
+    payload, pickle_end = _make_legacy_pytorch_container(
         b"A" * 128,
         declared_storage_size=512,
     )
@@ -2127,7 +2158,7 @@ def test_large_non_seekable_legacy_pytorch_short_read_fails_closed() -> None:
 
     result = PickleScanner(
         config={
-            "max_file_read_size": 64,
+            "max_file_read_size": pickle_end,
             "max_known_stream_read_bytes": declared_size,
         }
     ).scan_stream(

@@ -116,7 +116,7 @@ from modelaudit.utils.file.large_file_handler import (
     should_use_large_file_handler,
 )
 from modelaudit.utils.file.streaming import stream_analyze_file, stream_source_path
-from modelaudit.utils.helpers.cache_decorator import cached_scan
+from modelaudit.utils.helpers.cache_decorator import cached_scan, should_defer_hash_for_pytorch_read_limit
 from modelaudit.utils.helpers.interrupt_handler import check_interrupted
 from modelaudit.utils.helpers.types import (
     FilePath,
@@ -1729,75 +1729,6 @@ def _should_defer_hash_for_max_file_size(file_path: str, config: dict[str, Any])
     return file_size > max_file_size and not should_use_advanced_handler(file_path)
 
 
-_PYTORCH_HASH_DEFERRAL_EXTENSIONS = {".bin", ".ckpt", ".pkl", ".pt", ".pth"}
-
-
-def _max_file_read_size_for_hash_deferral(config: dict[str, Any]) -> int:
-    try:
-        return int(config.get("max_file_read_size", BaseScanner.default_max_file_read_size) or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _should_defer_hash_for_pytorch_zip_read_limit(file_path: str, config: dict[str, Any]) -> bool:
-    """Avoid full-file aggregate hashing for oversized ZIP-backed PyTorch containers."""
-    if Path(file_path).suffix.lower() not in _PYTORCH_HASH_DEFERRAL_EXTENSIONS:
-        return False
-    max_file_read_size = _max_file_read_size_for_hash_deferral(config)
-    if max_file_read_size <= 0:
-        return False
-
-    try:
-        file_size = os.path.getsize(file_path)
-        with open(file_path, "rb") as handle:
-            header = handle.read(4)
-    except OSError:
-        return False
-    if file_size <= max_file_read_size or not header.startswith(b"PK"):
-        return False
-
-    try:
-        return is_pytorch_zip_archive(file_path, config)
-    except Exception:
-        return True
-
-
-def _should_defer_hash_for_legacy_pytorch_read_limit(file_path: str, config: dict[str, Any]) -> bool:
-    """Avoid full-file aggregate hashing for oversized raw legacy PyTorch containers."""
-    if Path(file_path).suffix.lower() not in _PYTORCH_HASH_DEFERRAL_EXTENSIONS:
-        return False
-    max_file_read_size = _max_file_read_size_for_hash_deferral(config)
-    if max_file_read_size <= 0:
-        return False
-
-    try:
-        file_size = os.path.getsize(file_path)
-    except OSError:
-        return False
-    if file_size <= max_file_read_size:
-        return False
-
-    try:
-        from modelaudit.scanners.pickle_scanner import PickleScanner
-
-        scanner = PickleScanner(config=config)
-        with open(file_path, "rb") as handle:
-            control_probe = handle.read(scanner._legacy_pytorch_control_probe_size(file_size))
-
-            def read_at(local_offset: int, size: int) -> bytes:
-                handle.seek(local_offset)
-                return handle.read(size)
-
-            legacy_layout, _legacy_storage_valid = scanner._legacy_pytorch_layout_for_scan(
-                control_probe,
-                total_size=file_size,
-                read_at=read_at,
-            )
-    except Exception:
-        return False
-    return legacy_layout is not None
-
-
 def _should_defer_hash_for_max_total_size(
     config: dict[str, Any],
     *,
@@ -1853,11 +1784,8 @@ def _hash_files_by_path(
         if _should_defer_hash_for_safetensors_header_limit(routing_path, hash_config):
             content_hashes[file_path] = f"unhashable_bounded_safetensors_{id(file_path)}"
             continue
-        if _should_defer_hash_for_pytorch_zip_read_limit(routing_path, hash_config):
+        if should_defer_hash_for_pytorch_read_limit(routing_path, hash_config):
             content_hashes[file_path] = f"unhashable_pytorch_zip_read_limit_{id(file_path)}"
-            continue
-        if _should_defer_hash_for_legacy_pytorch_read_limit(routing_path, hash_config):
-            content_hashes[file_path] = f"unhashable_legacy_pytorch_read_limit_{id(file_path)}"
             continue
         if _should_defer_hash_for_max_file_size(routing_path, hash_config):
             content_hashes[file_path] = f"unhashable_max_file_size_{id(file_path)}"
@@ -3187,24 +3115,20 @@ def scan_model_directory_or_file(
                     hashed_bytes=top_level_hashed_bytes,
                 )
                 defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(target, config)
-                defer_hash_for_pytorch_zip_read_limit = _should_defer_hash_for_pytorch_zip_read_limit(target, config)
-                defer_hash_for_legacy_pytorch_read_limit = _should_defer_hash_for_legacy_pytorch_read_limit(
+                defer_hash_for_pytorch_read_limit = should_defer_hash_for_pytorch_read_limit(
                     target,
                     config,
                 )
-                if (
-                    defer_hash_for_max_total_size
-                    or defer_hash_for_max_file_size
-                    or defer_hash_for_pytorch_zip_read_limit
-                    or defer_hash_for_legacy_pytorch_read_limit
-                ):
+                if defer_hash_for_max_total_size or defer_hash_for_max_file_size or defer_hash_for_pytorch_read_limit:
                     aggregate_hash_complete = False
+                if defer_hash_for_pytorch_read_limit:
+                    target_config = dict(target_config)
+                    target_config["cache_enabled"] = False
                 if (
                     not _should_defer_hash_for_safetensors_header_limit(target, config)
                     and not defer_hash_for_max_file_size
                     and not defer_hash_for_max_total_size
-                    and not defer_hash_for_pytorch_zip_read_limit
-                    and not defer_hash_for_legacy_pytorch_read_limit
+                    and not defer_hash_for_pytorch_read_limit
                 ):
                     try:
                         top_level_hashing_started_at = _start_phase_timing(phase_timings)
@@ -3648,6 +3572,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         sr.finish(success=False)
         return sr
 
+    bypass_cache_for_pytorch_read_limit = should_defer_hash_for_pytorch_read_limit(path, config, file_size)
+
     # Check if we should use extreme handler BEFORE applying size limits
     # Extreme handler bypasses size limits for large models
     use_extreme_handler = should_use_advanced_handler(
@@ -4015,7 +3941,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             elif use_large_handler:
                 logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
                 result = scan_large_file(path, scanner, progress_callback, timeout)
-            elif is_xgboost_pickle_spoof:
+            elif is_xgboost_pickle_spoof or bypass_cache_for_pytorch_read_limit:
                 result = scanner.scan(path)
             else:
                 result = scanner.scan_with_cache(path)
@@ -4083,7 +4009,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 elif use_large_handler:
                     logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
                     result = scan_large_file(path, scanner, progress_callback, timeout)
-                elif unavailable_preferred_scanner_id is not None or is_xgboost_pickle_spoof:
+                elif (
+                    unavailable_preferred_scanner_id is not None
+                    or is_xgboost_pickle_spoof
+                    or bypass_cache_for_pytorch_read_limit
+                ):
                     result = scanner.scan(path)
                 else:
                     result = scanner.scan_with_cache(path)
@@ -4546,27 +4476,20 @@ def scan_model_streaming(
                     hashed_bytes=top_level_hashed_bytes,
                 )
                 defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(str(scan_path), scan_config)
-                defer_hash_for_pytorch_zip_read_limit = _should_defer_hash_for_pytorch_zip_read_limit(
+                defer_hash_for_pytorch_read_limit = should_defer_hash_for_pytorch_read_limit(
                     str(scan_path),
                     scan_config,
                 )
-                defer_hash_for_legacy_pytorch_read_limit = _should_defer_hash_for_legacy_pytorch_read_limit(
-                    str(scan_path),
-                    scan_config,
-                )
-                if (
-                    defer_hash_for_max_total_size
-                    or defer_hash_for_max_file_size
-                    or defer_hash_for_pytorch_zip_read_limit
-                    or defer_hash_for_legacy_pytorch_read_limit
-                ):
+                if defer_hash_for_max_total_size or defer_hash_for_max_file_size or defer_hash_for_pytorch_read_limit:
                     aggregate_hash_complete = False
+                if defer_hash_for_pytorch_read_limit:
+                    scan_config = dict(scan_config)
+                    scan_config["cache_enabled"] = False
                 if (
                     not _should_defer_hash_for_safetensors_header_limit(str(scan_path), scan_config)
                     and not defer_hash_for_max_file_size
                     and not defer_hash_for_max_total_size
-                    and not defer_hash_for_pytorch_zip_read_limit
-                    and not defer_hash_for_legacy_pytorch_read_limit
+                    and not defer_hash_for_pytorch_read_limit
                 ):
                     if progress_callback:
                         progress_callback(

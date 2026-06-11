@@ -441,6 +441,57 @@ class TestHashGenerationEdgeCases:
 
         assert content_hashes[str(zip_path)].startswith("unhashable_pytorch_zip_read_limit_")
 
+    @pytest.mark.parametrize("read_size", [None, "invalid", -1])
+    def test_hash_files_by_path_uses_default_for_invalid_pytorch_read_limit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_size: object
+    ) -> None:
+        """Invalid read-limit config should mirror scanner defaults before aggregate hashing."""
+        from modelaudit import core
+
+        zip_path = create_mock_pytorch_zip(tmp_path / "large.pt")
+        with zip_path.open("ab") as handle:
+            handle.write(b"A" * 2048)
+
+        def fail_hash(path: str) -> str:
+            if path == str(zip_path):
+                pytest.fail("invalid max_file_read_size should still use default bounded PyTorch deferral")
+            return "a" * 64
+
+        monkeypatch.setattr(core.BaseScanner, "default_max_file_read_size", 256)
+        monkeypatch.setattr(core, "_calculate_file_hash", fail_hash)
+
+        content_hashes = core._hash_files_by_path(
+            [str(zip_path)],
+            config={"max_file_read_size": read_size},
+        )
+
+        assert content_hashes[str(zip_path)].startswith("unhashable_pytorch_zip_read_limit_")
+
+    def test_hash_files_by_path_treats_bool_pytorch_read_limit_as_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Boolean read-limit config must not be coerced to a one-byte cap."""
+        from modelaudit import core
+
+        zip_path = create_mock_pytorch_zip(tmp_path / "small.pt")
+        original_hash = core._calculate_file_hash
+        hashed_paths: list[str] = []
+
+        def track_hash(path: str) -> str:
+            hashed_paths.append(path)
+            return original_hash(path)
+
+        monkeypatch.setattr(core.BaseScanner, "default_max_file_read_size", 1_000_000)
+        monkeypatch.setattr(core, "_calculate_file_hash", track_hash)
+
+        content_hashes = core._hash_files_by_path(
+            [str(zip_path)],
+            config={"max_file_read_size": True},
+        )
+
+        assert hashed_paths == [str(zip_path)]
+        assert content_hashes[str(zip_path)] == original_hash(str(zip_path))
+
     def test_single_file_scan_defers_oversized_pytorch_zip_content_hash(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

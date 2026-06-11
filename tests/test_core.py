@@ -11432,6 +11432,44 @@ def test_scan_file_inconclusive_safetensors_header_limit_result_is_not_cached(
         reset_cache_manager()
 
 
+def test_scan_file_bypasses_cache_hash_for_bounded_pytorch_zip_read_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "large.pt")
+    with model_path.open("ab") as handle:
+        handle.write(b"A" * 2048)
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+        "max_cache_file_size": 10_000,
+        "max_file_read_size": 128,
+    }
+    monkeypatch.setattr(
+        SecureFileHasher,
+        "hash_file",
+        lambda _self, _path: pytest.fail("bounded PyTorch scans must bypass cache-key hashing"),
+    )
+    monkeypatch.setattr(
+        SecureFileHasher,
+        "hash_file_with_stat",
+        lambda _self, _path, _stat: pytest.fail("bounded PyTorch scans must bypass cache validation hashing"),
+    )
+
+    reset_cache_manager()
+    try:
+        result = scan_file(str(model_path), config=config)
+
+        assert result.success is True
+        assert result.metadata["file_hashes"]["sha256_prefix"]
+        assert "sha256" not in result.metadata["file_hashes"]
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 def test_scan_file_ignores_benign_onnx_token_near_match(tmp_path: Path) -> None:
     near_match = tmp_path / "note.payload"
     near_match.write_bytes(b"this documentation mentions onnx but is not a model")

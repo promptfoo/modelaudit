@@ -4059,9 +4059,22 @@ class PickleScanner(BaseScanner):
                     )
                     if not _matches_legacy_pytorch_preamble(initial_payload):
                         return deferred_size_check
-                    if self._legacy_pytorch_layout_for_scan(initial_payload, total_size=standalone_size)[
-                        0
-                    ] is None and not _legacy_pytorch_control_probe_needs_more_bytes(initial_payload):
+                    initial_layout, _initial_storage_valid = self._legacy_pytorch_layout_for_scan(
+                        initial_payload,
+                        total_size=standalone_size,
+                    )
+                    if initial_layout is None and _legacy_pytorch_control_probe_needs_more_bytes(initial_payload):
+                        capped_probe = self._read_stream_payload_for_root(
+                            file_obj,
+                            standalone_size,
+                            initial_payload=initial_payload,
+                        )
+                        initial_payload = capped_probe.payload
+                        initial_layout, _initial_storage_valid = self._legacy_pytorch_layout_for_scan(
+                            initial_payload,
+                            total_size=standalone_size,
+                        )
+                    if initial_layout is None:
                         return deferred_size_check
                 stream_read = self._read_stream_payload_for_root(
                     file_obj,
