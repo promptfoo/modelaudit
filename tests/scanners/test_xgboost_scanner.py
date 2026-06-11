@@ -53,6 +53,42 @@ def _headerless_legacy_binary_header() -> bytes:
     return struct.pack("<fIiiiII27i", 0.5, 4, 0, 1, 0, 0, 90, *([0] * 27))
 
 
+def _proto_varint(value: int) -> bytes:
+    encoded = bytearray()
+    while value >= 0x80:
+        encoded.append((value & 0x7F) | 0x80)
+        value >>= 7
+    encoded.append(value)
+    return bytes(encoded)
+
+
+def _proto_field(field_number: int, wire_type: int, payload: bytes) -> bytes:
+    return _proto_varint((field_number << 3) | wire_type) + payload
+
+
+def _sentencepiece_piece(piece: str, piece_type: int) -> bytes:
+    piece_payload = (
+        _proto_field(1, 2, _proto_varint(len(piece.encode("utf-8"))) + piece.encode("utf-8"))
+        + _proto_field(2, 5, struct.pack("<f", 0.0))
+        + _proto_field(3, 0, _proto_varint(piece_type))
+    )
+    return _proto_field(1, 2, _proto_varint(len(piece_payload)) + piece_payload)
+
+
+def _sentencepiece_model_proto() -> bytes:
+    pieces = [
+        ("<unk>", 2),
+        ("<s>", 3),
+        ("</s>", 3),
+        ("<0x00>", 6),
+        ("<0x01>", 6),
+        ("<0x02>", 6),
+        ("<0x03>", 6),
+        ("<0x04>", 6),
+    ]
+    return b"".join(_sentencepiece_piece(piece, piece_type) for piece, piece_type in pieces)
+
+
 @pytest.fixture
 def xgboost_scanner() -> XGBoostScanner:
     """Create an XGBoost scanner instance."""
@@ -286,9 +322,9 @@ def _xgboost_ubjson_deep_before_counted_null_array_probe() -> bytes:
 class TestXGBoostScannerBasic:
     """Test basic XGBoost scanner functionality."""
 
-    def test_can_handle_supported_extensions(self, temp_dir):
+    def test_can_handle_supported_extensions(self, temp_dir: Path) -> None:
         """Test that scanner handles supported XGBoost file extensions."""
-        # .bst, .model, .ubj are accepted based on extension
+        # .bst, .ubj, and ambiguous .model files are accepted based on extension.
         for ext in [".bst", ".model", ".ubj"]:
             test_file = temp_dir / f"test{ext}"
             test_file.write_text("dummy content")
@@ -298,6 +334,24 @@ class TestXGBoostScannerBasic:
         json_file = temp_dir / "test.json"
         json_file.write_text(json.dumps({"version": [1, 5, 2], "learner": {"gradient_booster": {}}}))
         assert XGBoostScanner.can_handle(str(json_file))
+
+    def test_can_handle_rejects_strong_sentencepiece_tokenizer_model(self, tmp_path: Path) -> None:
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(_sentencepiece_model_proto())
+
+        assert not XGBoostScanner.can_handle(str(tokenizer_model))
+
+    def test_can_handle_keeps_malformed_sentencepiece_like_model_on_xgboost_route(self, tmp_path: Path) -> None:
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(b"\x0a\x0e\x0a\x05<unk>\x15\x00" + (b"\0" * 64))
+
+        assert XGBoostScanner.can_handle(str(tokenizer_model))
+
+    def test_can_handle_keeps_xgboost_model_extension_controls(self, tmp_path: Path) -> None:
+        binary_model = tmp_path / "xgboost.model"
+        binary_model.write_bytes(b"binf" + (b"\0" * 60))
+
+        assert XGBoostScanner.can_handle(str(binary_model))
 
     def test_cannot_handle_unsupported_extensions(self, temp_dir):
         """Test that scanner rejects unsupported file extensions."""
@@ -1665,6 +1719,54 @@ class TestXGBoostFailClosedEndToEnd:
         assert determine_exit_code(result) == 2
         _assert_inconclusive_metadata(result, binary_file, "xgboost_read_failed")
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    def test_sentencepiece_tokenizer_model_core_is_not_xgboost_false_positive(self, tmp_path: Path) -> None:
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(_sentencepiece_model_proto())
+
+        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+        assert direct.success is True
+        assert direct.scanner_name == "unknown"
+        assert "xgboost" not in aggregate.scanner_names
+        assert determine_exit_code(aggregate) == 0
+        assert not any(issue.rule_code == "S1004" for issue in aggregate.issues)
+
+    def test_malformed_sentencepiece_like_model_still_fails_closed_in_xgboost(self, tmp_path: Path) -> None:
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(b"\x0a\x0e\x0a\x05<unk>\x15\x00" + (b"\0" * 64))
+
+        result = scan_file(str(tokenizer_model), config={"cache_enabled": False})
+
+        assert result.success is False
+        assert result.scanner_name == "xgboost"
+        assert "xgboost_binary_structure_unrecognized" in result.metadata["scan_outcome_reasons"]
+        assert any(issue.rule_code == "S1004" for issue in result.issues)
+
+    def test_xgboost_binary_model_extension_still_scans_cleanly(self, tmp_path: Path) -> None:
+        binary_model = tmp_path / "native.model"
+        binary_model.write_bytes(b"binf" + (b"\0" * 60))
+
+        result = scan_file(str(binary_model), config={"cache_enabled": False})
+
+        assert result.success is True
+        assert result.scanner_name == "xgboost"
+        assert not result.issues
+
+    def test_xgboost_shaped_model_extension_still_fails_closed(
+        self, tmp_path: Path, valid_xgboost_json: dict[str, Any]
+    ) -> None:
+        valid_xgboost_json["learner"]["malicious_code"] = "os.system('touch pwned')"
+        model_file = tmp_path / "tokenizer.model"
+        model_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
+
+        result = scan_file(str(model_file), config={"cache_enabled": False})
+
+        assert result.success is False
+        assert result.scanner_name == "xgboost"
+        assert "xgboost_binary_structure_unrecognized" in result.metadata["scan_outcome_reasons"]
+        assert any(issue.rule_code == "S1004" for issue in result.issues)
 
     def test_extensionless_ubjson_nested_zip_detects_malicious_content(
         self, tmp_path: Path, valid_xgboost_json: dict[str, Any]

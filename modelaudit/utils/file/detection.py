@@ -89,6 +89,14 @@ _ONNX_MODEL_FIELD_WIRE_TYPES = {
 _PROTO_GROUP_MAX_ROUTING_FIELDS = 512
 _PROTO_GROUP_MAX_ROUTING_DEPTH = 8
 _COREML_PROTO_SIGNATURE_READ_BYTES = 1024 * 1024
+_SENTENCEPIECE_MODEL_PROTO_READ_BYTES = 64 * 1024
+_SENTENCEPIECE_MODEL_MAX_FIELDS = 4096
+_SENTENCEPIECE_MIN_STRONG_PIECES = 8
+_SENTENCEPIECE_MAX_PIECE_FIELDS = 16
+_SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES = 4096
+_SENTENCEPIECE_MAX_PIECE_TEXT_BYTES = 512
+_SENTENCEPIECE_IDENTITY_TOKENS = frozenset({"<unk>", "<s>", "</s>", "<pad>", "<bos>", "<eos>"})
+_SENTENCEPIECE_BYTE_FALLBACK_RE = re.compile(r"^<0x[0-9A-Fa-f]{2}>$")
 _COREML_PROTO_PREFIX_WIRE_TYPES = frozenset({0, 1, 2, 3, 5})
 _COREML_GROUP_BUDGET_EXHAUSTED: Literal["budget_exhausted"] = "budget_exhausted"
 _COREML_GROUP_INCOMPLETE: Literal["incomplete"] = "incomplete"
@@ -1376,6 +1384,145 @@ def _skip_proto_value(data: bytes, offset: int, wire_type: int, end: int | None 
         next_offset = offset + 4
         return next_offset if next_offset <= limit else None
     return None
+
+
+def _parse_sentencepiece_piece_proto(data: bytes, start: int, end: int) -> tuple[str, int | None] | None:
+    """Return the token text and optional type for one SentencePiece piece."""
+    if end - start > _SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES:
+        return None
+
+    offset = start
+    fields_seen = 0
+    piece_text: str | None = None
+    piece_type: int | None = None
+    has_score = False
+    while offset < end and fields_seen < _SENTENCEPIECE_MAX_PIECE_FIELDS:
+        tag_result = _read_proto_varint(data, offset, end)
+        if tag_result is None:
+            return None
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return None
+
+        if field_number == 1 and wire_type == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset, end)
+            if bounds is None:
+                return None
+            length, value_start, _value_end, actual_value_end = bounds
+            if length == 0 or length > _SENTENCEPIECE_MAX_PIECE_TEXT_BYTES or actual_value_end > end:
+                return None
+            raw_piece = data[value_start:actual_value_end]
+            try:
+                piece_text = raw_piece.decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+            if "\x00" in piece_text:
+                return None
+            offset = actual_value_end
+        elif field_number == 2 and wire_type == 5:
+            fixed32_end = value_offset + 4
+            if fixed32_end > end:
+                return None
+            has_score = True
+            offset = fixed32_end
+        elif field_number == 3 and wire_type == 0:
+            type_result = _read_proto_varint(data, value_offset, end)
+            if type_result is None:
+                return None
+            piece_type, offset = type_result
+            if not 1 <= piece_type <= 6:
+                return None
+        else:
+            skipped_offset = _skip_proto_value(data, value_offset, wire_type, end)
+            if skipped_offset is None:
+                return None
+            offset = skipped_offset
+        fields_seen += 1
+
+    if offset != end or fields_seen >= _SENTENCEPIECE_MAX_PIECE_FIELDS:
+        return None
+    if piece_text is None or not has_score:
+        return None
+    return piece_text, piece_type
+
+
+def _is_sentencepiece_identity_piece(piece: str) -> bool:
+    return piece in _SENTENCEPIECE_IDENTITY_TOKENS or _SENTENCEPIECE_BYTE_FALLBACK_RE.fullmatch(piece) is not None
+
+
+def _has_strong_sentencepiece_model_proto_prefix(data: bytes) -> bool:
+    """Recognize a SentencePiece ModelProto from repeated scored pieces."""
+    offset = 0
+    fields_seen = 0
+    piece_count = 0
+    typed_piece_count = 0
+    identity_piece_count = 0
+    has_unknown_piece = False
+
+    while offset < len(data) and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            return False
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+
+        if field_number == 1 and wire_type == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return False
+            length, value_start, _sampled_value_end, actual_value_end = bounds
+            if length == 0 or actual_value_end > len(data):
+                return False
+            parsed_piece = _parse_sentencepiece_piece_proto(data, value_start, actual_value_end)
+            if parsed_piece is None:
+                return False
+            piece, piece_type = parsed_piece
+            piece_count += 1
+            if piece_type is not None:
+                typed_piece_count += 1
+            if _is_sentencepiece_identity_piece(piece):
+                identity_piece_count += 1
+            if piece == "<unk>":
+                has_unknown_piece = True
+            offset = actual_value_end
+        else:
+            next_offset = _skip_proto_value(data, value_offset, wire_type)
+            if next_offset is None:
+                return False
+            offset = next_offset
+
+        fields_seen += 1
+        if (
+            piece_count >= _SENTENCEPIECE_MIN_STRONG_PIECES
+            and typed_piece_count >= 3
+            and identity_piece_count >= 3
+            and has_unknown_piece
+        ):
+            return True
+
+    return False
+
+
+def is_sentencepiece_model_proto_file(path: str | Path) -> bool:
+    """Return True for strongly identified SentencePiece tokenizer ModelProto files."""
+    file_path = Path(path)
+    try:
+        if not file_path.is_file():
+            return False
+        size = file_path.stat().st_size
+        if size < 32:
+            return False
+        with file_path.open("rb") as handle:
+            prefix = handle.read(min(size, _SENTENCEPIECE_MODEL_PROTO_READ_BYTES))
+    except OSError:
+        return False
+
+    return _has_strong_sentencepiece_model_proto_prefix(prefix)
 
 
 def _skip_coreml_proto_group(
