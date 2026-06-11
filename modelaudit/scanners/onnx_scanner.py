@@ -614,6 +614,30 @@ def _has_symlink_component(path: Path, root: Path) -> bool:
     return False
 
 
+def _is_trusted_huggingface_cache_external_alias(
+    model_path: Path,
+    lexical_external_path: Path,
+    external_path: Path,
+) -> bool:
+    """Return True for Hugging Face snapshot symlinks that resolve to the model cache blobs directory."""
+    try:
+        from ..utils.sources._huggingface_cache import _find_hf_cache_root, _trusted_hf_blobs_root
+    except Exception:
+        return False
+
+    model_cache_root = _find_hf_cache_root(model_path)
+    if model_cache_root is None or _find_hf_cache_root(lexical_external_path) != model_cache_root:
+        return False
+    blobs_root = _trusted_hf_blobs_root(model_cache_root)
+    if blobs_root is None:
+        return False
+    try:
+        external_path.relative_to(blobs_root)
+    except ValueError:
+        return False
+    return True
+
+
 def _tensor_data_type_to_np_dtype(data_type: int) -> Any:
     """Resolve an ONNX tensor dtype across current and legacy ONNX APIs."""
     import numpy as np
@@ -2891,7 +2915,12 @@ class OnnxScanner(BaseScanner):
             result.metadata["custom_domains"] = sorted(custom_domains)
 
     def _check_external_data(self, model: Any, path: str, result: ScanResult) -> None:
-        model_dir = Path(path).resolve().parent
+        model_path = Path(path).absolute()
+        model_dir = model_path.parent
+        try:
+            resolved_model_dir = model_dir.resolve()
+        except (OSError, RuntimeError):
+            resolved_model_dir = model_dir
         import onnx
 
         # Track per-file status to avoid flooding the result with one check
@@ -2935,8 +2964,19 @@ class OnnxScanner(BaseScanner):
                     lexical_external_path,
                     model_dir,
                 )
-                symlink_escapes_model_dir = has_symlink_component and not _is_contained_in(external_path, model_dir)
-                escapes_model_dir = has_windows_absolute_path or not _is_contained_in(external_path, model_dir)
+                trusted_hf_cache_alias = has_symlink_component and _is_trusted_huggingface_cache_external_alias(
+                    model_path,
+                    lexical_external_path,
+                    external_path,
+                )
+                symlink_escapes_model_dir = (
+                    has_symlink_component
+                    and not trusted_hf_cache_alias
+                    and not _is_contained_in(external_path, resolved_model_dir)
+                )
+                escapes_model_dir = has_windows_absolute_path or (
+                    not trusted_hf_cache_alias and not _is_contained_in(external_path, resolved_model_dir)
+                )
                 if symlink_escapes_model_dir:
                     result.add_check(
                         name="CVE-2026-34447: External Data Symlink Traversal",

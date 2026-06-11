@@ -1,3 +1,4 @@
+import os
 import struct
 import sys
 from pathlib import Path
@@ -3715,6 +3716,35 @@ class TestCVE202551480SavePathTraversal:
 class TestCVE202634447SymlinkTraversal:
     """Tests for CVE-2026-34447: ONNX external_data symlink traversal."""
 
+    def _create_hf_cache_snapshot_model(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        sidecar_target: Path | None = None,
+    ) -> Path:
+        cache_hub = tmp_path / "hf-hub"
+        monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+        cache_root = cache_hub / "models--FacebookAI--xlm-roberta-large"
+        blobs_dir = cache_root / "blobs"
+        snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+        blobs_dir.mkdir(parents=True)
+        snapshot_dir.mkdir(parents=True)
+
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        source_model = create_onnx_model(source_dir, external=True, external_path="model.onnx_data")
+        model_blob = blobs_dir / "model-blob"
+        sidecar_blob = blobs_dir / "sidecar-blob"
+        model_blob.write_bytes(source_model.read_bytes())
+        sidecar_blob.write_bytes((source_dir / "model.onnx_data").read_bytes())
+
+        model_path = snapshot_dir / "model.onnx"
+        sidecar_path = snapshot_dir / "model.onnx_data"
+        model_path.symlink_to(os.path.relpath(model_blob, snapshot_dir))
+        sidecar_path.symlink_to(os.path.relpath(sidecar_target or sidecar_blob, snapshot_dir))
+        return model_path
+
     def test_symlink_escape_detected(self, tmp_path: Path, requires_symlinks: None) -> None:
         outside_dir = tmp_path.parent / f"{tmp_path.name}_outside"
         outside_dir.mkdir(parents=True, exist_ok=True)
@@ -3742,6 +3772,57 @@ class TestCVE202634447SymlinkTraversal:
         assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2025-51480"]
         assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2024-27318"]
         assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2022-25882"]
+
+    def test_huggingface_cache_snapshot_sidecar_symlink_to_blob_not_flagged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        model_path = self._create_hf_cache_snapshot_model(tmp_path, monkeypatch)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        missing_checks = [
+            c for c in result.checks if c.name == "External Data Reference Check" and c.status == CheckStatus.FAILED
+        ]
+        resolved_checks = [
+            c
+            for c in result.checks
+            if c.name == "External Data Reference Check"
+            and c.status == CheckStatus.PASSED
+            and c.details.get("file") == "model.onnx_data"
+        ]
+        assert result.success is True
+        assert missing_checks == []
+        assert len(resolved_checks) == 1
+        assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
+
+    def test_huggingface_cache_snapshot_sidecar_symlink_outside_blob_still_flagged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        outside_dir = tmp_path.parent / f"{tmp_path.name}_outside_hf"
+        outside_dir.mkdir(parents=True, exist_ok=True)
+        outside_weights = outside_dir / "weights.bin"
+        outside_weights.write_bytes(struct.pack("f", 1.0))
+        model_path = self._create_hf_cache_snapshot_model(
+            tmp_path,
+            monkeypatch,
+            sidecar_target=outside_weights,
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        cve_checks = [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
+        assert result.success is False
+        assert len(cve_checks) == 1
+        assert cve_checks[0].details["resolved_path"] == str(outside_weights.resolve())
+        assert not [
+            c for c in result.checks if c.name == "External Data Reference Check" and c.status == CheckStatus.FAILED
+        ]
 
     def test_symlink_inside_model_dir_not_flagged(self, tmp_path: Path, requires_symlinks: None) -> None:
         safe_weights = tmp_path / "safe_payload.bin"

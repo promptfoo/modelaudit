@@ -2328,7 +2328,7 @@ def scan_model_directory_or_file(
                     route_hf_shard_alias = (
                         is_hf_cache_symlink and resolved_file.exists() and snapshot_shard_family_key is not None
                     )
-                    scan_source = snapshot_path if route_hf_shard_alias else resolved_file
+                    scan_source = snapshot_path if is_hf_cache_symlink else resolved_file
 
                     # Skip non-model files early if filtering is enabled
                     # Note: skip_file_types parameter already contains the correct value

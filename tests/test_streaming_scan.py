@@ -776,6 +776,51 @@ def test_scan_model_streaming_hf_onnx_escaping_external_data_remains_cve(
     assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == ["onnx/model.onnx"]
 
 
+def test_scan_model_directory_hf_cache_onnx_external_data_uses_snapshot_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Local scans over HF cache snapshots should resolve ONNX sidecars beside the snapshot alias."""
+    cache_hub = tmp_path / "hf-hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+    cache_root = cache_hub / "models--test--model"
+    blobs_dir = cache_root / "blobs"
+    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    (snapshot_dir / "model.onnx").symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    (snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+
+    result = scan_model_directory_or_file(
+        str(snapshot_dir),
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    failed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status.value == "failed"
+    ]
+    passed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check"
+        and check.status.value == "passed"
+        and check.details.get("file") == "model.onnx_data"
+    ]
+    assert failed_external == []
+    assert len(passed_external) == 1
+    assert determine_exit_code(result) == 0
+
+
 @pytest.mark.parametrize("delete_after_scan", [False, True])
 def test_scan_model_streaming_reconciles_cross_directory_shard_coverage(
     delete_after_scan: bool,
