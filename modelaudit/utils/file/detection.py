@@ -54,6 +54,7 @@ _TF_METAGRAPH_MAX_ROUTING_DEPTH = 64
 _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES = 2 * 1024 * 1024
 _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES = b"\t\n\r" + bytes(range(0x20, 0x7F))
 _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS = frozenset({"\t", "\n", "\r", "\f"})
+_CONTENT_ROUTE_TEXT_OWNER_SUFFIXES = frozenset({".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".json"})
 _CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES = (
     bytes(byte for byte in range(0x20) if byte not in {0x09, 0x0A, 0x0C, 0x0D}) + b"\x7f"
 )
@@ -5360,13 +5361,32 @@ def _is_complete_bounded_printable_text(file_path: Path, file_size: int) -> bool
     return all(char in _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS or char.isprintable() for char in text)
 
 
+def _is_complete_bounded_printable_text_content_owner(file_path: Path, file_size: int) -> bool:
+    """Return whether printable text can safely own this complete file."""
+    if file_size > _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES:
+        return False
+    try:
+        payload = read_magic_bytes(str(file_path), file_size)
+    except OSError:
+        return False
+    if not payload.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES):
+        return True
+    if file_path.suffix.lower() not in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES:
+        return False
+    try:
+        text = payload.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False
+    return all(char in _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS or char.isprintable() for char in text)
+
+
 def _preserve_inconclusive_protobuf_model_routing(file_path: Path, file_size: int) -> bool:
     """Keep ambiguous binary model protobufs scannable without claiming proven text."""
     if file_path.suffix.lower() in {".py", ".pyw"} and not _has_bounded_non_source_control_signal(file_path, file_size):
         return False
     return not _is_complete_structured_json_content_owner(
         file_path, file_size
-    ) and not _is_complete_bounded_printable_text(file_path, file_size)
+    ) and not _is_complete_bounded_printable_text_content_owner(file_path, file_size)
 
 
 def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
@@ -5384,7 +5404,7 @@ def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
             return False
         if json_document_probe is None and ext not in _FLAX_MSGPACK_CONTENT_ROUTE_ALLOWED_DECLARED_SUFFIXES:
             return True
-        if _is_complete_bounded_printable_text(file_path, size):
+        if _is_complete_bounded_printable_text_content_owner(file_path, size):
             return False
     if ext == "":
         xgboost_route = _detect_extensionless_xgboost_ubjson_route(

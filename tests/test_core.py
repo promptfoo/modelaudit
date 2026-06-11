@@ -224,6 +224,11 @@ def _build_protocolless_binary_benign_scalar_pickle() -> bytes:
     return b"\x8c\x02os\x94."
 
 
+def _build_printable_utf8_ambiguous_binary_route() -> bytes:
+    """Build printable UTF-8 bytes that still require binary fail-closed routing."""
+    return (b'""' + ("é" * 17).encode("utf-8")) * 4097
+
+
 def _write_pickle_safetensors_polyglot(path: Path, header_length: int) -> None:
     """Write a valid SafeTensors file whose bytes are also a dangerous pickle."""
     pickle_tail = b"\n0cos\nsystem\n(Vecho modelaudit-polyglot\ntR."
@@ -5013,9 +5018,15 @@ def test_scan_file_routes_malicious_flax_checkpoint_under_skipped_suffix(tmp_pat
     ("filename", "payload", "expected_scanner"),
     [
         ("merges.txt", "#version: 0.2\nĠ t\n", "unknown"),
+        (
+            "tokenizer.json",
+            json.dumps({"version": "1.0", "model": {"type": "BPE", "vocab": {"Ġthe": 0}}}),
+            "jinja2_template",
+        ),
+        ("vocab.json", json.dumps({"Ġthe": 0, "áudio": 1}), "unknown"),
         ("README.md", "# Higgs áudio\n\nModel card.\n", "text"),
     ],
-    ids=["bpe-merges", "markdown-readme"],
+    ids=["bpe-merges", "tokenizer-json", "vocab-json", "markdown-readme"],
 )
 def test_scan_file_keeps_bounded_utf8_tokenizer_text_out_of_flax_scanner(
     tmp_path: Path,
@@ -5035,6 +5046,62 @@ def test_scan_file_keeps_bounded_utf8_tokenizer_text_out_of_flax_scanner(
     assert result.scanner_name == expected_scanner
     assert result.scanner_name != "flax_msgpack"
     assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+
+
+def test_scan_file_keeps_nested_utf8_tokenizer_text_member_out_of_flax_scanner(tmp_path: Path) -> None:
+    archive = tmp_path / "tokenizer-bundle.zip"
+    _create_misnamed_zip(archive, {"tokenizer/merges.txt": "#version: 0.2\nĠ t\n".encode()})
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
+    assert result.success is True
+    assert not result.issues
+    assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+    assert result.metadata["contents"] == [{"path": f"{archive}:tokenizer/merges.txt", "type": "unknown", "size": 19}]
+
+
+def test_scan_file_fails_closed_for_printable_utf8_non_text_suffix_binary_candidate(tmp_path: Path) -> None:
+    payload = _build_printable_utf8_ambiguous_binary_route()
+    candidate = tmp_path / "ambiguous.jpg"
+    candidate.write_bytes(payload)
+
+    assert file_detection.detect_file_format(str(candidate)) == "flax_msgpack"
+    assert file_detection.detect_file_format_from_magic(str(candidate)) == "flax_msgpack"
+    assert file_detection.detect_file_format_for_skip_filter(str(candidate)) == "flax_msgpack"
+
+    result = scan_file(str(candidate), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(candidate), cache_scan_results=False)
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "flax_msgpack_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_fails_closed_for_nested_printable_utf8_non_text_suffix_binary_candidate(tmp_path: Path) -> None:
+    payload = _build_printable_utf8_ambiguous_binary_route()
+    archive = tmp_path / "ambiguous-bundle.zip"
+    _create_misnamed_zip(archive, {"payload.jpg": payload})
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+    assert result.scanner_name == "zip"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "flax_msgpack_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.message == "Flax MessagePack analysis incomplete because bounded routing inspection could not complete"
+        for issue in result.issues
+    )
+    assert result.metadata["contents"] == [
+        {"path": f"{archive}:payload.jpg", "type": "flax_msgpack", "size": len(payload)}
+    ]
+    assert core_module.determine_exit_code(aggregate) == 2
 
 
 def test_scan_file_keeps_real_msgpack_fixture_owned_by_flax_scanner(tmp_path: Path) -> None:
