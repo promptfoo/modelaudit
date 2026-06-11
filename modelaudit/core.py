@@ -162,6 +162,7 @@ _add_asset_to_results = core_results.add_asset_to_results
 _add_error_asset_to_results = core_results.add_error_asset_to_results
 _DIRECTORY_PRECOUNT_CHILD_LIMIT = 1000
 _COMPRESSED_TAR_STREAM_INCOMPLETE_REASON = "tar_compressed_stream_incomplete"
+_STREAMING_SOURCE_INTERRUPTED_REASON = "streaming_source_interrupted"
 
 
 def _repository_member_path_for_scan(scan_path: str, scan_root: Path | None) -> str | None:
@@ -4889,6 +4890,7 @@ def scan_model_streaming(
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
     is_hf_cache = base_dir is not None and hf_cache_root is not None
+    stream_started = False
 
     try:
         file_iterator = iter(file_generator)
@@ -4896,11 +4898,40 @@ def scan_model_streaming(
         while True:
             try:
                 file_path, _is_last = next(file_iterator)
+                stream_started = True
             except StopIteration:
                 if not scanning_deferred_openvino_sidecars and deferred_openvino_sidecars:
                     file_iterator = iter((sidecar_path, True) for sidecar_path in deferred_openvino_sidecars.values())
                     scanning_deferred_openvino_sidecars = True
                     continue
+                break
+            except Exception as e:
+                if not stream_started:
+                    raise
+                logger.error(f"Streaming source interrupted after partial scan: {e}")
+                results.has_errors = True
+                results.success = False
+                preserve_shard_reconciliation_errors = True
+                aggregate_hash_complete = False
+                _add_issue_to_model(
+                    results,
+                    (
+                        "Streaming source interrupted before all artifacts could be scanned; "
+                        "partial results were preserved."
+                    ),
+                    severity=IssueSeverity.INFO.value,
+                    details={
+                        "analysis_incomplete": True,
+                        "operational_error": True,
+                        "operational_error_reason": _STREAMING_SOURCE_INTERRUPTED_REASON,
+                        "exception_type": type(e).__name__,
+                        "files_scanned_before_failure": results.files_scanned,
+                        "scan_outcome": "inconclusive",
+                        "scan_outcome_reason": _STREAMING_SOURCE_INTERRUPTED_REASON,
+                        "scan_outcome_reasons": [_STREAMING_SOURCE_INTERRUPTED_REASON],
+                    },
+                    issue_type=_STREAMING_SOURCE_INTERRUPTED_REASON,
+                )
                 break
 
             source_path = Path(file_path)

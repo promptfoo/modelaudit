@@ -45,10 +45,10 @@ def _run_operation(operation: str, operation_kwargs: dict[str, Any]) -> dict[str
     elif operation == "get_model_size":
         from huggingface_hub import HfApi
 
-        model_info = HfApi().model_info(
-            operation_kwargs["repo_id"],
-            timeout=operation_kwargs.get("request_timeout"),
-        )
+        model_info_kwargs: dict[str, Any] = {"timeout": operation_kwargs.get("request_timeout")}
+        if operation_kwargs.get("revision") is not None:
+            model_info_kwargs["revision"] = operation_kwargs["revision"]
+        model_info = HfApi().model_info(operation_kwargs["repo_id"], **model_info_kwargs)
         total_size = sum(
             file_info.size
             for file_info in (getattr(model_info, "siblings", None) or ())
