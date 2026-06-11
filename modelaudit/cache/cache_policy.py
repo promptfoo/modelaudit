@@ -84,6 +84,10 @@ def _metadata_disqualifies_cache(metadata: Any) -> bool:
     if isinstance(findings, (list, tuple, set, frozenset)):
         return any(_metadata_disqualifies_cache(finding) for finding in findings)
 
+    details = metadata.get("details")
+    if isinstance(details, dict):
+        return _metadata_disqualifies_cache(details)
+
     return False
 
 
