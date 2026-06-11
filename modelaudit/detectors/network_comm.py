@@ -3033,6 +3033,7 @@ class NetworkCommDetector:
                                 "message": f"Explicit network pattern in ML model: {matched_text[:100]}",
                                 "pattern_type": pattern_type,
                                 "matched_text": matched_text[:200],
+                                "position": match.start(),
                                 "context": context,
                             }
                         ):

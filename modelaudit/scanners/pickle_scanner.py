@@ -271,6 +271,37 @@ _NETWORK_SCAN_SEEDS: tuple[bytes, ...] = (
     b"websocket",
     b"zombie",
 )
+_PICKLE_LITERAL_URL_RE = re.compile(rb"(?i)https?://[a-zA-Z0-9\-._~:/?#[\]@!$&'()*+,;=%]+")
+_EXECUTABLE_NETWORK_LITERAL_SEEDS: tuple[bytes, ...] = (
+    b"__import__",
+    b"cloudpickle.load",
+    b"dill.load",
+    b"download_file(",
+    b"eval(",
+    b"exec(",
+    b"gethostbyname",
+    b"getaddrinfo",
+    b"hf_hub_download(",
+    b"http.request",
+    b"joblib.load",
+    b"load_state_dict_from_url",
+    b"os.popen",
+    b"os.system",
+    b"pickle.load",
+    b"requests.",
+    b"shell=true",
+    b"socket.",
+    b"snapshot_download(",
+    b"subprocess",
+    b"torch.hub.load",
+    b"urllib.",
+    b"urlopen",
+    b"urlretrieve",
+    b"yaml.load",
+)
+_EXECUTABLE_NETWORK_LITERAL_COMMAND_RE = re.compile(
+    rb"(?i)(?<![A-Za-z0-9_./-])(?:bash|curl|nc|netcat|pwsh|powershell|sh|wget)(?:\.exe)?(?=$|[\s;&|'\")])"
+)
 _SECRET_ASSIGNMENT_SHAPE_RE = re.compile(
     rb"(?i)\b[a-z0-9_.-]{0,64}(?:api[_-]?key|secret|token|password|passwd|pwd|credential|access[_-]?key)"
     rb"[a-z0-9_.-]{0,64}\s*[:=]\s*['\"]?[A-Za-z0-9_./+=:-]{8,}"
@@ -438,6 +469,13 @@ class _PickleCveStream:
     payload: bytes
     offset: int
     parse_incomplete: bool
+
+
+@dataclass(frozen=True)
+class _PickleLiteralRecord:
+    start: int
+    end: int
+    literal: bytes
 
 
 @dataclass(frozen=True)
@@ -1113,22 +1151,85 @@ def _literal_arg_bytes(arg: object) -> bytes | None:
 
 
 def _documentation_literal_spans(data: bytes) -> tuple[tuple[int, int], ...]:
+    spans: list[tuple[int, int]] = []
+    for record in _pickle_literal_records(data):
+        if not _is_primarily_documentation(record.literal):
+            continue
+        spans.append((record.start, record.end))
+    return tuple(spans)
+
+
+def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
     try:
         operations = list(pickletools.genops(data))
     except Exception:
         return ()
 
-    spans: list[tuple[int, int]] = []
+    records: list[_PickleLiteralRecord] = []
     for index, (opcode, arg, position) in enumerate(operations):
         if position is None or opcode.name not in _PICKLE_LITERAL_OPCODE_NAMES:
             continue
         literal = _literal_arg_bytes(arg)
-        if literal is None or not _is_primarily_documentation(literal):
+        if literal is None:
             continue
         next_position = operations[index + 1][2] if index + 1 < len(operations) else None
         end_position = next_position if isinstance(next_position, int) and next_position > position else len(data)
-        spans.append((position, end_position))
-    return tuple(spans)
+        records.append(_PickleLiteralRecord(position, end_position, literal))
+    return tuple(records)
+
+
+def _pickle_literal_has_executable_network_context(literal: bytes) -> bool:
+    context = _PICKLE_LITERAL_URL_RE.sub(b" ", literal)
+    lowered = context.lower()
+    compact = re.sub(rb"\s+", b"", lowered)
+    if any(seed in lowered or seed in compact for seed in _EXECUTABLE_NETWORK_LITERAL_SEEDS):
+        return True
+    return _EXECUTABLE_NETWORK_LITERAL_COMMAND_RE.search(context) is not None
+
+
+def _network_finding_is_inert_pickle_literal_url(
+    finding: dict[str, Any],
+    literal_records: tuple[_PickleLiteralRecord, ...],
+) -> bool:
+    if finding.get("type") != "explicit_network_pattern" or finding.get("pattern_type") != "url":
+        return False
+    position = finding.get("position")
+    if not isinstance(position, int):
+        return False
+    for record in literal_records:
+        if record.start <= position < record.end:
+            return not _pickle_literal_has_executable_network_context(record.literal)
+    return False
+
+
+def filter_inert_pickle_literal_network_findings(
+    findings: list[dict[str, Any]],
+    data: bytes,
+) -> list[dict[str, Any]]:
+    """Drop URL-only critical network findings for inert pickle literals."""
+    if not findings:
+        return findings
+    literal_records = _pickle_literal_records(data)
+    if not literal_records:
+        return findings
+    return [
+        finding for finding in findings if not _network_finding_is_inert_pickle_literal_url(finding, literal_records)
+    ]
+
+
+def _pickle_literal_url_stripped_scan_view(data: bytes) -> bytes:
+    literal_records = _pickle_literal_records(data)
+    if not literal_records:
+        return data
+    stripped: bytearray | None = None
+    for record in literal_records:
+        if _pickle_literal_has_executable_network_context(record.literal):
+            continue
+        for match in _PICKLE_LITERAL_URL_RE.finditer(data, record.start, record.end):
+            if stripped is None:
+                stripped = bytearray(data)
+            stripped[match.start() : match.end()] = b" " * (match.end() - match.start())
+    return data if stripped is None else bytes(stripped)
 
 
 def _pickle_literal_strings(data: bytes) -> tuple[str, ...]:
@@ -2801,7 +2902,13 @@ class PickleScanner(BaseScanner):
         if _contains_any_seed_lowered(expensive_lower, _NETWORK_SCAN_SEEDS, expensive_present_bytes) or (
             _has_domain_or_ip_shape(expensive_data)
         ):
-            self.check_for_network_communication(expensive_data, result, context=source)
+            network_findings = self.collect_network_communication_findings(
+                expensive_data,
+                context=source,
+                result=result,
+            )
+            network_findings = filter_inert_pickle_literal_network_findings(network_findings, expensive_data)
+            self.add_network_communication_findings(network_findings, result, context=source)
         else:
             result.metadata["pickle_network_raw_detector_skipped"] = True
 
@@ -3090,11 +3197,16 @@ class PickleScanner(BaseScanner):
         lower_data: bytes | None = None,
         present_bytes: frozenset[int] | None = None,
     ) -> None:
-        lower = data.lower() if lower_data is None else lower_data
+        scan_data = _pickle_literal_url_stripped_scan_view(data)
+        if scan_data is data:
+            lower = data.lower() if lower_data is None else lower_data
+        else:
+            lower = scan_data.lower()
+            present_bytes = None
         if present_bytes is None:
             present_bytes = frozenset(lower)
         if not _has_raw_text_indicator_shape(
-            data,
+            scan_data,
             lower,
             rust_clean=self._rust_scan_completed_cleanly(result),
             present_bytes=present_bytes,
@@ -3129,9 +3241,9 @@ class PickleScanner(BaseScanner):
                 and _contains_non_documentation_token(lower, b"import ", documentation_spans)
             ):
                 _append_raw_indicator(indicators, "importlib")
-        if _raw_call_token_should_report(data, lower, b"eval", documentation_spans):
+        if _raw_call_token_should_report(scan_data, lower, b"eval", documentation_spans):
             _append_raw_indicator(indicators, "eval", "builtins.eval")
-        if _raw_call_token_should_report(data, lower, b"exec", documentation_spans):
+        if _raw_call_token_should_report(scan_data, lower, b"exec", documentation_spans):
             _append_raw_indicator(indicators, "exec", "builtins.exec")
         if _contains_module_attr(lower, b"webbrowser", b"open", documentation_spans):
             _append_raw_indicator(indicators, "webbrowser.open")

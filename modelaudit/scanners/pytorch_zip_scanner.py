@@ -37,7 +37,7 @@ from .archive_member_security import (
     probe_executable_archive_member_signature,
 )
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
-from .pickle_scanner import PickleScanner
+from .pickle_scanner import PickleScanner, filter_inert_pickle_literal_network_findings
 from .picklescan_adapter import apply_pickle_member_context
 from .pytorch_zip_support import (
     RelaxedZipCrcTracker,
@@ -2127,6 +2127,7 @@ class PyTorchZipScanner(BaseScanner):
                             context=f"{path}:{name}",
                             result=result,
                         )
+                        network_findings = filter_inert_pickle_literal_network_findings(network_findings, file_data)
                         all_network_findings.extend(network_findings)
 
             except Exception as e:

