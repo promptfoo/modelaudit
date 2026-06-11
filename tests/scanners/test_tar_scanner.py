@@ -1806,6 +1806,59 @@ class TestTarScanner:
         assert "tar entry payload.bin exceeds maximum size of 64 bytes" in oversize_checks[0].message.lower()
         assert "tar_entry_extraction_incomplete" in result.metadata["scan_outcome_reasons"]
 
+    def test_scan_stops_after_oversized_uncompressed_tar_member_without_streaming_body(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        scanner = TarScanner(config={"max_entry_size": 64})
+        archive_path = tmp_path / "oversized_first.tar"
+        payload = b"B" * 4096
+        later_payload = b"later"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+            later_info = tarfile.TarInfo("later.txt")
+            later_info.size = len(later_payload)
+            archive.addfile(later_info, tarfile.io.BytesIO(later_payload))  # type: ignore[attr-defined]
+
+        bytes_read = 0
+        original_read = tar_scanner_module._TarBoundedStream.read
+
+        def tracked_read(self: Any, size: int = -1) -> bytes:
+            nonlocal bytes_read
+            data = original_read(self, size)
+            bytes_read += len(data)
+            return data
+
+        monkeypatch.setattr(tar_scanner_module._TarBoundedStream, "read", tracked_read)
+
+        result = scanner._scan_tar_file(str(archive_path))
+
+        assert result.success is False
+        assert "tar_entry_extraction_incomplete" in result.metadata["scan_outcome_reasons"]
+        contents = result.metadata["contents"]
+        assert any(entry["path"].endswith("payload.bin") for entry in contents)
+        assert not any(entry["path"].endswith("later.txt") for entry in contents)
+        assert bytes_read < len(payload)
+
+    def test_tiny_total_budget_allows_tar_header_reads_for_empty_member(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "tiny_total_empty.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("empty.txt")
+            info.size = 0
+            archive.addfile(info, tarfile.io.BytesIO(b""))  # type: ignore[attr-defined]
+
+        result = TarScanner(config={"max_tar_total_uncompressed_size": 1}).scan(str(archive_path))
+
+        reasons = result.metadata.get("scan_outcome_reasons", [])
+        assert "tar_metadata_read_limit_exceeded" not in reasons
+        assert "tar_stream_budget_exceeded" not in reasons
+        assert any(entry["path"].endswith("empty.txt") for entry in result.metadata["contents"])
+
     def test_oversized_benign_tar_member_returns_inconclusive_exit_code(self, tmp_path: Path) -> None:
         """Skipped ordinary member content is incomplete coverage, not a security finding."""
         archive_path = tmp_path / "oversized_benign.tar"
@@ -1922,8 +1975,8 @@ class TestTarScanner:
         assert oversize_checks[0].severity == IssueSeverity.INFO
         assert "tar entry payload.bin exceeds maximum size of 64 bytes" in oversize_checks[0].message.lower()
 
-    def test_scan_continues_after_oversized_member_and_detects_later_payload(self, tmp_path: Path) -> None:
-        """A single oversized member should fail that entry without hiding later malicious members."""
+    def test_scan_stops_after_oversized_member_and_marks_later_payload_uninspected(self, tmp_path: Path) -> None:
+        """Oversized uncompressed members fail closed instead of streaming ahead to later payloads."""
         scanner = TarScanner(config={"max_entry_size": 64})
         archive_path = tmp_path / "mixed.tar"
         payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
@@ -1947,7 +2000,9 @@ class TestTarScanner:
             and check.details.get("entry") == "huge.bin"
             for check in result.checks
         )
-        assert any(
+        assert "tar_entry_extraction_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert not any(entry["path"].endswith("payload.txt") for entry in result.metadata["contents"])
+        assert not any(
             issue.severity == IssueSeverity.CRITICAL
             and issue.location == f"{archive_path}:payload.txt"
             and any(global_name in issue.message.lower() for global_name in ("os.system", "posix.system"))
@@ -1958,7 +2013,7 @@ class TestTarScanner:
             cache_enabled=False,
             max_entry_size=64,
         )
-        assert core.determine_exit_code(aggregate) == 1
+        assert core.determine_exit_code(aggregate) == 2
 
     def test_nested_member_scan_exception_returns_inconclusive_exit_code(self, tmp_path: Path) -> None:
         """A member scanner failure is unavailable coverage, not an observed finding."""

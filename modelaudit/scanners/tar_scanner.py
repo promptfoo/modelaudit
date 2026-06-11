@@ -347,11 +347,10 @@ class TarScanner(BaseScanner):
         return budget
 
     def _tar_stream_read_limit(self) -> int:
-        limits = [self.max_metadata_bytes]
-        max_total_size = self._get_max_total_uncompressed_size()
-        if max_total_size > 0:
-            limits.append(max_total_size)
-        return max(1, min(limits))
+        return max(tarfile.BLOCKSIZE, self.max_metadata_bytes)
+
+    def _tar_metadata_limit(self) -> int:
+        return max(1, self.max_metadata_bytes)
 
     @contextmanager
     def _open_tar_stream(self, path: str) -> Iterator[tuple[tarfile.TarFile, _TarBoundedStream, str | None]]:
@@ -379,7 +378,7 @@ class TarScanner(BaseScanner):
                     bufsize=tarfile.BLOCKSIZE,
                     tarinfo=cast(
                         type[tarfile.TarInfo],
-                        _tarinfo_class_with_metadata_limit(self._tar_stream_read_limit()),
+                        _tarinfo_class_with_metadata_limit(self._tar_metadata_limit()),
                     ),
                 )
             )
@@ -1274,6 +1273,8 @@ class TarScanner(BaseScanner):
                                 "scan_outcome_reason": TAR_ENTRY_EXTRACTION_INCOMPLETE_REASON,
                             },
                         )
+                        if compression_codec is None:
+                            break
                     except Exception as exc:
                         scan_complete = False
                         mark_archive_scan_incomplete(result, "tar_entry_scan_incomplete")

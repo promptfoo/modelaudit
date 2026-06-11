@@ -3829,7 +3829,9 @@ def _detect_tar_route(path: str, *, allow_incomplete_generic_tar_route: bool = F
         return None
 
     try:
-        with tarfile.open(file_path, "r|*", tarinfo=_NemoRouteTarInfo) as archive:
+        seekable_raw_tar_route = file_path.suffix.lower() == ".tar"
+        tar_mode: Literal["r:", "r|*"] = "r:" if seekable_raw_tar_route else "r|*"
+        with tarfile.open(file_path, tar_mode, tarinfo=_NemoRouteTarInfo) as archive:
             if file_path.suffix.lower() == ".nemo":
                 return "tar"
             members_by_normalized_name: dict[str, list[tarfile.TarInfo]] = {}
@@ -3866,16 +3868,17 @@ def _detect_tar_route(path: str, *, allow_incomplete_generic_tar_route: bool = F
                     )
                     if physical_destination is not None:
                         occupied_names.add(physical_destination)
-                    member_size = max(member.size, 0)
-                    if member_size > body_skip_budget:
-                        if _tar_links_resolve_to_regular_member(
-                            root_config_links,
-                            members_by_normalized_name,
-                            link_resolution_budget,
-                        ):
-                            return "nemo"
-                        return "tar" if allow_incomplete_generic_tar_route else NEMO_ROUTING_INCONCLUSIVE_FORMAT
-                    body_skip_budget -= member_size
+                    if not seekable_raw_tar_route:
+                        member_size = max(member.size, 0)
+                        if member_size > body_skip_budget:
+                            if _tar_links_resolve_to_regular_member(
+                                root_config_links,
+                                members_by_normalized_name,
+                                link_resolution_budget,
+                            ):
+                                return "nemo"
+                            return "tar" if allow_incomplete_generic_tar_route else NEMO_ROUTING_INCONCLUSIVE_FORMAT
+                        body_skip_budget -= member_size
                 elif member.issym():
                     destination_name = _resolve_safe_tar_path_through_symlinks(
                         member.name,
