@@ -1020,9 +1020,10 @@ def _trusted_reference_executable_matches_snapshot(
 ) -> bool:
     if not _trusted_executable_value_matches_snapshot(value, expected[0]):
         return False
-    if type(value) is not type:
+    if not _runtime_value_is_class(value):
         return not expected[1]
-    mro = type.__getattribute__(value, "__mro__")
+    class_ = cast(type[object], value)
+    mro = type.__getattribute__(class_, "__mro__")
     if len(mro) != len(expected[1]):
         return False
     for base, (expected_base, expected_namespace) in zip(mro, expected[1], strict=True):
@@ -2323,7 +2324,7 @@ def _loaded_trusted_reference_matches_baseline(module_name: str, name: str) -> b
     if origin_kind == "site_packages":
         if not _loaded_site_package_reference_owner_matches(module_name, name, reference_state[1]):
             return False
-        if expected is None and (module_name, name) in _TRUSTED_FRAMEWORK_METADATA_REFERENCES:
+        if expected is None:
             return True
     if expected is None:
         return False

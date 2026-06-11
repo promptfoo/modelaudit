@@ -9,6 +9,8 @@ import sys
 import warnings
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
+from modelaudit_picklescan.call_graph import import_only_reference_is_proven_trusted
+
 from ..core_results import mark_operational_scan_error
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanResult
@@ -70,6 +72,18 @@ _VALIDATED_NUMPY_OBJECT_DTYPE_RECONSTRUCTION_REFERENCES = frozenset(
 )
 NUMPY_HEADER_MAX_SIZE = 10_000
 NUMPY_V3_HEADER_MAX_BYTES = NUMPY_HEADER_MAX_SIZE * 4
+
+
+def _import_reference_origin_is_trusted(import_reference: object) -> bool:
+    if not isinstance(import_reference, str):
+        return False
+    module, separator, name = import_reference.rpartition(".")
+    if not separator or not module or not name:
+        return False
+    try:
+        return import_only_reference_is_proven_trusted(module, name)
+    except Exception:
+        return False
 
 
 def _read_numpy_array_header(handle: BinaryIO, version: tuple[int, int]) -> tuple[tuple[int, ...], bool, Any]:
@@ -258,6 +272,7 @@ class NumPyScanner(BaseScanner):
             return (
                 item.rule_code == "NON_ALLOWLISTED_GLOBAL"
                 and item.details.get("import_reference") in _VALIDATED_NUMPY_OBJECT_DTYPE_RECONSTRUCTION_REFERENCES
+                and _import_reference_origin_is_trusted(item.details.get("import_reference"))
             )
 
         result.issues = [issue for issue in result.issues if not is_validated_numpy_object_reconstruction(issue)]

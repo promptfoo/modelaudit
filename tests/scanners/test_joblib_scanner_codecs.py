@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import modelaudit_picklescan.api as picklescan_api
 import pytest
+from modelaudit_picklescan.call_graph import _clear_source_sensitive_caches
 
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Issue
@@ -63,7 +64,13 @@ def _scan_payload(
     original_requires_origin_review = picklescan_api.import_only_module_requires_origin_review
 
     def trust_joblib_wrapper(module: str, name: str) -> bool:
-        if (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper"):
+        if (module, name) in {
+            ("joblib.numpy_pickle", "NumpyArrayWrapper"),
+            ("numpy", "dtype"),
+            ("numpy", "memmap"),
+            ("numpy", "matrix"),
+            ("numpy", "ndarray"),
+        }:
             return trust_numpy_array_wrapper
         return original_reference_is_trusted(module, name)
 
@@ -72,12 +79,16 @@ def _scan_payload(
             return not trust_numpy_array_wrapper
         return original_requires_origin_review(module, name)
 
-    with (
-        patch("modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted", trust_joblib_wrapper),
-        patch("modelaudit_picklescan.api.import_only_reference_is_proven_trusted", trust_joblib_wrapper),
-        patch("modelaudit_picklescan.api.import_only_module_requires_origin_review", requires_origin_review),
-    ):
-        return JoblibScanner().scan(str(path))
+    _clear_source_sensitive_caches()
+    try:
+        with (
+            patch("modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted", trust_joblib_wrapper),
+            patch("modelaudit_picklescan.api.import_only_reference_is_proven_trusted", trust_joblib_wrapper),
+            patch("modelaudit_picklescan.api.import_only_module_requires_origin_review", requires_origin_review),
+        ):
+            return JoblibScanner().scan(str(path))
+    finally:
+        _clear_source_sensitive_caches()
 
 
 def _joblib_numpy_wrapper_stop_prefix() -> bytes:
@@ -605,7 +616,13 @@ def test_validated_reference_positions_include_stack_global() -> None:
     assert _validated_reference_positions(payload, {2}) == frozenset({payload.index(b"cnumpy\nndarray\n")})
 
 
-def test_validated_joblib_wrapper_cleanup_preserves_unvalidated_dtype_occurrence() -> None:
+def test_validated_joblib_wrapper_cleanup_preserves_unvalidated_dtype_occurrence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted",
+        lambda _module, _name: True,
+    )
     result = ScanResult("joblib")
     result.metadata["analysis_incomplete"] = True
     result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
@@ -658,6 +675,40 @@ def test_validated_joblib_wrapper_cleanup_preserves_unvalidated_dtype_occurrence
     remaining_issue_positions = [issue.details.get("position") for issue in result.issues]
     assert remaining_check_positions == [99]
     assert remaining_issue_positions == [99]
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["pickle_report_status"] == "inconclusive"
+    assert result.metadata["pickle_verdict"] == "suspicious"
+
+
+def test_validated_joblib_wrapper_cleanup_preserves_untrusted_dtype_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def trust_only_wrapper(module: str, name: str) -> bool:
+        return (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper")
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted",
+        trust_only_wrapper,
+    )
+    result = ScanResult("joblib")
+    result.metadata["analysis_incomplete"] = True
+    result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    result.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
+    result.metadata["pickle_report_status"] = "inconclusive"
+    result.metadata["pickle_verdict"] = "suspicious"
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="validated dtype",
+        severity=IssueSeverity.WARNING,
+        details={"import_reference": "numpy.dtype", "position": 10},
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+    )
+
+    JoblibScanner._remove_validated_numpy_array_wrapper_findings(result, frozenset({10}))
+
+    assert [check.details.get("position") for check in result.checks] == [10]
+    assert [issue.details.get("position") for issue in result.issues] == [10]
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata["pickle_report_status"] == "inconclusive"
     assert result.metadata["pickle_verdict"] == "suspicious"
