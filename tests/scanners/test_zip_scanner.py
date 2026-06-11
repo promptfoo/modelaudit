@@ -8552,7 +8552,8 @@ class TestZipScanner:
             entry["path"] == f"{archive_path}:model.onnx" and entry["type"] == "onnx"
             for entry in result.metadata["contents"]
         )
-        assert any(check.name == "ONNX Library Check" for check in result.checks)
+        assert any(check.name == "ONNX Capability Check" for check in result.checks)
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
         assert not any(check.name == "ONNX Candidate Analysis" for check in result.checks)
 
     def test_nested_member_does_not_route_prefixed_generic_protobuf_as_onnx(self, tmp_path: Path) -> None:
