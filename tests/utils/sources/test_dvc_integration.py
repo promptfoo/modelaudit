@@ -1761,6 +1761,45 @@ class TestDvcSecurity:
 
         assert path_state.dvc_covered_paths == {str(first_shard), str(second_shard)}
 
+    def test_cli_incomplete_shard_check_paths_do_not_count_as_dvc_coverage(self, tmp_path: Path) -> None:
+        """Incomplete shard-family scans must not discharge omitted DVC shard outputs."""
+        from modelaudit.cli import _ScanPathState
+        from modelaudit.models import AssetModel, create_initial_audit_result
+
+        first_shard = tmp_path / "model-00001-of-00002.safetensors"
+        second_shard = tmp_path / "model-00002-of-00002.safetensors"
+        first_shard.write_bytes(b"first")
+        second_shard.write_bytes(b"second")
+        shard_result = create_initial_audit_result()
+        shard_result.success = False
+        shard_result.assets.append(AssetModel(path=str(first_shard), type="safetensors"))
+        shard_result.checks.append(
+            Check(
+                name="Sharded Model Detection",
+                status=CheckStatus.PASSED,
+                message="Detected sharded model",
+                details={"shards": [str(first_shard), str(second_shard)]},
+            )
+        )
+        shard_result.checks.append(
+            Check(
+                name="Shard Scan",
+                status=CheckStatus.FAILED,
+                message="Error scanning shard",
+                location=str(second_shard),
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": "shard_scan_error",
+                },
+            )
+        )
+        path_state = _ScanPathState(collect_dvc_coverage=True)
+
+        path_state.record_dvc_coverage(str(first_shard), shard_result)
+
+        assert path_state.dvc_covered_paths == {str(first_shard)}
+
     def test_cli_orders_capped_pointer_after_sibling_paths(self, tmp_path: Path) -> None:
         """Concrete sibling inputs should run before a capped pointer verifies their coverage."""
         from modelaudit.cli import _resolve_scan_paths
@@ -2664,6 +2703,72 @@ class TestDvcCliIntegration:
             for issue in output_data["issues"]
         )
         assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
+
+    def test_cli_incomplete_shard_prior_coverage_keeps_capped_dvc_gap(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An incomplete prior shard-family scan must not cover omitted DVC shard outputs."""
+        from click.testing import CliRunner
+
+        from modelaudit import cli as cli_module
+        from modelaudit.cli import cli
+        from modelaudit.models import AssetModel
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        first_shard = model_dir / "model-00001-of-00002.safetensors"
+        second_shard = model_dir / "model-00002-of-00002.safetensors"
+        first_shard.write_bytes(b"first")
+        second_shard.write_bytes(b"second")
+        dvc_file = tmp_path / "shards.dvc"
+        dvc_file.write_text(f"outs:\n- path: model/{first_shard.name}\n- path: model/{second_shard.name}\n")
+        monkeypatch.setattr("modelaudit.utils.sources.dvc.MAX_DVC_OUTPUTS", 1)
+
+        incomplete_shard_result = create_initial_audit_result()
+        incomplete_shard_result.success = False
+        incomplete_shard_result.assets.append(AssetModel(path=str(first_shard), type="safetensors"))
+        incomplete_shard_result.checks.append(
+            Check(
+                name="Sharded Model Detection",
+                status=CheckStatus.PASSED,
+                message="Detected sharded model",
+                details={"shards": [str(first_shard), str(second_shard)]},
+            )
+        )
+        incomplete_shard_result.checks.append(
+            Check(
+                name="Shard Scan",
+                status=CheckStatus.FAILED,
+                message="Error scanning shard",
+                location=str(second_shard),
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": "shard_scan_error",
+                },
+            )
+        )
+        original_scan = cli_module.scan_model_directory_or_file
+
+        def fake_scan_model_directory_or_file(path: str, *args: Any, **kwargs: Any) -> Any:
+            if path == str(first_shard):
+                return incomplete_shard_result
+            return original_scan(path, *args, **kwargs)
+
+        monkeypatch.setattr(cli_module, "scan_model_directory_or_file", fake_scan_model_directory_or_file)
+
+        result = CliRunner().invoke(
+            cli,
+            ["scan", str(first_shard), str(dvc_file), "--format", "json", "--no-cache"],
+        )
+
+        assert result.exit_code == 2, result.output
+        output_data = json.loads(result.output[result.output.index("{") :])
+        assert output_data["success"] is False
+        assert output_data["has_errors"] is True
+        assert any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
 
     def test_cli_dvc_file_expansion(self, tmp_path: Path) -> None:
         """Test that CLI properly expands DVC files."""

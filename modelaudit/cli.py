@@ -1446,17 +1446,61 @@ class _ScanPathState:
         if scanner_policy.active:
             from modelaudit.scanners import get_scanner_for_file
 
+        def resolve_coverage_path(file_path: str | None) -> Path | None:
+            if not isinstance(file_path, str):
+                return None
+            try:
+                return Path(file_path).resolve()
+            except OSError:
+                return None
+
         def record_covered_file(file_path: str) -> None:
             if scanner_policy.active and get_scanner_for_file(file_path, config=scanner_config) is None:
                 return
-            try:
-                resolved_path = Path(file_path).resolve()
-            except OSError:
+            resolved_path = resolve_coverage_path(file_path)
+            if resolved_path is None:
                 return
             if not resolved_path.is_file():
                 return
             self.dvc_covered_paths.add(str(resolved_path))
             self.dvc_covered_directories.update(str(parent) for parent in resolved_path.parents)
+
+        def path_matches_shard_family(candidate_path: str | None, shard_paths: set[Path]) -> bool:
+            resolved_candidate = resolve_coverage_path(candidate_path)
+            if resolved_candidate is None:
+                return False
+            if resolved_candidate in shard_paths:
+                return True
+            if resolved_candidate.is_dir():
+                return any(shard_path.is_relative_to(resolved_candidate) for shard_path in shard_paths)
+            return False
+
+        def shard_family_has_incomplete_coverage(shard_paths: set[Path]) -> bool:
+            for metadata_path, metadata in scan_result.file_metadata.items():
+                if not (metadata.get("operational_error") is True or metadata_has_incomplete_coverage(metadata)):
+                    continue
+                if path_matches_shard_family(metadata_path, shard_paths):
+                    return True
+
+            incomplete_shard_checks = {
+                "Shard Scan",
+                "Sharded Model Coverage Check",
+                "Sharded Model Membership Check",
+            }
+            records: tuple[Any, ...] = (*scan_result.checks, *scan_result.issues)
+            for record in records:
+                details = getattr(record, "details", None)
+                details = details if isinstance(details, dict) else None
+                if details is None:
+                    continue
+                if not (details.get("operational_error") is True or metadata_has_incomplete_coverage(details)):
+                    continue
+                if path_matches_shard_family(getattr(record, "location", None), shard_paths):
+                    return True
+                if getattr(record, "name", None) in incomplete_shard_checks:
+                    return True
+
+            return False
 
         for asset in scan_result.assets:
             if not asset.path or asset.type == "error":
@@ -1471,6 +1515,13 @@ class _ScanPathState:
         for check in scan_result.checks:
             shard_paths = check.details.get("shards") if isinstance(check.details, dict) else None
             if check.name != "Sharded Model Detection" or not isinstance(shard_paths, list):
+                continue
+            resolved_shard_paths = {
+                resolved_path
+                for shard_path in shard_paths
+                if isinstance(shard_path, str) and (resolved_path := resolve_coverage_path(shard_path)) is not None
+            }
+            if shard_family_has_incomplete_coverage(resolved_shard_paths):
                 continue
             for shard_path in shard_paths:
                 if isinstance(shard_path, str):
