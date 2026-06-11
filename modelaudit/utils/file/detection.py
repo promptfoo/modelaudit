@@ -306,6 +306,10 @@ _HF_TOKENIZER_ROOT_KEYS = frozenset({"version", "added_tokens"})
 _HF_TOKENIZER_MODEL_TYPES = frozenset({"BPE", "Unigram", "WordPiece", "WordLevel"})
 _HF_TOKENIZER_TEMPLATE_KEYS = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
 _JSON_PROBE_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
+_JSON_PROBE_ESCAPED_TEMPLATE_INDICATOR_RE = re.compile(
+    rb"(?:\{|\\u007b)(?:\{|\\u007b|%|\\u0025|#|\\u0023)",
+    re.IGNORECASE,
+)
 _HF_TOKENIZER_JAX_ROUTE_KEYS = frozenset(_JAX_JSON_CHECKPOINT_IDENTITY_KEYS | _JAX_JSON_CHECKPOINT_MARKER_KEYS)
 _HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_KEYS = (
     _HF_TOKENIZER_TEMPLATE_KEYS | _MXNET_SYMBOL_ROOT_KEYS | {"learner"} | _JAX_JSON_CHECKPOINT_MARKER_KEYS
@@ -710,6 +714,7 @@ class _JSONStreamContext:
     path: tuple[str, ...]
     mode: str
     pending_key: str | None = None
+    pending_route_key: str | None = None
     skip_templates: bool = False
 
 
@@ -1038,24 +1043,34 @@ def _hf_tokenizer_suffix_has_structural_route_key(
             continue
         if not require_jax_identity_value or key in _JAX_JSON_CHECKPOINT_MARKER_KEYS:
             return True
-    if keys == _HF_TOKENIZER_TEMPLATE_KEYS and not require_jax_identity_value:
-        return _hf_tokenizer_stream_has_template_route_evidence(file_path)
-    return False
+    return _hf_tokenizer_stream_has_structural_route_key(
+        file_path,
+        keys,
+        require_jax_identity_value=require_jax_identity_value,
+    )
 
 
 def _hf_tokenizer_stream_path_skips_templates(path: tuple[str, ...]) -> bool:
     return len(path) >= 2 and path[0] == "model" and path[1] == "vocab"
 
 
-def _hf_tokenizer_stream_has_template_route_evidence(file_path: Path) -> bool:
-    """Return whether a bounded-memory structural scan finds tokenizer template evidence."""
+def _hf_tokenizer_stream_has_structural_route_key(
+    file_path: Path,
+    keys: frozenset[str],
+    *,
+    require_jax_identity_value: bool = False,
+) -> bool:
+    """Return whether a bounded-memory structural scan finds tokenizer route evidence."""
     indicator_bytes = tuple(indicator.encode("utf-8") for indicator in _JSON_PROBE_TEMPLATE_INDICATORS)
     indicator_tail_size = max(len(indicator) for indicator in indicator_bytes) - 1
+    scan_template_values = bool(keys & _HF_TOKENIZER_TEMPLATE_KEYS) and not require_jax_identity_value
     stack: list[_JSONStreamContext] = []
     in_string = False
     string_is_key = False
     string_skip_templates = False
+    string_route_key: str | None = None
     string_key_bytes = bytearray()
+    string_value_bytes = bytearray()
     string_tail = b""
     escaped = False
     in_primitive = False
@@ -1080,6 +1095,7 @@ def _hf_tokenizer_stream_has_template_route_evidence(file_path: Path) -> bool:
         context = stack[-1]
         context.mode = "after_value"
         context.pending_key = None
+        context.pending_route_key = None
 
     def push_context(kind: str) -> None:
         path = current_value_path()
@@ -1142,11 +1158,19 @@ def _hf_tokenizer_stream_has_template_route_evidence(file_path: Path) -> bool:
                     if in_string:
                         if string_is_key and len(string_key_bytes) <= _HF_TOKENIZER_STREAM_MAX_KEY_BYTES:
                             string_key_bytes.append(byte)
-                        if not string_is_key and not string_skip_templates:
+                        if (
+                            not string_is_key
+                            and string_route_key is not None
+                            and len(string_value_bytes) <= _HF_TOKENIZER_STREAM_MAX_KEY_BYTES
+                        ):
+                            string_value_bytes.append(byte)
+                        if scan_template_values and not string_is_key and not string_skip_templates:
                             combined = string_tail + bytes((byte,))
-                            if any(indicator in combined for indicator in indicator_bytes):
+                            if any(indicator in combined for indicator in indicator_bytes) or (
+                                _JSON_PROBE_ESCAPED_TEMPLATE_INDICATOR_RE.search(combined) is not None
+                            ):
                                 return True
-                            string_tail = combined[-indicator_tail_size:]
+                            string_tail = combined[-max(indicator_tail_size, 12) :]
                         if escaped:
                             escaped = False
                             continue
@@ -1166,11 +1190,35 @@ def _hf_tokenizer_stream_has_template_route_evidence(file_path: Path) -> bool:
                             )
                             context = stack[-1] if stack else None
                             if context and context.kind == "object" and context.mode == "key":
-                                if key in _HF_TOKENIZER_TEMPLATE_KEYS and not context.skip_templates:
+                                route_key_is_template = key in _HF_TOKENIZER_TEMPLATE_KEYS
+                                route_key_is_root = context.path == ()
+                                if (
+                                    route_key_is_template
+                                    and key in keys
+                                    and not require_jax_identity_value
+                                    and not context.skip_templates
+                                ):
                                     return True
+                                if key in keys and route_key_is_root:
+                                    if require_jax_identity_value:
+                                        if key in _JAX_JSON_CHECKPOINT_MARKER_KEYS:
+                                            return True
+                                        if key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS:
+                                            context.pending_route_key = key
+                                    else:
+                                        return True
                                 context.pending_key = key
                                 context.mode = "colon"
                         else:
+                            if string_route_key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS:
+                                value_bytes = bytes(string_value_bytes)
+                                value = (
+                                    _json_probe_decode_string(value_bytes, 0, len(value_bytes))
+                                    if len(value_bytes) <= _HF_TOKENIZER_STREAM_MAX_KEY_BYTES
+                                    else None
+                                )
+                                if value and _JAX_JSON_CHECKPOINT_IDENTITY_RE.search(value):
+                                    return True
                             mark_value_complete()
                         continue
 
@@ -1198,7 +1246,13 @@ def _hf_tokenizer_stream_has_template_route_evidence(file_path: Path) -> bool:
                         escaped = False
                         string_is_key = bool(context and context.kind == "object" and context.mode == "key")
                         string_skip_templates = current_value_skips_templates()
+                        string_route_key = (
+                            context.pending_route_key
+                            if context and context.kind == "object" and context.mode == "value"
+                            else None
+                        )
                         string_key_bytes = bytearray(b'"') if string_is_key else bytearray()
+                        string_value_bytes = bytearray(b'"') if string_route_key is not None else bytearray()
                         string_tail = b""
                         continue
 

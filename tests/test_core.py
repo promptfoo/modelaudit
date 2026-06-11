@@ -9889,6 +9889,31 @@ def test_scan_file_tokenizer_json_root_template_between_probe_and_suffix_preserv
     )
 
 
+def test_scan_file_tokenizer_json_escaped_jinja_string_between_probe_and_suffix_preserves_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"metadata":"\\u007b\\u007b \'\'.__class__.__mro__[1].__subclasses__() \\u007d\\u007d",'
+            '"tail":"' + ("y" * 256) + '"'
+        ),
+        padding_size=256,
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
 def test_scan_file_tokenizer_json_escaped_chat_template_preserves_jinja_detection(tmp_path: Path) -> None:
     tokenizer_path = tmp_path / "tokenizer.json"
     malicious_template = "{{ ''.__class__.__mro__[1].__subclasses__() }}"
