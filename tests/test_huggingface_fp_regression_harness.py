@@ -441,6 +441,80 @@ def test_hf_repo_dry_run_preview_rejects_empty_scanner_selection() -> None:
     mock_scan.assert_not_called()
 
 
+def test_hf_repo_dry_run_preview_uses_content_routed_download_selection() -> None:
+    runner = CliRunner()
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": "a" * 40,
+        "total_size": 20,
+        "file_count": 1,
+        "files": [{"name": "renamed.payload", "size": 20}],
+    }
+
+    def detect_format(_repo_id: str, filename: str, _revision: str, _budget: object) -> str | None:
+        return "pytorch_zip" if filename == "renamed.payload" else None
+
+    with (
+        patch("modelaudit.cli.get_model_info", return_value=metadata),
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+        patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", detect_format),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--format",
+                "json",
+                "--max-size",
+                "30B",
+                "hf://test/model",
+            ],
+        )
+
+    parsed = parse_click_json_output(result.stdout)
+    assert result.exit_code == 0
+    assert parsed["files_scanned"] == 0
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
+def test_hf_stream_dry_run_preview_enforces_unfiltered_file_limit() -> None:
+    runner = CliRunner()
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": "a" * 40,
+        "total_size": 129,
+        "file_count": 129,
+        "files": [{"name": f"assets/blob-{index}.data", "size": 1} for index in range(129)],
+    }
+
+    with (
+        patch("modelaudit.cli.get_model_info", return_value=metadata),
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--stream",
+                "--format",
+                "json",
+                "hf://test/model",
+            ],
+        )
+
+    assert result.exit_code == 2
+    assert "repository listing exceeds the bounded unfiltered candidate limit" in result.output
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
 def test_hf_file_dry_run_preview_does_not_download_or_scan() -> None:
     url = "https://huggingface.co/test/model/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.json"
     runner = CliRunner()

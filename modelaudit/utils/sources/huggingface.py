@@ -1505,6 +1505,7 @@ def get_model_info(url: str) -> dict:
 
         return {
             "repo_id": repo_id,
+            "revision": getattr(model_info, "sha", None),
             "total_size": total_size,
             "file_count": len(files),
             "files": files,

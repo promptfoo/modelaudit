@@ -206,14 +206,53 @@ def _huggingface_preview_file_size(item: dict[str, Any]) -> int | None:
     return size
 
 
-def _huggingface_preview_download_files(files: object) -> list[dict[str, Any]]:
-    """Return metadata entries that the non-streaming Hugging Face downloader would suffix-select."""
+def _huggingface_preview_file_names(files: object) -> list[str]:
+    """Return stable file names from Hugging Face preview metadata."""
     if not isinstance(files, list):
         return []
 
+    names: list[str] = []
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return list(dict.fromkeys(names))
+
+
+def _huggingface_preview_files_by_name(files: object, names: list[str]) -> list[dict[str, Any]]:
+    """Map selected Hugging Face file names back to their metadata entries."""
+    if not isinstance(files, list):
+        return []
+
+    items_by_name = {item.get("name"): item for item in files if isinstance(item, dict)}
+    selected: list[dict[str, Any]] = []
+    for name in names:
+        item = items_by_name.get(name)
+        if isinstance(item, dict):
+            selected.append(item)
+    return selected
+
+
+def _huggingface_preview_download_files(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return metadata entries that the non-streaming Hugging Face downloader would suffix-select."""
+    files = metadata.get("files", [])
     from .utils.sources import huggingface as huggingface_source
 
+    file_names = _huggingface_preview_file_names(files)
     model_extensions = huggingface_source._get_model_extensions()
+    repo_id = str(metadata.get("repo_id") or metadata.get("model_id") or "unknown")
+    revision = metadata.get("revision")
+    if isinstance(revision, str) and revision:
+        selected_names = huggingface_source._select_huggingface_model_files(
+            repo_id,
+            file_names,
+            revision,
+            model_extensions,
+        )
+        return _huggingface_preview_files_by_name(files, selected_names)
+
     selected: list[dict[str, Any]] = []
     for item in files:
         if not isinstance(item, dict):
@@ -224,6 +263,35 @@ def _huggingface_preview_download_files(files: object) -> list[dict[str, Any]]:
         if huggingface_source._is_scannable_hf_file(name, model_extensions):
             selected.append(item)
     return selected
+
+
+def _huggingface_preview_stream_files(metadata: dict[str, Any], runtime: "_ScanRuntimeConfig") -> list[dict[str, Any]]:
+    """Return metadata entries that the streaming Hugging Face downloader would select."""
+    files = metadata.get("files", [])
+    file_names = _huggingface_preview_file_names(files)
+    repo_id = str(metadata.get("repo_id") or metadata.get("model_id") or "unknown")
+    revision = metadata.get("revision")
+    if not isinstance(revision, str) or not revision:
+        return _selected_huggingface_preview_files(files, runtime)
+
+    from .utils.sources import huggingface as huggingface_source
+
+    stream_kwargs: dict[str, Any] = {}
+    if runtime.scannable_extensions is not None:
+        stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
+    if runtime.scannable_filenames is not None:
+        stream_kwargs["scannable_filenames"] = runtime.scannable_filenames
+    if runtime.scannable_scanner_ids is not None:
+        stream_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
+    if runtime.hf_stream_include_all_files:
+        stream_kwargs["include_all_files"] = True
+    selected_names = huggingface_source._select_streamable_hf_files(
+        repo_id,
+        file_names,
+        revision,
+        **stream_kwargs,
+    )
+    return _huggingface_preview_files_by_name(files, selected_names)
 
 
 def _selected_huggingface_preview_files(files: object, runtime: "_ScanRuntimeConfig") -> list[dict[str, Any]]:
@@ -274,13 +342,21 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
     display_path = _display_path(path)
     metadata = get_model_info(path)
     files = metadata.get("files", [])
-    selected_files = _selected_huggingface_preview_files(files, runtime)
-    download_files = _huggingface_preview_download_files(files)
+    selected_files = (
+        _huggingface_preview_stream_files(metadata, runtime)
+        if runtime.scan_and_delete
+        else _selected_huggingface_preview_files(files, runtime)
+    )
     if runtime.scanner_selection_metadata is not None and not selected_files:
         raise ValueError("No Hugging Face files match the active scanner selection; refusing dry-run")
+    download_files: list[dict[str, Any]] | None = None
+    if not runtime.scan_and_delete and (
+        runtime.scanner_selection_metadata is None or runtime.max_download_bytes is not None
+    ):
+        download_files = _huggingface_preview_download_files(metadata)
     if runtime.scanner_selection_metadata is None and not runtime.scan_and_delete and not download_files:
         raise ValueError("No recognized ModelAudit-scannable Hugging Face files found; refusing dry-run")
-    budget_files = selected_files if runtime.scan_and_delete else download_files
+    budget_files = selected_files if runtime.scan_and_delete else (download_files or selected_files)
     total_size = metadata.get("total_size")
     selected_display_sizes = [_huggingface_preview_file_size(item) for item in selected_files]
     selected_display_size = sum(size for size in selected_display_sizes if size is not None)
