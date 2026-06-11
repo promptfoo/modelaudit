@@ -10,6 +10,7 @@ import struct
 import subprocess
 import sys
 import time
+import unicodedata
 from collections.abc import Callable, Collection, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -1144,6 +1145,64 @@ def _build_literal_allow_patterns(filenames: list[str]) -> list[str]:
     return [escape_glob(filename) for filename in filenames]
 
 
+def _remote_companion_path_key(filename: str) -> str:
+    return unicodedata.normalize("NFC", filename).casefold()
+
+
+def _openvino_bin_companion_name(filename: str, repo_files: Collection[str] | None = None) -> str | None:
+    """Return the exact same-stem OpenVINO weights filename for a repo XML path."""
+    remote_path = PurePosixPath(filename)
+    if remote_path.suffix.lower() != ".xml":
+        return None
+    expected_companion = remote_path.with_suffix(".bin").as_posix()
+    if repo_files is None or expected_companion in repo_files:
+        return expected_companion
+
+    expected_key = _remote_companion_path_key(expected_companion)
+    candidates = [repo_file for repo_file in repo_files if _remote_companion_path_key(repo_file) == expected_key]
+    if len(candidates) == 1:
+        return candidates[0]
+    return expected_companion
+
+
+def _include_huggingface_openvino_companions(
+    repo_id: str,
+    repo_files: list[str],
+    revision: str,
+    model_files: list[str],
+    *,
+    include_openvino_companions: bool = True,
+    deadline: float | None = None,
+) -> list[str]:
+    """Include exact OpenVINO XML/BIN companions before size checks and downloads."""
+    if not include_openvino_companions:
+        return model_files
+
+    from modelaudit.utils.file.detection import XML_MODEL_INCONCLUSIVE_FORMAT
+
+    repo_file_set = set(repo_files)
+    selected_files = set(model_files)
+    expanded_files = list(model_files)
+    probe_budget = _HuggingFaceProbeBudget(
+        remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
+        deadline=deadline,
+    )
+
+    for filename in model_files:
+        companion = _openvino_bin_companion_name(filename, repo_files)
+        if companion is None or companion not in repo_file_set or companion in selected_files:
+            continue
+
+        detected_format = _detect_huggingface_content_route_format(repo_id, filename, revision, probe_budget)
+        if detected_format not in {"openvino", XML_MODEL_INCONCLUSIVE_FORMAT}:
+            continue
+
+        expanded_files.append(companion)
+        selected_files.add(companion)
+
+    return expanded_files
+
+
 def _extract_huggingface_repo_files(repo_info: Any) -> list[str] | None:
     """Extract repository filenames from a Hugging Face repository response."""
     siblings = getattr(repo_info, "siblings", None)
@@ -1398,6 +1457,16 @@ def _select_streamable_hf_files(
                 )
             model_files.append(file_name)
 
+    exact_openvino_companion_candidates = (
+        {
+            companion
+            for selected_file in model_files
+            if (companion := _openvino_bin_companion_name(selected_file, repo_files)) is not None
+        }
+        if selected_route_scanner_ids == {"openvino"}
+        else set()
+    )
+
     if sniff_renamed_files:
         inspected_files = 0
         probe_budget = _HuggingFaceProbeBudget(
@@ -1407,6 +1476,8 @@ def _select_streamable_hf_files(
         selected_files = set(model_files)
         for file_name in repo_files:
             if file_name in selected_files:
+                continue
+            if file_name in exact_openvino_companion_candidates:
                 continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
@@ -2148,6 +2219,13 @@ def download_model(
             model_extensions,
             deadline=deadline,
         )
+        model_files = _include_huggingface_openvino_companions(
+            repo_id,
+            repo_files,
+            repo_revision,
+            model_files,
+            deadline=deadline,
+        )
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
 
@@ -2317,6 +2395,17 @@ def download_model_streaming(
             deadline=deadline,
         )
         model_files = selection.filenames
+        openvino_companion_suppression_enabled = scannable_scanner_ids is None or "openvino" in {
+            str(scanner_id).lower() for scanner_id in scannable_scanner_ids
+        }
+        model_files = _include_huggingface_openvino_companions(
+            repo_id,
+            repo_files,
+            repo_revision,
+            model_files,
+            include_openvino_companions=openvino_companion_suppression_enabled,
+            deadline=deadline,
+        )
         revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
             repo_id,
             model_files,
@@ -2336,6 +2425,42 @@ def download_model_streaming(
         if cache_dir is not None:
             download_path = _build_huggingface_download_path(cache_dir, namespace, repo_name)
             download_path.mkdir(parents=True, exist_ok=True)
+
+        openvino_companion_by_xml = (
+            {
+                filename: companion
+                for filename in model_files
+                if (companion := _openvino_bin_companion_name(filename, model_files)) in selected_file_set
+            }
+            if openvino_companion_suppression_enabled
+            else {}
+        )
+        openvino_xml_by_companion = {companion: xml for xml, companion in openvino_companion_by_xml.items()}
+
+        # Download each file one at a time. OpenVINO XML/BIN pairs are staged
+        # together, then only the XML is yielded so the scanner owns the logical
+        # model and the weights sidecar is not routed as standalone PyTorch.
+        downloaded_total_size = 0
+        prefetched_selected_paths: dict[str, Path] = {}
+        downloaded_selected_paths: dict[str, Path] = {}
+        consumed_filenames: set[str] = set()
+
+        def emit_file(path: Path, cleanup_paths: list[Path], is_last: bool) -> Iterator[tuple[Path, bool]]:
+            try:
+                yield (path, is_last)
+            finally:
+                for external_path in cleanup_paths:
+                    with suppress(OSError):
+                        external_path.unlink()
+
+        def has_future_yield(current_index: int) -> bool:
+            for future_filename in model_files[current_index + 1 :]:
+                if future_filename in consumed_filenames:
+                    continue
+                if future_filename in openvino_xml_by_companion:
+                    continue
+                return True
+            return False
 
         def download_stream_file(filename: str) -> Path:
             download_kwargs: dict[str, Any] = {
@@ -2365,13 +2490,11 @@ def download_model_streaming(
                 )
             return Path(local_path)
 
-        # Download each file one at a time
-        total_files = len(model_files)
-        downloaded_total_size = 0
-        prefetched_selected_paths: dict[str, Path] = {}
-        downloaded_selected_paths: dict[str, Path] = {}
-        for idx, filename in enumerate(model_files):
-            is_last = idx == total_files - 1
+        def download_selected_file(filename: str) -> Path:
+            nonlocal downloaded_total_size
+            downloaded_file = downloaded_selected_paths.get(filename)
+            if downloaded_file is not None and downloaded_file.is_file():
+                return downloaded_file
 
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
@@ -2398,6 +2521,11 @@ def download_model_streaming(
                         f"{downloaded_total_size} bytes exceeds max size {size_limit} bytes"
                     )
             downloaded_selected_paths[filename] = downloaded_file
+            return downloaded_file
+
+        def prepare_stream_yield(filename: str) -> tuple[Path, list[Path]]:
+            nonlocal downloaded_total_size
+            downloaded_file = download_selected_file(filename)
 
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
@@ -2487,12 +2615,33 @@ def download_model_streaming(
                         if _should_cleanup_hf_streaming_context_file(cache_dir, download_path, external_path):
                             onnx_external_data_cleanup_paths.append(external_path)
 
-            try:
-                yield (downloaded_file, is_last)
-            finally:
-                for external_path in onnx_external_data_cleanup_paths:
-                    with suppress(OSError):
-                        external_path.unlink()
+            return downloaded_file, onnx_external_data_cleanup_paths
+
+        for idx, filename in enumerate(model_files):
+            if filename in consumed_filenames:
+                continue
+
+            if filename in openvino_xml_by_companion:
+                # Wait for the XML so we can prove it is an OpenVINO model
+                # before suppressing standalone analysis of the same-stem .bin.
+                continue
+
+            downloaded_file, cleanup_paths = prepare_stream_yield(filename)
+            companion = openvino_companion_by_xml.get(filename)
+            if companion is not None:
+                from modelaudit.scanners.openvino_scanner import OpenVinoScanner
+
+                if OpenVinoScanner.can_handle(str(downloaded_file)):
+                    download_selected_file(companion)
+                    consumed_filenames.add(companion)
+                else:
+                    companion_path, companion_cleanup_paths = prepare_stream_yield(companion)
+                    consumed_filenames.add(companion)
+                    yield from emit_file(downloaded_file, cleanup_paths, False)
+                    yield from emit_file(companion_path, companion_cleanup_paths, not has_future_yield(idx))
+                    continue
+
+            yield from emit_file(downloaded_file, cleanup_paths, not has_future_yield(idx))
 
     except Exception as e:
         raise Exception(

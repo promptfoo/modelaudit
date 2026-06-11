@@ -20,7 +20,7 @@ from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 from modelaudit.utils.helpers.code_validation import validate_python_syntax
 
 from ..scanner_results import mark_inconclusive_scan_result
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 from .picklescan_adapter import pickle_report_to_scan_result, scan_options_from_config
 
 _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES = 64 * 1024
@@ -916,9 +916,13 @@ def _legacy_pytorch_storage_records(
             elif opcode_name == "DUP":
                 if stack:
                     stack.append(stack[-1])
+            elif opcode_name == "PERSID":
+                return None
             elif opcode_name == "BINPERSID":
                 pid = stack.pop() if stack else unknown
                 is_storage, record = storage_record_from_pid(pid)
+                if not is_storage:
+                    return None
                 if is_storage:
                     if record is None or (record.key in records and records[record.key] != record):
                         return None
@@ -2240,6 +2244,52 @@ class PickleScanner(BaseScanner):
         result.metadata["last_pickle_end_pos"] = position_offset + layout.pickle_end
         if layout.storage_key_count > 0:
             result.metadata["legacy_pytorch_storage_payload_skipped"] = True
+
+    @staticmethod
+    def _is_legacy_pytorch_storage_persistent_id_record(
+        details: dict[str, Any],
+        trusted_storage_keys: set[str],
+    ) -> bool:
+        storage_key = details.get("pytorch_storage_key")
+        return (
+            details.get("pickle_rule_code") == "PERSISTENT_ID"
+            and details.get("opcode") == "BINPERSID"
+            and details.get("pytorch_storage_persistent_id") is True
+            and isinstance(storage_key, str)
+            and storage_key in trusted_storage_keys
+        )
+
+    @classmethod
+    def _downgrade_legacy_pytorch_storage_persistent_ids(
+        cls,
+        result: ScanResult,
+        layout: _LegacyPyTorchStreamLayout,
+    ) -> None:
+        """Treat canonical storage BINPERSID records as informational in validated legacy PyTorch streams."""
+        trusted_storage_keys = set(layout.storage_keys)
+        downgraded_count = 0
+        for check in result.checks:
+            if not cls._is_legacy_pytorch_storage_persistent_id_record(check.details, trusted_storage_keys):
+                continue
+            check.status = CheckStatus.PASSED
+            check.severity = IssueSeverity.INFO
+            check.message = "PyTorch storage persistent ID found in validated legacy PyTorch stream"
+            check.details["trusted_legacy_pytorch_context"] = True
+            downgraded_count += 1
+
+        result.issues = [
+            issue
+            for issue in result.issues
+            if not cls._is_legacy_pytorch_storage_persistent_id_record(issue.details, trusted_storage_keys)
+        ]
+        if downgraded_count:
+            result.metadata["legacy_pytorch_trusted_storage_persistent_id_count"] = downgraded_count
+            if (
+                not result.has_errors
+                and not result.has_warnings
+                and result.metadata.get("pickle_verdict") == "suspicious"
+            ):
+                result.metadata["pickle_verdict"] = "clean"
 
     @staticmethod
     def _mark_legacy_pytorch_storage_layout_incomplete(
@@ -3733,6 +3783,7 @@ class PickleScanner(BaseScanner):
                 if legacy_storage_valid:
                     assert legacy_layout.storage_end is not None
                     self._annotate_legacy_pytorch_layout(result, legacy_layout, position_offset=start_position)
+                    self._downgrade_legacy_pytorch_storage_persistent_ids(result, legacy_layout)
                     suffix_raw_limit = max(self._root_raw_scan_limit() - len(raw_data), 0)
                     try:
                         suffix_raw_data = self._scan_legacy_pytorch_seekable_suffix(
@@ -3787,6 +3838,7 @@ class PickleScanner(BaseScanner):
                 if legacy_storage_valid:
                     assert legacy_layout.storage_end is not None
                     self._annotate_legacy_pytorch_layout(result, legacy_layout)
+                    self._downgrade_legacy_pytorch_storage_persistent_ids(result, legacy_layout)
                     suffix = payload[legacy_layout.storage_end :]
                     self._scan_legacy_pytorch_suffix_bytes(
                         result,
@@ -3934,6 +3986,7 @@ class PickleScanner(BaseScanner):
                 if legacy_storage_valid:
                     assert legacy_layout.storage_end is not None
                     self._annotate_legacy_pytorch_layout(scan_result, legacy_layout)
+                    self._downgrade_legacy_pytorch_storage_persistent_ids(scan_result, legacy_layout)
                     suffix_raw_limit = max(self._root_raw_scan_limit() - len(detector_data), 0)
                     suffix_raw_data = self._scan_legacy_pytorch_file_suffix(
                         scan_result,
