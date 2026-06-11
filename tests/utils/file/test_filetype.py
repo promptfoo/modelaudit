@@ -1601,15 +1601,24 @@ def test_hf_tokenizer_json_with_late_root_overlap_after_probe_is_not_claimed(
     assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
 
 
-def test_hf_tokenizer_json_incomplete_root_value_checks_escaped_suffix_conflicts(
+@pytest.mark.parametrize(
+    "padding",
+    [
+        "x" * 1024,
+        ["x" * 1024],
+        int("9" * 1024),
+    ],
+)
+def test_hf_tokenizer_json_incomplete_non_object_value_checks_escaped_suffix_conflicts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    padding: str | list[str] | int,
 ) -> None:
     monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
     tokenizer_path = _write_hf_tokenizer_json(
         tmp_path / "tokenizer.json",
         {
-            "padding": {"data": "x" * 1024},
+            "padding": padding,
         },
     )
     malicious_template = "{{ ''.__class__.__mro__[1].__subclasses__() }}"

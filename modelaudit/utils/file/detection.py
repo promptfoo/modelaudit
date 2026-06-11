@@ -316,11 +316,6 @@ _HF_TOKENIZER_JAX_ROUTE_KEYS = frozenset(
 _HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_KEYS = (
     _HF_TOKENIZER_TEMPLATE_KEYS | _MXNET_SYMBOL_ROOT_KEYS | {"learner"} | _HF_TOKENIZER_JAX_ROUTE_KEYS
 )
-_HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_RE = re.compile(
-    rb'}\s*,\s*"(?:'
-    + b"|".join(re.escape(key.encode("utf-8")) for key in sorted(_HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_KEYS))
-    + rb')"\s*:'
-)
 LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT = "llamafile_routing_inconclusive"
 NEMO_ROUTING_INCONCLUSIVE_FORMAT = "nemo_routing_inconclusive"
 XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT = "xgboost_ubjson_routing_inconclusive"
@@ -606,6 +601,13 @@ def _json_probe_skip_whitespace(probe: bytes, offset: int) -> int:
     while offset < len(probe) and probe[offset] in b" \t\r\n":
         offset += 1
     return offset
+
+
+def _json_probe_skip_whitespace_reverse(probe: bytes, offset: int) -> int | None:
+    offset -= 1
+    while offset >= 0 and probe[offset] in b" \t\r\n":
+        offset -= 1
+    return offset if offset >= 0 else None
 
 
 def _json_probe_skip_string(probe: bytes, offset: int) -> int | None:
@@ -943,12 +945,18 @@ def _hf_tokenizer_probe_model_object(
     return None, saw_model_type and saw_vocab
 
 
-def _hf_tokenizer_suffix_has_route_conflict(file_path: Path, file_size: int) -> bool:
+def _hf_tokenizer_suffix_has_route_conflict(
+    file_path: Path,
+    file_size: int,
+    *,
+    allow_after_any_value: bool = False,
+) -> bool:
     """Return whether a bounded suffix exposes late scanner-owned root evidence."""
     return _hf_tokenizer_suffix_has_structural_route_key(
         file_path,
         file_size,
         _HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_KEYS,
+        allow_after_any_value=allow_after_any_value,
     )
 
 
@@ -956,6 +964,8 @@ def _hf_tokenizer_suffix_has_structural_route_key(
     file_path: Path,
     file_size: int,
     keys: frozenset[str],
+    *,
+    allow_after_any_value: bool = False,
 ) -> bool:
     """Return whether a bounded suffix exposes a key after a closed object."""
     if file_size <= TOKENIZER_JSON_ROUTING_READ_BYTES:
@@ -970,10 +980,12 @@ def _hf_tokenizer_suffix_has_structural_route_key(
         return True
 
     for offset, byte in enumerate(suffix):
-        if byte != ord("}"):
+        if byte != ord(","):
             continue
-        offset = _json_probe_skip_whitespace(suffix, offset + 1)
-        if offset >= len(suffix) or suffix[offset] != ord(","):
+        previous_offset = _json_probe_skip_whitespace_reverse(suffix, offset)
+        if previous_offset is None:
+            continue
+        if suffix[previous_offset] != ord("}") and not allow_after_any_value:
             continue
         offset = _json_probe_skip_whitespace(suffix, offset + 1)
         if offset >= len(suffix) or suffix[offset] != ord('"'):
@@ -1041,7 +1053,12 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
             return False
         value_offset = _json_probe_skip_whitespace(probe, offset + 1)
         if value_offset >= len(probe):
-            return _hf_tokenizer_suffix_has_structural_route_key(file_path, file_size, keys)
+            return _hf_tokenizer_suffix_has_structural_route_key(
+                file_path,
+                file_size,
+                keys,
+                allow_after_any_value=key != "model",
+            )
 
         if scan_nested_templates:
             state = _HFTokenizerJSONProbeState()
@@ -1060,6 +1077,7 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
                     file_path,
                     file_size,
                     keys,
+                    allow_after_any_value=key != "model",
                 )
             if state.has_template_evidence:
                 return True
@@ -1068,6 +1086,7 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
                     file_path,
                     file_size,
                     keys,
+                    allow_after_any_value=key != "model",
                 )
         else:
             next_offset = _json_probe_skip_value(probe, value_offset)
@@ -1076,6 +1095,7 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
                     file_path,
                     file_size,
                     keys,
+                    allow_after_any_value=key != "model",
                 )
 
         offset = _json_probe_skip_whitespace(probe, next_offset)
