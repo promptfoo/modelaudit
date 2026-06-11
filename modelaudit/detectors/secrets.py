@@ -368,6 +368,11 @@ BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN = re.compile(
     r")\s*\(\s*\\?[\"']\s*(?:proxy-authorization|authorization)\s*\\?[\"']\s*,\s*\\?[\"']?\s*$",
     re.IGNORECASE,
 )
+BASIC_AUTH_HEADERS_CONSTRUCTOR_PREFIX_PATTERN = re.compile(
+    r"(?:^|[^\w$])(?:new\s+)?Headers\s*\(\s*\[\s*\[\s*\\?[\"']\s*"
+    r"(?:proxy-authorization|authorization)\s*\\?[\"']\s*,\s*\\?[\"']?\s*$",
+    re.IGNORECASE,
+)
 BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS = 256
 BASIC_AUTH_HEADER_NAMES = {
     "authorization": "Authorization",
@@ -624,6 +629,12 @@ class SecretsDetector:
         if BASIC_AUTH_HEADER_PREFIX_PATTERN.search(line_prefix) is not None:
             return True
         if BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(line_prefix) is not None:
+            return True
+        bounded_prefix = text[search_start:position]
+        if (
+            BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(bounded_prefix) is not None
+            or BASIC_AUTH_HEADERS_CONSTRUCTOR_PREFIX_PATTERN.search(bounded_prefix) is not None
+        ):
             return True
         if BASIC_AUTH_CONTINUATION_PREFIX_PATTERN.fullmatch(line_prefix) is None:
             return False

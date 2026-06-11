@@ -266,6 +266,28 @@ class TestSecretsDetector:
                 _basic_auth_token(b"headers-append:pass"),
             ),
             (
+                f'headers.set(\n  "Authorization",\n  "Basic {_basic_auth_token(b"headers-set-multiline:pass")}"\n)',
+                _basic_auth_token(b"headers-set-multiline:pass"),
+            ),
+            (
+                "request.setRequestHeader(\n"
+                "  'Authorization',\n"
+                f"  'Basic {_basic_auth_token(b'set-header-multiline:pass')}'\n"
+                ")",
+                _basic_auth_token(b"set-header-multiline:pass"),
+            ),
+            (
+                "headers.append(\n"
+                '  "Proxy-Authorization",\n'
+                f'  "Basic {_basic_auth_token(b"append-multiline:pass")}"\n'
+                ")",
+                _basic_auth_token(b"append-multiline:pass"),
+            ),
+            (
+                f'new Headers([\n  ["Authorization", "Basic {_basic_auth_token(b"headers-constructor:pass")}"]\n])',
+                _basic_auth_token(b"headers-constructor:pass"),
+            ),
+            (
                 f"Authorization: Basic {_basic_auth_token(bytes.fromhex('ceb4cebfcebaceb9cebcceae3a70c3a47373'))}",
                 _basic_auth_token(bytes.fromhex("ceb4cebfcebaceb9cebcceae3a70c3a47373")),
             ),
