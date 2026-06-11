@@ -1379,7 +1379,15 @@ def _read_bounded_huggingface_tree_response(response: Any, repo_id: str) -> obje
             )
 
     payload = bytearray()
-    for chunk in response.iter_content(chunk_size=_HF_REPOSITORY_TREE_RESPONSE_CHUNK_BYTES):
+    iter_bytes = getattr(response, "iter_bytes", None)
+    iter_content = getattr(response, "iter_content", None)
+    if callable(iter_bytes):
+        chunks = iter_bytes(chunk_size=_HF_REPOSITORY_TREE_RESPONSE_CHUNK_BYTES)
+    elif callable(iter_content):
+        chunks = iter_content(chunk_size=_HF_REPOSITORY_TREE_RESPONSE_CHUNK_BYTES)
+    else:
+        raise ValueError(f"Hugging Face repository inventory incomplete: invalid tree page response for {repo_id}")
+    for chunk in chunks:
         if not chunk:
             continue
         payload.extend(chunk)
@@ -1432,7 +1440,20 @@ def _list_huggingface_repo_files_paginated(
                 f"the bounded pagination limit ({_MAX_HF_REPOSITORY_INVENTORY_PAGES}) for {repo_id}"
             )
 
-        with session.get(next_url, headers=headers, params=params, timeout=timeout_seconds, stream=True) as response:
+        stream_response = getattr(session, "stream", None)
+        if callable(stream_response):
+            response_context = stream_response(
+                "GET",
+                next_url,
+                headers=headers,
+                params=params,
+                timeout=timeout_seconds,
+            )
+        else:
+            response_context = session.get(
+                next_url, headers=headers, params=params, timeout=timeout_seconds, stream=True
+            )
+        with response_context as response:
             response.raise_for_status()
             page_items = _read_bounded_huggingface_tree_response(response, repo_id)
 

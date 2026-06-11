@@ -101,6 +101,9 @@ class _FakeTreeResponse:
         for start in range(0, len(self.raw_payload), chunk_size):
             yield self.raw_payload[start : start + chunk_size]
 
+    def iter_bytes(self, chunk_size: int) -> Iterator[bytes]:
+        yield from self.iter_content(chunk_size)
+
 
 def _make_tar_payload() -> bytes:
     payload = BytesIO()
@@ -583,7 +586,7 @@ class TestModelDownload:
         """Large repository inventory should consume every tree page once and deduplicate names."""
         mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
         mock_session = mock_get_session.return_value
-        mock_session.get.side_effect = [
+        mock_session.stream.side_effect = [
             _FakeTreeResponse(
                 [
                     {"type": "file", "path": "z-model.bin"},
@@ -605,10 +608,10 @@ class TestModelDownload:
         assert revision == _HF_TEST_REVISION
         assert error is None
         mock_get_session.assert_called_once_with()
-        assert mock_session.get.call_count == 2
-        assert mock_session.get.call_args_list[0].kwargs["params"] == {"recursive": True, "expand": False}
-        assert mock_session.get.call_args_list[0].kwargs["stream"] is True
-        assert mock_session.get.call_args_list[1].kwargs["params"] is None
+        assert mock_session.stream.call_count == 2
+        assert mock_session.stream.call_args_list[0].args[:2] == ("GET", ANY)
+        assert mock_session.stream.call_args_list[0].kwargs["params"] == {"recursive": True, "expand": False}
+        assert mock_session.stream.call_args_list[1].kwargs["params"] is None
 
     @pytest.mark.parametrize(
         "filename",
@@ -631,7 +634,7 @@ class TestModelDownload:
     ) -> None:
         """Repository tree names must not escape local placement or verification roots."""
         mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
-        mock_get_session.return_value.get.return_value = _FakeTreeResponse([{"type": "file", "path": filename}])
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse([{"type": "file", "path": filename}])
 
         repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
 
@@ -658,7 +661,7 @@ class TestModelDownload:
     ) -> None:
         """Unknown tree item types must not create a partial benign inventory."""
         mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
-        mock_get_session.return_value.get.return_value = _FakeTreeResponse(
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse(
             [
                 {"type": "file", "path": "benign.bin"},
                 tree_item,
@@ -690,7 +693,7 @@ class TestModelDownload:
     ) -> None:
         """Malformed file entries must fail closed before the inventory is accepted."""
         mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
-        mock_get_session.return_value.get.return_value = _FakeTreeResponse(
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse(
             [
                 {"type": "file", "path": "benign.bin"},
                 tree_item,
@@ -715,7 +718,7 @@ class TestModelDownload:
         repeated_url = "https://huggingface.co/api/models/test/model/tree/repeated"
         mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
         mock_session = mock_get_session.return_value
-        mock_session.get.side_effect = [
+        mock_session.stream.side_effect = [
             _FakeTreeResponse([{"type": "file", "path": "first.bin"}], links={"next": {"url": repeated_url}}),
             _FakeTreeResponse([{"type": "file", "path": "second.bin"}], links={"next": {"url": repeated_url}}),
         ]
@@ -726,7 +729,7 @@ class TestModelDownload:
         assert revision is None
         assert error is not None
         assert "pagination cursor repeated" in error
-        assert mock_session.get.call_count == 2
+        assert mock_session.stream.call_count == 2
 
     @patch("huggingface_hub.utils.get_session")
     @patch("huggingface_hub.HfApi.repo_info")
@@ -737,7 +740,7 @@ class TestModelDownload:
     ) -> None:
         """A later page failure must not produce a partial successful inventory."""
         mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
-        mock_get_session.return_value.get.side_effect = [
+        mock_get_session.return_value.stream.side_effect = [
             _FakeTreeResponse(
                 [{"type": "file", "path": "first.bin"}],
                 links={"next": {"url": "https://huggingface.co/api/models/test/model/tree/page-2"}},
@@ -763,7 +766,7 @@ class TestModelDownload:
         """Repository inventory remains explicitly bounded even when pagination succeeds."""
         monkeypatch.setattr("modelaudit.utils.sources.huggingface._MAX_HF_REPOSITORY_INVENTORY_FILES", 2)
         mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
-        mock_get_session.return_value.get.return_value = _FakeTreeResponse(
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse(
             [
                 {"type": "file", "path": "one.bin"},
                 {"type": "file", "path": "two.bin"},
@@ -789,7 +792,7 @@ class TestModelDownload:
         """Tree pages must be byte-bounded before JSON decoding."""
         monkeypatch.setattr("modelaudit.utils.sources.huggingface._MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES", 16)
         mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
-        mock_get_session.return_value.get.return_value = _FakeTreeResponse(
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse(
             [{"type": "file", "path": "model.bin"}],
             headers={"Content-Length": "17"},
         )
@@ -812,7 +815,7 @@ class TestModelDownload:
         """Accepted tree paths must be length-bounded before local path or glob use."""
         monkeypatch.setattr("modelaudit.utils.sources.huggingface._MAX_HF_REPOSITORY_PATH_CHARS", 8)
         mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
-        mock_get_session.return_value.get.return_value = _FakeTreeResponse(
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse(
             [{"type": "file", "path": "very-long-model.bin"}]
         )
 
@@ -834,7 +837,7 @@ class TestModelDownload:
         """Pagination must fail closed when page count exceeds the explicit cap."""
         monkeypatch.setattr("modelaudit.utils.sources.huggingface._MAX_HF_REPOSITORY_INVENTORY_PAGES", 1)
         mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
-        mock_get_session.return_value.get.return_value = _FakeTreeResponse(
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse(
             [{"type": "file", "path": "first.bin"}],
             links={"next": {"url": "https://huggingface.co/api/models/test/model/tree/page-2"}},
         )
@@ -858,7 +861,7 @@ class TestModelDownload:
         repeated_url = "https://huggingface.co/api/models/test/model/tree/page?expand=false&cursor=abc"
         mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
         mock_session = mock_get_session.return_value
-        mock_session.get.side_effect = [
+        mock_session.stream.side_effect = [
             _FakeTreeResponse([{"type": "file", "path": "first.bin"}], links={"next": {"url": first_url}}),
             _FakeTreeResponse([{"type": "file", "path": "second.bin"}], links={"next": {"url": repeated_url}}),
         ]
@@ -869,7 +872,7 @@ class TestModelDownload:
         assert revision is None
         assert error is not None
         assert "pagination cursor repeated" in error
-        assert mock_session.get.call_count == 2
+        assert mock_session.stream.call_count == 2
 
     @patch("huggingface_hub.utils.build_hf_headers")
     @patch("huggingface_hub.utils.get_session")
@@ -884,7 +887,7 @@ class TestModelDownload:
         mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
         mock_build_headers.return_value = {"authorization": "Bearer configured-token"}
         mock_session = mock_get_session.return_value
-        mock_session.get.return_value = _FakeTreeResponse([{"type": "file", "path": "model.bin"}])
+        mock_session.stream.return_value = _FakeTreeResponse([{"type": "file", "path": "model.bin"}])
 
         repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
 
@@ -893,7 +896,8 @@ class TestModelDownload:
         assert error is None
         mock_build_headers.assert_called_once_with(token=None)
         mock_get_session.assert_called_once_with()
-        assert mock_session.get.call_args.kwargs["headers"] == {"authorization": "Bearer configured-token"}
+        assert mock_session.stream.call_args.args[0] == "GET"
+        assert mock_session.stream.call_args.kwargs["headers"] == {"authorization": "Bearer configured-token"}
 
     @pytest.mark.parametrize("revision", [None, "", "main", "g" * 40])
     @patch("huggingface_hub.HfApi.repo_info")
