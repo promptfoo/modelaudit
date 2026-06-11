@@ -9859,6 +9859,52 @@ def test_scan_file_oversized_tokenizer_template_preempts_selected_jax(
     )
 
 
+def test_scan_file_oversized_tokenizer_model_template_after_vocab_preserves_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "model": {
+                "type": "Unigram",
+                "vocab": [[f"piece_{index}", -float(index)] for index in range(80)],
+                "template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+            },
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_template_preserves_explicit_jax_selection(tmp_path: Path) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "chat_template": "{{ harmless_user_name }}",
+            "framework": "jax",
+            "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+        },
+    )
+
+    result = scan_file(
+        str(tokenizer_path),
+        config={"cache_scan_results": False, "scanners": ["jax_checkpoint"]},
+    )
+
+    assert result.scanner_name == "jax_checkpoint"
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
 def test_scan_file_selected_jax_requires_positive_json_evidence(tmp_path: Path) -> None:
     generic_path = tmp_path / "generic.json"
     generic_path.write_text(

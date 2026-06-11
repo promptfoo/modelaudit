@@ -888,7 +888,7 @@ def _hf_tokenizer_suffix_has_structural_route_key(
     *,
     allow_after_any_value: bool = False,
 ) -> bool:
-    """Return whether a bounded suffix exposes a key after a closed object."""
+    """Return whether a bounded suffix exposes a key after a completed value."""
     if file_size <= TOKENIZER_JSON_ROUTING_READ_BYTES:
         return False
 
@@ -906,7 +906,7 @@ def _hf_tokenizer_suffix_has_structural_route_key(
         previous_offset = _json_probe_skip_whitespace_reverse(suffix, offset)
         if previous_offset is None:
             continue
-        if suffix[previous_offset] != ord("}") and not allow_after_any_value:
+        if suffix[previous_offset] not in {ord("}"), ord("]")} and not allow_after_any_value:
             continue
         offset = _json_probe_skip_whitespace(suffix, offset + 1)
         if offset >= len(suffix) or suffix[offset] != ord('"'):

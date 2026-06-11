@@ -1238,13 +1238,24 @@ def _select_non_hdf5_preferred_scanner_id(
     if header_format == "tar" and ext == ".nemo":
         return "nemo"
 
+    scanner_policy = policy_from_config(config) if config is not None else None
+    tokenizer_template_route = (
+        config is not None
+        and ext == ".json"
+        and header_format == "unknown"
+        and huggingface_tokenizer_json_has_template_route_evidence(path)
+    )
+    if tokenizer_template_route and scanner_policy is not None and scanner_policy.allows("jinja2_template"):
+        return "jinja2_template"
+
     if (
         config is not None
         and ext == ".json"
         and header_format == "unknown"
-        and policy_from_config(config).allows("jax_checkpoint")
+        and scanner_policy is not None
+        and scanner_policy.allows("jax_checkpoint")
         and not is_huggingface_tokenizer_json_file(path)
-        and not huggingface_tokenizer_json_has_template_route_evidence(path)
+        and (not tokenizer_template_route or not scanner_policy.allows("jinja2_template"))
         and is_confirmed_jax_json_checkpoint_file(path)
     ):
         return "jax_checkpoint"
