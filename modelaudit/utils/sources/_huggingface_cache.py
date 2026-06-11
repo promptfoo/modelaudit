@@ -56,10 +56,22 @@ def _path_has_part(path: Path, part: str) -> bool:
 def _hf_cache_snapshot_revision(path: Path, cache_root: Path | None = None) -> str | None:
     """Return the lexical HF snapshot revision for ``snapshots/<revision>/...`` aliases."""
     absolute_path = Path(os.path.abspath(path.expanduser()))
+    if cache_root is not None:
+        absolute_cache_root = Path(os.path.abspath(cache_root.expanduser()))
+        try:
+            relative_parts = absolute_path.relative_to(absolute_cache_root).parts
+        except ValueError:
+            return None
+        if (
+            len(relative_parts) >= 3
+            and relative_parts[0].lower() == "snapshots"
+            and relative_parts[1] not in {"", ".", ".."}
+        ):
+            return relative_parts[1]
+        return None
+
     for index, segment in enumerate(absolute_path.parts):
         if not segment.lower().startswith("models--"):
-            continue
-        if cache_root is not None and segment != cache_root.name:
             continue
         relative_parts = absolute_path.parts[index + 1 :]
         if (
