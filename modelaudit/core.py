@@ -3833,7 +3833,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         if (
             format_probe_error is None
             and ext == ".nemo"
-            and magic_format == "gzip"
+            and (header_format == "gzip" or magic_format == "gzip")
             and header_format in {"gzip", "nemo", "tar"}
         )
         else None
