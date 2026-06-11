@@ -123,6 +123,11 @@ from modelaudit.utils.helpers.types import (
     ProgressCallback,
 )
 from modelaudit.utils.lfs import check_lfs_pointer, get_lfs_issue_details, get_lfs_remediation_steps
+from modelaudit.utils.repository_context import (
+    REPOSITORY_CURRENT_FILE_CONFIG_KEY,
+    REPOSITORY_SCAN_ROOT_CONFIG_KEY,
+    normalize_repository_member_path,
+)
 from modelaudit.utils.sources._huggingface_cache import (
     _find_hf_cache_root,
     _get_hf_cache_roots,
@@ -149,6 +154,19 @@ logger = logging.getLogger("modelaudit.core")
 _add_asset_to_results = core_results.add_asset_to_results
 _add_error_asset_to_results = core_results.add_error_asset_to_results
 _DIRECTORY_PRECOUNT_CHILD_LIMIT = 1000
+
+
+def _repository_member_path_for_scan(scan_path: str, scan_root: Path | None) -> str | None:
+    if scan_root is not None:
+        try:
+            relative_path = Path(scan_path).resolve().relative_to(scan_root).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            pass
+        else:
+            normalized_relative = normalize_repository_member_path(relative_path)
+            if normalized_relative is not None:
+                return normalized_relative
+    return normalize_repository_member_path(Path(scan_path).name)
 
 
 def _count_immediate_children_up_to(path: Path, limit: int) -> int:
@@ -2692,9 +2710,12 @@ def scan_model_directory_or_file(
 
                         file_scan_started_at = _start_phase_timing(phase_timings)
                         try:
-                            file_config = config
+                            file_config = dict(config)
+                            file_config.setdefault(REPOSITORY_SCAN_ROOT_CONFIG_KEY, str(base_dir))
+                            repository_current_file = _repository_member_path_for_scan(representative_file, base_dir)
+                            if repository_current_file is not None:
+                                file_config[REPOSITORY_CURRENT_FILE_CONFIG_KEY] = repository_current_file
                             if shard_family_key is not None:
-                                file_config = dict(config)
                                 file_config[_SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY] = (
                                     _build_shard_family_cache_fingerprint(
                                         shard_family_key,
@@ -4412,6 +4433,11 @@ def scan_model_streaming(
                     "timeout": timeout - int(time.time() - start_time),
                     **scan_kwargs,
                 }
+                if base_dir is not None:
+                    scan_config.setdefault(REPOSITORY_SCAN_ROOT_CONFIG_KEY, str(base_dir))
+                    repository_current_file = _repository_member_path_for_scan(str(source_path), base_dir)
+                    if repository_current_file is not None:
+                        scan_config[REPOSITORY_CURRENT_FILE_CONFIG_KEY] = repository_current_file
                 initial_shard_target = _snapshot_validated_shard_target(
                     str(source_path),
                     resolved_path=str(scan_path),

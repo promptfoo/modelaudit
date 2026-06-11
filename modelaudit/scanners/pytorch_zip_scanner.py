@@ -27,6 +27,7 @@ from ..scanner_results import (
 from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTES, _looks_like_proto0_or_1_pickle
+from ..utils.repository_context import repository_has_safetensors_sibling
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
 from ._evidence_redaction import redact_evidence_string, redact_untrusted_error_message
@@ -3470,20 +3471,13 @@ class PyTorchZipScanner(BaseScanner):
 
     def _check_safetensors_available(self, model_path: str) -> bool:
         """Check if a SafeTensors alternative exists in the same directory"""
+        if repository_has_safetensors_sibling(model_path, self.config):
+            return True
+
         try:
-            import glob
-
-            # Get the directory containing the PyTorch model
-            model_dir = os.path.dirname(model_path)
-            if not model_dir:
-                # If no directory (relative path), use current directory
-                model_dir = "."
-
-            # Look for .safetensors files in the same directory
-            safetensors_pattern = os.path.join(model_dir, "*.safetensors")
-            safetensors_files = glob.glob(safetensors_pattern)
-
-            return len(safetensors_files) > 0
+            model_dir = os.path.dirname(model_path) or "."
+            with os.scandir(model_dir) as entries:
+                return any(entry.is_file() and entry.name.lower().endswith(".safetensors") for entry in entries)
         except Exception:
             return False
 

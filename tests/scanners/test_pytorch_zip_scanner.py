@@ -20,7 +20,7 @@ import pytest
 from modelaudit_picklescan.call_graph import import_only_module_requires_origin_review
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file, scan_model_streaming
 from modelaudit.detectors import jit_script as jit_script_module
 from modelaudit.detectors import network_comm as network_comm_module
 from modelaudit.detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
@@ -29,6 +29,10 @@ from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
+from modelaudit.utils.repository_context import (
+    REPOSITORY_CURRENT_FILE_CONFIG_KEY,
+    REPOSITORY_FILE_INVENTORY_CONFIG_KEY,
+)
 from tests.helpers import create_mock_pytorch_zip
 
 _ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
@@ -8326,6 +8330,165 @@ def _pickle_result_with_reduce(import_reference: str | None = None) -> ScanResul
 
 def _weights_only_analysis_check(result: ScanResult) -> Check:
     return next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
+
+
+def test_pytorch_zip_repository_inventory_marks_safetensors_available_without_local_file(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "pytorch_model.bin", prefix="archive")
+    scanner = PyTorchZipScanner(
+        config={REPOSITORY_FILE_INVENTORY_CONFIG_KEY: ("pytorch_model.bin", "model.safetensors")}
+    )
+
+    result = scanner.scan(str(model_path))
+
+    assert not (tmp_path / "model.safetensors").exists()
+    check = _weights_only_analysis_check(result)
+    assert check.details["safetensors_available"] is True
+
+
+def test_pytorch_zip_repository_inventory_requires_same_directory_safetensors(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "pytorch_model.bin", prefix="archive")
+    scanner = PyTorchZipScanner(
+        config={
+            REPOSITORY_FILE_INVENTORY_CONFIG_KEY: (
+                "pytorch_model.bin",
+                "model.safetensors.tmp",
+                "model.safetensors/weights.bin",
+                "../model.safetensors",
+                "nested/model.safetensors",
+            )
+        }
+    )
+
+    result = scanner.scan(str(model_path))
+
+    check = _weights_only_analysis_check(result)
+    assert check.details["safetensors_available"] is False
+
+
+def test_pytorch_zip_local_safetensors_check_ignores_deceptive_directory_and_suffix(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "pytorch_model.bin", prefix="archive")
+    (tmp_path / "model.safetensors").mkdir()
+    (tmp_path / "model.safetensors.tmp").write_bytes(b"not safetensors")
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    check = _weights_only_analysis_check(result)
+    assert check.details["safetensors_available"] is False
+
+
+def test_pytorch_zip_directory_scan_uses_repository_inventory_for_nested_sibling(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    nested_dir = repo_root / "sentence-transformer"
+    nested_dir.mkdir(parents=True)
+    create_mock_pytorch_zip(nested_dir / "pytorch_model.bin", prefix="archive")
+    repository_config: dict[str, Any] = {
+        REPOSITORY_FILE_INVENTORY_CONFIG_KEY: (
+            "sentence-transformer/pytorch_model.bin",
+            "sentence-transformer/model.safetensors",
+        )
+    }
+
+    result = scan_model_directory_or_file(
+        str(repo_root),
+        cache_enabled=False,
+        **repository_config,
+    )
+
+    check = next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
+    assert check.details["safetensors_available"] is True
+
+
+def test_pytorch_zip_streaming_scan_uses_repository_inventory(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    model_path = create_mock_pytorch_zip(repo_root / "pytorch_model.bin", prefix="archive")
+
+    def file_generator() -> Iterator[tuple[Path, bool]]:
+        yield model_path, True
+
+    repository_config: dict[str, Any] = {
+        REPOSITORY_FILE_INVENTORY_CONFIG_KEY: ["pytorch_model.bin", "model.safetensors"]
+    }
+    result = scan_model_streaming(
+        file_generator=file_generator(),
+        scan_root=str(repo_root),
+        delete_after_scan=False,
+        timeout=30,
+        cache_enabled=False,
+        **repository_config,
+    )
+
+    check = next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
+    assert check.details["safetensors_available"] is True
+
+
+def test_pytorch_zip_safetensors_inventory_does_not_suppress_malicious_pickle(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "pytorch_model.bin", malicious=True, prefix="archive")
+    scanner = PyTorchZipScanner(
+        config={REPOSITORY_FILE_INVENTORY_CONFIG_KEY: ("pytorch_model.bin", "model.safetensors")}
+    )
+
+    result = scanner.scan(str(model_path))
+
+    check = _weights_only_analysis_check(result)
+    assert check.status == CheckStatus.FAILED
+    assert check.severity == IssueSeverity.CRITICAL
+    assert check.details["safetensors_available"] is True
+    assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
+
+
+def test_pytorch_zip_embedded_safetensors_member_is_not_repository_alternative(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "pytorch_model.bin", malicious=True, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("model.safetensors", b"not an external alternative")
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    check = _weights_only_analysis_check(result)
+    assert check.status == CheckStatus.FAILED
+    assert check.severity == IssueSeverity.CRITICAL
+    assert check.details["safetensors_available"] is False
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    ("repo_id", "revision"),
+    [
+        ("sentence-transformers/all-MiniLM-L12-v2", "a50ef00143b4d5391434df20ae11632588ac25be"),
+        ("intfloat/multilingual-e5-base", "d128750597153bb5987e10b1c3493a34e5a4502a"),
+    ],
+)
+def test_pinned_huggingface_inventory_marks_safetensors_available_without_weight_download(
+    tmp_path: Path,
+    repo_id: str,
+    revision: str,
+) -> None:
+    if os.environ.get("MODELAUDIT_RUN_HF_E2E") != "1":
+        pytest.skip("Set MODELAUDIT_RUN_HF_E2E=1 to query pinned Hugging Face inventory")
+
+    from huggingface_hub import HfApi
+
+    info = HfApi().model_info(repo_id, revision=revision, files_metadata=True)
+    inventory = tuple(
+        name
+        for sibling in info.siblings or []
+        if isinstance(name := (getattr(sibling, "rfilename", None) or getattr(sibling, "path", None)), str)
+    )
+    assert "model.safetensors" in inventory
+
+    model_path = create_mock_pytorch_zip(tmp_path / "pytorch_model.bin", prefix="archive")
+    scanner = PyTorchZipScanner(
+        config={
+            REPOSITORY_FILE_INVENTORY_CONFIG_KEY: inventory,
+            REPOSITORY_CURRENT_FILE_CONFIG_KEY: "pytorch_model.bin",
+        }
+    )
+
+    result = scanner.scan(str(model_path))
+
+    check = _weights_only_analysis_check(result)
+    assert check.details["safetensors_available"] is True
 
 
 def _legacy_s207_pickle_result(opcode_counts: dict[str, int]) -> ScanResult:

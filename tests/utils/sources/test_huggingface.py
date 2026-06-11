@@ -396,6 +396,29 @@ class TestModelDownload:
 
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin", "model.safetensors"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_fills_repository_file_inventory(
+        self,
+        mock_snapshot_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        mock_path = tmp_path / "test_model"
+        mock_path.mkdir()
+        (mock_path / "pytorch_model.bin").write_bytes(b"weights")
+        (mock_path / "model.safetensors").write_bytes(b"safe weights")
+        mock_snapshot_download.return_value = str(mock_path)
+        inventory: list[str] = []
+
+        result = download_model("https://huggingface.co/test/model", repository_file_inventory=inventory)
+
+        assert result == mock_path
+        assert inventory == ["pytorch_model.bin", "model.safetensors"]
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
         return_value=(["model.bin"], _HF_TEST_REVISION, None),
     )
     @patch("huggingface_hub.snapshot_download")
@@ -3598,6 +3621,36 @@ class TestHuggingFaceFileURLs:
             cache_dir=None,
         )
         assert result == downloaded_file
+
+    @patch("huggingface_hub.HfApi")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_file_fills_repository_file_inventory(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_hf_api: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        downloaded_file = tmp_path / "downloaded_file.bin"
+        downloaded_file.write_bytes(b"weights")
+        mock_hf_hub_download.return_value = str(downloaded_file)
+        mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(
+            sha=TEST_COMMIT_SHA,
+            siblings=[
+                SimpleNamespace(rfilename="pytorch_model.bin"),
+                SimpleNamespace(rfilename="model.safetensors"),
+            ],
+        )
+        mock_hf_api.return_value.get_paths_info.return_value = [SimpleNamespace(size=len(b"weights"))]
+        inventory: list[str] = []
+
+        result = download_file_from_hf(
+            "https://huggingface.co/test/model/resolve/main/pytorch_model.bin",
+            max_size=1024,
+            repository_file_inventory=inventory,
+        )
+
+        assert result == downloaded_file
+        assert inventory == ["pytorch_model.bin", "model.safetensors"]
 
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
