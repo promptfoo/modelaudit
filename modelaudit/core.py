@@ -1241,8 +1241,7 @@ def _select_non_hdf5_preferred_scanner_id(
     scanner_policy = policy_from_config(config) if config is not None else None
     tokenizer_template_route = (
         config is not None
-        and ext == ".json"
-        and header_format == "unknown"
+        and header_format in {"unknown", "pytorch_binary", "jax_checkpoint"}
         and huggingface_tokenizer_json_has_template_route_evidence(path)
     )
     if tokenizer_template_route and scanner_policy is not None and scanner_policy.allows("jinja2_template"):

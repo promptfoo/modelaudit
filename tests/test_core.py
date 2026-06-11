@@ -9935,6 +9935,78 @@ def test_scan_file_tokenizer_json_escaped_chat_template_preserves_jinja_detectio
     )
 
 
+@pytest.mark.parametrize("filename", ["tokenizer", "tokenizer.txt", "tokenizer.bin"])
+def test_scan_file_tokenizer_named_json_template_evidence_without_json_suffix_preserves_jinja(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / filename,
+        {"chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}"},
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_extensionless_tokenizer_template_preempts_selected_jax(tmp_path: Path) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer",
+        {
+            "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+            "framework": "jax",
+            "checkpoint_type": "orbax",
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected_scanner"),
+    [
+        ("tokenizer", "unknown"),
+        ("tokenizer.txt", "text"),
+        ("tokenizer.bin", "pytorch_binary"),
+    ],
+)
+def test_scan_file_tokenizer_named_vocab_template_tokens_without_json_suffix_stays_benign(
+    tmp_path: Path,
+    filename: str,
+    expected_scanner: str,
+) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / filename,
+        {
+            "model": {
+                "type": "BPE",
+                "vocab": {"{{": 0, "{%": 1, "template": 2, "hello": 3},
+                "merges": [],
+            }
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is True
+    assert result.scanner_name == expected_scanner
+    assert not any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
 def test_scan_file_tokenizer_json_mxnet_root_preempts_template_evidence(tmp_path: Path) -> None:
     tokenizer_path = _write_hf_tokenizer_json(
         tmp_path / "tokenizer.json",
@@ -10482,6 +10554,29 @@ def test_scan_file_tokenizer_json_jax_identity_composes_jinja_template_analysis(
     )
 
 
+def test_scan_file_extensionless_tokenizer_jax_identity_composes_jinja_template_analysis(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer",
+        late_fields=(
+            ',"framework":"jax",'
+            '"payload":"jax.experimental.host_callback.call(os.system, \'id\')",'
+            '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"'
+        ),
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert set(result.metadata["scanner_dependency_ids"]) >= {"jinja2_template", "jax_checkpoint"}
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
 def test_scan_file_tokenizer_json_jax_library_identity_composes_jinja_template_analysis(tmp_path: Path) -> None:
     tokenizer_path = _write_ordered_hf_tokenizer_json(
         tmp_path / "tokenizer.json",
@@ -10597,6 +10692,20 @@ def test_scan_file_tokenizer_json_malformed_after_structure_budget_fails_closed(
     tokenizer_path = _write_truncated_ordered_hf_tokenizer_json(
         tmp_path / "tokenizer.json",
         padding_size=256,
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "MXNet Symbol Routing" for check in result.checks)
+
+
+def test_scan_file_malformed_exact_tokenizer_json_with_schema_evidence_fails_closed(tmp_path: Path) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0}},"padding":1e+}',
+        encoding="utf-8",
     )
 
     result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})

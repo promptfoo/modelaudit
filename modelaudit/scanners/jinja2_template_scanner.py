@@ -461,6 +461,9 @@ class Jinja2TemplateScanner(BaseScanner):
         if ext in [".jinja", ".j2", ".template"]:
             return True
 
+        if huggingface_tokenizer_json_has_template_route_evidence(path):
+            return True
+
         # JSON files containing templates
         if ext == ".json" and any(
             pattern in filename
@@ -782,7 +785,12 @@ class Jinja2TemplateScanner(BaseScanner):
         """Preserve JAX analysis for Jinja-owned tokenizer JSON files."""
         if self.config.get(JINJA_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY) is True:
             return
-        if Path(path).name.lower() != "tokenizer.json" or not huggingface_tokenizer_json_has_jax_route_evidence(path):
+        if Path(path).name.lower() not in {
+            "tokenizer",
+            "tokenizer.json",
+            "tokenizer.txt",
+            "tokenizer.bin",
+        } or not huggingface_tokenizer_json_has_jax_route_evidence(path):
             return
 
         from .jax_checkpoint_scanner import JAX_SKIP_JINJA_JSON_OVERLAP_CONFIG_KEY, JaxCheckpointScanner

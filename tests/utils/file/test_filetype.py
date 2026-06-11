@@ -1540,6 +1540,71 @@ def test_hf_tokenizer_json_decodes_escaped_template_route_evidence(tmp_path: Pat
     assert detect_file_format(str(tokenizer_path)) == "unknown"
 
 
+@pytest.mark.parametrize(
+    ("filename", "expected_format"),
+    [
+        ("tokenizer", "unknown"),
+        ("tokenizer.txt", "unknown"),
+        ("tokenizer.bin", "pytorch_binary"),
+    ],
+)
+def test_hf_tokenizer_named_json_template_evidence_routes_without_json_suffix(
+    tmp_path: Path,
+    filename: str,
+    expected_format: str,
+) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / filename,
+        {"chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}"},
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == expected_format
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected_format"),
+    [
+        ("tokenizer", "unknown"),
+        ("tokenizer.txt", "unknown"),
+        ("tokenizer.bin", "pytorch_binary"),
+    ],
+)
+def test_hf_tokenizer_named_vocab_template_tokens_do_not_route_jinja_without_json_suffix(
+    tmp_path: Path,
+    filename: str,
+    expected_format: str,
+) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / filename,
+        {
+            "model": {
+                "type": "BPE",
+                "vocab": {"{{": 0, "{%": 1, "template": 2, "hello": 3},
+                "merges": [],
+            }
+        },
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is False
+    assert detect_file_format(str(tokenizer_path)) == expected_format
+
+
+def test_hf_tokenizer_json_malformed_schema_evidence_fails_closed_for_routing(tmp_path: Path) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0}},"padding":1e+}',
+        encoding="utf-8",
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert detect_file_format(str(tokenizer_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(tokenizer_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(tokenizer_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
 def test_hf_tokenizer_json_allows_vocab_jinja_markers_when_schema_is_bounded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
