@@ -64,6 +64,17 @@ STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset(
     }
 )
 SCHEMA_VALIDATED_ONNX_DOMAINS: frozenset[str] = frozenset({"ai.onnx.preview"})
+_AMBIGUOUS_ONNX_OPSET_VERSION = -1
+_LOW_NOISE_ONNX_RUNTIME_OPERATORS: dict[str, dict[str, frozenset[int]]] = {
+    # ONNX Runtime optimization passes commonly emit these contrib kernels in
+    # public transformer exports. Suppress S1111 only for exact domain/operator
+    # tuples with an imported supported opset and empty overload; unknown vendor
+    # operators remain custom-domain findings.
+    "com.microsoft": {
+        "FastGelu": frozenset({1}),
+        "SkipLayerNormalization": frozenset({1}),
+    },
+}
 ONNX_STRUCTURE_INCONCLUSIVE_REASON = "onnx_structure_validation_failed"
 ONNX_RAW_DETECTION_INCONCLUSIVE_REASON = "onnx_raw_detection_analysis_incomplete"
 ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON = "onnx_weight_distribution_analysis_incomplete"
@@ -376,12 +387,10 @@ def _iter_model_graphs(model: Any) -> Any:
 
 def _iter_model_graphs_with_opsets(model: Any) -> Any:
     """Yield model graphs with the operator-set versions governing each graph."""
-    model_opset_versions = {opset.domain or "": int(opset.version) for opset in getattr(model, "opset_import", [])}
+    model_opset_versions = _opset_versions_by_domain(getattr(model, "opset_import", []))
     yield model.graph, model_opset_versions
     for function in getattr(model, "functions", []):
-        function_opset_versions = {
-            opset.domain or "": int(opset.version) for opset in getattr(function, "opset_import", [])
-        }
+        function_opset_versions = _opset_versions_by_domain(getattr(function, "opset_import", []))
         yield function, function_opset_versions
         for attribute in getattr(function, "attribute_proto", []):
             for graph in _iter_attribute_graphs(attribute):
@@ -389,6 +398,20 @@ def _iter_model_graphs_with_opsets(model: Any) -> Any:
     for training_info in getattr(model, "training_info", []):
         yield training_info.initialization, model_opset_versions
         yield training_info.algorithm, model_opset_versions
+
+
+def _opset_versions_by_domain(opset_imports: Iterable[Any]) -> dict[str, int]:
+    """Collect opset imports, preserving ambiguity for conflicting duplicates."""
+    versions: dict[str, int] = {}
+    for opset in opset_imports:
+        domain = opset.domain or ""
+        version = int(opset.version)
+        previous = versions.get(domain)
+        if previous is None:
+            versions[domain] = version
+        elif previous != version:
+            versions[domain] = _AMBIGUOUS_ONNX_OPSET_VERSION
+    return versions
 
 
 def _model_local_function_identifiers(model: Any) -> frozenset[tuple[str, str, str]]:
@@ -431,6 +454,22 @@ def _is_schema_validated_operator(node: Any, opset_versions: dict[str, int]) -> 
     )
 
 
+def _is_low_noise_vendor_operator(node: Any, opset_versions: dict[str, int]) -> bool:
+    """Return whether a custom-domain node matches the documented vendor policy."""
+    domain = node.domain or ""
+    domain_policy = _LOW_NOISE_ONNX_RUNTIME_OPERATORS.get(domain)
+    overload = str(getattr(node, "overload", "") or "")
+    if domain_policy is None or overload:
+        return False
+
+    supported_versions = domain_policy.get(node.op_type or "")
+    if supported_versions is None:
+        return False
+
+    version = opset_versions.get(domain)
+    return version in supported_versions
+
+
 def _is_external_custom_operator(
     node: Any,
     local_function_identifiers: frozenset[tuple[str, str, str]],
@@ -443,6 +482,7 @@ def _is_external_custom_operator(
         and domain not in STANDARD_ONNX_DOMAINS
         and _operator_identifier(node) not in local_function_identifiers
         and not _is_schema_validated_operator(node, opset_versions)
+        and not _is_low_noise_vendor_operator(node, opset_versions)
     )
 
 
@@ -2909,7 +2949,10 @@ class OnnxScanner(BaseScanner):
             result.add_check(
                 name="Custom Operator Domain Check",
                 passed=True,
-                message="All operators use standard ONNX domains or model-local function implementations",
+                message=(
+                    "All operators use standard ONNX domains, model-local function implementations, "
+                    "or known low-noise vendor runtime operators"
+                ),
                 location=path,
                 details={"safe_nodes": safe_nodes},
                 rule_code=None,  # Passing check
