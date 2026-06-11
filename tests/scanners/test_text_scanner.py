@@ -1077,6 +1077,32 @@ git clone https://github.com/example-org/model.git && ./model/install.sh
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_fenced_documentation_github_clone_then_execute_remains_actionable(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+git clone https://github.com/example-org/model.git
+./model/install.sh
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_command"
+        and check.details.get("command_type") == "git_clone"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_fenced_documentation_github_clone_does_not_hide_github_download(
     tmp_path: Path,
 ) -> None:
@@ -1449,6 +1475,38 @@ exec(resp.text)
     assert determine_exit_code(aggregate) == 1
 
 
+@pytest.mark.parametrize("executor", ["os.system(resp.text)", "subprocess.run(resp.text, shell=True)"])
+def test_text_scanner_fenced_documentation_passive_media_does_not_hide_shell_executed_response(
+    tmp_path: Path,
+    executor: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        f"""```python
+import os
+import subprocess
+import requests
+
+resp = requests.get("http://localhost:8080/v1/payload")
+{executor}
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_executable_loopback_api_request_remains_actionable(tmp_path: Path) -> None:
     text_path = tmp_path / "client.py"
     text_path.write_text('requests.get("http://localhost:8080/v1/embeddings")\n', encoding="utf-8")
@@ -1743,6 +1801,68 @@ def test_text_scanner_pinned_omnivoice_trusted_package_index_is_informational(
         and check.details.get("type") in {"domain", "domain_name"}
         and check.details.get("domain") == "download.pytorch.org"
         and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_pinned_omnivoice_reporting_limit_with_local_audio_is_informational(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        (
+            "<!-- k2-fsa/OmniVoice@999c332499c708b116876ff5fe1aa5dd15f422ce -->\n"
+            "# OmniVoice\n\n"
+            '<img src="https://zhu-han.github.io/omnivoice/pics/omnivoice.jpg" />\n'
+            "```bash\n"
+            "pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 "
+            "--extra-index-url https://download.pytorch.org/whl/cu128\n"
+            "```\n"
+            "See https://pytorch.org/get-started/locally/ for other versions.\n"
+            "- Model: https://huggingface.co/k2-fsa/OmniVoice\n"
+            "- Space: https://huggingface.co/spaces/k2-fsa/OmniVoice\n"
+            "- Paper: https://huggingface.co/papers/2604.00688\n"
+            "- Repository: https://github.com/k2-fsa/OmniVoice\n"
+            "- Issues: https://github.com/k2-fsa/OmniVoice/issues\n"
+            "```python\n"
+            "from omnivoice import OmniVoice\n"
+            "import soundfile as sf\n"
+            "\n"
+            'model = OmniVoice.from_pretrained("k2-fsa/OmniVoice")\n'
+            'audio = model.generate(ref_audio="ref.wav")\n'
+            'sf.write("out.wav", audio[0], 24000)\n'
+            "```\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = TextScanner(
+        config={
+            "check_secrets": False,
+            "text_content_max_findings": 6,
+        }
+    ).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        cache_enabled=False,
+        check_secrets=False,
+        text_content_max_findings=6,
+    )
+
+    assert result.success is True
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == "https://download.pytorch.org/whl/cu128"
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert any(
+        check.details.get("type") == "detector_finding_limit"
+        and check.details.get("analysis_incomplete") is False
+        and check.details.get("reporting_incomplete") is True
         for check in result.checks
     )
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)

@@ -54,6 +54,21 @@ PASSIVE_NETWORK_FINDING_TYPES = frozenset(
 DOCUMENTATION_FENCED_LOOPBACK_API_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 DOCUMENTATION_FENCED_LOOPBACK_API_PORTS = frozenset({80, 443, 8000, 8080})
 DOCUMENTATION_FENCED_PASSIVE_MEDIA_URL_SUFFIXES = (".gif", ".jpeg", ".jpg", ".png", ".webp")
+DOCUMENTATION_LOCAL_FILE_TOKEN_SUFFIXES = (
+    b".aac",
+    b".flac",
+    b".gif",
+    b".jpeg",
+    b".jpg",
+    b".json",
+    b".m4a",
+    b".mp3",
+    b".ogg",
+    b".png",
+    b".txt",
+    b".wav",
+    b".webp",
+)
 DOCUMENTATION_FENCED_PASSIVE_MEDIA_URL_HOSTS = frozenset(
     {
         "cdn-media.huggingface.co",
@@ -372,7 +387,7 @@ DOCUMENTATION_FENCED_GIT_CLONE_REFERENCE_PATTERN = re.compile(
     + rb"){0,8}\s+(?:--\s+)?(?P<destination>"
     + DOCUMENTATION_GIT_CLONE_DESTINATION
     + rb")"
-    + rb"(?:\s+[^\s;&|#]{1,4096})?(?=\s*(?:$|[;&|#]))",
+    + rb"(?:\s+(?P<local_destination>[^\s;&|#]{1,4096}))?(?=\s*(?:$|[;&|#]))",
     re.IGNORECASE,
 )
 DOCUMENTATION_SSH_OPTION_WITH_ARGUMENT = rb"-(?:B|b|c|D|E|F|I|i|J|L|l|m|O|o|p|Q|R|S|W|w)(?:=|\s+)?[^\s]{1,4096}"
@@ -566,8 +581,13 @@ DOCUMENTATION_FENCED_MODULE_ALIAS_NETWORK_CALL_PATTERN = re.compile(
     rb"(?:get|head|post|put|patch|delete|request|urlopen|urlretrieve)\s*\(",
     re.IGNORECASE,
 )
+DOCUMENTATION_FENCED_RESPONSE_EXECUTOR = (
+    rb"(?:exec|eval|compile|os\.system|subprocess\.(?:run|call|check_call|check_output|Popen))"
+)
 DOCUMENTATION_FENCED_EXECUTED_FETCH_PATTERN = re.compile(
-    rb"\b(?:exec|eval|compile)\s*\([^()\r\n]*(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
+    rb"\b"
+    + DOCUMENTATION_FENCED_RESPONSE_EXECUTOR
+    + rb"\s*\([^()\r\n]*(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_FETCH_RESPONSE_ASSIGNMENT_PATTERN = re.compile(
@@ -576,7 +596,7 @@ DOCUMENTATION_FENCED_FETCH_RESPONSE_ASSIGNMENT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_EXECUTED_RESPONSE_PATTERN = re.compile(
-    rb"\b(?:exec|eval|compile)\s*\(\s*(?P<target>[A-Za-z_][A-Za-z0-9_]*)"
+    rb"\b" + DOCUMENTATION_FENCED_RESPONSE_EXECUTOR + rb"\s*\(\s*(?P<target>[A-Za-z_][A-Za-z0-9_]*)"
     rb"(?:\s*\.\s*(?:text|content)|\s*\.\s*read\s*\(\s*\))?",
     re.IGNORECASE,
 )
@@ -1458,12 +1478,19 @@ class TextScanner(BaseScanner):
         cls,
         payload: bytes,
         finding: dict[str, Any],
+        fenced_code_ranges: tuple[tuple[int, int], ...],
     ) -> bool:
         line_parts = cls._finding_line_parts(payload, finding)
         if line_parts is None:
             return True
         line, position = line_parts
-        if cls._documentation_fenced_git_clone_reference_is_informational(line, position, finding):
+        if cls._documentation_fenced_git_clone_reference_is_informational(
+            payload,
+            line,
+            position,
+            finding,
+            fenced_code_ranges,
+        ):
             return True
         if cls._documentation_fenced_package_version_is_informational(line, position, finding):
             return True
@@ -1498,11 +1525,14 @@ class TextScanner(BaseScanner):
             )
         )
 
-    @staticmethod
+    @classmethod
     def _documentation_fenced_git_clone_reference_is_informational(
+        cls,
+        payload: bytes,
         line: bytes,
         position: int,
         finding: dict[str, Any],
+        fenced_code_ranges: tuple[tuple[int, int], ...],
     ) -> bool:
         match_line = line.rstrip(b"\r")
         clone_match = DOCUMENTATION_FENCED_GIT_CLONE_REFERENCE_PATTERN.match(match_line)
@@ -1510,6 +1540,13 @@ class TextScanner(BaseScanner):
             return False
         trailing = match_line[clone_match.end() :].strip()
         if trailing and not trailing.startswith(b"#"):
+            return False
+        if cls._documentation_fenced_git_clone_block_executes_checkout(
+            payload,
+            position,
+            clone_match,
+            fenced_code_ranges,
+        ):
             return False
         finding_type = finding.get("type")
         if finding_type in {"domain", "domain_name"}:
@@ -1532,6 +1569,119 @@ class TextScanner(BaseScanner):
             and hostname.casefold() == "github.com"
             and raw_port in {None, 443}
         )
+
+    @staticmethod
+    def _documentation_git_clone_checkout_path(clone_match: re.Match[bytes]) -> bytes | None:
+        local_destination = clone_match.groupdict().get("local_destination")
+        if local_destination:
+            checkout_path = local_destination.strip().rstrip(b"/")
+        else:
+            destination = clone_match.group("destination").strip().rstrip(b"/")
+            if destination.endswith(b".git"):
+                destination = destination[:-4]
+            checkout_path = destination.rsplit(b"/", maxsplit=1)[-1].rsplit(b":", maxsplit=1)[-1]
+        while checkout_path.startswith(b"./"):
+            checkout_path = checkout_path[2:]
+        if checkout_path in {b"", b".."} or b"\x00" in checkout_path:
+            return None
+        if not (checkout_path == b"." or re.fullmatch(rb"[A-Za-z0-9._/\-]{1,512}", checkout_path) is not None):
+            return None
+        return checkout_path
+
+    @staticmethod
+    def _documentation_fenced_shell_command_prefix_pattern() -> bytes:
+        return rb"^\s*(?:sudo\s+)?"
+
+    @classmethod
+    def _documentation_fenced_line_enters_clone_checkout(cls, line: bytes, checkout_path: bytes) -> bool:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(b"#") or checkout_path == b".":
+            return False
+        path_reference = rb"(?:\./)?" + re.escape(checkout_path)
+        return (
+            re.match(
+                cls._documentation_fenced_shell_command_prefix_pattern()
+                + rb"cd\s+"
+                + path_reference
+                + rb"\s*(?:$|[;&|])",
+                stripped,
+                flags=re.IGNORECASE,
+            )
+            is not None
+        )
+
+    @classmethod
+    def _documentation_fenced_line_executes_relative_checkout_path(cls, line: bytes) -> bool:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(b"#"):
+            return False
+        prefix = cls._documentation_fenced_shell_command_prefix_pattern()
+        return any(
+            re.match(pattern, stripped, flags=re.IGNORECASE) is not None
+            for pattern in (
+                prefix + rb"\./[A-Za-z0-9_./\-]{1,4096}(?:\s|$)",
+                prefix
+                + rb"(?:bash|sh|zsh|python(?:[0-9.]+)?|py|node|ruby|perl|source|\.)\s+\./"
+                + rb"[A-Za-z0-9_./\-]{1,4096}(?:\s|$)",
+            )
+        )
+
+    @classmethod
+    def _documentation_fenced_line_executes_clone_checkout(cls, line: bytes, checkout_path: bytes) -> bool:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(b"#"):
+            return False
+        if checkout_path == b".":
+            return cls._documentation_fenced_line_executes_relative_checkout_path(stripped)
+        path_reference = rb"(?:\./)?" + re.escape(checkout_path)
+        prefix = cls._documentation_fenced_shell_command_prefix_pattern()
+        return any(
+            re.match(pattern, stripped, flags=re.IGNORECASE) is not None
+            for pattern in (
+                prefix + path_reference + rb"/[A-Za-z0-9_./\-]{1,4096}(?:\s|$)",
+                prefix
+                + rb"(?:bash|sh|zsh|python(?:[0-9.]+)?|py|node|ruby|perl|source|\.)\s+"
+                + path_reference
+                + rb"/[A-Za-z0-9_./\-]{1,4096}(?:\s|$)",
+                prefix + rb"cd\s+" + path_reference + rb"\s*(?:&&|;)\s*(?:\./)?[A-Za-z0-9_./\-]{1,4096}(?:\s|$)",
+                prefix + rb"make\s+-C\s+" + path_reference + rb"(?:\s|$)",
+            )
+        )
+
+    @classmethod
+    def _documentation_fenced_git_clone_block_executes_checkout(
+        cls,
+        payload: bytes,
+        position: int,
+        clone_match: re.Match[bytes],
+        fenced_code_ranges: tuple[tuple[int, int], ...],
+    ) -> bool:
+        checkout_path = cls._documentation_git_clone_checkout_path(clone_match)
+        if checkout_path is None:
+            return False
+        fenced_range = next(
+            (
+                (range_start, range_end)
+                for range_start, range_end in fenced_code_ranges
+                if range_start <= position < range_end
+            ),
+            None,
+        )
+        if fenced_range is None:
+            return False
+        _range_start, range_end = fenced_range
+        line_end = payload.find(b"\n", position, range_end)
+        if line_end == -1:
+            return False
+        inside_checkout = False
+        for raw_line in payload[line_end + 1 : range_end].splitlines():
+            if inside_checkout and cls._documentation_fenced_line_executes_relative_checkout_path(raw_line):
+                return True
+            if cls._documentation_fenced_line_executes_clone_checkout(raw_line, checkout_path):
+                return True
+            if cls._documentation_fenced_line_enters_clone_checkout(raw_line, checkout_path):
+                inside_checkout = True
+        return False
 
     @staticmethod
     def _documentation_fenced_package_version_is_informational(
@@ -2013,7 +2163,12 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
-    def _documentation_fenced_network_command_is_informational(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+    def _documentation_fenced_network_command_is_informational(
+        cls,
+        payload: bytes,
+        finding: dict[str, Any],
+        fenced_code_ranges: tuple[tuple[int, int], ...],
+    ) -> bool:
         if finding.get("command_type") != "git_clone":
             return False
         destination = finding.get("destination")
@@ -2024,19 +2179,27 @@ class TextScanner(BaseScanner):
         line_parts = cls._finding_line_parts(payload, finding)
         if line_parts is None:
             return False
-        line, _position = line_parts
+        line, position = line_parts
         match_line = line.rstrip(b"\r")
         clone_match = DOCUMENTATION_FENCED_GIT_CLONE_REFERENCE_PATTERN.match(match_line)
         if clone_match is None:
             return False
         trailing = match_line[clone_match.end() :].strip()
-        return not trailing or trailing.startswith(b"#")
+        if trailing and not trailing.startswith(b"#"):
+            return False
+        return not cls._documentation_fenced_git_clone_block_executes_checkout(
+            payload,
+            position,
+            clone_match,
+            fenced_code_ranges,
+        )
 
     @classmethod
     def _documentation_fenced_finding_is_informational(
         cls,
         payload: bytes,
         finding: dict[str, Any],
+        fenced_code_ranges: tuple[tuple[int, int], ...],
         fenced_passive_network_example_ranges: tuple[tuple[int, int], ...],
     ) -> bool:
         if cls._documentation_fenced_passive_network_example_contains_finding(
@@ -2047,9 +2210,9 @@ class TextScanner(BaseScanner):
             return True
         finding_type = finding.get("type")
         if finding_type == "network_command":
-            return cls._documentation_fenced_network_command_is_informational(payload, finding)
+            return cls._documentation_fenced_network_command_is_informational(payload, finding, fenced_code_ranges)
         if finding_type in PASSIVE_NETWORK_FINDING_TYPES:
-            return cls._documentation_fenced_passive_finding_is_informational(payload, finding)
+            return cls._documentation_fenced_passive_finding_is_informational(payload, finding, fenced_code_ranges)
         return finding_type in {
             "cc_pattern",
             "suspicious_port",
@@ -2145,6 +2308,7 @@ class TextScanner(BaseScanner):
                 and cls._documentation_fenced_finding_is_informational(
                     payload,
                     candidate,
+                    fenced_code_ranges,
                     fenced_passive_network_example_ranges,
                 )
             ):
@@ -2355,8 +2519,29 @@ class TextScanner(BaseScanner):
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(line) is not None
         )
 
+    @staticmethod
+    def _documentation_bare_token_is_local_file_reference(token: bytes) -> bool:
+        normalized = token.rstrip(b"`.,;:!?)\"'>]}").lower()
+        return (
+            normalized.count(b".") == 1
+            and b"/" not in normalized
+            and b"\\" not in normalized
+            and b"@" not in normalized
+            and normalized.endswith(DOCUMENTATION_LOCAL_FILE_TOKEN_SUFFIXES)
+        )
+
     @classmethod
     def _documentation_code_bare_network_token_requires_classification(cls, line: bytes, position: int) -> bool:
+        token_match = next(
+            (
+                match
+                for match in BARE_NETWORK_DOMAIN_TOKEN_PATTERN.finditer(line)
+                if match.start() <= position < match.end()
+            ),
+            None,
+        )
+        if token_match is not None and cls._documentation_bare_token_is_local_file_reference(token_match.group()):
+            return False
         return cls._documentation_python_string_contains_position(
             line,
             position,
@@ -2399,6 +2584,7 @@ class TextScanner(BaseScanner):
                             "destination": cls._documentation_network_token_value(match),
                             "position": position,
                         },
+                        fenced_code_ranges,
                     )
                 ):
                     continue
@@ -2565,6 +2751,7 @@ class TextScanner(BaseScanner):
                 and cls._documentation_fenced_finding_is_informational(
                     payload,
                     finding,
+                    fenced_code_ranges,
                     fenced_passive_network_example_ranges,
                 )
             ):
