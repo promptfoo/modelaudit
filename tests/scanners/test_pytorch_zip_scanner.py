@@ -3,6 +3,7 @@ import json
 import pickle
 import stat
 import struct
+import sys
 import time
 import warnings
 import zipfile
@@ -8054,6 +8055,33 @@ def _static_getattr_reduce_payload(
     return payload + b"\x86R."
 
 
+def _clear_ultralytics_modules() -> None:
+    for module_name in tuple(sys.modules):
+        if module_name == "ultralytics" or module_name.startswith("ultralytics."):
+            sys.modules.pop(module_name, None)
+
+
+def _write_ultralytics_head_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> Path:
+    _clear_ultralytics_modules()
+    source_root = tmp_path / "ultralytics_source"
+    modules_dir = source_root / "ultralytics" / "nn" / "modules"
+    modules_dir.mkdir(parents=True)
+    for package_dir in (
+        source_root / "ultralytics",
+        source_root / "ultralytics" / "nn",
+        modules_dir,
+    ):
+        (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    head_path = modules_dir / "head.py"
+    head_path.write_text(source, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(source_root))
+    return head_path
+
+
 def _write_getattr_reconstruction_zip(tmp_path: Path, payload: bytes) -> Path:
     model_path = tmp_path / "getattr_reconstruction.pt"
     create_mock_pytorch_zip(model_path, with_pickle=False, prefix="archive")
@@ -8076,7 +8104,15 @@ def _weights_only_analysis_check(result: ScanResult) -> Check:
     return next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
 
 
-def test_pytorch_zip_static_getattr_framework_reconstruction_does_not_emit_s115(tmp_path: Path) -> None:
+def test_pytorch_zip_static_getattr_framework_reconstruction_does_not_emit_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
     model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
 
     result = PyTorchZipScanner().scan(str(model_path))
@@ -8088,6 +8124,7 @@ def test_pytorch_zip_static_getattr_framework_reconstruction_does_not_emit_s115(
 @pytest.mark.parametrize(
     "payload",
     [
+        _static_getattr_reduce_payload(),
         _static_getattr_reduce_payload(attribute=b"__dict__"),
         _static_getattr_reduce_payload(opaque_target=True),
         _static_getattr_reduce_payload(non_literal_attribute=True),
@@ -8096,7 +8133,24 @@ def test_pytorch_zip_static_getattr_framework_reconstruction_does_not_emit_s115(
     ],
 )
 def test_pytorch_zip_static_getattr_unsafe_context_keeps_s115(tmp_path: Path, payload: bytes) -> None:
+    _clear_ultralytics_modules()
     model_path = _write_getattr_reconstruction_zip(tmp_path, payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
+def test_pytorch_zip_static_getattr_source_backed_method_sink_keeps_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "import os\n\nclass Detect:\n    def forward(self):\n        os.system('id')\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
 
     result = PyTorchZipScanner().scan(str(model_path))
 

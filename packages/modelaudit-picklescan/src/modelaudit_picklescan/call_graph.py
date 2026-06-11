@@ -2009,6 +2009,17 @@ def find_analyzed_callable_call_graph_global_positions(
     return frozenset(positions)
 
 
+def class_static_attribute_lookup_is_proven_source_backed(module: str, name: str) -> bool:
+    """Return whether a static class attribute lookup is source-backed and has no explicit metaclass."""
+    class_target = _resolve_class_target(f"{module}.{name}")
+    if class_target is None:
+        return False
+    context = _source_class_context(class_target)
+    if context is None:
+        return False
+    return not _class_has_explicit_metaclass(context.class_node)
+
+
 def module_initialization_is_proven_inert(module_name: str) -> bool:
     """Return whether importing a source-backed module has no executable initialization."""
     parts = _bounded_module_name_parts(module_name)
@@ -4867,6 +4878,10 @@ def _class_method_nodes(class_node: ast.ClassDef) -> dict[str, ast.FunctionDef |
         for child in _definition_scope_statements(class_node.body)
         if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)
     }
+
+
+def _class_has_explicit_metaclass(class_node: ast.ClassDef) -> bool:
+    return any(keyword.arg == "metaclass" for keyword in class_node.keywords)
 
 
 def _inherited_class_methods(
