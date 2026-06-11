@@ -972,8 +972,8 @@ class GgufScanner(BaseScanner):
         return key == "tokenizer.chat_template" or key.startswith("tokenizer.chat_template.")
 
     @staticmethod
-    def _is_tokenizer_vocabulary_key(key: str) -> bool:
-        return key == "tokenizer.ggml.tokens" or key.startswith("tokenizer.ggml.tokens.")
+    def _is_tokenizer_vocabulary_key(key: str, value: Any) -> bool:
+        return key == "tokenizer.ggml.tokens" and isinstance(value, list)
 
     @staticmethod
     def _metadata_decode_variants(value: str) -> tuple[str, ...]:
@@ -1310,7 +1310,11 @@ class GgufScanner(BaseScanner):
             option_name, _option_value = word.split("=", 1)
             return option_name in _GGUF_FETCH_OPTIONS_WITH_VALUE
         if word.startswith("-") and not word.startswith("--") and len(word) > 2:
-            return any(option in _GGUF_FETCH_SHORT_OPTIONS_WITH_SEPARATE_VALUE for option in word[1:])
+            short_options = word[1:].lower()
+            return any(
+                option in _GGUF_FETCH_SHORT_OPTIONS_WITH_SEPARATE_VALUE and index == len(short_options) - 1
+                for index, option in enumerate(short_options)
+            )
         return False
 
     @staticmethod
@@ -1548,7 +1552,7 @@ class GgufScanner(BaseScanner):
                     stack.append((item_path, item))
 
     def _report_metadata_value_security_checks(self, key: str, value: Any, result: ScanResult) -> None:
-        if self._is_tokenizer_vocabulary_key(key):
+        if self._is_tokenizer_vocabulary_key(key, value):
             return
 
         reported = sum(
