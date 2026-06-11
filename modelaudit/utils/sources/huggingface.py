@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable, Collection, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
+from functools import cache
 from glob import escape as escape_glob
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -909,22 +910,22 @@ def _get_hf_content_route_scanner_ids() -> set[str]:
     return scanner_ids
 
 
-def _hf_detected_safetensors_shard_excluded_by_selection(
-    filename: str,
-    detected_format: str,
-    selected_route_scanner_ids: set[str] | None,
-) -> bool:
-    """Return whether scanner selection excludes a detected shard-shaped SafeTensors artifact."""
-    if (
-        selected_route_scanner_ids is None
-        or detected_format != "safetensors"
-        or _HF_SAFETENSORS_SHARD_PATTERN.search(filename) is None
-    ):
-        return False
-
+@cache
+def _hf_safetensors_route_scanner_ids() -> frozenset[str]:
     from ...scanner_selection import scanner_ids_for_detected_format
 
-    return not selected_route_scanner_ids.intersection(scanner_ids_for_detected_format(detected_format))
+    return scanner_ids_for_detected_format("safetensors")
+
+
+def _hf_safetensors_shard_excluded_by_selection(
+    filename: str,
+    selected_route_scanner_ids: set[str] | None,
+) -> bool:
+    """Return whether scanner selection excludes a shard-shaped SafeTensors artifact."""
+    if selected_route_scanner_ids is None or _HF_SAFETENSORS_SHARD_PATTERN.search(filename) is None:
+        return False
+
+    return not selected_route_scanner_ids.intersection(_hf_safetensors_route_scanner_ids())
 
 
 def _get_selected_hf_content_route_formats(
@@ -1076,6 +1077,8 @@ def _select_streamable_hf_files(
         for file_name in repo_files:
             if file_name in selected_files:
                 continue
+            if _hf_safetensors_shard_excluded_by_selection(file_name, selected_route_scanner_ids):
+                continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
                     "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "
@@ -1085,9 +1088,8 @@ def _select_streamable_hf_files(
             detected_format = _detect_huggingface_content_route_format(repo_id, file_name, revision, probe_budget)
             if detected_format is None:
                 continue
-            if _hf_detected_safetensors_shard_excluded_by_selection(
+            if detected_format == "safetensors" and _hf_safetensors_shard_excluded_by_selection(
                 file_name,
-                detected_format,
                 selected_route_scanner_ids,
             ):
                 continue

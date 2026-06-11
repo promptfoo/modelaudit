@@ -27,6 +27,7 @@ from modelaudit.scanner_selection import (
 from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
 from modelaudit.utils.sources._huggingface_download_worker import _run_operation as _run_huggingface_worker_operation
 from modelaudit.utils.sources.huggingface import (
+    _HF_CONTENT_SNIFF_MAX_FILES,
     _get_huggingface_path_sizes,
     _HuggingFaceProbeBudget,
     _list_huggingface_repo_files_at_revision,
@@ -2652,29 +2653,32 @@ class TestModelDownloadStreaming:
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
         return_value=(
-            ["MODEL.UBJ", "model-00001-of-00002.safetensors"],
+            [
+                "MODEL.UBJ",
+                *[
+                    f"model-{index:05d}-of-{_HF_CONTENT_SNIFF_MAX_FILES + 1:05d}.safetensors"
+                    for index in range(1, _HF_CONTENT_SNIFF_MAX_FILES + 2)
+                ],
+            ],
             _HF_TEST_REVISION,
             None,
         ),
     )
     @patch("requests.get")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_selected_non_overlap_skips_detected_safetensors_shard_after_probe(
+    def test_download_model_streaming_selected_non_overlap_skips_declared_safetensors_shards_before_probe(
         self,
         mock_hf_hub_download: MagicMock,
         mock_requests_get: MagicMock,
         _mock_list_repo_files: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """Detected SafeTensors shards excluded by non-overlap selection must stay bounded and undispatched."""
+        """Non-overlap selection must not range-probe declared SafeTensors shards or hit the sniff cap."""
         policy = resolve_scanner_selection_policy(scanners=["xgboost"])
         extensions = selected_scanner_extensions(policy, conservative=True)
         assert extensions is not None
         assert ".ubj" in extensions
         assert ".safetensors" not in extensions
-        safetensors_header = b'{"__metadata__":{"format":"pt"}}'
-        safetensors_shard = struct.pack("<Q", len(safetensors_header)) + safetensors_header + (b"\x00" * 16)
-        mock_requests_get.return_value = _FakeRangeResponse(safetensors_shard)
 
         def download_side_effect(*, filename: str, **_kwargs: object) -> str:
             assert filename == "MODEL.UBJ"
@@ -2694,8 +2698,7 @@ class TestModelDownloadStreaming:
         )
 
         assert results == [(tmp_path / "MODEL.UBJ", True)]
-        mock_requests_get.assert_called_once()
-        assert mock_requests_get.call_args.kwargs["headers"]["Range"] == "bytes=0-8191"
+        mock_requests_get.assert_not_called()
         mock_hf_hub_download.assert_called_once_with(
             repo_id="test/model",
             filename="MODEL.UBJ",
