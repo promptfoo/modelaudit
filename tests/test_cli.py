@@ -42,6 +42,7 @@ from modelaudit.cli import (
 )
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
+from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.cli_output import parse_click_json_output
 from tests.helpers import create_mock_pytorch_zip
@@ -100,6 +101,23 @@ def _make_trusted_shard_parent(path: Path, *, parents: bool = False) -> None:
     """Create a shard parent without inheriting group-write test umasks."""
     path.mkdir(parents=parents)
     path.chmod(0o755)
+
+
+def _write_ordered_hf_tokenizer_json(
+    path: Path,
+    *,
+    late_fields: str = "",
+    padding_size: int = 0,
+) -> Path:
+    padding = f',"padding":"{"x" * padding_size}"' if padding_size else ""
+    path.write_text(
+        (
+            '{"version":"1.0","added_tokens":[],'
+            f'"model":{{"type":"BPE","vocab":{{"hello":0}},"merges":[]}}{padding}{late_fields}}}'
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 def _bert_like_multilingual_vocab_bytes(*tail_tokens: str) -> bytes:
@@ -486,6 +504,31 @@ def test_scan_cli_keeps_imported_network_alias_pickle_url_actionable(tmp_path: P
         and issue.get("details", {}).get("type") == "url_detected"
         and issue.get("details", {}).get("url") == "https://attacker.example/payload"
         for issue in output_payload.get("issues", [])
+    )
+
+
+def test_scan_cli_tokenizer_json_late_chat_template_after_structure_budget_reports_issue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 192)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"',
+        padding_size=256,
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--no-cache", "--format", "json", str(tokenizer_path)],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 1
+    output_payload = parse_click_json_output(result.output)
+    assert any(
+        check["name"] == "Jinja2 Template Injection Detection" and check["status"] == "failed"
+        for check in output_payload["checks"]
     )
 
 
