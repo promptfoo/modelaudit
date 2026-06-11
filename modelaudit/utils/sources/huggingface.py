@@ -807,9 +807,13 @@ def _include_huggingface_openvino_companions(
     revision: str,
     model_files: list[str],
     *,
+    include_openvino_companions: bool = True,
     deadline: float | None = None,
 ) -> list[str]:
     """Include exact OpenVINO XML/BIN companions before size checks and downloads."""
+    if not include_openvino_companions:
+        return model_files
+
     from modelaudit.utils.file.detection import XML_MODEL_INCONCLUSIVE_FORMAT
 
     repo_file_set = set(repo_files)
@@ -1895,6 +1899,10 @@ def download_model_streaming(
             repo_files,
             repo_revision,
             model_files,
+            include_openvino_companions=(
+                scannable_scanner_ids is None
+                or "openvino" in {str(scanner_id).lower() for scanner_id in scannable_scanner_ids}
+            ),
             deadline=deadline,
         )
         revision, selected_sizes = _ensure_huggingface_selection_within_max_size(

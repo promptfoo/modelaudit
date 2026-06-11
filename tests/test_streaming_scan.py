@@ -1480,6 +1480,25 @@ def test_scan_model_streaming_openvino_prefetched_companion_changes_content_hash
     assert first_result.content_hash != second_result.content_hash
 
 
+def test_scan_model_streaming_openvino_prefetched_companion_counts_toward_max_total_size(tmp_path: Path) -> None:
+    """HF-style XML-only yields must count staged OpenVINO weights against total scan caps."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+    bin_path.write_bytes(b"\x00" * 64)
+
+    result = scan_model_streaming(
+        file_generator=iter([(xml_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+        max_total_size=32,
+    )
+
+    assert determine_exit_code(result) == 2
+    assert result.bytes_scanned > 32
+    assert result.content_hash is None
+    assert any("Total scan size limit exceeded" in issue.message for issue in result.issues)
+
+
 def test_scan_model_streaming_openvino_missing_companion_still_reports_s701(tmp_path: Path) -> None:
     """Missing OpenVINO weights must not be suppressed by companion-preservation logic."""
     xml_path = tmp_path / "model.xml"
@@ -1557,6 +1576,23 @@ def test_scan_model_streaming_openvino_companion_swap_fails_closed(tmp_path: Pat
         and check.details.get("scan_outcome_reason") == "openvino_weights_changed_during_xml_scan"
         for check in result.checks
     )
+
+
+def test_scan_model_streaming_openvino_bin_without_yielded_xml_fails_closed(tmp_path: Path) -> None:
+    """A bin-first stream cannot mark weights covered unless its OpenVINO XML is yielded."""
+    _xml_path, bin_path = _write_openvino_pair(tmp_path)
+    create_malicious_pickle(bin_path)
+
+    result = scan_model_streaming(
+        file_generator=iter([(bin_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+    )
+
+    assert determine_exit_code(result) == 1
+    assert "pickle" in result.scanner_names
+    assert any(issue.location == str(bin_path) and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_scan_model_directory_or_file_openvino_bin_sidecar_not_pytorch(tmp_path: Path) -> None:
