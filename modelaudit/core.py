@@ -86,6 +86,7 @@ from modelaudit.utils.file.detection import (
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
+    _is_malformed_sentencepiece_model_proto_candidate_file,
     detect_file_format,
     detect_file_format_from_magic,
     detect_flax_msgpack_overlap_routes,
@@ -3656,6 +3657,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         format_probe_error is None
         and header_format in {"unknown", "pytorch_binary"}
         and pytorch_binary_supplemental_scanner_id is None
+        and not (ext == ".model" and _is_malformed_sentencepiece_model_proto_candidate_file(path))
         and scanner_selection.allows("zip")
         and ZipScanner.can_handle(path)
     ):

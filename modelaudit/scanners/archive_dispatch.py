@@ -42,6 +42,7 @@ from ..utils.file.detection import (
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
+    _is_malformed_sentencepiece_model_proto_candidate_file,
     detect_file_format,
     detect_file_format_from_magic,
     detect_flax_msgpack_overlap_routes,
@@ -1221,8 +1222,12 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
     except (TypeError, ValueError):
         max_zip_entries = ZipScanner.DEFAULT_MAX_ENTRIES
     max_zip_directory_size = ZipScanner.central_directory_size_limit(raw_config)
+    malformed_sentencepiece_model_candidate = Path(
+        path
+    ).suffix.lower() == ".model" and _is_malformed_sentencepiece_model_proto_candidate_file(path)
     if (
-        (not is_safetensors_hdf5_overlap or hdf5_signature_offset in (None, 0))
+        not malformed_sentencepiece_model_candidate
+        and (not is_safetensors_hdf5_overlap or hdf5_signature_offset in (None, 0))
         and allows_zip_structure_analysis(scanner_selection, path)
         and ZipScanner.requires_preflight_result(
             path,

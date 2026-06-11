@@ -78,6 +78,17 @@ def _proto_field(field_number: int, wire_type: int, payload: bytes) -> bytes:
     return _proto_varint((field_number << 3) | wire_type) + payload
 
 
+def _unknown_sentencepiece_field(payload: bytes) -> bytes:
+    return _proto_field(99, 2, _proto_varint(len(payload)) + payload)
+
+
+def _small_zip_payload() -> bytes:
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zip_archive:
+        zip_archive.writestr("payload.py", "print('nested')")
+    return archive.getvalue()
+
+
 def _sentencepiece_piece(piece: str, piece_type: int) -> bytes:
     piece_payload = (
         _proto_field(1, 2, _proto_varint(len(piece.encode("utf-8"))) + piece.encode("utf-8"))
@@ -222,6 +233,10 @@ _SENTENCEPIECE_MALFORMED_TAILS = (
     pytest.param(_proto_varint((2 << 3) | 6), id="invalid-wire-type-6"),
     pytest.param(_proto_varint((2 << 3) | 7), id="invalid-wire-type-7"),
     pytest.param(b"\x00not a protobuf tail", id="arbitrary-tail"),
+    pytest.param(
+        _unknown_sentencepiece_field(pickle.dumps({"payload": "pickle"}, protocol=4)), id="unknown-field-pickle"
+    ),
+    pytest.param(_unknown_sentencepiece_field(_small_zip_payload()), id="unknown-field-zip"),
 )
 
 
@@ -2420,6 +2435,44 @@ class TestXGBoostFailClosedEndToEnd:
         expected_location = (
             f"{archive_file} -> tokenizer.model" if archive_kind == "gz" else f"{archive_file}:{member_name}"
         )
+
+        assert determine_exit_code(result) == 2
+        assert any(issue.rule_code == "S1004" and issue.location == expected_location for issue in result.issues)
+        assert cli_result.exit_code == 2
+        assert any(
+            issue.get("rule_code") == "S1004" and issue.get("location") == expected_location
+            for issue in cli_payload.get("issues", [])
+        )
+
+    @pytest.mark.parametrize("archive_kind", ["zip", "tar", "tar.gz", "gz"])
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            pytest.param(_unknown_sentencepiece_field(pickle.dumps({"payload": "pickle"}, protocol=4)), id="pickle"),
+            pytest.param(_unknown_sentencepiece_field(_small_zip_payload()), id="zip"),
+        ],
+    )
+    def test_archived_sentencepiece_unknown_field_payload_still_fails_closed_in_xgboost(
+        self, tmp_path: Path, archive_kind: str, tail: bytes
+    ) -> None:
+        member_name = "models/tokenizer.model"
+        archive_file = _write_sentencepiece_archive(
+            tmp_path,
+            archive_kind,
+            member_name,
+            _sentencepiece_model_proto() + tail,
+        )
+        expected_location = (
+            f"{archive_file} -> tokenizer.model" if archive_kind == "gz" else f"{archive_file}:{member_name}"
+        )
+
+        result = scan_model_directory_or_file(str(archive_file), cache_enabled=False)
+        cli_result = CliRunner().invoke(
+            cli,
+            ["scan", "--no-cache", "--format", "json", str(archive_file)],
+            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+        )
+        cli_payload = parse_click_json_output(cli_result.output)
 
         assert determine_exit_code(result) == 2
         assert any(issue.rule_code == "S1004" and issue.location == expected_location for issue in result.issues)

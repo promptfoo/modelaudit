@@ -1859,10 +1859,7 @@ def _has_strong_sentencepiece_model_proto_prefix(data: bytes, *, sample_is_prefi
                 return False
             offset = actual_value_end
         else:
-            next_offset = _skip_proto_value(data, value_offset, wire_type)
-            if next_offset is None:
-                return accept_incomplete_prefix()
-            offset = next_offset
+            return False
 
         fields_seen += 1
         strong_match = _has_strong_sentencepiece_model_proto_evidence(
@@ -2115,15 +2112,7 @@ def _classify_sentencepiece_model_proto_stream(
             stream.seek(actual_value_end)
             offset = actual_value_end
         else:
-            skip_status = _skip_proto_stream_value(
-                stream,
-                wire_type,
-                file_size,
-                field_number=field_number,
-            )
-            if skip_status is not True:
-                return reject_candidate()
-            offset = stream.tell()
+            return reject_candidate()
 
         fields_seen += 1
         strong_match = _has_strong_sentencepiece_model_proto_evidence(
