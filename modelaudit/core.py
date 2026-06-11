@@ -109,7 +109,11 @@ from modelaudit.utils.file.detection import (
     detect_pytorch_binary_supplemental_format,
     detect_xgboost_ubjson_content_route,
     gzip_tar_trailing_data_status,
+    huggingface_tokenizer_json_has_jax_route_evidence,
+    huggingface_tokenizer_json_has_template_route_evidence,
+    is_confirmed_jax_json_checkpoint_file,
     is_executorch_archive,
+    is_huggingface_tokenizer_json_file,
     is_keras_zip_archive,
     is_pytorch_zip_archive,
     is_sentencepiece_model_proto_file,
@@ -1442,6 +1446,33 @@ def _select_non_hdf5_preferred_scanner_id(
             or validate_file_type_with_formats(path, header_format, "nemo")
         ):
             return "nemo"
+
+    scanner_policy = policy_from_config(config) if config is not None else None
+    tokenizer_template_route = (
+        config is not None
+        and header_format in {"unknown", "pytorch_binary", "jax_checkpoint"}
+        and huggingface_tokenizer_json_has_template_route_evidence(path)
+    )
+    if tokenizer_template_route and scanner_policy is not None and scanner_policy.allows("jinja2_template"):
+        return "jinja2_template"
+
+    tokenizer_jax_route = (
+        config is not None
+        and ext == ".json"
+        and header_format == "unknown"
+        and huggingface_tokenizer_json_has_jax_route_evidence(path)
+    )
+    if (
+        config is not None
+        and ext == ".json"
+        and header_format == "unknown"
+        and scanner_policy is not None
+        and scanner_policy.allows("jax_checkpoint")
+        and not is_huggingface_tokenizer_json_file(path)
+        and (not tokenizer_template_route or not scanner_policy.allows("jinja2_template"))
+        and (is_confirmed_jax_json_checkpoint_file(path) or tokenizer_jax_route)
+    ):
+        return "jax_checkpoint"
 
     return _registry.get_scanner_id_for_header_format(header_format)
 

@@ -946,6 +946,31 @@ def test_get_scanner_for_path_routes_model_manifest_json_to_manifest_scanner(tmp
     _assert_scanner_for_path(manifest_path, "manifest")
 
 
+def test_manifest_metadata_does_not_claim_tokenizer_exact_filenames() -> None:
+    manifest_filenames = set(SCANNER_REGISTRY_METADATA["manifest"].get("content_routed_filenames", []))
+
+    assert "tokenizer.json" not in manifest_filenames
+    assert "tokenizer_config.json" not in manifest_filenames
+
+
+def test_get_scanner_for_path_does_not_route_hf_tokenizer_json_to_generic_json_scanners(tmp_path: Path) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(
+        json.dumps(
+            {
+                "version": "1.0",
+                "added_tokens": [],
+                "model": {"type": "BPE", "vocab": {"hello": 0}, "merges": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    scanner_class = ScannerRegistry().get_scanner_for_path(str(tokenizer_path))
+
+    assert scanner_class is None or scanner_class.name not in {"manifest", "jinja2_template", "mxnet", "xgboost"}
+
+
 def test_get_scanner_for_path_routes_declared_manifest_paths_to_manifest_scanner(tmp_path: Path) -> None:
     hyperparams_path = tmp_path / "hyperparams.yaml"
     hyperparams_path.write_text("model_type: bert\n", encoding="utf-8")
