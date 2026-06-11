@@ -1446,13 +1446,53 @@ class _ScanPathState:
         if scanner_policy.active:
             from modelaudit.scanners import get_scanner_for_file
 
-        def resolve_coverage_path(file_path: str | None) -> Path | None:
+        def resolve_coverage_path(file_path: str | None, *, base: Path | None = None) -> Path | None:
             if not isinstance(file_path, str):
                 return None
             try:
-                return Path(file_path).resolve()
+                path = Path(file_path)
+                if base is not None and not path.is_absolute():
+                    path = base / path
+                return path.resolve()
             except OSError:
                 return None
+
+        def resolved_path_applies_to_asset(resolved_path: Path, resolved_asset: Path) -> bool:
+            if resolved_path == resolved_asset:
+                return True
+            return resolved_path.is_dir() and resolved_asset.is_relative_to(resolved_path)
+
+        def coverage_location_candidates(location: str) -> list[Path]:
+            candidates: list[Path] = []
+            seen: set[Path] = set()
+
+            def add_candidate(path: Path | None) -> None:
+                if path is None or path in seen:
+                    return
+                seen.add(path)
+                candidates.append(path)
+
+            add_candidate(resolve_coverage_path(location))
+            if resolved_scan_path is not None and not Path(location).is_absolute():
+                base = resolved_scan_path if resolved_scan_path.is_dir() else resolved_scan_path.parent
+                add_candidate(resolve_coverage_path(location, base=base))
+            return candidates
+
+        def coverage_location_applies_to_asset(location: str, resolved_asset: Path) -> bool:
+            for resolved_location in coverage_location_candidates(location):
+                if resolved_path_applies_to_asset(resolved_location, resolved_asset):
+                    return True
+
+            for separator_index, char in reversed(list(enumerate(location))):
+                if char != ":":
+                    continue
+                archive_location = location[:separator_index]
+                if not archive_location:
+                    continue
+                for resolved_location in coverage_location_candidates(archive_location):
+                    if resolved_path_applies_to_asset(resolved_location, resolved_asset):
+                        return True
+            return False
 
         def record_covered_file(file_path: str) -> None:
             if scanner_policy.active and get_scanner_for_file(file_path, config=scanner_config) is None:
@@ -1475,6 +1515,38 @@ class _ScanPathState:
                 return any(shard_path.is_relative_to(resolved_candidate) for shard_path in shard_paths)
             return False
 
+        scan_records: tuple[Any, ...] = (*scan_result.checks, *scan_result.issues)
+        coverable_asset_count = sum(1 for asset in scan_result.assets if asset.path and asset.type != "error")
+        resolved_scan_path = resolve_coverage_path(scan_path)
+
+        def record_has_incomplete_coverage(record: Any) -> bool:
+            details = getattr(record, "details", None)
+            if not isinstance(details, dict):
+                return False
+            return details.get("operational_error") is True or metadata_has_incomplete_coverage(details)
+
+        def record_applies_to_asset(record: Any, resolved_asset: Path) -> bool:
+            location = getattr(record, "location", None)
+            if isinstance(location, str) and location:
+                if coverage_location_applies_to_asset(location, resolved_asset):
+                    return True
+                return coverable_asset_count == 1 and not coverage_location_candidates(location)
+
+            if resolved_scan_path is not None and resolved_scan_path == resolved_asset:
+                return True
+            if resolved_scan_path is not None and resolved_scan_path.is_dir():
+                return resolved_asset.is_relative_to(resolved_scan_path)
+            return coverable_asset_count == 1
+
+        def asset_has_incomplete_coverage_record(asset_path: str) -> bool:
+            resolved_asset = resolve_coverage_path(asset_path)
+            if resolved_asset is None:
+                return False
+            return any(
+                record_has_incomplete_coverage(record) and record_applies_to_asset(record, resolved_asset)
+                for record in scan_records
+            )
+
         def shard_family_has_incomplete_coverage(shard_paths: set[Path]) -> bool:
             for metadata_path, metadata in scan_result.file_metadata.items():
                 if not (metadata.get("operational_error") is True or metadata_has_incomplete_coverage(metadata)):
@@ -1487,13 +1559,8 @@ class _ScanPathState:
                 "Sharded Model Coverage Check",
                 "Sharded Model Membership Check",
             }
-            records: tuple[Any, ...] = (*scan_result.checks, *scan_result.issues)
-            for record in records:
-                details = getattr(record, "details", None)
-                details = details if isinstance(details, dict) else None
-                if details is None:
-                    continue
-                if not (details.get("operational_error") is True or metadata_has_incomplete_coverage(details)):
+            for record in scan_records:
+                if not record_has_incomplete_coverage(record):
                     continue
                 if path_matches_shard_family(getattr(record, "location", None), shard_paths):
                     return True
@@ -1509,6 +1576,8 @@ class _ScanPathState:
             if metadata is not None and (
                 metadata.get("operational_error") is True or metadata_has_incomplete_coverage(metadata)
             ):
+                continue
+            if asset_has_incomplete_coverage_record(asset.path):
                 continue
             record_covered_file(asset.path)
 

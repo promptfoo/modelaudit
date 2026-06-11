@@ -17,6 +17,7 @@ from typing import Any, ClassVar
 from ..core_results import (
     OPERATIONAL_ERROR_REASON_METADATA_KEY,
     mark_operational_scan_error,
+    metadata_has_incomplete_coverage,
     scan_result_has_operational_error,
 )
 from ..utils import is_absolute_archive_path, sanitize_archive_path
@@ -1158,6 +1159,8 @@ _NESTED_OPERATIONAL_CHECK_NAMES = {
     "xml_model_routing_incomplete": "XML Model Routing",
 }
 _NESTED_OPERATIONAL_REASON_FALLBACK = "nemo_referenced_nested_operational_error"
+_NESTED_COVERAGE_ONLY_INCOMPLETE_REASONS = frozenset({"recognized_format_scanner_unavailable"})
+_NESTED_COVERAGE_ONLY_INCOMPLETE_SUFFIXES = ("_routing_incomplete",)
 
 
 class _NemoConfigTraversalLimit(Exception):
@@ -1225,6 +1228,12 @@ def _is_dangerous_callable_target(callable_target: str) -> bool:
 
 def _scan_result_has_security_findings(result: ScanResult) -> bool:
     return any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+def _is_nested_coverage_only_incomplete_reason(reason: str) -> bool:
+    return reason in _NESTED_COVERAGE_ONLY_INCOMPLETE_REASONS or reason.endswith(
+        _NESTED_COVERAGE_ONLY_INCOMPLETE_SUFFIXES
+    )
 
 
 def _get_nested_scanner_for_file(path: str, *, config: dict[str, Any]) -> BaseScanner | None:
@@ -2981,12 +2990,32 @@ class NemoScanner(BaseScanner):
         archive_location = f"{archive_path}:{entry_name}"
         actionable_severities = {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         raw_operational_reason = nested_result.metadata.get(OPERATIONAL_ERROR_REASON_METADATA_KEY)
-        operational_reason = (
-            raw_operational_reason if isinstance(raw_operational_reason, str) else _NESTED_OPERATIONAL_REASON_FALLBACK
-        )
+        raw_incomplete_reason = nested_result.metadata.get("scan_outcome_reason")
+        raw_incomplete_reasons = nested_result.metadata.get("scan_outcome_reasons")
+        if isinstance(raw_operational_reason, str):
+            operational_reason = raw_operational_reason
+        elif isinstance(raw_incomplete_reason, str):
+            operational_reason = raw_incomplete_reason
+        elif (
+            isinstance(raw_incomplete_reasons, list)
+            and raw_incomplete_reasons
+            and isinstance(raw_incomplete_reasons[0], str)
+        ):
+            operational_reason = raw_incomplete_reasons[0]
+        else:
+            operational_reason = _NESTED_OPERATIONAL_REASON_FALLBACK
+        nested_incomplete = metadata_has_incomplete_coverage(nested_result.metadata)
         nested_operational = scan_result_has_operational_error(nested_result)
-        if nested_operational:
+        nested_has_actionable_finding = any(
+            check.status == CheckStatus.FAILED and check.severity in actionable_severities
+            for check in nested_result.checks
+        ) or any(issue.severity in actionable_severities for issue in nested_result.issues)
+        if nested_operational or (
+            nested_incomplete
+            and (nested_has_actionable_finding or _is_nested_coverage_only_incomplete_reason(operational_reason))
+        ):
             mark_archive_scan_incomplete(result, operational_reason)
+        if nested_operational:
             mark_operational_scan_error(result, operational_reason)
 
         for check in nested_result.checks:

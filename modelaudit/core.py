@@ -169,6 +169,7 @@ _add_scan_result_to_model = core_results.add_scan_result_to_model
 _consolidate_checks = core_results.consolidate_checks
 _mark_inconclusive_scan_outcome = core_results.mark_inconclusive_scan_outcome
 _mark_operational_scan_error = core_results.mark_operational_scan_error
+_metadata_has_coverage_only_operational_error = core_results.metadata_has_coverage_only_operational_error
 _metadata_has_incomplete_coverage = core_results.metadata_has_incomplete_coverage
 _results_have_operational_error = core_results.results_have_operational_error
 _results_should_be_unsuccessful = core_results.results_should_be_unsuccessful
@@ -182,6 +183,116 @@ merge_scan_result = core_results.merge_scan_result
 HEADER_FORMAT_TO_SCANNER_ID = _registry.get_header_format_to_scanner_ids()
 
 
+def _resolve_coverage_path(file_path: str | None, *, base: Path | None = None) -> Path | None:
+    if not isinstance(file_path, str):
+        return None
+    try:
+        path = Path(file_path)
+        if base is not None and not path.is_absolute():
+            path = base / path
+        return path.resolve()
+    except OSError:
+        return None
+
+
+def _resolved_coverage_path_applies_to_asset(resolved_path: Path, resolved_asset: Path) -> bool:
+    if resolved_path == resolved_asset:
+        return True
+    return resolved_path.is_dir() and resolved_asset.is_relative_to(resolved_path)
+
+
+def _coverage_location_candidates(location: str, *, scan_root: Path | None) -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    def add_candidate(path: Path | None) -> None:
+        if path is None or path in seen:
+            return
+        seen.add(path)
+        candidates.append(path)
+
+    add_candidate(_resolve_coverage_path(location))
+    if scan_root is not None and not Path(location).is_absolute():
+        base = scan_root if scan_root.is_dir() else scan_root.parent
+        add_candidate(_resolve_coverage_path(location, base=base))
+    return candidates
+
+
+def _coverage_location_applies_to_asset(location: str, resolved_asset: Path, *, scan_root: Path | None) -> bool:
+    for resolved_location in _coverage_location_candidates(location, scan_root=scan_root):
+        if _resolved_coverage_path_applies_to_asset(resolved_location, resolved_asset):
+            return True
+
+    for separator_index, char in reversed(list(enumerate(location))):
+        if char != ":":
+            continue
+        archive_location = location[:separator_index]
+        if not archive_location:
+            continue
+        for resolved_location in _coverage_location_candidates(archive_location, scan_root=scan_root):
+            if _resolved_coverage_path_applies_to_asset(resolved_location, resolved_asset):
+                return True
+    return False
+
+
+def _scan_record_has_operational_or_incomplete_details(record: Any) -> bool:
+    details = getattr(record, "details", None)
+    if not isinstance(details, dict):
+        return False
+    return details.get("operational_error") is True or _metadata_has_incomplete_coverage(details)
+
+
+def _scan_record_applies_to_asset(
+    record: Any,
+    resolved_asset: Path,
+    *,
+    scan_root: Path | None,
+    coverable_asset_count: int,
+) -> bool:
+    location = getattr(record, "location", None)
+    if isinstance(location, str) and location:
+        if _coverage_location_applies_to_asset(location, resolved_asset, scan_root=scan_root):
+            return True
+        return coverable_asset_count == 1 and not _coverage_location_candidates(location, scan_root=scan_root)
+
+    if scan_root is not None:
+        if scan_root == resolved_asset:
+            return True
+        if scan_root.is_dir() and resolved_asset.is_relative_to(scan_root):
+            return True
+    return coverable_asset_count == 1
+
+
+def _result_asset_has_operational_or_incomplete_record(
+    scan_result: ModelAuditResultModel,
+    asset_path: str | None,
+    *,
+    scan_root: Path | None,
+) -> bool:
+    resolved_asset = _resolve_coverage_path(asset_path)
+    if resolved_asset is None:
+        return False
+
+    coverable_asset_count = sum(1 for asset in scan_result.assets if asset.path and asset.type != "error")
+    return any(
+        _scan_record_has_operational_or_incomplete_details(record)
+        and _scan_record_applies_to_asset(
+            record,
+            resolved_asset,
+            scan_root=scan_root,
+            coverable_asset_count=coverable_asset_count,
+        )
+        for record in (*scan_result.checks, *scan_result.issues)
+    )
+
+
+def _scan_result_has_operational_or_incomplete_record(scan_result: ScanResult) -> bool:
+    return any(
+        _scan_record_has_operational_or_incomplete_details(record)
+        for record in (*scan_result.checks, *scan_result.issues)
+    )
+
+
 def _record_dvc_output_limit_incomplete(
     results: ModelAuditResultModel,
     scan_metadata: dict[str, Any],
@@ -193,7 +304,6 @@ def _record_dvc_output_limit_incomplete(
         return
 
     scan_metadata["success"] = False
-    scan_metadata["has_operational_errors"] = True
     _add_issue_to_model(
         results,
         "DVC output limit exceeded - not all declared outputs were scanned",
@@ -842,12 +952,20 @@ def _update_missing_shard_coverage_record(record: Check | Issue, reason: str, me
 
 def _results_have_explicit_operational_error(results: ModelAuditResultModel) -> bool:
     """Return whether retained result evidence identifies an operational failure."""
-    if any(bool(metadata.get("operational_error")) for metadata in results.file_metadata.values()):
+    if any(
+        bool(metadata.get("operational_error")) and not _metadata_has_coverage_only_operational_error(metadata)
+        for metadata in results.file_metadata.values()
+    ):
         return True
     if any(asset.type == "error" for asset in results.assets):
         return True
     records: list[Check | Issue] = [*results.checks, *results.issues]
-    return any(isinstance(record.details, dict) and bool(record.details.get("operational_error")) for record in records)
+    return any(
+        isinstance(record.details, dict)
+        and bool(record.details.get("operational_error"))
+        and not _metadata_has_coverage_only_operational_error(record.details)
+        for record in records
+    )
 
 
 def _results_have_retained_incomplete_outcome(results: ModelAuditResultModel) -> bool:
@@ -2865,6 +2983,7 @@ def scan_model_directory_or_file(
                     except Exception as e:
                         logger.warning(f"Error scanning file {representative_file}: {e!s}")
                         scan_metadata["success"] = False
+                        scan_metadata["has_operational_errors"] = True
 
                         _add_issue_to_model(
                             results,
@@ -2880,12 +2999,19 @@ def scan_model_directory_or_file(
             if pending_dvc_output_limit_checks:
                 from modelaudit.scanners import get_scanner_for_file
 
+                resolved_directory_scan_root = _resolve_coverage_path(path)
                 for asset in results.assets:
                     if asset.type == "error" or not os.path.isfile(asset.path):
                         continue
                     metadata = results.file_metadata.get(asset.path)
                     if metadata is not None and (
                         metadata.get("operational_error") is True or _metadata_has_incomplete_coverage(metadata)
+                    ):
+                        continue
+                    if _result_asset_has_operational_or_incomplete_record(
+                        results,
+                        asset.path,
+                        scan_root=resolved_directory_scan_root,
                     ):
                         continue
                     if scanner_selection.active and get_scanner_for_file(asset.path, config=config) is None:
@@ -3031,6 +3157,11 @@ def scan_model_directory_or_file(
                                 metadata.get("operational_error") is True or _metadata_has_incomplete_coverage(metadata)
                             )
                         )
+                        and not _result_asset_has_operational_or_incomplete_record(
+                            nested_result,
+                            asset.path,
+                            scan_root=_resolve_coverage_path(target),
+                        )
                     }
                     scanned_dvc_paths.update(nested_scanned_paths)
                     internally_scanned_dvc_paths.update(nested_scanned_paths)
@@ -3156,6 +3287,7 @@ def scan_model_directory_or_file(
                     is_dvc_pointer
                     and not _scan_result_has_operational_error(file_result)
                     and not _metadata_has_incomplete_coverage(file_result.metadata or {})
+                    and not _scan_result_has_operational_or_incomplete_record(file_result)
                 ):
                     scanned_dvc_paths.add(resolved_target)
                     internally_scanned_dvc_paths.add(resolved_target)
@@ -3258,6 +3390,7 @@ def scan_model_directory_or_file(
     except KeyboardInterrupt:
         logger.debug("Scan interrupted by user")
         scan_metadata["success"] = False
+        scan_metadata["has_operational_errors"] = True
         _add_issue_to_model(
             results, "Scan interrupted by user", severity=IssueSeverity.INFO.value, details={"interrupted": True}
         )
@@ -3269,6 +3402,7 @@ def scan_model_directory_or_file(
         else:
             logger.exception(f"Error during scan: {report_error}")
         scan_metadata["success"] = False
+        scan_metadata["has_operational_errors"] = True
         _add_issue_to_model(
             results,
             f"Error during scan: {report_error}",
@@ -3307,7 +3441,7 @@ def scan_model_directory_or_file(
         logger.warning(f"Error checking license warnings: {e!s}")
 
     # Determine if there were operational scan errors vs security findings.
-    results.has_errors = bool(scan_metadata.get("has_operational_errors", False) or not scan_metadata["success"])
+    results.has_errors = bool(scan_metadata.get("has_operational_errors", False))
 
     # Set success flag for backward compatibility
     results.success = not _results_should_be_unsuccessful(results)

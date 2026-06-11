@@ -98,7 +98,7 @@ def test_pinned_huggingface_inconclusive_files_fail_coverage_success(
         catch_exceptions=False,
     )
 
-    assert result.exit_code == 1, result.output
+    assert result.exit_code == 2, result.output
     payload = parse_click_json_output(result.output)
     assert payload["success"] is False
     assert payload["has_errors"] is False
@@ -109,7 +109,7 @@ def test_pinned_huggingface_inconclusive_files_fail_coverage_success(
     qwen_metadata = file_metadata[str(tmp_path / "merges.txt")]
     assert vibevoice_metadata["scan_outcome"] == "inconclusive"
     assert vibevoice_metadata["analysis_incomplete"] is True
-    assert "pickle_analysis_incomplete" in vibevoice_metadata["scan_outcome_reasons"]
+    assert "pickle_routing_incomplete" in vibevoice_metadata["scan_outcome_reasons"]
     assert qwen_metadata["scan_outcome"] == "inconclusive"
     assert qwen_metadata["analysis_incomplete"] is True
     assert "flax_msgpack_routing_incomplete" in qwen_metadata["scan_outcome_reasons"]

@@ -512,6 +512,42 @@ def test_scan_result_operational_flag_keeps_exit_code_2(tmp_path: Path) -> None:
     assert determine_exit_code(results) == 2
 
 
+def test_scan_result_operational_flag_with_security_and_incomplete_keeps_exit_code_2(tmp_path: Path) -> None:
+    """Explicit operational failures outrank security findings even with incomplete metadata."""
+    test_file = tmp_path / "timeout-danger.pkl"
+    test_file.write_bytes(b"payload")
+
+    scan_result = ScanResult(scanner_name="pickle")
+    scan_result.add_issue(
+        "Dangerous pickle global: os.system",
+        severity=IssueSeverity.WARNING,
+        location=str(test_file),
+    )
+    scan_result.add_check(
+        name="Scan Timeout Check",
+        passed=False,
+        message="Scan timeout: simulated timeout",
+        severity=IssueSeverity.INFO,
+        location=str(test_file),
+        details={"timeout": 1},
+    )
+    scan_result.metadata["operational_error"] = True
+    scan_result.metadata["operational_error_reason"] = "scan_timeout"
+    scan_result.metadata["analysis_incomplete"] = True
+    scan_result.metadata["scan_outcome"] = "inconclusive"
+    scan_result.metadata["scan_outcome_reasons"] = ["opcode_budget_exceeded"]
+    scan_result.finish(success=False)
+
+    with patch("modelaudit.core.scan_file", return_value=scan_result):
+        results = scan_model_directory_or_file(str(test_file))
+
+    assert results.has_errors is True
+    assert results.success is False
+    assert results.file_metadata[str(test_file)]["analysis_incomplete"] is True
+    assert any(issue.severity == IssueSeverity.WARNING for issue in results.issues)
+    assert determine_exit_code(results) == 2
+
+
 def test_scan_result_info_only_failed_scan_without_outcome_fails_closed(tmp_path: Path) -> None:
     """Bare success=False results should become inconclusive instead of exiting clean."""
     test_file = tmp_path / "trailing.npy"
