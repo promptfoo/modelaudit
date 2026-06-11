@@ -2399,6 +2399,31 @@ def test_onnx_scanner_repeated_custom_domain_nodes_emit_one_domain_check(tmp_pat
     assert len([issue for issue in result.issues if issue.rule_code == "S1111"]) == 1
 
 
+def test_onnx_scanner_custom_domain_aggregate_reports_distinct_operator_identities(tmp_path: Path) -> None:
+    custom_nodes = [
+        ("com.vendor", "KernelA", "fast", "kernel_a_fast"),
+        ("com.vendor", "KernelA", "safe", "kernel_a_safe"),
+        ("com.vendor", "KernelB", "fast", "kernel_b_fast"),
+    ]
+    model_path = create_onnx_model_with_explicit_custom_operator_identities(tmp_path, custom_nodes)
+
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+
+    assert len(custom_domain_checks) == 1
+    details = custom_domain_checks[0].details
+    assert details["domain"] == "com.vendor"
+    assert details["occurrence_count"] == len(custom_nodes)
+    assert details["distinct_operator_identity_count"] == len(custom_nodes)
+    assert details["operator_identities"] == [
+        {"domain": "com.vendor", "op_type": "KernelA", "overload": "fast"},
+        {"domain": "com.vendor", "op_type": "KernelA", "overload": "safe"},
+        {"domain": "com.vendor", "op_type": "KernelB", "overload": "fast"},
+    ]
+    assert details["operator_identities_truncated"] is False
+    assert details["check_consolidation_key"] == "onnx_custom_operator_domain:com.vendor"
+    assert metadata_custom_domains == ["com.vendor"]
+
+
 def test_onnx_scanner_repeated_custom_domains_emit_one_check_per_domain(tmp_path: Path) -> None:
     custom_nodes = [
         ("com.microsoft", "Attention", "attention_0"),
@@ -2417,6 +2442,42 @@ def test_onnx_scanner_repeated_custom_domains_emit_one_check_per_domain(tmp_path
     assert checks_by_domain["com.attacker"].details["occurrence_count"] == 2
     assert checks_by_domain["ai.onnx.ml.malicious"].details["occurrence_count"] == 1
     assert metadata_custom_domains == ["ai.onnx.ml.malicious", "com.attacker", "com.microsoft"]
+
+
+def test_onnx_scanner_custom_domains_survive_core_check_consolidation(tmp_path: Path) -> None:
+    custom_nodes = [
+        ("com.microsoft", "Attention", "attention_0"),
+        ("com.attacker", "BackdoorOp", "backdoor_0"),
+        ("ai.onnx.ml.malicious", "BackdoorOp", "lookalike"),
+    ]
+    model_path = create_onnx_model_with_custom_nodes(tmp_path, custom_nodes)
+
+    result = scan_model_directory_or_file(
+        str(model_path),
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    custom_checks = [
+        check
+        for check in result.checks
+        if check.name == "Custom Operator Domain Check" and check.status == CheckStatus.FAILED
+    ]
+    checks_by_domain = {check.details["domain"]: check for check in custom_checks}
+
+    assert sorted(checks_by_domain) == ["ai.onnx.ml.malicious", "com.attacker", "com.microsoft"]
+    assert {check.details["check_consolidation_key"] for check in custom_checks} == {
+        "onnx_custom_operator_domain:ai.onnx.ml.malicious",
+        "onnx_custom_operator_domain:com.attacker",
+        "onnx_custom_operator_domain:com.microsoft",
+    }
+    assert {
+        issue.details["domain"]
+        for issue in result.issues
+        if issue.rule_code == "S1111" and issue.details.get("type") != "python_operator"
+    } == set(checks_by_domain)
 
 
 def test_onnx_scanner_repeated_custom_domain_without_opset_import_still_flagged(tmp_path: Path) -> None:

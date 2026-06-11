@@ -426,13 +426,18 @@ def _custom_operator_identity_display(value: str) -> str:
 class _CustomOperatorAggregate:
     occurrence_count: int = 0
     operator_samples: list[str] = field(default_factory=list)
+    operator_identities: list[dict[str, str]] = field(default_factory=list)
     representative_nodes: list[dict[str, str]] = field(default_factory=list)
     operator_samples_truncated: bool = False
+    operator_identities_truncated: bool = False
     _operator_sample_seen: set[str] = field(default_factory=set)
+    _operator_identity_seen: set[tuple[str, str, str]] = field(default_factory=set)
 
     def add_node(self, node: Any) -> None:
         self.occurrence_count += 1
         op_type = _bounded_custom_operator_value(getattr(node, "op_type", ""))
+        domain = _bounded_custom_operator_value(getattr(node, "domain", ""))
+        overload = _bounded_custom_operator_value(getattr(node, "overload", ""))
         if op_type not in self._operator_sample_seen:
             if len(self.operator_samples) < _ONNX_CUSTOM_OPERATOR_SAMPLE_LIMIT:
                 self.operator_samples.append(op_type)
@@ -440,31 +445,50 @@ class _CustomOperatorAggregate:
             else:
                 self.operator_samples_truncated = True
 
+        operator_identity = (domain, op_type, overload)
+        if operator_identity not in self._operator_identity_seen:
+            if len(self.operator_identities) < _ONNX_CUSTOM_OPERATOR_SAMPLE_LIMIT:
+                self._operator_identity_seen.add(operator_identity)
+                self.operator_identities.append(
+                    {
+                        "domain": domain,
+                        "op_type": op_type,
+                        "overload": overload,
+                    }
+                )
+            else:
+                self.operator_identities_truncated = True
+
         if len(self.representative_nodes) >= _ONNX_CUSTOM_OPERATOR_REPRESENTATIVE_LIMIT:
             return
 
         node_summary = {
             "op_type": op_type,
-            "domain": _bounded_custom_operator_value(getattr(node, "domain", "")),
+            "domain": domain,
         }
         node_name = _bounded_custom_operator_value(getattr(node, "name", ""))
         if node_name:
             node_summary["name"] = node_name
-        overload = _bounded_custom_operator_value(getattr(node, "overload", ""))
         if overload:
             node_summary["overload"] = overload
         self.representative_nodes.append(node_summary)
 
-    def details(self, *, domain: str, security_note: str) -> dict[str, Any]:
+    def details(self, *, domain: str, security_note: str, check_consolidation_key: str | None = None) -> dict[str, Any]:
         details: dict[str, Any] = {
             "domain": domain,
             "occurrence_count": self.occurrence_count,
             "operator_samples": self.operator_samples,
             "operator_samples_truncated": self.operator_samples_truncated,
+            "operator_identities": self.operator_identities,
+            "operator_identities_truncated": self.operator_identities_truncated,
+            "distinct_operator_identity_count": len(self._operator_identity_seen),
+            "distinct_operator_identity_count_truncated": self.operator_identities_truncated,
             "representative_nodes": self.representative_nodes,
             "representative_nodes_truncated": self.occurrence_count > len(self.representative_nodes),
             "security_note": security_note,
         }
+        if check_consolidation_key:
+            details["check_consolidation_key"] = check_consolidation_key
         if self.operator_samples:
             details["op_type"] = self.operator_samples[0]
         return details
@@ -2917,6 +2941,7 @@ class OnnxScanner(BaseScanner):
         # Security risk is in runtime environment (installing malicious operators)
         # not in the ONNX file itself. Emit one bounded aggregate per domain/file.
         for domain, finding in sorted(custom_domain_findings.items()):
+            check_consolidation_key = f"onnx_custom_operator_domain:{_bounded_custom_operator_value(domain)}"
             result.add_check(
                 name="Custom Operator Domain Check",
                 passed=False,
@@ -2928,14 +2953,25 @@ class OnnxScanner(BaseScanner):
                 severity=IssueSeverity.INFO,
                 location=path,
                 rule_code="S1111",
-                details=finding.details(domain=domain, security_note=custom_operator_security_note),
+                details=finding.details(
+                    domain=domain,
+                    security_note=custom_operator_security_note,
+                    check_consolidation_key=check_consolidation_key,
+                ),
             )
 
         for (domain, op_type, overload), finding in sorted(explicit_custom_operator_findings.items()):
             domain_display = _custom_operator_identity_display(domain)
             op_type_display = _bounded_custom_operator_value(op_type)
             overload_display = _custom_operator_identity_display(overload)
-            details = finding.details(domain=domain, security_note=custom_operator_security_note)
+            check_consolidation_key = (
+                f"onnx_custom_operator_identity:{domain_display}:{op_type_display}:{overload_display}"
+            )
+            details = finding.details(
+                domain=domain,
+                security_note=custom_operator_security_note,
+                check_consolidation_key=check_consolidation_key,
+            )
             details.update(
                 {
                     "op_type": op_type,
