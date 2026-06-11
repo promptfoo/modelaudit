@@ -3589,6 +3589,41 @@ class TestCVE202523304HydraTarget:
         assert reason in result.metadata["scan_outcome_reasons"]
         assert "operational_error" not in result.metadata
 
+    @pytest.mark.parametrize("reason", ["compressed_decompression_limit_exceeded", "joblib_read_failed"])
+    def test_nested_fail_closed_incomplete_outcome_without_findings_is_propagated(
+        self,
+        tmp_path: Path,
+        reason: str,
+    ) -> None:
+        extracted_path = str(tmp_path / "nested-payload.tar.gz")
+        result = ScanResult(scanner_name="nemo")
+        nested_result = ScanResult(scanner_name="joblib" if reason == "joblib_read_failed" else "compressed")
+        nested_result.metadata["analysis_incomplete"] = True
+        nested_result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        nested_result.metadata["scan_outcome_reasons"] = [reason]
+        nested_result.add_check(
+            name="Nested Scanner Analysis",
+            passed=False,
+            message="Nested scanner analysis was incomplete",
+            severity=IssueSeverity.INFO,
+            location=extracted_path,
+            details={"scan_outcome_reason": reason},
+        )
+
+        NemoScanner._merge_nested_security_findings(
+            result,
+            nested_result,
+            extracted_path,
+            str(tmp_path / "outer.nemo"),
+            "assets/payload.tar.gz",
+        )
+
+        assert result.checks == []
+        assert result.issues == []
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert reason in result.metadata["scan_outcome_reasons"]
+        assert "operational_error" not in result.metadata
+
     def test_nested_structural_reject_without_findings_is_not_propagated(self, tmp_path: Path) -> None:
         extracted_path = str(tmp_path / "tokenizer.model")
         result = ScanResult(scanner_name="nemo")

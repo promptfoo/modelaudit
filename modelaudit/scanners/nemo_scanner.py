@@ -1161,6 +1161,7 @@ _NESTED_OPERATIONAL_CHECK_NAMES = {
 _NESTED_OPERATIONAL_REASON_FALLBACK = "nemo_referenced_nested_operational_error"
 _NESTED_COVERAGE_ONLY_INCOMPLETE_REASONS = frozenset({"recognized_format_scanner_unavailable"})
 _NESTED_COVERAGE_ONLY_INCOMPLETE_SUFFIXES = ("_routing_incomplete",)
+_NESTED_NON_PROPAGATING_INCOMPLETE_REASONS = frozenset({"xgboost_binary_structure_too_small"})
 
 
 class _NemoConfigTraversalLimit(Exception):
@@ -1234,6 +1235,10 @@ def _is_nested_coverage_only_incomplete_reason(reason: str) -> bool:
     return reason in _NESTED_COVERAGE_ONLY_INCOMPLETE_REASONS or reason.endswith(
         _NESTED_COVERAGE_ONLY_INCOMPLETE_SUFFIXES
     )
+
+
+def _is_nested_non_propagating_incomplete_reason(reason: str) -> bool:
+    return reason in _NESTED_NON_PROPAGATING_INCOMPLETE_REASONS
 
 
 def _get_nested_scanner_for_file(path: str, *, config: dict[str, Any]) -> BaseScanner | None:
@@ -3010,10 +3015,12 @@ class NemoScanner(BaseScanner):
             check.status == CheckStatus.FAILED and check.severity in actionable_severities
             for check in nested_result.checks
         ) or any(issue.severity in actionable_severities for issue in nested_result.issues)
-        if nested_operational or (
-            nested_incomplete
-            and (nested_has_actionable_finding or _is_nested_coverage_only_incomplete_reason(operational_reason))
-        ):
+        nested_incomplete_should_propagate = nested_incomplete and (
+            nested_has_actionable_finding
+            or _is_nested_coverage_only_incomplete_reason(operational_reason)
+            or not _is_nested_non_propagating_incomplete_reason(operational_reason)
+        )
+        if nested_operational or nested_incomplete_should_propagate:
             mark_archive_scan_incomplete(result, operational_reason)
         if nested_operational:
             mark_operational_scan_error(result, operational_reason)
