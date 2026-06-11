@@ -6,6 +6,7 @@ import subprocess
 import sys
 import textwrap
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -1168,6 +1169,110 @@ def test_large_dense_hdf5_name_attribute_uses_isolated_worker(tmp_path: Path, mo
         check.name == "HDF5 External Reference Analysis Limit" and check.details["weight_roots_truncated"] is True
         for check in result.checks
     )
+
+
+def test_large_variable_string_model_config_uses_json_budget(tmp_path: Path) -> None:
+    model_path = tmp_path / "large_variable_model_config.h5"
+    model_config = {
+        "class_name": "Sequential",
+        "config": {
+            "name": "A" * 5000,
+            "layers": [
+                {
+                    "class_name": "Lambda",
+                    "config": {"function": "lambda x: __import__('os').system('id')"},
+                }
+            ],
+        },
+    }
+    with h5py.File(model_path, "w") as f:
+        f.attrs.create(
+            "model_config",
+            json.dumps(model_config),
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+        f.require_group("model_weights")
+    inflate_h5_file_to_size(model_path)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert_not_rejected_by_read_cap(result)
+    assert "keras_h5_model_config_parse_failed" not in result.metadata.get("scan_outcome_reasons", [])
+    assert "keras_h5_model_config_size_limit_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+    assert any(
+        check.name == "Lambda Layer Code Analysis" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(
+        issue.message == "Lambda layer contains dangerous Python code" and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
+
+
+def test_variable_string_vector_custom_objects_does_not_skip_training_config(tmp_path: Path) -> None:
+    model_path = tmp_path / "vector_custom_objects.h5"
+    model_config = {
+        "class_name": "Sequential",
+        "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+    }
+    training_config = {
+        "loss": {"output_1": "malicious_loss"},
+        "metrics": [["accuracy"]],
+    }
+    with h5py.File(model_path, "w") as f:
+        f.attrs["model_config"] = json.dumps(model_config)
+        f.attrs.create(
+            "custom_objects",
+            ["custom_loss", "custom_metric"],
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+        f.attrs["training_config"] = json.dumps(training_config)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert "keras_h5_scan_failed" not in result.metadata.get("scan_outcome_reasons", [])
+    assert any(
+        check.name == "Custom Objects Security Check"
+        and check.details["custom_objects"] == ["custom_loss", "custom_metric"]
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Custom Loss Detection" and check.details.get("identifier") == "malicious_loss"
+        for check in result.checks
+    )
+
+
+def test_large_legacy_weight_name_attributes_are_batched_in_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layer_count = 64
+    model_path = tmp_path / "many_legacy_layers.weights.h5"
+    with h5py.File(model_path, "w") as f:
+        layer_names = [f"layer_{index}".encode() for index in range(layer_count)]
+        f.attrs["layer_names"] = layer_names
+        for index in range(layer_count):
+            layer = f.create_group(f"layer_{index}")
+            layer.attrs["weight_names"] = [b"kernel:0"]
+            layer.create_dataset("kernel:0", data=[float(index)])
+    inflate_h5_file_to_size(model_path)
+
+    worker_batch_sizes: list[int] = []
+    original_batch_reader: Callable[[list[dict[str, Any]]], list[dict[str, Any]]] = (
+        KerasH5Scanner._read_hdf5_attributes_in_worker
+    )
+
+    def counting_batch_reader(cls: type[KerasH5Scanner], requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        worker_batch_sizes.append(len(requests))
+        return original_batch_reader(requests)
+
+    monkeypatch.setattr(KerasH5Scanner, "_read_hdf5_attributes_in_worker", classmethod(counting_batch_reader))
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert result.success is True
+    assert_not_rejected_by_read_cap(result)
+    assert max(worker_batch_sizes) >= layer_count
+    assert len(worker_batch_sizes) <= 12
 
 
 def _sha256_file(path: Path) -> str:
