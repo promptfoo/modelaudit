@@ -2,9 +2,10 @@ from pathlib import Path
 
 import pytest
 
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.openvino_scanner import OpenVinoScanner
+from tests.helpers import create_malicious_pickle
 
 
 def create_basic_model(dir_path: Path) -> Path:
@@ -43,6 +44,79 @@ def test_openvino_scanner_basic_model_has_zero_cli_exit(tmp_path: Path) -> None:
     assert not any(
         check.name == "Format Validation" and check.severity == IssueSeverity.WARNING for check in cli_result.checks
     )
+
+
+def test_openvino_scanner_matches_casefolded_unicode_weights_companion(tmp_path: Path) -> None:
+    """Case and Unicode normalization variants should still resolve the adjacent weights."""
+    xml_path = tmp_path / "Cafe\u0301-Model.XML"
+    bin_path = tmp_path / "CAF\u00c9-model.BIN"
+    xml_path.write_text("<net version='10'></net>", encoding="utf-8")
+    bin_path.write_bytes(b"weights")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    assert OpenVinoScanner.can_handle(str(xml_path)) is True
+    assert result.success is True
+    assert result.metadata["bin_size"] == bin_path.stat().st_size
+    assert not any("weights file not found" in check.message.lower() for check in result.checks)
+
+
+def test_openvino_scanner_casefolded_companion_cache_rescans_changed_weights(tmp_path: Path) -> None:
+    """Cache bypass must follow the actual normalized/casefolded OpenVINO companion."""
+    xml_path = tmp_path / "Cafe\u0301-Model.XML"
+    bin_path = tmp_path / "CAF\u00c9-model.BIN"
+    xml_path.write_text("<net version='10'></net>", encoding="utf-8")
+    bin_path.write_bytes(b"\x00" * 7)
+    cache_config = {
+        "cache_enabled": True,
+        "cache_dir": str(tmp_path / "cache"),
+        "min_cache_file_size": 0,
+    }
+
+    first_result = scan_file(str(xml_path), config=cache_config)
+    bin_path.write_bytes(b"\x01" * 33)
+    second_result = scan_file(str(xml_path), config=cache_config)
+
+    assert first_result.metadata["bin_size"] == 7
+    assert second_result.metadata["bin_size"] == 33
+
+
+def test_openvino_scanner_detects_pickle_payload_in_weights_companion(tmp_path: Path) -> None:
+    """A valid OpenVINO XML must not hide pickle-formatted same-stem weights."""
+    xml_path = create_basic_model(tmp_path)
+    bin_path = create_malicious_pickle(tmp_path / "model.bin")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    assert result.success is False
+    assert result.metadata["openvino_weights_pickle_payload_scanned"] is True
+    assert "pickle" in result.metadata["scanner_dependency_ids"]
+    assert any(
+        issue.location == str(bin_path)
+        and issue.severity == IssueSeverity.CRITICAL
+        and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
+        for issue in result.issues
+    )
+
+
+def test_openvino_scanner_honors_pickle_exclusion_for_weights_companion(tmp_path: Path) -> None:
+    """Embedded pickle scanning for OpenVINO weights must obey scanner selection."""
+    xml_path = create_basic_model(tmp_path)
+    bin_path = create_malicious_pickle(tmp_path / "model.bin")
+
+    result = OpenVinoScanner({"exclude_scanners": ["pickle"]}).scan(str(xml_path))
+
+    assert result.success is True
+    assert result.metadata["openvino_weights_pickle_payload_skipped"] is True
+    assert result.metadata["skipped_scanner_ids"] == ["pickle"]
+    assert any(
+        check.name == "Scanner Selection"
+        and check.location == str(bin_path)
+        and check.details.get("skipped_scanner_id") == "pickle"
+        and check.details.get("context") == "OpenVINO weights sidecar"
+        for check in result.checks
+    )
+    assert not any(issue.location == str(bin_path) for issue in result.issues)
 
 
 def test_openvino_scanner_can_handle_long_xml_prolog(tmp_path: Path) -> None:
@@ -343,6 +417,53 @@ def test_openvino_scanner_respects_configured_file_size_limit(tmp_path: Path) ->
 
     assert result.success is False
     assert any(check.name == "File Size Limit" for check in result.checks)
+
+
+def test_openvino_scanner_oversize_weights_fail_closed(tmp_path: Path) -> None:
+    """Direct XML scans must fail closed when bounded OpenVINO weights are skipped."""
+    xml_path = create_basic_model(tmp_path)
+    bin_path = tmp_path / "model.bin"
+    max_file_size = xml_path.stat().st_size + 1
+    bin_path.write_bytes(b"\x00" * (max_file_size + 1))
+
+    direct_result = scan_file(
+        str(xml_path),
+        config={"max_file_size": max_file_size, "cache_enabled": False},
+    )
+    cli_result = scan_model_directory_or_file(
+        str(xml_path),
+        max_file_size=max_file_size,
+        cache_enabled=False,
+    )
+
+    assert direct_result.success is False
+    assert direct_result.metadata["operational_error"] is True
+    assert direct_result.metadata["operational_error_reason"] == "openvino_weights_file_size_exceeded"
+    assert any(
+        check.name == "OpenVINO Weights File Size Limit"
+        and check.details.get("scan_outcome_reason") == "openvino_weights_file_size_exceeded"
+        for check in direct_result.checks
+    )
+    assert cli_result.has_errors is True
+    assert determine_exit_code(cli_result) == 2
+
+
+def test_openvino_scanner_sidecar_cache_rescans_changed_weights(tmp_path: Path) -> None:
+    """OpenVINO XML cache entries must not hide changed same-stem weights metadata."""
+    xml_path = create_basic_model(tmp_path)
+    bin_path = tmp_path / "model.bin"
+    cache_config = {
+        "cache_enabled": True,
+        "cache_dir": str(tmp_path / "cache"),
+        "min_cache_file_size": 0,
+    }
+
+    first_result = scan_file(str(xml_path), config=cache_config)
+    bin_path.write_bytes(b"\x01" * 32)
+    second_result = scan_file(str(xml_path), config=cache_config)
+
+    assert first_result.metadata["bin_size"] == 10
+    assert second_result.metadata["bin_size"] == 32
 
 
 def test_openvino_scanner_detects_nested_external_library_references(tmp_path: Path) -> None:
