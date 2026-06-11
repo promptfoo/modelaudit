@@ -3509,6 +3509,44 @@ def test_scan_huggingface_preview_reports_gated_and_unknown_access(tmp_path: Pat
     assert "Access: 1 selected file size(s) unavailable" in output
 
 
+def test_scan_huggingface_preview_reports_unknown_size_gated_access(tmp_path: Path) -> None:
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "config.json").write_text("{}")
+
+    with (
+        patch("modelaudit.cli.is_huggingface_url", return_value=True),
+        patch(
+            "modelaudit.utils.sources.huggingface.get_model_info",
+            return_value={
+                "model_id": "org/unknown-size-gated-model",
+                "total_size": 0,
+                "file_count": 1,
+                "inventory_status": "gated_inaccessible",
+                "inaccessible_gated_bytes": 0,
+                "inaccessible_gated_file_count": 1,
+                "unknown_size_count": 1,
+            },
+        ),
+        patch("modelaudit.cli.download_model", return_value=downloaded_dir),
+        patch(
+            "modelaudit.cli.scan_model_directory_or_file",
+            return_value=create_mock_scan_result(files_scanned=1, issues=[]),
+        ),
+        patch("shutil.rmtree"),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--no-cache", "--format", "text", "hf://org/unknown-size-gated-model"],
+        )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, output
+    assert "Size: Unknown size (1 files)" in output
+    assert "Access: 1 selected file(s) are gated/inaccessible" in output
+    assert "Access: 1 selected file size(s) unavailable" in output
+
+
 def test_scan_huggingface_metadata_preflight_verbose_log_is_sanitized(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
