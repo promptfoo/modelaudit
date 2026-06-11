@@ -482,6 +482,49 @@ class TestJinja2TemplateScannerExecutableSpans:
 
         assert [span.text for span in spans] == ["{{ requests.get('https://example.test/live')"]
 
+    @pytest.mark.parametrize(
+        "template_content",
+        [
+            pytest.param(
+                "{# \" requests.get('https://example.test/comment') #}\n"
+                "{{ requests.get('https://example.test/live') }}",
+                id="comment-unmatched-quote",
+            ),
+            pytest.param(
+                "{% raw %}"
+                "{% set ignored = \"requests.get('https://example.test/raw') %}"
+                "{{ requests.get('https://example.test/raw-expression') }}"
+                "{% endraw %}\n"
+                "{{ requests.get('https://example.test/live') }}",
+                id="raw-unmatched-quote",
+            ),
+        ],
+    )
+    def test_delimiter_fallback_malformed_ignored_regions_do_not_hide_later_requests(
+        self,
+        template_content: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(jinja2_template_scanner, "HAS_JINJA2_SANDBOX", False)
+
+        spans = Jinja2TemplateScanner._executable_template_spans(template_content)
+
+        assert [span.text for span in spans] == ["{{ requests.get('https://example.test/live') }}"]
+
+        template_file = tmp_path / "malformed-ignored-region.jinja"
+        template_file.write_text(template_content, encoding="utf-8")
+        result = Jinja2TemplateScanner().scan(str(template_file))
+
+        request_checks = [
+            check
+            for check in _jinja_detection_checks(result)
+            if check.severity == IssueSeverity.CRITICAL
+            and check.details.get("pattern_type") == "critical_injection"
+            and check.details.get("match_text") == "requests."
+        ]
+        assert len(request_checks) == 1
+
 
 class TestJinja2TemplateScannerJSONExtraction:
     """Test JSON template extraction."""

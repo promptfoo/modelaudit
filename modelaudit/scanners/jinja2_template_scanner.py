@@ -1484,7 +1484,12 @@ class Jinja2TemplateScanner(BaseScanner):
                 break
 
             if marker == "{#":
-                cursor = Jinja2TemplateScanner._find_jinja_tag_end(template_content, marker_start, "#}")
+                cursor = Jinja2TemplateScanner._find_jinja_tag_end(
+                    template_content,
+                    marker_start,
+                    "#}",
+                    quote_aware=False,
+                )
                 continue
 
             if marker == "{{":
@@ -1517,7 +1522,13 @@ class Jinja2TemplateScanner(BaseScanner):
         return next_marker_start, next_marker
 
     @staticmethod
-    def _find_jinja_tag_end(template_content: str, marker_start: int, end_token: str) -> int:
+    def _find_jinja_tag_end(
+        template_content: str,
+        marker_start: int,
+        end_token: str,
+        *,
+        quote_aware: bool = True,
+    ) -> int:
         cursor = marker_start + 2
         quote: str | None = None
         escaped = False
@@ -1533,7 +1544,7 @@ class Jinja2TemplateScanner(BaseScanner):
                 cursor += 1
                 continue
 
-            if character in {"'", '"'}:
+            if quote_aware and character in {"'", '"'}:
                 quote = character
                 cursor += 1
                 continue
@@ -1559,11 +1570,16 @@ class Jinja2TemplateScanner(BaseScanner):
             block_start = template_content.find("{%", cursor)
             if block_start == -1:
                 return len(template_content)
-            block_end = Jinja2TemplateScanner._find_jinja_tag_end(template_content, block_start, "%}")
+            block_end = Jinja2TemplateScanner._find_jinja_tag_end(
+                template_content,
+                block_start,
+                "%}",
+                quote_aware=False,
+            )
             block_text = template_content[block_start:block_end]
             if Jinja2TemplateScanner._jinja_block_tag_name(block_text) == "endraw":
                 return block_end
-            cursor = max(block_end, block_start + 2)
+            cursor = block_start + 2
         return len(template_content)
 
     def _is_common_ml_pattern(self, match_text: str, context: MLContext) -> bool:
