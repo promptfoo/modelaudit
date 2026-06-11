@@ -327,6 +327,120 @@ def test_hf_repo_dry_run_preview_rejects_unknown_selected_size_with_max_size() -
     mock_scan.assert_not_called()
 
 
+def test_hf_repo_dry_run_preview_uses_non_streaming_download_set_for_max_size() -> None:
+    runner = CliRunner()
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "total_size": 120,
+        "file_count": 2,
+        "files": [
+            {"name": "model.safetensors", "size": 20},
+            {"name": "pytorch_model.bin", "size": 100},
+        ],
+    }
+
+    with (
+        patch("modelaudit.cli.get_model_info", return_value=metadata),
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--format",
+                "json",
+                "--max-size",
+                "50B",
+                "--scanners",
+                "safetensors",
+                "hf://test/model",
+            ],
+        )
+
+    assert result.exit_code == 2
+    assert "Selected Hugging Face files total 120 bytes exceeds max size 50 bytes" in result.output
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
+def test_hf_repo_dry_run_preview_keeps_scannable_size_scanner_selected() -> None:
+    runner = CliRunner()
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "total_size": 120,
+        "file_count": 2,
+        "files": [
+            {"name": "model.safetensors", "size": 20},
+            {"name": "pytorch_model.bin", "size": 100},
+        ],
+    }
+
+    with (
+        patch("modelaudit.cli.get_model_info", return_value=metadata),
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--format",
+                "json",
+                "--max-size",
+                "200B",
+                "--scanners",
+                "safetensors",
+                "hf://test/model",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Scannable files: 1 of 2" in result.stderr
+    assert "Scannable size: 20 B" in result.stderr
+    assert "Scannable size: 120 B" not in result.stderr
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
+def test_hf_repo_dry_run_preview_rejects_empty_scanner_selection() -> None:
+    runner = CliRunner()
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "total_size": 100,
+        "file_count": 1,
+        "files": [{"name": "pytorch_model.bin", "size": 100}],
+    }
+
+    with (
+        patch("modelaudit.cli.get_model_info", return_value=metadata),
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--format",
+                "json",
+                "--scanners",
+                "safetensors",
+                "hf://test/model",
+            ],
+        )
+
+    assert result.exit_code == 2
+    assert "No Hugging Face files match the active scanner selection; refusing dry-run" in result.output
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
 def test_hf_file_dry_run_preview_does_not_download_or_scan() -> None:
     url = "https://huggingface.co/test/model/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/config.json"
     runner = CliRunner()

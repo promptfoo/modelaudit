@@ -206,6 +206,26 @@ def _huggingface_preview_file_size(item: dict[str, Any]) -> int | None:
     return size
 
 
+def _huggingface_preview_download_files(files: object) -> list[dict[str, Any]]:
+    """Return metadata entries that the non-streaming Hugging Face downloader would suffix-select."""
+    if not isinstance(files, list):
+        return []
+
+    from .utils.sources import huggingface as huggingface_source
+
+    model_extensions = huggingface_source._get_model_extensions()
+    selected: list[dict[str, Any]] = []
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        if huggingface_source._is_scannable_hf_file(name, model_extensions):
+            selected.append(item)
+    return selected
+
+
 def _selected_huggingface_preview_files(files: object, runtime: "_ScanRuntimeConfig") -> list[dict[str, Any]]:
     """Return filename-selected Hugging Face preview entries without probing file content."""
     if not isinstance(files, list):
@@ -255,15 +275,22 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
     metadata = get_model_info(path)
     files = metadata.get("files", [])
     selected_files = _selected_huggingface_preview_files(files, runtime)
+    download_files = _huggingface_preview_download_files(files)
+    if runtime.scanner_selection_metadata is not None and not selected_files:
+        raise ValueError("No Hugging Face files match the active scanner selection; refusing dry-run")
+    if runtime.scanner_selection_metadata is None and not runtime.scan_and_delete and not download_files:
+        raise ValueError("No recognized ModelAudit-scannable Hugging Face files found; refusing dry-run")
+    budget_files = selected_files if runtime.scan_and_delete else download_files
     total_size = metadata.get("total_size")
-    selected_sizes = [_huggingface_preview_file_size(item) for item in selected_files]
-    selected_size = sum(size for size in selected_sizes if size is not None)
-    if runtime.max_download_bytes is not None and any(size is None for size in selected_sizes):
+    selected_display_sizes = [_huggingface_preview_file_size(item) for item in selected_files]
+    selected_display_size = sum(size for size in selected_display_sizes if size is not None)
+    budget_sizes = [_huggingface_preview_file_size(item) for item in budget_files]
+    budget_size = sum(size for size in budget_sizes if size is not None)
+    if runtime.max_download_bytes is not None and any(size is None for size in budget_sizes):
         raise ValueError("Selected Hugging Face file sizes are unknown; refusing dry-run with max size")
-    if runtime.max_download_bytes is not None and selected_size > runtime.max_download_bytes:
+    if runtime.max_download_bytes is not None and budget_size > runtime.max_download_bytes:
         raise ValueError(
-            f"Selected Hugging Face files total {selected_size} bytes exceeds max size "
-            f"{runtime.max_download_bytes} bytes"
+            f"Selected Hugging Face files total {budget_size} bytes exceeds max size {runtime.max_download_bytes} bytes"
         )
 
     _preview_echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:", err=err)
@@ -276,7 +303,7 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
     _preview_echo(f"   Total size: {_format_preview_size(total_size)}", err=err)
     if runtime.scannable_extensions is not None or runtime.scannable_filenames is not None:
         _preview_echo(f"   Scannable files: {len(selected_files)} of {metadata.get('file_count', 0)}", err=err)
-        _preview_echo(f"   Scannable size: {_format_preview_size(selected_size)}", err=err)
+        _preview_echo(f"   Scannable size: {_format_preview_size(selected_display_size)}", err=err)
     if runtime.scan_and_delete:
         _preview_echo("   Mode: Streaming", err=err)
     if runtime.scanner_selection_metadata is not None:
