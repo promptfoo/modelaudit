@@ -29,6 +29,8 @@ from modelaudit.scanners.onnx_scanner import (
 )
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
 from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
+from modelaudit.utils.helpers.file_hash import compute_sha256_hash
+from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 
 
 def _make_external_tensor(name: str, data_type: int, dims: list[int], external_path: str) -> Any:
@@ -2317,6 +2319,51 @@ def test_onnx_scanner_raw_read_failure_falls_back_to_path_parse(
     assert coverage_checks[0].details["coverage_gap"] == "file_read_failed"
 
 
+def test_directory_scan_hashes_external_data_for_content_routed_onnx_bin(tmp_path: Path) -> None:
+    model_path = create_onnx_model(tmp_path, external=True, external_path="model.onnx_data")
+    routed_model_path = tmp_path / "model.bin"
+    model_path.rename(routed_model_path)
+    sidecar_path = tmp_path / "model.onnx_data"
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    assert result.success is True
+    assert result.bytes_scanned == routed_model_path.stat().st_size + sidecar_path.stat().st_size
+    assert result.content_hash == compute_aggregate_hash(
+        [
+            compute_sha256_hash(routed_model_path),
+            compute_sha256_hash(sidecar_path),
+        ]
+    )
+
+
+def test_directory_scan_does_not_parse_oversized_streamed_onnx_for_sidecar_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_onnx_model(tmp_path, external=True, external_path="model.onnx_data")
+    parsed_paths: list[str] = []
+
+    def tracking_path_loader(path: str, *_args: Any, **_kwargs: Any) -> Any:
+        parsed_paths.append(path)
+        raise AssertionError("oversized ONNX must not be parsed before max_file_size rejection")
+
+    monkeypatch.setattr(onnx, "load", tracking_path_loader)
+
+    result = scan_model_directory_or_file(
+        str(tmp_path),
+        max_file_size=model_path.stat().st_size - 1,
+        cache_scan_results=False,
+    )
+
+    assert parsed_paths == []
+    assert result.success is False
+    assert any(
+        metadata.get("operational_error_reason") == "max_file_size_exceeded"
+        for metadata in result.file_metadata.values()
+    )
+
+
 def test_onnx_scanner_custom_op(tmp_path: Path) -> None:
     model_path = create_onnx_model(tmp_path, custom=True)
     result = OnnxScanner().scan(str(model_path))
@@ -4011,6 +4058,7 @@ class TestCVE202634447SymlinkTraversal:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         *,
+        model_name: str = "model.onnx",
         sidecar_target: Path | None = None,
     ) -> Path:
         cache_hub = tmp_path / "hf-hub"
@@ -4029,7 +4077,7 @@ class TestCVE202634447SymlinkTraversal:
         model_blob.write_bytes(source_model.read_bytes())
         sidecar_blob.write_bytes((source_dir / "model.onnx_data").read_bytes())
 
-        model_path = snapshot_dir / "model.onnx"
+        model_path = snapshot_dir / model_name
         sidecar_path = snapshot_dir / "model.onnx_data"
         model_path.symlink_to(os.path.relpath(model_blob, snapshot_dir))
         sidecar_path.symlink_to(os.path.relpath(sidecar_target or sidecar_blob, snapshot_dir))
@@ -4086,6 +4134,35 @@ class TestCVE202634447SymlinkTraversal:
         assert result.success is True
         assert missing_checks == []
         assert len(resolved_checks) == 1
+        assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
+
+    def test_huggingface_cache_snapshot_content_routed_onnx_bin_uses_alias_sidecar_context(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        model_path = self._create_hf_cache_snapshot_model(tmp_path, monkeypatch, model_name="model.bin")
+        sidecar_path = model_path.parent / "model.onnx_data"
+
+        result = scan_model_directory_or_file(str(model_path.parent), cache_scan_results=False)
+
+        resolved_checks = [
+            c
+            for c in result.checks
+            if c.name == "External Data Reference Check"
+            and c.status == CheckStatus.PASSED
+            and c.details.get("file") == "model.onnx_data"
+        ]
+        assert result.success is True
+        assert len(resolved_checks) == 1
+        assert result.bytes_scanned == model_path.stat().st_size + sidecar_path.stat().st_size
+        assert result.content_hash == compute_aggregate_hash(
+            [
+                compute_sha256_hash(model_path),
+                compute_sha256_hash(sidecar_path),
+            ]
+        )
         assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
 
     def test_huggingface_cache_snapshot_regular_model_with_sidecar_symlink_to_blob_still_flagged(

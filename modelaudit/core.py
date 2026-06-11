@@ -661,11 +661,8 @@ def _is_openvino_xml_path(path: Path) -> bool:
 
 def _is_streamed_onnx_external_data_hash_candidate(path: Path) -> bool:
     """Return whether a streamed path may declare ONNX external_data sidecars."""
-    suffix = path.suffix.lower()
-    if suffix == ".onnx":
+    if path.suffix.lower() == ".onnx":
         return True
-    if suffix:
-        return False
     try:
         return detect_file_format_for_skip_filter(str(path)) == "onnx"
     except (OSError, RuntimeError, ValueError):
@@ -2243,8 +2240,6 @@ def _should_scan_hf_cache_alias_lexically_for_onnx(snapshot_path: Path, hf_cache
     suffix = snapshot_path.suffix.lower()
     if suffix == ".onnx":
         return True
-    if suffix:
-        return False
     if not _hf_cache_snapshot_alias_has_safe_parent_components(snapshot_path, hf_cache_root):
         return False
     try:
@@ -5113,7 +5108,10 @@ def scan_model_streaming(
                         openvino_scan_companion_path,
                         scan_config,
                     )
-                if scanner_selection.allows("onnx"):
+                if scanner_selection.allows("onnx") and not _should_defer_hash_for_max_file_size(
+                    str(scan_path),
+                    scan_config,
+                ):
                     for onnx_external_data_path in _streamed_onnx_external_data_hash_paths(scan_path):
                         external_data_key = Path(os.path.abspath(onnx_external_data_path))
                         external_data_was_stream_source = external_data_key in hashed_stream_source_hashes_by_path
