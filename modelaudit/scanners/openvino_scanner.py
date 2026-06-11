@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from collections.abc import Iterator
 from io import BytesIO
 from pathlib import Path
@@ -51,6 +52,30 @@ def _is_contained_in(child: Path, parent: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _companion_filename_key(filename: str) -> str:
+    return unicodedata.normalize("NFC", filename).casefold()
+
+
+def _same_stem_companion(path: Path, suffix: str) -> Path:
+    expected_path = path.with_suffix(suffix)
+    if expected_path.exists() or expected_path.is_symlink():
+        return expected_path
+
+    expected_key = _companion_filename_key(expected_path.name)
+    try:
+        candidates = [
+            child
+            for child in path.parent.iterdir()
+            if _companion_filename_key(child.name) == expected_key and (child.exists() or child.is_symlink())
+        ]
+    except OSError:
+        return expected_path
+
+    if len(candidates) == 1:
+        return candidates[0]
+    return expected_path
 
 
 def _skip_doctype_declaration(xml_prefix: bytes, start_offset: int) -> int | None:
@@ -191,12 +216,27 @@ def openvino_xml_companion_for_weights(path: str | os.PathLike[str]) -> Path | N
     if weights_path.suffix.lower() != ".bin":
         return None
 
-    xml_path = weights_path.with_suffix(".xml")
+    xml_path = _same_stem_companion(weights_path, ".xml")
     if not xml_path.is_file():
         return None
     if not OpenVinoScanner.can_handle(str(xml_path)):
         return None
     return xml_path
+
+
+def openvino_weights_companion_for_xml(
+    path: str | os.PathLike[str],
+    *,
+    require_existing: bool = True,
+) -> Path | None:
+    """Return the same-stem OpenVINO weights sidecar for an XML path."""
+    xml_path = Path(path)
+    if xml_path.suffix.lower() != ".xml":
+        return None
+    weights_path = _same_stem_companion(xml_path, ".bin")
+    if require_existing and not (weights_path.exists() or weights_path.is_symlink()):
+        return None
+    return weights_path
 
 
 class OpenVinoScanner(BaseScanner):
@@ -264,7 +304,9 @@ class OpenVinoScanner(BaseScanner):
         result.metadata["xml_size"] = self.get_file_size(path)
 
         model_dir = Path(path).resolve().parent
-        bin_path = Path(os.path.splitext(path)[0] + ".bin")
+        bin_path = openvino_weights_companion_for_xml(path, require_existing=False)
+        if bin_path is None:
+            bin_path = Path(os.path.splitext(path)[0] + ".bin")
         if bin_path.is_symlink():
             resolved_bin_path = bin_path.resolve(strict=False)
             if not _is_contained_in(resolved_bin_path, model_dir):

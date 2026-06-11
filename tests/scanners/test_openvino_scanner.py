@@ -45,6 +45,21 @@ def test_openvino_scanner_basic_model_has_zero_cli_exit(tmp_path: Path) -> None:
     )
 
 
+def test_openvino_scanner_matches_casefolded_unicode_weights_companion(tmp_path: Path) -> None:
+    """Case and Unicode normalization variants should still resolve the adjacent weights."""
+    xml_path = tmp_path / "Cafe\u0301-Model.XML"
+    bin_path = tmp_path / "CAF\u00c9-model.BIN"
+    xml_path.write_text("<net version='10'></net>", encoding="utf-8")
+    bin_path.write_bytes(b"weights")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    assert OpenVinoScanner.can_handle(str(xml_path)) is True
+    assert result.success is True
+    assert result.metadata["bin_size"] == bin_path.stat().st_size
+    assert not any("weights file not found" in check.message.lower() for check in result.checks)
+
+
 def test_openvino_scanner_can_handle_long_xml_prolog(tmp_path: Path) -> None:
     """OpenVINO XML routing should not depend on finding the root tag in the first 256 bytes."""
     xml_path = tmp_path / "model.xml"

@@ -1422,6 +1422,45 @@ def test_scan_model_streaming_preserves_openvino_companion_when_bin_arrives_firs
     assert not any(check.rule_code == "S901" for check in result.checks)
 
 
+def test_scan_model_streaming_preserves_path_sensitive_openvino_companions_with_duplicate_basenames(
+    tmp_path: Path,
+) -> None:
+    """Duplicate basenames in nested dirs must preserve and delete each exact sidecar."""
+    encoder_dir = tmp_path / "models" / "encoder"
+    decoder_dir = tmp_path / "models" / "decoder"
+    encoder_dir.mkdir(parents=True)
+    decoder_dir.mkdir(parents=True)
+    encoder_xml, encoder_bin = _write_openvino_pair(encoder_dir)
+    decoder_xml, decoder_bin = _write_openvino_pair(decoder_dir)
+    encoder_bin.write_bytes(b"e" * 11)
+    decoder_bin.write_bytes(b"d" * 23)
+
+    result = scan_model_streaming(
+        file_generator=iter(
+            [
+                (encoder_bin, False),
+                (decoder_bin, False),
+                (encoder_xml, False),
+                (decoder_xml, True),
+            ]
+        ),
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+    )
+
+    assert determine_exit_code(result) == 0
+    assert "pytorch_binary" not in result.scanner_names
+    assert not encoder_xml.exists()
+    assert not encoder_bin.exists()
+    assert not decoder_xml.exists()
+    assert not decoder_bin.exists()
+    assert result.file_metadata[str(encoder_xml)]["bin_size"] == 11
+    assert result.file_metadata[str(decoder_xml)]["bin_size"] == 23
+    assert not any(check.rule_code == "S701" for check in result.checks)
+    assert not any(check.rule_code == "S901" for check in result.checks)
+
+
 def test_scan_model_streaming_openvino_xml_with_prefetched_companion(tmp_path: Path) -> None:
     """HF-style streaming can yield only XML after pre-staging the .bin companion."""
     xml_path, bin_path = _write_openvino_pair(tmp_path)
@@ -1615,6 +1654,32 @@ def test_scan_model_streaming_selected_openvino_preserves_bin_before_skip_filter
     assert result.file_metadata[str(xml_path)]["bin_size"] == 16
     assert not any("weights file not found" in check.message.lower() for check in result.checks)
     assert not any(check.rule_code == "S701" for check in result.checks)
+
+
+def test_scan_model_streaming_openvino_case_variant_companion(tmp_path: Path) -> None:
+    """OpenVINO companion ownership should allow one unambiguous suffix case variant."""
+    stem = "OpenVINO_Mod\u00e8le"
+    xml_path = tmp_path / f"{stem}.XML"
+    bin_path = tmp_path / f"{stem}.BIN"
+    xml_path.write_text("<net version='10'></net>", encoding="utf-8")
+    bin_path.write_bytes(b"\x00" * 16)
+
+    result = scan_model_streaming(
+        file_generator=iter([(bin_path, False), (xml_path, True)]),
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+        skip_file_types=True,
+        scanners=["openvino"],
+    )
+
+    assert determine_exit_code(result) == 0
+    assert result.scanner_names == ["openvino"]
+    assert not xml_path.exists()
+    assert not bin_path.exists()
+    assert result.file_metadata[str(xml_path)]["bin_size"] == 16
+    assert not any(check.rule_code == "S701" for check in result.checks)
+    assert not any(check.name == "Scanner Selection" and check.location == str(bin_path) for check in result.checks)
 
 
 def test_scan_model_directory_or_file_openvino_bin_sidecar_not_pytorch(tmp_path: Path) -> None:

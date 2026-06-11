@@ -8,6 +8,7 @@ import struct
 import subprocess
 import sys
 import time
+import unicodedata
 from collections.abc import Callable, Collection, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -793,12 +794,24 @@ def _build_literal_allow_patterns(filenames: list[str]) -> list[str]:
     return [escape_glob(filename) for filename in filenames]
 
 
-def _openvino_bin_companion_name(filename: str) -> str | None:
+def _remote_companion_path_key(filename: str) -> str:
+    return unicodedata.normalize("NFC", filename).casefold()
+
+
+def _openvino_bin_companion_name(filename: str, repo_files: Collection[str] | None = None) -> str | None:
     """Return the exact same-stem OpenVINO weights filename for a repo XML path."""
     remote_path = PurePosixPath(filename)
     if remote_path.suffix.lower() != ".xml":
         return None
-    return remote_path.with_suffix(".bin").as_posix()
+    expected_companion = remote_path.with_suffix(".bin").as_posix()
+    if repo_files is None or expected_companion in repo_files:
+        return expected_companion
+
+    expected_key = _remote_companion_path_key(expected_companion)
+    candidates = [repo_file for repo_file in repo_files if _remote_companion_path_key(repo_file) == expected_key]
+    if len(candidates) == 1:
+        return candidates[0]
+    return expected_companion
 
 
 def _include_huggingface_openvino_companions(
@@ -825,7 +838,7 @@ def _include_huggingface_openvino_companions(
     )
 
     for filename in model_files:
-        companion = _openvino_bin_companion_name(filename)
+        companion = _openvino_bin_companion_name(filename, repo_files)
         if companion is None or companion not in repo_file_set or companion in selected_files:
             continue
 
@@ -1096,7 +1109,7 @@ def _select_streamable_hf_files(
         {
             companion
             for selected_file in model_files
-            if (companion := _openvino_bin_companion_name(selected_file)) is not None
+            if (companion := _openvino_bin_companion_name(selected_file, repo_files)) is not None
         }
         if selected_route_scanner_ids == {"openvino"}
         else set()
@@ -1936,7 +1949,7 @@ def download_model_streaming(
         openvino_companion_by_xml = {
             filename: companion
             for filename in model_files
-            if (companion := _openvino_bin_companion_name(filename)) in selected_file_set
+            if (companion := _openvino_bin_companion_name(filename, model_files)) in selected_file_set
         }
         openvino_xml_by_companion = {companion: xml for xml, companion in openvino_companion_by_xml.items()}
 

@@ -729,8 +729,12 @@ def _openvino_xml_weights_companion(path: Path) -> Path | None:
     """Return a local OpenVINO XML model's same-stem weights sidecar."""
     if not _is_openvino_xml_path(path):
         return None
-    companion_path = path.with_suffix(".bin")
-    return companion_path if companion_path.exists() or companion_path.is_symlink() else None
+    try:
+        from modelaudit.scanners.openvino_scanner import openvino_weights_companion_for_xml
+
+        return openvino_weights_companion_for_xml(path)
+    except Exception:
+        return None
 
 
 def _snapshot_openvino_companion_for_hash(xml_path: Path, companion_path: Path) -> _FileIdentitySnapshot | None:
@@ -4777,8 +4781,8 @@ def scan_model_streaming(
                     continue
 
                 if scanner_selection.allows("openvino") and _is_openvino_xml_path(scan_path):
-                    candidate_companion = scan_path.with_suffix(".bin")
-                    if candidate_companion.exists() or candidate_companion.is_symlink():
+                    candidate_companion = _openvino_xml_weights_companion(scan_path)
+                    if candidate_companion is not None:
                         openvino_scan_companion_path = candidate_companion
                         openvino_scan_companion_key = Path(os.path.abspath(candidate_companion))
                         openvino_companion_pre_scan_identity = _snapshot_file_identity(candidate_companion)
