@@ -124,6 +124,14 @@ def fullwidth_percent_release_url() -> str:
     )
 
 
+def encoded_fullwidth_percent_release_url() -> str:
+    escaped_percent = quote(FULLWIDTH_PERCENT, safe="")
+    return (
+        f"https://github.com/Lightricks/LTX-2/{escaped_percent}252freleases"
+        f"{escaped_percent}252fdownload{escaped_percent}252fv1/license"
+    )
+
+
 def test_valid_safetensors_file(tmp_path: Path) -> None:
     file_path = tmp_path / "model.safetensors"
     create_safetensors_file(file_path)
@@ -429,6 +437,15 @@ def test_license_document_reconstructs_comment_separated_wrapped_base64_tail() -
     assert not SafeTensorsScanner._looks_like_ordinary_license_document(payload)
 
 
+def test_license_document_reconstructs_short_wrapped_base64_tail() -> None:
+    license_text = ordinary_license_text_with_url()
+    tail = "\n".join(executable_wrapped_base64_lines((31,)))
+    payload = f"{license_text}\n{tail}"
+
+    assert SafeTensorsScanner._looks_like_ordinary_license_document(license_text)
+    assert not SafeTensorsScanner._looks_like_ordinary_license_document(payload)
+
+
 def test_license_url_residual_encoding_fails_closed() -> None:
     encoded_prefix = encode_url_path("/releases/download/v1", passes=5)
 
@@ -445,6 +462,8 @@ def test_license_url_residual_encoding_fails_closed() -> None:
     )
     assert not SafeTensorsScanner._url_looks_like_license_reference(confusable_payload_url())
     assert not SafeTensorsScanner._url_looks_like_license_reference(fullwidth_percent_release_url())
+    assert not SafeTensorsScanner._url_looks_like_license_reference(encoded_fullwidth_percent_release_url())
+    assert not SafeTensorsScanner._url_looks_like_license_reference("https://github.com/Lightricks/LTX-2;payload")
 
 
 def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -> None:
@@ -501,6 +520,8 @@ def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -
         "https://github.com/Lightricks/LTX-2/blob/main/%65%78%66%69%6c/license",
         confusable_payload_url(),
         fullwidth_percent_release_url(),
+        encoded_fullwidth_percent_release_url(),
+        "https://github.com/Lightricks/LTX-2;payload",
         "https://opensource.org/licenses/MIT?u=https://evil.example/x",
         "https://[",
     ],
@@ -686,6 +707,10 @@ def test_license_metadata_standard_wrapped_base64_tail_keeps_length_and_s905(tmp
         (
             "\n".join(f"License grant continuation {line}" for line in executable_wrapped_base64_lines((64, 76, 52))),
             "mixed_width_prefixed",
+        ),
+        (
+            "\n".join(executable_wrapped_base64_lines((31,))),
+            "short_width",
         ),
         (
             comment_separated_executable_wrapped_base64_tail(),

@@ -312,13 +312,13 @@ _SUSPICIOUS_LICENSE_URL_PATH_SUFFIXES = (
 )
 _OPAQUE_LICENSE_TOKEN_MIN_CHARS = 128
 _OPAQUE_LICENSE_TOKEN_PATTERN = re.compile(rf"\b[A-Za-z0-9+/=_-]{{{_OPAQUE_LICENSE_TOKEN_MIN_CHARS},}}\b")
-_BASE64_LICENSE_WRAP_LINE_MIN_CHARS = 32
+_BASE64_LICENSE_WRAP_LINE_MIN_CHARS = 16
 _BASE64_LICENSE_WRAP_MAX_LINES = 128
 _BASE64_LICENSE_WRAP_MAX_CHARS = 8192
 _BASE64_LICENSE_WRAP_MAX_DECODED_BYTES = 6144
 _BASE64_LICENSE_WRAP_MAX_SEPARATOR_LINES = 4
 _BASE64_LICENSE_WRAP_LINE_PATTERN = re.compile(r"^[A-Za-z0-9+/_-]+={0,2}$")
-_BASE64_LICENSE_WRAP_TOKEN_PATTERN = re.compile(r"\b[A-Za-z0-9+/_-]{32,}={0,2}\b")
+_BASE64_LICENSE_WRAP_TOKEN_PATTERN = re.compile(r"\b[A-Za-z0-9+/_-]{16,}={0,2}\b")
 _BASE64_LICENSE_WRAP_SEPARATOR_PATTERN = re.compile(
     r"^(?:[#>;]|//|--|\*)\s*(?:continued|continuation|wrapped|base64|license(?:\s+terms?)?)?\s*$",
     re.IGNORECASE,
@@ -610,9 +610,14 @@ class SafeTensorsScanner(BaseScanner):
         for _ in range(_URL_PATH_NORMALIZATION_PASSES):
             decoded = unquote(normalized)
             if decoded == normalized:
-                return normalized.lower(), False
+                normalized_path = normalized.lower()
+                return normalized_path, not normalized_path.isascii()
             normalized = decoded
-        return normalized.lower(), _PERCENT_ENCODED_BYTE_PATTERN.search(normalized) is not None
+        normalized_path = normalized.lower()
+        return (
+            normalized_path,
+            not normalized_path.isascii() or _PERCENT_ENCODED_BYTE_PATTERN.search(normalized_path) is not None,
+        )
 
     @classmethod
     def _url_path_segments(cls, path: str) -> tuple[list[str], bool]:
@@ -662,7 +667,7 @@ class SafeTensorsScanner(BaseScanner):
             return False
         if not parsed.netloc.isascii() or not parsed.path.isascii():
             return False
-        if parsed.query or parsed.fragment:
+        if parsed.params or parsed.query or parsed.fragment:
             return False
 
         lowered_url = cleaned_url.lower()
