@@ -464,6 +464,12 @@ DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN = re.compile(
     rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\]|$)",
     re.IGNORECASE,
 )
+DOCUMENTATION_FENCED_PROCESS_SUBSTITUTION_EXECUTION_PATTERN = re.compile(
+    rb"\b(?:(?:(?:/[A-Za-z0-9._-]+)*/)?(?:bash|sh|zsh|python(?:\d+(?:\.\d+)*)?|perl|ruby|node|php)\s+)?"
+    rb"<\(\s*" + DOCUMENTATION_SHELL_WRAPPED_COMMAND + DOCUMENTATION_DOWNLOADER_COMMAND + rb"\b\s+"
+    rb"(?:--?[A-Za-z]|[A-Za-z][A-Za-z0-9+.-]*://|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}|[$\"'\\]|$)",
+    re.IGNORECASE,
+)
 DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN = re.compile(
     rb"\|\s*(?:sudo\s+)?(?:(?:(?:/[A-Za-z0-9._-]+)*/)?env\s+"
     rb"(?:(?:-[A-Za-z0-9_=-]+|[A-Za-z_][A-Za-z0-9_]*=[^\s]+)\s+)*)?(?:(?:/[A-Za-z0-9._-]+)*/)?"
@@ -543,12 +549,35 @@ DOCUMENTATION_FENCED_NETWORK_FUNCTION_PATTERN = re.compile(
     rb"mongo\.connect|getaddrinfo|gethostbyname|gethostbyaddr|dns\.resolver)\b",
     re.IGNORECASE,
 )
+DOCUMENTATION_FENCED_NETWORK_MODULE_IMPORT_PATTERN = re.compile(
+    rb"\bimport\s+(?P<imports>[^\r\n#;]+)",
+    re.IGNORECASE,
+)
 DOCUMENTATION_FENCED_NETWORK_FUNCTION_IMPORT_PATTERN = re.compile(
     rb"\bfrom\s+(?:requests|urllib\.request)\s+import\s+(?P<imports>[^\r\n#;]+)",
     re.IGNORECASE,
 )
+DOCUMENTATION_FENCED_MULTILINE_NETWORK_FUNCTION_IMPORT_PATTERN = re.compile(
+    rb"\bfrom\s+(?:requests|urllib\.request)\s+import\s*\((?P<imports>[^)]{1,4096})\)",
+    re.IGNORECASE | re.DOTALL,
+)
+DOCUMENTATION_FENCED_MODULE_ALIAS_NETWORK_CALL_PATTERN = re.compile(
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*"
+    rb"(?:get|head|post|put|patch|delete|request|urlopen|urlretrieve)\s*\(",
+    re.IGNORECASE,
+)
 DOCUMENTATION_FENCED_EXECUTED_FETCH_PATTERN = re.compile(
     rb"\b(?:exec|eval|compile)\s*\([^()\r\n]*(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_FETCH_RESPONSE_ASSIGNMENT_PATTERN = re.compile(
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+    rb"(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_EXECUTED_RESPONSE_PATTERN = re.compile(
+    rb"\b(?:exec|eval|compile)\s*\(\s*(?P<target>[A-Za-z_][A-Za-z0-9_]*)"
+    rb"(?:\s*\.\s*(?:text|content)|\s*\.\s*read\s*\(\s*\))?",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_BIBLIOGRAPHY_URL_FIELD_PATTERN = re.compile(
@@ -1258,6 +1287,7 @@ class TextScanner(BaseScanner):
             or DOCUMENTATION_INLINE_POWERSHELL_COMMAND_PATTERN.search(line) is not None
             or DOCUMENTATION_INLINE_SHELL_COMMAND_PATTERN.search(prefix) is not None
             or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(prefix) is not None
+            or DOCUMENTATION_FENCED_PROCESS_SUBSTITUTION_EXECUTION_PATTERN.search(prefix) is not None
             or cls._documentation_xargs_downloader_is_actionable(line, position)
         )
         if cls._documentation_shell_comment_before_position(
@@ -1713,6 +1743,11 @@ class TextScanner(BaseScanner):
     def _span_overlaps_any(start: int, end: int, spans: tuple[tuple[int, int], ...]) -> bool:
         return any(start < span_end and span_start < end for span_start, span_end in spans)
 
+    @staticmethod
+    def _documentation_fenced_import_parts(imports: bytes) -> tuple[bytes, ...]:
+        normalized_imports = imports.replace(b"(", b" ").replace(b")", b" ")
+        return tuple(import_part.strip() for import_part in normalized_imports.split(b",") if import_part.strip())
+
     @classmethod
     def _documentation_fenced_has_call_after_assignment(
         cls,
@@ -1735,28 +1770,70 @@ class TextScanner(BaseScanner):
     def _documentation_fenced_has_imported_network_call(cls, fenced_code: bytes) -> bool:
         imported_targets: dict[bytes, list[int]] = {}
         network_names = {b"get", b"head", b"post", b"put", b"patch", b"delete", b"request", b"urlopen", b"urlretrieve"}
-        for match in DOCUMENTATION_FENCED_NETWORK_FUNCTION_IMPORT_PATTERN.finditer(fenced_code):
+        for pattern in (
+            DOCUMENTATION_FENCED_NETWORK_FUNCTION_IMPORT_PATTERN,
+            DOCUMENTATION_FENCED_MULTILINE_NETWORK_FUNCTION_IMPORT_PATTERN,
+        ):
+            for match in pattern.finditer(fenced_code):
+                if cls._documentation_fenced_match_is_line_comment(
+                    fenced_code,
+                    match.start(),
+                ) or cls._documentation_python_string_contains_absolute_position(fenced_code, match.start()):
+                    continue
+                for name_part in cls._documentation_fenced_import_parts(match.group("imports")):
+                    alias_parts = re.split(rb"\s+as\s+", name_part, maxsplit=1, flags=re.IGNORECASE)
+                    imported_name = alias_parts[0].strip()
+                    if imported_name not in network_names:
+                        continue
+                    target = (alias_parts[-1] if len(alias_parts) == 2 else imported_name).strip()
+                    if re.fullmatch(rb"[A-Za-z_][A-Za-z0-9_]*", target) is not None:
+                        imported_targets.setdefault(target, []).append(match.start())
+        return any(
+            any(position < call_match.start() for position in imported_targets.get(call_match.group("target"), []))
+            for call_match in DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN.finditer(fenced_code)
+            if not cls._documentation_fenced_match_is_line_comment(fenced_code, call_match.start())
+        )
+
+    @classmethod
+    def _documentation_fenced_has_module_alias_network_call(cls, fenced_code: bytes) -> bool:
+        imported_targets: dict[bytes, list[int]] = {}
+        network_modules = {b"requests", b"urllib.request"}
+        for match in DOCUMENTATION_FENCED_NETWORK_MODULE_IMPORT_PATTERN.finditer(fenced_code):
             if cls._documentation_fenced_match_is_line_comment(
                 fenced_code,
                 match.start(),
             ) or cls._documentation_python_string_contains_absolute_position(fenced_code, match.start()):
                 continue
-            imports = match.group("imports").replace(b"(", b" ").replace(b")", b" ")
-            for import_part in imports.split(b","):
-                name_part = import_part.strip()
-                if not name_part:
-                    continue
+            for name_part in cls._documentation_fenced_import_parts(match.group("imports")):
                 alias_parts = re.split(rb"\s+as\s+", name_part, maxsplit=1, flags=re.IGNORECASE)
-                imported_name = alias_parts[0].strip()
-                if imported_name not in network_names:
+                module_name = alias_parts[0].strip()
+                if len(alias_parts) != 2 or module_name not in network_modules:
                     continue
-                target = (alias_parts[-1] if len(alias_parts) == 2 else imported_name).strip()
+                target = alias_parts[-1].strip()
                 if re.fullmatch(rb"[A-Za-z_][A-Za-z0-9_]*", target) is not None:
                     imported_targets.setdefault(target, []).append(match.start())
+
         return any(
             any(position < call_match.start() for position in imported_targets.get(call_match.group("target"), []))
-            for call_match in DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN.finditer(fenced_code)
+            for call_match in DOCUMENTATION_FENCED_MODULE_ALIAS_NETWORK_CALL_PATTERN.finditer(fenced_code)
             if not cls._documentation_fenced_match_is_line_comment(fenced_code, call_match.start())
+        )
+
+    @classmethod
+    def _documentation_fenced_has_executed_fetch_response(cls, fenced_code: bytes) -> bool:
+        response_assignments: dict[bytes, list[int]] = {}
+        for match in DOCUMENTATION_FENCED_FETCH_RESPONSE_ASSIGNMENT_PATTERN.finditer(fenced_code):
+            if cls._documentation_fenced_match_is_line_comment(
+                fenced_code,
+                match.start(),
+            ) or cls._documentation_python_string_contains_absolute_position(fenced_code, match.start()):
+                continue
+            response_assignments.setdefault(match.group("target"), []).append(match.start())
+
+        return any(
+            any(position < exec_match.start() for position in response_assignments.get(exec_match.group("target"), []))
+            for exec_match in DOCUMENTATION_FENCED_EXECUTED_RESPONSE_PATTERN.finditer(fenced_code)
+            if not cls._documentation_fenced_match_is_line_comment(fenced_code, exec_match.start())
         )
 
     @classmethod
@@ -1791,9 +1868,12 @@ class TextScanner(BaseScanner):
         if (
             DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN.search(fenced_code)
             or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(fenced_code)
+            or DOCUMENTATION_FENCED_PROCESS_SUBSTITUTION_EXECUTION_PATTERN.search(fenced_code)
             or DOCUMENTATION_FENCED_SESSION_HTTP_CALL_PATTERN.search(fenced_code)
             or DOCUMENTATION_FENCED_EXECUTED_FETCH_PATTERN.search(fenced_code)
             or cls._documentation_fenced_has_imported_network_call(fenced_code)
+            or cls._documentation_fenced_has_module_alias_network_call(fenced_code)
+            or cls._documentation_fenced_has_executed_fetch_response(fenced_code)
             or cls._documentation_fenced_has_bound_session_alias_call(fenced_code)
             or cls._documentation_fenced_has_call_after_assignment(
                 fenced_code,
