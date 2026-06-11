@@ -592,6 +592,28 @@ def test_directory_scan_preserves_selected_text_scanner_skip_extensions(tmp_path
     assert result.scanner_selection["enabled_scanner_ids"] == ["text"]
 
 
+def test_scan_file_keeps_malicious_pickle_named_license_on_pickle_route(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(b'cposix\nsystem\n(S"echo pwned"\ntR.')
+
+    result = scan_file(str(path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    assert _has_pickle_execution_finding(result)
+
+
+def test_scan_file_fails_closed_for_binary_pickle_embedded_in_license_text(tmp_path: Path) -> None:
+    path = tmp_path / "LICENSE"
+    path.write_bytes(b"MIT License\nCopyright (c) Example\n" + b"\x80\x04cposix\nsystem\n(S'id'\ntR.")
+
+    result = scan_file(str(path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "pickle_routing_incomplete"
+    assert any(check.name == "Pickle Routing" for check in result.checks)
+
+
 def test_cache_key_includes_scanner_selection_policy(tmp_path: Path) -> None:
     path = tmp_path / "benign.pkl"
     path.write_bytes(pickle.dumps({"payload": "x" * 2048}))
@@ -818,7 +840,30 @@ def test_remote_prefilters_preserve_text_scanner_extensionless_documentation() -
 
     assert extensions is not None
     assert "" not in extensions
-    assert filenames == frozenset({"readme", "model_card", "requirements.txt"})
+    assert filenames == frozenset({"license", "model_card", "notice", "readme", "requirements.txt"})
+    files = [
+        {"path": "s3://bucket/README"},
+        {"path": "s3://bucket/LICENSE"},
+        {"path": "s3://bucket/NOTICE"},
+        {"path": "s3://bucket/payload"},
+    ]
+
+    assert (
+        filter_cloud_scannable_files(
+            files,
+            scannable_extensions=extensions,
+            scannable_filenames=filenames,
+        )
+        == files[:3]
+    )
+    assert (
+        filter_jfrog_scannable_files(
+            files,
+            scannable_extensions=extensions,
+            scannable_filenames=filenames,
+        )
+        == files[:3]
+    )
 
 
 def test_remote_prefilters_do_not_download_extensionless_xgboost_candidates() -> None:

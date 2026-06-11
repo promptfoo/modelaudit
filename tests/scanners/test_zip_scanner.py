@@ -10803,6 +10803,35 @@ class TestZipScanner:
             f"Expected critical os/posix.system issue, got: {critical_messages}"
         )
 
+    def test_scan_zip_routes_legal_text_member_to_text_scanner(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "legal_text_member.zip"
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr(
+                "LICENSE",
+                "MIT License\n\nCopyright (c) 2026 Example\nPermission is hereby granted.\n",
+            )
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert any(
+            check.name == "File Type Identification"
+            and check.details.get("file_type") == "license"
+            and check.details.get("zip_entry") == "LICENSE"
+            for check in result.checks
+        )
+        assert not any(issue.rule_code in {"S901", "S902"} for issue in result.issues)
+
+    def test_scan_zip_keeps_malicious_pickle_named_license_on_pickle_route(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "malicious_license_member.zip"
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("LICENSE", b'cposix\nsystem\n(S"echo pwned"\ntR.')
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert any(issue.rule_code == "S201" and issue.details.get("zip_entry") == "LICENSE" for issue in result.issues)
+
     def test_scan_npz_with_object_member_recurses_into_pickle(self, tmp_path: Path) -> None:
         import numpy as np
 

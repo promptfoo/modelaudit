@@ -15,7 +15,7 @@ from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
 from .archive_member_security import scan_archive_member_for_known_risks
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import LOGICAL_SCAN_PATH_CONFIG_KEY, BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
     "/etc",
@@ -646,6 +646,7 @@ class TarScanner(BaseScanner):
                             # cannot serve as reusable cache keys.
                             nested_config["cache_enabled"] = False
                             nested_config["_archive_depth"] = depth + 1
+                            nested_config[LOGICAL_SCAN_PATH_CONFIG_KEY] = name
                             nested_result = self._scan_nested_archive_entry(tmp_path, nested_config)
                             if member_scan_incomplete(nested_result):
                                 scan_complete = False
@@ -676,6 +677,7 @@ class TarScanner(BaseScanner):
                                 # cannot serve as reusable cache keys.
                                 nested_config["cache_enabled"] = False
                                 nested_config["_archive_depth"] = depth + 1
+                                nested_config[LOGICAL_SCAN_PATH_CONFIG_KEY] = name
                                 file_result = self._scan_nested_archive_entry(tmp_path, nested_config)
                                 self._rewrite_nested_result_context(file_result, tmp_path, path, name)
                                 if member_scan_incomplete(file_result):

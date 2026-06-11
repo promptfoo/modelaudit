@@ -1416,12 +1416,23 @@ def test_scan_model_streaming_skips_non_model_files(tmp_path: Path) -> None:
     assert result.files_scanned == 1
 
 
-def test_scan_model_streaming_preserves_license_metadata_when_skipped(tmp_path: Path) -> None:
-    """Skipped license files should still populate file metadata in streaming mode."""
+def test_scan_model_streaming_routes_license_text_and_preserves_metadata(tmp_path: Path) -> None:
+    """Text-routed license files should still populate file metadata in streaming mode."""
     license_file = tmp_path / "license.txt"
     license_file.write_text("MIT License\nCopyright 2026 Example")
+    scan_result = ScanResult(scanner_name="text")
+    scan_result.bytes_scanned = license_file.stat().st_size
+    scan_result.metadata.update(
+        {
+            "file_type": "license",
+            "license_info": [{"spdx_id": "MIT", "confidence": 0.9, "source": str(license_file)}],
+            "copyright_notices": [{"holder": "Example", "year": "2026", "confidence": 0.9}],
+        }
+    )
+    scan_result.finish(success=True)
 
     with patch("modelaudit.core.scan_file") as mock_scan:
+        mock_scan.return_value = scan_result
         result = scan_model_streaming(
             file_generator=iter([(license_file, True)]),
             timeout=30,
@@ -1429,10 +1440,14 @@ def test_scan_model_streaming_preserves_license_metadata_when_skipped(tmp_path: 
             skip_file_types=True,
         )
 
-    mock_scan.assert_not_called()
-    assert result.files_scanned == 0
+    mock_scan.assert_called_once()
+    assert mock_scan.call_args.args[0] == str(license_file)
+    assert mock_scan.call_args.kwargs["config"]["skip_file_types"] is True
+    assert result.files_scanned == 1
+    assert result.scanner_names == ["text"]
     assert str(license_file) in result.file_metadata
     metadata = result.file_metadata[str(license_file)].model_dump()
+    assert metadata["file_type"] == "license"
     assert "license_info" in metadata
     assert "copyright_notices" in metadata
 

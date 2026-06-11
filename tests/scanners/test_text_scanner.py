@@ -71,6 +71,55 @@ def test_text_scanner_routes_extensionless_documentation_through_security_detect
     )
 
 
+@pytest.mark.parametrize(
+    ("filename", "expected_type", "content"),
+    [
+        ("LICENSE", "license", "Microsoft.\r\nCopyright (c) Microsoft Corporation.\r\nPermission is granted.\r\n"),
+        ("NOTICE", "notice", "NOTICE\nThis product includes third-party software.\nCopyright 2026 Example.\n"),
+    ],
+)
+def test_text_scanner_routes_legal_sidecars_before_pickle_probe(
+    tmp_path: Path,
+    filename: str,
+    expected_type: str,
+    content: str,
+) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text(content, encoding="utf-8")
+
+    result = scan_file(str(text_path), config={"cache_enabled": False})
+
+    assert TextScanner.can_handle(str(text_path))
+    assert result.scanner_name == "text"
+    assert any(
+        check.name == "File Type Identification" and check.details.get("file_type") == expected_type
+        for check in result.checks
+    )
+    assert not any(issue.rule_code in {"S901", "S902"} for issue in result.issues)
+    assert not any(check.rule_code in {"S901", "S902"} and "pickle" in check.message.lower() for check in result.checks)
+
+
+def test_text_scanner_does_not_claim_misleading_pickle_suffix(tmp_path: Path) -> None:
+    payload = tmp_path / "LICENSE.pkl"
+    payload.write_text("MIT License\nCopyright (c) Example\n", encoding="utf-8")
+
+    assert not TextScanner.can_handle(str(payload))
+
+
+def test_directory_scan_routes_legal_sidecar_to_text_before_pickle_probe(tmp_path: Path) -> None:
+    license_path = tmp_path / "LICENSE"
+    license_path.write_text(
+        "Microsoft.\r\nCopyright (c) Microsoft Corporation.\r\nPermission is hereby granted.\r\n",
+        encoding="utf-8",
+    )
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+    assert result.files_scanned == 1
+    assert result.scanner_names == ["text"]
+    assert not any(issue.rule_code in {"S901", "S902"} for issue in result.issues)
+
+
 @pytest.mark.parametrize("filename", ["README.en.md", "model_card.en.md", "modelcard.fr.rst"])
 def test_text_scanner_routes_localized_documentation_through_security_detectors(
     tmp_path: Path,

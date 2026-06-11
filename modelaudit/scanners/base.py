@@ -59,6 +59,7 @@ __all__ = [
 
 TRUSTED_HUGGINGFACE_SOURCES = frozenset({"huggingface"})
 FORMAT_VALIDATION_CONFIG_KEY: Final[str] = "_modelaudit_format_validation"
+LOGICAL_SCAN_PATH_CONFIG_KEY: Final[str] = "_modelaudit_logical_scan_path"
 _TRUSTED_SOURCE_PROVENANCE_TOKEN: Final[object] = object()
 _WHITELIST_STALE_WARNING_THRESHOLD_DAYS: Final[int] = 90
 _WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES: Final[frozenset[str]] = frozenset(

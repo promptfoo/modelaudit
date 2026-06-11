@@ -13,7 +13,7 @@ from urllib.parse import parse_qsl, urlsplit
 from modelaudit.core_results import mark_operational_scan_error
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from modelaudit.scanners._evidence_redaction import redact_untrusted_error_message
-from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import LOGICAL_SCAN_PATH_CONFIG_KEY, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 TEXT_CONTENT_SECURITY_SCAN_INCOMPLETE_REASON = "text_content_security_scan_incomplete"
 TEXT_CONTENT_SECURITY_DETECTOR_FAILED_REASON = "text_content_security_detector_failed"
@@ -25,6 +25,7 @@ DETECTOR_FINDING_LIMIT_TYPE = "detector_finding_limit"
 FSTRING_MIDDLE_TOKEN_TYPE = getattr(token, "FSTRING_MIDDLE", None)
 DOCUMENTATION_TEXT_FILENAMES = frozenset(
     {
+        "license",
         "license.md",
         "license.rst",
         "license.txt",
@@ -33,6 +34,10 @@ DOCUMENTATION_TEXT_FILENAMES = frozenset(
         "model_card.rst",
         "model_card.txt",
         "modelcard.md",
+        "notice",
+        "notice.md",
+        "notice.rst",
+        "notice.txt",
         "readme",
         "readme.md",
         "readme.markdown",
@@ -589,10 +594,28 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
+    def _is_legal_documentation_filename(cls, filename: str) -> bool:
+        ext = os.path.splitext(filename)[1].lower()
+        if not ext:
+            return filename in {"license", "notice"}
+        stem = filename[: -len(ext)]
+        return stem in {"license", "notice"} and ext in cls.supported_extensions
+
+    def _routed_filename(self, path: str) -> str:
+        logical_name = self.config.get(LOGICAL_SCAN_PATH_CONFIG_KEY)
+        if isinstance(logical_name, str) and logical_name:
+            return os.path.basename(logical_name).lower()
+        return os.path.basename(path).lower()
+
+    @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given file."""
         filename = os.path.basename(path).lower()
-        if cls._is_model_card_documentation_filename(filename) or cls._is_readme_documentation_filename(filename):
+        if (
+            cls._is_model_card_documentation_filename(filename)
+            or cls._is_readme_documentation_filename(filename)
+            or cls._is_legal_documentation_filename(filename)
+        ):
             return True
 
         ext = os.path.splitext(path)[1].lower()
@@ -615,9 +638,14 @@ class TextScanner(BaseScanner):
             "model_card.rst",
             "model_card.txt",
             "modelcard.md",
+            "license",
             "license.txt",
             "license.md",
             "license.rst",
+            "notice",
+            "notice.txt",
+            "notice.md",
+            "notice.rst",
             "requirements.txt",
         }
 
@@ -1830,10 +1858,20 @@ class TextScanner(BaseScanner):
                     rule_code=None,  # Passing check
                 )
 
-            filename = os.path.basename(path).lower()
+            filename = self._routed_filename(path)
 
             # Identify file type - these are informational checks, not security issues
-            if filename in DOCUMENTATION_TEXT_FILENAMES:
+            if self._is_legal_documentation_filename(filename):
+                file_type = "license" if filename.startswith("license") else "notice"
+                result.add_check(
+                    name="File Type Identification",
+                    passed=True,
+                    message="License or notice file",
+                    location=path,
+                    details={"file_type": file_type},
+                    rule_code=None,  # Passing check
+                )
+            elif filename in DOCUMENTATION_TEXT_FILENAMES:
                 result.add_check(
                     name="File Type Identification",
                     passed=True,
@@ -1858,15 +1896,6 @@ class TextScanner(BaseScanner):
                     message="Classification labels file",
                     location=path,
                     details={"file_type": "labels"},
-                    rule_code=None,  # Passing check
-                )
-            elif filename in ["license.txt", "license.md"]:
-                result.add_check(
-                    name="File Type Identification",
-                    passed=True,
-                    message="License file",
-                    location=path,
-                    details={"file_type": "license"},
                     rule_code=None,  # Passing check
                 )
             elif filename == "requirements.txt":

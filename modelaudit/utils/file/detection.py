@@ -1,3 +1,5 @@
+import base64
+import binascii
 import bz2
 import codecs
 import json
@@ -309,6 +311,42 @@ _COMPRESSED_EXTENSION_CODECS = {
     ".lz4": "lz4",
     ".zlib": "zlib",
 }
+_LEGAL_TEXT_ROUTE_MAX_BYTES = 2 * 1024 * 1024
+_LEGAL_TEXT_BASENAMES = frozenset({"license", "notice"})
+_LEGAL_TEXT_EXTENSIONS = frozenset({"", ".txt", ".md", ".markdown", ".rst"})
+_LEGAL_TEXT_ALLOWED_CONTROLS = frozenset({"\t", "\n", "\r", "\f"})
+_LEGAL_TEXT_SIGNAL_RE = re.compile(
+    r"\b(?:"
+    r"all rights reserved|apache|bsd|copyright|license|licence|mit|notice|permission|"
+    r"redistribution|spdx-license-identifier|third[- ]party"
+    r")\b",
+    re.IGNORECASE,
+)
+_LEGAL_TEXT_BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{10,}={0,2}(?![A-Za-z0-9+/=])")
+_LEGAL_TEXT_HEX_TOKEN_RE = re.compile(rb"(?<![A-Fa-f0-9])[A-Fa-f0-9]{20,}(?![A-Fa-f0-9])")
+_LEGAL_TEXT_MAX_ENCODED_TOKENS = 64
+_LEGAL_TEXT_MAX_DECODED_BYTES = 1024 * 1024
+_LEGAL_TEXT_ENCODED_EXECUTION_PATTERNS = (
+    b"eval(",
+    b"exec(",
+    b"os.system",
+    b"subprocess",
+    b"__import__",
+)
+_LEGAL_TEXT_EMBEDDED_PICKLE_GLOBAL_RE = re.compile(
+    rb"(?=[#()\]\}lpt0FGIJKLMNPSTUVX]{0,256}[ci][^\n\r]{1,128}\n[^\n\r]{1,128}\n)"
+)
+_LEGAL_TEXT_EMBEDDED_PICKLE_SEEDS = (
+    b"__builtin__",
+    b"builtins",
+    b"eval",
+    b"exec",
+    b"os\n",
+    b"posix",
+    b"subprocess",
+    b"system",
+)
+_LEGAL_TEXT_MAX_EMBEDDED_PICKLE_CANDIDATES = 4096
 
 
 def _is_supported_llamafile_executable_header(header: bytes) -> bool:
@@ -3097,6 +3135,185 @@ def _classify_extended_initial_line_pickle_security_signal(
     )
 
 
+def _logical_basename_for_route(path: Path, logical_name: str | None = None) -> str:
+    if logical_name:
+        return PurePosixPath(logical_name).name.lower()
+    return path.name.lower()
+
+
+def _is_legal_text_sidecar_name(path: Path, logical_name: str | None = None) -> bool:
+    filename = _logical_basename_for_route(path, logical_name)
+    suffixes = PurePosixPath(filename).suffixes
+    extension = suffixes[-1].lower() if suffixes else ""
+    if extension not in _LEGAL_TEXT_EXTENSIONS:
+        return False
+    basename = filename[: -len(extension)] if extension else filename
+    return basename in _LEGAL_TEXT_BASENAMES
+
+
+def _contains_only_plain_text_controls(text: str) -> bool:
+    for character in text:
+        codepoint = ord(character)
+        if character in _LEGAL_TEXT_ALLOWED_CONTROLS:
+            continue
+        if codepoint < 0x20 or 0x7F <= codepoint <= 0x9F:
+            return False
+    return True
+
+
+def _complete_utf8_legal_text(payload: bytes) -> bool:
+    try:
+        text = payload.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False
+    if not text.strip() or not _contains_only_plain_text_controls(text):
+        return False
+    return _LEGAL_TEXT_SIGNAL_RE.search(text) is not None
+
+
+def _classify_pickle_security_payload(payload: bytes) -> str | None:
+    if not payload:
+        return None
+    if _looks_like_binary_pickle_protocol(payload[:4]):
+        state = _classify_initial_pickle_security_signal(
+            payload[:PROTO0_1_MAX_PROBE_BYTES],
+            sample_is_prefix=len(payload) > PROTO0_1_MAX_PROBE_BYTES,
+            available_stream_length=len(payload),
+        )
+        if state is False:
+            return "pickle"
+        return "pickle" if state is True else PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    state = _classify_initial_pickle_security_signal(
+        payload[:PROTO0_1_MAX_PROBE_BYTES],
+        sample_is_prefix=len(payload) > PROTO0_1_MAX_PROBE_BYTES,
+        available_stream_length=len(payload),
+    )
+    if state is True:
+        return "pickle"
+    if state is None and _could_start_proto0_or_1_pickle(payload):
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    if _looks_like_proto0_or_1_pickle(
+        payload[:PROTO0_1_MAX_PROBE_BYTES],
+        sample_is_prefix=len(payload) > PROTO0_1_MAX_PROBE_BYTES,
+    ):
+        return "pickle"
+    return None
+
+
+def _decoded_token_pickle_route(decoded: bytes) -> str | None:
+    lowered = decoded.lower()
+    if any(pattern in lowered for pattern in _LEGAL_TEXT_ENCODED_EXECUTION_PATTERNS):
+        return "pickle"
+    return _classify_pickle_security_payload(decoded)
+
+
+def _decode_base64_route_token(token: bytes) -> bytes:
+    padding = b"=" * ((4 - (len(token) % 4)) % 4)
+    return base64.b64decode(token + padding, validate=True)
+
+
+def _encoded_pickle_route(payload: bytes) -> str | None:
+    decoded_budget = _LEGAL_TEXT_MAX_DECODED_BYTES
+    seen_tokens: set[tuple[str, bytes]] = set()
+    token_count = 0
+
+    for decoder_name, token_re, decoder in (
+        ("base64", _LEGAL_TEXT_BASE64_TOKEN_RE, _decode_base64_route_token),
+        ("hex", _LEGAL_TEXT_HEX_TOKEN_RE, binascii.unhexlify),
+    ):
+        for match in token_re.finditer(payload):
+            if token_count >= _LEGAL_TEXT_MAX_ENCODED_TOKENS or decoded_budget <= 0:
+                return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+            token = match.group(0)
+            token_key = (decoder_name, token)
+            if token_key in seen_tokens:
+                continue
+            seen_tokens.add(token_key)
+            token_count += 1
+            try:
+                decoded = decoder(token)
+            except (binascii.Error, ValueError):
+                continue
+            if not decoded:
+                continue
+            if len(decoded) > decoded_budget:
+                return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+            decoded_budget -= len(decoded)
+            route = _decoded_token_pickle_route(decoded)
+            if route is not None:
+                return route
+    return None
+
+
+def _embedded_raw_pickle_route(payload: bytes) -> str | None:
+    binary_offset = payload.find(b"\x80")
+    while binary_offset != -1:
+        if _looks_like_binary_pickle_protocol(payload[binary_offset : binary_offset + 4]):
+            return "pickle" if binary_offset == 0 else PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        binary_offset = payload.find(b"\x80", binary_offset + 1)
+
+    lowered = payload.lower()
+    if not any(seed in lowered for seed in _LEGAL_TEXT_EMBEDDED_PICKLE_SEEDS):
+        return None
+
+    for candidate_count, match in enumerate(_LEGAL_TEXT_EMBEDDED_PICKLE_GLOBAL_RE.finditer(payload), start=1):
+        if candidate_count > _LEGAL_TEXT_MAX_EMBEDDED_PICKLE_CANDIDATES:
+            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        offset = match.start()
+        suffix = payload[offset : offset + PROTO0_1_MAX_PROBE_BYTES]
+        state = _classify_initial_pickle_security_signal(
+            suffix,
+            sample_is_prefix=len(payload) - offset > len(suffix),
+            available_stream_length=len(payload) - offset,
+        )
+        if state is True:
+            return "pickle"
+        if state is None:
+            return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    return None
+
+
+def _legal_text_sidecar_route_from_bytes(
+    path: Path,
+    payload: bytes,
+    *,
+    logical_name: str | None = None,
+) -> str | None:
+    if not _is_legal_text_sidecar_name(path, logical_name):
+        return None
+
+    raw_route = _embedded_raw_pickle_route(payload)
+    if raw_route is not None:
+        return raw_route
+
+    encoded_route = _encoded_pickle_route(payload)
+    if encoded_route is not None:
+        return encoded_route
+
+    if _complete_utf8_legal_text(payload):
+        return "text"
+    return None
+
+
+def _detect_legal_text_sidecar_route(
+    path: Path,
+    size: int,
+    *,
+    logical_name: str | None = None,
+) -> str | None:
+    if size <= 0 or size > _LEGAL_TEXT_ROUTE_MAX_BYTES or not _is_legal_text_sidecar_name(path, logical_name):
+        return None
+    try:
+        with path.open("rb") as handle:
+            payload = handle.read(_LEGAL_TEXT_ROUTE_MAX_BYTES + 1)
+    except OSError:
+        return None
+    if len(payload) != size:
+        return None
+    return _legal_text_sidecar_route_from_bytes(path, payload, logical_name=logical_name)
+
+
 def _detect_safetensors_content_route(path: Path | None, magic8: bytes, file_size: int) -> str | None:
     """Resolve a validated SafeTensors frame that may also contain a pickle."""
     validated_header = _validated_safetensors_routing_header(path, magic8, file_size)
@@ -5657,7 +5874,7 @@ def detect_format_from_magic_bytes(
     return "unknown"
 
 
-def detect_file_format_from_magic(path: str) -> str:
+def detect_file_format_from_magic(path: str, *, logical_name: str | None = None) -> str:
     """Detect file format solely from magic bytes."""
     file_path = Path(path)
     if file_path.is_dir():
@@ -5715,8 +5932,16 @@ def detect_file_format_from_magic(path: str) -> str:
                 tar_route = _detect_tar_route(path)
                 if tar_route in {"nemo", NEMO_ROUTING_INCONCLUSIVE_FORMAT}:
                     return tar_route
+            if format_result == "pickle":
+                legal_text_route = _detect_legal_text_sidecar_route(file_path, size, logical_name=logical_name)
+                if legal_text_route is not None:
+                    return legal_text_route
             if format_result != "unknown":
                 return format_result
+
+            legal_text_route = _detect_legal_text_sidecar_route(file_path, size, logical_name=logical_name)
+            if legal_text_route is not None:
+                return legal_text_route
 
             # Protocol 0/1 pickle payloads can evade short magic-byte checks.
             # Probe a bounded prefix and require a valid opcode stream.
@@ -5841,7 +6066,7 @@ def detect_xgboost_ubjson_content_route(path: str) -> str | None:
         return None
 
 
-def detect_file_format_for_skip_filter(path: str) -> str:
+def detect_file_format_for_skip_filter(path: str, *, logical_name: str | None = None) -> str:
     """Cheap content detection for skipped-extension preservation.
 
     This intentionally recognizes only content-derived format signals. It avoids
@@ -5889,8 +6114,16 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             if tar_route is not None:
                 return tar_route
             return format_result
+        if format_result == "pickle":
+            legal_text_route = _detect_legal_text_sidecar_route(file_path, size, logical_name=logical_name)
+            if legal_text_route is not None:
+                return legal_text_route
         if format_result != "unknown":
             return format_result
+
+        legal_text_route = _detect_legal_text_sidecar_route(file_path, size, logical_name=logical_name)
+        if legal_text_route is not None:
+            return legal_text_route
 
         if _could_start_proto0_or_1_pickle(prefix):
             max_probe_size = min(size, PROTO0_1_MAX_PROBE_BYTES)
@@ -5966,7 +6199,7 @@ def detect_file_format_for_skip_filter(path: str) -> str:
     return "unknown"
 
 
-def detect_file_format(path: str) -> str:
+def detect_file_format(path: str, *, logical_name: str | None = None) -> str:
     """
     Attempt to identify the format:
     - TensorFlow SavedModel (directory with saved_model.pb)
@@ -6049,6 +6282,9 @@ def detect_file_format(path: str) -> str:
             return safetensors_route
         if structural_torch7_route:
             return "torch7"
+        legal_text_route = _detect_legal_text_sidecar_route(file_path, size, logical_name=logical_name)
+        if legal_text_route is not None:
+            return legal_text_route
         could_be_flax = _could_be_content_routed_flax_msgpack(file_path)
         if _looks_like_binary_pickle_protocol(magic4) and not could_be_flax:
             return "pickle"

@@ -18,6 +18,10 @@ from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
+from modelaudit.scanner_selection import (
+    resolve_scanner_selection_policy,
+    selected_scanner_filenames,
+)
 from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
 from modelaudit.utils.sources._huggingface_download_worker import _run_operation as _run_huggingface_worker_operation
 from modelaudit.utils.sources.huggingface import (
@@ -45,6 +49,14 @@ from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 from tests.helpers import create_mock_coreml, create_mock_onnx
 
 _HF_TEST_REVISION = "a" * 40
+_PHI4_LICENSE_REVISION = "932b33c0ec9ca189badeb22480721a8de9d0e006"
+_PHI4_LICENSE_TEXT = (
+    "Microsoft.\r\n"
+    "Copyright (c) Microsoft Corporation.\r\n"
+    "\r\n"
+    "Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated "
+    'documentation files (the "Software"), to deal in the Software without restriction.\r\n'
+)
 
 
 class _FakeRangeResponse:
@@ -2512,6 +2524,54 @@ class TestModelDownloadStreaming:
         assert results == [(readme_path, True)]
         assert mock_hf_hub_download.call_count == 1
         assert mock_hf_hub_download.call_args.kwargs["filename"] == "README"
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            ["LICENSE", "README.md", "model-00001-of-00006.safetensors", "model-00002-of-00006.safetensors"],
+            _PHI4_LICENSE_REVISION,
+            None,
+        ),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_text_selection_preserves_phi4_license_without_weights(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Pinned phi-4 LICENSE should be selected without downloading model weights."""
+        license_path = tmp_path / "LICENSE"
+        license_path.write_text(_PHI4_LICENSE_TEXT, encoding="utf-8")
+        license_size = len(_PHI4_LICENSE_TEXT.encode("utf-8"))
+        mock_hf_hub_download.return_value = str(license_path)
+        mock_get_paths_info.return_value = [SimpleNamespace(path="LICENSE", size=license_size)]
+
+        policy = resolve_scanner_selection_policy(scanners=["text"])
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/microsoft/phi-4",
+                max_size=license_size + 1,
+                scannable_extensions=set(),
+                scannable_filenames=selected_scanner_filenames(policy, conservative=True),
+                scannable_scanner_ids=policy.enabled_scanner_ids,
+            )
+        )
+
+        assert results == [(license_path, True)]
+        mock_get_paths_info.assert_called_once_with(
+            "microsoft/phi-4",
+            ["LICENSE"],
+            revision=_PHI4_LICENSE_REVISION,
+        )
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="microsoft/phi-4",
+            filename="LICENSE",
+            revision=_PHI4_LICENSE_REVISION,
+        )
+        assert all("safetensors" not in str(call_args) for call_args in mock_hf_hub_download.mock_calls)
 
     @patch("huggingface_hub.hf_hub_download")
     def test_download_model_streaming_selected_filename_ignores_unrelated_extensionless_files(

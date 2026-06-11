@@ -58,7 +58,7 @@ from ..utils.file.detection import (
     is_torchserve_mar_archive,
 )
 from ..utils.file.hdf5 import HDF5_SIGNATURE_SCAN_MAX_BYTES, find_hdf5_signature_offset
-from .base import FORMAT_VALIDATION_CONFIG_KEY
+from .base import FORMAT_VALIDATION_CONFIG_KEY, LOGICAL_SCAN_PATH_CONFIG_KEY
 from .mxnet_scanner import MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY
 from .xgboost_scanner import (
     XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY,
@@ -334,6 +334,21 @@ def merge_safetensors_overlap_analysis(
         if isinstance(supplemental_scanners, list):
             result.metadata["supplemental_scanners"] = list(dict.fromkeys(supplemental_scanners))
         _deduplicate_exact_merged_findings(result)
+
+
+def _detect_nested_format(
+    detector: Callable[..., str],
+    path: str,
+    logical_name: str | None,
+) -> str:
+    if logical_name is None:
+        return detector(path)
+    try:
+        return detector(path, logical_name=logical_name)
+    except TypeError as exc:
+        if "logical_name" not in str(exc):
+            raise
+        return detector(path)
 
 
 def _nested_scanner_can_handle(
@@ -1163,6 +1178,9 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
     from . import _registry
     from .zip_scanner import ZipPreflightRejected, ZipScanner
 
+    logical_name = None
+    if config is not None and isinstance(config.get(LOGICAL_SCAN_PATH_CONFIG_KEY), str):
+        logical_name = config[LOGICAL_SCAN_PATH_CONFIG_KEY]
     scanner_selection = policy_from_config(config)
     hdf5_signature_offset = find_hdf5_signature_offset(path)
     safetensors_overlap_scanner_ids = detect_safetensors_overlap_scanner_ids(path)
@@ -1210,8 +1228,8 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
     ):
         return with_safetensors_overlap(ZipScanner(config=config).scan(path))
     scanner_class = None
-    routed_content_format = detect_file_format(path)
-    trusted_content_format = detect_file_format_from_magic(path)
+    routed_content_format = _detect_nested_format(detect_file_format, path, logical_name)
+    trusted_content_format = _detect_nested_format(detect_file_format_from_magic, path, logical_name)
     if is_safetensors_hdf5_overlap:
         trusted_content_format = "hdf5"
     skipped_overlap_scanner_id: str | None = None
@@ -1308,7 +1326,9 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         result.finish(success=not result.has_errors)
         return with_safetensors_overlap(result)
 
-    header_format_override = trusted_content_format if trusted_content_format in {"hdf5", "mxnet", "xgboost"} else None
+    header_format_override = (
+        trusted_content_format if trusted_content_format in {"hdf5", "mxnet", "text", "xgboost"} else None
+    )
     try:
         scanner_id = _select_nested_scanner_id(path, header_format_override, config)
     except ZipPreflightRejected as exc:

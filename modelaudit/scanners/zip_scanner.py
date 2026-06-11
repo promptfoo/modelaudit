@@ -23,7 +23,7 @@ from .archive_dispatch import (
     scan_nested_file,
 )
 from .archive_member_security import is_executable_archive_member_name, scan_archive_member_for_known_risks
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import LOGICAL_SCAN_PATH_CONFIG_KEY, BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
     "/etc",
@@ -2024,6 +2024,7 @@ class ZipScanner(BaseScanner):
                         # stable cache keys for a subsequent scan.
                         nested_config["cache_enabled"] = False
                         nested_config["_archive_depth"] = depth + 1
+                        nested_config[LOGICAL_SCAN_PATH_CONFIG_KEY] = name
                         if zipfile.is_zipfile(tmp_path):
                             nested_config["_zip_depth"] = depth + 1
 

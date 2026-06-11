@@ -55,7 +55,7 @@ from modelaudit.scanners.archive_dispatch import (
     merge_inconclusive_flax_msgpack_outcome,
     merge_safetensors_overlap_analysis,
 )
-from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
+from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, LOGICAL_SCAN_PATH_CONFIG_KEY, BaseScanner
 from modelaudit.scanners.mxnet_scanner import MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY
 from modelaudit.scanners.safetensors_scanner import MAX_HEADER_BYTES as SAFETENSORS_MAX_HEADER_BYTES
 from modelaudit.scanners.xgboost_scanner import (
@@ -3618,7 +3618,17 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         format_probe_error = e
 
     try:
-        header_format = "unknown" if format_probe_error is not None else detect_file_format(path)
+        logical_scan_path = config.get(LOGICAL_SCAN_PATH_CONFIG_KEY)
+        logical_name = logical_scan_path if isinstance(logical_scan_path, str) else None
+        header_format = (
+            "unknown"
+            if format_probe_error is not None
+            else (
+                detect_file_format(path, logical_name=logical_name)
+                if logical_name is not None
+                else detect_file_format(path)
+            )
+        )
     except OSError as e:
         # Dedicated scanners can produce a format-specific inconclusive result
         # once extension routing selects their ownership.
@@ -3645,7 +3655,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         magic_format = header_format
     else:
         try:
-            magic_format = detect_file_format_from_magic(path)
+            magic_format = (
+                detect_file_format_from_magic(path, logical_name=logical_name)
+                if logical_name is not None
+                else detect_file_format_from_magic(path)
+            )
         except OSError as e:
             magic_format = "unknown"
             format_probe_error = e

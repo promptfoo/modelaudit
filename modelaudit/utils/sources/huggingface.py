@@ -632,12 +632,15 @@ def _detect_huggingface_content_route_format(
         return None
 
     from modelaudit.utils.file.detection import (
+        _LEGAL_TEXT_ROUTE_MAX_BYTES,
         _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS,
         PROTO0_1_MAX_PROBE_BYTES,
         _allows_renamed_binary_content_route,
         _could_start_proto0_or_1_pickle,
         _is_cntk_signature,
         _is_content_routed_lightgbm_signature,
+        _is_legal_text_sidecar_name,
+        _legal_text_sidecar_route_from_bytes,
         _looks_like_proto0_or_1_pickle,
         _looks_like_uncompressed_tar_header,
         detect_format_from_magic_bytes,
@@ -671,6 +674,25 @@ def _detect_huggingface_content_route_format(
     mxnet_route = _detect_huggingface_mxnet_symbol_route(repo_id, filename, revision, budget, prefix)
     if mxnet_route is not None:
         return mxnet_route
+
+    if _is_legal_text_sidecar_name(remote_path, filename):
+        legal_probe = _read_huggingface_probe(
+            repo_id,
+            filename,
+            revision,
+            budget,
+            prefix,
+            _LEGAL_TEXT_ROUTE_MAX_BYTES + 1,
+        )
+        if not _huggingface_sample_is_prefix(
+            budget,
+            filename,
+            legal_probe,
+            _LEGAL_TEXT_ROUTE_MAX_BYTES + 1,
+        ):
+            legal_route = _legal_text_sidecar_route_from_bytes(remote_path, legal_probe, logical_name=filename)
+            if legal_route is not None:
+                return legal_route
 
     if _could_start_proto0_or_1_pickle(prefix):
         pickle_probe = _read_huggingface_probe(
