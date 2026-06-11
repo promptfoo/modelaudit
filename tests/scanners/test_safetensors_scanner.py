@@ -403,6 +403,30 @@ def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -
     )
 
 
+def test_license_metadata_untrusted_url_is_not_suppressed(tmp_path: Path) -> None:
+    file_path = tmp_path / "license_metadata_untrusted_url.safetensors"
+    payload = ordinary_license_text_with_url() + "\nAdditional terms: https://evil.example/payload"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert "suspicious_pattern" in result.metadata["custom_metadata_security_flags"]
+    assert any(issue.rule_code == "S905" and "license" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Metadata Pattern Check"
+        and check.status == CheckStatus.FAILED
+        and check.details == {"key": "license", "pattern": "https?://"}
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize("key", ["license_payload", "license_url_bypass", "licensee"])
 def test_deceptive_license_metadata_keys_do_not_get_license_context(tmp_path: Path, key: str) -> None:
     file_path = tmp_path / "deceptive_license_metadata.safetensors"

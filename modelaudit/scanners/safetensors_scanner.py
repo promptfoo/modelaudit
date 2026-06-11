@@ -8,6 +8,7 @@ import re
 import struct
 from collections.abc import Iterator
 from typing import Any, ClassVar
+from urllib.parse import urlparse
 
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_METADATA_PATTERNS
 
@@ -223,6 +224,18 @@ _LICENSE_DOCUMENT_MARKERS = (
 )
 _LICENSE_DOCUMENT_MIN_CHARS = 500
 _DUPLICATE_JSON_KEY_DETAIL_LIMIT = 20
+_URL_METADATA_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+_LICENSE_REFERENCE_HOST_SUFFIXES = (
+    "apache.org",
+    "creativecommons.org",
+    "github.com",
+    "gnu.org",
+    "mozilla.org",
+    "opensource.org",
+    "spdx.org",
+)
+_LICENSE_REFERENCE_PATH_MARKERS = ("license", "licence", "licensing", "legal", "terms", "policy")
+_SUSPICIOUS_LICENSE_URL_MARKERS = ("payload", "exfil", "webhook", "callback", "/raw/", ".sh", ".ps1", ".cmd")
 
 
 class SafeTensorsScanner(BaseScanner):
@@ -385,6 +398,32 @@ class SafeTensorsScanner(BaseScanner):
             return False
         return "license" in lower_value and any(marker in lower_value for marker in _LICENSE_DOCUMENT_MARKERS)
 
+    @staticmethod
+    def _url_host_matches_suffix(hostname: str, suffix: str) -> bool:
+        return hostname == suffix or hostname.endswith(f".{suffix}")
+
+    @classmethod
+    def _url_looks_like_license_reference(cls, raw_url: str) -> bool:
+        cleaned_url = raw_url.rstrip(").,;:]}")
+        parsed = urlparse(cleaned_url)
+        hostname = parsed.hostname.lower() if parsed.hostname else ""
+        if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+            return False
+
+        lowered_url = cleaned_url.lower()
+        if any(marker in lowered_url for marker in _SUSPICIOUS_LICENSE_URL_MARKERS):
+            return False
+
+        path = parsed.path.lower()
+        if any(marker in path for marker in _LICENSE_REFERENCE_PATH_MARKERS):
+            return True
+        return any(cls._url_host_matches_suffix(hostname, suffix) for suffix in _LICENSE_REFERENCE_HOST_SUFFIXES)
+
+    @classmethod
+    def _license_document_urls_are_documentary(cls, value: str) -> bool:
+        urls = _URL_METADATA_PATTERN.findall(value)
+        return all(cls._url_looks_like_license_reference(url) for url in urls)
+
     @classmethod
     def _metadata_value_has_active_risk(cls, value: str) -> bool:
         lower_value = value.lower()
@@ -423,7 +462,11 @@ class SafeTensorsScanner(BaseScanner):
             return False
         if key.strip().lower() not in _LICENSE_METADATA_KEYS:
             return False
-        return cls._looks_like_ordinary_license_document(value) and not cls._metadata_value_has_active_risk(value)
+        return (
+            cls._looks_like_ordinary_license_document(value)
+            and cls._license_document_urls_are_documentary(value)
+            and not cls._metadata_value_has_active_risk(value)
+        )
 
     @classmethod
     def _summarize_custom_metadata(cls, custom_metadata: Any) -> dict[str, Any]:
