@@ -26,10 +26,6 @@ def _write_orbax_metadata(checkpoint_dir: Path, metadata: dict[str, object]) -> 
     (checkpoint_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
 
 
-def _descriptor_bound_directory_owner_path_available() -> bool:
-    return bool(hasattr(os, "fchdir") or Path("/proc/self/fd").is_dir() or Path("/dev/fd").is_dir())
-
-
 def _proto4_short_unicode(value: str) -> bytes:
     encoded = value.encode("utf-8")
     assert len(encoded) <= 255
@@ -2520,8 +2516,8 @@ def test_malformed_orbax_metadata_is_inconclusive(tmp_path: Path) -> None:
         for check in result.checks
     )
     owner_metadata = aggregate.file_metadata[str(checkpoint_dir)]
-    if _descriptor_bound_directory_owner_path_available():
-        assert owner_metadata["directory_owner_scan"] is True
+    if owner_metadata["directory_owner_scan"]:
+        assert "jax_orbax_metadata_parse_failed" in owner_metadata["scan_outcome_reasons"]
     else:
         assert owner_metadata["directory_owner_scan"] is False
         assert any(

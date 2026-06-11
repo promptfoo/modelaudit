@@ -10,6 +10,7 @@ import io
 import json
 import os
 import pickle
+import stat
 import struct
 import subprocess
 import sys
@@ -18,6 +19,7 @@ import zipfile
 import zlib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -77,6 +79,77 @@ from tests.helpers import (
 )
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
+
+
+def _stat_result_with(
+    source: os.stat_result,
+    *,
+    size: int | None = None,
+    nlink: int | None = None,
+    ctime: float | None = None,
+) -> os.stat_result:
+    values = list(source)
+    if nlink is not None:
+        values[3] = nlink
+    if size is not None:
+        values[6] = size
+    if ctime is not None:
+        values[9] = ctime
+    return os.stat_result(values)
+
+
+def _install_stale_directory_scandir_stats(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_scandir = core_module.os.scandir
+
+    class StaleDirectoryEntry:
+        def __init__(self, entry: Any) -> None:
+            self._entry = entry
+            self.name = entry.name
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._entry, name)
+
+        def stat(self, *args: Any, **kwargs: Any) -> os.stat_result:
+            entry_stat = cast(os.stat_result, self._entry.stat(*args, **kwargs))
+            if stat.S_ISDIR(entry_stat.st_mode):
+                return _stat_result_with(
+                    entry_stat,
+                    size=entry_stat.st_size + 4096,
+                    nlink=entry_stat.st_nlink + 1,
+                    ctime=entry_stat.st_ctime + 10,
+                )
+            return entry_stat
+
+    class StaleScandir:
+        def __init__(self, path: Any) -> None:
+            self._context = real_scandir(path)
+            self._iterator: Iterator[Any] | None = None
+
+        def __enter__(self) -> StaleScandir:
+            self._iterator = iter(self._context.__enter__())
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            traceback: object | None,
+        ) -> None:
+            self._context.__exit__(exc_type, exc, traceback)
+
+        def __iter__(self) -> StaleScandir:
+            if self._iterator is None:
+                self._iterator = iter(self._context)
+            return self
+
+        def __next__(self) -> StaleDirectoryEntry:
+            if self._iterator is None:
+                self._iterator = iter(self._context)
+            return StaleDirectoryEntry(next(self._iterator))
+
+    monkeypatch.setattr(core_module.os, "supports_fd", set())
+    monkeypatch.setattr(core_module.os, "supports_dir_fd", set())
+    monkeypatch.setattr(core_module.os, "scandir", StaleScandir)
 
 
 def _mock_weight_distribution_scanner_availability(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1146,6 +1219,11 @@ def test_directory_scan_fails_closed_when_owner_root_is_swapped_and_restored(
         finally:
             model_dir.rename(replacement_dir)
             parked_dir.rename(model_dir)
+            restored_stat = model_dir.stat()
+            os.utime(
+                model_dir,
+                ns=(restored_stat.st_atime_ns, restored_stat.st_mtime_ns + 1_000_000_000),
+            )
 
     monkeypatch.setattr(JaxCheckpointScanner, "scan", swap_root_during_owner_scan)
 
@@ -1389,6 +1467,50 @@ def test_directory_scan_dispatches_structure_only_owner_without_child_files(
     assert result.has_errors is False
 
 
+def test_directory_owner_snapshot_detects_directory_metadata_drift(tmp_path: Path) -> None:
+    model_dir = tmp_path / "owner-root"
+    model_dir.mkdir()
+    directory_entry = core_module._directory_owner_snapshot_entry(model_dir, ())
+    drifted_directory_entry = replace(
+        directory_entry,
+        size=directory_entry.size + 4096,
+        link_count=directory_entry.link_count + 1,
+        ctime_ns=directory_entry.ctime_ns + 10_000_000_000,
+    )
+
+    source_path = model_dir / "metadata.json"
+    source_path.write_text('{"format":"orbax"}', encoding="utf-8")
+    source_entry = core_module._directory_owner_snapshot_entry(source_path, ("metadata.json",))
+    drifted_source_entry = replace(source_entry, ctime_ns=source_entry.ctime_ns + 10_000_000_000)
+
+    assert core_module._directory_owner_snapshot_changed_paths(
+        (directory_entry,),
+        (drifted_directory_entry,),
+    ) == {()}
+    assert core_module._directory_owner_snapshot_changed_paths(
+        (source_entry,),
+        (drifted_source_entry,),
+    ) == {("metadata.json",)}
+
+
+def test_path_fallback_directory_owner_snapshot_uses_lstat_for_child_directory_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "orbax-model"
+    (model_dir / "checkpoint_1").mkdir(parents=True)
+    _install_stale_directory_scandir_stats(monkeypatch)
+
+    snapshot = core_module._capture_directory_owner_namespace(
+        model_dir,
+        JaxCheckpointScanner,
+        deadline=core_module.time.time() + 10,
+        max_entries=10,
+    )
+
+    assert any(entry.relative_parts == ("checkpoint_1",) for entry in snapshot)
+
+
 @pytest.mark.skipif(
     not _DESCRIPTOR_BOUND_DIRECTORY_OWNER_PATH_AVAILABLE,
     reason="descriptor-bound directory owner path is unavailable",
@@ -1495,6 +1617,30 @@ def test_filtered_savedmodel_owner_asset_updates_aggregate_hash_and_accounting(t
     assert first.bytes_scanned != second.bytes_scanned
     assert determine_exit_code(first) == 0
     assert determine_exit_code(second) == 0
+
+
+def test_filtered_savedmodel_owner_hash_survives_stale_scandir_directory_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_tf_protos()
+    model_dir = tmp_path / "saved-model"
+    model_dir.mkdir()
+    saved_model_path = model_dir / "saved_model.pb"
+    _write_safe_savedmodel(saved_model_path)
+    assets_dir = model_dir / "assets"
+    assets_dir.mkdir()
+    asset_path = assets_dir / "notes.txt"
+    asset_path.write_bytes(b"benign asset")
+    _install_stale_directory_scandir_stats(monkeypatch)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    assert result.content_hash is not None
+    assert result.files_scanned == 2
+    assert result.bytes_scanned == saved_model_path.stat().st_size + asset_path.stat().st_size
+    assert result.file_metadata[str(model_dir)]["directory_owner_scan"] is True
+    assert determine_exit_code(result) == 0
 
 
 def test_savedmodel_owner_and_child_sources_share_total_size_budget(tmp_path: Path) -> None:

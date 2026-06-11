@@ -646,12 +646,12 @@ def _capture_directory_owner_namespace(
                         f"Directory owner namespace exceeds {max_entries} entries",
                     )
 
-                entry_stat = lexical_entry.stat(follow_symlinks=False)
+                relative_parts = (*root_relative_parts, lexical_entry.name)
+                entry_path = root_path.joinpath(*relative_parts)
+                entry_stat = entry_path.lstat()
                 reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
                 file_attributes = getattr(entry_stat, "st_file_attributes", 0)
                 is_link = stat.S_ISLNK(entry_stat.st_mode) or bool(reparse_flag and file_attributes & reparse_flag)
-                relative_parts = (*root_relative_parts, lexical_entry.name)
-                entry_path = root_path.joinpath(*relative_parts)
                 if stat.S_ISDIR(entry_stat.st_mode) and not is_link:
                     child_directories.append((entry_path, relative_parts, entry_stat))
 
