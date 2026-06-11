@@ -329,6 +329,60 @@ def test_exit_code_check_details_incomplete_without_security_findings() -> None:
     assert determine_exit_code(results) == 2
 
 
+def test_exit_code_consolidated_check_findings_preserve_incomplete_coverage() -> None:
+    """Consolidated check findings should not hide detail-only incomplete coverage."""
+    child = _create_result_model(
+        checks=[
+            Check(
+                name="DVC Output Resolution",
+                status=CheckStatus.FAILED,
+                message="DVC output resolution incomplete",
+                severity=IssueSeverity.INFO,
+                location="model.dvc",
+                details={
+                    "component_count": 2,
+                    "findings": [
+                        {"analysis_incomplete": True, "scan_outcome_reason": "dvc_output_limit_exceeded"},
+                        {"component": "covered-sibling"},
+                    ],
+                },
+                timestamp=0.0,
+            ),
+        ],
+    )
+    aggregate = _create_result_model()
+
+    aggregate.aggregate_scan_result(child.model_dump())
+
+    assert aggregate.success is False
+    assert results_have_inconclusive_outcome(aggregate) is True
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_direct_aggregate_scan_result_preserves_consolidated_incomplete_coverage() -> None:
+    """Direct ScanResult aggregation should recurse through consolidated check details."""
+    scan_result = ScanResult(scanner_name="synthetic")
+    scan_result.add_check(
+        name="DVC Output Resolution",
+        passed=False,
+        message="DVC output resolution incomplete",
+        severity=IssueSeverity.INFO,
+        location="model.dvc",
+        details={
+            "component_count": 2,
+            "findings": [{"scan_outcome_reasons": ["dvc_output_limit_exceeded"]}],
+        },
+    )
+    scan_result.finish(success=True)
+    aggregate = _create_result_model()
+
+    aggregate.aggregate_scan_result_direct(scan_result)
+
+    assert aggregate.success is False
+    assert results_have_inconclusive_outcome(aggregate) is True
+    assert determine_exit_code(aggregate) == 2
+
+
 def test_exit_code_issue_details_incomplete_with_security_findings() -> None:
     """Security findings still exit 1 while issue-only coverage remains visible."""
     results = _create_result_model(

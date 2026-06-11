@@ -13,6 +13,7 @@ import stat
 import sys
 import time
 import unicodedata
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from typing import Any, NoReturn
@@ -45,13 +46,24 @@ from .core import (
     determine_exit_code,
     scan_model_directory_or_file,
 )
-from .core_results import metadata_has_incomplete_coverage, results_have_inconclusive_outcome
+from .core_results import (
+    details_have_incomplete_coverage,
+    metadata_has_incomplete_coverage,
+    records_have_incomplete_coverage_for_path,
+    results_have_inconclusive_outcome,
+)
 from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import format_sarif_output
 from .integrations.source_redaction import redact_source_value
-from .models import ModelAuditResultModel
+from .models import FileMetadataModel, ModelAuditResultModel
 from .rules import Rule, RuleRegistry, Severity
-from .scanner_results import IssueSeverity
+from .scanner_results import (
+    INCONCLUSIVE_SCAN_OUTCOME,
+    SCAN_OUTCOME_METADATA_KEY,
+    SCAN_OUTCOME_REASONS_METADATA_KEY,
+    Issue,
+    IssueSeverity,
+)
 from .scanner_selection import (
     SCANNER_SELECTION_CONFIG_KEY,
     collect_suppressed_preferred_scanners,
@@ -97,6 +109,8 @@ from .utils.sources.huggingface import (
     extract_model_id_from_path,
     is_huggingface_file_url,
     is_huggingface_url,
+    parse_huggingface_file_url,
+    parse_huggingface_url_with_revision,
     redact_huggingface_url_for_display,
     redact_huggingface_urls_in_text,
 )
@@ -1457,43 +1471,6 @@ class _ScanPathState:
             except OSError:
                 return None
 
-        def resolved_path_applies_to_asset(resolved_path: Path, resolved_asset: Path) -> bool:
-            if resolved_path == resolved_asset:
-                return True
-            return resolved_path.is_dir() and resolved_asset.is_relative_to(resolved_path)
-
-        def coverage_location_candidates(location: str) -> list[Path]:
-            candidates: list[Path] = []
-            seen: set[Path] = set()
-
-            def add_candidate(path: Path | None) -> None:
-                if path is None or path in seen:
-                    return
-                seen.add(path)
-                candidates.append(path)
-
-            add_candidate(resolve_coverage_path(location))
-            if resolved_scan_path is not None and not Path(location).is_absolute():
-                base = resolved_scan_path if resolved_scan_path.is_dir() else resolved_scan_path.parent
-                add_candidate(resolve_coverage_path(location, base=base))
-            return candidates
-
-        def coverage_location_applies_to_asset(location: str, resolved_asset: Path) -> bool:
-            for resolved_location in coverage_location_candidates(location):
-                if resolved_path_applies_to_asset(resolved_location, resolved_asset):
-                    return True
-
-            for separator_index, char in reversed(list(enumerate(location))):
-                if char != ":":
-                    continue
-                archive_location = location[:separator_index]
-                if not archive_location:
-                    continue
-                for resolved_location in coverage_location_candidates(archive_location):
-                    if resolved_path_applies_to_asset(resolved_location, resolved_asset):
-                        return True
-            return False
-
         def record_covered_file(file_path: str) -> None:
             if scanner_policy.active and get_scanner_for_file(file_path, config=scanner_config) is None:
                 return
@@ -1516,36 +1493,6 @@ class _ScanPathState:
             return False
 
         scan_records: tuple[Any, ...] = (*scan_result.checks, *scan_result.issues)
-        coverable_asset_count = sum(1 for asset in scan_result.assets if asset.path and asset.type != "error")
-        resolved_scan_path = resolve_coverage_path(scan_path)
-
-        def record_has_incomplete_coverage(record: Any) -> bool:
-            details = getattr(record, "details", None)
-            if not isinstance(details, dict):
-                return False
-            return details.get("operational_error") is True or metadata_has_incomplete_coverage(details)
-
-        def record_applies_to_asset(record: Any, resolved_asset: Path) -> bool:
-            location = getattr(record, "location", None)
-            if isinstance(location, str) and location:
-                if coverage_location_applies_to_asset(location, resolved_asset):
-                    return True
-                return coverable_asset_count == 1 and not coverage_location_candidates(location)
-
-            if resolved_scan_path is not None and resolved_scan_path == resolved_asset:
-                return True
-            if resolved_scan_path is not None and resolved_scan_path.is_dir():
-                return resolved_asset.is_relative_to(resolved_scan_path)
-            return coverable_asset_count == 1
-
-        def asset_has_incomplete_coverage_record(asset_path: str) -> bool:
-            resolved_asset = resolve_coverage_path(asset_path)
-            if resolved_asset is None:
-                return False
-            return any(
-                record_has_incomplete_coverage(record) and record_applies_to_asset(record, resolved_asset)
-                for record in scan_records
-            )
 
         def shard_family_has_incomplete_coverage(shard_paths: set[Path]) -> bool:
             for metadata_path, metadata in scan_result.file_metadata.items():
@@ -1560,7 +1507,11 @@ class _ScanPathState:
                 "Sharded Model Membership Check",
             }
             for record in scan_records:
-                if not record_has_incomplete_coverage(record):
+                details = getattr(record, "details", None)
+                details = details if isinstance(details, dict) else None
+                if details is None:
+                    continue
+                if not (details.get("operational_error") is True or details_have_incomplete_coverage(details)):
                     continue
                 if path_matches_shard_family(getattr(record, "location", None), shard_paths):
                     return True
@@ -1577,7 +1528,7 @@ class _ScanPathState:
                 metadata.get("operational_error") is True or metadata_has_incomplete_coverage(metadata)
             ):
                 continue
-            if asset_has_incomplete_coverage_record(asset.path):
+            if records_have_incomplete_coverage_for_path((*scan_result.checks, *scan_result.issues), asset.path):
                 continue
             record_covered_file(asset.path)
 
@@ -1621,6 +1572,160 @@ class _ScanPathState:
                     walked_directories.add(str(resolved_directory))
             if not walk_errors:
                 self.dvc_covered_directories.update(walked_directories)
+
+
+_HF_ACQUISITION_ERROR_REASON = "huggingface_acquisition_error"
+_HF_ACQUISITION_BLOCKED_REASON = "huggingface_acquisition_blocked"
+_HF_AUTH_BLOCKED_MARKERS = (
+    "gatedrepoerror",
+    "gated repo",
+    "gated repository",
+    "401",
+    "403",
+    "unauthorized",
+    "forbidden",
+    "repositorynotfounderror",
+    "repository not found",
+    "restricted",
+)
+
+
+class _HuggingFaceAcquisitionError(RuntimeError):
+    """Marker for Hugging Face stream failures before the first artifact is yielded."""
+
+
+class _HuggingFaceStreamInterruptedError(RuntimeError):
+    """Marker for Hugging Face stream failures after artifact scanning may have started."""
+
+
+def _track_huggingface_stream_acquisition(
+    file_generator: Iterator[tuple[Path, bool]],
+) -> Iterator[tuple[Path, bool]]:
+    """Distinguish pre-yield acquisition failures from interrupted streamed scans."""
+    yielded_artifact = False
+    try:
+        for file_path, is_last in file_generator:
+            yielded_artifact = True
+            yield file_path, is_last
+    except Exception as exc:
+        if yielded_artifact:
+            raise _HuggingFaceStreamInterruptedError(str(exc)) from exc
+        raise _HuggingFaceAcquisitionError(str(exc)) from exc
+
+
+def _metadata_get_bool(metadata: Any, key: str) -> bool:
+    if isinstance(metadata, dict):
+        return bool(metadata.get(key))
+    getter = getattr(metadata, "get", None)
+    if callable(getter):
+        try:
+            return bool(getter(key))
+        except Exception:
+            return False
+    return bool(getattr(metadata, key, False))
+
+
+def _results_have_acquisition_error_metadata(results: ModelAuditResultModel | dict[str, Any]) -> bool:
+    if isinstance(results, ModelAuditResultModel):
+        return any(_metadata_get_bool(metadata, "acquisition_error") for metadata in results.file_metadata.values())
+    raw_metadata = results.get("file_metadata", {})
+    if not isinstance(raw_metadata, dict):
+        return False
+    return any(_metadata_get_bool(metadata, "acquisition_error") for metadata in raw_metadata.values())
+
+
+def _results_have_blocked_acquisition_metadata(results: ModelAuditResultModel | dict[str, Any]) -> bool:
+    if isinstance(results, ModelAuditResultModel):
+        return any(_metadata_get_bool(metadata, "blocked") for metadata in results.file_metadata.values())
+    raw_metadata = results.get("file_metadata", {})
+    if not isinstance(raw_metadata, dict):
+        return False
+    return any(_metadata_get_bool(metadata, "blocked") for metadata in raw_metadata.values())
+
+
+def _huggingface_requested_revision(path: str) -> str | None:
+    try:
+        if is_huggingface_file_url(path):
+            _repo_id, file_revision, _filename = parse_huggingface_file_url(path)
+            return file_revision
+        if is_huggingface_url(path):
+            _namespace, _repo_name, requested_revision = parse_huggingface_url_with_revision(path)
+            return requested_revision
+    except ValueError:
+        return None
+    return None
+
+
+def _classify_huggingface_acquisition_error(error_msg: str) -> tuple[str, bool, str]:
+    normalized = error_msg.lower()
+    if any(marker in normalized for marker in _HF_AUTH_BLOCKED_MARKERS):
+        return _HF_ACQUISITION_BLOCKED_REASON, True, "blocked"
+    return _HF_ACQUISITION_ERROR_REASON, False, "acquisition_error"
+
+
+def _huggingface_acquisition_source_key(path: str, requested_revision: str | None) -> str:
+    display_path = _display_scan_path(path)
+    if requested_revision and not is_huggingface_file_url(path):
+        return f"{display_path}@{requested_revision}"
+    return display_path
+
+
+def _record_huggingface_acquisition_error(
+    audit_result: ModelAuditResultModel,
+    path_state: _ScanPathState,
+    *,
+    path: str,
+    error_msg: str,
+) -> None:
+    """Record a Hugging Face source failure without claiming artifact coverage."""
+    requested_revision = _huggingface_requested_revision(path)
+    source_key = _huggingface_acquisition_source_key(path, requested_revision)
+    reason, blocked, category = _classify_huggingface_acquisition_error(error_msg)
+    issue_message = (
+        f"Hugging Face acquisition blocked for {source_key}; no model artifacts were scanned."
+        if blocked
+        else f"Hugging Face acquisition failed for {source_key}; no model artifacts were scanned."
+    )
+
+    details: dict[str, Any] = {
+        "source": "huggingface",
+        "source_url": source_key,
+        "acquisition_error": True,
+        "blocked": blocked,
+        "error_category": category,
+        "error": error_msg,
+        SCAN_OUTCOME_METADATA_KEY: INCONCLUSIVE_SCAN_OUTCOME,
+        "scan_outcome_reason": reason,
+        SCAN_OUTCOME_REASONS_METADATA_KEY: [reason],
+    }
+    if requested_revision is not None:
+        details["requested_revision"] = requested_revision
+
+    audit_result.issues.append(
+        Issue(
+            message=issue_message,
+            severity=IssueSeverity.INFO,
+            location=source_key,
+            details=details,
+            type="huggingface_acquisition_error",
+        )
+    )
+    audit_result.file_metadata[source_key] = FileMetadataModel(
+        source="huggingface",
+        source_url=source_key,
+        acquisition_error=True,
+        blocked=blocked,
+        error_category=category,
+        operational_error=True,
+        operational_error_reason=reason,
+        scan_outcome=INCONCLUSIVE_SCAN_OUTCOME,
+        scan_outcome_reason=reason,
+        scan_outcome_reasons=[reason],
+        requested_revision=requested_revision,
+    )
+    audit_result.has_errors = True
+    audit_result.success = False
+    path_state.mark_non_shard_error(audit_result)
 
 
 def should_use_color() -> bool:
@@ -2464,7 +2569,12 @@ def _record_scan_end_and_exit(audit_result: ModelAuditResultModel, scan_start_ti
     scan_duration = time.time() - scan_start_time
     try:
         if audit_result.has_errors:
-            record_scan_failed(scan_duration, "Scan completed with errors")
+            failure_reason = (
+                "Model acquisition failed"
+                if _results_have_acquisition_error_metadata(audit_result)
+                else "Scan completed with errors"
+            )
+            record_scan_failed(scan_duration, failure_reason)
         else:
             record_scan_completed(scan_duration, audit_result.model_dump())
     finally:
@@ -2831,7 +2941,12 @@ def _resolve_scan_source_for_path(
             error_msg = _display_error(exc, path)
             logger.error(f"Failed to download file from {display_path}: {error_msg}")
             click.echo(f"Error downloading file from {display_path}: {error_msg}", err=True)
-            path_state.mark_non_shard_error(audit_result)
+            _record_huggingface_acquisition_error(
+                audit_result,
+                path_state,
+                path=path,
+                error_msg=error_msg,
+            )
             path_state.defer_temp_cleanup(
                 temp_dir,
                 cache_enabled=runtime.cache_enabled,
@@ -2911,13 +3026,15 @@ def _resolve_scan_source_for_path(
                     hf_stream_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
                 if runtime.hf_stream_include_all_files:
                     hf_stream_kwargs["include_all_files"] = True
-                file_generator = download_model_streaming(
-                    path,
-                    cache_dir=hf_cache_dir,
-                    show_progress=runtime.show_progress,
-                    max_size=runtime.max_download_bytes,
-                    timeout_seconds=runtime.timeout,
-                    **hf_stream_kwargs,
+                file_generator = _track_huggingface_stream_acquisition(
+                    download_model_streaming(
+                        path,
+                        cache_dir=hf_cache_dir,
+                        show_progress=runtime.show_progress,
+                        max_size=runtime.max_download_bytes,
+                        timeout_seconds=runtime.timeout,
+                        **hf_stream_kwargs,
+                    )
                 )
 
                 streaming_kwargs: dict[str, Any] = {}
@@ -2925,26 +3042,32 @@ def _resolve_scan_source_for_path(
                     streaming_kwargs["_trusted_source_provenance"] = trusted_source_provenance
                 streaming_kwargs.update(_scanner_selection_overrides(runtime))
 
-                streaming_result = scan_model_streaming(
-                    file_generator=file_generator,
-                    shard_family_group=f"stream-invocation:{id(file_generator):x}",
-                    _trusted_shard_family_root=(
-                        _make_trusted_stream_shard_root(str(hf_cache_dir / "huggingface"))
-                        if runtime.cache_enabled and trusted_source_provenance is not None
-                        else None
-                    ),
-                    timeout=runtime.timeout,
-                    delete_after_scan=True,
-                    blacklist_patterns=list(blacklist) if blacklist else None,
-                    max_file_size=runtime.max_file_size,
-                    max_total_size=runtime.max_total_size,
-                    strict_license=runtime.strict_license,
-                    skip_file_types=runtime.skip_non_model_files,
-                    use_hf_whitelist=runtime.use_hf_whitelist,
-                    cache_enabled=runtime.cache_enabled,
-                    cache_dir=runtime.cache_dir,
-                    **streaming_kwargs,
-                )
+                try:
+                    streaming_result = scan_model_streaming(
+                        file_generator=file_generator,
+                        shard_family_group=f"stream-invocation:{id(file_generator):x}",
+                        _trusted_shard_family_root=(
+                            _make_trusted_stream_shard_root(str(hf_cache_dir / "huggingface"))
+                            if runtime.cache_enabled and trusted_source_provenance is not None
+                            else None
+                        ),
+                        timeout=runtime.timeout,
+                        delete_after_scan=True,
+                        blacklist_patterns=list(blacklist) if blacklist else None,
+                        max_file_size=runtime.max_file_size,
+                        max_total_size=runtime.max_total_size,
+                        strict_license=runtime.strict_license,
+                        skip_file_types=runtime.skip_non_model_files,
+                        use_hf_whitelist=runtime.use_hf_whitelist,
+                        cache_enabled=runtime.cache_enabled,
+                        cache_dir=runtime.cache_dir,
+                        **streaming_kwargs,
+                    )
+                except _HuggingFaceAcquisitionError:
+                    raise
+                except Exception as exc:
+                    raise _HuggingFaceStreamInterruptedError(str(exc)) from exc
+
                 path_state.record_non_shard_result_errors(streaming_result)
                 audit_result.aggregate_scan_result(streaming_result.model_dump())
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
@@ -2953,7 +3076,10 @@ def _resolve_scan_source_for_path(
                 record_download_completed("huggingface", download_duration, 0, display_path)
 
                 if runtime.show_styled_output:
-                    click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
+                    if streaming_result.has_errors or not streaming_result.success:
+                        click.echo(style_text("❌ Streaming scan incomplete", fg="red", bold=True))
+                    else:
+                        click.echo(style_text("✅ Streaming scan complete", fg="green", bold=True))
 
                 return _SourceDispatchResult(
                     actual_path=path,
@@ -2996,6 +3122,21 @@ def _resolve_scan_source_for_path(
                 source_model_id=source_model_id,
                 source_model_source=source_model_source,
             )
+        except _HuggingFaceStreamInterruptedError as exc:
+            if runtime.show_styled_output:
+                click.echo(style_text("❌ Download/scan failed", fg="red", bold=True))
+
+            error_msg = _display_error(exc, path)
+            logger.error(f"Streaming scan interrupted for {display_path}: {error_msg}")
+            click.echo(f"Error processing model from {display_path}: {error_msg}", err=True)
+            path_state.mark_non_shard_error(audit_result)
+            audit_result.success = False
+            path_state.defer_temp_cleanup(
+                temp_dir,
+                cache_enabled=runtime.cache_enabled,
+                verbose=verbose,
+            )
+            return None
         except Exception as exc:
             if runtime.show_styled_output:
                 click.echo(style_text("❌ Download/scan failed", fg="red", bold=True))
@@ -3016,7 +3157,12 @@ def _resolve_scan_source_for_path(
                 logger.error(f"Failed to process model from {display_path}: {error_msg}")
                 click.echo(f"Error processing model from {display_path}: {error_msg}", err=True)
 
-            path_state.mark_non_shard_error(audit_result)
+            _record_huggingface_acquisition_error(
+                audit_result,
+                path_state,
+                path=path,
+                error_msg=error_msg,
+            )
             path_state.defer_temp_cleanup(
                 temp_dir,
                 cache_enabled=runtime.cache_enabled,
@@ -4525,18 +4671,29 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
 
     # Check if scan had operational errors first (highest priority in exit code)
     has_operational_errors = bool(results.get("has_errors"))
+    has_acquisition_errors = _results_have_acquisition_error_metadata(results)
+    has_blocked_acquisition = _results_have_blocked_acquisition_metadata(results)
     files_scanned = results.get("files_scanned", 0)
     has_critical_findings = any(_get_issue_attr(issue, "severity") == "critical" for issue in visible_issues)
     has_warning_findings = any(_get_issue_attr(issue, "severity") == "warning" for issue in visible_issues)
     has_security_findings = has_critical_findings or has_warning_findings
     if has_operational_errors:
         status_icon = "❌"
-        status_msg = "SCAN COMPLETED WITH OPERATIONAL ERRORS"
+        if has_acquisition_errors:
+            status_msg = "MODEL ACQUISITION BLOCKED" if has_blocked_acquisition else "MODEL ACQUISITION FAILED"
+        else:
+            status_msg = "SCAN COMPLETED WITH OPERATIONAL ERRORS"
         status_color = "red"
         output_lines.append(f"  {style_text(f'{status_icon} {status_msg}', fg=status_color, bold=True)}")
-        output_lines.append(
-            f"  {style_text('Review warnings above and use --verbose for troubleshooting details.', fg='yellow')}"
-        )
+        if has_acquisition_errors:
+            guidance = (
+                "No model artifacts were scanned for blocked Hugging Face source(s)."
+                if has_blocked_acquisition
+                else "No model artifacts were scanned for failed Hugging Face source(s)."
+            )
+        else:
+            guidance = "Review warnings above and use --verbose for troubleshooting details."
+        output_lines.append(f"  {style_text(guidance, fg='yellow')}")
     # Determine overall status
     elif has_security_findings:
         if has_critical_findings:
@@ -4629,7 +4786,7 @@ def _incomplete_coverage_summaries(results: dict[str, Any]) -> list[tuple[str, s
         fallback_location = collection_name[:-1]
         for record in records:
             details = _get_issue_attr(record, "details", {})
-            if not metadata_has_incomplete_coverage(details):
+            if not details_have_incomplete_coverage(details):
                 continue
             location = (
                 _get_issue_attr(record, "location")
@@ -4660,7 +4817,7 @@ def _append_incomplete_coverage_summary(
     summaries.append(summary)
 
 
-def _incomplete_coverage_reason(metadata: Any) -> str:
+def _incomplete_coverage_reason(metadata: Any, *, _depth: int = 0) -> str:
     if not isinstance(metadata, dict):
         return "incomplete coverage"
 
@@ -4688,6 +4845,16 @@ def _incomplete_coverage_reason(metadata: Any) -> str:
         return "analysis_incomplete"
     if metadata.get("scan_outcome") == "inconclusive":
         return "inconclusive"
+
+    if _depth < 4:
+        findings = metadata.get("findings")
+        if isinstance(findings, dict) and details_have_incomplete_coverage(findings):
+            return _incomplete_coverage_reason(findings, _depth=_depth + 1)
+        if isinstance(findings, (list, tuple, set, frozenset)):
+            for finding in findings:
+                if details_have_incomplete_coverage(finding):
+                    return _incomplete_coverage_reason(finding, _depth=_depth + 1)
+
     return "incomplete coverage"
 
 

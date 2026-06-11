@@ -7,6 +7,7 @@ import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 from modelaudit.models import ModelAuditResultModel
@@ -136,9 +137,46 @@ def metadata_has_incomplete_coverage(metadata: Any) -> bool:
     return False
 
 
+def details_have_incomplete_coverage(details: Any, *, _depth: int = 0) -> bool:
+    """Return True when details or consolidated detail findings identify incomplete coverage."""
+    if metadata_has_incomplete_coverage(details):
+        return True
+    if _depth >= 4:
+        return False
+
+    findings = _metadata_value(details, "findings")
+    if isinstance(findings, dict):
+        return details_have_incomplete_coverage(findings, _depth=_depth + 1)
+    if isinstance(findings, (list, tuple, set, frozenset)):
+        for finding in findings:
+            if details_have_incomplete_coverage(finding, _depth=_depth + 1):
+                return True
+            nested_details = _metadata_value(finding, "details")
+            if nested_details is not finding and details_have_incomplete_coverage(nested_details, _depth=_depth + 1):
+                return True
+
+    return False
+
+
 def record_details_have_incomplete_coverage(record: Any) -> bool:
     """Return True when a retained issue/check detail object identifies incomplete coverage."""
-    return metadata_has_incomplete_coverage(_metadata_value(record, "details"))
+    return details_have_incomplete_coverage(_metadata_value(record, "details"))
+
+
+def _location_matches_file_path(location: str, file_path: str) -> bool:
+    if location == file_path:
+        return True
+    if not location.startswith(file_path):
+        return False
+
+    suffix = location[len(file_path) :]
+    if not suffix:
+        return True
+
+    separators = {":", " ", "#", "(", "[", os.sep}
+    if os.altsep:
+        separators.add(os.altsep)
+    return suffix[:1] in separators
 
 
 def records_have_incomplete_coverage(records: Iterable[Any] | None) -> bool:
@@ -147,6 +185,45 @@ def records_have_incomplete_coverage(records: Iterable[Any] | None) -> bool:
         return False
     try:
         return any(record_details_have_incomplete_coverage(record) for record in records)
+    except TypeError:
+        return False
+
+
+def record_has_incomplete_coverage_for_path(record: Any, file_path: str) -> bool:
+    """Return True when a retained issue/check marks a specific file's coverage incomplete."""
+    if not record_details_have_incomplete_coverage(record):
+        return False
+
+    location = _metadata_value(record, "location")
+    if not isinstance(location, str) or not location:
+        return True
+
+    file_path_str = str(file_path)
+    if _location_matches_file_path(location, file_path_str):
+        return True
+    file_name = Path(file_path_str).name
+    if file_name and _location_matches_file_path(location, file_name):
+        return True
+
+    try:
+        resolved_file_path = str(Path(file_path_str).resolve(strict=False))
+        if _location_matches_file_path(location, resolved_file_path):
+            return True
+        if Path(location).resolve(strict=False) == Path(file_path_str).resolve(strict=False):
+            return True
+    except (OSError, RuntimeError, ValueError):
+        # Malformed or unresolvable locations still use the lexical fallback below.
+        pass
+
+    return False
+
+
+def records_have_incomplete_coverage_for_path(records: Iterable[Any] | None, file_path: str) -> bool:
+    """Return True when retained issue/check details make a file unsafe to treat as covered."""
+    if records is None:
+        return False
+    try:
+        return any(record_has_incomplete_coverage_for_path(record, file_path) for record in records)
     except TypeError:
         return False
 

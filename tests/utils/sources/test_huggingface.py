@@ -44,6 +44,7 @@ from modelaudit.utils.sources.huggingface import (
     is_huggingface_url,
     parse_huggingface_file_url,
     parse_huggingface_url,
+    parse_huggingface_url_with_revision,
     redact_huggingface_url_for_display,
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
@@ -264,6 +265,42 @@ class TestHuggingFaceURLParsing:
         for url, expected in test_cases:
             namespace, repo = parse_huggingface_url(url)
             assert (namespace, repo) == expected, f"Failed to parse {url}"
+
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            ("https://huggingface.co/org/repo?revision=main", ("org", "repo", "main")),
+            ("https://hf.co/org/repo?revision=refs%2Fpr%2F1", ("org", "repo", "refs/pr/1")),
+            ("hf://org/repo?revision=refs%2Fpr%2F1", ("org", "repo", "refs/pr/1")),
+            ("hf://gpt2?revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ("gpt2", "", "a" * 40)),
+        ],
+    )
+    def test_parse_urls_with_revision_query(self, url: str, expected: tuple[str, str, str]) -> None:
+        """Repository URLs should preserve explicit requested revisions."""
+        assert parse_huggingface_url_with_revision(url) == expected
+        assert parse_huggingface_url(url) == expected[:2]
+
+    def test_parse_urls_accepts_duplicate_matching_revision_query(self) -> None:
+        """Repeated matching revision parameters are redundant, not ambiguous."""
+        assert parse_huggingface_url_with_revision("https://huggingface.co/org/repo?revision=main&revision=main") == (
+            "org",
+            "repo",
+            "main",
+        )
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://huggingface.co/org/repo?revision=",
+            "https://huggingface.co/org/repo?revision=main&revision=dev",
+            "https://huggingface.co/org/repo?revision=..",
+            "hf://org/repo?revision=refs%2F..%2Fescape",
+        ],
+    )
+    def test_parse_urls_rejects_invalid_revision_query(self, url: str) -> None:
+        """Ambiguous or unsafe revision query values must fail before SDK calls."""
+        with pytest.raises(ValueError):
+            parse_huggingface_url_with_revision(url)
 
     def test_parse_invalid_urls(self):
         """Test that invalid URLs raise ValueError."""
@@ -558,6 +595,30 @@ class TestModelDownload:
         assert error is None
         mock_repo_info.assert_called_once_with("test/model", timeout=7, files_metadata=False)
 
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_timeout_passes_requested_revision(self, mock_repo_info: MagicMock) -> None:
+        """Requested repository revisions should reach direct HfApi listing calls."""
+        mock_repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            siblings=[SimpleNamespace(rfilename="config.json")],
+        )
+
+        repo_files, revision, error = _list_repo_files_with_timeout(
+            "test/model",
+            timeout_seconds=7,
+            revision="refs/pr/1",
+        )
+
+        assert repo_files == ["config.json"]
+        assert revision == _HF_TEST_REVISION
+        assert error is None
+        mock_repo_info.assert_called_once_with(
+            "test/model",
+            timeout=7,
+            files_metadata=False,
+            revision="refs/pr/1",
+        )
+
     @patch("modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline")
     def test_list_repo_files_deadline_uses_terminable_worker(self, mock_run_worker: MagicMock) -> None:
         """Deadline-bound listings must be terminable, not only socket-timeout bounded."""
@@ -581,6 +642,30 @@ class TestModelDownload:
             "test/model",
         )
 
+    @patch("modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline")
+    def test_list_repo_files_deadline_passes_requested_revision(self, mock_run_worker: MagicMock) -> None:
+        """Requested revisions must also reach the terminable listing worker."""
+        mock_run_worker.return_value = {
+            "value": {"files": ["config.json"], "revision": _HF_TEST_REVISION},
+        }
+
+        repo_files, revision, error = _list_repo_files_with_timeout(
+            "test/model",
+            timeout_seconds=7,
+            deadline=123.0,
+            revision="refs/pr/1",
+        )
+
+        assert repo_files == ["config.json"]
+        assert revision == _HF_TEST_REVISION
+        assert error is None
+        mock_run_worker.assert_called_once_with(
+            "list_repo_files",
+            {"repo_id": "test/model", "request_timeout": 7, "revision": "refs/pr/1"},
+            123.0,
+            "test/model",
+        )
+
     @patch("huggingface_hub.HfApi.repo_info")
     def test_download_worker_serializes_repository_listing(self, mock_repo_info: MagicMock) -> None:
         """The deadline worker should return only serializable listing evidence."""
@@ -598,6 +683,44 @@ class TestModelDownload:
             "value": {"files": ["model.bin", "config.json"], "revision": _HF_TEST_REVISION},
         }
         mock_repo_info.assert_called_once_with("test/model", timeout=7, files_metadata=False)
+
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_download_worker_passes_requested_revision_to_listing(self, mock_repo_info: MagicMock) -> None:
+        """Worker listing operations should not silently fall back to default branch."""
+        mock_repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            siblings=[SimpleNamespace(rfilename="model.bin")],
+        )
+
+        result = _run_huggingface_worker_operation(
+            "list_repo_files",
+            {"repo_id": "test/model", "request_timeout": 7, "revision": "refs/pr/1"},
+        )
+
+        assert result == {
+            "value": {"files": ["model.bin"], "revision": _HF_TEST_REVISION},
+        }
+        mock_repo_info.assert_called_once_with(
+            "test/model",
+            timeout=7,
+            files_metadata=False,
+            revision="refs/pr/1",
+        )
+
+    @patch("huggingface_hub.HfApi.model_info")
+    def test_download_worker_passes_requested_revision_to_model_size(self, mock_model_info: MagicMock) -> None:
+        """Worker model-size operations should query the requested revision."""
+        mock_model_info.return_value = SimpleNamespace(
+            siblings=[SimpleNamespace(size=7), SimpleNamespace(size=None)],
+        )
+
+        result = _run_huggingface_worker_operation(
+            "get_model_size",
+            {"repo_id": "test/model", "request_timeout": 7, "revision": "refs/pr/1"},
+        )
+
+        assert result == {"value": 7}
+        mock_model_info.assert_called_once_with("test/model", timeout=7, revision="refs/pr/1")
 
     @pytest.mark.parametrize("revision", [None, "", "main", "g" * 40])
     @patch("huggingface_hub.HfApi.repo_info")
@@ -1710,7 +1833,7 @@ class TestModelDownload:
         ):
             download_model("https://huggingface.co/test/model", timeout_seconds=1)
 
-        _mock_list_repo_files.assert_called_once_with("test/model", 1.0, deadline=101.0)
+        _mock_list_repo_files.assert_called_once_with("test/model", 1.0, deadline=101.0, revision=None)
         mock_requests_get.assert_not_called()
         mock_snapshot_download.assert_not_called()
 
@@ -1727,7 +1850,7 @@ class TestModelDownload:
         with pytest.raises(RuntimeError, match="stop after model-size lookup"):
             download_model("https://huggingface.co/test/model", timeout_seconds=1)
 
-        mock_get_model_size.assert_called_once_with("test/model", 101.0)
+        mock_get_model_size.assert_called_once_with("test/model", 101.0, revision=None)
 
     @patch("modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline")
     def test_huggingface_path_sizes_use_terminable_deadline_worker(
@@ -2402,6 +2525,381 @@ class TestModelDownloadStreaming:
             local_dir=str(tmp_path / "huggingface" / "test" / "model"),
         )
 
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            ["openvino/openvino_model.bin", "openvino/openvino_model.xml", "README.md"],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_prefetches_openvino_bin_companion(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """OpenVINO-only streaming must stage the exact .bin sidecar before yielding XML."""
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / "huggingface" / "test" / "model" / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if filename.endswith(".xml"):
+                path.write_text("<net version='10'></net>", encoding="utf-8")
+            else:
+                path.write_bytes(b"weights")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_detect_content.side_effect = lambda _repo_id, filename, _revision, _budget: (
+            "openvino" if filename.endswith(".xml") else None
+        )
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path,
+                scannable_extensions={".xml"},
+                scannable_scanner_ids={"openvino"},
+            )
+        )
+
+        yielded_xml = tmp_path / "huggingface" / "test" / "model" / "openvino" / "openvino_model.xml"
+        assert results == [(yielded_xml, True)]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "openvino/openvino_model.xml",
+            "openvino/openvino_model.bin",
+        ]
+        assert call("test/model", "openvino/openvino_model.xml", _HF_TEST_REVISION, ANY) in (
+            mock_detect_content.call_args_list
+        )
+        assert call("test/model", "openvino/openvino_model.bin", _HF_TEST_REVISION, ANY) not in (
+            mock_detect_content.call_args_list
+        )
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            [
+                "models/encoder/openvino_model.bin",
+                "models/encoder/openvino_model.xml",
+                "models/decoder/openvino_model.bin",
+                "models/decoder/openvino_model.xml",
+                "variants/\u00dcnicode-Model.bin",
+                "variants/\u00dcnicode-Model.xml",
+                "orphan/openvino_model.bin",
+            ],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_prefetches_path_sensitive_openvino_companions(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Duplicate basenames must stage only each XML's exact same-directory weights."""
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / "huggingface" / "test" / "model" / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if filename.endswith(".xml"):
+                path.write_text("<net version='10'></net>", encoding="utf-8")
+            else:
+                path.write_bytes(filename.encode("utf-8"))
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_detect_content.side_effect = lambda _repo_id, filename, _revision, _budget: (
+            "openvino" if filename.endswith(".xml") else None
+        )
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path,
+                scannable_extensions={".xml"},
+                scannable_scanner_ids={"openvino"},
+            )
+        )
+
+        download_root = tmp_path / "huggingface" / "test" / "model"
+        assert results == [
+            (download_root / "models" / "encoder" / "openvino_model.xml", False),
+            (download_root / "models" / "decoder" / "openvino_model.xml", False),
+            (download_root / "variants" / "\u00dcnicode-Model.xml", True),
+        ]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "models/encoder/openvino_model.xml",
+            "models/encoder/openvino_model.bin",
+            "models/decoder/openvino_model.xml",
+            "models/decoder/openvino_model.bin",
+            "variants/\u00dcnicode-Model.xml",
+            "variants/\u00dcnicode-Model.bin",
+        ]
+        assert "orphan/openvino_model.bin" not in {
+            call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list
+        }
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            [
+                "openvino/openvino_model.bin",
+                "openvino/openvino_model.xml",
+                "openvino/openvino_model_qint8_quantized.bin",
+                "openvino/openvino_model_qint8_quantized.xml",
+            ],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_prefetches_multiple_openvino_bin_companions(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Pinned OpenVINO repositories can stage every exact XML/BIN pair before scanning."""
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / "huggingface" / "test" / "model" / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if filename.endswith(".xml"):
+                path.write_text("<net version='10'></net>", encoding="utf-8")
+            else:
+                path.write_bytes(b"weights")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_detect_content.side_effect = lambda _repo_id, filename, _revision, _budget: (
+            "openvino" if filename.endswith(".xml") else None
+        )
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path,
+                scannable_extensions={".xml"},
+                scannable_scanner_ids={"openvino"},
+            )
+        )
+
+        download_root = tmp_path / "huggingface" / "test" / "model" / "openvino"
+        assert results == [
+            (download_root / "openvino_model.xml", False),
+            (download_root / "openvino_model_qint8_quantized.xml", True),
+        ]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "openvino/openvino_model.xml",
+            "openvino/openvino_model.bin",
+            "openvino/openvino_model_qint8_quantized.xml",
+            "openvino/openvino_model_qint8_quantized.bin",
+        ]
+        assert all(call.args[1].endswith(".xml") for call in mock_detect_content.call_args_list)
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            [
+                "a/OpenVINO_Mod\u00e8le.BIN",
+                "a/OpenVINO_Mod\u00e8le.XML",
+                "b/OpenVINO_Mod\u00e8le.BIN",
+                "b/OpenVINO_Mod\u00e8le.XML",
+            ],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_prefetches_case_variant_duplicate_openvino_companions(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """HF OpenVINO companion staging should keep duplicate basenames path-specific."""
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / "huggingface" / "test" / "model" / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if filename.endswith(".XML"):
+                path.write_text("<net version='10'></net>", encoding="utf-8")
+            else:
+                path.write_bytes(b"weights")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_detect_content.side_effect = lambda _repo_id, filename, _revision, _budget: (
+            "openvino" if filename.endswith(".XML") else None
+        )
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path,
+                scannable_extensions={".xml"},
+                scannable_scanner_ids={"openvino"},
+            )
+        )
+
+        download_root = tmp_path / "huggingface" / "test" / "model"
+        assert results == [
+            (download_root / "a" / "OpenVINO_Mod\u00e8le.XML", False),
+            (download_root / "b" / "OpenVINO_Mod\u00e8le.XML", True),
+        ]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "a/OpenVINO_Mod\u00e8le.XML",
+            "a/OpenVINO_Mod\u00e8le.BIN",
+            "b/OpenVINO_Mod\u00e8le.XML",
+            "b/OpenVINO_Mod\u00e8le.BIN",
+        ]
+        assert all(call.args[1].endswith(".XML") for call in mock_detect_content.call_args_list)
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            ["openvino/openvino_model.bin", "openvino/openvino_model.xml", "README.md"],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_manifest_selection_does_not_prefetch_openvino_bin_companion(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Non-OpenVINO XML scans must not stage unrelated same-stem OpenVINO weights."""
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / "huggingface" / "test" / "model" / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("<net version='10'></net>", encoding="utf-8")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_detect_content.side_effect = lambda _repo_id, filename, _revision, _budget: (
+            "openvino" if filename.endswith(".xml") else None
+        )
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path,
+                scannable_extensions={".xml"},
+                scannable_scanner_ids={"manifest"},
+            )
+        )
+
+        yielded_xml = tmp_path / "huggingface" / "test" / "model" / "openvino" / "openvino_model.xml"
+        assert results == [(yielded_xml, True)]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "openvino/openvino_model.xml"
+        ]
+        mock_detect_content.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["openvino/model.xml", "openvino/model.bin"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_yields_openvino_bin_when_openvino_not_selected(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Selected .bin files must not be consumed as OpenVINO companions when OpenVINO is excluded."""
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / "huggingface" / "test" / "model" / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if filename.endswith(".xml"):
+                path.write_text("<net version='10'></net>", encoding="utf-8")
+            else:
+                path.write_bytes(b"pickle-or-pytorch-candidate")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path,
+                scannable_extensions={".xml", ".bin"},
+                scannable_scanner_ids={"pickle"},
+            )
+        )
+
+        download_root = tmp_path / "huggingface" / "test" / "model" / "openvino"
+        assert results == [(download_root / "model.xml", False), (download_root / "model.bin", True)]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "openvino/model.xml",
+            "openvino/model.bin",
+        ]
+        mock_detect_content.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["document.xml", "document.bin"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_yields_non_openvino_near_match_bin(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A non-OpenVINO XML must not hide a same-stem .bin from standalone scanning."""
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if filename.endswith(".xml"):
+                path.write_text("<project><model name='not-openvino'/></project>", encoding="utf-8")
+            else:
+                path.write_bytes(b"binary")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        _mock_detect_content.side_effect = lambda _repo_id, filename, _revision, _budget: (
+            "openvino" if filename.endswith(".xml") else None
+        )
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                scannable_extensions={".xml"},
+                scannable_scanner_ids={"openvino"},
+            )
+        )
+
+        assert results == [(tmp_path / "document.xml", False), (tmp_path / "document.bin", True)]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "document.xml",
+            "document.bin",
+        ]
+
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -2473,7 +2971,7 @@ class TestModelDownloadStreaming:
         with pytest.raises(Exception, match=r"hidden\.payload \(TimeoutError\)"):
             list(download_model_streaming("https://huggingface.co/test/model", timeout_seconds=1))
 
-        _mock_list_repo_files.assert_called_once_with("test/model", 1.0, deadline=101.0)
+        _mock_list_repo_files.assert_called_once_with("test/model", 1.0, deadline=101.0, revision=None)
         mock_requests_get.assert_not_called()
         mock_hf_hub_download.assert_not_called()
 

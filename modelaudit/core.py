@@ -7,7 +7,7 @@ import os
 import stat
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,7 +32,19 @@ from modelaudit.integrations.license_checker import (
     collect_license_metadata,
 )
 from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
-from modelaudit.scanner_results import Check, Issue, IssueSeverity, ScanResult
+from modelaudit.scanner_results import (
+    ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
+    INCONCLUSIVE_SCAN_OUTCOME,
+    OPERATIONAL_ERROR_METADATA_KEY,
+    SCAN_OUTCOME_METADATA_KEY,
+    SCAN_OUTCOME_REASONS_METADATA_KEY,
+    SUPPRESSED_FAILED_CHECKS_METADATA_KEY,
+    VALIDATED_FORMAT_METADATA_KEY,
+    Check,
+    Issue,
+    IssueSeverity,
+    ScanResult,
+)
 from modelaudit.scanner_selection import (
     SCANNER_SELECTION_PREFERRED_KIND,
     ScannerSelectionPolicy,
@@ -82,9 +94,11 @@ from modelaudit.utils.file.detection import (
     ONNX_ROUTING_INCONCLUSIVE_FORMAT,
     PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
     PROTOBUF_MODEL_CANDIDATE_FORMAT,
+    SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
+    _is_malformed_sentencepiece_model_proto_candidate_file,
     detect_file_format,
     detect_file_format_from_magic,
     detect_flax_msgpack_overlap_routes,
@@ -96,6 +110,7 @@ from modelaudit.utils.file.detection import (
     is_executorch_archive,
     is_keras_zip_archive,
     is_pytorch_zip_archive,
+    is_sentencepiece_model_proto_file,
     is_skops_archive,
     is_torchserve_mar_archive,
     should_defer_safetensors_header_limit_hash,
@@ -151,6 +166,7 @@ _add_asset_to_results = core_results.add_asset_to_results
 _add_error_asset_to_results = core_results.add_error_asset_to_results
 _DIRECTORY_PRECOUNT_CHILD_LIMIT = 1000
 _COMPRESSED_TAR_STREAM_INCOMPLETE_REASON = "tar_compressed_stream_incomplete"
+_STREAMING_SOURCE_INTERRUPTED_REASON = "streaming_source_interrupted"
 
 
 def _count_immediate_children_up_to(path: Path, limit: int) -> int:
@@ -171,6 +187,8 @@ _mark_inconclusive_scan_outcome = core_results.mark_inconclusive_scan_outcome
 _mark_operational_scan_error = core_results.mark_operational_scan_error
 _metadata_has_coverage_only_operational_error = core_results.metadata_has_coverage_only_operational_error
 _metadata_has_incomplete_coverage = core_results.metadata_has_incomplete_coverage
+_record_details_have_incomplete_coverage = core_results.record_details_have_incomplete_coverage
+_records_have_incomplete_coverage_for_path = core_results.records_have_incomplete_coverage_for_path
 _results_have_operational_error = core_results.results_have_operational_error
 _results_should_be_unsuccessful = core_results.results_should_be_unsuccessful
 _scan_result_has_operational_error = core_results.scan_result_has_operational_error
@@ -181,116 +199,6 @@ determine_exit_code = core_results.determine_exit_code
 merge_scan_result = core_results.merge_scan_result
 
 HEADER_FORMAT_TO_SCANNER_ID = _registry.get_header_format_to_scanner_ids()
-
-
-def _resolve_coverage_path(file_path: str | None, *, base: Path | None = None) -> Path | None:
-    if not isinstance(file_path, str):
-        return None
-    try:
-        path = Path(file_path)
-        if base is not None and not path.is_absolute():
-            path = base / path
-        return path.resolve()
-    except OSError:
-        return None
-
-
-def _resolved_coverage_path_applies_to_asset(resolved_path: Path, resolved_asset: Path) -> bool:
-    if resolved_path == resolved_asset:
-        return True
-    return resolved_path.is_dir() and resolved_asset.is_relative_to(resolved_path)
-
-
-def _coverage_location_candidates(location: str, *, scan_root: Path | None) -> list[Path]:
-    candidates: list[Path] = []
-    seen: set[Path] = set()
-
-    def add_candidate(path: Path | None) -> None:
-        if path is None or path in seen:
-            return
-        seen.add(path)
-        candidates.append(path)
-
-    add_candidate(_resolve_coverage_path(location))
-    if scan_root is not None and not Path(location).is_absolute():
-        base = scan_root if scan_root.is_dir() else scan_root.parent
-        add_candidate(_resolve_coverage_path(location, base=base))
-    return candidates
-
-
-def _coverage_location_applies_to_asset(location: str, resolved_asset: Path, *, scan_root: Path | None) -> bool:
-    for resolved_location in _coverage_location_candidates(location, scan_root=scan_root):
-        if _resolved_coverage_path_applies_to_asset(resolved_location, resolved_asset):
-            return True
-
-    for separator_index, char in reversed(list(enumerate(location))):
-        if char != ":":
-            continue
-        archive_location = location[:separator_index]
-        if not archive_location:
-            continue
-        for resolved_location in _coverage_location_candidates(archive_location, scan_root=scan_root):
-            if _resolved_coverage_path_applies_to_asset(resolved_location, resolved_asset):
-                return True
-    return False
-
-
-def _scan_record_has_operational_or_incomplete_details(record: Any) -> bool:
-    details = getattr(record, "details", None)
-    if not isinstance(details, dict):
-        return False
-    return details.get("operational_error") is True or _metadata_has_incomplete_coverage(details)
-
-
-def _scan_record_applies_to_asset(
-    record: Any,
-    resolved_asset: Path,
-    *,
-    scan_root: Path | None,
-    coverable_asset_count: int,
-) -> bool:
-    location = getattr(record, "location", None)
-    if isinstance(location, str) and location:
-        if _coverage_location_applies_to_asset(location, resolved_asset, scan_root=scan_root):
-            return True
-        return coverable_asset_count == 1 and not _coverage_location_candidates(location, scan_root=scan_root)
-
-    if scan_root is not None:
-        if scan_root == resolved_asset:
-            return True
-        if scan_root.is_dir() and resolved_asset.is_relative_to(scan_root):
-            return True
-    return coverable_asset_count == 1
-
-
-def _result_asset_has_operational_or_incomplete_record(
-    scan_result: ModelAuditResultModel,
-    asset_path: str | None,
-    *,
-    scan_root: Path | None,
-) -> bool:
-    resolved_asset = _resolve_coverage_path(asset_path)
-    if resolved_asset is None:
-        return False
-
-    coverable_asset_count = sum(1 for asset in scan_result.assets if asset.path and asset.type != "error")
-    return any(
-        _scan_record_has_operational_or_incomplete_details(record)
-        and _scan_record_applies_to_asset(
-            record,
-            resolved_asset,
-            scan_root=scan_root,
-            coverable_asset_count=coverable_asset_count,
-        )
-        for record in (*scan_result.checks, *scan_result.issues)
-    )
-
-
-def _scan_result_has_operational_or_incomplete_record(scan_result: ScanResult) -> bool:
-    return any(
-        _scan_record_has_operational_or_incomplete_details(record)
-        for record in (*scan_result.checks, *scan_result.issues)
-    )
 
 
 def _record_dvc_output_limit_incomplete(
@@ -385,10 +293,14 @@ _COMPRESSED_HEADER_FORMATS = frozenset({"compressed", "gzip", "bzip2", "xz", "lz
 _R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
 _XGBOOST_BINARY_EXTENSIONS = frozenset({".bst"})
 _XGBOOST_PICKLE_SPOOF_REASON = "xgboost_binary_pickle_spoof"
+_ALTERNATE_VALIDATED_FORMAT_ALLOWED_INCONCLUSIVE_REASONS = {
+    "onnx": frozenset({"onnx_weight_distribution_analysis_incomplete"}),
+}
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
 _FORMAT_DETECTION_READ_FAILED_REASON = "format_detection_read_failed"
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON = "protobuf_model_routing_incomplete"
+_SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON = "sentencepiece_model_proto_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
 _PICKLE_ROUTING_INCOMPLETE_REASON = "pickle_routing_incomplete"
@@ -404,6 +316,27 @@ _DVC_EXCLUDED_PATHS_CONFIG_KEY = "_dvc_excluded_paths"
 _DVC_COVERAGE_ROOTS_CONFIG_KEY = "_dvc_coverage_roots"
 DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY = "_dvc_external_covered_paths"
 DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY = "_dvc_external_covered_directories"
+_INCOMPLETE_SHARD_CHECK_NAMES = frozenset(
+    {
+        "Shard Scan",
+        "Sharded Model Coverage Check",
+        "Sharded Model Membership Check",
+    }
+)
+
+
+def _shard_family_has_incomplete_coverage(records: Iterable[Any], shard_paths: set[str]) -> bool:
+    for record in records:
+        if not _record_details_have_incomplete_coverage(record):
+            continue
+        if getattr(record, "name", None) in _INCOMPLETE_SHARD_CHECK_NAMES:
+            return True
+        if any(_records_have_incomplete_coverage_for_path((record,), shard_path) for shard_path in shard_paths):
+            return True
+    return False
+
+
+_OPENVINO_SCANNED_XML_COMPANIONS_CONFIG_KEY = "_openvino_scanned_xml_companions"
 
 
 def _record_incomplete_dvc_resolution(
@@ -484,6 +417,15 @@ class _TrustedStreamShardRoot:
 
     path: Path
     token: object
+
+
+@dataclass(frozen=True)
+class _FileIdentitySnapshot:
+    """Stable identity fields for a path-sensitive companion file."""
+
+    lstat: tuple[int, int, int, int, int, int]
+    stat: tuple[int, int, int, int, int, int] | None
+    resolved_path: str | None
 
 
 def _make_trusted_stream_shard_root(path: FilePath) -> object:
@@ -730,6 +672,135 @@ def _snapshot_validated_shard_target(
         if trusted_family_group:
             target["family_group"] = trusted_family_group
     return {str(source.absolute()): target}
+
+
+def _openvino_weights_companion_owner(path: Path) -> Path | None:
+    """Return the OpenVINO XML that owns a same-stem .bin sidecar."""
+    try:
+        from modelaudit.scanners.openvino_scanner import openvino_xml_companion_for_weights
+
+        return openvino_xml_companion_for_weights(path)
+    except Exception:
+        return None
+
+
+def _is_openvino_xml_path(path: Path) -> bool:
+    """Return whether the path is a local OpenVINO XML model."""
+    if path.suffix.lower() != ".xml":
+        return False
+    try:
+        from modelaudit.scanners.openvino_scanner import OpenVinoScanner
+
+        return OpenVinoScanner.can_handle(str(path))
+    except Exception:
+        return False
+
+
+def _openvino_xml_companion_key(path: Path) -> str:
+    """Return a stable lexical key for one scheduled OpenVINO XML scan."""
+    return os.path.normcase(os.path.normpath(str(Path(os.path.abspath(path)))))
+
+
+def _with_openvino_scanned_xml_companion(config: dict[str, Any], xml_path: Path) -> dict[str, Any]:
+    """Record an OpenVINO XML that will cover its same-stem weights sidecar."""
+    configured_companions = config.get(_OPENVINO_SCANNED_XML_COMPANIONS_CONFIG_KEY, ())
+    companion_keys = {
+        str(companion_key) for companion_key in configured_companions if isinstance(companion_key, (str, Path))
+    }
+    companion_keys.add(_openvino_xml_companion_key(xml_path))
+    updated_config = dict(config)
+    updated_config[_OPENVINO_SCANNED_XML_COMPANIONS_CONFIG_KEY] = tuple(sorted(companion_keys))
+    return updated_config
+
+
+def _openvino_xml_companion_will_be_scanned(xml_path: Path, config: dict[str, Any]) -> bool:
+    """Return whether this scan invocation scheduled the owning XML through OpenVINO."""
+    if not policy_from_config(config).allows("openvino"):
+        return False
+    configured_companions = config.get(_OPENVINO_SCANNED_XML_COMPANIONS_CONFIG_KEY, ())
+    if not isinstance(configured_companions, (list, tuple, set, frozenset)):
+        return False
+    return _openvino_xml_companion_key(xml_path) in {
+        str(companion_key) for companion_key in configured_companions if isinstance(companion_key, (str, Path))
+    }
+
+
+def _snapshot_file_identity(path: Path) -> _FileIdentitySnapshot | None:
+    """Snapshot path and target identity for TOCTOU-sensitive companion checks."""
+    try:
+        link_stat = os.lstat(path)
+    except OSError:
+        return None
+
+    stat_fields: tuple[int, int, int, int, int, int] | None = None
+    resolved_path: str | None = None
+    try:
+        target_stat = os.stat(path)
+        stat_fields = (
+            target_stat.st_dev,
+            target_stat.st_ino,
+            target_stat.st_mode,
+            target_stat.st_size,
+            target_stat.st_mtime_ns,
+            target_stat.st_ctime_ns,
+        )
+        resolved_path = str(path.resolve(strict=True))
+    except OSError:
+        # TOCTOU races or inaccessible symlink targets still leave a useful lstat snapshot.
+        logger.debug("Could not snapshot target identity for %s", path, exc_info=True)
+
+    return _FileIdentitySnapshot(
+        lstat=(
+            link_stat.st_dev,
+            link_stat.st_ino,
+            link_stat.st_mode,
+            link_stat.st_size,
+            link_stat.st_mtime_ns,
+            link_stat.st_ctime_ns,
+        ),
+        stat=stat_fields,
+        resolved_path=resolved_path,
+    )
+
+
+def _snapshot_file_size(snapshot: _FileIdentitySnapshot | None) -> int:
+    """Return the target size captured by a file identity snapshot."""
+    if snapshot is None:
+        return 0
+    stat_fields = snapshot.stat or snapshot.lstat
+    return stat_fields[3]
+
+
+def _openvino_xml_weights_companion(path: Path) -> Path | None:
+    """Return a local OpenVINO XML model's same-stem weights sidecar."""
+    if not _is_openvino_xml_path(path):
+        return None
+    try:
+        from modelaudit.scanners.openvino_scanner import openvino_weights_companion_for_xml
+
+        return openvino_weights_companion_for_xml(path)
+    except Exception:
+        return None
+
+
+def _snapshot_openvino_companion_for_hash(xml_path: Path, companion_path: Path) -> _FileIdentitySnapshot | None:
+    """Snapshot an OpenVINO sidecar only when hashing stays in the model directory."""
+    companion_snapshot = _snapshot_file_identity(companion_path)
+    if companion_snapshot is None:
+        return None
+    if not companion_path.is_symlink():
+        return companion_snapshot
+
+    try:
+        model_dir = xml_path.resolve(strict=True).parent
+    except OSError:
+        return None
+    if companion_snapshot.resolved_path is None or not is_within_directory(
+        str(model_dir),
+        companion_snapshot.resolved_path,
+    ):
+        return None
+    return companion_snapshot
 
 
 def _validated_shard_family_scopes(
@@ -1519,6 +1590,65 @@ def _preferred_scanner_can_handle(
     return False
 
 
+def _has_only_allowed_alternate_format_inconclusive_reasons(result: ScanResult, validated_format: str) -> bool:
+    allowed_reasons = _ALTERNATE_VALIDATED_FORMAT_ALLOWED_INCONCLUSIVE_REASONS.get(validated_format, frozenset())
+    reasons = result.metadata.get(SCAN_OUTCOME_REASONS_METADATA_KEY)
+    if not isinstance(reasons, list):
+        return bool(result.success)
+    return bool(reasons) and all(isinstance(reason, str) and reason in allowed_reasons for reason in reasons)
+
+
+def _has_private_actionable_scanner_evidence(result: ScanResult) -> bool:
+    for metadata_key in (ACTIONABLE_FAILED_CHECKS_METADATA_KEY, SUPPRESSED_FAILED_CHECKS_METADATA_KEY):
+        private_checks = result._private_metadata.get(metadata_key)
+        if _private_checks_contain_actionable_evidence(private_checks):
+            return True
+    return False
+
+
+def _private_checks_contain_actionable_evidence(private_checks: Any) -> bool:
+    if not isinstance(private_checks, list):
+        return False
+    for private_check in private_checks:
+        if not isinstance(private_check, dict):
+            continue
+        if private_check.get("severity") in {IssueSeverity.WARNING.value, IssueSeverity.CRITICAL.value}:
+            return True
+    return False
+
+
+def _validated_alternate_format_for_mismatch(
+    result: ScanResult,
+    *,
+    header_format: str,
+    magic_format: str,
+) -> str | None:
+    """Return a validated alternate format that can demote extension mismatch."""
+    validated_format = result.metadata.get(VALIDATED_FORMAT_METADATA_KEY)
+    if not isinstance(validated_format, str):
+        return None
+    if validated_format != result.scanner_name:
+        return None
+    if validated_format not in _ALTERNATE_VALIDATED_FORMAT_ALLOWED_INCONCLUSIVE_REASONS:
+        return None
+    if header_format not in {validated_format, PROTOBUF_MODEL_CANDIDATE_FORMAT} and magic_format not in {
+        validated_format,
+        PROTOBUF_MODEL_CANDIDATE_FORMAT,
+    }:
+        return None
+    if result.has_errors or result.has_warnings or _has_private_actionable_scanner_evidence(result):
+        return None
+    if result.metadata.get(OPERATIONAL_ERROR_METADATA_KEY) is True:
+        return None
+    if (
+        result.success is False
+        or result.metadata.get(SCAN_OUTCOME_METADATA_KEY) == INCONCLUSIVE_SCAN_OUTCOME
+        or result.metadata.get("analysis_incomplete") is True
+    ) and not _has_only_allowed_alternate_format_inconclusive_reasons(result, validated_format):
+        return None
+    return validated_format
+
+
 def _mark_xgboost_pickle_extension_spoof(result: ScanResult, path: str, ext: str) -> None:
     """Preserve pickle analysis while flagging XGBoost extension spoofing."""
     existing_reasons = result.metadata.get("scan_outcome_reasons")
@@ -1620,6 +1750,26 @@ def _make_incomplete_protobuf_model_result(path: str) -> ScanResult:
     )
     _mark_inconclusive_scan_outcome(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
     _mark_operational_scan_error(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_sentencepiece_model_proto_result(path: str) -> ScanResult:
+    """Fail closed when a SentencePiece-like protobuf fails ownership validation."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="SentencePiece ModelProto Routing",
+        passed=False,
+        message=(
+            "SentencePiece ModelProto routing was inconclusive because the payload "
+            "looked like a tokenizer protobuf but failed ownership validation"
+        ),
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON)
     result.finish(success=False)
     return result
 
@@ -2714,6 +2864,46 @@ def scan_model_directory_or_file(
                     seen_complete_hf_shard_families.add(family_dedupe_key)
                 scan_entries.append((representative_file, ordered_family_paths, shard_family_key))
 
+            scheduled_openvino_companion_sizes: dict[str, int] = {}
+            if scanner_selection.allows("openvino"):
+                scheduled_companions_by_key: dict[str, str] = {}
+                for representative_file, _scanned_file_paths, _entry_shard_family_key in scan_entries:
+                    xml_path = Path(representative_file)
+                    companion_path = _openvino_xml_weights_companion(xml_path)
+                    if companion_path is None:
+                        continue
+                    companion_snapshot = _snapshot_openvino_companion_for_hash(xml_path, companion_path)
+                    if companion_snapshot is None:
+                        aggregate_hash_complete = False
+                        continue
+                    xml_key = _openvino_xml_companion_key(xml_path)
+                    companion_path_str = str(companion_path)
+                    scheduled_openvino_companion_sizes[xml_key] = _snapshot_file_size(companion_snapshot)
+                    scheduled_companions_by_key[_openvino_xml_companion_key(companion_path)] = companion_path_str
+
+                if scheduled_companions_by_key:
+                    expanded_scan_entries: list[_ScanEntry] = []
+                    for representative_file, scanned_file_paths, entry_shard_family_key in scan_entries:
+                        representative_key = _openvino_xml_companion_key(Path(representative_file))
+                        if representative_key in scheduled_companions_by_key:
+                            continue
+
+                        expanded_scanned_file_paths = list(scanned_file_paths)
+                        expanded_scanned_path_keys = {
+                            _openvino_xml_companion_key(Path(scanned_file_path))
+                            for scanned_file_path in expanded_scanned_file_paths
+                        }
+                        companion_path = _openvino_xml_weights_companion(Path(representative_file))
+                        if companion_path is not None:
+                            companion_key = _openvino_xml_companion_key(companion_path)
+                            scheduled_companion_path = scheduled_companions_by_key.get(companion_key)
+                            if scheduled_companion_path is not None and companion_key not in expanded_scanned_path_keys:
+                                expanded_scanned_file_paths.append(scheduled_companion_path)
+                        expanded_scan_entries.append(
+                            (representative_file, expanded_scanned_file_paths, entry_shard_family_key)
+                        )
+                    scan_entries = expanded_scan_entries
+
             if isinstance(dvc_parent_file, str) and isinstance(dvc_remaining_total_size, int):
                 remaining_size = dvc_remaining_total_size
                 bounded_scan_entries: list[_ScanEntry] = []
@@ -2748,6 +2938,11 @@ def scan_model_directory_or_file(
             # family once. Shard scans already expand to sibling shards in the
             # advanced handler, so scanning each shard path would duplicate work.
             if scan_entries:
+                scheduled_openvino_xml_companions = {
+                    _openvino_xml_companion_key(Path(representative_file))
+                    for representative_file, _scanned_file_paths, _entry_shard_family_key in scan_entries
+                    if scanner_selection.allows("openvino") and _is_openvino_xml_path(Path(representative_file))
+                }
                 hash_sources: list[str] = []
                 seen_hash_sources: set[str] = set()
                 hash_source_by_path: dict[str, str] = {}
@@ -2844,7 +3039,17 @@ def scan_model_directory_or_file(
                                         shard_family_targets.get(shard_family_key, {}),
                                     )
                                 )
+                            openvino_owner = _openvino_weights_companion_owner(Path(representative_file))
+                            if (
+                                openvino_owner is not None
+                                and _openvino_xml_companion_key(openvino_owner) in scheduled_openvino_xml_companions
+                            ):
+                                file_config = _with_openvino_scanned_xml_companion(file_config, openvino_owner)
                             file_result = scan_file(representative_file, file_config)
+                            file_result.bytes_scanned += scheduled_openvino_companion_sizes.get(
+                                _openvino_xml_companion_key(Path(representative_file)),
+                                0,
+                            )
                         finally:
                             _finish_phase_timing(phase_timings, "file_scan_dispatch", file_scan_started_at)
 
@@ -2999,7 +3204,6 @@ def scan_model_directory_or_file(
             if pending_dvc_output_limit_checks:
                 from modelaudit.scanners import get_scanner_for_file
 
-                resolved_directory_scan_root = _resolve_coverage_path(path)
                 for asset in results.assets:
                     if asset.type == "error" or not os.path.isfile(asset.path):
                         continue
@@ -3008,11 +3212,7 @@ def scan_model_directory_or_file(
                         metadata.get("operational_error") is True or _metadata_has_incomplete_coverage(metadata)
                     ):
                         continue
-                    if _result_asset_has_operational_or_incomplete_record(
-                        results,
-                        asset.path,
-                        scan_root=resolved_directory_scan_root,
-                    ):
+                    if _records_have_incomplete_coverage_for_path((*results.checks, *results.issues), asset.path):
                         continue
                     if scanner_selection.active and get_scanner_for_file(asset.path, config=config) is None:
                         continue
@@ -3157,10 +3357,9 @@ def scan_model_directory_or_file(
                                 metadata.get("operational_error") is True or _metadata_has_incomplete_coverage(metadata)
                             )
                         )
-                        and not _result_asset_has_operational_or_incomplete_record(
-                            nested_result,
+                        and not _records_have_incomplete_coverage_for_path(
+                            (*nested_result.checks, *nested_result.issues),
                             asset.path,
-                            scan_root=_resolve_coverage_path(target),
                         )
                     }
                     scanned_dvc_paths.update(nested_scanned_paths)
@@ -3228,10 +3427,21 @@ def scan_model_directory_or_file(
                     results.aggregate_scan_result(nested_result)
                     for asset in nested_result.assets:
                         asset_path = Path(asset.path)
-                        if asset_path.is_file():
-                            resolved_asset_path = str(asset_path.resolve())
-                            scanned_dvc_paths.add(resolved_asset_path)
-                            internally_scanned_dvc_paths.add(resolved_asset_path)
+                        if not asset_path.is_file():
+                            continue
+                        metadata = nested_result.file_metadata.get(asset.path)
+                        if metadata is not None and (
+                            metadata.get("operational_error") is True or _metadata_has_incomplete_coverage(metadata)
+                        ):
+                            continue
+                        if _records_have_incomplete_coverage_for_path(
+                            (*nested_result.checks, *nested_result.issues),
+                            asset.path,
+                        ):
+                            continue
+                        resolved_asset_path = str(asset_path.resolve())
+                        scanned_dvc_paths.add(resolved_asset_path)
+                        internally_scanned_dvc_paths.add(resolved_asset_path)
                     for root, _dirs, _files in os.walk(target, followlinks=False):
                         resolved_directory = str(Path(root).resolve())
                         dvc_scanned_directories.add(resolved_directory)
@@ -3283,11 +3493,12 @@ def scan_model_directory_or_file(
                 _add_scan_result_to_model(results, scan_metadata, file_result, target)
 
                 _add_asset_to_results(results, target, file_result)
+                file_records = (*file_result.checks, *file_result.issues)
                 if (
                     is_dvc_pointer
                     and not _scan_result_has_operational_error(file_result)
                     and not _metadata_has_incomplete_coverage(file_result.metadata or {})
-                    and not _scan_result_has_operational_or_incomplete_record(file_result)
+                    and not _records_have_incomplete_coverage_for_path(file_records, target)
                 ):
                     scanned_dvc_paths.add(resolved_target)
                     internally_scanned_dvc_paths.add(resolved_target)
@@ -3299,6 +3510,8 @@ def scan_model_directory_or_file(
                                 for shard_path in shard_paths
                                 if isinstance(shard_path, str)
                             }
+                            if _shard_family_has_incomplete_coverage(file_records, resolved_shard_paths):
+                                continue
                             scanned_dvc_paths.update(resolved_shard_paths)
                             internally_scanned_dvc_paths.update(resolved_shard_paths)
                 _finish_phase_timing(phase_timings, "result_merge", result_merge_started_at)
@@ -3733,6 +3946,26 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         sr.finish(success=False)
         return sr
 
+    openvino_owner = _openvino_weights_companion_owner(Path(path))
+    if openvino_owner is not None and _openvino_xml_companion_will_be_scanned(openvino_owner, config):
+        sr = ScanResult(scanner_name="openvino")
+        sr.bytes_scanned = file_size
+        sr.metadata["file_size"] = file_size
+        sr.metadata["openvino_xml_companion"] = str(openvino_owner)
+        sr.add_check(
+            name="OpenVINO Weights Sidecar Routing",
+            passed=True,
+            message="OpenVINO weights sidecar covered by adjacent XML model scan",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "xml_companion": str(openvino_owner),
+                "sidecar_file": path,
+            },
+        )
+        sr.finish(success=True)
+        return sr
+
     hdf5_signature_offset = find_hdf5_signature_offset(path)
     safetensors_overlap_scanner_ids = detect_safetensors_overlap_scanner_ids(path)
     try:
@@ -3784,6 +4017,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         format_probe_error is None
         and header_format in {"unknown", "pytorch_binary"}
         and pytorch_binary_supplemental_scanner_id is None
+        and not (ext == ".model" and _is_malformed_sentencepiece_model_proto_candidate_file(path))
         and scanner_selection.allows("zip")
         and ZipScanner.can_handle(path)
     ):
@@ -3857,6 +4091,13 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             if nested_xgboost_route == "xgboost":
                 config[XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY] = True
     is_xgboost_pickle_spoof = ext in _XGBOOST_BINARY_EXTENSIONS and header_format == "pickle"
+    sentencepiece_model_proto_owned = (
+        format_probe_error is None
+        and ext == ".model"
+        and header_format == "unknown"
+        and magic_format == "unknown"
+        and is_sentencepiece_model_proto_file(path)
+    )
     # Record telemetry for file type detection
     detected_format = header_format if header_format != "unknown" else ext_format
     record_file_type_detected(path, detected_format)
@@ -3899,6 +4140,14 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         return sr
     if header_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT or magic_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT:
         sr = _make_incomplete_onnx_routing_result(path)
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
+    if (
+        header_format == SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+        or magic_format == SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT
+    ):
+        sr = _make_incomplete_sentencepiece_model_proto_result(path)
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
@@ -3976,19 +4225,22 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             f"File type validation failed: extension indicates {ext_format} but magic bytes "
             f"indicate {magic_format}. This could indicate file spoofing or corruption."
         )
-        logger.warning(discrepancy_msg)
-    elif header_format != ext_format and header_format != "unknown" and ext_format != "unknown":
-        # Suppress expected container-vs-extension differences for known wrapper formats.
-        if not (
+    elif (
+        header_format != ext_format
+        and header_format != "unknown"
+        and ext_format != "unknown"
+        and not (
             (ext_format == "pytorch_binary" and header_format in ["zip", "pickle"] and ext == ".bin")
             or (ext_format == "pytorch_binary" and header_format == "pickle" and ext in [".pt", ".pth"])
             or (ext_format == "pickle" and header_format == "jax_checkpoint" and ext in [".ckpt", ".pickle"])
             or (ext_format == "keras" and header_format in ["zip", "hdf5"])
             or (ext_format == "protobuf" and header_format == "onnx" and ext == ".pb")
             or (ext_format == "skops" and header_format == "zip" and ext == ".skops")
-        ):
-            discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
-            logger.debug(discrepancy_msg)
+        )
+    ):
+        # Suppress expected container-vs-extension differences for known wrapper formats.
+        discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
+        logger.debug(discrepancy_msg)
 
     # Prefer scanners based on trusted structure rather than the filename alone.
     preferred_scanner: type[BaseScanner] | None = None
@@ -4120,7 +4372,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 and scanner_selection.allows(fallback_scanner_id)
             ):
                 scanner_class = _registry.load_scanner_by_id(fallback_scanner_id)
-        elif scanner_class is None:
+        elif scanner_class is None and not sentencepiece_model_proto_owned:
             scanner_class = _registry.get_scanner_for_path(
                 path,
                 scanner_selection=scanner_selection if scanner_selection.active else None,
@@ -4196,7 +4448,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     kind=SCANNER_SELECTION_PREFERRED_KIND,
                 )
         else:
-            if unavailable_preferred_scanner_id is None and scanner_selection.active:
+            if (
+                unavailable_preferred_scanner_id is None
+                and scanner_selection.active
+                and not sentencepiece_model_proto_owned
+            ):
                 candidate_scanner_id = skipped_preferred_scanner_id
                 if candidate_scanner_id is None:
                     candidate_scanner_class = _registry.get_scanner_for_path(path)
@@ -4256,6 +4512,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 sr = _make_incomplete_xgboost_ubjson_routing_result(path)
             elif magic_format == ONNX_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_onnx_routing_result(path)
+            elif magic_format == SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_sentencepiece_model_proto_result(path)
             elif magic_format == PICKLE_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_pickle_routing_result(path)
             elif magic_format == TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT:
@@ -4392,22 +4650,59 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         )
 
     if discrepancy_msg:
-        # Determine severity based on whether it's a validation failure or just a discrepancy
-        severity = IssueSeverity.WARNING if not file_type_valid else IssueSeverity.DEBUG
-        # For validation failures, use the actual magic format
-        detail_header_format = magic_format if not file_type_valid else header_format
+        validated_alternate_format = (
+            _validated_alternate_format_for_mismatch(
+                result,
+                header_format=header_format,
+                magic_format=magic_format,
+            )
+            if not file_type_valid
+            else None
+        )
+        if validated_alternate_format is not None:
+            severity = IssueSeverity.INFO
+            rule_code = None
+            file_type_validation_failed = False
+            detail_header_format = magic_format
+            check_message = (
+                f"File extension indicates {ext_format} but {validated_alternate_format} scanner validated "
+                f"content indicated by {magic_format}. Filename and content disagree; using validated "
+                "alternate-format analysis."
+            )
+        else:
+            # Determine severity based on whether it's a validation failure or just a discrepancy
+            severity = IssueSeverity.WARNING if not file_type_valid else IssueSeverity.DEBUG
+            rule_code = "S901" if not file_type_valid else None
+            file_type_validation_failed = not file_type_valid
+            # For validation failures, use the actual magic format
+            detail_header_format = magic_format if not file_type_valid else header_format
+            check_message = discrepancy_msg + " Using header-based detection."
+        details = {
+            "extension_format": ext_format,
+            "header_format": detail_header_format,
+            "file_type_validation_failed": file_type_validation_failed,
+        }
+        if validated_alternate_format is not None:
+            details.update(
+                {
+                    "alternate_format_validated": True,
+                    "original_file_type_validation_failed": True,
+                    "validated_format": validated_alternate_format,
+                }
+            )
+            logger.info(check_message)
+        elif not file_type_valid:
+            logger.warning(discrepancy_msg)
+        else:
+            logger.debug(discrepancy_msg)
         result.add_check(
             name="Format Validation",
             passed=False,
-            message=discrepancy_msg + " Using header-based detection.",
+            message=check_message,
             severity=severity,
             location=path,
-            details={
-                "extension_format": ext_format,
-                "header_format": detail_header_format,
-                "file_type_validation_failed": not file_type_valid,
-            },
-            rule_code="S901" if not file_type_valid else None,
+            details=details,
+            rule_code=rule_code,
         )
 
     # Ensure bytes_scanned reflects the actual file size even when a scanner
@@ -4458,6 +4753,7 @@ def scan_model_streaming(
     start_time = time.time()
     results = create_initial_audit_result()
     file_hashes: list[str] = []
+    hashed_stream_file_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
     aggregate_hash_complete = True
     top_level_hashed_bytes = 0
     files_processed = 0
@@ -4477,6 +4773,9 @@ def scan_model_streaming(
     nearby_license_cache: dict[str, list[str]] = {}
     pending_delete_failures: dict[Path, Exception] = {}
     validated_shard_targets: ValidatedShardTargets = {}
+    preserved_openvino_companion_snapshots: dict[Path, _FileIdentitySnapshot] = {}
+    deferred_openvino_sidecars: dict[Path, Path] = {}
+    consumed_openvino_companions: set[Path] = set()
     preserve_shard_reconciliation_errors = False
 
     def delete_streamed_source(source_path: Path, context: str) -> None:
@@ -4526,16 +4825,172 @@ def scan_model_streaming(
             }
         )
 
+    def record_openvino_companion_stability_failure(
+        xml_path: Path,
+        companion_path: Path,
+        reason: str,
+    ) -> None:
+        """Record a durable operational failure when a streamed OpenVINO sidecar changes."""
+        failure = ScanResult(scanner_name="openvino")
+        _mark_inconclusive_scan_outcome(failure, reason)
+        _mark_operational_scan_error(failure, reason)
+        failure.add_check(
+            name="OpenVINO Weights Companion Stability",
+            passed=False,
+            message="OpenVINO weights companion changed while preserving XML/BIN scan context",
+            severity=IssueSeverity.INFO,
+            location=str(companion_path),
+            details={
+                "xml_file": str(xml_path),
+                "companion_file": str(companion_path),
+                "analysis_incomplete": True,
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reason": reason,
+            },
+        )
+        failure.finish(success=False)
+        results.aggregate_scan_result(
+            {
+                "bytes_scanned": 0,
+                "files_scanned": 0,
+                "has_errors": True,
+                "success": False,
+                "issues": _serialize_streamed_records(
+                    list(failure.issues),
+                    str(companion_path),
+                    str(companion_path),
+                ),
+                "checks": _serialize_streamed_records(
+                    list(failure.checks),
+                    str(companion_path),
+                    str(companion_path),
+                ),
+                "scanners": [failure.scanner_name],
+                "file_metadata": {str(companion_path): dict(failure.metadata)},
+            }
+        )
+
+    def append_streamed_file_hash(
+        scan_path: Path,
+        scan_config: dict[str, Any],
+        *,
+        progress_label: str,
+    ) -> str | None:
+        """Hash one streamed source once before it can be deleted or consumed."""
+        nonlocal aggregate_hash_complete, top_level_hashed_bytes
+
+        scan_path_key = Path(os.path.abspath(scan_path))
+        scan_path_identity = _snapshot_file_identity(scan_path)
+        if scan_path_identity is not None and (scan_path_key, scan_path_identity) in hashed_stream_file_instances:
+            return None
+
+        defer_hash_for_max_total_size = _should_defer_hash_for_max_total_size(
+            scan_config,
+            hashed_bytes=top_level_hashed_bytes,
+        )
+        defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(str(scan_path), scan_config)
+        if defer_hash_for_max_total_size or defer_hash_for_max_file_size:
+            aggregate_hash_complete = False
+            return None
+        if _should_defer_hash_for_safetensors_header_limit(str(scan_path), scan_config):
+            return None
+
+        if progress_callback:
+            progress_callback(
+                f"Hashing {progress_label}",
+                (files_processed / (files_processed + 1)) * 100,
+            )
+        with suppress(OSError):
+            top_level_hashed_bytes += scan_path.stat().st_size
+        file_hash = compute_sha256_hash(scan_path)
+        file_hashes.append(file_hash)
+        if scan_path_identity is not None:
+            hashed_stream_file_instances.add((scan_path_key, scan_path_identity))
+        return file_hash
+
+    def append_streamed_openvino_companion_hash(
+        xml_path: Path,
+        companion_path: Path,
+        scan_config: dict[str, Any],
+    ) -> None:
+        """Hash an OpenVINO sidecar only after preserving its directory boundary."""
+        nonlocal aggregate_hash_complete
+
+        if companion_path.is_symlink():
+            try:
+                resolved_companion = companion_path.resolve(strict=True)
+                model_dir = xml_path.resolve(strict=True).parent
+            except OSError:
+                aggregate_hash_complete = False
+                return
+            if not is_within_directory(str(model_dir), str(resolved_companion)):
+                aggregate_hash_complete = False
+                return
+        append_streamed_file_hash(
+            companion_path,
+            scan_config,
+            progress_label=companion_path.name,
+        )
+
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
     is_hf_cache = base_dir is not None and hf_cache_root is not None
+    stream_started = False
 
     try:
-        for file_path, _is_last in file_generator:
+        file_iterator = iter(file_generator)
+        scanning_deferred_openvino_sidecars = False
+        while True:
+            try:
+                file_path, _is_last = next(file_iterator)
+                stream_started = True
+            except StopIteration:
+                if not scanning_deferred_openvino_sidecars and deferred_openvino_sidecars:
+                    file_iterator = iter((sidecar_path, True) for sidecar_path in deferred_openvino_sidecars.values())
+                    scanning_deferred_openvino_sidecars = True
+                    continue
+                break
+            except Exception as e:
+                if not stream_started:
+                    raise
+                logger.error(f"Streaming source interrupted after partial scan: {e}")
+                results.has_errors = True
+                results.success = False
+                preserve_shard_reconciliation_errors = True
+                aggregate_hash_complete = False
+                _add_issue_to_model(
+                    results,
+                    (
+                        "Streaming source interrupted before all artifacts could be scanned; "
+                        "partial results were preserved."
+                    ),
+                    severity=IssueSeverity.INFO.value,
+                    details={
+                        "analysis_incomplete": True,
+                        "operational_error": True,
+                        "operational_error_reason": _STREAMING_SOURCE_INTERRUPTED_REASON,
+                        "exception_type": type(e).__name__,
+                        "files_scanned_before_failure": results.files_scanned,
+                        "scan_outcome": "inconclusive",
+                        "scan_outcome_reason": _STREAMING_SOURCE_INTERRUPTED_REASON,
+                        "scan_outcome_reasons": [_STREAMING_SOURCE_INTERRUPTED_REASON],
+                    },
+                    issue_type=_STREAMING_SOURCE_INTERRUPTED_REASON,
+                )
+                break
+
             source_path = Path(file_path)
+            source_key = Path(os.path.abspath(source_path))
+            if source_key in consumed_openvino_companions:
+                continue
             scan_path = source_path
             report_path = str(source_path)
             pinned_scan_context: Any | None = None
+            preserve_source_after_scan = False
+            openvino_scan_companion_path: Path | None = None
+            openvino_scan_companion_key: Path | None = None
+            openvino_companion_pre_scan_identity: _FileIdentitySnapshot | None = None
+            openvino_companion_bytes_scanned = 0
 
             # Check for interruption before starting work on the yielded file.
             try:
@@ -4573,10 +5028,41 @@ def scan_model_streaming(
                         continue
                     scan_path = resolved_path
 
-                if skip_file_types and should_skip_file(
-                    str(source_path),
-                    metadata_scanner_available=metadata_scanner_available,
-                    scanner_selection_extensions=scanner_selection_extensions,
+                # Build config before skip filtering so bin-first OpenVINO
+                # sidecars can wait for their selected XML owner.
+                scan_config = {
+                    "timeout": timeout - int(time.time() - start_time),
+                    **scan_kwargs,
+                }
+
+                openvino_sidecar_owner = _openvino_weights_companion_owner(scan_path)
+                if (
+                    openvino_sidecar_owner is not None
+                    and scanner_selection.allows("openvino")
+                    and not scanning_deferred_openvino_sidecars
+                ):
+                    is_lfs_sidecar, _lfs_info = check_lfs_pointer(str(scan_path))
+                    if not is_lfs_sidecar:
+                        preserve_source_after_scan = True
+                        deferred_openvino_sidecars.setdefault(Path(os.path.abspath(scan_path)), source_path)
+                        sidecar_snapshot = _snapshot_file_identity(scan_path)
+                        if sidecar_snapshot is not None:
+                            preserved_openvino_companion_snapshots[Path(os.path.abspath(scan_path))] = sidecar_snapshot
+                        continue
+
+                scan_unconsumed_openvino_sidecar = (
+                    openvino_sidecar_owner is not None
+                    and scanner_selection.allows("openvino")
+                    and scanning_deferred_openvino_sidecars
+                )
+                if (
+                    skip_file_types
+                    and not scan_unconsumed_openvino_sidecar
+                    and should_skip_file(
+                        str(source_path),
+                        metadata_scanner_available=metadata_scanner_available,
+                        scanner_selection_extensions=scanner_selection_extensions,
+                    )
                 ):
                     filename_lower = source_path.name.lower()
                     if filename_lower in LICENSE_FILES:
@@ -4595,11 +5081,27 @@ def scan_model_streaming(
                         logger.debug(f"Skipping non-model file: {source_path}")
                     continue
 
-                # Build config dict for scan_file
-                scan_config = {
-                    "timeout": timeout - int(time.time() - start_time),
-                    **scan_kwargs,
-                }
+                if scanner_selection.allows("openvino") and _is_openvino_xml_path(scan_path):
+                    candidate_companion = _openvino_xml_weights_companion(scan_path)
+                    if candidate_companion is not None:
+                        openvino_scan_companion_path = candidate_companion
+                        openvino_scan_companion_key = Path(os.path.abspath(candidate_companion))
+                        openvino_companion_pre_scan_identity = _snapshot_file_identity(candidate_companion)
+                        openvino_companion_bytes_scanned = _snapshot_file_size(openvino_companion_pre_scan_identity)
+                        preserved_snapshot = preserved_openvino_companion_snapshots.get(openvino_scan_companion_key)
+                        if (
+                            preserved_snapshot is not None
+                            and openvino_companion_pre_scan_identity is not None
+                            and preserved_snapshot != openvino_companion_pre_scan_identity
+                        ):
+                            record_openvino_companion_stability_failure(
+                                scan_path,
+                                candidate_companion,
+                                "openvino_weights_changed_before_xml_scan",
+                            )
+                            preserve_shard_reconciliation_errors = True
+                            aggregate_hash_complete = False
+
                 initial_shard_target = _snapshot_validated_shard_target(
                     str(source_path),
                     resolved_path=str(scan_path),
@@ -4634,28 +5136,17 @@ def scan_model_streaming(
                             files_processed += 1
                             continue
 
-                file_hash: str | None = None
-                defer_hash_for_max_total_size = _should_defer_hash_for_max_total_size(
+                file_hash = append_streamed_file_hash(
+                    scan_path,
                     scan_config,
-                    hashed_bytes=top_level_hashed_bytes,
+                    progress_label=source_path.name,
                 )
-                defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(str(scan_path), scan_config)
-                if defer_hash_for_max_total_size or defer_hash_for_max_file_size:
-                    aggregate_hash_complete = False
-                if (
-                    not _should_defer_hash_for_safetensors_header_limit(str(scan_path), scan_config)
-                    and not defer_hash_for_max_file_size
-                    and not defer_hash_for_max_total_size
-                ):
-                    if progress_callback:
-                        progress_callback(
-                            f"Hashing {source_path.name}",
-                            (files_processed / (files_processed + 1)) * 100,
-                        )
-                    with suppress(OSError):
-                        top_level_hashed_bytes += scan_path.stat().st_size
-                    file_hash = compute_sha256_hash(scan_path)
-                    file_hashes.append(file_hash)
+                if openvino_scan_companion_path is not None:
+                    append_streamed_openvino_companion_hash(
+                        scan_path,
+                        openvino_scan_companion_path,
+                        scan_config,
+                    )
 
                 # Scan the file
                 if progress_callback:
@@ -4665,6 +5156,19 @@ def scan_model_streaming(
                     str(scan_path),
                     config=scan_config,
                 )
+                scan_result.bytes_scanned += openvino_companion_bytes_scanned
+                if (
+                    openvino_scan_companion_path is not None
+                    and openvino_companion_pre_scan_identity is not None
+                    and _snapshot_file_identity(openvino_scan_companion_path) != openvino_companion_pre_scan_identity
+                ):
+                    record_openvino_companion_stability_failure(
+                        scan_path,
+                        openvino_scan_companion_path,
+                        "openvino_weights_changed_during_xml_scan",
+                    )
+                    preserve_shard_reconciliation_errors = True
+                    aggregate_hash_complete = False
                 if pre_scan_shard_target:
                     _ensure_streamed_shard_coverage_placeholder(scan_result, source_path)
 
@@ -4779,7 +5283,13 @@ def scan_model_streaming(
                 if pinned_scan_context is not None:
                     pinned_scan_context.__exit__(None, None, None)
                 # Delete file after scanning if requested
-                delete_streamed_source(source_path, "after scanning")
+                if not preserve_source_after_scan:
+                    delete_streamed_source(source_path, "after scanning")
+                if openvino_scan_companion_path is not None and openvino_scan_companion_key is not None:
+                    delete_streamed_source(openvino_scan_companion_path, "after OpenVINO XML scan")
+                    consumed_openvino_companions.add(openvino_scan_companion_key)
+                    deferred_openvino_sidecars.pop(openvino_scan_companion_key, None)
+                    preserved_openvino_companion_snapshots.pop(openvino_scan_companion_key, None)
 
         _reconcile_cross_directory_shard_coverage(
             results,

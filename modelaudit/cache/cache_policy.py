@@ -3,9 +3,11 @@
 from typing import Any
 
 from modelaudit.scanner_results import (
+    ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
     INCONCLUSIVE_SCAN_OUTCOME,
     SCAN_OUTCOME_REASONS_METADATA_KEY,
     SCANNER_DEPENDENCY_IDS_METADATA_KEY,
+    SUPPRESSED_FAILED_CHECKS_METADATA_KEY,
 )
 
 _OPERATIONAL_ERROR_INDICATORS = (
@@ -36,6 +38,10 @@ _OPERATIONAL_ERROR_INDICATORS = (
     "too many open files",
     "associated .bin weights file not found",
 )
+_PRIVATE_EVIDENCE_METADATA_KEYS = (
+    ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
+    SUPPRESSED_FAILED_CHECKS_METADATA_KEY,
+)
 
 
 def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
@@ -43,8 +49,11 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
     if scan_result.get("success") is False:
         return False
 
-    metadata = scan_result.get("metadata")
-    if isinstance(metadata, dict) and (bool(metadata.get("operational_error")) or _has_incomplete_coverage(metadata)):
+    if _metadata_disqualifies_cache(scan_result.get("metadata")):
+        return False
+
+    private_metadata = scan_result.get("_private_metadata")
+    if isinstance(private_metadata, dict) and any(key in private_metadata for key in _PRIVATE_EVIDENCE_METADATA_KEYS):
         return False
 
     for collection_name in ("issues", "checks"):
@@ -56,10 +65,7 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
             if not isinstance(entry, dict):
                 continue
 
-            details = entry.get("details")
-            if isinstance(details, dict) and (
-                bool(details.get("operational_error")) or _has_incomplete_coverage(details)
-            ):
+            if _metadata_disqualifies_cache(entry.get("details")):
                 return False
 
             message = entry.get("message")
@@ -71,15 +77,36 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
     return True
 
 
-def _has_incomplete_coverage(metadata: dict[str, Any]) -> bool:
-    if metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
+def _metadata_disqualifies_cache(metadata: Any) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    if (
+        bool(metadata.get("operational_error"))
+        or bool(metadata.get("analysis_incomplete"))
+        or metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        or _has_incomplete_coverage_reasons(metadata)
+    ):
+        return True
+
+    findings = metadata.get("findings")
+    if isinstance(findings, dict):
+        return _metadata_disqualifies_cache(findings)
+    if isinstance(findings, (list, tuple, set, frozenset)):
+        return any(_metadata_disqualifies_cache(finding) for finding in findings)
+
+    details = metadata.get("details")
+    if isinstance(details, dict):
+        return _metadata_disqualifies_cache(details)
+
+    return False
+
+
+def _has_incomplete_coverage_reasons(metadata: dict[str, Any]) -> bool:
+    reason = metadata.get("scan_outcome_reason")
+    if isinstance(reason, str) and reason:
         return True
     if metadata.get("analysis_incomplete") is True:
         return True
-
-    reason = metadata.get("scan_outcome_reason")
-    if isinstance(reason, str):
-        return bool(reason)
 
     reasons = metadata.get(SCAN_OUTCOME_REASONS_METADATA_KEY)
     if isinstance(reasons, str):

@@ -17,6 +17,9 @@ SCAN_OUTCOME_METADATA_KEY: Final[str] = "scan_outcome"
 SCAN_OUTCOME_REASONS_METADATA_KEY: Final[str] = "scan_outcome_reasons"
 SCAN_OUTCOME_MESSAGE_METADATA_KEY: Final[str] = "scan_outcome_message"
 SCANNER_DEPENDENCY_IDS_METADATA_KEY: Final[str] = "scanner_dependency_ids"
+VALIDATED_FORMAT_METADATA_KEY: Final[str] = "validated_format"
+ACTIONABLE_FAILED_CHECKS_METADATA_KEY: Final[str] = "actionable_failed_checks"
+SUPPRESSED_FAILED_CHECKS_METADATA_KEY: Final[str] = "suppressed_failed_checks"
 OPERATIONAL_ERROR_METADATA_KEY: Final[str] = "operational_error"
 RAW_DETECTOR_ANALYSIS_INCOMPLETE_REASON: Final[str] = "raw_detector_analysis_incomplete"
 RAW_DETECTOR_FAILURES_METADATA_KEY: Final[str] = "raw_detector_analysis_failures"
@@ -302,6 +305,24 @@ class ScanResult:
         self._metadata_restored_critical: bool = False
         self._merged_children_success: bool = True
 
+    def _record_private_failed_check(
+        self,
+        metadata_key: str,
+        *,
+        name: str,
+        rule_code: str,
+        severity: IssueSeverity,
+    ) -> None:
+        failed_checks = self._private_metadata.setdefault(metadata_key, [])
+        if isinstance(failed_checks, list):
+            failed_checks.append(
+                {
+                    "name": name,
+                    "rule_code": rule_code,
+                    "severity": severity.value,
+                }
+            )
+
     def add_check(
         self,
         name: str,
@@ -336,8 +357,24 @@ class ScanResult:
 
         config = get_config()
 
+        raw_failed_severity = severity or IssueSeverity.WARNING
+        if rule_code and not passed and raw_failed_severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}:
+            self._record_private_failed_check(
+                ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
+                name=name,
+                rule_code=rule_code,
+                severity=raw_failed_severity,
+            )
+
         # Check if rule is suppressed
         if rule_code and config.is_suppressed(rule_code, location):
+            if not passed:
+                self._record_private_failed_check(
+                    SUPPRESSED_FAILED_CHECKS_METADATA_KEY,
+                    name=name,
+                    rule_code=rule_code,
+                    severity=raw_failed_severity,
+                )
             # Messages can include matched secrets or attacker-controlled model content.
             logger.debug("Suppressed security finding")
             return
