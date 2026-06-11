@@ -1,5 +1,6 @@
 import ctypes
 import errno
+import hashlib
 import importlib
 import json
 import logging
@@ -79,6 +80,29 @@ def _make_trusted_shard_parent(path: Path, *, parents: bool = False) -> None:
     """Create a shard parent without inheriting group-write test umasks."""
     path.mkdir(parents=parents)
     path.chmod(0o755)
+
+
+def _bert_like_multilingual_vocab_bytes(*tail_tokens: str) -> bytes:
+    tokens = [
+        "[PAD]",
+        "[UNK]",
+        "[CLS]",
+        "[SEP]",
+        "[MASK]",
+        "the",
+        "und",
+        "de",
+        "la",
+        "\u4e2d",
+        "\u56fd",
+        "\u8a9e",
+        "\u03b1",
+        "\u03b2",
+        *[f"token{index}" for index in range(128)],
+        *[f"##piece{index}" for index in range(8)],
+        *tail_tokens,
+    ]
+    return ("\n".join(tokens) + "\n").encode()
 
 
 def create_mock_scan_result(**kwargs: Any) -> ModelAuditResultModel:
@@ -4487,6 +4511,51 @@ def test_scan_huggingface_cached_stream_reconciles_snapshot_alias_shards(
 
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+def test_scan_huggingface_streaming_omits_multilingual_vocab_cc_token(
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Streamed Hugging Face tokenizer vocabularies should retain vocabulary context."""
+    mock_is_hf_url.return_value = True
+    model_dir = tmp_path / "huggingface" / "google-bert" / "bert-base-multilingual-uncased"
+    model_dir.mkdir(parents=True)
+    vocab_path = model_dir / "tokenizer-multilingual.txt"
+    vocab_path.write_bytes(_bert_like_multilingual_vocab_bytes("zombie"))
+    mock_download_streaming.return_value = iter([(vocab_path, True)])
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--stream",
+            "--quiet",
+            "--format",
+            "json",
+            "--scanners",
+            "text",
+            "hf://google-bert/bert-base-multilingual-uncased",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 1
+    assert not output_payload["issues"]
+    assert not [
+        check
+        for check in output_payload["checks"]
+        if check.get("name") == "Network Communication Detection"
+        and check.get("details", {}).get("type") == "cc_pattern"
+    ]
+    assert mock_download_streaming.call_args.kwargs["scannable_extensions"] == frozenset(
+        {".txt", ".md", ".markdown", ".rst"}
+    )
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
 def test_scan_huggingface_streaming_passes_selected_scanner_extensions(
     mock_scan_streaming: MagicMock,
@@ -4711,7 +4780,9 @@ def test_scan_huggingface_sbom_excludes_download_cache_files(
 
     cache_dir = downloaded_dir / ".cache" / "huggingface" / "download"
     cache_dir.mkdir(parents=True)
-    (cache_dir / "config.json.metadata").write_text("{}")
+    (cache_dir / "config.json.metadata").write_text(
+        "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n"
+    )
     (cache_dir / ".gitignore").write_text("*\n")
 
     mock_download.return_value = downloaded_dir
@@ -4753,7 +4824,9 @@ def test_scan_directory_skips_huggingface_cache_bookkeeping(tmp_path):
 
     cache_dir = model_dir / ".cache" / "huggingface" / "download"
     cache_dir.mkdir(parents=True)
-    (cache_dir / "config.json.metadata").write_text("{}")
+    (cache_dir / "config.json.metadata").write_text(
+        "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n"
+    )
     (cache_dir / ".gitignore").write_text("*\n")
 
     result = scan_model_directory_or_file(str(model_dir))
@@ -5322,6 +5395,18 @@ def test_scan_path_state_redacts_stream_fallback_for_sbom() -> None:
     path_state.track_streaming_paths_for_sbom(create_initial_audit_result(), url)
 
     assert path_state.scanned_paths == ["stream://https://bucket.s3.amazonaws.com/model.bin"]
+
+
+def test_scan_path_state_omits_empty_local_streaming_inventory_for_sbom(tmp_path: Path) -> None:
+    """A local streamed inventory with no assets must not fall back to re-inventorying the directory."""
+    model_dir = tmp_path / "only-sidecars"
+    model_dir.mkdir()
+    path_state = _ScanPathState()
+
+    path_state.track_streaming_paths_for_sbom(create_initial_audit_result(), str(model_dir))
+
+    assert path_state.sbom_paths_resolved is True
+    assert path_state.scanned_paths == []
 
 
 def test_scan_path_state_preserves_local_asset_path_for_sbom() -> None:
@@ -6341,6 +6426,94 @@ def test_exit_code_streaming_symlink_traversal_without_safe_files(tmp_path: Path
     assert "Path traversal outside scanned directory" in output
     assert "CRITICAL SECURITY ISSUES FOUND" in output
     assert "NO FILES SCANNED" not in output
+
+
+def test_cli_streaming_local_download_sidecars_excluded_from_inventory_and_sbom(tmp_path: Path) -> None:
+    """CLI streaming scans should not count Hugging Face local-dir sidecars."""
+    model_dir = tmp_path / "downloaded-model"
+    model_dir.mkdir()
+    config_path = model_dir / "config.json"
+    config_path.write_text('{"model_type":"bert"}', encoding="utf-8")
+    vocab_path = model_dir / "vocab.txt"
+    vocab_path.write_text("[PAD]\n[UNK]\n", encoding="utf-8")
+
+    download_root = model_dir / ".cache" / "huggingface" / "download"
+    download_root.mkdir(parents=True)
+    (download_root / "config.json.metadata").write_text(
+        "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n",
+        encoding="utf-8",
+    )
+    (download_root / "config.json.lock").touch()
+    (download_root / "vocab.txt.metadata").write_text(
+        "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n",
+        encoding="utf-8",
+    )
+    (model_dir / ".cache" / "huggingface" / "CACHEDIR.TAG").write_text(
+        "Signature: 8a477f597d28d172789f06886806bc55\n"
+        "# This file is a cache directory tag created by huggingface_hub.\n"
+        "# For information about cache directory tags, see:\n"
+        "#\thttps://bford.info/cachedir/\n",
+        encoding="utf-8",
+    )
+    sbom_file = tmp_path / "stream.sbom.json"
+    file_hashes = [
+        hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        hashlib.sha256(vocab_path.read_bytes()).hexdigest(),
+    ]
+    expected_content_hash = hashlib.sha256("".join(sorted(file_hashes)).encode()).hexdigest()
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--stream", "--format", "json", "--no-cache", "--sbom", str(sbom_file), str(model_dir)],
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 2
+    assert output_payload["content_hash"] == expected_content_hash
+    assert {Path(asset["path"]).relative_to(model_dir).as_posix() for asset in output_payload["assets"]} == {
+        "config.json",
+        "vocab.txt",
+    }
+    assert not any(".cache/huggingface" in path for path in output_payload["file_metadata"])
+    assert not any(".cache/huggingface" in (check.get("location") or "") for check in output_payload["checks"])
+    assert not any(".cache/huggingface" in (issue.get("location") or "") for issue in output_payload["issues"])
+
+    sbom_data = json.loads(sbom_file.read_text())
+    component_names = {component["name"] for component in sbom_data["components"]}
+    assert component_names == {"config.json", "vocab.txt"}
+
+
+def test_cli_streaming_empty_hf_cache_sidecars_do_not_populate_sbom(tmp_path: Path) -> None:
+    """A zero-asset streaming scan should not re-inventory skipped Hugging Face cache tags for SBOM."""
+    model_dir = tmp_path / "downloaded-model"
+    cachedir_tag = model_dir / ".cache" / "huggingface" / "CACHEDIR.TAG"
+    cachedir_tag.parent.mkdir(parents=True)
+    cachedir_tag.write_text(
+        "Signature: 8a477f597d28d172789f06886806bc55\n"
+        "# This file is a cache directory tag created by huggingface_hub.\n"
+        "# For information about cache directory tags, see:\n"
+        "#\thttps://bford.info/cachedir/\n",
+        encoding="utf-8",
+    )
+    sbom_file = tmp_path / "stream-empty.sbom.json"
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--stream", "--format", "json", "--no-cache", "--sbom", str(sbom_file), str(model_dir)],
+    )
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 0
+    assert output_payload["assets"] == []
+    assert output_payload["file_metadata"] == {}
+    assert output_payload["success"] is True
+
+    sbom_text = sbom_file.read_text()
+    sbom_data = json.loads(sbom_text)
+    assert sbom_data.get("components", []) == []
+    assert "CACHEDIR.TAG" not in sbom_text
 
 
 def test_exit_code_scan_errors(tmp_path):

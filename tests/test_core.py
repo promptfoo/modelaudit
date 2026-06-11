@@ -2590,7 +2590,9 @@ def test_scan_file_hf_bookkeeping_skip_precedes_zip_preflight(
     monkeypatch.setenv("HF_HOME", str(hf_home))
     metadata_path = hf_home / "download" / "model.metadata"
     metadata_path.parent.mkdir(parents=True)
-    metadata_path.write_text("{}")
+    metadata_path.write_text(
+        "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n"
+    )
 
     def fail_zip_preflight(*_args: Any, **_kwargs: Any) -> bool:
         raise AssertionError("Hugging Face bookkeeping must be skipped before ZIP preflight")
