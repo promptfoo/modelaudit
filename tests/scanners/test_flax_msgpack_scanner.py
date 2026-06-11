@@ -35,6 +35,73 @@ def create_msgpack_file(path: Path, data: Any) -> None:
         f.write(msgpack.packb(data, use_bin_type=True))
 
 
+def _write_msgpack_str(output: Any, value: str) -> None:
+    encoded = value.encode()
+    if len(encoded) <= 31:
+        output.write(bytes([0xA0 | len(encoded)]))
+    elif len(encoded) <= 0xFF:
+        output.write(b"\xd9" + struct.pack(">B", len(encoded)))
+    elif len(encoded) <= 0xFFFF:
+        output.write(b"\xda" + struct.pack(">H", len(encoded)))
+    else:
+        output.write(b"\xdb" + struct.pack(">I", len(encoded)))
+    output.write(encoded)
+
+
+def _write_msgpack_uint(output: Any, value: int) -> None:
+    if value <= 0x7F:
+        output.write(bytes([value]))
+    elif value <= 0xFF:
+        output.write(b"\xcc" + struct.pack(">B", value))
+    elif value <= 0xFFFF:
+        output.write(b"\xcd" + struct.pack(">H", value))
+    elif value <= 0xFFFFFFFF:
+        output.write(b"\xce" + struct.pack(">I", value))
+    else:
+        output.write(b"\xcf" + struct.pack(">Q", value))
+
+
+def _write_sparse_large_flax_tensor(
+    path: Path,
+    tensor_size: int,
+    *,
+    trailing_reduce: bool = False,
+    body_bytes: bytes | None = None,
+) -> None:
+    with path.open("wb") as output:
+        output.write(b"\x82" if trailing_reduce else b"\x81")
+        _write_msgpack_str(output, "params")
+        output.write(b"\x81")
+        _write_msgpack_str(output, "embedding")
+        output.write(b"\xc6" + struct.pack(">I", tensor_size))
+        if body_bytes is None:
+            output.seek(tensor_size - 1, os.SEEK_CUR)
+            output.write(b"\0")
+        else:
+            output.write(body_bytes)
+        if trailing_reduce:
+            _write_msgpack_str(output, "__reduce__")
+            _write_msgpack_str(output, "os.system")
+
+
+def _write_sparse_large_flax_ndarray_ext(path: Path, tensor_size: int) -> None:
+    metadata_size = 1 + 1 + 5 + 8 + 5
+    ext_size = metadata_size + tensor_size
+    with path.open("wb") as output:
+        output.write(b"\x81")
+        _write_msgpack_str(output, "params")
+        output.write(b"\x81")
+        _write_msgpack_str(output, "embedding")
+        output.write(b"\xc9" + struct.pack(">I", ext_size) + b"\x01")
+        output.write(b"\x93")
+        output.write(b"\x91")
+        _write_msgpack_uint(output, tensor_size // 4)
+        _write_msgpack_str(output, "float32")
+        output.write(b"\xc6" + struct.pack(">I", tensor_size))
+        output.seek(tensor_size - 1, os.SEEK_CUR)
+        output.write(b"\0")
+
+
 def _assert_inconclusive_aggregate_not_cached(
     path: Path,
     expected_reason: str,
@@ -1323,9 +1390,9 @@ def test_flax_msgpack_small_decode_buffer_accepts_stream_of_small_objects(tmp_pa
 
 
 def test_flax_msgpack_decode_limit_is_inconclusive(tmp_path: Path) -> None:
-    """Oversized MessagePack members should fail closed before materializing content."""
+    """Oversized non-tensor MessagePack members should fail closed before materializing content."""
     path = tmp_path / "oversized_blob.msgpack"
-    create_msgpack_file(path, {"params": {"blob": b"x" * 512}})
+    create_msgpack_file(path, {"params": {"blob": b"x" * 513}})
 
     result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
 
@@ -1337,6 +1404,96 @@ def test_flax_msgpack_decode_limit_is_inconclusive(tmp_path: Path) -> None:
         and check.status == CheckStatus.FAILED
         and check.details["analysis_incomplete"] is True
         for check in result.checks
+    )
+
+
+def test_flax_msgpack_large_tensor_above_decode_budget_scans_without_bufferfull(tmp_path: Path) -> None:
+    path = tmp_path / "sparse_large_tensor.msgpack"
+    tensor_size = (512 * 1024 * 1024) + 4
+    _write_sparse_large_flax_tensor(path, tensor_size)
+
+    result = FlaxMsgpackScanner(
+        config={
+            "max_msgpack_decode_bytes": 128,
+            "max_blob_bytes": 64,
+        }
+    ).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["top_level_keys"] == ["params"]
+    assert result.metadata["estimated_parameters"] == tensor_size // 4
+    assert result.metadata["jax_metadata"]["tensor_count"] == 1
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
+    blob_check = next(check for check in result.checks if check.name == "Binary Blob Size Check")
+    assert blob_check.details["size"] == tensor_size
+
+
+def test_flax_msgpack_large_flax_ndarray_ext_above_decode_budget_skips_tensor_body(tmp_path: Path) -> None:
+    path = tmp_path / "sparse_large_ndarray_ext.msgpack"
+    tensor_size = (512 * 1024 * 1024) + 4
+    _write_sparse_large_flax_ndarray_ext(path, tensor_size)
+
+    result = FlaxMsgpackScanner(
+        config={
+            "max_msgpack_decode_bytes": 128,
+            "max_blob_bytes": 64,
+        }
+    ).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["estimated_parameters"] == tensor_size // 4
+    assert result.metadata["jax_metadata"]["tensor_count"] == 1
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
+    assert all(check.name != "Binary Blob Size Check" for check in result.checks)
+
+
+def test_flax_msgpack_large_tensor_skip_continues_to_later_security_finding(tmp_path: Path) -> None:
+    path = tmp_path / "sparse_large_tensor_then_reduce.msgpack"
+    tensor_size = (512 * 1024 * 1024) + 4
+    _write_sparse_large_flax_tensor(path, tensor_size, trailing_reduce=True)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    assert "scan_outcome" not in result.metadata
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == "Suspicious object attribute detected: __reduce__"
+        and issue.location == "root/__reduce__"
+        for issue in result.issues
+    )
+
+
+def test_flax_msgpack_truncated_declared_large_tensor_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "truncated_sparse_tensor.msgpack"
+    tensor_size = (512 * 1024 * 1024) + 4
+    _write_sparse_large_flax_tensor(path, tensor_size, body_bytes=b"\0" * 8)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.TRUNCATED_STREAM_INCONCLUSIVE_REASON]
+    parse_check = next(check for check in result.checks if check.name == "Msgpack Parse Check")
+    assert parse_check.details["parse_error"] == "incomplete trailing msgpack object"
+
+
+def test_flax_msgpack_duplicate_keys_are_reported_and_values_scanned(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate_params.msgpack"
+    path.write_bytes(b"\x82\xa6params\x80\xa6params\x81\xaa__reduce__\xa9os.system")
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    duplicate_check = next(check for check in result.checks if check.name == "MessagePack Duplicate Key Check")
+    assert duplicate_check.details["key"] == "params"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == "Suspicious object attribute detected: __reduce__"
+        and issue.location == "root/params/__reduce__"
+        for issue in result.issues
     )
 
 

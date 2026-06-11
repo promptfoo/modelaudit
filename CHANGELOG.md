@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- stream large Flax MessagePack tensor bodies by declared length without tripping the 512 MiB decode budget
 - stream bounded Llamafile runtime coverage across preview gaps and report incomplete runtime reads or bounds
 - prefer validated SafeTensors framing over invalid pickle and weak-magic collisions while retaining security-bearing pickle overlaps
 - scope both ONNX weight scanners to bounded semantic weight lineage across nested graphs, control flow, local functions, constants, Gather/Einsum, and static views; fail closed on ambiguous or sparse coverage; and evaluate extreme tails per conceptual output without suppressing repeated malicious patterns or flagging clean heavy tails

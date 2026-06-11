@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import os
 import re
+import struct
 from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -41,6 +42,14 @@ _JAX_TRANSFORM_DEDUP_METADATA_KEY = "flax_msgpack_jax_transform_findings"
 
 class _StreamCoverageStopped(Exception):
     """Internal signal that a fail-closed container budget ended the walk."""
+
+
+class OutOfData(Exception):
+    """Internal MessagePack cursor signal for truncated input."""
+
+
+class _MsgpackStreamFormatError(ValueError):
+    """Internal MessagePack cursor signal for malformed input."""
 
 
 @dataclass
@@ -87,6 +96,104 @@ class _StreamMarkerReader:
     def peek(self, offset: int) -> int | None:
         prefix = self.read(offset, 1)
         return prefix[0] if prefix else None
+
+
+@dataclass
+class _MsgpackStreamCursor:
+    source: BinaryIO
+    stream_size: int
+    offset: int = 0
+
+    def tell(self) -> int:
+        return self.offset
+
+    def _read_exact(self, size: int) -> bytes:
+        if size < 0:
+            raise _MsgpackStreamFormatError("negative MessagePack read length")
+        if size == 0:
+            return b""
+        self.source.seek(self.offset)
+        data = self.source.read(size)
+        self.offset += len(data)
+        if len(data) != size:
+            raise OutOfData
+        return data
+
+    def _peek_bytes(self, size: int) -> bytes:
+        if size <= 0 or self.offset >= self.stream_size:
+            return b""
+        source_offset = self.source.tell()
+        try:
+            self.source.seek(self.offset)
+            return self.source.read(size)
+        finally:
+            self.source.seek(source_offset)
+
+    def peek_marker(self) -> int | None:
+        prefix = self._peek_bytes(1)
+        return prefix[0] if prefix else None
+
+    def peek_declared_data_bytes(self) -> int | None:
+        marker = self.peek_marker()
+        if marker is None:
+            return None
+        header_bytes = _msgpack_marker_header_bytes(marker)
+        prefix = self._peek_bytes(header_bytes)
+        if len(prefix) < header_bytes:
+            return None
+        return _msgpack_declared_data_bytes(marker, prefix)
+
+    def read_marker(self) -> int:
+        return self._read_exact(1)[0]
+
+    def read_uint(self, size: int) -> int:
+        return int.from_bytes(self._read_exact(size), "big", signed=False)
+
+    def read_int(self, size: int) -> int:
+        return int.from_bytes(self._read_exact(size), "big", signed=True)
+
+    def skip(self, size: int) -> None:
+        if size < 0:
+            raise _MsgpackStreamFormatError("negative MessagePack skip length")
+        if self.stream_size - self.offset < size:
+            self.offset = self.stream_size
+            self.source.seek(self.offset)
+            raise OutOfData
+        self.offset += size
+        self.source.seek(self.offset)
+
+    def read_map_header(self) -> int:
+        marker = self.read_marker()
+        if 0x80 <= marker <= 0x8F:
+            return marker & 0x0F
+        if marker == 0xDE:
+            return self.read_uint(2)
+        if marker == 0xDF:
+            return self.read_uint(4)
+        raise _MsgpackStreamFormatError(f"expected map header, found marker 0x{marker:02x}")
+
+    def read_array_header(self) -> int:
+        marker = self.read_marker()
+        if 0x90 <= marker <= 0x9F:
+            return marker & 0x0F
+        if marker == 0xDC:
+            return self.read_uint(2)
+        if marker == 0xDD:
+            return self.read_uint(4)
+        raise _MsgpackStreamFormatError(f"expected array header, found marker 0x{marker:02x}")
+
+    def iter_utf8_chunks(self, size: int) -> Iterable[str]:
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+        remaining = size
+        while remaining > 0:
+            chunk = self._read_exact(min(remaining, _STREAM_TEXT_CHUNK_BYTES))
+            remaining -= len(chunk)
+            decoded = decoder.decode(chunk, final=False)
+            if decoded:
+                yield decoded
+        final_chunk = decoder.decode(b"", final=True)
+        if final_chunk:
+            yield final_chunk
 
 
 @dataclass
@@ -1863,11 +1970,27 @@ class FlaxMsgpackScanner(BaseScanner):
         if any(indicator in visible for indicator in ("opt_state", "optimizer", "adam", "sgd", "learning_rate")):
             summary.has_optimizer_state = True
 
-    def _record_stream_tensor(self, value: bytes | bytearray, location: str, summary: _FlaxStreamSummary) -> None:
-        size = len(value)
+    @staticmethod
+    def _is_tensor_like_binary_size(size: int) -> bool:
+        return size >= 16 and (size % 4 == 0 or size % 8 == 0)
+
+    def _add_binary_blob_size_check(self, result: ScanResult, location: str, size: int) -> None:
+        if size <= self.max_blob_bytes:
+            return
+        result.add_check(
+            name="Binary Blob Size Check",
+            passed=False,
+            message=f"Suspiciously large binary blob: {size:,} bytes",
+            severity=IssueSeverity.INFO,
+            location=_redact_evidence_location(location),
+            details={"size": size, "max_allowed": self.max_blob_bytes},
+            rule_code="S902",
+        )
+
+    def _record_stream_tensor_size(self, size: int, location: str, summary: _FlaxStreamSummary) -> None:
         if size >= 16 and size % 4 == 0:
             summary.parameter_count += size // 4
-        if size < 16 or (size % 4 != 0 and size % 8 != 0):
+        if not self._is_tensor_like_binary_size(size):
             return
 
         summary.tensor_count += 1
@@ -1911,6 +2034,10 @@ class FlaxMsgpackScanner(BaseScanner):
                     break
             if matched:
                 break
+
+    def _record_stream_tensor(self, value: bytes | bytearray, location: str, summary: _FlaxStreamSummary) -> None:
+        size = len(value)
+        self._record_stream_tensor_size(size, location, summary)
 
     def _analyze_streamed_text_chunks(
         self,
@@ -2095,16 +2222,7 @@ class FlaxMsgpackScanner(BaseScanner):
 
         if isinstance(value, bytes | bytearray):
             size = len(value)
-            if size > self.max_blob_bytes:
-                result.add_check(
-                    name="Binary Blob Size Check",
-                    passed=False,
-                    message=f"Suspiciously large binary blob: {size:,} bytes",
-                    severity=IssueSeverity.INFO,
-                    location=_redact_evidence_location(location),
-                    details={"size": size, "max_allowed": self.max_blob_bytes},
-                    rule_code="S902",
-                )
+            self._add_binary_blob_size_check(result, location, size)
             if size > _STREAM_TEXT_CHUNK_BYTES:
                 self._analyze_large_binary_text(value, location, result)
             else:
@@ -2152,6 +2270,497 @@ class FlaxMsgpackScanner(BaseScanner):
                 rule_code="S902",
             )
 
+    def _analyze_streamed_string_scalar(
+        self,
+        chunks: Iterable[str],
+        length: int,
+        location: str,
+        result: ScanResult,
+        summary: _FlaxStreamSummary,
+        *,
+        check_string_jax_transform: bool = True,
+    ) -> None:
+        def recorded_chunks() -> Iterable[str]:
+            for chunk in chunks:
+                self._record_stream_text(chunk, summary)
+                yield chunk
+
+        self._analyze_streamed_text_chunks(
+            recorded_chunks(),
+            location,
+            result,
+            full_length=length,
+            finding_location=location,
+            coverage_details={"text_length": length},
+            check_jax_transform=check_string_jax_transform,
+        )
+        if length > 100000:
+            result.add_check(
+                name="String Length Check",
+                passed=False,
+                message=f"Extremely long string found: {length:,} characters",
+                rule_code="S902",
+                severity=IssueSeverity.INFO,
+                location=_redact_evidence_location(location),
+                details={"length": length, "threshold": 100000},
+            )
+
+    def _analyze_streamed_binary_sample(
+        self,
+        sample: bytes,
+        length: int,
+        location: str,
+        result: ScanResult,
+    ) -> None:
+        if not sample or not _is_text_like_short_binary(sample):
+            return
+        decoded = sample.decode("utf-8", errors="replace")
+        self._check_jax_transform("", decoded, location, result)
+        self._check_suspicious_strings(decoded, f"{location}[decoded_binary]", result)
+
+    def _analyze_streamed_binary_chunks(
+        self,
+        first_chunk: bytes,
+        cursor: _MsgpackStreamCursor,
+        remaining: int,
+        length: int,
+        location: str,
+        result: ScanResult,
+    ) -> None:
+        def decoded_chunks() -> Iterable[str]:
+            nonlocal remaining
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            decoded = decoder.decode(first_chunk, final=False)
+            if decoded:
+                yield decoded
+            while remaining > 0:
+                raw_chunk = cursor._read_exact(min(remaining, _STREAM_TEXT_CHUNK_BYTES))
+                remaining -= len(raw_chunk)
+                decoded = decoder.decode(raw_chunk, final=False)
+                if decoded:
+                    yield decoded
+            final_chunk = decoder.decode(b"", final=True)
+            if final_chunk:
+                yield final_chunk
+
+        self._analyze_streamed_text_chunks(
+            decoded_chunks(),
+            location,
+            result,
+            full_length=length,
+            finding_location=f"{location}[decoded_binary]",
+            coverage_details={"binary_size": length},
+            check_jax_transform=True,
+        )
+
+    def _read_stream_metadata_int(self, cursor: _MsgpackStreamCursor) -> int:
+        marker = cursor.read_marker()
+        if marker <= 0x7F:
+            return marker
+        if marker >= 0xE0:
+            return marker - 256
+        if marker == 0xCC:
+            return cursor.read_uint(1)
+        if marker == 0xCD:
+            return cursor.read_uint(2)
+        if marker == 0xCE:
+            return cursor.read_uint(4)
+        if marker == 0xCF:
+            return cursor.read_uint(8)
+        if marker == 0xD0:
+            return cursor.read_int(1)
+        if marker == 0xD1:
+            return cursor.read_int(2)
+        if marker == 0xD2:
+            return cursor.read_int(4)
+        if marker == 0xD3:
+            return cursor.read_int(8)
+        raise _MsgpackStreamFormatError(f"expected integer metadata, found marker 0x{marker:02x}")
+
+    def _read_stream_metadata_string(self, cursor: _MsgpackStreamCursor) -> str:
+        marker = cursor.read_marker()
+        if 0xA0 <= marker <= 0xBF:
+            length = marker & 0x1F
+        elif marker == 0xD9:
+            length = cursor.read_uint(1)
+        elif marker == 0xDA:
+            length = cursor.read_uint(2)
+        elif marker == 0xDB:
+            length = cursor.read_uint(4)
+        else:
+            raise _MsgpackStreamFormatError(f"expected string metadata, found marker 0x{marker:02x}")
+        if length > self.max_stream_key_length:
+            raise _MsgpackStreamFormatError("string metadata exceeds max_msgpack_key_length")
+        return cursor._read_exact(length).decode("utf-8")
+
+    @staticmethod
+    def _read_stream_binary_header(cursor: _MsgpackStreamCursor) -> int:
+        marker = cursor.read_marker()
+        if marker == 0xC4:
+            return cursor.read_uint(1)
+        if marker == 0xC5:
+            return cursor.read_uint(2)
+        if marker == 0xC6:
+            return cursor.read_uint(4)
+        raise _MsgpackStreamFormatError(f"expected binary tensor payload, found marker 0x{marker:02x}")
+
+    def _check_stream_shape_values(self, shape_values: list[int], location: str, result: ScanResult) -> None:
+        shape_summary = _StreamSequenceSummary(
+            item_count=len(shape_values),
+            evidence_values=shape_values[:_MAX_STREAM_SEQUENCE_EVIDENCE],
+            evidence_complete=len(shape_values) <= _MAX_STREAM_SEQUENCE_EVIDENCE,
+        )
+        for index, value in enumerate(shape_values):
+            if value < 0 and shape_summary.negative_dimension is None:
+                shape_summary.negative_dimension = (index, value)
+            elif value > 10**9 and shape_summary.oversized_dimension is None:
+                shape_summary.oversized_dimension = (index, value)
+        self._check_stream_shape_metadata(shape_summary, location, result)
+
+    def _consume_large_binary_scalar(
+        self,
+        cursor: _MsgpackStreamCursor,
+        length: int,
+        location: str,
+        result: ScanResult,
+        summary: _FlaxStreamSummary,
+        state: _StreamTraversalState,
+        *,
+        path: str,
+    ) -> _StreamValue:
+        self._add_binary_blob_size_check(result, location, length)
+        is_tensor_like = self._is_tensor_like_binary_size(length)
+        if is_tensor_like:
+            self._record_stream_tensor_size(length, location, summary)
+        else:
+            summary.analysis_complete = False
+            self._report_stream_decode_limit(
+                state,
+                result,
+                path,
+                f"binary payload length {length} exceeds max_msgpack_decode_bytes({self.max_msgpack_decode_bytes})",
+            )
+
+        sample_size = min(length, _STREAM_TEXT_CHUNK_BYTES)
+        sample = cursor._read_exact(sample_size)
+        remaining = length - sample_size
+        if _is_text_like_short_binary(sample):
+            self._analyze_streamed_binary_chunks(sample, cursor, remaining, length, location, result)
+        else:
+            cursor.skip(remaining)
+        return _StreamValue("bytes", value=None)
+
+    def _consume_flax_ndarray_ext_scalar(
+        self,
+        cursor: _MsgpackStreamCursor,
+        length: int,
+        location: str,
+        result: ScanResult,
+        summary: _FlaxStreamSummary,
+        *,
+        path: str,
+    ) -> _StreamValue:
+        body_start = cursor.tell()
+        body_end = body_start + length
+        field_count = cursor.read_array_header()
+        if field_count != 3:
+            raise _MsgpackStreamFormatError("unexpected Flax ndarray extension field count")
+
+        shape_count = cursor.read_array_header()
+        if shape_count > 32:
+            raise _MsgpackStreamFormatError("Flax ndarray extension shape rank exceeds metadata limit")
+        shape_values = [self._read_stream_metadata_int(cursor) for _ in range(shape_count)]
+        self._check_stream_shape_values(shape_values, location, result)
+
+        dtype = self._read_stream_metadata_string(cursor)
+        self._record_stream_text(dtype, summary)
+
+        data_length = self._read_stream_binary_header(cursor)
+        if cursor.tell() + data_length > body_end:
+            raise OutOfData
+
+        value_location = f"{location}[1]"
+        self._record_stream_tensor_size(data_length, value_location, summary)
+        sample_size = min(data_length, _STREAM_TEXT_CHUNK_BYTES)
+        sample = cursor._read_exact(sample_size)
+        remaining = data_length - sample_size
+        if _is_text_like_short_binary(sample):
+            self._analyze_streamed_binary_chunks(sample, cursor, remaining, data_length, value_location, result)
+        else:
+            cursor.skip(remaining)
+
+        if cursor.tell() > body_end:
+            raise _MsgpackStreamFormatError("Flax ndarray extension consumed beyond declared length")
+        cursor.skip(body_end - cursor.tell())
+        return _StreamValue("ExtType", value=None)
+
+    def _read_stream_string_scalar(
+        self,
+        cursor: _MsgpackStreamCursor,
+        length: int,
+        location: str,
+        result: ScanResult,
+        summary: _FlaxStreamSummary,
+        *,
+        analyze_scalar: bool,
+    ) -> _StreamValue:
+        if not analyze_scalar:
+            raw_value = cursor._read_exact(length)
+            return _StreamValue("str", value=raw_value.decode("utf-8"))
+
+        if length > self.max_msgpack_decode_bytes:
+            self._analyze_streamed_string_scalar(
+                cursor.iter_utf8_chunks(length),
+                length,
+                location,
+                result,
+                summary,
+            )
+            return _StreamValue("str", value=None)
+
+        raw_value = cursor._read_exact(length)
+        value = raw_value.decode("utf-8")
+        self._analyze_stream_scalar(value, location, result, summary)
+        return _StreamValue("str", value=value)
+
+    def _read_stream_binary_scalar(
+        self,
+        cursor: _MsgpackStreamCursor,
+        length: int,
+        location: str,
+        result: ScanResult,
+        summary: _FlaxStreamSummary,
+        state: _StreamTraversalState,
+        *,
+        path: str,
+        analyze_scalar: bool,
+    ) -> _StreamValue:
+        if not analyze_scalar:
+            return _StreamValue("bytes", value=cursor._read_exact(length))
+
+        if length > _STREAM_TEXT_CHUNK_BYTES and self._is_tensor_like_binary_size(length):
+            return self._consume_large_binary_scalar(cursor, length, location, result, summary, state, path=path)
+
+        if length > self.max_msgpack_decode_bytes:
+            return self._consume_large_binary_scalar(cursor, length, location, result, summary, state, path=path)
+
+        value = cursor._read_exact(length)
+        self._analyze_stream_scalar(value, location, result, summary)
+        return _StreamValue("bytes", value=value)
+
+    def _read_stream_ext_scalar(
+        self,
+        cursor: _MsgpackStreamCursor,
+        length: int,
+        code: int,
+        location: str,
+        result: ScanResult,
+        summary: _FlaxStreamSummary,
+        state: _StreamTraversalState,
+        *,
+        path: str,
+        analyze_scalar: bool,
+    ) -> _StreamValue:
+        value_location = f"{location}[1]"
+        if not analyze_scalar:
+            data = cursor._read_exact(length)
+            if HAS_MSGPACK and 0 <= code <= 127:
+                return _StreamValue("ExtType", value=msgpack.ExtType(code, data))
+            return _StreamValue("ExtType", value=data)
+
+        if code == 1 and length > _STREAM_TEXT_CHUNK_BYTES:
+            return self._consume_flax_ndarray_ext_scalar(cursor, length, location, result, summary, path=path)
+
+        if length > _STREAM_TEXT_CHUNK_BYTES and self._is_tensor_like_binary_size(length):
+            self._consume_large_binary_scalar(cursor, length, value_location, result, summary, state, path=path)
+            return _StreamValue("ExtType", value=None)
+
+        if length > self.max_msgpack_decode_bytes:
+            self._consume_large_binary_scalar(cursor, length, value_location, result, summary, state, path=path)
+            return _StreamValue("ExtType", value=None)
+
+        data = cursor._read_exact(length)
+        value = msgpack.ExtType(code, data) if HAS_MSGPACK and 0 <= code <= 127 else data
+        self._analyze_stream_scalar(value, location, result, summary)
+        return _StreamValue("ExtType", value=value)
+
+    def _read_stream_scalar_value(
+        self,
+        cursor: _MsgpackStreamCursor,
+        result: ScanResult,
+        summary: _FlaxStreamSummary,
+        state: _StreamTraversalState,
+        *,
+        path: str,
+        location: str,
+        analyze_scalar: bool,
+    ) -> _StreamValue:
+        marker = cursor.read_marker()
+        if marker <= 0x7F:
+            value: Any = marker
+        elif marker >= 0xE0:
+            value = marker - 256
+        elif 0xA0 <= marker <= 0xBF:
+            return self._read_stream_string_scalar(
+                cursor,
+                marker & 0x1F,
+                location,
+                result,
+                summary,
+                analyze_scalar=analyze_scalar,
+            )
+        elif marker == 0xC0:
+            value = None
+        elif marker == 0xC2:
+            value = False
+        elif marker == 0xC3:
+            value = True
+        elif marker == 0xC4:
+            return self._read_stream_binary_scalar(
+                cursor,
+                cursor.read_uint(1),
+                location,
+                result,
+                summary,
+                state,
+                path=path,
+                analyze_scalar=analyze_scalar,
+            )
+        elif marker == 0xC5:
+            return self._read_stream_binary_scalar(
+                cursor,
+                cursor.read_uint(2),
+                location,
+                result,
+                summary,
+                state,
+                path=path,
+                analyze_scalar=analyze_scalar,
+            )
+        elif marker == 0xC6:
+            return self._read_stream_binary_scalar(
+                cursor,
+                cursor.read_uint(4),
+                location,
+                result,
+                summary,
+                state,
+                path=path,
+                analyze_scalar=analyze_scalar,
+            )
+        elif marker == 0xC7:
+            length = cursor.read_uint(1)
+            code = cursor.read_int(1)
+            return self._read_stream_ext_scalar(
+                cursor,
+                length,
+                code,
+                location,
+                result,
+                summary,
+                state,
+                path=path,
+                analyze_scalar=analyze_scalar,
+            )
+        elif marker == 0xC8:
+            length = cursor.read_uint(2)
+            code = cursor.read_int(1)
+            return self._read_stream_ext_scalar(
+                cursor,
+                length,
+                code,
+                location,
+                result,
+                summary,
+                state,
+                path=path,
+                analyze_scalar=analyze_scalar,
+            )
+        elif marker == 0xC9:
+            length = cursor.read_uint(4)
+            code = cursor.read_int(1)
+            return self._read_stream_ext_scalar(
+                cursor,
+                length,
+                code,
+                location,
+                result,
+                summary,
+                state,
+                path=path,
+                analyze_scalar=analyze_scalar,
+            )
+        elif marker == 0xCA:
+            value = struct.unpack(">f", cursor._read_exact(4))[0]
+        elif marker == 0xCB:
+            value = struct.unpack(">d", cursor._read_exact(8))[0]
+        elif marker == 0xCC:
+            value = cursor.read_uint(1)
+        elif marker == 0xCD:
+            value = cursor.read_uint(2)
+        elif marker == 0xCE:
+            value = cursor.read_uint(4)
+        elif marker == 0xCF:
+            value = cursor.read_uint(8)
+        elif marker == 0xD0:
+            value = cursor.read_int(1)
+        elif marker == 0xD1:
+            value = cursor.read_int(2)
+        elif marker == 0xD2:
+            value = cursor.read_int(4)
+        elif marker == 0xD3:
+            value = cursor.read_int(8)
+        elif marker in {0xD4, 0xD5, 0xD6, 0xD7, 0xD8}:
+            length = {0xD4: 1, 0xD5: 2, 0xD6: 4, 0xD7: 8, 0xD8: 16}[marker]
+            code = cursor.read_int(1)
+            return self._read_stream_ext_scalar(
+                cursor,
+                length,
+                code,
+                location,
+                result,
+                summary,
+                state,
+                path=path,
+                analyze_scalar=analyze_scalar,
+            )
+        elif marker == 0xD9:
+            return self._read_stream_string_scalar(
+                cursor,
+                cursor.read_uint(1),
+                location,
+                result,
+                summary,
+                analyze_scalar=analyze_scalar,
+            )
+        elif marker == 0xDA:
+            return self._read_stream_string_scalar(
+                cursor,
+                cursor.read_uint(2),
+                location,
+                result,
+                summary,
+                analyze_scalar=analyze_scalar,
+            )
+        elif marker == 0xDB:
+            return self._read_stream_string_scalar(
+                cursor,
+                cursor.read_uint(4),
+                location,
+                result,
+                summary,
+                analyze_scalar=analyze_scalar,
+            )
+        elif marker == 0xC1:
+            raise _MsgpackStreamFormatError("reserved MessagePack marker 0xc1")
+        else:
+            raise _MsgpackStreamFormatError(f"unexpected MessagePack scalar marker 0x{marker:02x}")
+
+        if analyze_scalar:
+            self._analyze_stream_scalar(value, location, result, summary)
+        type_name = "NoneType" if value is None else type(value).__name__
+        return _StreamValue(type_name, value=value)
+
     def _analyze_stream_key(
         self,
         key: Any,
@@ -2193,6 +2802,30 @@ class FlaxMsgpackScanner(BaseScanner):
         if has_layer_word:
             summary.layer_count += 1
         return key_str, location_key
+
+    @staticmethod
+    def _stream_key_identity(key: Any) -> tuple[Any, ...]:
+        if HAS_MSGPACK and isinstance(key, msgpack.ExtType):
+            return ("ext", key.code, key.data)
+        if isinstance(key, bytes | bytearray):
+            return ("bin", bytes(key))
+        if isinstance(key, str):
+            return ("str", key)
+        if key is None or isinstance(key, bool | int | float):
+            return (type(key).__name__, repr(key))
+        return (type(key).__name__, _stringify_evidence_fragment(key))
+
+    @staticmethod
+    def _add_duplicate_map_key_check(result: ScanResult, key: Any, location: str) -> None:
+        result.add_check(
+            name="MessagePack Duplicate Key Check",
+            passed=False,
+            message="Duplicate MessagePack map key detected",
+            severity=IssueSeverity.INFO,
+            location=_redact_evidence_location(location),
+            details={"key": _redact_evidence_key(key)},
+            rule_code="S902",
+        )
 
     @staticmethod
     def _is_msgpack_limit_error(error: Exception) -> bool:
@@ -2293,8 +2926,7 @@ class FlaxMsgpackScanner(BaseScanner):
 
     def _read_stream_value(
         self,
-        unpacker: Any,
-        marker_reader: _StreamMarkerReader,
+        cursor: _MsgpackStreamCursor,
         result: ScanResult,
         summary: _FlaxStreamSummary,
         state: _StreamTraversalState,
@@ -2347,12 +2979,14 @@ class FlaxMsgpackScanner(BaseScanner):
                 state.recursion_limit_reported = True
             raise _StreamCoverageStopped
 
-        marker = marker_reader.peek(unpacker.tell())
+        marker = cursor.peek_marker()
         if marker is not None and (0x80 <= marker <= 0x8F or marker in {0xDE, 0xDF}):
-            map_length = unpacker.read_map_header()
+            map_length = cursor.read_map_header()
             if top_level:
                 summary.top_level_key_count = map_length
             direct_string_keys: set[str] = set()
+            seen_keys: set[tuple[Any, ...]] = set()
+            duplicate_key_reports = 0
             has_jax_array = False
             visible_items = min(map_length, self.max_items_per_container)
             if map_length > self.max_items_per_container:
@@ -2395,23 +3029,19 @@ class FlaxMsgpackScanner(BaseScanner):
             }
 
             for index in range(visible_items):
-                key_offset = unpacker.tell()
-                key_prefix = marker_reader.read(key_offset, 6)
-                if key_prefix:
-                    declared_key_length = _msgpack_declared_data_bytes(key_prefix[0], key_prefix)
-                    if declared_key_length is not None and declared_key_length > self.max_stream_key_length:
-                        summary.analysis_complete = False
-                        self._report_stream_decode_limit(
-                            state,
-                            result,
-                            path,
-                            "map key length "
-                            f"{declared_key_length} exceeds max_msgpack_key_length({self.max_stream_key_length})",
-                        )
-                        raise _StreamCoverageStopped
+                declared_key_length = cursor.peek_declared_data_bytes()
+                if declared_key_length is not None and declared_key_length > self.max_stream_key_length:
+                    summary.analysis_complete = False
+                    self._report_stream_decode_limit(
+                        state,
+                        result,
+                        path,
+                        "map key length "
+                        f"{declared_key_length} exceeds max_msgpack_key_length({self.max_stream_key_length})",
+                    )
+                    raise _StreamCoverageStopped
                 key_value = self._read_stream_value(
-                    unpacker,
-                    marker_reader,
+                    cursor,
                     result,
                     summary,
                     state,
@@ -2439,6 +3069,11 @@ class FlaxMsgpackScanner(BaseScanner):
                     )
                     raise _StreamCoverageStopped
                 key_str, safe_key_str = self._analyze_stream_key(key, location, result, summary)
+                key_identity = self._stream_key_identity(key)
+                if key_identity in seen_keys and duplicate_key_reports < 16:
+                    duplicate_key_reports += 1
+                    self._add_duplicate_map_key_check(result, key, location)
+                seen_keys.add(key_identity)
                 key_text = _text_for_security_matching(key)
                 key_location = f"{location}/{safe_key_str}" if location else safe_key_str
                 if key_text is not None and key_text in transformer_keys:
@@ -2452,8 +3087,7 @@ class FlaxMsgpackScanner(BaseScanner):
                             summary.orbax_format = True
 
                 value = self._read_stream_value(
-                    unpacker,
-                    marker_reader,
+                    cursor,
                     result,
                     summary,
                     state,
@@ -2484,7 +3118,7 @@ class FlaxMsgpackScanner(BaseScanner):
             return _StreamValue("dict", direct_string_keys=direct_string_keys)
 
         if marker is not None and (0x90 <= marker <= 0x9F or marker in {0xDC, 0xDD}):
-            array_length = unpacker.read_array_header()
+            array_length = cursor.read_array_header()
             visible_items = min(array_length, self.max_items_per_container)
             if array_length > self.max_items_per_container:
                 summary.analysis_complete = False
@@ -2497,8 +3131,7 @@ class FlaxMsgpackScanner(BaseScanner):
             sequence_summary = _StreamSequenceSummary(item_count=array_length) if capture_sequence else None
             for index in range(visible_items):
                 value = self._read_stream_value(
-                    unpacker,
-                    marker_reader,
+                    cursor,
                     result,
                     summary,
                     state,
@@ -2539,16 +3172,15 @@ class FlaxMsgpackScanner(BaseScanner):
                 captured_values = sequence_summary.evidence_values
             return _StreamValue("list", value=captured_values, sequence_summary=sequence_summary)
 
-        value = unpacker.unpack()
-        if analyze_scalar:
-            self._analyze_stream_scalar(value, location, result, summary)
-        if value is None:
-            type_name = "NoneType"
-        elif HAS_MSGPACK and isinstance(value, msgpack.ExtType):
-            type_name = "ExtType"
-        else:
-            type_name = type(value).__name__
-        return _StreamValue(type_name, value=value)
+        return self._read_stream_scalar_value(
+            cursor,
+            result,
+            summary,
+            state,
+            path=path,
+            location=location,
+            analyze_scalar=analyze_scalar,
+        )
 
     def _add_msgpack_stream_integrity_check_from_types(
         self,
@@ -2583,21 +3215,16 @@ class FlaxMsgpackScanner(BaseScanner):
         try:
             with open(path, "rb") as source:
                 stream_size = os.fstat(source.fileno()).st_size
-                marker_reader = _StreamMarkerReader(source)
-                unpacker = msgpack.Unpacker(
-                    source,
-                    read_size=self._msgpack_stream_read_size(),
-                    **self._msgpack_event_unpacker_kwargs(),
-                )
+                cursor = _MsgpackStreamCursor(source, stream_size)
                 while True:
-                    previous_offset = unpacker.tell()
+                    previous_offset = cursor.tell()
                     if len(object_types) >= self.max_msgpack_stream_objects:
                         if previous_offset == stream_size:
                             break
-                        marker = marker_reader.peek(previous_offset)
+                        marker = cursor.peek_marker()
                         required_header_bytes = 1 if marker is None else _msgpack_marker_header_bytes(marker)
                         remaining_bytes = stream_size - previous_offset
-                        marker_prefix = marker_reader.read(previous_offset, required_header_bytes)
+                        marker_prefix = cursor._peek_bytes(required_header_bytes)
                         declared_data_bytes = (
                             None if marker is None else _msgpack_declared_data_bytes(marker, marker_prefix)
                         )
@@ -2627,8 +3254,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     location = "root" if object_index == 0 else f"root[msgpack_object_{object_index}]"
                     try:
                         value = self._read_stream_value(
-                            unpacker,
-                            marker_reader,
+                            cursor,
                             result,
                             summary,
                             state,
@@ -2639,7 +3265,7 @@ class FlaxMsgpackScanner(BaseScanner):
                         )
                     except Exception as error:
                         if self._is_msgpack_out_of_data(error):
-                            current_offset = unpacker.tell()
+                            current_offset = cursor.tell()
                             if current_offset == previous_offset and previous_offset == stream_size:
                                 break
                             self._add_msgpack_truncated_stream_check(
