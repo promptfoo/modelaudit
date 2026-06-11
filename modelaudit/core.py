@@ -290,6 +290,7 @@ _DVC_EXCLUDED_PATHS_CONFIG_KEY = "_dvc_excluded_paths"
 _DVC_COVERAGE_ROOTS_CONFIG_KEY = "_dvc_coverage_roots"
 DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY = "_dvc_external_covered_paths"
 DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY = "_dvc_external_covered_directories"
+_OPENVINO_ALLOW_SIDECAR_ROUTING_CONFIG_KEY = "_openvino_allow_sidecar_routing"
 
 
 def _record_incomplete_dvc_resolution(
@@ -2728,6 +2729,10 @@ def scan_model_directory_or_file(
                         duplicate_paths_by_hash.setdefault(content_hash, []).append(file_path)
                 recorded_content_hashes: set[str] = set()
 
+                if scan_entries:
+                    config = dict(config)
+                    config[_OPENVINO_ALLOW_SIDECAR_ROUTING_CONFIG_KEY] = True
+
                 if len(scan_entries) > 1:
                     pickle_source_snapshot_stack.enter_context(shared_source_sensitive_caches())
 
@@ -3651,7 +3656,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         sr.finish(success=False)
         return sr
 
-    openvino_owner = _openvino_weights_companion_owner(Path(path))
+    openvino_owner = None
+    if config.get(_OPENVINO_ALLOW_SIDECAR_ROUTING_CONFIG_KEY) is True and scanner_selection.allows("openvino"):
+        openvino_owner = _openvino_weights_companion_owner(Path(path))
     if openvino_owner is not None:
         sr = ScanResult(scanner_name="openvino")
         sr.bytes_scanned = file_size
@@ -4359,6 +4366,7 @@ def scan_model_streaming(
     start_time = time.time()
     results = create_initial_audit_result()
     file_hashes: list[str] = []
+    hashed_stream_paths: set[Path] = set()
     aggregate_hash_complete = True
     top_level_hashed_bytes = 0
     files_processed = 0
@@ -4584,6 +4592,8 @@ def scan_model_streaming(
                     "timeout": timeout - int(time.time() - start_time),
                     **scan_kwargs,
                 }
+                if openvino_sidecar_owner is not None or openvino_scan_companion_path is not None:
+                    scan_config[_OPENVINO_ALLOW_SIDECAR_ROUTING_CONFIG_KEY] = True
                 initial_shard_target = _snapshot_validated_shard_target(
                     str(source_path),
                     resolved_path=str(scan_path),
@@ -4640,6 +4650,29 @@ def scan_model_streaming(
                         top_level_hashed_bytes += scan_path.stat().st_size
                     file_hash = compute_sha256_hash(scan_path)
                     file_hashes.append(file_hash)
+                    hashed_stream_paths.add(Path(os.path.abspath(scan_path)))
+
+                if openvino_scan_companion_path is not None:
+                    companion_hash_key = Path(os.path.abspath(openvino_scan_companion_path))
+                    if companion_hash_key not in hashed_stream_paths:
+                        defer_companion_hash_for_max_total_size = _should_defer_hash_for_max_total_size(
+                            scan_config,
+                            hashed_bytes=top_level_hashed_bytes,
+                        )
+                        defer_companion_hash_for_max_file_size = _should_defer_hash_for_max_file_size(
+                            str(openvino_scan_companion_path),
+                            scan_config,
+                        )
+                        if defer_companion_hash_for_max_total_size or defer_companion_hash_for_max_file_size:
+                            aggregate_hash_complete = False
+                        elif not _should_defer_hash_for_safetensors_header_limit(
+                            str(openvino_scan_companion_path),
+                            scan_config,
+                        ):
+                            with suppress(OSError):
+                                top_level_hashed_bytes += openvino_scan_companion_path.stat().st_size
+                            file_hashes.append(compute_sha256_hash(openvino_scan_companion_path))
+                            hashed_stream_paths.add(companion_hash_key)
 
                 # Scan the file
                 if progress_callback:

@@ -32,6 +32,7 @@ from modelaudit.models import FileMetadataModel, LicenseInfoModel, create_initia
 from modelaudit.scanners import safetensors_scanner
 from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
+from modelaudit.utils.helpers.file_hash import compute_sha256_hash
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from tests.helpers import create_malicious_pickle
@@ -1440,6 +1441,22 @@ def test_scan_model_streaming_openvino_xml_with_prefetched_companion(tmp_path: P
     assert not any("weights file not found" in check.message.lower() for check in result.checks)
 
 
+def test_scan_model_streaming_openvino_prefetched_companion_contributes_content_hash(tmp_path: Path) -> None:
+    """A staged OpenVINO .bin sidecar must remain part of the streaming aggregate hash."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(xml_path), compute_sha256_hash(bin_path)])
+
+    result = scan_model_streaming(
+        file_generator=iter([(xml_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+    )
+
+    assert determine_exit_code(result) == 0
+    assert result.content_hash == expected_hash
+
+
 def test_scan_model_streaming_openvino_missing_companion_still_reports_s701(tmp_path: Path) -> None:
     """Missing OpenVINO weights must not be suppressed by companion-preservation logic."""
     xml_path = tmp_path / "model.xml"
@@ -1528,6 +1545,27 @@ def test_scan_model_directory_or_file_openvino_bin_sidecar_not_pytorch(tmp_path:
     assert "pytorch_binary" not in result.scanner_names
     assert result.file_metadata[str(xml_path)]["bin_size"] == bin_path.stat().st_size
     assert not any(check.rule_code == "S901" for check in result.checks)
+
+
+def test_openvino_bin_sidecar_respects_scanner_selection(tmp_path: Path) -> None:
+    """A standalone .bin scanner must still run when OpenVINO is excluded."""
+    _xml_path, bin_path = _write_openvino_pair(tmp_path)
+    create_malicious_pickle(bin_path)
+
+    result = scan_model_directory_or_file(
+        str(tmp_path),
+        cache_enabled=False,
+        skip_file_types=True,
+        exclude_scanners=["openvino"],
+    )
+
+    assert "openvino" not in result.scanner_names
+    assert "pickle" in result.scanner_names
+    assert any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "openvino"
+        for check in result.checks
+    )
+    assert any(issue.location == str(bin_path) and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_non_openvino_xml_near_match_does_not_hide_malicious_bin(tmp_path: Path) -> None:

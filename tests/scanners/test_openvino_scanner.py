@@ -345,6 +345,21 @@ def test_openvino_scanner_respects_configured_file_size_limit(tmp_path: Path) ->
     assert any(check.name == "File Size Limit" for check in result.checks)
 
 
+def test_openvino_scanner_oversized_bin_fails_closed(tmp_path: Path) -> None:
+    """Associated weights exceeding max_file_size make OpenVINO coverage incomplete."""
+    xml_path = create_basic_model(tmp_path)
+
+    result = OpenVinoScanner(config={"max_file_size": 8}).scan(str(xml_path))
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "openvino_weights_file_size_exceeded"
+    assert any(
+        check.name == "OpenVINO Weights File Size Limit"
+        and check.details.get("scan_outcome_reason") == "openvino_weights_file_size_exceeded"
+        for check in result.checks
+    )
+
+
 def test_openvino_scanner_detects_nested_external_library_references(tmp_path: Path) -> None:
     """Nested layer config nodes should be checked for implementation/library references."""
     xml_path = tmp_path / "model.xml"
