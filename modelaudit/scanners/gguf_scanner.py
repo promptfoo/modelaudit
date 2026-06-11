@@ -46,6 +46,7 @@ GGUF_STRUCTURE_INCONCLUSIVE_REASON = "gguf_structure_validation_failed"
 GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON = "gguf_duplicate_metadata_keys"
 GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON = "gguf_metadata_limit_exceeded"
 GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON = "gguf_tensor_limit_exceeded"
+_GGUF_MAX_METADATA_VALUE_SECURITY_CHECKS = 64
 _GGUF_METADATA_COMMAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "python_command_api",
@@ -107,6 +108,7 @@ _GGUF_FETCH_OPTIONS_WITH_VALUE = frozenset(
         "-outfile",
     }
 )
+_GGUF_FETCH_DESTINATION_OPTIONS_WITH_VALUE = frozenset({"--url", "-uri"})
 _GGUF_METADATA_NETWORK_APIS = (
     "requests.get",
     "requests.post",
@@ -119,6 +121,7 @@ _GGUF_METADATA_NETWORK_APIS = (
 _GGUF_NETWORK_URL_ASSIGNMENT_PATTERN = re.compile(
     r"""(?is)\b(?P<name>[a-z_][a-z0-9_]*)\s*=\s*(?:[rubf]{0,2})?(?P<quote>['"])(?:https?|ftp)://[^'"\s<>]+(?P=quote)""",
 )
+_GGUF_SHELL_VARIABLE_NAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_]*$")
 _GGUF_DEFAULT_MAX_TEMPLATE_SIZE = 50000
 _GGUF_CHAT_TEMPLATE_METADATA_PATTERN_TYPES = tuple(JINJA2_SSTI_PATTERNS)
 _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
@@ -129,7 +132,7 @@ _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] =
 _GGUF_TIMEOUT_OPTIONS_WITH_VALUE = frozenset({"-k", "--kill-after"})
 _GGUF_TIMEOUT_DURATION_PATTERN = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
 _GGUF_REMOTE_URL_SCHEMES = ("http://", "https://", "ftp://")
-_GGUF_SHELL_SEGMENT_SEPARATORS = ";&|`$()"
+_GGUF_SHELL_SEGMENT_SEPARATORS = ";&|`()"
 
 
 class _GgufMetadataLimitExceeded(ValueError):
@@ -351,7 +354,7 @@ class GgufScanner(BaseScanner):
         data = self._read_bytes(f, length, budget)
         if len(data) != length:
             raise ValueError("Unexpected end of file while reading string")
-        return data.decode("utf-8", "ignore")
+        return data.decode("utf-8")
 
     def _scan_gguf(self, f: BinaryIO, file_size: int, result: ScanResult) -> None:
         """Comprehensive GGUF file scanning with security checks."""
@@ -429,29 +432,7 @@ class GgufScanner(BaseScanner):
                     self._record_chat_template_occurrence(chat_templates, key, value, occurrence)
                 metadata[key] = value
 
-                # Security check for suspicious values
-                metadata_evidence = (
-                    self._metadata_value_security_evidence(
-                        key,
-                        value,
-                        max_template_size=self.config.get("max_template_size", _GGUF_DEFAULT_MAX_TEMPLATE_SIZE),
-                    )
-                    if isinstance(value, str)
-                    else []
-                )
-                for evidence in metadata_evidence:
-                    result.add_check(
-                        name="Metadata Value Security Check",
-                        passed=False,
-                        message=(
-                            f"Suspicious metadata value for key '{key}' contains "
-                            f"{evidence['evidence_type'].replace('_', ' ')} evidence"
-                        ),
-                        severity=IssueSeverity.INFO,
-                        location=self.current_file_path,
-                        details={"key": key, "value": str(value)[:200], **evidence},
-                        rule_code="S902",
-                    )
+                self._report_metadata_value_security_checks(key, value, result)
 
             result.metadata["metadata"] = metadata
             self._report_duplicate_metadata_keys(metadata_key_occurrences, result)
@@ -960,6 +941,10 @@ class GgufScanner(BaseScanner):
         return key == "tokenizer.chat_template" or key.startswith("tokenizer.chat_template.")
 
     @staticmethod
+    def _is_tokenizer_vocabulary_key(key: str) -> bool:
+        return key == "tokenizer.ggml.tokens" or key.startswith("tokenizer.ggml.tokens.")
+
+    @staticmethod
     def _metadata_decode_variants(value: str) -> tuple[str, ...]:
         variants: list[str] = []
         current = value
@@ -970,6 +955,8 @@ class GgufScanner(BaseScanner):
             if decoded == current:
                 break
             current = decoded
+        if current not in variants:
+            variants.append(current)
         return tuple(variants)
 
     @classmethod
@@ -1019,6 +1006,50 @@ class GgufScanner(BaseScanner):
         if current_segment:
             segments.append(current_segment)
         return segments
+
+    @staticmethod
+    def _is_documentation_metadata_key(key: str) -> bool:
+        lowered = key.lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "description",
+                "documentation",
+                "instructions",
+                "readme",
+                "model_card",
+                "license",
+                "author",
+            )
+        )
+
+    @classmethod
+    def _metadata_value_looks_like_documentation(cls, key: str, value: str) -> bool:
+        if not cls._is_documentation_metadata_key(key):
+            return False
+
+        lines = [line.strip() for line in value.splitlines() if line.strip()]
+        if not lines:
+            return False
+
+        doc_lines = 0
+        in_fence = False
+        for line in lines:
+            lowered = line.lower()
+            if lowered.startswith(("```", "~~~")):
+                in_fence = not in_fence
+                doc_lines += 1
+                continue
+            if in_fence:
+                doc_lines += 1
+                continue
+            if lowered.startswith(("#", "//", "*", "-", ">")):
+                doc_lines += 1
+                continue
+            if any(marker in lowered for marker in ("example", "documentation", "instructions", "model card", "usage")):
+                doc_lines += 1
+
+        return doc_lines > len(lines) / 2
 
     @staticmethod
     def _shell_command_name(word: str) -> str:
@@ -1124,6 +1155,42 @@ class GgufScanner(BaseScanner):
         token = word.strip("\"'<>[]{}(),")
         return any(token.startswith(scheme) for scheme in _GGUF_REMOTE_URL_SCHEMES)
 
+    @classmethod
+    def _shell_url_variable_names(cls, words: list[str]) -> set[str]:
+        names: set[str] = set()
+        for word in words:
+            if "=" not in word or word.startswith("-"):
+                continue
+            name, value = word.split("=", 1)
+            name = name.strip("\"'")
+            if _GGUF_SHELL_VARIABLE_NAME_PATTERN.fullmatch(name) and cls._is_remote_url_token(value):
+                names.add(name)
+        return names
+
+    @staticmethod
+    def _shell_word_references_variable(word: str, names: set[str]) -> bool:
+        if not names:
+            return False
+
+        token = word.strip("\"'<>[](),")
+        if token.startswith("${"):
+            close_position = token.find("}", 2)
+            if close_position == -1:
+                return False
+            name = token[2:close_position]
+            return name in names
+
+        if not token.startswith("$"):
+            return False
+
+        name_chars: list[str] = []
+        for character in token[1:]:
+            if character.isalnum() or character == "_":
+                name_chars.append(character)
+                continue
+            break
+        return "".join(name_chars) in names
+
     @staticmethod
     def _is_fetch_option_with_value(word: str) -> bool:
         if word in _GGUF_FETCH_OPTIONS_WITH_VALUE:
@@ -1133,25 +1200,48 @@ class GgufScanner(BaseScanner):
             return option_name in _GGUF_FETCH_OPTIONS_WITH_VALUE
         return False
 
+    @staticmethod
+    def _is_fetch_destination_option_with_value(word: str) -> bool:
+        option_name = word.split("=", 1)[0]
+        return option_name in _GGUF_FETCH_DESTINATION_OPTIONS_WITH_VALUE
+
     @classmethod
-    def _fetch_segment_has_remote_url(cls, words: list[str], command: str) -> bool:
+    def _fetch_segment_has_remote_url(cls, words: list[str], command: str, shell_url_variables: set[str]) -> bool:
         for command_index, word in enumerate(words):
             if cls._shell_command_name(word) != command:
                 continue
             index = command_index + 1
             while index < len(words):
                 candidate = words[index]
-                if cls._is_remote_url_token(candidate):
+                if cls._is_remote_url_token(candidate) or cls._shell_word_references_variable(
+                    candidate,
+                    shell_url_variables,
+                ):
                     return True
                 if candidate.startswith("-"):
-                    if any(scheme in candidate for scheme in _GGUF_REMOTE_URL_SCHEMES):
+                    if not cls._is_fetch_option_with_value(candidate) and any(
+                        scheme in candidate for scheme in _GGUF_REMOTE_URL_SCHEMES
+                    ):
                         return True
                     if cls._is_fetch_option_with_value(candidate):
                         if "=" in candidate:
+                            _option_name, option_value = candidate.split("=", 1)
+                            if cls._is_fetch_destination_option_with_value(candidate) and (
+                                cls._is_remote_url_token(option_value)
+                                or cls._shell_word_references_variable(option_value, shell_url_variables)
+                            ):
+                                return True
                             index += 1
                             continue
                         index += 1
-                        if index < len(words) and cls._is_remote_url_token(words[index]):
+                        if (
+                            cls._is_fetch_destination_option_with_value(candidate)
+                            and index < len(words)
+                            and (
+                                cls._is_remote_url_token(words[index])
+                                or cls._shell_word_references_variable(words[index], shell_url_variables)
+                            )
+                        ):
                             return True
                     index += 1
                     continue
@@ -1160,10 +1250,12 @@ class GgufScanner(BaseScanner):
 
     @classmethod
     def _has_fetch_command_with_url(cls, value: str, commands: tuple[str, ...]) -> bool:
+        shell_url_variables: set[str] = set()
         for segment in cls._shell_command_segments(value):
             for command in commands:
-                if cls._fetch_segment_has_remote_url(segment, command):
+                if cls._fetch_segment_has_remote_url(segment, command, shell_url_variables):
                     return True
+            shell_url_variables.update(cls._shell_url_variable_names(segment))
         return False
 
     @staticmethod
@@ -1178,6 +1270,14 @@ class GgufScanner(BaseScanner):
         if before and (before.isalnum() or before in "._-"):
             return False
         return not (after and (after.isalnum() or after in "._-"))
+
+    @classmethod
+    def _has_network_api_boundary(cls, value: str, position: int, token: str) -> bool:
+        if token == "fetch" and position > 0 and value[position - 1] == ".":
+            after_position = position + len(token)
+            after = value[after_position] if after_position < len(value) else ""
+            return not (after and (after.isalnum() or after in "._-"))
+        return cls._has_token_boundary(value, position, token)
 
     @staticmethod
     def _api_argument_window(value: str, after_position: int) -> str | None:
@@ -1194,13 +1294,17 @@ class GgufScanner(BaseScanner):
         return argument_window is not None and cls._has_remote_url(argument_window)
 
     @staticmethod
-    def _remote_url_variable_names_before(value: str, position: int) -> set[str]:
-        names: set[str] = set()
-        for match in _GGUF_NETWORK_URL_ASSIGNMENT_PATTERN.finditer(value, 0, position):
-            names.add(match.group("name"))
-            if len(names) >= 64:
+    def _remote_url_variable_assignments(value: str) -> tuple[tuple[int, str], ...]:
+        assignments: list[tuple[int, str]] = []
+        for match in _GGUF_NETWORK_URL_ASSIGNMENT_PATTERN.finditer(value):
+            assignments.append((match.start(), match.group("name")))
+            if len(assignments) >= 64:
                 break
-        return names
+        return tuple(assignments)
+
+    @staticmethod
+    def _remote_url_variable_names_before(assignments: tuple[tuple[int, str], ...], position: int) -> set[str]:
+        return {name for assignment_position, name in assignments if assignment_position < position}
 
     @classmethod
     def _argument_window_uses_variable(cls, argument_window: str, names: set[str]) -> bool:
@@ -1235,9 +1339,10 @@ class GgufScanner(BaseScanner):
         if not cls._has_remote_url(value_lower):
             return None
 
+        remote_url_assignments = cls._remote_url_variable_assignments(value_lower)
         for api_name in _GGUF_METADATA_NETWORK_APIS:
             for api_position in cls._iter_substring_positions(value_lower, api_name):
-                if not cls._has_token_boundary(value_lower, api_position, api_name):
+                if not cls._has_network_api_boundary(value_lower, api_position, api_name):
                     continue
                 after_position = api_position + len(api_name)
                 argument_window = cls._api_argument_window(value_lower, after_position)
@@ -1245,7 +1350,7 @@ class GgufScanner(BaseScanner):
                     continue
                 if cls._has_remote_url(argument_window):
                     return "network_api"
-                remote_url_variables = cls._remote_url_variable_names_before(value_lower, api_position)
+                remote_url_variables = cls._remote_url_variable_names_before(remote_url_assignments, api_position)
                 if remote_url_variables and cls._argument_window_uses_variable(argument_window, remote_url_variables):
                     return "network_api"
         return None
@@ -1265,6 +1370,9 @@ class GgufScanner(BaseScanner):
         *,
         max_template_size: int = _GGUF_DEFAULT_MAX_TEMPLATE_SIZE,
     ) -> list[dict[str, str]]:
+        if cls._metadata_value_looks_like_documentation(key, value):
+            return []
+
         if cls._is_chat_template_key(key):
             if len(value) <= max_template_size:
                 return []
@@ -1292,6 +1400,62 @@ class GgufScanner(BaseScanner):
             evidence.append({"evidence_type": "remote_fetch", "pattern": network_remote_fetch_pattern})
 
         return evidence
+
+    @classmethod
+    def _iter_metadata_strings(cls, value: Any, *, max_items: int = 1024) -> Iterable[tuple[str, str]]:
+        stack: list[tuple[str, Any]] = [("", value)]
+        visited = 0
+        while stack and visited < max_items:
+            path, current = stack.pop()
+            visited += 1
+            if isinstance(current, str):
+                yield path, current
+                continue
+            if isinstance(current, list):
+                for index in range(len(current) - 1, -1, -1):
+                    item = current[index]
+                    item_path = f"{path}[{index}]" if path else f"[{index}]"
+                    stack.append((item_path, item))
+
+    def _report_metadata_value_security_checks(self, key: str, value: Any, result: ScanResult) -> None:
+        if self._is_tokenizer_vocabulary_key(key):
+            return
+
+        reported = sum(
+            1
+            for check in result.checks
+            if check.name == "Metadata Value Security Check" and check.status.value == "failed"
+        )
+        max_template_size = self.config.get("max_template_size", _GGUF_DEFAULT_MAX_TEMPLATE_SIZE)
+
+        for value_path, string_value in self._iter_metadata_strings(value):
+            for evidence in self._metadata_value_security_evidence(
+                key,
+                string_value,
+                max_template_size=max_template_size,
+            ):
+                if reported >= _GGUF_MAX_METADATA_VALUE_SECURITY_CHECKS:
+                    result.metadata["metadata_value_security_checks_truncated"] = True
+                    result.metadata["max_metadata_value_security_checks"] = _GGUF_MAX_METADATA_VALUE_SECURITY_CHECKS
+                    return
+                result.add_check(
+                    name="Metadata Value Security Check",
+                    passed=False,
+                    message=(
+                        f"Suspicious metadata value for key '{key}' contains "
+                        f"{evidence['evidence_type'].replace('_', ' ')} evidence"
+                    ),
+                    severity=IssueSeverity.INFO,
+                    location=self.current_file_path,
+                    details={
+                        "key": key,
+                        "value_path": value_path,
+                        "value": string_value[:200],
+                        **evidence,
+                    },
+                    rule_code="S902",
+                )
+                reported += 1
 
     @staticmethod
     def _record_chat_template_occurrence(
