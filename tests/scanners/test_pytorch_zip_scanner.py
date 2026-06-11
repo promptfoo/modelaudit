@@ -8014,7 +8014,10 @@ def test_pytorch_zip_unknown_runtime_emits_skipped_cve_applicability_checks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
+    model_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1.0, 2.0, 3.0]}))
     scanner = PyTorchZipScanner()
     monkeypatch.delitem(sys.modules, "torch", raising=False)
     monkeypatch.setattr(scanner, "_trusted_python_package_roots", lambda: ())
@@ -8034,7 +8037,40 @@ def test_pytorch_zip_unknown_runtime_emits_skipped_cve_applicability_checks(
         assert check.severity == IssueSeverity.INFO
         assert check.details["runtime_cve_version_gate"] == "local_environment_only"
         assert check.details["analysis_incomplete"] is True
+        assert "scan_outcome_reason" not in check.details
     assert result.success is True
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    _assert_no_runtime_pytorch_cve_failures(result, _PYTORCH_RUNTIME_CVE_IDS)
+
+
+def test_pytorch_zip_unknown_runtime_with_producer_version_fails_closed_and_is_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.0.1")
+    monkeypatch.setattr(PyTorchZipScanner, "_trusted_python_package_roots", staticmethod(lambda: ()))
+
+    _assert_pytorch_zip_inconclusive_not_cached(
+        model_path,
+        tmp_path / "unknown-runtime-cache",
+        PyTorchZipScanner.RUNTIME_VERSION_UNKNOWN_INCONCLUSIVE_REASON,
+        expected_success=False,
+        expected_exit_code=2,
+    )
+
+    result = PyTorchZipScanner().scan(str(model_path))
+    skipped_checks = [
+        check
+        for check in result.checks
+        if check.status == CheckStatus.SKIPPED and check.details.get("runtime_cve_applicability") == "unknown"
+    ]
+    assert {check.details["cve_id"] for check in skipped_checks} == set(_PYTORCH_RUNTIME_CVE_IDS)
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert PyTorchZipScanner.RUNTIME_VERSION_UNKNOWN_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    for check in skipped_checks:
+        assert check.details["producer_pytorch_version"] == "2.0.1"
+        assert check.details["producer_pytorch_version_source"] == "metadata:config.json:pytorch_version"
+        assert check.details["scan_outcome_reason"] == PyTorchZipScanner.RUNTIME_VERSION_UNKNOWN_INCONCLUSIVE_REASON
     _assert_no_runtime_pytorch_cve_failures(result, _PYTORCH_RUNTIME_CVE_IDS)
 
 
@@ -8366,7 +8402,7 @@ def test_pinned_huggingface_pyannote_checkpoint_does_not_emit_metadata_only_runt
         timeout=120,
     )
 
-    assert completed.returncode == 0, completed.stderr + completed.stdout
+    assert completed.returncode == 2, completed.stderr + completed.stdout
     report: dict[str, Any] = json.loads(output_path.read_text())
     critical_cves = {
         issue.get("details", {}).get("cve_id") for issue in report["issues"] if issue.get("severity") == "critical"
@@ -8377,6 +8413,8 @@ def test_pinned_huggingface_pyannote_checkpoint_does_not_emit_metadata_only_runt
     )
     assert pytorch_metadata["pytorch_framework_version"] == "2.0.1"
     assert pytorch_metadata["pytorch_version_source"] == "pickle:pytorch_model.310/data.pkl"
+    assert pytorch_metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert PyTorchZipScanner.RUNTIME_VERSION_UNKNOWN_INCONCLUSIVE_REASON in pytorch_metadata["scan_outcome_reasons"]
 
 
 def _pickle_result_with_reduce(import_reference: str | None = None) -> ScanResult:

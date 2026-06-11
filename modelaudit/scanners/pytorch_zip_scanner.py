@@ -324,6 +324,7 @@ class PyTorchZipScanner(BaseScanner):
     LOCAL_ENTRY_LIMIT_METADATA_KEY: ClassVar[str] = "pytorch_zip_local_entry_limit_exceeded"
     VERSION_METADATA_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_version_metadata_size_limit"
     VERSION_METADATA_READ_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_version_metadata_read_failed"
+    RUNTIME_VERSION_UNKNOWN_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_runtime_version_unknown"
     SCAN_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_scan_incomplete"
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -3104,14 +3105,22 @@ class PyTorchZipScanner(BaseScanner):
         fix_version: str,
         description: str,
         remediation: str,
+        fail_closed: bool,
+        producer_version: str | None = None,
+        producer_source: str | None = None,
         cvss: float | None = None,
         cwe: str | None = None,
     ) -> None:
         """Record explicit unknown applicability for runtime-version-gated CVEs."""
+        if fail_closed:
+            mark_inconclusive_scan_result(result, self.RUNTIME_VERSION_UNKNOWN_INCONCLUSIVE_REASON)
+
         details: dict[str, Any] = {
             "cve_id": cve_id,
             "description": description,
             "remediation": remediation,
+            "producer_pytorch_version": producer_version,
+            "producer_pytorch_version_source": producer_source,
             "installed_pytorch_version": None,
             "installed_pytorch_metadata_path": self._get_installed_pytorch_metadata_path(),
             "runtime_version_known": False,
@@ -3120,6 +3129,8 @@ class PyTorchZipScanner(BaseScanner):
             "analysis_incomplete": True,
             "fixed_in": f"PyTorch {fix_version}",
         }
+        if fail_closed:
+            details["scan_outcome_reason"] = self.RUNTIME_VERSION_UNKNOWN_INCONCLUSIVE_REASON
         if cvss is not None:
             details["cvss"] = cvss
         if cwe is not None:
@@ -3138,6 +3149,14 @@ class PyTorchZipScanner(BaseScanner):
                 details=details,
             )
         )
+
+    @staticmethod
+    def _producer_framework_version_evidence(version_info: dict[str, Any]) -> tuple[str | None, str | None]:
+        producer_version = version_info.get("pytorch_framework_version")
+        if not isinstance(producer_version, str) or not producer_version.strip():
+            return None, None
+        producer_source = version_info.get("pytorch_version_source")
+        return producer_version.strip(), producer_source if isinstance(producer_source, str) else None
 
     def _add_pytorch_version_provenance_check(
         self,
@@ -3210,6 +3229,7 @@ class PyTorchZipScanner(BaseScanner):
             version_info, self._is_vulnerable_pytorch_version
         )
         if not detected_version:
+            producer_version, producer_source = self._producer_framework_version_evidence(version_info)
             self._add_unknown_pytorch_runtime_version_check(
                 result,
                 path,
@@ -3220,6 +3240,9 @@ class PyTorchZipScanner(BaseScanner):
                 remediation=(
                     "Update to PyTorch 2.6.0 or later, avoid torch.load(weights_only=True) with untrusted models"
                 ),
+                fail_closed=producer_version is not None,
+                producer_version=producer_version,
+                producer_source=producer_source,
                 cvss=9.8,
                 cwe="CWE-502",
             )
@@ -3272,6 +3295,7 @@ class PyTorchZipScanner(BaseScanner):
         )
         if not detected_version:
             cve_info = CVE_COMBINED_PATTERNS[self.CVE_2026_24747_ID]
+            producer_version, producer_source = self._producer_framework_version_evidence(version_info)
             self._add_unknown_pytorch_runtime_version_check(
                 result,
                 path,
@@ -3280,6 +3304,9 @@ class PyTorchZipScanner(BaseScanner):
                 fix_version=self.CVE_2026_24747_FIX_VERSION,
                 description=str(cve_info["description"]),
                 remediation=str(cve_info["remediation"]),
+                fail_closed=producer_version is not None,
+                producer_version=producer_version,
+                producer_source=producer_source,
                 cvss=float(str(cve_info["cvss"])),
                 cwe=str(cve_info["cwe"]),
             )
@@ -3406,6 +3433,7 @@ class PyTorchZipScanner(BaseScanner):
             is_vulnerable,
         )
         if not detected_version:
+            producer_version, producer_source = self._producer_framework_version_evidence(version_info)
             self._add_unknown_pytorch_runtime_version_check(
                 result,
                 path,
@@ -3414,6 +3442,9 @@ class PyTorchZipScanner(BaseScanner):
                 fix_version=cve_metadata.fix_version,
                 description=cve_metadata.description,
                 remediation=cve_metadata.remediation,
+                fail_closed=producer_version is not None,
+                producer_version=producer_version,
+                producer_source=producer_source,
                 cvss=cve_metadata.cvss,
                 cwe=cve_metadata.cwe,
             )
