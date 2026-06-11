@@ -290,6 +290,7 @@ VALID_MEDIA_ROUTING_FORMAT = "valid_media"
 MEDIA_ROUTE_READ_BYTES = FLAX_MSGPACK_STRUCTURE_READ_BYTES
 MEDIA_ROUTE_TAIL_READ_BYTES = 64 * 1024
 _MEDIA_ROUTE_MAX_PNG_CHUNKS = 4096
+_MEDIA_STRUCTURAL_PROOF_READ_BYTES = 10 * 1024 * 1024
 _PNG_CRC_READ_CHUNK_BYTES = 64 * 1024
 _JPEG_SCAN_READ_CHUNK_BYTES = 64 * 1024
 _MEDIA_ROUTING_SUFFIXES = frozenset({".jpeg", ".jpg", ".png"})
@@ -5462,6 +5463,7 @@ def _find_png_end_with_reader(file_size: int, read_at: Callable[[int, int], byte
 
         offset = len(_PNG_SIGNATURE)
         saw_ihdr = False
+        crc_bytes_checked = 0
         for _ in range(_MEDIA_ROUTE_MAX_PNG_CHUNKS):
             if offset + 8 > file_size:
                 return None
@@ -5479,8 +5481,12 @@ def _find_png_end_with_reader(file_size: int, read_at: Callable[[int, int], byte
                 saw_ihdr = True
             elif chunk_type == b"IHDR":
                 return None
+            crc_proof_bytes = chunk_length + 4
+            if crc_bytes_checked + crc_proof_bytes > _MEDIA_STRUCTURAL_PROOF_READ_BYTES:
+                return None
             if not _png_chunk_crc_matches_with_reader(chunk_type, chunk_length, offset + 8, read_at):
                 return None
+            crc_bytes_checked += crc_proof_bytes
             if chunk_type == _PNG_IEND_CHUNK:
                 return chunk_end if chunk_length == 0 else None
             offset = chunk_end
@@ -5495,9 +5501,21 @@ def _find_jpeg_end_with_reader(file_size: int, read_at: Callable[[int, int], byt
         return None
 
     def read_exact(offset: int, size: int) -> bytes:
-        data = read_at(offset, size)
+        data = read_limited(offset, size)
         if len(data) != size:
             raise OSError("short JPEG read")
+        return data
+
+    bytes_requested = 0
+
+    def read_limited(offset: int, size: int) -> bytes:
+        nonlocal bytes_requested
+        if size <= 0:
+            return b""
+        if bytes_requested + size > _MEDIA_STRUCTURAL_PROOF_READ_BYTES:
+            raise OSError("bounded JPEG proof exceeded")
+        data = read_at(offset, size)
+        bytes_requested += size
         return data
 
     try:
@@ -5534,7 +5552,7 @@ def _find_jpeg_end_with_reader(file_size: int, read_at: Callable[[int, int], byt
 
             offset = segment_end
             while offset < file_size:
-                chunk = read_at(offset, min(_JPEG_SCAN_READ_CHUNK_BYTES, file_size - offset))
+                chunk = read_limited(offset, min(_JPEG_SCAN_READ_CHUNK_BYTES, file_size - offset))
                 if not chunk:
                     return None
                 index = 0

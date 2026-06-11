@@ -86,6 +86,18 @@ def _fake_content_range_response(payload: bytes, start: int, end: int) -> _FakeR
     )
 
 
+def _fake_range_responder(payload: bytes) -> Callable[[str], _FakeRangeResponse]:
+    def get_response(_url: str, **kwargs: object) -> _FakeRangeResponse:
+        headers = cast(dict[str, str], kwargs.get("headers", {}))
+        range_header = headers.get("Range", "")
+        if range_header.startswith("bytes="):
+            start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
+            return _fake_content_range_response(payload, int(start_text), int(end_text))
+        return _FakeRangeResponse(payload)
+
+    return get_response
+
+
 def _make_tar_payload() -> bytes:
     payload = BytesIO()
     with tarfile.open(fileobj=payload, mode="w") as archive:
@@ -132,6 +144,13 @@ def _make_forged_jpeg_tail_payload() -> bytes:
     prefix_padding = b"\0" * ((8 * 1024) - len(app0_header))
     tail_padding = b"\0" * (MEDIA_ROUTE_TAIL_READ_BYTES + 32)
     return app0_header + prefix_padding + malicious_pickle_bytes() + tail_padding + b"\xff\xd9" + b"\0" * 8
+
+
+def _make_large_valid_jpeg_payload() -> bytes:
+    app0_header = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+    scan_header = b"\xff\xda\x00\x08\x01\x01\x00\x00?\x00"
+    entropy = b"\x11" * ((8 * 1024) + MEDIA_ROUTE_TAIL_READ_BYTES)
+    return app0_header + scan_header + entropy + b"\xff\xd9"
 
 
 def _ubjson_key(key: bytes) -> bytes:
@@ -1486,6 +1505,32 @@ class TestModelDownload:
         assert (
             detect_file_format_for_skip_filter(str(download_path / "payload.jpg")) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
         )
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["model.safetensors", "preview.jpg"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_excludes_large_remote_jpeg_with_bounded_structural_proof(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        download_path = tmp_path / "download"
+        download_path.mkdir()
+        (download_path / "model.safetensors").write_bytes(b"weights")
+        payload = _make_large_valid_jpeg_payload()
+        mock_snapshot_download.return_value = str(download_path)
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        download_model("https://huggingface.co/test/model")
+
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["model.safetensors"]
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"})
     @patch(

@@ -471,6 +471,81 @@ def _detect_huggingface_png_media_route(
     return _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=trailing_size > len(trailing))
 
 
+def _detect_huggingface_jpeg_media_route(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> str | None:
+    """Return a JPEG media route by walking marker structure with sparse range reads."""
+    from modelaudit.utils.file.detection import (
+        MEDIA_ROUTE_READ_BYTES,
+        MEDIA_ROUTE_TAIL_READ_BYTES,
+        PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+        VALID_MEDIA_ROUTING_FORMAT,
+        _detect_complete_media_route_from_trailing,
+        _find_jpeg_end_with_reader,
+    )
+
+    if not prefix.startswith(b"\xff\xd8"):
+        return None
+    file_size = budget.file_sizes.get(filename)
+    if file_size is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    tail: bytes | None = None
+    tail_start = file_size
+    range_windows: list[tuple[int, bytes]] = []
+
+    def read_at(offset: int, size: int) -> bytes:
+        nonlocal tail, tail_start
+        end_offset = offset + size
+        if end_offset <= len(prefix):
+            return prefix[offset:end_offset]
+        if tail is None:
+            tail = _read_huggingface_tail(
+                repo_id,
+                filename,
+                revision,
+                budget,
+                prefix,
+                MEDIA_ROUTE_TAIL_READ_BYTES,
+            )
+            tail_start = file_size - len(tail)
+        if tail_start <= offset and end_offset <= tail_start + len(tail):
+            return tail[offset - tail_start : end_offset - tail_start]
+        if offset < len(prefix) and len(prefix) >= tail_start and end_offset <= tail_start + len(tail):
+            prefix_part = prefix[offset : min(end_offset, len(prefix))]
+            tail_part_start = max(len(prefix), tail_start)
+            tail_part = tail[tail_part_start - tail_start : end_offset - tail_start]
+            return prefix_part + tail_part
+        for window_start, window in range_windows:
+            if window_start <= offset and end_offset <= window_start + len(window):
+                return window[offset - window_start : end_offset - window_start]
+        window_size = min(MEDIA_ROUTE_TAIL_READ_BYTES, file_size - offset)
+        window = _read_huggingface_range(repo_id, filename, revision, budget, prefix, offset, window_size)
+        range_windows.append((offset, window))
+        return window[:size]
+
+    try:
+        media_end = _find_jpeg_end_with_reader(file_size, read_at)
+    except ValueError:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    if media_end is None:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+
+    trailing_size = file_size - media_end
+    if trailing_size <= 0:
+        return VALID_MEDIA_ROUTING_FORMAT
+    read_size = min(trailing_size, MEDIA_ROUTE_READ_BYTES + 1)
+    try:
+        trailing = read_at(media_end, read_size)
+    except ValueError:
+        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+    return _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=trailing_size > len(trailing))
+
+
 def _looks_like_safetensors_prefix(
     repo_id: str,
     filename: str,
@@ -920,6 +995,8 @@ def _detect_huggingface_content_route_format(
 
     if remote_path.suffix.lower() in _MEDIA_ROUTING_SUFFIXES:
         media_route = _detect_huggingface_png_media_route(repo_id, filename, revision, budget, prefix)
+        if media_route is None:
+            media_route = _detect_huggingface_jpeg_media_route(repo_id, filename, revision, budget, prefix)
         if media_route is None:
             media_tail = _read_huggingface_tail(
                 repo_id,

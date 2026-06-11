@@ -288,6 +288,25 @@ def test_malformed_media_headers_fail_closed(tmp_path: Path, filename: str, payl
     assert detect_file_format_for_skip_filter(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
 
 
+def test_png_crc_reader_refuses_oversized_payload_before_unbounded_read() -> None:
+    def png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
+        checksum = zlib.crc32(chunk_type + payload) & 0xFFFFFFFF
+        return len(payload).to_bytes(4, "big") + chunk_type + payload + checksum.to_bytes(4, "big")
+
+    ihdr = png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+    oversized_idat_length = file_detection._MEDIA_STRUCTURAL_PROOF_READ_BYTES + 1
+    prefix = b"\x89PNG\r\n\x1a\n" + ihdr + oversized_idat_length.to_bytes(4, "big") + b"IDAT"
+    idat_payload_offset = len(prefix)
+    file_size = idat_payload_offset + oversized_idat_length + 4
+
+    def read_at(offset: int, size: int) -> bytes:
+        if offset >= idat_payload_offset:
+            pytest.fail("oversized PNG CRC proof attempted to read chunk payload")
+        return prefix[offset : offset + size]
+
+    assert file_detection._find_png_end_with_reader(file_size, read_at) is None
+
+
 def test_detect_file_format_zip(tmp_path):
     """Test detecting a ZIP file format."""
     # Create a ZIP file
