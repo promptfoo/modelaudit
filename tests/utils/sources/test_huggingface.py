@@ -21,6 +21,7 @@ import pytest
 
 from modelaudit.scanner_selection import (
     resolve_scanner_selection_policy,
+    scanner_ids_for_detected_format,
     selected_scanner_extensions,
     selected_scanner_filenames,
 )
@@ -2765,6 +2766,7 @@ class TestModelDownloadStreaming:
     ) -> None:
         """Shard-shaped names must not hide pickle content from pickle-only selection."""
         policy = resolve_scanner_selection_policy(scanners=["pickle"])
+        assert "pickle" in scanner_ids_for_detected_format("safetensors")
         malicious_pickle = b"cos\nsystem\n(S'echo pwn'\ntR."
         mock_requests_get.return_value = _FakeRangeResponse(malicious_pickle)
 

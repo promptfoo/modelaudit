@@ -921,11 +921,14 @@ def _hf_safetensors_shard_excluded_by_selection(
     filename: str,
     selected_route_scanner_ids: set[str] | None,
 ) -> bool:
-    """Return whether scanner selection excludes a shard-shaped SafeTensors artifact."""
+    """Return whether no selected scanner can claim a declared SafeTensors shard."""
     if selected_route_scanner_ids is None or _HF_SAFETENSORS_SHARD_PATTERN.search(filename) is None:
         return False
 
-    return not selected_route_scanner_ids.intersection(_hf_safetensors_route_scanner_ids())
+    # SafeTensors content routes intentionally include overlap-capable scanners
+    # such as pickle and compressed, not only the SafeTensors scanner itself.
+    selected_safetensors_routes = selected_route_scanner_ids.intersection(_hf_safetensors_route_scanner_ids())
+    return not selected_safetensors_routes
 
 
 def _get_selected_hf_content_route_formats(
