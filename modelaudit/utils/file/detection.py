@@ -1063,7 +1063,12 @@ def _hf_tokenizer_json_has_decoded_route_evidence(
         key_start = offset
         key_end = _json_probe_skip_string(probe, offset)
         if key_end is None:
-            return _hf_tokenizer_suffix_has_structural_route_key(file_path, file_size, keys)
+            return _hf_tokenizer_suffix_has_structural_route_key(
+                file_path,
+                file_size,
+                keys,
+                require_jax_identity_value=require_jax_identity_value,
+            )
         key = _json_probe_decode_string(probe, key_start, key_end)
         if key is None:
             return False

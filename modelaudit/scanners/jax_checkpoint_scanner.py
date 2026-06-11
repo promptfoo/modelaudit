@@ -1853,6 +1853,9 @@ class JaxCheckpointScanner(BaseScanner):
 
         from .jinja2_template_scanner import JINJA_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY, Jinja2TemplateScanner
 
+        if not Jinja2TemplateScanner.can_handle(path):
+            return
+
         scanner_selection = policy_from_config(self.config)
         if scanner_selection.allows("jinja2_template"):
             jinja_config = dict(self.config)
@@ -1874,7 +1877,11 @@ class JaxCheckpointScanner(BaseScanner):
         if Path(path).suffix.lower() != ".json":
             return
 
-        from .xgboost_scanner import XGBOOST_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY, XGBoostScanner
+        from .xgboost_scanner import (
+            XGBOOST_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY,
+            XGBOOST_SKIP_JINJA_JSON_OVERLAP_CONFIG_KEY,
+            XGBoostScanner,
+        )
 
         if not XGBoostScanner.can_handle(path):
             return
@@ -1883,6 +1890,7 @@ class JaxCheckpointScanner(BaseScanner):
         if scanner_selection.allows("xgboost"):
             xgboost_config = dict(self.config)
             xgboost_config[XGBOOST_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY] = True
+            xgboost_config[XGBOOST_SKIP_JINJA_JSON_OVERLAP_CONFIG_KEY] = True
             self._merge_filename_owned_result(result, XGBoostScanner(config=xgboost_config).scan(path))
         elif scanner_selection.active:
             add_scanner_selection_skip_check(
