@@ -832,8 +832,23 @@ class TextScanner(BaseScanner):
         return any(opening == "(" and is_call for opening, is_call in stack)
 
     @staticmethod
-    def _documentation_prefix_is_passive_markdown_link(prefix: bytes) -> bool:
-        return DOCUMENTATION_MARKDOWN_LINK_URL_PREFIX_PATTERN.search(prefix.rstrip()) is not None
+    def _documentation_passive_markdown_link_match(prefix: bytes) -> re.Match[bytes] | None:
+        return DOCUMENTATION_MARKDOWN_LINK_URL_PREFIX_PATTERN.search(prefix.rstrip())
+
+    @classmethod
+    def _documentation_prefix_is_passive_markdown_link(cls, prefix: bytes) -> bool:
+        return cls._documentation_passive_markdown_link_match(prefix) is not None
+
+    @classmethod
+    def _documentation_markdown_link_is_in_code_context(cls, prefix: bytes, link_start: int) -> bool:
+        code_prefix = prefix[:link_start]
+        return (
+            cls._documentation_assignment_is_actionable(code_prefix)
+            or DOCUMENTATION_CODE_CALL_PATTERN.search(code_prefix) is not None
+            or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(code_prefix) is not None
+            or cls._documentation_nested_config_is_actionable(code_prefix)
+            or DOCUMENTATION_CONFIG_TAG_PATTERN.search(code_prefix) is not None
+        )
 
     @classmethod
     def _documentation_position_is_in_passive_markdown_link(cls, payload: bytes, position: int) -> bool:
@@ -846,7 +861,12 @@ class TextScanner(BaseScanner):
         line_position = position - line_start
         for match in BARE_NETWORK_URL_TOKEN_PATTERN.finditer(line):
             if match.start() <= line_position < match.end():
-                return cls._documentation_prefix_is_passive_markdown_link(line[: match.start()])
+                prefix = line[: match.start()]
+                markdown_match = cls._documentation_passive_markdown_link_match(prefix)
+                return markdown_match is not None and not cls._documentation_markdown_link_is_in_code_context(
+                    prefix,
+                    markdown_match.start(),
+                )
         return False
 
     @staticmethod
@@ -1588,8 +1608,40 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
-    def _documentation_line_bounds(payload: bytes, position: int) -> tuple[int, int, int]:
+    def _documentation_line_bounds_lookup(
+        payload: bytes,
+        positions: list[int],
+    ) -> dict[int, tuple[int, int, int]]:
+        normalized_positions = sorted({min(max(position, 0), len(payload)) for position in positions})
+        lookup: dict[int, tuple[int, int, int]] = {}
+        if not normalized_positions:
+            return lookup
+
+        line_start = 0
+        line_number = 1
+        position_index = 0
+        while position_index < len(normalized_positions):
+            line_end = payload.find(b"\n", line_start)
+            if line_end < 0:
+                line_end = len(payload)
+            while position_index < len(normalized_positions) and normalized_positions[position_index] <= line_end:
+                lookup[normalized_positions[position_index]] = (line_start, line_end, line_number)
+                position_index += 1
+            if line_end == len(payload):
+                break
+            line_start = line_end + 1
+            line_number += 1
+        return lookup
+
+    @staticmethod
+    def _documentation_line_bounds(
+        payload: bytes,
+        position: int,
+        line_lookup: dict[int, tuple[int, int, int]] | None = None,
+    ) -> tuple[int, int, int]:
         position = min(max(position, 0), len(payload))
+        if line_lookup is not None and (line_bounds := line_lookup.get(position)) is not None:
+            return line_bounds
         line_start = payload.rfind(b"\n", 0, position) + 1
         line_end = payload.find(b"\n", position)
         if line_end < 0:
@@ -1627,8 +1679,9 @@ class TextScanner(BaseScanner):
         *,
         kind: str,
         value: str,
+        line_lookup: dict[int, tuple[int, int, int]] | None = None,
     ) -> dict[str, Any]:
-        line_start, _line_end, line_number = cls._documentation_line_bounds(payload, span_start)
+        line_start, _line_end, line_number = cls._documentation_line_bounds(payload, span_start, line_lookup)
         return {
             "kind": kind,
             "value": cls._normalize_documentation_network_evidence_value(value),
@@ -1643,8 +1696,9 @@ class TextScanner(BaseScanner):
         cls,
         payload: bytes,
         position: int,
+        line_lookup: dict[int, tuple[int, int, int]] | None = None,
     ) -> dict[str, Any] | None:
-        line_start, line_end, _line_number = cls._documentation_line_bounds(payload, position)
+        line_start, line_end, _line_number = cls._documentation_line_bounds(payload, position, line_lookup)
         line = payload[line_start:line_end]
         line_position = position - line_start
         for match in BARE_NETWORK_URL_TOKEN_PATTERN.finditer(line):
@@ -1657,6 +1711,7 @@ class TextScanner(BaseScanner):
                 line_start + match.end(),
                 kind="url",
                 value=redact_url_for_finding(raw_value),
+                line_lookup=line_lookup,
             )
         return None
 
@@ -1665,17 +1720,18 @@ class TextScanner(BaseScanner):
         cls,
         payload: bytes,
         finding: dict[str, Any],
+        line_lookup: dict[int, tuple[int, int, int]] | None = None,
     ) -> dict[str, Any] | None:
         position = finding.get("position")
         destination = finding.get("destination")
         if not isinstance(position, int) or not isinstance(destination, str) or not destination:
             return None
 
-        url_evidence = cls._documentation_url_evidence_at_position(payload, position)
+        url_evidence = cls._documentation_url_evidence_at_position(payload, position, line_lookup)
         if url_evidence is not None:
             return url_evidence
 
-        line_start, line_end, _line_number = cls._documentation_line_bounds(payload, position)
+        line_start, line_end, _line_number = cls._documentation_line_bounds(payload, position, line_lookup)
         line_position = position - line_start
         destination_match = DOCUMENTATION_NETWORK_DESTINATION_TOKEN_PATTERN.match(
             payload[line_start:line_end], line_position
@@ -1688,6 +1744,7 @@ class TextScanner(BaseScanner):
             line_start + destination_match.end(),
             kind="destination",
             value=destination,
+            line_lookup=line_lookup,
         )
 
     @staticmethod
@@ -1699,12 +1756,13 @@ class TextScanner(BaseScanner):
         cls,
         payload: bytes,
         findings: list[dict[str, Any]],
+        line_lookup: dict[int, tuple[int, int, int]],
     ) -> list[dict[str, Any]]:
         return [
             evidence
             for finding in findings
             if cls._documentation_network_command_is_correlatable(finding)
-            if (evidence := cls._documentation_network_command_evidence(payload, finding)) is not None
+            if (evidence := cls._documentation_network_command_evidence(payload, finding, line_lookup)) is not None
         ]
 
     @staticmethod
@@ -1725,6 +1783,7 @@ class TextScanner(BaseScanner):
         payload: bytes,
         finding: dict[str, Any],
         command_evidences: list[dict[str, Any]],
+        line_lookup: dict[int, tuple[int, int, int]],
     ) -> dict[str, Any] | None:
         finding_type = finding.get("type")
         position = finding.get("position")
@@ -1733,7 +1792,7 @@ class TextScanner(BaseScanner):
         if finding_type == "network_command" and not cls._documentation_network_command_is_correlatable(finding):
             return None
 
-        url_evidence = cls._documentation_url_evidence_at_position(payload, position)
+        url_evidence = cls._documentation_url_evidence_at_position(payload, position, line_lookup)
         if url_evidence is not None:
             if finding_type in {"cloud_storage_url", "url_detected"}:
                 finding_url = finding.get("url")
@@ -1746,6 +1805,7 @@ class TextScanner(BaseScanner):
                             position + len(finding_url.encode("utf-8", errors="ignore")),
                             kind="url",
                             value=finding_url,
+                            line_lookup=line_lookup,
                         )
             return url_evidence
 
@@ -1754,7 +1814,7 @@ class TextScanner(BaseScanner):
             return command_evidence
 
         if finding_type == "network_command":
-            return cls._documentation_network_command_evidence(payload, finding)
+            return cls._documentation_network_command_evidence(payload, finding, line_lookup)
 
         if finding_type in {"domain", "domain_name"}:
             value = finding.get("domain")
@@ -1776,6 +1836,7 @@ class TextScanner(BaseScanner):
             position + len(value.encode("utf-8", errors="ignore")),
             kind=kind,
             value=value,
+            line_lookup=line_lookup,
         )
 
     @staticmethod
@@ -1873,12 +1934,14 @@ class TextScanner(BaseScanner):
         if not cls._is_documentation_sidecar(path):
             return findings
 
-        command_evidences = cls._documentation_network_command_evidences(payload, findings)
+        finding_positions = [position for finding in findings if isinstance((position := finding.get("position")), int)]
+        line_lookup = cls._documentation_line_bounds_lookup(payload, finding_positions)
+        command_evidences = cls._documentation_network_command_evidences(payload, findings, line_lookup)
         grouped: dict[tuple[int, int, str, str], list[tuple[int, dict[str, Any], dict[str, Any]]]] = {}
         ordered_items: list[tuple[str, int | tuple[int, int, str, str]]] = []
         standalone: dict[int, dict[str, Any]] = {}
         for index, finding in enumerate(findings):
-            evidence = cls._documentation_network_finding_evidence(payload, finding, command_evidences)
+            evidence = cls._documentation_network_finding_evidence(payload, finding, command_evidences, line_lookup)
             if evidence is None:
                 ordered_items.append(("standalone", index))
                 standalone[index] = finding

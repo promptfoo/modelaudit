@@ -257,11 +257,15 @@ def _create_results(
         import hashlib
 
         fingerprint = ""
+        fingerprint_location = _redact_path_for_sarif(issue.location or "")
         if issue.details:
-            fingerprint = _redact_text_for_sarif(str(issue.details.get("evidence_fingerprint", "")))
+            evidence_fingerprint = _redact_text_for_sarif(str(issue.details.get("evidence_fingerprint", "")))
+            if evidence_fingerprint:
+                fingerprint = hashlib.sha256(
+                    "\x1f".join((evidence_fingerprint, fingerprint_location, str(issue.severity))).encode()
+                ).hexdigest()[:16]
         if not fingerprint:
             fingerprint_message = _redact_text_for_sarif(issue.message)
-            fingerprint_location = _redact_path_for_sarif(issue.location or "")
             fingerprint = hashlib.sha256(
                 f"{fingerprint_message}{fingerprint_location}{issue.severity}".encode()
             ).hexdigest()[:16]

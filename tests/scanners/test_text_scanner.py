@@ -448,6 +448,29 @@ def test_text_scanner_model_card_dedup_keeps_code_block_controls_separate(tmp_pa
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_model_card_markdown_link_string_endpoint_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        'endpoint = "[download](https://evil.example/payload.sh)"\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_model_card_dedup_bounds_repeated_documentation_links(tmp_path: Path) -> None:
     text_path = tmp_path / "model_card.md"
     lines = [f"Reference {index}: https://docs.example.com/reference" for index in range(96)]
