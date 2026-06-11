@@ -2107,11 +2107,14 @@ def test_large_seekable_legacy_stream_partial_hash_uses_prefix_metadata() -> Non
 
 
 def test_large_non_seekable_legacy_pytorch_stream_uses_stream_budget_not_file_cap() -> None:
-    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 512)
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 512, malicious_object=True)
+    max_file_read_size = pickle_scanner._PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES
+
+    assert pickle_end > max_file_read_size
 
     result = PickleScanner(
         config={
-            "max_file_read_size": pickle_end,
+            "max_file_read_size": max_file_read_size,
             "max_known_stream_read_bytes": len(payload),
         }
     ).scan_stream(
@@ -2123,11 +2126,50 @@ def test_large_non_seekable_legacy_pytorch_stream_uses_stream_budget_not_file_ca
     assert result.success is False
     assert result.metadata["legacy_pytorch_container"] is True
     assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
+    assert result.metadata["legacy_pytorch_bounded_analysis"] is True
     assert result.metadata["pickle_stream_bytes_buffered"] == len(payload)
     assert result.metadata["pickle_stream_bytes_buffered"] > pickle_end
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "legacy_pytorch_storage_payload_skipped" in result.metadata["scan_outcome_reasons"]
     assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+    bounded_check = next(check for check in result.checks if check.name == "Legacy PyTorch Bounded Analysis")
+    coverage_check = next(check for check in result.checks if check.name == "Legacy PyTorch Storage Payload Coverage")
+    assert bounded_check.status == CheckStatus.PASSED
+    assert coverage_check.status == CheckStatus.FAILED
+    assert bounded_check.details["max_file_read_size"] == max_file_read_size
+    assert bounded_check.details["tensor_storage_materialized"] is False
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any(issue.details.get("import_reference") == EXPECTED_SYSTEM_GLOBAL for issue in result.issues)
+
+
+def test_large_non_seekable_legacy_pytorch_stream_detects_large_malicious_control() -> None:
+    storage_keys = tuple(f"{index:04d}" for index in range(96))
+    payload, pickle_end = _make_legacy_pytorch_container(
+        b"",
+        storage_keys=storage_keys,
+        malicious_object=True,
+    )
+    max_file_read_size = 256
+    assert pickle_end > max_file_read_size
+
+    result = PickleScanner(
+        config={
+            "max_file_read_size": max_file_read_size,
+            "max_known_stream_read_bytes": len(payload),
+        }
+    ).scan_stream(
+        NonSeekableBytesIO(payload),
+        len(payload),
+        source="legacy-large-malicious-control.pt",
+    )
+
+    assert result.success is False
+    assert result.metadata["legacy_pytorch_bounded_analysis"] is True
+    assert result.metadata["legacy_pytorch_storage_key_count"] == len(storage_keys)
+    assert "legacy_pytorch_storage_payload_skipped" in result.metadata["scan_outcome_reasons"]
+    assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any(issue.details.get("import_reference") == EXPECTED_SYSTEM_GLOBAL for issue in result.issues)
 
 
 def test_large_non_seekable_legacy_preamble_without_layout_keeps_file_size_limit() -> None:

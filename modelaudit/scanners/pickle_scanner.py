@@ -1038,6 +1038,61 @@ def _legacy_pytorch_control_probe_needs_more_bytes(data: bytes) -> bool:
     return False
 
 
+def _legacy_pytorch_incomplete_sys_info_needs_more_bytes(data: bytes) -> bool:
+    if not _matches_legacy_pytorch_preamble(data):
+        return False
+
+    probe = io.BytesIO(data)
+    offset = 0
+    for stream_index in range(_PYTORCH_LEGACY_STREAM_COUNT):
+        extent, consumed, parsed_opcode = _probe_pickle_stream(
+            probe,
+            offset,
+            max_opcodes=_PYTORCH_LEGACY_MAX_CONTROL_OPCODES,
+        )
+        if extent is None:
+            if stream_index != 2 or not parsed_opcode or offset + consumed < len(data):
+                return False
+            partial_sys_info = data[offset:]
+            return partial_sys_info.startswith(b"\x80\x02}")
+
+        end = offset + extent
+        if stream_index == 0 and _pickle_scalar_integer(data[:end]) != _PYTORCH_LEGACY_MAGIC_NUMBER:
+            return False
+        if stream_index == 1 and _pickle_scalar_integer(data[offset:end]) != _PYTORCH_LEGACY_PROTOCOL_VERSION:
+            return False
+        offset = end
+
+    return False
+
+
+def _legacy_pytorch_object_probe_needs_more_bytes(data: bytes) -> bool:
+    if not _matches_legacy_pytorch_preamble(data):
+        return False
+
+    probe = io.BytesIO(data)
+    offset = 0
+    for stream_index in range(_PYTORCH_LEGACY_STREAM_COUNT):
+        extent, consumed, parsed_opcode = _probe_pickle_stream(
+            probe,
+            offset,
+            max_opcodes=_PYTORCH_LEGACY_MAX_CONTROL_OPCODES,
+        )
+        if extent is None:
+            return stream_index >= 3 and parsed_opcode and offset + consumed >= len(data)
+
+        end = offset + extent
+        if stream_index == 0 and _pickle_scalar_integer(data[:end]) != _PYTORCH_LEGACY_MAGIC_NUMBER:
+            return False
+        if stream_index == 1 and _pickle_scalar_integer(data[offset:end]) != _PYTORCH_LEGACY_PROTOCOL_VERSION:
+            return False
+        if stream_index == 2 and not _matches_legacy_pytorch_sys_info(data[offset:end]):
+            return False
+        offset = end
+
+    return False
+
+
 def _legacy_pytorch_storage_end(
     data: bytes,
     layout: _LegacyPyTorchStreamLayout,
@@ -4114,13 +4169,15 @@ class PickleScanner(BaseScanner):
                         initial_payload,
                         total_size=standalone_size,
                     )
-                    if initial_layout is None and _legacy_pytorch_control_probe_needs_more_bytes(initial_payload):
-                        capped_probe = self._read_stream_payload_for_root(
+                    if initial_layout is None and (
+                        _legacy_pytorch_incomplete_sys_info_needs_more_bytes(initial_payload)
+                        or _legacy_pytorch_object_probe_needs_more_bytes(initial_payload)
+                    ):
+                        probe_target = self._legacy_pytorch_control_probe_size(standalone_size)
+                        initial_payload += self._read_stream_bytes(
                             file_obj,
-                            standalone_size,
-                            initial_payload=initial_payload,
+                            max(probe_target - len(initial_payload), 0),
                         )
-                        initial_payload = capped_probe.payload
                         initial_layout, _initial_storage_valid = self._legacy_pytorch_layout_for_scan(
                             initial_payload,
                             total_size=standalone_size,
