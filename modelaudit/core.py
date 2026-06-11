@@ -1788,14 +1788,14 @@ def _should_defer_hash_for_legacy_pytorch_read_limit(file_path: str, config: dic
                 handle.seek(local_offset)
                 return handle.read(size)
 
-            legacy_layout, legacy_storage_valid = scanner._legacy_pytorch_layout_for_scan(
+            legacy_layout, _legacy_storage_valid = scanner._legacy_pytorch_layout_for_scan(
                 control_probe,
                 total_size=file_size,
                 read_at=read_at,
             )
     except Exception:
         return False
-    return legacy_layout is not None and legacy_storage_valid
+    return legacy_layout is not None
 
 
 def _should_defer_hash_for_max_total_size(
