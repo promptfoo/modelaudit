@@ -1885,15 +1885,8 @@ def _non_allowlisted_import_finding_is_proven_safe(
         if position is not None
         else reference in analyzed_invocation_references
     )
-    invocation_is_trusted_reconstruction = (
-        position in trusted_reconstruction_global_positions
-        if position is not None
-        else reference in trusted_reconstruction_references
-    )
     inert_reference_is_proven_safe = position is not None and not finding_is_invoked
-    trusted_reference_is_proven_safe = position is not None and (
-        not finding_is_invoked or invocation_is_analyzed or invocation_is_trusted_reconstruction
-    )
+    trusted_reference_is_proven_safe = position is not None and (not finding_is_invoked or invocation_is_analyzed)
     return (trusted_reference_is_proven_safe and (module, name) in trusted_import_references) or (
         inert_reference_is_proven_safe and module in inert_initialization_modules
     )

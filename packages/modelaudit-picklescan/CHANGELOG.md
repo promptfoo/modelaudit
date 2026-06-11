@@ -9,7 +9,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- allow inert Hugging Face training metadata globals while preserving executable pickle controls
+- allow source-backed inert Hugging Face training metadata globals while keeping unresolved executable reconstruction suspicious
 - avoid routing trusted NumPy extension reconstruction exports through module `__getattr__` fallbacks while preserving legacy dotted-`GLOBAL` hook detection
 - preserve nested and aliased callable opcode evidence for downstream scanners
 

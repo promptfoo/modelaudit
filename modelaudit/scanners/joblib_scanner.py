@@ -34,6 +34,7 @@ _MAX_JOBLIB_CONTROL_OPCODES = 1000000
 _MAX_JOBLIB_ARRAY_DIMENSIONS = 64
 _NUMPY_DTYPE_HAS_OBJECT_FLAG = 1
 _JOBLIB_COMPRESSED_PREFIXES = (b"x", b"\x1f\x8b", b"]\x00", b"\xfd7zXZ")
+_JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE = "joblib.numpy_pickle.NumpyArrayWrapper"
 
 
 @dataclass(frozen=True)
@@ -743,6 +744,8 @@ class JoblibScanner(BaseScanner):
         result.merge(sub_result)
         if has_only_validated_codec_encodes:
             self._remove_validated_dtype_codec_findings(result)
+        if raw_array_count:
+            self._remove_validated_numpy_array_wrapper_findings(result)
         result.metadata.pop("trusted_incomplete_tail", None)
         result.metadata.pop("trusted_incomplete_tail_reason", None)
         has_security_findings = any(
@@ -756,6 +759,7 @@ class JoblibScanner(BaseScanner):
             and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
             and not has_security_findings
         ):
+            result.trust_merged_child_failures()
             result.metadata["trusted_incomplete_tail"] = True
             result.metadata["trusted_incomplete_tail_reason"] = "joblib_numpy_array_payload"
             result.metadata["joblib_numpy_array_payload_count"] = raw_array_count
@@ -773,6 +777,38 @@ class JoblibScanner(BaseScanner):
 
         result.issues = [issue for issue in result.issues if not is_validated_dtype_codec_finding(issue)]
         result.checks = [check for check in result.checks if not is_validated_dtype_codec_finding(check)]
+
+    @staticmethod
+    def _remove_validated_numpy_array_wrapper_findings(result: ScanResult) -> None:
+        def is_validated_wrapper_finding(finding: Any) -> bool:
+            return (
+                finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+                and finding.details.get("import_reference") == _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE
+            )
+
+        removed = any(is_validated_wrapper_finding(issue) for issue in result.issues) or any(
+            is_validated_wrapper_finding(check) for check in result.checks
+        )
+        if not removed:
+            return
+
+        result.issues = [issue for issue in result.issues if not is_validated_wrapper_finding(issue)]
+        result.checks = [check for check in result.checks if not is_validated_wrapper_finding(check)]
+        has_security_findings = any(
+            issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues
+        ) or any(
+            check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            for check in result.checks
+        )
+        if has_security_findings or result.metadata.get("scan_outcome_reasons") != ["pickle_analysis_incomplete"]:
+            return
+
+        for key in ("analysis_incomplete", "scan_outcome", "scan_outcome_message", "scan_outcome_reasons"):
+            result.metadata.pop(key, None)
+        if result.metadata.get("pickle_report_status") == "inconclusive":
+            result.metadata["pickle_report_status"] = "complete"
+        if result.metadata.get("pickle_verdict") == "suspicious":
+            result.metadata["pickle_verdict"] = "clean"
 
     @staticmethod
     def _downgrade_embedded_pickle_parse_errors(result: ScanResult) -> None:

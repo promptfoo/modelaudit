@@ -5,6 +5,8 @@ import os
 import pickle
 import stat
 import struct
+import subprocess
+import sys
 import time
 import urllib.request
 import warnings
@@ -15,7 +17,7 @@ from pathlib import Path
 from typing import IO, Any
 
 import pytest
-from modelaudit_picklescan.call_graph import import_only_module_requires_origin_review
+from modelaudit_picklescan.call_graph import _clear_source_sensitive_caches, import_only_module_requires_origin_review
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
@@ -43,6 +45,12 @@ def _pickle_global(module: str, name: str) -> bytes:
 
 def _pickle_binunicode(value: bytes) -> bytes:
     return b"X" + len(value).to_bytes(4, "little") + value
+
+
+def _pickle_short_binunicode(value: bytes) -> bytes:
+    if len(value) > 0xFF:
+        raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
+    return b"\x8c" + bytes([len(value)]) + value
 
 
 def _metadata_reduce_payload(module: str, name: str, value: bytes = b"metadata") -> bytes:
@@ -79,6 +87,154 @@ def _write_training_args_bin(path: Path, payload: bytes) -> None:
         zip_file.writestr("training_args/byteorder", "little")
         zip_file.writestr("training_args/version", "3")
         zip_file.writestr("training_args/.data/serialization_id", "0" * 40)
+
+
+_SHADOW_FRAMEWORK_MODULE = "transformers.training_args"
+_SHADOW_FRAMEWORK_NAME = "TrainingArguments"
+
+
+def _force_framework_metadata_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._trusted_module_origin_kind",
+        lambda _module_name: "unresolved",
+    )
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._resolve_module_source", lambda _module_name: None)
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._find_module_spec_without_imports",
+        lambda _module_name: None,
+    )
+
+
+def _stack_global_reference_payload(protocol: int) -> bytes:
+    return (
+        bytes((0x80, protocol))
+        + _pickle_short_binunicode(_SHADOW_FRAMEWORK_MODULE.encode("ascii"))
+        + b"\x94"
+        + _pickle_short_binunicode(_SHADOW_FRAMEWORK_NAME.encode("ascii"))
+        + b"\x94\x93"
+    )
+
+
+def _shadow_newobj_build_payload(protocol: int = 4) -> bytes:
+    return _stack_global_reference_payload(protocol) + b")\x81}b."
+
+
+def _shadow_memo_alias_payload() -> bytes:
+    return _stack_global_reference_payload(4) + b"\x94" + b"0" + b"h\x02)\x81}b."
+
+
+def _shadow_newobj_ex_payload() -> bytes:
+    return _stack_global_reference_payload(4) + b")}\x92}b."
+
+
+def _shadow_slot_state_build_payload() -> bytes:
+    return (
+        _stack_global_reference_payload(4)
+        + b")\x81N}"
+        + _pickle_short_binunicode(b"payload")
+        + _pickle_short_binunicode(b"owned")
+        + b"s\x86b."
+    )
+
+
+def _bytes_literal_payload(payload: bytes) -> bytes:
+    return b"\x80\x04B" + len(payload).to_bytes(4, "little") + payload + b"."
+
+
+def _extension_reconstruction_payload(opcode: bytes, encoded_code: bytes) -> bytes:
+    return b"\x80\x04" + opcode + encoded_code + b")\x81}b."
+
+
+def _shadow_framework_divergence_cases() -> tuple[object, ...]:
+    nested = _shadow_newobj_build_payload(4)
+    return (
+        pytest.param("protocol4_stack_global", _shadow_newobj_build_payload(4), "single", None, id="protocol4"),
+        pytest.param("protocol5_stack_global", _shadow_newobj_build_payload(5), "single", None, id="protocol5"),
+        pytest.param("memo_alias", _shadow_memo_alias_payload(), "single", None, id="memo-alias"),
+        pytest.param("newobj_ex", _shadow_newobj_ex_payload(), "single", None, id="newobj-ex"),
+        pytest.param("slot_state_build", _shadow_slot_state_build_payload(), "single", None, id="slot-state-build"),
+        pytest.param("nested_stream", _bytes_literal_payload(nested), "nested", None, id="nested"),
+        pytest.param("concatenated_stream", b"\x80\x04N." + nested, "concatenated", None, id="concatenated"),
+        pytest.param("ext1_control", _extension_reconstruction_payload(b"\x82", b"\x01"), "single", 1, id="ext1"),
+        pytest.param(
+            "ext2_control",
+            _extension_reconstruction_payload(b"\x83", (256).to_bytes(2, "little")),
+            "single",
+            256,
+            id="ext2",
+        ),
+        pytest.param(
+            "ext4_control",
+            _extension_reconstruction_payload(b"\x84", (70_000).to_bytes(4, "little")),
+            "single",
+            70_000,
+            id="ext4",
+        ),
+    )
+
+
+def _write_shadow_transformers_package(package_root: Path, marker: Path) -> None:
+    package_dir = package_root / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        "\n".join(
+            [
+                "from pathlib import Path",
+                f"_MARKER = Path({str(marker)!r})",
+                "class TrainingArguments:",
+                "    __slots__ = ('payload',)",
+                "    def __new__(cls, *args, **kwargs):",
+                "        return object.__new__(cls)",
+                "    def __setstate__(self, state):",
+                "        _MARKER.write_text('setstate', encoding='utf-8')",
+                "    def __setattr__(self, name, value):",
+                "        _MARKER.write_text(f'setattr:{name}', encoding='utf-8')",
+                "        object.__setattr__(self, name, value)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _assert_shadow_framework_unpickle_executes(
+    payload_path: Path,
+    tmp_path: Path,
+    *,
+    mode: str,
+    extension_code: int | None,
+) -> None:
+    marker = tmp_path / f"{payload_path.stem}.marker"
+    package_root = tmp_path / f"{payload_path.stem}.shadow"
+    _write_shadow_transformers_package(package_root, marker)
+    code_arg = "none" if extension_code is None else str(extension_code)
+    script = (
+        "import copyreg, io, pickle, sys\n"
+        "from pathlib import Path\n"
+        "payload = Path(sys.argv[1]).read_bytes()\n"
+        "mode = sys.argv[2]\n"
+        "code_arg = sys.argv[3]\n"
+        "if code_arg != 'none':\n"
+        "    copyreg.add_extension('transformers.training_args', 'TrainingArguments', int(code_arg))\n"
+        "if mode == 'nested':\n"
+        "    pickle.loads(pickle.loads(payload))\n"
+        "elif mode == 'concatenated':\n"
+        "    stream = io.BytesIO(payload)\n"
+        "    while stream.tell() < len(payload):\n"
+        "        pickle.load(stream)\n"
+        "else:\n"
+        "    pickle.loads(payload)\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), mode, code_arg],
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(package_root)},
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert marker.exists()
 
 
 def _download_pinned_training_args(tmp_path: Path) -> Path:
@@ -285,15 +441,61 @@ def test_pytorch_zip_scanner_can_handle(tmp_path):
     assert PyTorchZipScanner.can_handle(str(test_file)) is False
 
 
-def test_pytorch_zip_training_args_framework_metadata_refs_stay_clean(tmp_path: Path) -> None:
+def test_pytorch_zip_training_args_unresolved_framework_metadata_refs_warn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     model_path = tmp_path / "training_args.bin"
     _write_training_args_bin(model_path, _hf_training_args_metadata_payload())
+    _force_framework_metadata_unresolved(monkeypatch)
+    _clear_source_sensitive_caches()
 
-    result = PyTorchZipScanner().scan(str(model_path))
+    try:
+        result = PyTorchZipScanner().scan(str(model_path))
+    finally:
+        _clear_source_sensitive_caches()
 
-    assert result.success is True
+    assert result.success is False
     assert result.metadata["pickle_files"] == ["training_args/data.pkl"]
-    assert not [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}]
+    assert any(
+        issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        and (issue.details or {}).get("import_reference") == "transformers.training_args.TrainingArguments"
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize(
+    ("case_name", "payload", "mode", "extension_code"),
+    _shadow_framework_divergence_cases(),
+)
+def test_pytorch_zip_warns_on_unresolved_framework_scan_load_divergence(
+    case_name: str,
+    payload: bytes,
+    mode: str,
+    extension_code: int | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload_path = tmp_path / f"{case_name}.pkl"
+    payload_path.write_bytes(payload)
+    model_path = tmp_path / f"{case_name}.bin"
+    _write_training_args_bin(model_path, payload)
+    _force_framework_metadata_unresolved(monkeypatch)
+    _clear_source_sensitive_caches()
+    try:
+        result = PyTorchZipScanner().scan(str(model_path))
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert result.success is False
+    assert result.metadata["pickle_files"] == ["training_args/data.pkl"]
+    assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    _assert_shadow_framework_unpickle_executes(
+        payload_path,
+        tmp_path,
+        mode=mode,
+        extension_code=extension_code,
+    )
 
 
 @pytest.mark.integration

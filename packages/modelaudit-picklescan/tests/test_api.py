@@ -224,6 +224,143 @@ def _force_framework_metadata_unresolved(monkeypatch: pytest.MonkeyPatch) -> Non
     )
 
 
+_SHADOW_FRAMEWORK_MODULE = "transformers.training_args"
+_SHADOW_FRAMEWORK_NAME = "TrainingArguments"
+_SHADOW_FRAMEWORK_REFERENCE = f"{_SHADOW_FRAMEWORK_MODULE}.{_SHADOW_FRAMEWORK_NAME}"
+
+
+def _stack_global_reference_payload(protocol: int) -> bytes:
+    return (
+        bytes((0x80, protocol))
+        + _short_binunicode(_SHADOW_FRAMEWORK_MODULE.encode("ascii"))
+        + b"\x94"
+        + _short_binunicode(_SHADOW_FRAMEWORK_NAME.encode("ascii"))
+        + b"\x94\x93"
+    )
+
+
+def _shadow_newobj_build_payload(protocol: int = 4) -> bytes:
+    return _stack_global_reference_payload(protocol) + b")\x81}b."
+
+
+def _shadow_memo_alias_payload() -> bytes:
+    return _stack_global_reference_payload(4) + b"\x94" + b"0" + b"h\x02)\x81}b."
+
+
+def _shadow_newobj_ex_payload() -> bytes:
+    return _stack_global_reference_payload(4) + b")}\x92}b."
+
+
+def _shadow_slot_state_build_payload() -> bytes:
+    return (
+        _stack_global_reference_payload(4)
+        + b")\x81N}"
+        + _short_binunicode(b"payload")
+        + _short_binunicode(b"owned")
+        + b"s\x86b."
+    )
+
+
+def _bytes_literal_payload(payload: bytes) -> bytes:
+    return b"\x80\x04B" + len(payload).to_bytes(4, "little") + payload + b"."
+
+
+def _extension_reconstruction_payload(opcode: bytes, encoded_code: bytes) -> bytes:
+    return b"\x80\x04" + opcode + encoded_code + b")\x81}b."
+
+
+def _shadow_framework_divergence_cases() -> tuple[object, ...]:
+    nested = _shadow_newobj_build_payload(4)
+    return (
+        pytest.param("protocol4_stack_global", _shadow_newobj_build_payload(4), "single", None, id="protocol4"),
+        pytest.param("protocol5_stack_global", _shadow_newobj_build_payload(5), "single", None, id="protocol5"),
+        pytest.param("memo_alias", _shadow_memo_alias_payload(), "single", None, id="memo-alias"),
+        pytest.param("newobj_ex", _shadow_newobj_ex_payload(), "single", None, id="newobj-ex"),
+        pytest.param("slot_state_build", _shadow_slot_state_build_payload(), "single", None, id="slot-state-build"),
+        pytest.param("nested_stream", _bytes_literal_payload(nested), "nested", None, id="nested"),
+        pytest.param("concatenated_stream", b"\x80\x04N." + nested, "concatenated", None, id="concatenated"),
+        pytest.param("ext1_control", _extension_reconstruction_payload(b"\x82", b"\x01"), "single", 1, id="ext1"),
+        pytest.param(
+            "ext2_control",
+            _extension_reconstruction_payload(b"\x83", (256).to_bytes(2, "little")),
+            "single",
+            256,
+            id="ext2",
+        ),
+        pytest.param(
+            "ext4_control",
+            _extension_reconstruction_payload(b"\x84", (70_000).to_bytes(4, "little")),
+            "single",
+            70_000,
+            id="ext4",
+        ),
+    )
+
+
+def _write_shadow_transformers_package(package_root: Path, marker: Path) -> None:
+    package_dir = package_root / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        "\n".join(
+            [
+                "from pathlib import Path",
+                f"_MARKER = Path({str(marker)!r})",
+                "class TrainingArguments:",
+                "    __slots__ = ('payload',)",
+                "    def __new__(cls, *args, **kwargs):",
+                "        return object.__new__(cls)",
+                "    def __setstate__(self, state):",
+                "        _MARKER.write_text('setstate', encoding='utf-8')",
+                "    def __setattr__(self, name, value):",
+                "        _MARKER.write_text(f'setattr:{name}', encoding='utf-8')",
+                "        object.__setattr__(self, name, value)",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _assert_shadow_framework_unpickle_executes(
+    payload_path: Path,
+    tmp_path: Path,
+    *,
+    mode: str,
+    extension_code: int | None,
+) -> None:
+    marker = tmp_path / f"{payload_path.stem}.marker"
+    package_root = tmp_path / f"{payload_path.stem}.shadow"
+    _write_shadow_transformers_package(package_root, marker)
+    code_arg = "none" if extension_code is None else str(extension_code)
+    script = (
+        "import copyreg, io, pickle, sys\n"
+        "from pathlib import Path\n"
+        "payload = Path(sys.argv[1]).read_bytes()\n"
+        "mode = sys.argv[2]\n"
+        "code_arg = sys.argv[3]\n"
+        "if code_arg != 'none':\n"
+        "    copyreg.add_extension('transformers.training_args', 'TrainingArguments', int(code_arg))\n"
+        "if mode == 'nested':\n"
+        "    pickle.loads(pickle.loads(payload))\n"
+        "elif mode == 'concatenated':\n"
+        "    stream = io.BytesIO(payload)\n"
+        "    while stream.tell() < len(payload):\n"
+        "        pickle.load(stream)\n"
+        "else:\n"
+        "    pickle.loads(payload)\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), mode, code_arg],
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(package_root)},
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert marker.exists()
+
+
 def _import_reference_pairs(report: PickleReport) -> set[tuple[str, str]]:
     references = cast(tuple[collections.abc.Mapping[str, object], ...], report.metadata.get("import_references", ()))
     return {(str(reference.get("module", "")), str(reference.get("name", ""))) for reference in references}
@@ -5937,7 +6074,7 @@ def test_scan_bytes_warns_when_allowlisted_module_is_unresolved(monkeypatch: pyt
         ("torch._utils", "_rebuild_tensor_v2"),
     ],
 )
-def test_scan_bytes_keeps_unresolved_framework_reconstruction_global_clean(
+def test_scan_bytes_warns_on_unresolved_framework_reconstruction_global(
     module: str,
     name: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -5950,35 +6087,34 @@ def test_scan_bytes_keeps_unresolved_framework_reconstruction_global_clean(
     report = scan_bytes(f"c{module}\n{name}\n.".encode(), source="unresolved-framework-global.pkl")
 
     assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.{name}"
+        for finding in report.findings
+    )
 
 
-def test_scan_bytes_keeps_invoked_unresolved_framework_reconstruction_global_clean(
+def test_scan_bytes_warns_on_invoked_unresolved_framework_reconstruction_global(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        "modelaudit_picklescan.call_graph._trusted_module_origin_kind",
-        lambda _module_name: "unresolved",
-    )
-    monkeypatch.setattr("modelaudit_picklescan.call_graph._resolve_module_source", lambda _module_name: None)
-    monkeypatch.setattr(
-        "modelaudit_picklescan.call_graph._find_module_spec_without_imports",
-        lambda _module_name: None,
-    )
+    _force_framework_metadata_unresolved(monkeypatch)
 
     report = scan_bytes(
         b"ctorch._utils\n_rebuild_tensor_v2\n)R.",
         source="invoked-unresolved-framework-global.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
-    assert all(notice.code != "call_graph_source_unavailable" for notice in report.notices)
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "torch._utils._rebuild_tensor_v2"
+        for finding in report.findings
+    )
+    assert any(notice.code == "call_graph_source_unavailable" for notice in report.notices)
 
 
-def test_scan_bytes_keeps_hf_training_args_framework_metadata_clean(
+def test_scan_bytes_warns_on_unresolved_hf_training_args_framework_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _force_framework_metadata_unresolved(monkeypatch)
@@ -5991,11 +6127,46 @@ def test_scan_bytes_keeps_hf_training_args_framework_metadata_clean(
     finally:
         _clear_source_sensitive_caches()
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "transformers.training_args.TrainingArguments"
+        for finding in report.findings
+    )
     assert _import_reference_pairs(report) >= _HF_TRAINING_ARGS_METADATA_REFERENCES
-    assert all(notice.code != "call_graph_source_unavailable" for notice in report.notices)
+    assert any(notice.code == "call_graph_source_unavailable" for notice in report.notices)
+
+
+@pytest.mark.parametrize(
+    ("case_name", "payload", "mode", "extension_code"),
+    _shadow_framework_divergence_cases(),
+)
+def test_scan_file_warns_on_unresolved_framework_scan_load_divergence(
+    case_name: str,
+    payload: bytes,
+    mode: str,
+    extension_code: int | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload_path = tmp_path / f"{case_name}.pkl"
+    payload_path.write_bytes(payload)
+    _force_framework_metadata_unresolved(monkeypatch)
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_file(payload_path)
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert not (report.status == ScanStatus.COMPLETE and report.verdict == SafetyVerdict.CLEAN)
+    assert report.verdict in {SafetyVerdict.SUSPICIOUS, SafetyVerdict.MALICIOUS}
+    _assert_shadow_framework_unpickle_executes(
+        payload_path,
+        tmp_path,
+        mode=mode,
+        extension_code=extension_code,
+    )
 
 
 @pytest.mark.parametrize(
@@ -6028,7 +6199,7 @@ def test_scan_bytes_warns_on_untrusted_hf_framework_metadata_near_match(
 
 
 @pytest.mark.parametrize(("module", "name"), sorted(_HF_TRAINING_ARGS_REDUCE_REFERENCES))
-def test_scan_bytes_keeps_selected_hf_framework_metadata_reduce_clean(
+def test_scan_bytes_warns_on_unresolved_selected_hf_framework_metadata_reduce(
     module: str,
     name: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -6037,9 +6208,12 @@ def test_scan_bytes_keeps_selected_hf_framework_metadata_reduce_clean(
 
     report = scan_bytes(_metadata_reduce_payload(module, name) + b".", source="hf-training-args-reduce.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+    assert report.status in {ScanStatus.COMPLETE, ScanStatus.INCONCLUSIVE}
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.{name}"
+        for finding in report.findings
+    )
 
 
 @pytest.mark.parametrize(
@@ -6055,7 +6229,7 @@ def test_scan_bytes_warns_on_untrusted_hf_framework_metadata_reduce(
 
     report = scan_bytes(_metadata_reduce_payload(module, name) + b".", source="hf-training-args-untrusted-reduce.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
+    assert report.status in {ScanStatus.COMPLETE, ScanStatus.INCONCLUSIVE}
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.{name}"

@@ -39,6 +39,7 @@ _MIN_JAX_PICKLE_SCAN_LIMIT_BYTES = 1024
 _ROOT_EXPENSIVE_RAW_SCAN_LIMIT_BYTES = 1 * 1024 * 1024
 _MAX_METADATA_PICKLE_READ_BYTES = 10 * 1024 * 1024
 _KNOWN_PICKLE_EXTENSIONS = frozenset({".pkl", ".pickle", ".dill", ".joblib"})
+_LEGITIMATE_SERIALIZATION_ORIGIN_REVIEW_REFERENCES = frozenset({"joblib.numpy_pickle.NumpyArrayWrapper"})
 _PYTORCH_CONTAINER_EXTENSIONS = frozenset({".bin", ".pt", ".pth", ".ckpt", ".pkl"})
 _BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{10,}={0,2}(?![A-Za-z0-9+/=])")
 _HEX_TOKEN_RE = re.compile(rb"(?<![A-Fa-f0-9])[A-Fa-f0-9]{20,}(?![A-Fa-f0-9])")
@@ -1781,7 +1782,15 @@ def _is_legitimate_serialization_file(path: str) -> bool:
         report = StandalonePickleScanner().scan_file(path_obj, enrich_call_graph=False)
     except Exception:
         return False
-    return not report.has_security_findings and report.status.value != "error"
+    security_findings = tuple(
+        finding
+        for finding in report.findings
+        if not (
+            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+            and str(finding.details.get("import_reference", "")) in _LEGITIMATE_SERIALIZATION_ORIGIN_REVIEW_REFERENCES
+        )
+    )
+    return not security_findings and report.status.value != "error"
 
 
 def _path_prefix_looks_like_pickle(path: str) -> bool:

@@ -1350,16 +1350,12 @@ _TRUSTED_FRAMEWORK_METADATA_REFERENCES = frozenset(
     }
 )
 _TRUSTED_IMPORT_ONLY_REFERENCES |= _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES | _TRUSTED_FRAMEWORK_METADATA_REFERENCES
-_TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES = (
-    frozenset(
-        {
-            ("pathlib._local", "PurePath"),
-            ("pathlib._local", "PurePosixPath"),
-            ("pathlib._local", "PureWindowsPath"),
-        }
-    )
-    | _TRUSTED_FRAMEWORK_RECONSTRUCTION_REFERENCES
-    | _TRUSTED_FRAMEWORK_METADATA_REFERENCES
+_TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES = frozenset(
+    {
+        ("pathlib._local", "PurePath"),
+        ("pathlib._local", "PurePosixPath"),
+        ("pathlib._local", "PureWindowsPath"),
+    }
 )
 # Canonical-looking specs in sys.modules are forgeable. Identity trust is
 # limited to interpreter modules already loaded when this module initializes.
