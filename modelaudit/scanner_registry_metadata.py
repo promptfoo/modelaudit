@@ -343,6 +343,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "class": "JaxCheckpointScanner",
         "description": "Scans JAX checkpoint files in various serialization formats",
         "extensions": [".ckpt", ".checkpoint", ".orbax-checkpoint", ".pickle"],
+        "content_routed_extensions": [".json"],
         "header_formats": ["jax_checkpoint"],
         "priority": 15,
         "dependencies": [],

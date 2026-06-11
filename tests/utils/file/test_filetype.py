@@ -90,6 +90,34 @@ def _write_hf_tokenizer_json(path: Path, extra_fields: dict[str, Any] | None = N
     return path
 
 
+def _write_ordered_hf_tokenizer_json(
+    path: Path,
+    *,
+    late_fields: str = "",
+    padding_size: int = 0,
+    model_fields: str = '"type":"BPE","vocab":{"hello":0},"merges":[]',
+    version_json: str = '"1.0"',
+) -> Path:
+    padding = f',"padding":"{"x" * padding_size}"' if padding_size else ""
+    path.write_text(
+        (f'{{"version":{version_json},"added_tokens":[],"model":{{{model_fields}}}{padding}{late_fields}}}'),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_truncated_ordered_hf_tokenizer_json(path: Path, *, padding_size: int) -> Path:
+    path.write_text(
+        (
+            '{"version":"1.0","added_tokens":[],'
+            '"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},'
+            f'"padding":"{"x" * padding_size}'
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def _build_tf_metagraph_bytes() -> bytes:
     import modelaudit.protos  # noqa: F401
 
@@ -1638,6 +1666,113 @@ def test_hf_tokenizer_json_over_routing_budget_is_claimed_after_schema_probe(
 
     assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
     assert detect_file_format(str(tokenizer_path)) == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("late_fields", "expected_format"),
+    [
+        (
+            ',"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"',
+            "unknown",
+        ),
+        (
+            ',"learner":{"gradient_booster":{},"malicious_code":"os.system()"}',
+            "xgboost",
+        ),
+        (
+            ',"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+            '"arg_nodes":[0],"heads":[[0,0,0]]',
+            "mxnet",
+        ),
+    ],
+)
+def test_hf_tokenizer_json_late_security_root_keys_after_structure_budget_are_not_claimed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    late_fields: str,
+    expected_format: str,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 192)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=late_fields,
+        padding_size=256,
+        version_json="[1,7,4]" if expected_format == "xgboost" else '"1.0"',
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert detect_file_format(str(tokenizer_path)) == expected_format
+    assert detect_file_format_from_magic(str(tokenizer_path)) == expected_format
+    assert detect_file_format_for_skip_filter(str(tokenizer_path)) == expected_format
+
+
+def test_hf_tokenizer_json_late_conflict_after_16m_threshold_is_not_claimed(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"',
+        padding_size=file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES + 1,
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":@}}',
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0}},"padding":"bad \\q"}',
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0}},"padding":1e+}',
+    ],
+)
+def test_hf_tokenizer_json_malformed_schema_is_not_claimed(tmp_path: Path, payload: str) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(payload, encoding="utf-8")
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+
+
+def test_hf_tokenizer_json_truncated_at_structure_budget_is_not_claimed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 192)
+    tokenizer_path = _write_truncated_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        padding_size=256,
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+
+
+def test_hf_tokenizer_json_excessive_nested_root_value_is_not_claimed(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"metadata":' + ("[" * 70) + "0" + ("]" * 70),
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+
+
+def test_hf_tokenizer_json_jax_identity_is_not_claimed(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(',"framework":"jax","payload":"jax.experimental.host_callback.call(os.system, \'id\')"'),
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+
+
+def test_hf_tokenizer_json_vocab_template_token_is_claimed(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        model_fields='"type":"BPE","vocab":{"{{":0,"{%":1,"hello":2},"merges":[]',
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+    assert detect_file_format_from_magic(str(tokenizer_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(tokenizer_path)) == "unknown"
 
 
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
