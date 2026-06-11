@@ -3479,14 +3479,17 @@ def test_scan_huggingface_metadata_preflight_verbose_log_is_sanitized(
 
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.cli.download_model")
-def test_scan_huggingface_url_download_failure(mock_download, mock_is_hf_url):
+def test_scan_huggingface_url_download_failure(
+    mock_download: MagicMock,
+    mock_is_hf_url: MagicMock,
+) -> None:
     """Test handling of download failure for HuggingFace URL."""
     # Setup mocks
     mock_is_hf_url.return_value = True
     mock_download.side_effect = Exception("Download failed")
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["scan", "https://huggingface.co/test/model"])
+    result = runner.invoke(cli, ["scan", "--no-cache", "--format", "text", "https://huggingface.co/test/model"])
 
     # Should fail with error code 2
     assert result.exit_code == 2
