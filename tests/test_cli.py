@@ -1,5 +1,6 @@
 import ctypes
 import errno
+import hashlib
 import importlib
 import json
 import logging
@@ -5824,6 +5825,62 @@ def test_exit_code_streaming_symlink_traversal_without_safe_files(tmp_path: Path
     assert "Path traversal outside scanned directory" in output
     assert "CRITICAL SECURITY ISSUES FOUND" in output
     assert "NO FILES SCANNED" not in output
+
+
+def test_cli_streaming_local_download_sidecars_excluded_from_inventory_and_sbom(tmp_path: Path) -> None:
+    """CLI streaming scans should not count Hugging Face local-dir sidecars."""
+    model_dir = tmp_path / "downloaded-model"
+    model_dir.mkdir()
+    config_path = model_dir / "config.json"
+    config_path.write_text('{"model_type":"bert"}', encoding="utf-8")
+    vocab_path = model_dir / "vocab.txt"
+    vocab_path.write_text("[PAD]\n[UNK]\n", encoding="utf-8")
+
+    download_root = model_dir / ".cache" / "huggingface" / "download"
+    download_root.mkdir(parents=True)
+    (download_root / "config.json.metadata").write_text(
+        "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n",
+        encoding="utf-8",
+    )
+    (download_root / "config.json.lock").touch()
+    (download_root / "vocab.txt.metadata").write_text(
+        "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n",
+        encoding="utf-8",
+    )
+    (model_dir / ".cache" / "huggingface" / "CACHEDIR.TAG").write_text(
+        "Signature: 8a477f597d28d172789f06886806bc55\n"
+        "# This file is a cache directory tag created by huggingface_hub.\n"
+        "# For information about cache directory tags, see:\n"
+        "#\thttps://bford.info/cachedir/\n",
+        encoding="utf-8",
+    )
+    sbom_file = tmp_path / "stream.sbom.json"
+    file_hashes = [
+        hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        hashlib.sha256(vocab_path.read_bytes()).hexdigest(),
+    ]
+    expected_content_hash = hashlib.sha256("".join(sorted(file_hashes)).encode()).hexdigest()
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--stream", "--format", "json", "--no-cache", "--sbom", str(sbom_file), str(model_dir)],
+    )
+
+    assert result.exit_code == 0, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 2
+    assert output_payload["content_hash"] == expected_content_hash
+    assert {Path(asset["path"]).relative_to(model_dir).as_posix() for asset in output_payload["assets"]} == {
+        "config.json",
+        "vocab.txt",
+    }
+    assert not any(".cache/huggingface" in path for path in output_payload["file_metadata"])
+    assert not any(".cache/huggingface" in (check.get("location") or "") for check in output_payload["checks"])
+    assert not any(".cache/huggingface" in (issue.get("location") or "") for issue in output_payload["issues"])
+
+    sbom_data = json.loads(sbom_file.read_text())
+    component_names = {component["name"] for component in sbom_data["components"]}
+    assert component_names == {"config.json", "vocab.txt"}
 
 
 def test_exit_code_scan_errors(tmp_path):

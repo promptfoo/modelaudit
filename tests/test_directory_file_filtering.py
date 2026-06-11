@@ -5,6 +5,7 @@ import gzip
 import importlib
 import json
 import lzma
+import os
 import pickle
 import struct
 import sys
@@ -1328,6 +1329,97 @@ class TestDirectoryFileFiltering:
         }
         assert not any(".cache/huggingface" in path for path in results.file_metadata)
 
+    def test_local_download_metadata_symlink_traversal_is_not_skipped(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """A sidecar-shaped symlink must reach traversal validation instead of bookkeeping skip."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
+        outside_metadata = tmp_path / "outside.metadata"
+        _write_hf_download_metadata(outside_metadata)
+        sidecar = model_dir / ".cache" / "huggingface" / "download" / "config.json.metadata"
+        sidecar.parent.mkdir(parents=True)
+        sidecar.symlink_to(outside_metadata)
+
+        results = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+        assert _is_huggingface_cache_file(str(sidecar)) is False
+        assert any(
+            issue.location == str(sidecar) and "Path traversal outside scanned directory" in issue.message
+            for issue in results.issues
+        )
+
+    def test_local_download_metadata_hardlink_can_be_benign_bookkeeping(self, tmp_path: Path) -> None:
+        """A regular in-tree hardlink with benign metadata bytes is still bookkeeping."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
+        outside_metadata = tmp_path / "outside.metadata"
+        _write_hf_download_metadata(outside_metadata)
+        sidecar = model_dir / ".cache" / "huggingface" / "download" / "config.json.metadata"
+        sidecar.parent.mkdir(parents=True)
+        try:
+            os.link(outside_metadata, sidecar)
+        except OSError as exc:
+            pytest.skip(f"hardlinks unavailable: {exc}")
+
+        results = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+        assert _is_huggingface_cache_file(str(sidecar)) is True
+        assert str(sidecar) not in results.file_metadata
+        assert results.files_scanned == 1
+
+    def test_local_download_metadata_deep_json_falls_through_to_scan(self, tmp_path: Path) -> None:
+        """A pathological JSON sidecar must not raise or get skipped as benign metadata."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
+        sidecar = model_dir / ".cache" / "huggingface" / "download" / "config.json.metadata"
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_text("[" * 20000 + "]" * 20000, encoding="utf-8")
+
+        assert _is_huggingface_cache_file(str(sidecar)) is False
+
+    def test_local_download_sparse_oversized_metadata_falls_through_to_scan(self, tmp_path: Path) -> None:
+        """Sparse oversized metadata is rejected before content reads."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
+        sidecar = model_dir / ".cache" / "huggingface" / "download" / "config.json.metadata"
+        sidecar.parent.mkdir(parents=True)
+        with sidecar.open("wb") as handle:
+            handle.truncate((64 * 1024) + 1)
+
+        assert _is_huggingface_cache_file(str(sidecar)) is False
+
+    def test_local_download_oversized_git_bookkeeping_falls_through_to_scan(self, tmp_path: Path) -> None:
+        """Git bookkeeping files are size-checked before content reads."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
+        gitignore = model_dir / ".cache" / "huggingface" / "download" / ".gitignore"
+        gitignore.parent.mkdir(parents=True)
+        with gitignore.open("wb") as handle:
+            handle.truncate((64 * 1024) + 1)
+
+        assert _is_huggingface_cache_file(str(gitignore)) is False
+
+    def test_hf_cachedir_tag_fifo_is_not_opened(self, tmp_path: Path) -> None:
+        """Special files named like cache tags must be rejected before reads."""
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("mkfifo unavailable")
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
+        fifo = model_dir / ".cache" / "huggingface" / "CACHEDIR.TAG"
+        fifo.parent.mkdir(parents=True)
+        os.mkfifo(fifo)
+
+        assert _is_huggingface_cache_file(str(fifo)) is False
+
     def test_malicious_local_download_metadata_sidecar_is_scanned(self, tmp_path: Path) -> None:
         """Scannable bytes with a sidecar name must not be hidden by local_dir filtering."""
         model_dir = tmp_path / "downloaded-model"
@@ -1474,6 +1566,11 @@ class TestDirectoryFileFiltering:
         hf_ref_main = hf_home / "hub" / "models--org--repo" / "refs" / "main"
         hf_ref_head = hf_home / "hub" / "models--org--repo" / "refs" / "HEAD"
         hf_snapshot_main = hf_home / "hub" / "models--org--repo" / "snapshots" / "abc123" / "main"
+        hf_ref_main.parent.mkdir(parents=True)
+        hf_ref_main.write_text("abc123\n", encoding="utf-8")
+        hf_ref_head.write_text("abc123\n", encoding="utf-8")
+        hf_snapshot_main.parent.mkdir(parents=True)
+        hf_snapshot_main.write_text("payload", encoding="utf-8")
 
         assert _is_huggingface_cache_file(str(local_main)) is False
         assert _is_huggingface_cache_file(str(local_head)) is False

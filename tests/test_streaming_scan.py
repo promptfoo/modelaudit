@@ -32,6 +32,7 @@ from modelaudit.models import FileMetadataModel, LicenseInfoModel, create_initia
 from modelaudit.scanners import safetensors_scanner
 from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
+from modelaudit.utils.helpers.file_hash import compute_sha256_hash
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 
@@ -1577,6 +1578,43 @@ def test_scan_model_streaming_skips_local_download_sidecars(tmp_path: Path) -> N
 
     assert [call.args[0] for call in mock_scan.call_args_list] == [str(config_path), str(vocab_path)]
     assert result.files_scanned == 2
+
+
+def test_scan_model_streaming_local_download_sidecars_end_to_end_inventory(tmp_path: Path) -> None:
+    """Streaming local-dir scans should exclude HF sidecars from inventory and hashes."""
+    model_dir = tmp_path / "downloaded-model"
+    model_dir.mkdir()
+    config_path = model_dir / "config.json"
+    config_path.write_text('{"model_type":"bert"}', encoding="utf-8")
+    vocab_path = model_dir / "vocab.txt"
+    vocab_path.write_text("[PAD]\n[UNK]\n", encoding="utf-8")
+
+    download_root = model_dir / ".cache" / "huggingface" / "download"
+    write_hf_download_metadata(download_root / "config.json.metadata")
+    (download_root / "config.json.lock").touch()
+    write_hf_download_metadata(download_root / "vocab.txt.metadata")
+    write_hf_cachedir_tag(model_dir / ".cache" / "huggingface" / "CACHEDIR.TAG")
+
+    result = scan_model_streaming(
+        file_generator=iterate_files_streaming(model_dir),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(model_dir),
+        skip_file_types=True,
+        cache_enabled=False,
+    )
+    cache_fragment = ".cache/huggingface"
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(config_path), compute_sha256_hash(vocab_path)])
+
+    assert result.files_scanned == 2
+    assert {Path(asset.path).relative_to(model_dir).as_posix() for asset in result.assets} == {
+        "config.json",
+        "vocab.txt",
+    }
+    assert not any(cache_fragment in path for path in result.file_metadata)
+    assert not any(cache_fragment in (check.location or "") for check in result.checks)
+    assert not any(cache_fragment in (issue.location or "") for issue in result.issues)
+    assert result.content_hash == expected_hash
 
 
 def test_scan_model_streaming_scans_local_file_named_main(tmp_path: Path) -> None:

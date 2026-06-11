@@ -178,6 +178,9 @@ merge_scan_result = core_results.merge_scan_result
 
 HEADER_FORMAT_TO_SCANNER_ID = _registry.get_header_format_to_scanner_ids()
 _HF_DOWNLOAD_METADATA_MAX_BYTES = 64 * 1024
+_HF_DOWNLOAD_GIT_BOOKKEEPING_MAX_BYTES = 64 * 1024
+_HF_CACHE_REF_MAX_BYTES = 4096
+_HF_CACHEDIR_TAG_MAX_BYTES = 4096
 _HF_CACHEDIR_TAG_CONTENT = (
     "Signature: 8a477f597d28d172789f06886806bc55\n"
     "# This file is a cache directory tag created by huggingface_hub.\n"
@@ -3445,6 +3448,19 @@ def _download_sidecar_target_exists(path_obj: Path, download_root: Path) -> bool
     return (local_model_root / relative_parent / target_name).is_file()
 
 
+def _regular_bookkeeping_file_size(path_obj: Path, max_bytes: int) -> int | None:
+    """Return regular-file size for HF bookkeeping candidates without following symlinks."""
+    try:
+        stat_result = path_obj.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(stat_result.st_mode):
+        return None
+    if stat_result.st_size > max_bytes:
+        return None
+    return stat_result.st_size
+
+
 def _is_benign_local_hf_download_bookkeeping_file(
     path_obj: Path,
     *,
@@ -3457,16 +3473,20 @@ def _is_benign_local_hf_download_bookkeeping_file(
 
     filename = path_obj.name
     try:
+        max_size = _HF_DOWNLOAD_METADATA_MAX_BYTES
+        if filename in {".gitignore", ".gitattributes"}:
+            max_size = _HF_DOWNLOAD_GIT_BOOKKEEPING_MAX_BYTES
+        file_size = _regular_bookkeeping_file_size(path_obj, max_size)
+        if file_size is None:
+            return False
         if detect_file_format(str(path_obj)) != "unknown":
             return False
         if filename.endswith(".lock"):
             if require_existing_target and not _download_sidecar_target_exists(path_obj, download_root):
                 return False
-            return path_obj.stat().st_size == 0
+            return file_size == 0
         if filename.endswith(".metadata"):
             if require_existing_target and not _download_sidecar_target_exists(path_obj, download_root):
-                return False
-            if path_obj.stat().st_size > _HF_DOWNLOAD_METADATA_MAX_BYTES:
                 return False
             content = path_obj.read_text(encoding="utf-8")
             if _is_hf_download_metadata_text(content):
@@ -3476,8 +3496,8 @@ def _is_benign_local_hf_download_bookkeeping_file(
             if not allow_git_bookkeeping:
                 return False
             content = path_obj.read_text(encoding="utf-8")
-            return "\x00" not in content and len(content) <= 64 * 1024
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return "\x00" not in content
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return False
     return False
 
@@ -3509,6 +3529,8 @@ def _is_huggingface_cache_file(path: str) -> bool:
         return _is_hf_cachedir_tag(path_obj)
 
     if filename in ["main", "HEAD"]:
+        if _regular_bookkeeping_file_size(path_obj, _HF_CACHE_REF_MAX_BYTES) is None:
+            return False
         hf_cache_root = _find_hf_cache_root(path_obj)
         if hf_cache_root is None:
             return False
@@ -3541,9 +3563,9 @@ def _is_hf_cachedir_tag(path_obj: Path) -> bool:
         parent_parts = tuple(part.lower() for part in resolved_parent.parts[-2:])
         if parent_parts != (".cache", "huggingface"):
             return False
-        if detect_file_format(str(path_obj)) != "unknown":
+        if _regular_bookkeeping_file_size(path_obj, _HF_CACHEDIR_TAG_MAX_BYTES) is None:
             return False
-        if path_obj.stat().st_size > 4096:
+        if detect_file_format(str(path_obj)) != "unknown":
             return False
         content = path_obj.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
