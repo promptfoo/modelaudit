@@ -92,6 +92,19 @@ def should_bypass_cache_for_sharded_model(file_path: str) -> bool:
     return ShardedModelDetector.match_shard_filename(os.path.basename(file_path)) is not None
 
 
+def should_bypass_cache_for_openvino_sidecar(file_path: str) -> bool:
+    """Bypass XML-only cache keys when OpenVINO findings depend on a .bin sidecar."""
+    try:
+        from ...scanners.openvino_scanner import OpenVinoScanner
+    except Exception:
+        return False
+
+    if not OpenVinoScanner.can_handle(file_path):
+        return False
+    weights_path = os.path.splitext(file_path)[0] + ".bin"
+    return os.path.isfile(weights_path) or os.path.islink(weights_path)
+
+
 def _h5py_availability() -> bool:
     """Return whether Keras HDF5 analysis is available in this process."""
     try:
@@ -307,6 +320,10 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
                 if should_bypass_cache_for_sharded_model(file_path):
                     logger.debug(f"Bypassing cache for sharded model family: {file_path}")
+                    return func(*args, **kwargs)
+
+                if should_bypass_cache_for_openvino_sidecar(file_path):
+                    logger.debug(f"Bypassing cache for OpenVINO sidecar-dependent scan: {file_path}")
                     return func(*args, **kwargs)
 
                 raw_config, _ = _extract_config_and_path(args, kwargs)

@@ -1440,6 +1440,29 @@ def test_scan_model_streaming_openvino_xml_with_prefetched_companion(tmp_path: P
     assert not any("weights file not found" in check.message.lower() for check in result.checks)
 
 
+def test_scan_model_streaming_openvino_prefetched_companion_changes_content_hash(tmp_path: Path) -> None:
+    """HF-style XML-only yields must include staged OpenVINO weights in the aggregate hash."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+    first_result = scan_model_streaming(
+        file_generator=iter([(xml_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=True,
+    )
+
+    bin_path.write_bytes(b"\x01" * 16)
+    second_result = scan_model_streaming(
+        file_generator=iter([(xml_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=True,
+    )
+
+    assert first_result.content_hash is not None
+    assert second_result.content_hash is not None
+    assert first_result.content_hash != second_result.content_hash
+
+
 def test_scan_model_streaming_openvino_missing_companion_still_reports_s701(tmp_path: Path) -> None:
     """Missing OpenVINO weights must not be suppressed by companion-preservation logic."""
     xml_path = tmp_path / "model.xml"
@@ -1481,6 +1504,7 @@ def test_scan_model_streaming_openvino_symlink_escape_fails_closed(
     )
 
     assert determine_exit_code(result) == 1
+    assert result.content_hash is None
     assert not xml_path.exists()
     assert not bin_path.exists()
     assert escaped_weights.exists()
@@ -1528,6 +1552,36 @@ def test_scan_model_directory_or_file_openvino_bin_sidecar_not_pytorch(tmp_path:
     assert "pytorch_binary" not in result.scanner_names
     assert result.file_metadata[str(xml_path)]["bin_size"] == bin_path.stat().st_size
     assert not any(check.rule_code == "S901" for check in result.checks)
+
+
+@pytest.mark.parametrize(
+    "scanner_selection",
+    [
+        {"scanners": ["pytorch_binary"]},
+        {"exclude_scanners": ["openvino"]},
+    ],
+)
+def test_openvino_bin_sidecar_respects_scanner_selection(
+    tmp_path: Path,
+    scanner_selection: dict[str, list[str]],
+) -> None:
+    """A filtered OpenVINO XML must not hide a selected malicious .bin scanner route."""
+    _xml_path, bin_path = _write_openvino_pair(tmp_path)
+    bin_path.write_bytes(b"\x00" * 128 + b"eval('1 + 1')" + b"\x00" * 128)
+
+    result = scan_model_directory_or_file(
+        str(tmp_path),
+        cache_enabled=False,
+        skip_file_types=True,
+        **scanner_selection,
+    )
+
+    assert determine_exit_code(result) == 1
+    assert "pytorch_binary" in result.scanner_names
+    assert any(
+        issue.location and issue.location.startswith(str(bin_path)) and issue.severity == IssueSeverity.WARNING
+        for issue in result.issues
+    )
 
 
 def test_non_openvino_xml_near_match_does_not_hide_malicious_bin(tmp_path: Path) -> None:

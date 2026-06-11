@@ -290,6 +290,7 @@ _DVC_EXCLUDED_PATHS_CONFIG_KEY = "_dvc_excluded_paths"
 _DVC_COVERAGE_ROOTS_CONFIG_KEY = "_dvc_coverage_roots"
 DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY = "_dvc_external_covered_paths"
 DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY = "_dvc_external_covered_directories"
+_OPENVINO_SCANNED_XML_COMPANIONS_CONFIG_KEY = "_openvino_scanned_xml_companions"
 
 
 def _record_incomplete_dvc_resolution(
@@ -647,6 +648,35 @@ def _is_openvino_xml_path(path: Path) -> bool:
         return OpenVinoScanner.can_handle(str(path))
     except Exception:
         return False
+
+
+def _openvino_xml_companion_key(path: Path) -> str:
+    """Return a stable lexical key for one scheduled OpenVINO XML scan."""
+    return os.path.normcase(os.path.normpath(str(Path(os.path.abspath(path)))))
+
+
+def _with_openvino_scanned_xml_companion(config: dict[str, Any], xml_path: Path) -> dict[str, Any]:
+    """Record an OpenVINO XML that will cover its same-stem weights sidecar."""
+    configured_companions = config.get(_OPENVINO_SCANNED_XML_COMPANIONS_CONFIG_KEY, ())
+    companion_keys = {
+        str(companion_key) for companion_key in configured_companions if isinstance(companion_key, (str, Path))
+    }
+    companion_keys.add(_openvino_xml_companion_key(xml_path))
+    updated_config = dict(config)
+    updated_config[_OPENVINO_SCANNED_XML_COMPANIONS_CONFIG_KEY] = tuple(sorted(companion_keys))
+    return updated_config
+
+
+def _openvino_xml_companion_will_be_scanned(xml_path: Path, config: dict[str, Any]) -> bool:
+    """Return whether this scan invocation scheduled the owning XML through OpenVINO."""
+    if not policy_from_config(config).allows("openvino"):
+        return False
+    configured_companions = config.get(_OPENVINO_SCANNED_XML_COMPANIONS_CONFIG_KEY, ())
+    if not isinstance(configured_companions, (list, tuple, set, frozenset)):
+        return False
+    return _openvino_xml_companion_key(xml_path) in {
+        str(companion_key) for companion_key in configured_companions if isinstance(companion_key, (str, Path))
+    }
 
 
 def _snapshot_file_identity(path: Path) -> _FileIdentitySnapshot | None:
@@ -2676,6 +2706,11 @@ def scan_model_directory_or_file(
             # family once. Shard scans already expand to sibling shards in the
             # advanced handler, so scanning each shard path would duplicate work.
             if scan_entries:
+                scheduled_openvino_xml_companions = {
+                    _openvino_xml_companion_key(Path(representative_file))
+                    for representative_file, _scanned_file_paths, _entry_shard_family_key in scan_entries
+                    if scanner_selection.allows("openvino") and _is_openvino_xml_path(Path(representative_file))
+                }
                 hash_sources: list[str] = []
                 seen_hash_sources: set[str] = set()
                 hash_source_by_path: dict[str, str] = {}
@@ -2772,6 +2807,12 @@ def scan_model_directory_or_file(
                                         shard_family_targets.get(shard_family_key, {}),
                                     )
                                 )
+                            openvino_owner = _openvino_weights_companion_owner(Path(representative_file))
+                            if (
+                                openvino_owner is not None
+                                and _openvino_xml_companion_key(openvino_owner) in scheduled_openvino_xml_companions
+                            ):
+                                file_config = _with_openvino_scanned_xml_companion(file_config, openvino_owner)
                             file_result = scan_file(representative_file, file_config)
                         finally:
                             _finish_phase_timing(phase_timings, "file_scan_dispatch", file_scan_started_at)
@@ -3652,7 +3693,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         return sr
 
     openvino_owner = _openvino_weights_companion_owner(Path(path))
-    if openvino_owner is not None:
+    if openvino_owner is not None and _openvino_xml_companion_will_be_scanned(openvino_owner, config):
         sr = ScanResult(scanner_name="openvino")
         sr.bytes_scanned = file_size
         sr.metadata["file_size"] = file_size
@@ -4380,6 +4421,7 @@ def scan_model_streaming(
     validated_shard_targets: ValidatedShardTargets = {}
     preserved_openvino_companion_snapshots: dict[Path, _FileIdentitySnapshot] = {}
     consumed_openvino_companions: set[Path] = set()
+    hashed_stream_paths: set[Path] = set()
     preserve_shard_reconciliation_errors = False
 
     def delete_streamed_source(source_path: Path, context: str) -> None:
@@ -4474,6 +4516,66 @@ def scan_model_streaming(
             }
         )
 
+    def append_streamed_file_hash(
+        scan_path: Path,
+        scan_config: dict[str, Any],
+        *,
+        progress_label: str,
+    ) -> str | None:
+        """Hash one streamed source once before it can be deleted or consumed."""
+        nonlocal aggregate_hash_complete, top_level_hashed_bytes
+
+        scan_path_key = Path(os.path.abspath(scan_path))
+        if scan_path_key in hashed_stream_paths:
+            return None
+
+        defer_hash_for_max_total_size = _should_defer_hash_for_max_total_size(
+            scan_config,
+            hashed_bytes=top_level_hashed_bytes,
+        )
+        defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(str(scan_path), scan_config)
+        if defer_hash_for_max_total_size or defer_hash_for_max_file_size:
+            aggregate_hash_complete = False
+            return None
+        if _should_defer_hash_for_safetensors_header_limit(str(scan_path), scan_config):
+            return None
+
+        if progress_callback:
+            progress_callback(
+                f"Hashing {progress_label}",
+                (files_processed / (files_processed + 1)) * 100,
+            )
+        with suppress(OSError):
+            top_level_hashed_bytes += scan_path.stat().st_size
+        file_hash = compute_sha256_hash(scan_path)
+        file_hashes.append(file_hash)
+        hashed_stream_paths.add(scan_path_key)
+        return file_hash
+
+    def append_streamed_openvino_companion_hash(
+        xml_path: Path,
+        companion_path: Path,
+        scan_config: dict[str, Any],
+    ) -> None:
+        """Hash an OpenVINO sidecar only after preserving its directory boundary."""
+        nonlocal aggregate_hash_complete
+
+        if companion_path.is_symlink():
+            try:
+                resolved_companion = companion_path.resolve(strict=True)
+                model_dir = xml_path.resolve(strict=True).parent
+            except OSError:
+                aggregate_hash_complete = False
+                return
+            if not is_within_directory(str(model_dir), str(resolved_companion)):
+                aggregate_hash_complete = False
+                return
+        append_streamed_file_hash(
+            companion_path,
+            scan_config,
+            progress_label=companion_path.name,
+        )
+
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
     is_hf_cache = base_dir is not None and hf_cache_root is not None
@@ -4550,16 +4652,23 @@ def scan_model_streaming(
                         logger.debug(f"Skipping non-model file: {source_path}")
                     continue
 
+                # Build config dict for scan_file
+                scan_config = {
+                    "timeout": timeout - int(time.time() - start_time),
+                    **scan_kwargs,
+                }
+
                 openvino_sidecar_owner = _openvino_weights_companion_owner(scan_path)
-                if openvino_sidecar_owner is not None:
+                if openvino_sidecar_owner is not None and scanner_selection.allows("openvino"):
                     is_lfs_sidecar, _lfs_info = check_lfs_pointer(str(scan_path))
                     if not is_lfs_sidecar:
+                        scan_config = _with_openvino_scanned_xml_companion(scan_config, openvino_sidecar_owner)
                         preserve_source_after_scan = True
                         sidecar_snapshot = _snapshot_file_identity(scan_path)
                         if sidecar_snapshot is not None:
                             preserved_openvino_companion_snapshots[Path(os.path.abspath(scan_path))] = sidecar_snapshot
 
-                if _is_openvino_xml_path(scan_path):
+                if scanner_selection.allows("openvino") and _is_openvino_xml_path(scan_path):
                     candidate_companion = scan_path.with_suffix(".bin")
                     if candidate_companion.exists() or candidate_companion.is_symlink():
                         openvino_scan_companion_path = candidate_companion
@@ -4579,11 +4688,6 @@ def scan_model_streaming(
                             preserve_shard_reconciliation_errors = True
                             aggregate_hash_complete = False
 
-                # Build config dict for scan_file
-                scan_config = {
-                    "timeout": timeout - int(time.time() - start_time),
-                    **scan_kwargs,
-                }
                 initial_shard_target = _snapshot_validated_shard_target(
                     str(source_path),
                     resolved_path=str(scan_path),
@@ -4618,28 +4722,17 @@ def scan_model_streaming(
                             files_processed += 1
                             continue
 
-                file_hash: str | None = None
-                defer_hash_for_max_total_size = _should_defer_hash_for_max_total_size(
+                file_hash = append_streamed_file_hash(
+                    scan_path,
                     scan_config,
-                    hashed_bytes=top_level_hashed_bytes,
+                    progress_label=source_path.name,
                 )
-                defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(str(scan_path), scan_config)
-                if defer_hash_for_max_total_size or defer_hash_for_max_file_size:
-                    aggregate_hash_complete = False
-                if (
-                    not _should_defer_hash_for_safetensors_header_limit(str(scan_path), scan_config)
-                    and not defer_hash_for_max_file_size
-                    and not defer_hash_for_max_total_size
-                ):
-                    if progress_callback:
-                        progress_callback(
-                            f"Hashing {source_path.name}",
-                            (files_processed / (files_processed + 1)) * 100,
-                        )
-                    with suppress(OSError):
-                        top_level_hashed_bytes += scan_path.stat().st_size
-                    file_hash = compute_sha256_hash(scan_path)
-                    file_hashes.append(file_hash)
+                if openvino_scan_companion_path is not None:
+                    append_streamed_openvino_companion_hash(
+                        scan_path,
+                        openvino_scan_companion_path,
+                        scan_config,
+                    )
 
                 # Scan the file
                 if progress_callback:

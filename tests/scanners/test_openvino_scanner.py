@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.openvino_scanner import OpenVinoScanner
 
@@ -343,6 +343,49 @@ def test_openvino_scanner_respects_configured_file_size_limit(tmp_path: Path) ->
 
     assert result.success is False
     assert any(check.name == "File Size Limit" for check in result.checks)
+
+
+def test_openvino_scanner_oversize_weights_fail_closed(tmp_path: Path) -> None:
+    """Direct XML scans must fail closed when bounded OpenVINO weights are skipped."""
+    xml_path = create_basic_model(tmp_path)
+    bin_path = tmp_path / "model.bin"
+    max_file_size = xml_path.stat().st_size + 1
+    bin_path.write_bytes(b"\x00" * (max_file_size + 1))
+
+    direct_result = scan_file(
+        str(xml_path),
+        config={"max_file_size": max_file_size, "cache_enabled": False},
+    )
+    cli_result = scan_model_directory_or_file(
+        str(xml_path),
+        max_file_size=max_file_size,
+        cache_enabled=False,
+    )
+
+    assert direct_result.success is False
+    assert direct_result.metadata["operational_error"] is True
+    assert direct_result.metadata["operational_error_reason"] == "openvino_weights_file_size_exceeded"
+    assert any(check.name == "OpenVINO Weights File Size Limit" for check in direct_result.checks)
+    assert cli_result.has_errors is True
+    assert determine_exit_code(cli_result) == 2
+
+
+def test_openvino_scanner_sidecar_cache_rescans_changed_weights(tmp_path: Path) -> None:
+    """OpenVINO XML cache entries must not hide changed same-stem weights metadata."""
+    xml_path = create_basic_model(tmp_path)
+    bin_path = tmp_path / "model.bin"
+    cache_config = {
+        "cache_enabled": True,
+        "cache_dir": str(tmp_path / "cache"),
+        "min_cache_file_size": 0,
+    }
+
+    first_result = scan_file(str(xml_path), config=cache_config)
+    bin_path.write_bytes(b"\x01" * 32)
+    second_result = scan_file(str(xml_path), config=cache_config)
+
+    assert first_result.metadata["bin_size"] == 10
+    assert second_result.metadata["bin_size"] == 32
 
 
 def test_openvino_scanner_detects_nested_external_library_references(tmp_path: Path) -> None:
