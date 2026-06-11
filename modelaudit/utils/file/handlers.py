@@ -47,6 +47,7 @@ MAX_PARALLEL_WORKERS = 4
 SHARD_SCAN_TIMEOUT = 600  # 10 minutes per shard
 MAX_RECORDED_MISSING_SHARD_INDICES = 1000
 _SHARD_ALREADY_PINNED_CONFIG_KEY = "_trusted_shard_already_pinned"
+_SINGLE_SAFETENSORS_AS_FILE_CONFIG_KEY = "_trusted_single_safetensors_as_file"
 SAFETENSORS_SHARD_PATTERN = r"model-(\d+)-of-(\d+)\.safetensors"
 SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
 MAX_SAFETENSORS_SHARD_INDEX_BYTES = 10 * 1024 * 1024
@@ -1708,10 +1709,7 @@ class ParallelShardHandler:
                 isinstance(self.scanner_config, dict)
                 and self.scanner_config.get(_SHARD_ALREADY_PINNED_CONFIG_KEY) is True
             )
-            pin_optional_single_shard = validated_target is not None and _is_complete_single_safetensors_shard_info(
-                self.shard_info
-            )
-            if validated_target is None or already_pinned or pin_optional_single_shard:
+            if validated_target is None or already_pinned:
                 result: ScanResult = scanner.scan(scan_path)
             else:
                 with _pinned_shard_scan_path(scan_path, validated_target) as pinned_scan:
@@ -1793,6 +1791,12 @@ class AdvancedFileHandler:
         self.progress_callback = progress_callback
         self.timeout = timeout
         self.start_time = time.time()
+        scanner_config = getattr(scanner, "config", {})
+        single_safetensors_as_file = (
+            isinstance(scanner_config, dict)
+            and scanner_config.get(_SINGLE_SAFETENSORS_AS_FILE_CONFIG_KEY) is True
+            and _is_single_safetensors_shard_path(file_path)
+        )
         self.shard_boundary_error = _grouped_shard_boundary_error(
             file_path,
             allowed_shard_paths,
@@ -1802,7 +1806,7 @@ class AdvancedFileHandler:
         # Check for sharded model
         self.shard_info = (
             None
-            if self.shard_boundary_error is not None
+            if self.shard_boundary_error is not None or single_safetensors_as_file
             else ShardedModelDetector.detect_shards(
                 file_path,
                 allowed_paths=allowed_shard_paths,
@@ -2206,6 +2210,11 @@ def scan_advanced_large_file(
     config = getattr(scanner, "config", {})
     cache_enabled = config.get("cache_enabled", True)
     cache_dir = config.get("cache_dir")
+    single_safetensors_as_file = (
+        isinstance(config, dict)
+        and config.get(_SINGLE_SAFETENSORS_AS_FILE_CONFIG_KEY) is True
+        and _is_single_safetensors_shard_path(file_path)
+    )
 
     boundary_error = _grouped_shard_boundary_error(file_path, allowed_shard_paths, allowed_shard_targets)
     if boundary_error is not None:
@@ -2215,10 +2224,14 @@ def scan_advanced_large_file(
         logger.debug(f"Bypassing advanced-file cache for bounded SafeTensors header failure: {file_path}")
         return scanner.scan(file_path)  # type: ignore[no-any-return]
 
-    shard_info = ShardedModelDetector.detect_shards(
-        file_path,
-        allowed_paths=allowed_shard_paths,
-        allowed_targets=allowed_shard_targets,
+    shard_info = (
+        None
+        if single_safetensors_as_file
+        else ShardedModelDetector.detect_shards(
+            file_path,
+            allowed_paths=allowed_shard_paths,
+            allowed_targets=allowed_shard_targets,
+        )
     )
     if shard_info is not None and not _supports_reliable_shard_cache_identity():
         logger.debug(f"Bypassing advanced-file cache for unreliable shard identities: {file_path}")

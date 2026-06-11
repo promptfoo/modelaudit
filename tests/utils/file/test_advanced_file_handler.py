@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from modelaudit.cache.cache_manager import get_cache_manager, reset_cache_manager
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.base import BaseScanner
 from modelaudit.utils.file.handlers import (
@@ -416,22 +417,25 @@ class TestShardedModelDetector:
         self,
         tmp_path: Path,
     ) -> None:
-        """A complete one-shard SafeTensors family should validate the real header without descriptor pinning."""
+        """A complete one-shard SafeTensors family should scan as one file without descriptor pinning."""
         header = b'{"__metadata__":{"format":"pt"},"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}'
         shard = tmp_path / "model-00000-of-00001.safetensors"
         shard.write_bytes(struct.pack("<Q", len(header)) + header + b"\0")
         _write_safetensors_index(tmp_path, [shard.name])
 
-        with patch(
-            "modelaudit.utils.file.handlers._pinned_shard_scan_path",
-            side_effect=AssertionError("single SafeTensors shard should not require descriptor pinning"),
+        with (
+            patch("modelaudit.core.should_use_large_file_handler", return_value=True),
+            patch(
+                "modelaudit.utils.file.handlers._pinned_shard_scan_path",
+                side_effect=AssertionError("single SafeTensors shard should not require descriptor pinning"),
+            ),
         ):
-            result = AdvancedFileHandler(str(shard), HeaderHashShardScanner()).scan()
+            result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, scanners=["safetensors"])
 
         assert result.success is True
-        header_check = next(check for check in result.checks if check.name == "SafeTensors Header Pin")
-        assert header_check.details["header_sha256"] == hashlib.sha256(header).hexdigest()
-        assert "shard_pin_unavailable" not in result.metadata.get("scan_outcome_reasons", [])
+        assert determine_exit_code(result) == 0
+        assert "safetensors" in result.scanner_names
+        assert not any(check.details.get("scan_outcome_reason") == "shard_pin_unavailable" for check in result.checks)
 
     @pytest.mark.parametrize(
         "index_payload",

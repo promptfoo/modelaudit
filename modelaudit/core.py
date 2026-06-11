@@ -102,10 +102,12 @@ from modelaudit.utils.file.detection import (
 )
 from modelaudit.utils.file.handlers import (
     _SHARD_ALREADY_PINNED_CONFIG_KEY,
+    _SINGLE_SAFETENSORS_AS_FILE_CONFIG_KEY,
     MAX_RECORDED_MISSING_SHARD_INDICES,
     ShardedModelDetector,
     ValidatedShardTargets,
     _count_expected_shard_indices,
+    _is_complete_single_safetensors_shard_info,
     _is_single_safetensors_shard_path,
     _pinned_shard_scan_path,
     _ShardPinUnavailableError,
@@ -2386,6 +2388,7 @@ def scan_model_directory_or_file(
             shard_family_representatives: dict[_ShardFamilyKey, str] = {}
             shard_family_paths: dict[_ShardFamilyKey, set[str]] = {}
             shard_family_targets: dict[_ShardFamilyKey, ValidatedShardTargets] = {}
+            single_safetensors_as_file_paths: set[str] = set()
             complete_hf_shard_families: set[_ShardFamilyKey] = set()
             dvc_directory_output_owners: list[tuple[Path, str]] = []
             pending_dvc_output_limit_checks: list[tuple[str, DvcResolution]] = []
@@ -2625,6 +2628,12 @@ def scan_model_directory_or_file(
                                 if shard_info is None:
                                     family_paths.add(target_str)
                                 else:
+                                    if _is_complete_single_safetensors_shard_info(shard_info):
+                                        shard_family_representatives.pop(shard_family_key, None)
+                                        shard_family_paths.pop(shard_family_key, None)
+                                        single_safetensors_as_file_paths.add(target_str)
+                                        files_to_scan.append(target_str)
+                                        continue
                                     validated_targets: ValidatedShardTargets = {}
                                     detected_targets = shard_info.get("shard_targets")
                                     expected_total_shards = shard_info.get("expected_total_shards")
@@ -2883,7 +2892,10 @@ def scan_model_directory_or_file(
                         file_scan_started_at = _start_phase_timing(phase_timings)
                         try:
                             file_config = config
-                            if shard_family_key is not None:
+                            if representative_file in single_safetensors_as_file_paths:
+                                file_config = dict(config)
+                                file_config[_SINGLE_SAFETENSORS_AS_FILE_CONFIG_KEY] = True
+                            elif shard_family_key is not None:
                                 file_config = dict(config)
                                 file_config[_SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY] = (
                                     _build_shard_family_cache_fingerprint(
@@ -4489,6 +4501,7 @@ def scan_model_streaming(
     nearby_license_cache: dict[str, list[str]] = {}
     pending_delete_failures: dict[Path, Exception] = {}
     validated_shard_targets: ValidatedShardTargets = {}
+    single_safetensors_family_targets: ValidatedShardTargets = {}
     preserve_shard_reconciliation_errors = False
 
     def delete_streamed_source(source_path: Path, context: str) -> None:
@@ -4612,12 +4625,19 @@ def scan_model_streaming(
                     "timeout": timeout - int(time.time() - start_time),
                     **scan_kwargs,
                 }
-                initial_shard_target = _snapshot_validated_shard_target(
-                    str(source_path),
-                    resolved_path=str(scan_path),
-                    family_group=shard_family_group,
-                    family_group_policy="stream_staging",
-                    trusted_root_marker=_trusted_shard_family_root,
+                is_single_safetensors_stream = _is_single_safetensors_shard_path(source_path)
+                if is_single_safetensors_stream:
+                    scan_config[_SINGLE_SAFETENSORS_AS_FILE_CONFIG_KEY] = True
+                initial_shard_target = (
+                    {}
+                    if is_single_safetensors_stream
+                    else _snapshot_validated_shard_target(
+                        str(source_path),
+                        resolved_path=str(scan_path),
+                        family_group=shard_family_group,
+                        family_group_policy="stream_staging",
+                        trusted_root_marker=_trusted_shard_family_root,
+                    )
                 )
                 selected_resolved_path = str(scan_path)
                 pre_scan_shard_target: ValidatedShardTargets = {}
@@ -4626,28 +4646,25 @@ def scan_model_streaming(
                     resolved_target = initial_target.get("resolved_path")
                     if isinstance(resolved_target, str):
                         selected_resolved_path = resolved_target
-                        if _is_single_safetensors_shard_path(source_path):
-                            pre_scan_shard_target = initial_shard_target
-                        else:
-                            try:
-                                pinned_scan_context = _pinned_shard_scan_path(resolved_target, initial_target)
-                                scan_path = Path(pinned_scan_context.__enter__().path)
-                                pre_scan_shard_target = _snapshot_validated_shard_target(
-                                    str(source_path),
-                                    resolved_path=resolved_target,
-                                    family_group=shard_family_group,
-                                    family_group_policy="stream_staging",
-                                    trusted_root_marker=_trusted_shard_family_root,
-                                )
-                                scan_config[_SHARD_ALREADY_PINNED_CONFIG_KEY] = True
-                            except _ShardPinUnavailableError as error:
-                                if pinned_scan_context is not None:
-                                    pinned_scan_context = None
-                                record_shard_pin_failure(source_path, error)
-                                preserve_shard_reconciliation_errors = True
-                                aggregate_hash_complete = False
-                                files_processed += 1
-                                continue
+                        try:
+                            pinned_scan_context = _pinned_shard_scan_path(resolved_target, initial_target)
+                            scan_path = Path(pinned_scan_context.__enter__().path)
+                            pre_scan_shard_target = _snapshot_validated_shard_target(
+                                str(source_path),
+                                resolved_path=resolved_target,
+                                family_group=shard_family_group,
+                                family_group_policy="stream_staging",
+                                trusted_root_marker=_trusted_shard_family_root,
+                            )
+                            scan_config[_SHARD_ALREADY_PINNED_CONFIG_KEY] = True
+                        except _ShardPinUnavailableError as error:
+                            if pinned_scan_context is not None:
+                                pinned_scan_context = None
+                            record_shard_pin_failure(source_path, error)
+                            preserve_shard_reconciliation_errors = True
+                            aggregate_hash_complete = False
+                            files_processed += 1
+                            continue
 
                 file_hash: str | None = None
                 defer_hash_for_max_total_size = _should_defer_hash_for_max_total_size(
@@ -4733,6 +4750,16 @@ def scan_model_streaming(
                         )
                     if not operational_scan_failure and stable_while_scanning and stable_after_unpinning:
                         validated_shard_targets.update(final_shard_target)
+                    if is_single_safetensors_stream and not operational_scan_failure:
+                        single_safetensors_family_targets.update(
+                            _snapshot_validated_shard_target(
+                                str(source_path),
+                                resolved_path=selected_resolved_path,
+                                family_group=shard_family_group,
+                                family_group_policy="stream_staging",
+                                trusted_root_marker=_trusted_shard_family_root,
+                            )
+                        )
 
                     if file_hash is not None:
                         existing_hashes = metadata_dict.get("file_hashes")
@@ -4796,6 +4823,10 @@ def scan_model_streaming(
                 # Delete file after scanning if requested
                 delete_streamed_source(source_path, "after scanning")
 
+        _record_unexpected_validated_shard_families(
+            results,
+            _unexpected_validated_shard_families(single_safetensors_family_targets),
+        )
         _reconcile_cross_directory_shard_coverage(
             results,
             validated_shard_targets,

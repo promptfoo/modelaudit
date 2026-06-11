@@ -2455,6 +2455,58 @@ class TestModelDownloadStreaming:
 
         mock_hf_hub_download.assert_not_called()
 
+    def test_download_model_streaming_selected_json_does_not_expand_safetensors_index(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A non-SafeTensors scanner selection may scan an index JSON without downloading its shards."""
+        repo_files = [
+            "model.safetensors.index.json",
+            "model-00000-of-00001.safetensors",
+            "model.ubj",
+        ]
+        sizes = {
+            "model.safetensors.index.json": 40,
+            "model-00000-of-00001.safetensors": 10_000,
+            "model.ubj": 40,
+        }
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / filename
+            path.write_bytes(b"x" * sizes[filename])
+            return str(path)
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None),
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                return_value=(sizes, _HF_TEST_REVISION),
+            ) as mock_get_sizes,
+            patch("requests.get") as mock_requests_get,
+            patch("huggingface_hub.hf_hub_download", side_effect=download_side_effect) as mock_hf_hub_download,
+        ):
+            results = list(
+                download_model_streaming(
+                    "https://huggingface.co/test/model",
+                    scannable_extensions={".json", ".ubj"},
+                    scannable_scanner_ids={"xgboost"},
+                    max_size=100,
+                )
+            )
+
+        assert [path.name for path, _is_last in results] == ["model.safetensors.index.json", "model.ubj"]
+        assert [is_last for _path, is_last in results] == [False, True]
+        assert mock_get_sizes.call_args.args[1] == ["model.safetensors.index.json", "model.ubj"]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "model.safetensors.index.json",
+            "model.ubj",
+        ]
+        mock_requests_get.assert_not_called()
+
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",

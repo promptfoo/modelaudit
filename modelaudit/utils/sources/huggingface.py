@@ -814,6 +814,8 @@ def _validate_remote_safetensors_indexes(
     revision: str,
     model_files: list[str],
     probe_budget: _HuggingFaceProbeBudget,
+    *,
+    allow_index_expansion: bool = True,
 ) -> list[str]:
     """Validate indexed SafeTensors shard inventories against immutable repo listings."""
     from modelaudit.utils.file.handlers import (
@@ -826,6 +828,8 @@ def _validate_remote_safetensors_indexes(
     repo_file_set = set(repo_files)
     selected_files = set(model_files)
     updated_model_files = list(model_files)
+    if not allow_index_expansion:
+        return updated_model_files
     for index_file in repo_files:
         if PurePosixPath(index_file).name != SAFETENSORS_INDEX_NAME:
             continue
@@ -1248,7 +1252,17 @@ def _select_streamable_hf_files(
             remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
             deadline=deadline,
         )
-    model_files = _validate_remote_safetensors_indexes(repo_id, repo_files, revision, model_files, probe_budget)
+    allow_safetensors_index_expansion = scannable_scanner_ids is None or "safetensors" in {
+        str(scanner_id).lower() for scanner_id in scannable_scanner_ids
+    }
+    model_files = _validate_remote_safetensors_indexes(
+        repo_id,
+        repo_files,
+        revision,
+        model_files,
+        probe_budget,
+        allow_index_expansion=allow_safetensors_index_expansion,
+    )
     return model_files
 
 

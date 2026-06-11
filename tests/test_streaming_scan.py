@@ -22,6 +22,8 @@ from modelaudit.core import (
     _complete_validated_shard_family_sources,
     _reconcile_cross_directory_shard_coverage,
     _snapshot_validated_shard_target,
+    detect_file_format,
+    detect_file_format_from_magic,
     determine_exit_code,
     scan_file,
     scan_model_directory_or_file,
@@ -657,24 +659,22 @@ def test_scan_model_streaming_selected_safetensors_reconciles_pickle_inconclusiv
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Explicit SafeTensors streaming should not keep stale shard gaps from an excluded pickle probe."""
-    import modelaudit.core as core_module
-
     header = b'{"__metadata__":{"format":"pt"}}'
-    original_detect_file_format = core_module.detect_file_format
-    original_detect_file_format_from_magic = core_module.detect_file_format_from_magic
+    original_detect_file_format = detect_file_format
+    original_detect_file_format_from_magic = detect_file_format_from_magic
 
-    def detect_file_format(path: str) -> str:
+    def fake_detect_file_format(path: str) -> str:
         if path.endswith("model-00002-of-00002.safetensors"):
             return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
         return original_detect_file_format(path)
 
-    def detect_file_format_from_magic(path: str) -> str:
+    def fake_detect_file_format_from_magic(path: str) -> str:
         if path.endswith("model-00002-of-00002.safetensors"):
             return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
         return original_detect_file_format_from_magic(path)
 
-    monkeypatch.setattr(core_module, "detect_file_format", detect_file_format)
-    monkeypatch.setattr(core_module, "detect_file_format_from_magic", detect_file_format_from_magic)
+    monkeypatch.setattr("modelaudit.core.detect_file_format", fake_detect_file_format)
+    monkeypatch.setattr("modelaudit.core.detect_file_format_from_magic", fake_detect_file_format_from_magic)
 
     with ExitStack() as stack:
         shards: list[Path] = []
