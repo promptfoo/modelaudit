@@ -2828,7 +2828,7 @@ def _resolve_scan_source_for_path(
                     ),
                     timeout=runtime.timeout,
                     delete_after_scan=True,
-                    scan_root=str(stream_hf_cache_root) if runtime.cache_enabled else None,
+                    scan_root=str(stream_hf_cache_root),
                     blacklist_patterns=list(blacklist) if blacklist else None,
                     max_file_size=runtime.max_file_size,
                     max_total_size=runtime.max_total_size,

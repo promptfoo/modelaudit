@@ -40,6 +40,10 @@ from modelaudit.cli import (
 )
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
+from modelaudit.utils.repository_context import (
+    REPOSITORY_FILE_INVENTORY_CONFIG_KEY,
+    REPOSITORY_SCAN_ROOT_CONFIG_KEY,
+)
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.cli_output import parse_click_json_output
 from tests.helpers import create_mock_pytorch_zip
@@ -4240,6 +4244,48 @@ def test_scan_huggingface_strict_streaming_uses_ephemeral_cache_dir(
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
+@patch("shutil.rmtree")
+def test_scan_huggingface_no_cache_streaming_preserves_repository_scan_root(
+    mock_rmtree: MagicMock,
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """No-cache streaming still needs repository-relative paths for nested artifacts."""
+    mock_is_hf_url.return_value = True
+
+    streamed_file = tmp_path / "sub" / "pytorch_model.bin"
+    streamed_file.parent.mkdir()
+    streamed_file.write_bytes(b"weights")
+
+    def file_generator() -> Iterator[tuple[Path, bool]]:
+        yield (streamed_file, True)
+
+    mock_download_streaming.return_value = file_generator()
+    mock_scan_streaming.return_value = create_mock_scan_result(files_scanned=1, issues=[])
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", "--stream", "--no-cache", "--quiet", "hf://test/model"])
+
+    assert result.exit_code == 0
+    cache_dir = mock_download_streaming.call_args.kwargs["cache_dir"]
+    assert isinstance(cache_dir, Path)
+    assert cache_dir.name.startswith("modelaudit_hf_")
+
+    scan_kwargs = mock_scan_streaming.call_args.kwargs
+    assert scan_kwargs["scan_root"] == str(cache_dir / "huggingface")
+    assert scan_kwargs[REPOSITORY_SCAN_ROOT_CONFIG_KEY] == str(cache_dir / "huggingface" / "test" / "model")
+    assert (
+        scan_kwargs[REPOSITORY_FILE_INVENTORY_CONFIG_KEY]
+        is mock_download_streaming.call_args.kwargs["repository_file_inventory"]
+    )
+    mock_rmtree.assert_called()
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
 def test_scan_huggingface_streaming_sbom_includes_streamed_assets(
     mock_scan_streaming, mock_download_streaming, mock_is_hf_url, tmp_path
 ):
@@ -4460,7 +4506,14 @@ def test_scan_huggingface_streaming_routes_unknown_suffix_by_content(
 ) -> None:
     """Bounded unknown-suffix files should preserve benign and malicious content routing."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.unknown", malicious=malicious)
-    mock_hf_hub_download.return_value = str(model_path)
+
+    def fake_hf_hub_download(**download_kwargs: Any) -> str:
+        local_path = Path(download_kwargs["local_dir"]) / str(download_kwargs["filename"])
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(model_path.read_bytes())
+        return str(local_path)
+
+    mock_hf_hub_download.side_effect = fake_hf_hub_download
     mock_run_download.side_effect = lambda _operation, download_kwargs, _deadline, _repo_id, *, direct_download: str(
         direct_download(**download_kwargs)
     )
