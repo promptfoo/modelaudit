@@ -1308,6 +1308,154 @@ def test_pickle_report_to_scan_result_keeps_trusted_bin_padding_tails_as_inconcl
     )
 
 
+def _legacy_pytorch_tail_import_references() -> list[dict[str, object]]:
+    return [
+        {
+            "import_reference": "collections.OrderedDict",
+            "module": "collections",
+            "name": "OrderedDict",
+            "opcode": "GLOBAL",
+            "position": 139,
+            "is_dangerous": False,
+        },
+        {
+            "import_reference": "torch._utils._rebuild_tensor_v2",
+            "module": "torch._utils",
+            "name": "_rebuild_tensor_v2",
+            "opcode": "GLOBAL",
+            "position": 200,
+            "is_dangerous": False,
+        },
+        {
+            "import_reference": "torch.FloatStorage",
+            "module": "torch",
+            "name": "FloatStorage",
+            "opcode": "GLOBAL",
+            "position": 251,
+            "is_dangerous": False,
+        },
+    ]
+
+
+def _pytorch_storage_persistent_id_finding() -> Finding:
+    return Finding(
+        message="Found pickle persistent ID opcode: BINPERSID",
+        severity=Severity.WARNING,
+        location="pytorch_model.bin (pos 316)",
+        rule_code="PERSISTENT_ID",
+        details={
+            "opcode": "BINPERSID",
+            "pytorch_storage_persistent_id": True,
+        },
+    )
+
+
+def test_pickle_report_to_scan_result_trusts_legacy_pytorch_storage_tail() -> None:
+    report = PickleReport(
+        source="pytorch_model.bin",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(_pytorch_storage_persistent_id_finding(),),
+        notices=(
+            Notice(
+                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
+                severity=Severity.INFO,
+                location="pytorch_model.bin (pos 16932)",
+                code="parse_incomplete",
+                details={
+                    "exception": "at position 16932, opcode b'\\x00' unknown",
+                    "exception_type": "ValueError",
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+        metadata={
+            "first_pickle_end_pos": 15,
+            "import_references": _legacy_pytorch_tail_import_references(),
+        },
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.metadata["trusted_incomplete_tail"] is True
+    assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
+    assert any(
+        issue.severity == IssueSeverity.INFO
+        and issue.rule_code == "S902"
+        and issue.message == "Pickle parsing stopped before the stream was fully consumed: ValueError"
+        for issue in result.issues
+    )
+
+
+def test_pickle_report_to_scan_result_escalates_parse_failure_for_dangerous_legacy_pytorch_global() -> None:
+    report = PickleReport(
+        source="pytorch_model.bin",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            _pytorch_storage_persistent_id_finding(),
+            Finding(
+                message="Found dangerous global: posix.system",
+                severity=Severity.CRITICAL,
+                location="pytorch_model.bin (pos 400)",
+                rule_code="DANGEROUS_GLOBAL",
+                details={"module": "posix", "name": "system"},
+            ),
+        ),
+        notices=(
+            Notice(
+                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
+                severity=Severity.INFO,
+                location="pytorch_model.bin (pos 16932)",
+                code="parse_incomplete",
+                details={
+                    "exception": "at position 16932, opcode b'\\x00' unknown",
+                    "exception_type": "ValueError",
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+        metadata={
+            "first_pickle_end_pos": 15,
+            "import_references": _legacy_pytorch_tail_import_references(),
+        },
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
+
+
+def test_pickle_report_to_scan_result_escalates_truncated_legacy_pytorch_pickle() -> None:
+    report = PickleReport(
+        source="pytorch_model.bin",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        findings=(_pytorch_storage_persistent_id_finding(),),
+        notices=(
+            Notice(
+                message="Pickle parsing stopped before the stream was fully consumed: EOFError",
+                severity=Severity.INFO,
+                location="pytorch_model.bin (pos 16932)",
+                code="parse_incomplete",
+                details={
+                    "exception": "pickle exhausted before seeing STOP",
+                    "exception_type": "EOFError",
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+        metadata={
+            "first_pickle_end_pos": 15,
+            "import_references": _legacy_pytorch_tail_import_references(),
+        },
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
+
+
 def test_pickle_report_to_scan_result_keeps_unicode_decode_tails_as_inconclusive_notices() -> None:
     report = PickleReport(
         source="benign-tail.pkl",

@@ -70,6 +70,13 @@ _BENIGN_SERIALIZATION_TAIL_MODULE_PREFIXES = frozenset(
         "sklearn",
     }
 )
+_LEGACY_PYTORCH_TAIL_MODULE_PREFIXES = frozenset(
+    {
+        "collections",
+        "numpy",
+        "torch",
+    }
+)
 
 
 def _notice_marks_incomplete_coverage(notice: Notice) -> bool:
@@ -416,12 +423,14 @@ def _to_issue_severity(severity: Severity) -> IssueSeverity:
 def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
     """Keep known benign malformed tails as INFO notices while preserving fail-closed truncation."""
     source_ext = _pickle_source_extension(report.source)
-    if report.has_security_findings:
-        return False
 
     first_pickle_end_pos = report.metadata.get("first_pickle_end_pos")
     has_trusted_pickle_boundary = isinstance(first_pickle_end_pos, int) and first_pickle_end_pos >= 0
     if not has_trusted_pickle_boundary:
+        return False
+
+    legacy_pytorch_storage_tail = _is_legacy_pytorch_storage_tail(report)
+    if report.has_security_findings and not legacy_pytorch_storage_tail:
         return False
 
     for notice in report.notices:
@@ -439,6 +448,13 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
 
         if exception_type not in {"ParseError", "ValueError"}:
             continue
+
+        if (
+            legacy_pytorch_storage_tail
+            and source_ext in {".bin", ".pt", ".pth", ".pkl", ".pickle"}
+            and _is_unknown_opcode_tail_parse_error(exception_message)
+        ):
+            return True
 
         if (
             source_ext in {".bin", ".pkl", ".pickle", ".joblib", ".dill"}
@@ -469,6 +485,54 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
 def _is_zero_padding_tail_parse_error(exception_message: str) -> bool:
     """Return True when parsing only failed because the trusted tail is zero padding."""
     return "opcode b'\\x00' unknown" in exception_message or 'opcode b"\\x00" unknown' in exception_message
+
+
+def _is_unknown_opcode_tail_parse_error(exception_message: str) -> bool:
+    """Return True when parsing failed on a non-opcode byte (the start of a raw tensor-storage tail)."""
+    return ("opcode b'" in exception_message or 'opcode b"' in exception_message) and exception_message.endswith(
+        " unknown"
+    )
+
+
+def _is_legacy_pytorch_storage_tail(report: PickleReport) -> bool:
+    """Recognize the legacy (non-zip) PyTorch layout: state_dict pickle(s) followed by raw tensor storage bytes.
+
+    Legacy ``torch.save`` writes the model's pickle metadata and then appends the raw storage bytes of every
+    tensor referenced via ``persistent_id``. Opcode parsing stops at the first storage byte (an arbitrary value
+    that is not a valid opcode), which is benign rather than a malformed or truncated pickle.
+    """
+    if not report.findings:
+        return False
+    if not all(_is_pytorch_storage_persistent_id_finding(finding) for finding in report.findings):
+        return False
+    return _has_only_legacy_pytorch_tail_imports(report)
+
+
+def _is_pytorch_storage_persistent_id_finding(finding: Finding) -> bool:
+    """Return True when the finding is PyTorch's own externalized tensor-storage persistent_id."""
+    return bool(finding.details.get("pytorch_storage_persistent_id"))
+
+
+def _has_only_legacy_pytorch_tail_imports(report: PickleReport) -> bool:
+    """Return True when every import resolves to the canonical legacy torch state_dict module set."""
+    import_references = report.metadata.get("import_references")
+    if not _is_reference_sequence(import_references) or not import_references:
+        return False
+
+    saw_torch = False
+    for reference in import_references:
+        if not isinstance(reference, Mapping) or bool(reference.get("is_dangerous")):
+            return False
+        module = reference.get("module")
+        if not isinstance(module, str):
+            return False
+        top_level = module.split(".", 1)[0]
+        if top_level not in _LEGACY_PYTORCH_TAIL_MODULE_PREFIXES:
+            return False
+        if top_level == "torch":
+            saw_torch = True
+
+    return saw_torch
 
 
 def _pickle_source_extension(source: str) -> str:
