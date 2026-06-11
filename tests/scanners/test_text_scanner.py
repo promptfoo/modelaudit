@@ -1258,6 +1258,68 @@ def test_text_scanner_pinned_model_card_reference_urls_executable_context_remain
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_pinned_qwen2_vl_readme_requests_example_is_informational(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        (
+            "<!-- Qwen/Qwen2-VL-2B-Instruct@895c3a49bc3fa70a340399125c650a463535e71c -->\n"
+            "```python\n"
+            "from PIL import Image\n"
+            "import requests\n\n"
+            'url = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"\n'
+            "image = Image.open(requests.get(url, stream=True).raw)\n"
+            "```\n\n"
+            "```bibtex\n"
+            "@article{Qwen-VL,\n"
+            "  journal={arXiv preprint arXiv:2308.12966},\n"
+            "  year={2023}\n"
+            "}\n"
+            "```\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    informational_types = {
+        check.details.get("type")
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.severity == IssueSeverity.INFO
+    }
+    assert {"network_function", "network_library", "suspicious_port", "url_detected"} <= informational_types
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_pinned_qwen2_vl_requests_example_executable_text_remains_actionable(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        (
+            "import requests\n\n"
+            'url = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg"\n'
+            "requests.get(url, stream=True)\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 @pytest.mark.parametrize(
     ("content", "command_type"),
     [
