@@ -6,12 +6,18 @@ Detects API keys, passwords, tokens, and other sensitive data embedded in model 
 Part of ModelAudit's critical security validation suite.
 """
 
+import base64
+import binascii
 import logging
 import math
 import re
 from typing import Any
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+BASIC_AUTH_SECRET_TYPE = "Basic Auth Credentials"
+BASIC_AUTH_TOKEN_MAX_LENGTH = 8192
+BASIC_AUTH_CONFIDENCE = 0.8
 
 # High-priority secret patterns with descriptions
 SECRET_PATTERNS: list[tuple[str, str]] = [
@@ -49,7 +55,10 @@ SECRET_PATTERNS: list[tuple[str, str]] = [
     # Tokens and Secrets
     (r"eyJ[A-Za-z0-9-_=]+\.eyJ[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*", "JWT Token"),
     (r"Bearer\s+[a-zA-Z0-9\-._~+/]+=*", "Bearer Token"),
-    (r"Basic\s+[a-zA-Z0-9]+=*", "Basic Auth Credentials"),
+    (
+        rf"\bBasic\s+([A-Za-z0-9+/]{{2,{BASIC_AUTH_TOKEN_MAX_LENGTH}}}={{0,2}})(?![A-Za-z0-9+/=])",
+        BASIC_AUTH_SECRET_TYPE,
+    ),
     (r"[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}", "UUID (potential secret)"),
     # Passwords and Auth
     (r"password\s*[:=]\s*['\"]?([^'\"\s]{8,})['\"]?", "Hardcoded Password"),
@@ -341,6 +350,20 @@ BINARY_FALSE_POSITIVE_TYPES = frozenset(
 )
 FLOAT_LIKE_PATTERN = re.compile(r"[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?")
 REDACTED_CONTEXT_SECRET = "<redacted-secret>"
+BASIC_AUTH_HEADER_PREFIX_PATTERN = re.compile(
+    r"(?:^|[^\w-])(?:proxy-authorization|authorization)\s*[\"']?\s*[:=]\s*[\"']?\s*$",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADER_NAMES = frozenset({"authorization", "proxyauthorization"})
+BASIC_AUTH_VALUE_PREFIX_PATTERN = re.compile(r"^\s*Basic\s+", re.IGNORECASE)
+
+
+def _normalize_basic_auth_header_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.casefold())
+
+
+def _is_basic_auth_header_name(value: str) -> bool:
+    return _normalize_basic_auth_header_name(value) in BASIC_AUTH_HEADER_NAMES
 
 
 class SecretsDetector:
@@ -546,6 +569,69 @@ class SecretsDetector:
             redacted = pattern.sub(REDACTED_CONTEXT_SECRET, redacted)
         return redacted
 
+    @staticmethod
+    def _basic_auth_match_has_header_context(text: str, position: int) -> bool:
+        line_start = max(text.rfind("\n", 0, position), text.rfind("\r", 0, position)) + 1
+        return BASIC_AUTH_HEADER_PREFIX_PATTERN.search(text[line_start:position]) is not None
+
+    @staticmethod
+    def _basic_auth_token_decodes_to_credentials(token: str) -> bool:
+        if not token or len(token) > BASIC_AUTH_TOKEN_MAX_LENGTH or len(token) % 4 == 1:
+            return False
+        padding_start = token.find("=")
+        if padding_start != -1 and any(character != "=" for character in token[padding_start:]):
+            return False
+
+        padded_token = token + ("=" * ((4 - len(token) % 4) % 4))
+        try:
+            decoded = base64.b64decode(padded_token.encode("ascii"), validate=True)
+        except (binascii.Error, UnicodeEncodeError, ValueError):
+            return False
+
+        username, separator, password = decoded.partition(b":")
+        return bool(separator and username and password)
+
+    def _basic_auth_match_is_valid(self, text: str, match: re.Match[str], token: str) -> bool:
+        return self._basic_auth_match_has_header_context(
+            text,
+            match.start(),
+        ) and self._basic_auth_token_decodes_to_credentials(token)
+
+    def _record_basic_auth_finding(
+        self,
+        findings: list[dict[str, Any]],
+        token: str,
+        pattern: re.Pattern[str],
+        position: int,
+        context: str,
+        safe_context: str,
+    ) -> bool:
+        if self._is_whitelisted(token):
+            return True
+
+        confidence = max(
+            self._calculate_confidence(token, BASIC_AUTH_SECRET_TYPE, context),
+            BASIC_AUTH_CONFIDENCE,
+        )
+        severity = "CRITICAL" if confidence >= 0.8 else "WARNING"
+
+        return self._record_finding(
+            findings,
+            {
+                "type": "embedded_secret",
+                "severity": severity,
+                "secret_type": BASIC_AUTH_SECRET_TYPE,
+                "position": position,
+                "length": len(token),
+                "confidence": round(confidence, 2),
+                "pattern": pattern.pattern[:50] + "..." if len(pattern.pattern) > 50 else pattern.pattern,
+                "redacted_value": "Basic <redacted>",
+                "message": f"{BASIC_AUTH_SECRET_TYPE} detected (confidence: {confidence:.0%})",
+                "context": f"{safe_context} pos:{position}" if safe_context else f"pos:{position}",
+                "recommendation": f"Remove {BASIC_AUTH_SECRET_TYPE} from model data immediately",
+            },
+        )
+
     def scan_bytes(self, data: bytes, context: str = "") -> list[dict[str, Any]]:
         """Scan binary data for embedded secrets.
 
@@ -701,6 +787,21 @@ class SecretsDetector:
         for pattern, description in self._compiled_patterns:
             matches = pattern.finditer(text)
             for match in matches:
+                if description == BASIC_AUTH_SECRET_TYPE:
+                    token = match.group(1)
+                    if not self._basic_auth_match_is_valid(text, match, token):
+                        continue
+                    if not self._record_basic_auth_finding(
+                        findings,
+                        token,
+                        pattern,
+                        match.start(1),
+                        context,
+                        safe_context,
+                    ):
+                        return findings
+                    continue
+
                 # Use capture group if available (for patterns like key=VALUE)
                 # This extracts just the secret value, not the key name
                 if match.groups():
@@ -790,7 +891,10 @@ class SecretsDetector:
 
             # Check the value
             if isinstance(value, str):
-                findings.extend(self.scan_text(value, key_context, is_binary_source=False))
+                if _is_basic_auth_header_name(str(key)) and BASIC_AUTH_VALUE_PREFIX_PATTERN.match(value):
+                    findings.extend(self.scan_text(f"{key}: {value}", key_context, is_binary_source=False))
+                else:
+                    findings.extend(self.scan_text(value, key_context, is_binary_source=False))
             elif isinstance(value, bytes):
                 findings.extend(self.scan_bytes(value, key_context))
             elif isinstance(value, dict):

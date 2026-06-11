@@ -1,12 +1,21 @@
 """Tests for embedded secrets detection in ML models."""
 
+import base64
 import json
 import pickle
 
 import pytest
 
-from modelaudit.detectors.secrets import SecretsDetector, detect_secrets_in_file
+from modelaudit.detectors.secrets import BASIC_AUTH_TOKEN_MAX_LENGTH, SecretsDetector, detect_secrets_in_file
 from modelaudit.scanners.pickle_scanner import PickleScanner
+
+
+def _basic_auth_token(credentials: bytes) -> str:
+    return base64.b64encode(credentials).decode("ascii")
+
+
+def _basic_auth_findings(findings: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [finding for finding in findings if finding.get("secret_type") == "Basic Auth Credentials"]
 
 
 class TestSecretsDetector:
@@ -101,6 +110,118 @@ class TestSecretsDetector:
         findings = detector.scan_text(text)
 
         assert any(finding["secret_type"] == "JWT Token" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "context",
+        [
+            "audio_tokenizer/README.md",
+            "tokenizer_config.json",
+            "auth/README.md",
+            "credential_notes.txt",
+        ],
+    )
+    def test_basic_auth_ignores_prose_without_suppressing_other_secrets(self, context: str) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_text(
+            "Provide the basic links for the model\naws_access_key_id=AKIAABCDEFGHIJKLMNOP\n",
+            context=context,
+        )
+
+        assert _basic_auth_findings(findings) == []
+        assert any(finding["secret_type"] == "AWS Access Key ID" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Basic links are available for this model.",
+            "Basic authentication is documented here.",
+            "The basic links section lists model files.",
+            "Authorization notes mention Basic links without a header value.",
+        ],
+    )
+    def test_basic_auth_ignores_benign_prose_controls(self, text: str) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_text(text, context="audio_tokenizer/README.md")
+
+        assert _basic_auth_findings(findings) == []
+
+    @pytest.mark.parametrize(
+        ("text", "token"),
+        [
+            ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("Proxy-Authorization:\tBasic\tQWxhZGRpbjpvcGVuIHNlc2FtZQ==", "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="),
+            ("aUtHoRiZaTiOn: bAsIc dTpw", "dTpw"),
+            ("GET / HTTP/1.1\r\nHost: example.test\r\nAuthorization: Basic YTo/Pz8/\r\n", "YTo/Pz8/"),
+            ('{"Authorization": "Basic YTp+fn5+"}', "YTp+fn5+"),
+        ],
+    )
+    def test_basic_auth_valid_headers_are_detected(self, text: str, token: str) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_text(text, context="headers.txt")
+        basic_findings = _basic_auth_findings(findings)
+
+        assert basic_findings
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        serialized = json.dumps(basic_findings, sort_keys=True)
+        assert token not in serialized
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Basic dXNlcjpwYXNz",
+            "Authorization Basic dXNlcjpwYXNz",
+            "Authorization: Basic not_base64",
+            "Authorization: Basic bGlua3M=",
+            "Authorization: Basic dXNlci1wYXNz",
+            "Authorization: Basic dXNlcjpwYXNz====",
+            "Authorization: Basic AAAAA",
+            "Authorization: Basic dXNl cjpwYXNz",
+            "Proxy-Authorization: Basic Og==",
+            "X-Authorization: Basic dXNlcjpwYXNz",
+            f"Authorization: Basic {'A' * (BASIC_AUTH_TOKEN_MAX_LENGTH + 1)}",
+        ],
+    )
+    def test_basic_auth_malformed_or_unbounded_values_are_ignored(self, text: str) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_text(text, context="headers.txt")
+
+        assert _basic_auth_findings(findings) == []
+
+    def test_basic_auth_structured_header_values_are_detected(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"structured:s3cr3t")
+
+        findings = detector.scan_dict({"headers": {"Authorization": f"Basic {token}"}})
+
+        assert _basic_auth_findings(findings)
+
+    def test_basic_auth_valid_token_without_header_key_is_ignored_in_structured_data(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"structured:s3cr3t")
+
+        findings = detector.scan_dict({"audio_tokenizer": f"Basic {token}"})
+
+        assert _basic_auth_findings(findings) == []
+
+    def test_basic_auth_binary_polyglot_header_is_detected(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"polyglot:p@ssw0rd")
+
+        findings = detector.scan_bytes(b"\x89PNG\r\nAuthorization: Basic " + token.encode("ascii") + b"\r\n\x00")
+
+        assert _basic_auth_findings(findings)
+
+    def test_basic_auth_binary_bare_token_is_ignored(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"polyglot:p@ssw0rd")
+
+        findings = detector.scan_bytes(b"\x89PNG\r\nBasic " + token.encode("ascii") + b"\r\n\x00")
+
+        assert _basic_auth_findings(findings) == []
 
     def test_detect_database_connections(self):
         """Test detection of database connection strings."""

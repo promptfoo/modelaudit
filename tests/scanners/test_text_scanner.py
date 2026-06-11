@@ -91,6 +91,71 @@ def test_text_scanner_routes_localized_documentation_through_security_detectors(
     )
 
 
+def test_text_scanner_tokenizer_readme_basic_links_not_basic_auth_secret(tmp_path: Path) -> None:
+    text_path = tmp_path / "audio_tokenizer" / "README.md"
+    text_path.parent.mkdir()
+    text_path.write_text("Provide the basic links for the model\n", encoding="utf-8")
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+
+    assert result.success is True
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+    assert any(
+        check.name == "Embedded Secrets Detection" and check.status == CheckStatus.PASSED for check in result.checks
+    )
+
+
+def test_text_scanner_detects_valid_authorization_basic_credentials(tmp_path: Path) -> None:
+    text_path = tmp_path / "headers.txt"
+    text_path.write_text("Authorization: Basic dXNlcjpwYXNz\n", encoding="utf-8")
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+
+    failed_secret_checks = [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+    assert failed_secret_checks
+    assert failed_secret_checks[0].rule_code == "S702"
+    assert failed_secret_checks[0].details["redacted_value"] == "Basic <redacted>"
+
+
+@pytest.mark.integration
+def test_omnivoice_pinned_audio_tokenizer_readme_basic_links_not_basic_auth_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PROMPTFOO_DISABLE_TELEMETRY", "1")
+    monkeypatch.setenv("NO_ANALYTICS", "1")
+    from modelaudit.utils.sources.huggingface import download_file_from_hf
+
+    url = (
+        "https://huggingface.co/k2-fsa/OmniVoice/resolve/"
+        "999c332499c708b116876ff5fe1aa5dd15f422ce/audio_tokenizer/README.md"
+    )
+    downloaded_path = Path(download_file_from_hf(url, cache_dir=tmp_path / "hf", max_size=1024 * 1024))
+
+    assert "Provide the basic links for the model" in downloaded_path.read_text(encoding="utf-8")
+    result = TextScanner(config={"check_network_comm": False}).scan(str(downloaded_path))
+
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+
+
 @pytest.mark.parametrize(
     "filename",
     [

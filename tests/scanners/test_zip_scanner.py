@@ -10873,6 +10873,67 @@ class TestZipScanner:
             f"Expected no noisy pickle warning for plain text, got: {[i.message for i in noisy_pickle_warnings]}"
         )
 
+    def test_scan_zip_audio_tokenizer_readme_basic_links_not_basic_auth_secret(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "model_card.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("audio_tokenizer/README.md", "Provide the basic links for the model\n")
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            from modelaudit.scanners.text_scanner import TextScanner
+
+            return TextScanner(config={"check_network_comm": False, "cache_enabled": False}).scan(path)
+
+        result = ZipScanner(
+            config={
+                NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan,
+                ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY: ["audio_tokenizer/README.md"],
+            }
+        ).scan(str(archive_path))
+
+        assert result.success is True
+        assert not [
+            check
+            for check in result.checks
+            if check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("secret_type") == "Basic Auth Credentials"
+        ]
+        assert any(
+            check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.PASSED
+            and check.details.get("zip_entry") == "audio_tokenizer/README.md"
+            for check in result.checks
+        )
+
+    def test_scan_zip_text_member_detects_valid_basic_auth_header(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "headers.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("README.md", "Proxy-Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\n")
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            from modelaudit.scanners.text_scanner import TextScanner
+
+            return TextScanner(config={"check_network_comm": False, "cache_enabled": False}).scan(path)
+
+        result = ZipScanner(
+            config={
+                NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan,
+                ZIP_CONTENT_ONLY_MEMBER_ENTRIES_CONFIG_KEY: ["README.md"],
+            }
+        ).scan(str(archive_path))
+
+        failed_secret_checks = [
+            check
+            for check in result.checks
+            if check.name == "Embedded Secrets Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("secret_type") == "Basic Auth Credentials"
+        ]
+        assert result.success is False
+        assert failed_secret_checks
+        assert failed_secret_checks[0].rule_code == "S702"
+        assert failed_secret_checks[0].details.get("zip_entry") == "README.md"
+
     def test_scan_zip_with_proto0_pickle_with_single_comment_token_bypass_regression(self, tmp_path: Path) -> None:
         """Single comment-token prefix must not suppress proto0 payload detection."""
         archive_path = tmp_path / "proto0_comment_prefixed_payload.zip"
