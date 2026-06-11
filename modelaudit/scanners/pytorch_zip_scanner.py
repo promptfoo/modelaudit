@@ -1666,6 +1666,7 @@ class PyTorchZipScanner(BaseScanner):
         """Extract PyTorch version info and check for CVE vulnerabilities"""
         pytorch_version_info = self._extract_pytorch_version_info(zip_file, safe_entries, result)
         result.metadata.update(pytorch_version_info)
+        self._add_pytorch_version_provenance_check(pytorch_version_info, result, path)
         self._check_cve_2025_32434_vulnerability(pytorch_version_info, result, path)
         self._check_cve_2026_24747_vulnerability(pytorch_version_info, result, path)
         self._check_cve_2022_45907_vulnerability(pytorch_version_info, result, path)
@@ -2859,7 +2860,8 @@ class PyTorchZipScanner(BaseScanner):
                     for j in range(i + 1, min(i + 10, len(opcodes))):
                         next_opcode, next_arg, _next_pos = opcodes[j]
                         if (
-                            next_opcode.name in ["UNICODE", "STRING", "SHORT_BINSTRING", "BINUNICODE"]
+                            next_opcode.name
+                            in ["UNICODE", "STRING", "SHORT_BINSTRING", "SHORT_BINUNICODE", "BINUNICODE"]
                             and next_arg
                             and isinstance(next_arg, str)
                             and self._looks_like_version(next_arg)
@@ -2869,7 +2871,7 @@ class PyTorchZipScanner(BaseScanner):
             # Look for any version-like strings in the pickle
             for opcode, arg, _pos in opcodes:
                 if (
-                    opcode.name in ["UNICODE", "STRING", "SHORT_BINSTRING", "BINUNICODE"]
+                    opcode.name in ["UNICODE", "STRING", "SHORT_BINSTRING", "SHORT_BINUNICODE", "BINUNICODE"]
                     and arg
                     and isinstance(arg, str)
                     and self._looks_like_pytorch_version(arg)
@@ -2942,20 +2944,12 @@ class PyTorchZipScanner(BaseScanner):
         version_info: dict[str, Any],
         is_vulnerable: Callable[[str], bool],
     ) -> tuple[str | None, str | None]:
-        """Select the most conservative PyTorch version source for CVE gating."""
+        """Select active runtime version evidence for package/runtime CVE gating."""
+        del version_info, is_vulnerable
         installed_version = self._get_installed_pytorch_version()
-        metadata_version, metadata_source = self._get_detected_pytorch_version(
-            version_info,
-            installed_version=installed_version,
-        )
-
-        if installed_version and is_vulnerable(installed_version):
-            return installed_version, "local_environment"
-        if metadata_version and is_vulnerable(metadata_version):
-            return metadata_version, metadata_source
         if installed_version:
             return installed_version, "local_environment"
-        return metadata_version, metadata_source
+        return None, None
 
     @staticmethod
     def _format_pytorch_version_source(version_source: str | None) -> str:
@@ -2963,6 +2957,70 @@ class PyTorchZipScanner(BaseScanner):
         if version_source == "local_environment":
             return "Local PyTorch"
         return "Artifact metadata indicates PyTorch"
+
+    def _add_pytorch_version_provenance_check(
+        self,
+        version_info: dict[str, Any],
+        result: ScanResult,
+        path: str,
+    ) -> None:
+        """Record artifact producer version metadata separately from runtime CVE evidence."""
+        producer_version = version_info.get("pytorch_framework_version")
+        producer_source = version_info.get("pytorch_version_source")
+        archive_version = version_info.get("pytorch_archive_version")
+        installed_version = self._get_installed_pytorch_version()
+
+        if not any(isinstance(value, str) and value.strip() for value in (producer_version, archive_version)):
+            return
+
+        if isinstance(producer_version, str) and producer_version.strip():
+            producer_version = producer_version.strip()
+        else:
+            producer_version = None
+        if isinstance(producer_source, str) and producer_source.strip():
+            producer_source = producer_source.strip()
+        else:
+            producer_source = None
+        if isinstance(archive_version, str) and archive_version.strip():
+            archive_version = archive_version.strip()
+        else:
+            archive_version = None
+
+        if installed_version:
+            runtime_summary = f"active scanner/runtime PyTorch is {installed_version}"
+            runtime_scope = "local_environment"
+        else:
+            runtime_summary = "active scanner/runtime PyTorch version is not known"
+            runtime_scope = None
+
+        producer_summary = (
+            f"Artifact producer metadata records PyTorch {producer_version}"
+            if producer_version
+            else "Artifact contains PyTorch archive version metadata"
+        )
+        if producer_source:
+            producer_summary = f"{producer_summary} from {producer_source}"
+
+        result.add_check(
+            name="PyTorch Version Provenance",
+            passed=True,
+            message=(
+                f"{producer_summary}; {runtime_summary}. "
+                "Producer metadata is provenance and is not used by itself for runtime CVE applicability."
+            ),
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "producer_pytorch_version": producer_version,
+                "producer_pytorch_version_source": producer_source,
+                "pytorch_archive_version": archive_version,
+                "installed_pytorch_version": installed_version,
+                "active_runtime_version": installed_version,
+                "active_runtime_version_source": runtime_scope,
+                "runtime_version_known": installed_version is not None,
+                "runtime_cve_version_gate": "local_environment_only",
+            },
+        )
 
     def _check_cve_2025_32434_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
         """Check for CVE-2025-32434 using conservative PyTorch version evidence."""

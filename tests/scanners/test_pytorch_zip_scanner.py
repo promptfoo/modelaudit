@@ -1,8 +1,11 @@
 import base64
 import json
+import os
 import pickle
 import stat
 import struct
+import subprocess
+import sys
 import time
 import warnings
 import zipfile
@@ -27,6 +30,15 @@ from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
 
 _ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
+_TASK_23_RUNTIME_CVE_IDS = frozenset(
+    {
+        "CVE-2025-32434",
+        "CVE-2026-24747",
+        "CVE-2024-5480",
+        "CVE-2024-48063",
+    }
+)
+_PYTORCH_RUNTIME_CVE_IDS = _TASK_23_RUNTIME_CVE_IDS | frozenset({"CVE-2022-45907"})
 
 
 class _NewObjExImportGadget:
@@ -204,6 +216,43 @@ def _assert_standard_cve_details(details: dict[str, object], cve_id: str, detect
     assert details["cwe"] == cve_info["cwe"]
     assert details["vulnerability_description"] == cve_info["description"]
     assert details["recommendation"] == cve_info["remediation"]
+
+
+def _failed_runtime_pytorch_version_checks(
+    result: ScanResult,
+    cve_ids: frozenset[str] = _PYTORCH_RUNTIME_CVE_IDS,
+) -> list[Check]:
+    return [
+        check
+        for check in result.checks
+        if check.status == CheckStatus.FAILED
+        and "PyTorch Version Check" in check.name
+        and (check.details or {}).get("cve_id") in cve_ids
+    ]
+
+
+def _assert_no_runtime_pytorch_cve_failures(
+    result: ScanResult,
+    cve_ids: frozenset[str] = _PYTORCH_RUNTIME_CVE_IDS,
+) -> None:
+    failed_checks = _failed_runtime_pytorch_version_checks(result, cve_ids)
+    assert not failed_checks, f"Unexpected runtime CVE version failures: {[(c.name, c.message) for c in failed_checks]}"
+
+
+def _assert_pytorch_version_provenance(
+    result: ScanResult,
+    *,
+    producer_version: str,
+    installed_version: str | None,
+) -> Check:
+    provenance = next(check for check in result.checks if check.name == "PyTorch Version Provenance")
+    assert provenance.status == CheckStatus.PASSED
+    assert provenance.severity == IssueSeverity.INFO
+    assert provenance.details["producer_pytorch_version"] == producer_version
+    assert provenance.details["installed_pytorch_version"] == installed_version
+    assert provenance.details["active_runtime_version"] == installed_version
+    assert provenance.details["runtime_cve_version_gate"] == "local_environment_only"
+    return provenance
 
 
 def test_pytorch_zip_scanner_can_handle(tmp_path):
@@ -7887,10 +7936,10 @@ def test_pytorch_zip_version_selection_prefers_local_vulnerable_version(
     assert source == "local_environment"
 
 
-def test_pytorch_zip_version_selection_prefers_metadata_when_local_is_fixed(
+def test_pytorch_zip_version_selection_uses_local_runtime_when_metadata_is_vulnerable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A fixed local runtime must not hide vulnerable artifact metadata."""
+    """Producer metadata must not override the active local runtime."""
     scanner = PyTorchZipScanner()
 
     monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.10.0")
@@ -7900,14 +7949,14 @@ def test_pytorch_zip_version_selection_prefers_metadata_when_local_is_fixed(
         scanner._is_vulnerable_pytorch_version_2026,
     )
 
-    assert detected_version == "2.9.0"
-    assert source == "metadata:config.json:pytorch_version"
+    assert detected_version == "2.10.0"
+    assert source == "local_environment"
 
 
-def test_pytorch_zip_version_selection_uses_metadata_when_torch_unavailable(
+def test_pytorch_zip_version_selection_ignores_metadata_when_torch_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Metadata fallback should still work when local torch isn't importable."""
+    """Producer metadata is provenance, not active runtime evidence."""
     scanner = PyTorchZipScanner()
     monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: None)
 
@@ -7916,8 +7965,8 @@ def test_pytorch_zip_version_selection_uses_metadata_when_torch_unavailable(
         scanner._is_vulnerable_pytorch_version,
     )
 
-    assert detected_version == "2.5.1"
-    assert source == "metadata:config.json:pytorch_version"
+    assert detected_version is None
+    assert source is None
 
 
 def test_get_installed_pytorch_version_does_not_import_torch(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -7972,37 +8021,148 @@ def _create_pytorch_zip_with_framework_version(path: Path, pytorch_version: str)
     return path
 
 
-def test_pytorch_zip_cve_2026_24747_version_check(tmp_path: Path) -> None:
-    """Model metadata with vulnerable version should trigger CVE-2026-24747."""
+def test_pytorch_zip_producer_json_version_does_not_emit_runtime_cves(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Producer metadata is provenance and not active runtime evidence."""
     model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.9.0")
     scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: None)
+
     result = scanner.scan(str(model_path))
-    cve_2026_checks = [c for c in result.checks if "CVE-2026-24747" in c.name]
-    failed_checks = [c for c in cve_2026_checks if c.status == CheckStatus.FAILED]
-    assert len(failed_checks) > 0, (
-        f"Should flag PyTorch 2.9.0 as vulnerable to CVE-2026-24747. "
-        f"Checks: {[(c.name, c.status) for c in result.checks]}"
-    )
-    assert failed_checks[0].details.get("detected_pytorch_version") == "2.9.0"
-    assert failed_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
+
+    _assert_no_runtime_pytorch_cve_failures(result, _TASK_23_RUNTIME_CVE_IDS)
+    provenance = _assert_pytorch_version_provenance(result, producer_version="2.9.0", installed_version=None)
+    assert provenance.details["producer_pytorch_version_source"] == "metadata:config.json:pytorch_version"
 
 
-def test_pytorch_zip_cve_2025_32434_metadata_not_suppressed_by_local_torch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_pytorch_zip_producer_pickle_version_does_not_emit_runtime_cves(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A fixed local torch install must not hide vulnerable artifact metadata."""
+    """Pickled producer version literals must not claim the consumer runtime is vulnerable."""
+    model_path = create_mock_pytorch_zip(
+        tmp_path / "model.pt",
+        data={"weights": [1, 2, 3], "producer": {"pytorch_version": "2.0.1"}},
+        prefix="archive",
+    )
+    scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: None)
+
+    result = scanner.scan(str(model_path))
+
+    _assert_no_runtime_pytorch_cve_failures(result, _TASK_23_RUNTIME_CVE_IDS)
+    provenance = _assert_pytorch_version_provenance(result, producer_version="2.0.1", installed_version=None)
+    assert provenance.details["producer_pytorch_version_source"] == "pickle:archive/data.pkl"
+
+
+def test_pytorch_zip_fixed_local_runtime_with_old_producer_metadata_stays_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fixed active runtime should not inherit CVEs from old producer metadata."""
     model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.5.1")
     scanner = PyTorchZipScanner()
-    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.6.0")
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.10.0")
 
     result = scanner.scan(str(model_path))
 
-    failed_checks = [
-        c for c in result.checks if c.name == "CVE-2025-32434 PyTorch Version Check" and c.status == CheckStatus.FAILED
-    ]
-    assert len(failed_checks) > 0
-    assert failed_checks[0].details.get("detected_pytorch_version") == "2.5.1"
-    assert failed_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
+    _assert_no_runtime_pytorch_cve_failures(result, _TASK_23_RUNTIME_CVE_IDS)
+    _assert_pytorch_version_provenance(result, producer_version="2.5.1", installed_version="2.10.0")
+    assert not any(
+        (check.details or {}).get("pytorch_version_source") == "metadata:config.json:pytorch_version"
+        for check in _failed_runtime_pytorch_version_checks(result, _TASK_23_RUNTIME_CVE_IDS)
+    )
+
+
+def test_pytorch_zip_vulnerable_local_runtime_still_emits_runtime_cves(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Known vulnerable active runtime remains package/runtime vulnerability evidence."""
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
+    scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.2.2")
+
+    result = scanner.scan(str(model_path))
+
+    failed_checks = _failed_runtime_pytorch_version_checks(result, _TASK_23_RUNTIME_CVE_IDS)
+    failed_cve_ids = {(check.details or {}).get("cve_id") for check in failed_checks}
+    assert failed_cve_ids == set(_TASK_23_RUNTIME_CVE_IDS)
+    for check in failed_checks:
+        assert check.details["detected_pytorch_version"] == "2.2.2"
+        assert check.details["pytorch_version_source"] == "local_environment"
+        assert check.details["installed_pytorch_version"] == "2.2.2"
+
+
+def test_pytorch_zip_producer_metadata_does_not_suppress_malicious_pickle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removing metadata-only runtime CVEs must not create pickle false negatives."""
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt", malicious=True, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("config.json", json.dumps({"pytorch_version": "2.0.1"}))
+    scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: None)
+
+    result = scanner.scan(str(model_path))
+
+    _assert_no_runtime_pytorch_cve_failures(result, _TASK_23_RUNTIME_CVE_IDS)
+    _assert_pytorch_version_provenance(result, producer_version="2.0.1", installed_version=None)
+    assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_pinned_huggingface_pyannote_checkpoint_does_not_emit_metadata_only_runtime_cves(
+    tmp_path: Path,
+) -> None:
+    if os.environ.get("MODELAUDIT_RUN_HF_E2E") != "1":
+        pytest.skip("Set MODELAUDIT_RUN_HF_E2E=1 to download and scan the pinned Hugging Face checkpoint")
+
+    revision = "837717ddb9ff5507820346191109dc79c958d614"
+    url = f"https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM/resolve/{revision}/pytorch_model.bin"
+    output_path = tmp_path / "pinned-hf-pytorch-report.json"
+    env = os.environ.copy()
+    env["PROMPTFOO_DISABLE_TELEMETRY"] = "1"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "modelaudit.cli",
+            "scan",
+            "--format",
+            "json",
+            "--output",
+            str(output_path),
+            "--max-size",
+            "50MB",
+            "--no-cache",
+            "--scanners",
+            "pytorch_zip",
+            url,
+        ],
+        check=False,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    report: dict[str, Any] = json.loads(output_path.read_text())
+    critical_cves = {
+        issue.get("details", {}).get("cve_id") for issue in report["issues"] if issue.get("severity") == "critical"
+    }
+    assert critical_cves.isdisjoint(_TASK_23_RUNTIME_CVE_IDS)
+    pytorch_metadata = next(
+        value for key, value in report["file_metadata"].items() if key.endswith("pytorch_model.bin")
+    )
+    assert pytorch_metadata["pytorch_framework_version"] == "2.0.1"
+    assert pytorch_metadata["pytorch_version_source"] == "pickle:pytorch_model.310/data.pkl"
 
 
 def _pickle_result_with_reduce(import_reference: str | None = None) -> ScanResult:
@@ -8559,26 +8719,32 @@ def test_pytorch_zip_cve_2025_32434_dangerous_references_stay_critical(tmp_path:
     assert import_reference in check.details["import_analysis"]["found_malicious"]
 
 
-def test_pytorch_zip_cve_2026_24747_fixed_version(tmp_path: Path) -> None:
-    """Model metadata with fixed version should not trigger CVE-2026-24747."""
+def test_pytorch_zip_cve_2026_24747_fixed_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fixed producer metadata should not trigger runtime CVE-2026-24747."""
     model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.10.0")
     scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: None)
     result = scanner.scan(str(model_path))
 
-    # Fixed version: CVE-2026-24747 check should be present but not failed
-    cve_2026_checks = [c for c in result.checks if "CVE-2026-24747" in c.name]
-    assert len(cve_2026_checks) > 0, "Expected CVE-2026-24747 check to be present"
-    cve_2026_failed = [c for c in cve_2026_checks if c.status == CheckStatus.FAILED]
+    cve_2026_failed = _failed_runtime_pytorch_version_checks(result, frozenset({"CVE-2026-24747"}))
     assert len(cve_2026_failed) == 0, (
         f"PyTorch 2.10.0 should NOT trigger CVE-2026-24747. "
         f"Failed checks: {[(c.name, c.message) for c in cve_2026_failed]}"
     )
+    _assert_pytorch_version_provenance(result, producer_version="2.10.0", installed_version=None)
 
 
-def test_pytorch_zip_cve_2026_24747_prerelease_fix_version_is_vulnerable(tmp_path: Path) -> None:
-    """A prerelease of the fixed PyTorch release should still trigger CVE-2026-24747."""
-    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.10.0a0")
+def test_pytorch_zip_cve_2026_24747_local_prerelease_fix_version_is_vulnerable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local prerelease of the fixed PyTorch release should still trigger CVE-2026-24747."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.10.1")
     scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.10.0a0")
 
     result = scanner.scan(str(model_path))
 
@@ -8587,13 +8753,17 @@ def test_pytorch_zip_cve_2026_24747_prerelease_fix_version_is_vulnerable(tmp_pat
     ]
     assert len(failed_checks) > 0
     assert failed_checks[0].details.get("detected_pytorch_version") == "2.10.0a0"
-    assert failed_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
+    assert failed_checks[0].details.get("pytorch_version_source") == "local_environment"
 
 
-def test_pytorch_zip_cve_2026_24747_postfix_prerelease_is_not_vulnerable(tmp_path: Path) -> None:
+def test_pytorch_zip_cve_2026_24747_local_postfix_prerelease_is_not_vulnerable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A prerelease after the fixed PyTorch release should not become a false positive."""
     model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.10.1a1")
     scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.10.1a1")
 
     result = scanner.scan(str(model_path))
 
@@ -8660,12 +8830,16 @@ def test_pytorch_zip_tensor_metadata_validation(tmp_path: Path) -> None:
     )
 
 
-def test_pytorch_zip_tensor_metadata_mismatch_detection(tmp_path: Path) -> None:
+def test_pytorch_zip_tensor_metadata_mismatch_detection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Test that intentionally mismatched tensor metadata is detected.
 
     Creates a PyTorch ZIP where the pickle declares a tensor requiring more
     storage than the actual blob provides, which is the core CVE-2026-24747
-    metadata-mismatch exploitation vector.
+    metadata-mismatch exploitation vector. Old producer metadata must not
+    affect this artifact-structure finding.
     """
     import pickletools
     import struct
@@ -8692,16 +8866,22 @@ def test_pytorch_zip_tensor_metadata_mismatch_detection(tmp_path: Path) -> None:
         zipf.writestr("archive/data.pkl", bytes(pkl_data))
         # Blob is only 24 bytes but pickle declares 1M elements
         zipf.writestr("archive/data/0", b"\x00" * 24)
+        zipf.writestr("config.json", json.dumps({"pytorch_version": "2.0.1"}))
 
     scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: None)
     result = scanner.scan(str(zip_path))
 
     assert result is not None
+    _assert_no_runtime_pytorch_cve_failures(result, _TASK_23_RUNTIME_CVE_IDS)
+    _assert_pytorch_version_provenance(result, producer_version="2.0.1", installed_version=None)
     mismatch_checks = [c for c in result.checks if "Tensor Metadata" in c.name and c.status == CheckStatus.FAILED]
     assert len(mismatch_checks) > 0, (
         f"Should detect tensor storage size mismatch (24 bytes vs 1M declared elements). "
         f"Checks: {[(c.name, c.status, c.message) for c in result.checks]}"
     )
+    assert mismatch_checks[0].details["cve_id"] == "CVE-2026-24747"
+    assert mismatch_checks[0].details["total_mismatches"] > 0
 
 
 def test_pytorch_zip_tensor_metadata_parse_failure_fails_closed(tmp_path: Path) -> None:
@@ -8913,10 +9093,14 @@ def test_pytorch_zip_tensor_metadata_truncation_preserves_origin_warning_precede
 # --- CVE-2022-45907 version check tests ---
 
 
-def test_pytorch_zip_cve_2022_45907_version_check(tmp_path: Path) -> None:
-    """Model metadata with vulnerable version should trigger CVE-2022-45907."""
-    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "1.13.0")
+def test_pytorch_zip_cve_2022_45907_version_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vulnerable local runtime should trigger CVE-2022-45907."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.10.0")
     scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "1.13.0")
     result = scanner.scan(str(model_path))
 
     cve_checks = [c for c in result.checks if "CVE-2022-45907" in c.name]
@@ -8926,14 +9110,18 @@ def test_pytorch_zip_cve_2022_45907_version_check(tmp_path: Path) -> None:
         f"Checks: {[(c.name, c.status) for c in result.checks]}"
     )
     assert failed_checks[0].details.get("detected_pytorch_version") == "1.13.0"
-    assert failed_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
+    assert failed_checks[0].details.get("pytorch_version_source") == "local_environment"
     _assert_standard_cve_details(failed_checks[0].details, "CVE-2022-45907", "1.13.0")
 
 
-def test_pytorch_zip_cve_2022_45907_fixed_version(tmp_path: Path) -> None:
-    """Model metadata with fixed version should not trigger CVE-2022-45907."""
+def test_pytorch_zip_cve_2022_45907_fixed_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fixed producer metadata should not trigger CVE-2022-45907."""
     model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "1.13.1")
     scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: None)
     result = scanner.scan(str(model_path))
 
     cve_failed = [c for c in result.checks if "CVE-2022-45907" in c.name and c.status == CheckStatus.FAILED]
@@ -8945,10 +9133,14 @@ def test_pytorch_zip_cve_2022_45907_fixed_version(tmp_path: Path) -> None:
 # --- CVE-2024-5480 version check tests ---
 
 
-def test_pytorch_zip_cve_2024_5480_version_check(tmp_path: Path) -> None:
-    """Model metadata with vulnerable version should trigger CVE-2024-5480."""
-    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.2.2")
+def test_pytorch_zip_cve_2024_5480_version_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vulnerable local runtime should trigger CVE-2024-5480."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.10.0")
     scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.2.2")
     result = scanner.scan(str(model_path))
 
     cve_checks = [c for c in result.checks if "CVE-2024-5480" in c.name]
@@ -8958,14 +9150,18 @@ def test_pytorch_zip_cve_2024_5480_version_check(tmp_path: Path) -> None:
         f"Checks: {[(c.name, c.status) for c in result.checks]}"
     )
     assert failed_checks[0].details.get("detected_pytorch_version") == "2.2.2"
-    assert failed_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
+    assert failed_checks[0].details.get("pytorch_version_source") == "local_environment"
     _assert_standard_cve_details(failed_checks[0].details, "CVE-2024-5480", "2.2.2")
 
 
-def test_pytorch_zip_cve_2024_5480_fixed_version(tmp_path: Path) -> None:
-    """Model metadata with fixed version should not trigger CVE-2024-5480."""
+def test_pytorch_zip_cve_2024_5480_fixed_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fixed producer metadata should not trigger CVE-2024-5480."""
     model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.2.3")
     scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: None)
     result = scanner.scan(str(model_path))
 
     cve_failed = [c for c in result.checks if "CVE-2024-5480" in c.name and c.status == CheckStatus.FAILED]
@@ -8977,10 +9173,14 @@ def test_pytorch_zip_cve_2024_5480_fixed_version(tmp_path: Path) -> None:
 # --- CVE-2024-48063 version check tests ---
 
 
-def test_pytorch_zip_cve_2024_48063_version_check(tmp_path: Path) -> None:
-    """Model metadata with vulnerable version should trigger CVE-2024-48063."""
-    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.4.1")
+def test_pytorch_zip_cve_2024_48063_version_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vulnerable local runtime should trigger CVE-2024-48063."""
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.10.0")
     scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.4.1")
     result = scanner.scan(str(model_path))
 
     cve_checks = [c for c in result.checks if "CVE-2024-48063" in c.name]
@@ -8990,14 +9190,18 @@ def test_pytorch_zip_cve_2024_48063_version_check(tmp_path: Path) -> None:
         f"Checks: {[(c.name, c.status) for c in result.checks]}"
     )
     assert failed_checks[0].details.get("detected_pytorch_version") == "2.4.1"
-    assert failed_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
+    assert failed_checks[0].details.get("pytorch_version_source") == "local_environment"
     _assert_standard_cve_details(failed_checks[0].details, "CVE-2024-48063", "2.4.1")
 
 
-def test_pytorch_zip_cve_2024_48063_fixed_version(tmp_path: Path) -> None:
-    """Model metadata with fixed version should not trigger CVE-2024-48063."""
+def test_pytorch_zip_cve_2024_48063_fixed_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fixed producer metadata should not trigger CVE-2024-48063."""
     model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.5.0")
     scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: None)
     result = scanner.scan(str(model_path))
 
     cve_failed = [c for c in result.checks if "CVE-2024-48063" in c.name and c.status == CheckStatus.FAILED]
