@@ -314,6 +314,7 @@ _OPAQUE_LICENSE_TOKEN_MIN_CHARS = 128
 _OPAQUE_LICENSE_TOKEN_PATTERN = re.compile(rf"\b[A-Za-z0-9+/=_-]{{{_OPAQUE_LICENSE_TOKEN_MIN_CHARS},}}\b")
 _BASE64_LICENSE_WRAP_LINE_MIN_CHARS = 4
 _BASE64_LICENSE_WRAP_TOKEN_MIN_CHARS = 4
+_BASE64_LICENSE_WRAP_MIN_DECODE_CHARS = 24
 _BASE64_LICENSE_WRAP_MAX_LINES = 128
 _BASE64_LICENSE_WRAP_MAX_CHARS = 8192
 _BASE64_LICENSE_WRAP_MAX_DECODED_BYTES = 6144
@@ -328,13 +329,35 @@ _BASE64_LICENSE_WRAP_SEPARATOR_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _SUSPICIOUS_LICENSE_URL_MARKERS = ("payload", "exfil", "webhook", "callback")
+_BASE64_LICENSE_DECODED_ACTIVE_MARKERS = (
+    "#!",
+    "curl ",
+    "eval(",
+    "exec(",
+    "http://",
+    "https://",
+    "import ",
+    "os.system",
+    "subprocess",
+    "wget ",
+)
 _URL_PATH_NORMALIZATION_PASSES = 4
 _PERCENT_ENCODED_BYTE_PATTERN = re.compile(r"%[0-9a-fA-F]{2}")
-_ENCODED_URL_SCHEME_PATTERN = re.compile(r"https?%(?:25)*3a(?:%(?:25)*2f){2}", re.IGNORECASE)
+_ENCODED_URL_DELIMITER_PATTERN = re.compile(
+    r"https?(?P<colon>%(?:25)*3a|:)(?P<slash1>%(?:25)*2f|/)(?P<slash2>%(?:25)*2f|/)",
+    re.IGNORECASE,
+)
 
 
 def _url_path_has_unsafe_decoded_char(path: str) -> bool:
     return any(char == "\\" or ord(char) < 0x20 or ord(char) == 0x7F for char in path)
+
+
+def _value_has_encoded_url_delimiter(value: str) -> bool:
+    return any(
+        "%" in f"{match.group('colon')}{match.group('slash1')}{match.group('slash2')}"
+        for match in _ENCODED_URL_DELIMITER_PATTERN.finditer(value)
+    )
 
 
 class SafeTensorsScanner(BaseScanner):
@@ -571,7 +594,7 @@ class SafeTensorsScanner(BaseScanner):
 
     @staticmethod
     def _base64_candidate_decodes(candidate: str) -> bool:
-        if len(candidate) < _OPAQUE_LICENSE_TOKEN_MIN_CHARS:
+        if len(candidate) < _BASE64_LICENSE_WRAP_MIN_DECODE_CHARS:
             return False
         if len(candidate) > _BASE64_LICENSE_WRAP_MAX_CHARS:
             return True
@@ -590,6 +613,9 @@ class SafeTensorsScanner(BaseScanner):
             decoded = base64.b64decode(padded, validate=True)
         except binascii.Error:
             return False
+        if len(candidate) < _OPAQUE_LICENSE_TOKEN_MIN_CHARS:
+            decoded_text = decoded.decode("utf-8", errors="ignore").lower()
+            return any(marker in decoded_text for marker in _BASE64_LICENSE_DECODED_ACTIVE_MARKERS)
         return len(decoded) >= (_OPAQUE_LICENSE_TOKEN_MIN_CHARS * 3) // 4
 
     @classmethod
@@ -600,7 +626,9 @@ class SafeTensorsScanner(BaseScanner):
         separator_lines = 0
 
         def flush() -> bool:
-            return total_chars >= _OPAQUE_LICENSE_TOKEN_MIN_CHARS and cls._base64_candidate_decodes("".join(chunks))
+            return total_chars >= _BASE64_LICENSE_WRAP_MIN_DECODE_CHARS and cls._base64_candidate_decodes(
+                "".join(chunks)
+            )
 
         for line in [*lines, ""]:
             fragments = cls._license_document_line_base64_fragments(line)
@@ -743,7 +771,7 @@ class SafeTensorsScanner(BaseScanner):
 
     @classmethod
     def _license_document_urls_are_documentary(cls, value: str) -> bool:
-        if _ENCODED_URL_SCHEME_PATTERN.search(value):
+        if _value_has_encoded_url_delimiter(value):
             return False
         urls = _URL_METADATA_PATTERN.findall(value)
         return all(cls._url_looks_like_license_reference(url) for url in urls)

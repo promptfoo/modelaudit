@@ -117,6 +117,10 @@ def padded_executable_wrapped_base64_lines(chunk_size: int = 2) -> list[str]:
     ]
 
 
+def short_executable_base64_tail() -> str:
+    return base64.b64encode(b"import os\nos.system('id')\n").decode("ascii")
+
+
 def comment_separated_executable_wrapped_base64_tail() -> str:
     return "\n# continued\n".join(executable_wrapped_base64_lines())
 
@@ -490,12 +494,22 @@ def test_license_document_reconstructs_padded_wrapped_base64_tail() -> None:
     assert not SafeTensorsScanner._looks_like_ordinary_license_document(payload)
 
 
+def test_license_document_reconstructs_short_active_base64_tail() -> None:
+    license_text = ordinary_license_text_with_url()
+    payload = f"{license_text}\nLicense grant {short_executable_base64_tail()} under terms"
+
+    assert SafeTensorsScanner._looks_like_ordinary_license_document(license_text)
+    assert not SafeTensorsScanner._looks_like_ordinary_license_document(payload)
+
+
 def test_license_document_rejects_encoded_url_tail() -> None:
     license_text = ordinary_license_text_with_url()
     payload = f"{license_text}\nEncoded reference: https%3A%2F%2Fevil.example%2Fx"
+    mixed_payload = f"{license_text}\nEncoded reference: https%3A//evil.example/x"
 
     assert SafeTensorsScanner._is_ordinary_license_metadata_value("license", license_text, metadata_is_valid=True)
     assert not SafeTensorsScanner._is_ordinary_license_metadata_value("license", payload, metadata_is_valid=True)
+    assert not SafeTensorsScanner._is_ordinary_license_metadata_value("license", mixed_payload, metadata_is_valid=True)
 
 
 def test_license_url_residual_encoding_fails_closed() -> None:
@@ -590,6 +604,7 @@ def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -
         "https://github.com/Lightricks/LTX-2/%5Creleases%5Cdownload%5Cv1/license",
         "https://opensource.org/licenses/MIT,https://evil.example/x",
         "https%3A%2F%2Fevil.example%2Fx",
+        "https%3A//evil.example/x",
         "https://opensource.org/licenses/MIT?u=https://evil.example/x",
         "https://[",
     ],
@@ -791,6 +806,10 @@ def test_license_metadata_standard_wrapped_base64_tail_keeps_length_and_s905(tmp
         (
             "\n".join(f"License grant {line}" for line in padded_executable_wrapped_base64_lines()),
             "padded_prefixed",
+        ),
+        (
+            f"License grant {short_executable_base64_tail()} under terms",
+            "short_active",
         ),
         (
             "\nThis license paragraph continues under applicable law.\n".join(executable_wrapped_base64_lines((76,))),
