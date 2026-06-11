@@ -193,6 +193,10 @@ def _metadata_newobj_build_payload(module: str, name: str) -> bytes:
     return _reference_global(module, name) + b")\x81}b"
 
 
+def _metadata_memoized_newobj_build_then_reduce_payload(module: str, name: str) -> bytes:
+    return _reference_global(module, name) + b"q\x00)\x81}b0h\x00)R"
+
+
 def _hf_training_args_metadata_payload() -> bytes:
     items = [
         _metadata_newobj_build_payload("transformers.training_args", "TrainingArguments"),
@@ -6567,6 +6571,66 @@ def test_scan_file_trusts_newobj_build_without_reaching_init(tmp_path: Path) -> 
     assert output["status"] == ScanStatus.COMPLETE.value
     assert output["verdict"] == SafetyVerdict.CLEAN.value
     assert not any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.TrainingArguments"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_memoized_framework_global_is_reduced_after_reconstruction(tmp_path: Path) -> None:
+    payload_path = tmp_path / "memoized-newobj-build-reduce-training-args.pkl"
+    payload_path.write_bytes(
+        _metadata_memoized_newobj_build_then_reduce_payload("transformers.training_args", "TrainingArguments") + b"."
+    )
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_init_heavy_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "import transformers.training_args\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "report = scan_file(payload_path)\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "    'training_args_invocations': [\n"
+        "        {\n"
+        "            'opcode': invocation.get('opcode'),\n"
+        "            'global_position': invocation.get('global_position'),\n"
+        "        }\n"
+        "        for invocation in report.metadata.get('callable_invocations', [])\n"
+        "        if invocation.get('module') == 'transformers.training_args'\n"
+        "        and invocation.get('name') == 'TrainingArguments'\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    invocation_opcodes = {invocation["opcode"] for invocation in output["training_args_invocations"]}
+    invocation_positions = {invocation["global_position"] for invocation in output["training_args_invocations"]}
+    assert output["status"] == ScanStatus.COMPLETE.value
+    assert output["verdict"] == SafetyVerdict.SUSPICIOUS.value
+    assert invocation_opcodes >= {"NEWOBJ", "BUILD", "REDUCE"}
+    assert len(invocation_positions) == 1
+    assert any(
         finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
         and finding["import_reference"] == "transformers.training_args.TrainingArguments"
         for finding in output["findings"]
