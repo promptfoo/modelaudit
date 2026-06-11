@@ -73,6 +73,7 @@ _PICKLE_CODE_EXECUTION_OPCODE_RISKS = (
     ("BUILD", "__setstate__ method exploitation"),
 )
 _PICKLE_NESTED_EXECUTION_OPCODES = frozenset({"REDUCE", "INST", "OBJ", "NEWOBJ", "NEWOBJ_EX", "BUILD"})
+_PICKLE_OPCODE_BYTES = frozenset(ord(opcode.code) for opcode in pickletools.opcodes)
 
 
 @dataclass(frozen=True)
@@ -1737,8 +1738,14 @@ class PyTorchZipScanner(BaseScanner):
                 if opcode.name == "STOP":
                     return opcode_count >= 2
         except Exception:
-            return sample_is_prefix
+            return sample_is_prefix and (
+                opcode_count >= 2 or PyTorchZipScanner._has_known_binary_pickle_second_opcode(sample)
+            )
         return sample_is_prefix and opcode_count >= 2
+
+    @staticmethod
+    def _has_known_binary_pickle_second_opcode(sample: bytes) -> bool:
+        return len(sample) >= 3 and sample[2] in _PICKLE_OPCODE_BYTES
 
     @staticmethod
     def _proto0_or_1_trusted_storage_probe_should_scan(sample: bytes, *, sample_is_prefix: bool) -> bool:

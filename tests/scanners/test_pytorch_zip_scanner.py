@@ -196,6 +196,10 @@ def _pickleish_tensor_storage_bytes() -> bytes:
     return bytes.fromhex("478727be61f70dbd70953cbd09b996bd5c7a2ebe") + (b"\x00" * 128)
 
 
+def _binary_magic_tensor_storage_bytes() -> bytes:
+    return b"\x80\x04\x00" + (b"\x00" * 128)
+
+
 def _writestr_preserving_member_name(zip_file: zipfile.ZipFile, member_name: str, data: bytes) -> None:
     info = zipfile.ZipInfo("placeholder")
     info.filename = member_name
@@ -557,6 +561,22 @@ def test_pytorch_zip_discovery_skips_referenced_storage_blob_pickleish_bytes(tmp
         zip_file.writestr("archive/byteorder", "little")
         zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
         zip_file.writestr("archive/data/0", _pickleish_tensor_storage_bytes())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+
+
+def test_pytorch_zip_discovery_skips_referenced_storage_blob_binary_magic_without_opcode(tmp_path: Path) -> None:
+    model_path = tmp_path / "referenced_storage_binary_magic_bytes.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        zip_file.writestr("archive/data/0", _binary_magic_tensor_storage_bytes())
 
     result = PyTorchZipScanner().scan(str(model_path))
 

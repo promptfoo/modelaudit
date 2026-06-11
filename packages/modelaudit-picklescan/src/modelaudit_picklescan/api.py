@@ -40,6 +40,7 @@ _PYTORCH_ZIP_METADATA_BASENAMES = frozenset({"version", "byteorder"})
 _PYTORCH_CHECKPOINT_SUFFIXES = frozenset({".pt", ".pth", ".ckpt"})
 _PICKLE_MEMBER_SUFFIXES = (".pkl", ".pickle")
 _PICKLE_BINARY_PROTOCOL_PREFIXES = (b"\x80\x01", b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05")
+_PICKLE_OPCODE_BYTES = frozenset(ord(opcode.code) for opcode in pickletools.opcodes)
 _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
 _PICKLE_DISCOVERY_LONG_PROBE_BYTES = 64 * 1024
 _TRUSTED_STORAGE_PICKLE_PROBE_BYTES = 4 * 1024
@@ -872,8 +873,12 @@ def _binary_pickle_probe_should_scan(sample: bytes, *, sample_is_prefix: bool) -
             if opcode.name == "STOP":
                 return opcode_count >= 2
     except Exception:
-        return sample_is_prefix
+        return sample_is_prefix and (opcode_count >= 2 or _has_known_binary_pickle_second_opcode(sample))
     return sample_is_prefix and opcode_count >= 2
+
+
+def _has_known_binary_pickle_second_opcode(sample: bytes) -> bool:
+    return len(sample) >= 3 and sample[2] in _PICKLE_OPCODE_BYTES
 
 
 def _proto0_or_1_trusted_storage_probe_should_scan(sample: bytes, *, sample_is_prefix: bool) -> bool:

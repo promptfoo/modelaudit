@@ -207,6 +207,10 @@ def _pickleish_tensor_storage_bytes() -> bytes:
     return bytes.fromhex("478727be61f70dbd70953cbd09b996bd5c7a2ebe") + (b"\x00" * 128)
 
 
+def _binary_magic_tensor_storage_bytes() -> bytes:
+    return b"\x80\x04\x00" + (b"\x00" * 128)
+
+
 def _writestr_preserving_member_name(archive: zipfile.ZipFile, member_name: str, data: bytes) -> None:
     info = zipfile.ZipInfo("placeholder")
     info.filename = member_name
@@ -1883,6 +1887,22 @@ def test_scan_file_does_not_route_benign_storage_blob_as_hidden_pickle(tmp_path:
         archive.writestr("archive/byteorder", "little")
         archive.writestr("archive/data/0", _pickleish_tensor_storage_bytes())
         archive.writestr("archive/notes", b"cat is a category label, not a GLOBAL opcode stream")
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
+
+
+def test_scan_file_does_not_route_binary_magic_storage_blob_without_opcode(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _pytorch_storage_persistent_id_payload("0"))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", _binary_magic_tensor_storage_bytes())
 
     report = scan_file(archive_path)
 
