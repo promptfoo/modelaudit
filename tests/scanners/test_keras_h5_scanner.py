@@ -925,6 +925,44 @@ def test_keras_h5_oversized_config_attribute_fails_closed_before_json_parse(
     )
 
 
+@pytest.mark.parametrize("attr_name", ["layer_names", "weight_names"])
+def test_keras_h5_oversized_weight_name_attribute_fails_closed_before_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attr_name: str,
+) -> None:
+    model_path = tmp_path / f"oversized_{attr_name}.weights.h5"
+    with h5py.File(model_path, "w") as f:
+        if attr_name == "layer_names":
+            f.attrs["layer_names"] = [b"dense", b"A" * 64]
+        else:
+            f.attrs["layer_names"] = [b"dense"]
+            dense = f.create_group("dense")
+            dense.attrs["weight_names"] = [b"kernel:0", b"A" * 64]
+            dense.create_dataset("kernel:0", data=[1.0])
+    inflate_h5_file_to_size(model_path)
+    monkeypatch.setattr(KerasH5Scanner, "_MAX_HDF5_NAME_ATTRIBUTE_BYTES", 32)
+    original_attr_getitem = h5py.AttributeManager.__getitem__
+
+    def fail_name_attribute_materialization(self: Any, name: str) -> Any:
+        if name == attr_name:
+            raise AssertionError(f"oversized Keras H5 {attr_name} should not be materialized")
+        return original_attr_getitem(self, name)
+
+    monkeypatch.setattr(h5py.AttributeManager, "__getitem__", fail_name_attribute_materialization)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "keras_h5_external_reference_analysis_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert_not_rejected_by_read_cap(result)
+    assert any(
+        check.name == "HDF5 External Reference Analysis Limit" and check.details["weight_roots_truncated"] is True
+        for check in result.checks
+    )
+
+
 @pytest.mark.integration
 def test_real_hf_xlm_roberta_large_h5_reaches_keras_scan_without_read_cap(tmp_path: Path) -> None:
     if os.environ.get("MODELAUDIT_RUN_REAL_HF_H5") != "1":

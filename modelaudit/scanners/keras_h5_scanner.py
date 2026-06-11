@@ -349,6 +349,7 @@ class KerasH5Scanner(BaseScanner):
     _MAX_HDF5_EXTERNAL_STORAGE_SEGMENT_REPORTS: ClassVar[int] = 20
     _MAX_HDF5_REFERENCE_TEXT_CHARS: ClassVar[int] = 4096
     _MAX_HDF5_JSON_ATTRIBUTE_BYTES: ClassVar[int] = 10 * 1024 * 1024
+    _MAX_HDF5_NAME_ATTRIBUTE_BYTES: ClassVar[int] = 10 * 1024 * 1024
     _MAX_HDF5_SOFT_LINK_RESOLUTION_DEPTH: ClassVar[int] = 32
     _MAX_SERIALIZED_CONFIG_NODES: ClassVar[int] = 10_000
     _MODEL_CONTAINER_CLASSES: ClassVar[frozenset[str]] = frozenset({"Model", "Functional", "Sequential"})
@@ -832,7 +833,9 @@ class KerasH5Scanner(BaseScanner):
 
     @classmethod
     def _has_legacy_weights_layout(cls, h5_file: Any) -> bool:
-        layer_names = cls._decode_hdf5_names(h5_file.attrs.get("layer_names"))
+        layer_names, layer_names_truncated = cls._read_bounded_hdf5_name_attribute(h5_file.attrs, "layer_names")
+        if layer_names_truncated:
+            return True
         if not layer_names:
             return False
 
@@ -909,7 +912,15 @@ class KerasH5Scanner(BaseScanner):
             return True
 
         def add_weight_names(group: Any, prefix: str) -> bool:
-            for weight_name in cls._decode_hdf5_names(group.attrs.get("weight_names")):
+            nonlocal roots_truncated
+            weight_names, weight_names_truncated = cls._read_bounded_hdf5_name_attribute(
+                group.attrs,
+                "weight_names",
+            )
+            if weight_names_truncated:
+                roots_truncated = True
+                return False
+            for weight_name in weight_names:
                 if not consume_name_budget():
                     return False
                 lookup_name = weight_name or "."
@@ -927,7 +938,11 @@ class KerasH5Scanner(BaseScanner):
             nonlocal roots_truncated
             if not add_weight_names(group, prefix):
                 return
-            for layer_name in cls._decode_hdf5_names(group.attrs.get("layer_names")):
+            layer_names, layer_names_truncated = cls._read_bounded_hdf5_name_attribute(group.attrs, "layer_names")
+            if layer_names_truncated:
+                roots_truncated = True
+                return
+            for layer_name in layer_names:
                 if not consume_name_budget():
                     return
                 layer_link = group.get(layer_name, getlink=True)
@@ -960,7 +975,9 @@ class KerasH5Scanner(BaseScanner):
                     break
             return roots, roots_truncated
 
-        layer_names = cls._decode_hdf5_names(h5_file.attrs.get("layer_names"))
+        layer_names, layer_names_truncated = cls._read_bounded_hdf5_name_attribute(h5_file.attrs, "layer_names")
+        if layer_names_truncated:
+            return roots, True
         if layer_names:
             add_legacy_group_roots(h5_file, "")
             return roots, roots_truncated
@@ -1030,6 +1047,94 @@ class KerasH5Scanner(BaseScanner):
             elif isinstance(item, str):
                 names.append(item)
         return [name for name in names if name]
+
+    @classmethod
+    def _read_bounded_hdf5_name_attribute(cls, attrs: Any, attr_name: str) -> tuple[list[str], bool]:
+        """Read Keras HDF5 name-list attributes only when their encoded size is bounded."""
+        if attr_name not in attrs:
+            return [], False
+
+        try:
+            attr_id = attrs.get_id(attr_name)
+        except Exception:
+            return [], True
+
+        attr_point_count: int | None = None
+        with suppress(Exception):
+            attr_space = attr_id.get_space()
+            attr_point_count = int(attr_space.get_simple_extent_npoints())
+            if attr_point_count > cls._MAX_HDF5_LINK_VISITS:
+                return [], True
+
+        if cls._hdf5_attribute_is_variable_string(attr_id):
+            return cls._read_hdf5_variable_string_name_attribute(
+                attr_id,
+                max_bytes=cls._MAX_HDF5_NAME_ATTRIBUTE_BYTES,
+                point_count=attr_point_count,
+            )
+
+        with suppress(Exception):
+            if int(attr_id.get_storage_size()) > cls._MAX_HDF5_NAME_ATTRIBUTE_BYTES:
+                return [], True
+
+        try:
+            attr_value = attrs[attr_name]
+        except Exception:
+            return [], True
+
+        attr_size = cls._json_attribute_size(attr_value)
+        if attr_size is not None and attr_size > cls._MAX_HDF5_NAME_ATTRIBUTE_BYTES:
+            return [], True
+
+        names = cls._decode_hdf5_names(attr_value)
+        if len(names) > cls._MAX_HDF5_LINK_VISITS:
+            return names[: cls._MAX_HDF5_LINK_VISITS], True
+        return names, False
+
+    @classmethod
+    def _read_hdf5_variable_string_name_attribute(
+        cls,
+        attr_id: Any,
+        *,
+        max_bytes: int,
+        point_count: int | None,
+    ) -> tuple[list[str], bool]:
+        import numpy as np
+
+        if point_count is None:
+            with suppress(Exception):
+                point_count = int(attr_id.get_space().get_simple_extent_npoints())
+        if point_count is None or point_count <= 0 or point_count > cls._MAX_HDF5_LINK_VISITS:
+            return [], True
+
+        per_item_bytes = min(cls._MAX_HDF5_REFERENCE_TEXT_CHARS, max(max_bytes // point_count, 1)) + 1
+        if point_count * per_item_bytes > max_bytes + cls._MAX_HDF5_LINK_VISITS:
+            return [], True
+
+        with suppress(Exception):
+            dims = tuple(int(dimension) for dimension in attr_id.get_space().get_simple_extent_dims())
+            buffer_shape = dims if dims else ()
+            memory_type = h5py.h5t.C_S1.copy()
+            memory_type.set_size(per_item_bytes)
+            buffer = np.zeros(buffer_shape, dtype=f"S{per_item_bytes}")
+            attr_id.read(buffer, memory_type)
+            raw_items = [buffer.item()] if buffer_shape == () else buffer.reshape(-1).tolist()
+
+            names = []
+            total_bytes = 0
+            truncated = False
+            for raw_item in raw_items:
+                raw_bytes = bytes(raw_item) if isinstance(raw_item, bytes) else str(raw_item).encode("utf-8", "ignore")
+                total_bytes += len(raw_bytes)
+                if len(raw_bytes) >= per_item_bytes or total_bytes > max_bytes:
+                    truncated = True
+                names.append(raw_bytes.decode("utf-8", errors="ignore"))
+            names = [name for name in names if name]
+            if len(names) > cls._MAX_HDF5_LINK_VISITS:
+                return names[: cls._MAX_HDF5_LINK_VISITS], True
+            return names, truncated
+
+        return [], True
 
     @staticmethod
     def _normalize_hdf5_soft_link_path(source_name: str, target_path: str) -> str | None:
