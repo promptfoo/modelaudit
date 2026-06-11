@@ -568,7 +568,7 @@ class TextScanner(BaseScanner):
     """Scanner for text-based ML-related files."""
 
     name = "text"
-    supported_extensions: ClassVar[list[str]] = [".txt", ".md", ".markdown", ".rst"]
+    supported_extensions: ClassVar[list[str]] = [".txt", ".md", ".markdown", ".rst", ".env"]
     default_max_file_read_size = DEFAULT_TEXT_CONTENT_SECURITY_SCAN_BYTES
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -595,10 +595,6 @@ class TextScanner(BaseScanner):
         if cls._is_model_card_documentation_filename(filename) or cls._is_readme_documentation_filename(filename):
             return True
 
-        ext = os.path.splitext(path)[1].lower()
-        if ext not in cls.supported_extensions:
-            return False
-
         # Check for ML-related text files
         ml_text_files = {
             "readme.md",
@@ -619,9 +615,16 @@ class TextScanner(BaseScanner):
             "license.md",
             "license.rst",
             "requirements.txt",
+            ".env",
         }
+        if filename in ml_text_files:
+            return True
 
-        return filename in ml_text_files or any(filename.startswith(prefix) for prefix in ["vocab", "token", "label"])
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in cls.supported_extensions:
+            return False
+
+        return any(filename.startswith(prefix) for prefix in ["vocab", "token", "label"])
 
     @staticmethod
     def _get_file_size(path: str) -> int:

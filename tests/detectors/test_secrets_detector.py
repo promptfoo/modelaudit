@@ -151,6 +151,12 @@ class TestSecretsDetector:
         ("text", "token"),
         [
             ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            (f"Authorization: Basic {_basic_auth_token(b'sentence:pass')}.", _basic_auth_token(b"sentence:pass")),
+            (f"HTTP_AUTHORIZATION=Basic {_basic_auth_token(b'env-user:pass')}", _basic_auth_token(b"env-user:pass")),
+            (
+                f"HTTP_PROXY_AUTHORIZATION=Basic {_basic_auth_token(b'proxy-env:pass')}",
+                _basic_auth_token(b"proxy-env:pass"),
+            ),
             ("Proxy-Authorization:\tBasic\tQWxhZGRpbjpvcGVuIHNlc2FtZQ==", "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="),
             ("aUtHoRiZaTiOn: bAsIc dTpw", "dTpw"),
             ("GET / HTTP/1.1\r\nHost: example.test\r\nAuthorization: Basic YTo/Pz8/\r\n", "YTo/Pz8/"),
@@ -291,7 +297,16 @@ class TestSecretsDetector:
 
         assert _basic_auth_findings(findings) == []
 
-    @pytest.mark.parametrize("header_name", ["Authorization", "proxy_authorization", "proxyAuthorization"])
+    @pytest.mark.parametrize(
+        "header_name",
+        [
+            "Authorization",
+            "HTTP_AUTHORIZATION",
+            "proxy_authorization",
+            "proxyAuthorization",
+            "HTTP_PROXY_AUTHORIZATION",
+        ],
+    )
     def test_basic_auth_structured_header_values_are_detected(self, header_name: str) -> None:
         detector = SecretsDetector()
         token = _basic_auth_token(b"structured:s3cr3t")
@@ -304,7 +319,9 @@ class TestSecretsDetector:
         "data",
         [
             {"Authorization": b"Basic c3RydWN0dXJlZC1ieXRlczpzM2NyM3Q="},
+            {"HTTP_AUTHORIZATION": b"Basic aHR0cC1zdHJ1Y3R1cmVkOnMzY3IzdA=="},
             {b"Authorization": b"Basic c3RydWN0dXJlZC1ieXRlLWtleTpzM2NyM3Q="},
+            {b"HTTP_AUTHORIZATION": b"Basic aHR0cC1ieXRlLWtleTpzM2NyM3Q="},
             {"Authorization": ("Basic c3RydWN0dXJlZC10dXBsZTpzM2NyM3Q=",)},
             {"Authorization": {"value": "Basic c3RydWN0dXJlZC13cmFwcGVkOnMzY3IzdA=="}},
             {"headers": {"proxy_authorization": ["Basic c3RydWN0dXJlZC1saXN0OnMzY3IzdA=="]}},

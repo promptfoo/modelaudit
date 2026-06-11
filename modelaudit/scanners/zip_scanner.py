@@ -277,7 +277,8 @@ class ZipScanner(BaseScanner):
         if ext in {".zip", ".npz", ".mar"}:
             return True
         return (
-            basename == "readme"
+            basename == ".env"
+            or basename == "readme"
             or (basename.startswith("readme.") and ext in {".txt", ".md", ".markdown", ".rst"})
             or basename == "model_card"
             or (basename.startswith(("model_card.", "modelcard.")) and ext in {".txt", ".md", ".markdown", ".rst"})
@@ -1989,11 +1990,12 @@ class ZipScanner(BaseScanner):
                     if is_content_only_member:
                         suffix = ""
                     else:
-                        safe_name = re.sub(
+                        raw_safe_name = re.sub(
                             r"[^a-zA-Z0-9_.-]",
                             "_",
                             os.path.basename(name),
-                        ).strip("._")
+                        )
+                        safe_name = raw_safe_name if preserve_nested_routing_basename else raw_safe_name.strip("._")
                         if not safe_name:
                             safe_name = "archive-member"
                         suffix = f"_{safe_name}"

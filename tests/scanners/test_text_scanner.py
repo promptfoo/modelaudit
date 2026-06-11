@@ -130,6 +130,38 @@ def test_text_scanner_detects_valid_authorization_basic_credentials(tmp_path: Pa
     assert failed_secret_checks[0].details["redacted_value"] == "Basic <redacted>"
 
 
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        (".env", "HTTP_AUTHORIZATION=Basic ZW52LXVzZXI6cGFzcw==\n"),
+        ("model_card.md", "Use `Authorization: Basic c2VudGVuY2U6cGFzcw==.` for the endpoint.\n"),
+    ],
+)
+def test_text_scanner_detects_basic_auth_env_aliases_and_sentence_punctuation(
+    tmp_path: Path, filename: str, content: str
+) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+    routed = scan_file(str(text_path), config={"cache_scan_results": False, "check_network_comm": False})
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False, check_network_comm=False)
+
+    assert TextScanner.can_handle(str(text_path))
+    assert result.success is False
+    assert routed.scanner_name == "text"
+    assert routed.success is False
+    assert determine_exit_code(aggregate) == 1
+    assert any(
+        check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S702"
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+        and check.details.get("redacted_value") == "Basic <redacted>"
+        for check in result.checks
+    )
+
+
 def test_text_scanner_model_card_code_block_detects_escaped_basic_auth_header(tmp_path: Path) -> None:
     text_path = tmp_path / "model_card.md"
     token = "ZXNjYXBlZC1tb2RlbGNhcmQ6cGFzcw=="

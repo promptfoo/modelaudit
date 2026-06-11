@@ -818,7 +818,30 @@ def test_remote_prefilters_preserve_text_scanner_extensionless_documentation() -
 
     assert extensions is not None
     assert "" not in extensions
-    assert filenames == frozenset({"readme", "model_card", "requirements.txt"})
+    assert ".env" in extensions
+    assert filenames == frozenset({"readme", "model_card", "requirements.txt", ".env"})
+    files = [
+        {"path": "s3://bucket/.env"},
+        {"path": "s3://bucket/README"},
+        {"path": "s3://bucket/model.bin"},
+    ]
+
+    assert (
+        filter_cloud_scannable_files(
+            files,
+            scannable_extensions=extensions,
+            scannable_filenames=filenames,
+        )
+        == files[:2]
+    )
+    assert (
+        filter_jfrog_scannable_files(
+            files,
+            scannable_extensions=extensions,
+            scannable_filenames=filenames,
+        )
+        == files[:2]
+    )
 
 
 def test_remote_prefilters_do_not_download_extensionless_xgboost_candidates() -> None:
