@@ -73,6 +73,7 @@ royalty-free, irrevocable copyright license to reproduce, prepare Derivative
 Works of, publicly display, publicly perform, sublicense, and distribute the Work.
 
 Source reference: https://github.com/Lightricks/LTX-Video
+Additional licensing: https://ltx.io/model/licensing
 """
     return body + ("\nThis paragraph is ordinary license text and contains no executable metadata." * 10)
 
@@ -411,6 +412,9 @@ def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -
         "https://evil.example/payload",
         "https://evil.example/license",
         "https://github.com/Lightricks/LTX-Video/releases/download/v1/license.txt",
+        "https://github.com/Lightricks/LTX-2/blob/main/license_update.py",
+        "https://github.com/Lightricks/LTX-2/blob/main/license.js",
+        "https://github.com/Lightricks/LTX-2/%252Freleases%252Fv1/license",
         "https://opensource.org/licenses/MIT?u=https://evil.example/x",
         "https://[",
     ],
@@ -445,6 +449,30 @@ def test_license_metadata_untrusted_url_is_not_suppressed(tmp_path: Path, url: s
 def test_license_metadata_padded_blob_keeps_length_check(tmp_path: Path) -> None:
     file_path = tmp_path / "license_metadata_padded_blob.safetensors"
     payload = ordinary_license_text_with_url() + "\n" + ("A" * 5000)
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert "unusually_long_value" in result.metadata["custom_metadata_security_flags"]
+    assert any(
+        check.name == "Metadata Length Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("key") == "license"
+        for check in result.checks
+    )
+
+
+def test_license_metadata_wrapped_opaque_tail_keeps_length_check(tmp_path: Path) -> None:
+    file_path = tmp_path / "license_metadata_wrapped_opaque_tail.safetensors"
+    encoded_tail = "\n".join(f"Use {'QUJD' * 200}" for _ in range(20))
+    payload = ordinary_license_text_with_url() + "\n" + encoded_tail
     write_raw_safetensors(
         file_path,
         {
