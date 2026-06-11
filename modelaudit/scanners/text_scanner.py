@@ -654,15 +654,22 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
-    def _documentation_uses_markdown_fences(path: str, payload: bytes) -> bool:
+    def _documentation_fence_match_can_open_code(match: re.Match[bytes]) -> bool:
+        marker = match.group("marker")
+        suffix = match.group("suffix")
+        return not (marker.startswith(b"`") and b"`" in suffix)
+
+    @classmethod
+    def _documentation_uses_markdown_fences(cls, path: str, payload: bytes) -> bool:
         filename = os.path.basename(path).lower()
         extension = os.path.splitext(filename)[1]
         if extension == ".rst":
             return False
-        if extension:
+        if extension in {".md", ".markdown"}:
             return True
         return any(
-            match.group("marker").startswith(b"`") or bool(match.group("suffix").strip())
+            cls._documentation_fence_match_can_open_code(match)
+            and (match.group("marker").startswith(b"`") or bool(match.group("suffix").strip()))
             for match in DOCUMENTATION_FENCE_LINE_PATTERN.finditer(payload)
         )
 
@@ -1227,6 +1234,8 @@ class TextScanner(BaseScanner):
             marker = match.group("marker")
             suffix = match.group("suffix")
             if opening_marker is None:
+                if not TextScanner._documentation_fence_match_can_open_code(match):
+                    continue
                 opening_marker = marker
                 continue
             if marker[:1] != opening_marker[:1] or len(marker) < len(opening_marker) or suffix.strip():

