@@ -539,7 +539,7 @@ DOCUMENTATION_FENCED_NETWORK_FUNCTION_ALIAS_ASSIGNMENT_PATTERN = re.compile(
 DOCUMENTATION_FENCED_BOUND_NETWORK_METHOD_ALIAS_ASSIGNMENT_PATTERN = re.compile(
     rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*=\s*"
     rb"(?P<receiver>(?:requests\.)?Session\s*\([^)]*\)|[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*"
-    rb"(?:get|head|post|put|patch|delete|request)\b(?!\s*\()",
+    rb"(?:get|head|post|put|patch|delete|request|urlopen|urlretrieve)\b(?!\s*\()",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_VARIABLE_HTTP_CALL_PATTERN = re.compile(
@@ -590,6 +590,10 @@ DOCUMENTATION_FENCED_EXECUTED_FETCH_PATTERN = re.compile(
     rb"\b"
     + DOCUMENTATION_FENCED_RESPONSE_EXECUTOR
     + rb"\s*\([^\r\n]{0,4096}(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_RESPONSE_EXECUTOR_CALL_PATTERN = re.compile(
+    rb"\b" + DOCUMENTATION_FENCED_RESPONSE_EXECUTOR + rb"\s*\(",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_EXECUTED_IMPORTED_FETCH_PATTERN = re.compile(
@@ -1638,6 +1642,22 @@ class TextScanner(BaseScanner):
             target = target[2:]
         return command, target or b"."
 
+    @staticmethod
+    def _documentation_fenced_checkout_target_is_within_checkout(checkout_path: bytes, target: bytes) -> bool:
+        if checkout_path == b".":
+            return target == b"."
+        if target == checkout_path:
+            return True
+        checkout_prefix = checkout_path + b"/"
+        if not target.startswith(checkout_prefix):
+            return False
+        return all(part not in {b"", b".."} for part in target[len(checkout_prefix) :].split(b"/"))
+
+    @staticmethod
+    def _documentation_fenced_checkout_path_reference_pattern(checkout_path: bytes) -> bytes:
+        path_reference = rb"(?:\./)?" + re.escape(checkout_path)
+        return path_reference + rb"(?:/[A-Za-z0-9_./\-]{1,4096})?"
+
     @classmethod
     def _documentation_fenced_line_pops_directory_stack(cls, line: bytes) -> bool:
         stripped = line.strip()
@@ -1692,7 +1712,7 @@ class TextScanner(BaseScanner):
         stripped = line.strip()
         if not stripped or stripped.startswith(b"#") or checkout_path == b".":
             return False
-        path_reference = rb"(?:\./)?" + re.escape(checkout_path)
+        path_reference = cls._documentation_fenced_checkout_path_reference_pattern(checkout_path)
         match = re.match(
             cls._documentation_fenced_shell_command_prefix_pattern()
             + rb"(?:cd|pushd)\s+"
@@ -1712,7 +1732,7 @@ class TextScanner(BaseScanner):
             return cls._documentation_fenced_line_executes_inside_clone_checkout(stripped)
         if cls._documentation_fenced_line_enters_then_executes_clone_checkout(stripped, checkout_path):
             return True
-        path_reference = rb"(?:\./)?" + re.escape(checkout_path)
+        path_reference = cls._documentation_fenced_checkout_path_reference_pattern(checkout_path)
         prefix = cls._documentation_fenced_shell_command_prefix_pattern()
         return any(
             re.match(pattern, stripped, flags=re.IGNORECASE) is not None
@@ -1775,7 +1795,10 @@ class TextScanner(BaseScanner):
                 command, target = directory_change
                 if command == b"pushd":
                     directory_stack.append(inside_checkout)
-                inside_checkout = checkout_path != b"." and target == checkout_path
+                inside_checkout = cls._documentation_fenced_checkout_target_is_within_checkout(
+                    checkout_path,
+                    target,
+                )
                 continue
             if inside_checkout and cls._documentation_fenced_line_executes_inside_clone_checkout(raw_line):
                 return True
@@ -2160,6 +2183,25 @@ class TextScanner(BaseScanner):
         string_spans: tuple[tuple[int, int, str, bool], ...],
         string_span_starts: tuple[int, ...],
     ) -> bool:
+        imported_targets = cls._documentation_fenced_network_module_alias_positions(
+            fenced_code,
+            string_spans,
+            string_span_starts,
+        )
+
+        return any(
+            any(position < call_match.start() for position in imported_targets.get(call_match.group("target"), []))
+            for call_match in DOCUMENTATION_FENCED_MODULE_ALIAS_NETWORK_CALL_PATTERN.finditer(fenced_code)
+            if not cls._documentation_fenced_match_is_line_comment(fenced_code, call_match.start())
+        )
+
+    @classmethod
+    def _documentation_fenced_network_module_alias_positions(
+        cls,
+        fenced_code: bytes,
+        string_spans: tuple[tuple[int, int, str, bool], ...],
+        string_span_starts: tuple[int, ...],
+    ) -> dict[bytes, list[int]]:
         imported_targets: dict[bytes, list[int]] = {}
         network_modules = {b"requests", b"urllib.request"}
         for match in DOCUMENTATION_FENCED_NETWORK_MODULE_IMPORT_PATTERN.finditer(fenced_code):
@@ -2181,12 +2223,7 @@ class TextScanner(BaseScanner):
                 target = alias_parts[-1].strip()
                 if re.fullmatch(rb"[A-Za-z_][A-Za-z0-9_]*", target) is not None:
                     imported_targets.setdefault(target, []).append(match.start())
-
-        return any(
-            any(position < call_match.start() for position in imported_targets.get(call_match.group("target"), []))
-            for call_match in DOCUMENTATION_FENCED_MODULE_ALIAS_NETWORK_CALL_PATTERN.finditer(fenced_code)
-            if not cls._documentation_fenced_match_is_line_comment(fenced_code, call_match.start())
-        )
+        return imported_targets
 
     @classmethod
     def _documentation_fenced_has_imported_network_alias_call(
@@ -2291,16 +2328,67 @@ class TextScanner(BaseScanner):
                     for position in response_assignments.get(exec_match.group("target"), [])
                 ):
                     return True
+        for exec_match in DOCUMENTATION_FENCED_RESPONSE_EXECUTOR_CALL_PATTERN.finditer(fenced_code):
+            if cls._documentation_fenced_match_is_line_comment(
+                fenced_code,
+                exec_match.start(),
+            ) or cls._documentation_python_string_spans_contain_absolute_position(
+                fenced_code,
+                exec_match.start(),
+                string_spans,
+                string_span_starts,
+            ):
+                continue
+            argument_start = exec_match.end()
+            argument_end = min(len(fenced_code), argument_start + 4096)
+            line_end = fenced_code.find(b"\n", argument_start, argument_end)
+            if line_end != -1:
+                argument_end = line_end
+            executor_arguments = fenced_code[argument_start:argument_end]
+            for target, positions in response_assignments.items():
+                if not any(position < exec_match.start() for position in positions):
+                    continue
+                target_pattern = re.compile(
+                    rb"\b" + re.escape(target) + rb"\b(?:\s*\.\s*(?:text|content)|\s*\.\s*read\s*\(\s*\))?",
+                    re.IGNORECASE,
+                )
+                for target_match in target_pattern.finditer(executor_arguments):
+                    absolute_position = argument_start + target_match.start()
+                    if cls._documentation_fenced_match_is_line_comment(
+                        fenced_code,
+                        absolute_position,
+                    ) or cls._documentation_python_string_spans_contain_absolute_position(
+                        fenced_code,
+                        absolute_position,
+                        string_spans,
+                        string_span_starts,
+                    ):
+                        continue
+                    return True
         return False
 
     @classmethod
-    def _documentation_fenced_has_bound_session_alias_call(cls, fenced_code: bytes) -> bool:
+    def _documentation_fenced_has_bound_session_alias_call(
+        cls,
+        fenced_code: bytes,
+        string_spans: tuple[tuple[int, int, str, bool], ...] | None = None,
+        string_span_starts: tuple[int, ...] | None = None,
+    ) -> bool:
+        if string_spans is None:
+            string_spans = cls._documentation_python_string_absolute_spans(fenced_code)
+        if string_span_starts is None:
+            string_span_starts = tuple(span[0] for span in string_spans)
         session_assignment_positions: dict[bytes, list[int]] = {}
         for match in DOCUMENTATION_FENCED_SESSION_ASSIGNMENT_PATTERN.finditer(fenced_code):
             if cls._documentation_fenced_match_is_line_comment(fenced_code, match.start()):
                 continue
             session_assignment_positions.setdefault(match.group("target"), []).append(match.start())
 
+        module_alias_positions = cls._documentation_fenced_network_module_alias_positions(
+            fenced_code,
+            string_spans,
+            string_span_starts,
+        )
         alias_positions: dict[bytes, list[int]] = {}
         for match in DOCUMENTATION_FENCED_BOUND_NETWORK_METHOD_ALIAS_ASSIGNMENT_PATTERN.finditer(fenced_code):
             if cls._documentation_fenced_match_is_line_comment(fenced_code, match.start()):
@@ -2311,7 +2399,10 @@ class TextScanner(BaseScanner):
             ) is not None or any(
                 position < match.start() for position in session_assignment_positions.get(receiver, [])
             )
-            if receiver_is_session:
+            receiver_is_module_alias = any(
+                position < match.start() for position in module_alias_positions.get(receiver, [])
+            )
+            if receiver_is_session or receiver_is_module_alias:
                 alias_positions.setdefault(match.group("target"), []).append(match.start())
 
         return any(
@@ -2339,7 +2430,7 @@ class TextScanner(BaseScanner):
             or cls._documentation_fenced_has_module_alias_network_call(fenced_code, string_spans, string_span_starts)
             or cls._documentation_fenced_has_imported_network_alias_call(fenced_code, string_spans, string_span_starts)
             or cls._documentation_fenced_has_executed_fetch_response(fenced_code, string_spans, string_span_starts)
-            or cls._documentation_fenced_has_bound_session_alias_call(fenced_code)
+            or cls._documentation_fenced_has_bound_session_alias_call(fenced_code, string_spans, string_span_starts)
             or cls._documentation_fenced_has_call_after_assignment(
                 fenced_code,
                 DOCUMENTATION_FENCED_SESSION_ASSIGNMENT_PATTERN,
