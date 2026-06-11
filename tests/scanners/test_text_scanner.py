@@ -738,6 +738,27 @@ def test_text_scanner_model_card_dict_markdown_link_remains_actionable(
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_model_card_crlf_dict_markdown_link_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_bytes(b'payloads = {\r\n    "doc": "[download](https://evil.example/payload.sh)"\r\n}\r\n')
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_model_card_comment_markdown_link_stays_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "model_card.md"
     text_path.write_text(

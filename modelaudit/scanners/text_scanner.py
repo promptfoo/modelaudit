@@ -1491,7 +1491,7 @@ class TextScanner(BaseScanner):
                 payload.rfind(b"\n", context_start, previous_line_end) + 1,
                 context_start,
             )
-            previous_line = payload[previous_line_start:previous_line_end]
+            previous_line = payload[previous_line_start:previous_line_end].removesuffix(b"\r")
             stripped = previous_line.strip()
             if stripped and not stripped.startswith(b"#"):
                 previous_indent = len(previous_line) - len(previous_line.lstrip(b" \t"))
