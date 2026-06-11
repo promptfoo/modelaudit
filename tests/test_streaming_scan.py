@@ -35,6 +35,7 @@ from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYT
 from modelaudit.utils.helpers.file_hash import compute_sha256_hash
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
+from tests.helpers import create_malicious_pickle
 
 
 @pytest.fixture
@@ -1515,7 +1516,7 @@ def test_scan_model_streaming_skips_huggingface_cache_metadata(
     snapshots_dir.mkdir(parents=True)
 
     metadata_file = snapshots_dir / "config.json.metadata"
-    metadata_file.write_text("{}")
+    write_hf_download_metadata(metadata_file)
     model_file = snapshots_dir / "model.pkl"
     with model_file.open("wb") as f:
         pickle.dump({"data": "safe"}, f)
@@ -1641,6 +1642,64 @@ def test_scan_model_streaming_local_download_json_metadata_payload_is_scanned(tm
 
     assert result.files_scanned == 2
     assert str(sidecar) in result.file_metadata
+
+
+def test_scan_model_streaming_hf_snapshot_metadata_symlink_payload_is_scanned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """Streaming scans must not skip a model payload with a snapshot sidecar-like name."""
+    hf_home = tmp_path / ".cache" / "huggingface"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_root = hf_home / "hub" / "models--org--repo"
+    snapshot_root = cache_root / "snapshots" / "abc123"
+    blobs_root = cache_root / "blobs"
+    snapshot_root.mkdir(parents=True)
+    blobs_root.mkdir()
+    blob = blobs_root / "blob123"
+    create_malicious_pickle(blob)
+    payload_alias = snapshot_root / "payload.pkl.metadata"
+    payload_alias.symlink_to(Path("../../blobs") / blob.name)
+
+    result = scan_model_streaming(
+        file_generator=iterate_files_streaming(snapshot_root),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(snapshot_root),
+        cache_enabled=False,
+    )
+
+    assert result.files_scanned == 1
+    assert any(issue.rule_code == "S201" for issue in result.issues)
+
+
+def test_scan_model_streaming_hf_no_exist_marker_skips_only_empty_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Streaming scans skip empty negative-cache markers but scan contentful entries."""
+    hf_home = tmp_path / ".cache" / "huggingface"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    no_exist_root = hf_home / "hub" / "models--org--repo" / ".no_exist" / "abc123"
+    empty_marker = no_exist_root / "missing.safetensors"
+    malicious_marker = no_exist_root / "payload.pkl"
+    empty_marker.parent.mkdir(parents=True)
+    empty_marker.touch()
+    create_malicious_pickle(malicious_marker)
+
+    result = scan_model_streaming(
+        file_generator=iterate_files_streaming(hf_home / "hub" / "models--org--repo"),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(hf_home / "hub" / "models--org--repo"),
+        cache_enabled=False,
+    )
+
+    assert result.files_scanned == 1
+    assert str(malicious_marker) in result.file_metadata
+    assert str(empty_marker) not in result.file_metadata
+    assert any(issue.rule_code == "S201" and issue.location == str(malicious_marker) for issue in result.issues)
 
 
 def test_scan_model_streaming_scans_local_file_named_main(tmp_path: Path) -> None:

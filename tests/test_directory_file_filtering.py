@@ -1161,6 +1161,7 @@ class TestDirectoryFileFiltering:
         )
         hf_cache_metadata = hf_home / "hub" / "models--org--repo" / "snapshots" / "abc123" / "model.metadata"
         hf_download_metadata = hf_home / "download" / "model.metadata"
+        _write_hf_download_metadata(hf_cache_metadata)
         _write_hf_download_metadata(hf_download_metadata)
 
         assert _is_huggingface_cache_file(str(local_metadata)) is False
@@ -1200,6 +1201,8 @@ class TestDirectoryFileFiltering:
         hf_cache_lock = hf_home / "hub" / "models--org--repo" / "snapshots" / "abc123" / "payload.pkl.lock"
         hf_download_gitignore = hf_home / "download" / ".gitignore"
         hf_download_gitattributes = hf_home / "download" / ".gitattributes"
+        hf_cache_lock.parent.mkdir(parents=True)
+        hf_cache_lock.touch()
         hf_download_gitignore.parent.mkdir(parents=True)
         hf_download_gitignore.write_text("*\n", encoding="utf-8")
         hf_download_gitattributes.write_text("*.bin filter=lfs diff=lfs merge=lfs -text\n", encoding="utf-8")
@@ -1220,8 +1223,106 @@ class TestDirectoryFileFiltering:
         custom_hub = tmp_path / "custom-cache-root"
         monkeypatch.setenv("HF_HUB_CACHE", str(custom_hub))
         lock_path = custom_hub / "models--org--repo" / "snapshots" / "abc123" / "payload.pkl.lock"
+        lock_path.parent.mkdir(parents=True)
+        lock_path.touch()
 
         assert _is_huggingface_cache_file(str(lock_path)) is True
+
+    def test_hf_hub_bookkeeping_requires_existing_benign_content(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Hub cache sidecar-looking names are not trusted from path shape alone."""
+        hf_home = tmp_path / ".cache" / "huggingface"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+        snapshot_root = hf_home / "hub" / "models--org--repo" / "snapshots" / "abc123"
+        missing_metadata = snapshot_root / "missing.metadata"
+        malicious_metadata = snapshot_root / "payload.pkl.metadata"
+        benign_metadata = snapshot_root / "config.json.metadata"
+        malicious_gitattributes = snapshot_root / ".gitattributes"
+        benign_gitignore = snapshot_root / ".gitignore"
+
+        snapshot_root.mkdir(parents=True)
+        create_malicious_pickle(malicious_metadata)
+        create_malicious_pickle(malicious_gitattributes)
+        _write_hf_download_metadata(benign_metadata)
+        benign_gitignore.write_text("*\n", encoding="utf-8")
+
+        assert _is_huggingface_cache_file(str(missing_metadata)) is False
+        assert _is_huggingface_cache_file(str(malicious_metadata)) is False
+        assert _is_huggingface_cache_file(str(malicious_gitattributes)) is False
+        assert _is_huggingface_cache_file(str(benign_metadata)) is True
+        assert _is_huggingface_cache_file(str(benign_gitignore)) is True
+
+    def test_hf_hub_snapshot_metadata_payload_is_scanned(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A real model payload cannot hide behind a snapshot .metadata name."""
+        hf_home = tmp_path / ".cache" / "huggingface"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+        snapshot_root = hf_home / "hub" / "models--org--repo" / "snapshots" / "abc123"
+        payload = snapshot_root / "payload.pkl.metadata"
+        payload.parent.mkdir(parents=True)
+        create_malicious_pickle(payload)
+
+        results = scan_model_directory_or_file(str(snapshot_root), cache_scan_results=False)
+
+        assert _is_huggingface_cache_file(str(payload)) is False
+        assert results.files_scanned == 1
+        assert str(payload) in results.file_metadata
+        assert any(issue.rule_code == "S201" and issue.location == str(payload) for issue in results.issues)
+
+    def test_hf_hub_snapshot_metadata_symlink_payload_is_scanned(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        requires_symlinks: None,
+    ) -> None:
+        """Snapshot aliases with sidecar-like names must resolve to scanning trusted blobs."""
+        hf_home = tmp_path / ".cache" / "huggingface"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+        cache_root = hf_home / "hub" / "models--org--repo"
+        snapshot_root = cache_root / "snapshots" / "abc123"
+        blobs_root = cache_root / "blobs"
+        snapshot_root.mkdir(parents=True)
+        blobs_root.mkdir()
+        blob = blobs_root / "blob123"
+        create_malicious_pickle(blob)
+        payload_alias = snapshot_root / "payload.pkl.metadata"
+        payload_alias.symlink_to(Path("../../blobs") / blob.name)
+
+        results = scan_model_directory_or_file(str(snapshot_root), cache_scan_results=False)
+
+        assert _is_huggingface_cache_file(str(payload_alias)) is False
+        assert results.files_scanned == 1
+        assert any(issue.rule_code == "S201" for issue in results.issues)
+
+    def test_hf_no_exist_markers_skip_only_empty_regular_files(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Negative-cache markers stay quiet, but contentful entries are scanned."""
+        hf_home = tmp_path / ".cache" / "huggingface"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+        no_exist_root = hf_home / "hub" / "models--org--repo" / ".no_exist" / "abc123"
+        empty_marker = no_exist_root / "missing.safetensors"
+        malicious_marker = no_exist_root / "payload.pkl"
+        empty_marker.parent.mkdir(parents=True)
+        empty_marker.touch()
+        create_malicious_pickle(malicious_marker)
+
+        results = scan_model_directory_or_file(str(hf_home / "hub" / "models--org--repo"), cache_scan_results=False)
+
+        assert _is_huggingface_cache_file(str(empty_marker)) is True
+        assert _is_huggingface_cache_file(str(malicious_marker)) is False
+        assert results.files_scanned == 1
+        assert str(malicious_marker) in results.file_metadata
+        assert str(empty_marker) not in results.file_metadata
+        assert any(issue.rule_code == "S201" and issue.location == str(malicious_marker) for issue in results.issues)
 
     def test_download_bookkeeping_requires_configured_hf_home(
         self,
@@ -1329,6 +1430,78 @@ class TestDirectoryFileFiltering:
             "vocab.txt",
         }
         assert not any(".cache/huggingface" in path for path in results.file_metadata)
+
+    def test_local_download_metadata_requires_existing_target(self, tmp_path: Path) -> None:
+        """Incomplete local caches must not hide orphaned metadata sidecars."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        sidecar = model_dir / ".cache" / "huggingface" / "download" / "missing.bin.metadata"
+        _write_hf_download_metadata(sidecar)
+
+        assert _is_huggingface_cache_file(str(sidecar)) is False
+
+    def test_backslash_separated_cache_name_is_not_treated_as_hf_layout(self, tmp_path: Path) -> None:
+        """Literal separator-looking names must not create a trusted HF cache layout."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        spoofed = model_dir / ".cache\\huggingface\\download\\config.json.metadata"
+        _write_hf_download_metadata(spoofed)
+
+        assert _is_huggingface_cache_file(str(spoofed)) is False
+
+    def test_local_download_unicode_sidecar_preserves_target_inventory(self, tmp_path: Path) -> None:
+        """Unicode artifact names should map to their exact metadata sidecars."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        target = model_dir / "café.safetensors"
+        _write_minimal_safetensors(target)
+        _write_hf_download_metadata(model_dir / ".cache" / "huggingface" / "download" / "café.safetensors.metadata")
+
+        results = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert {Path(asset.path).relative_to(model_dir).as_posix() for asset in results.assets} == {
+            "café.safetensors",
+        }
+
+    def test_local_download_metadata_case_variant_is_not_bookkeeping(self, tmp_path: Path) -> None:
+        """Case variants of sidecar suffixes are scanned instead of trusted as HF metadata."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
+        sidecar = model_dir / ".cache" / "huggingface" / "download" / "config.json.METADATA"
+        _write_hf_download_metadata(sidecar)
+
+        results = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+        assert _is_huggingface_cache_file(str(sidecar)) is False
+        assert str(sidecar) in results.file_metadata
+
+    def test_bookkeeping_read_mutation_falls_through_to_scan(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A sidecar changed while being validated is not trusted as bookkeeping."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
+        sidecar = model_dir / ".cache" / "huggingface" / "download" / "config.json.metadata"
+        _write_hf_download_metadata(sidecar)
+        original_read = core_module.os.read
+        mutated = False
+
+        def mutate_after_read(fd: int, size: int) -> bytes:
+            nonlocal mutated
+            chunk = original_read(fd, size)
+            if not mutated:
+                mutated = True
+                sidecar.write_text('{"chat_template": "{{ cycler.__init__.__globals__.os.popen(\'id\').read() }}"}')
+            return chunk
+
+        monkeypatch.setattr(core_module.os, "read", mutate_after_read)
+
+        assert _is_huggingface_cache_file(str(sidecar)) is False
 
     def test_local_download_metadata_symlink_traversal_is_not_skipped(
         self,
@@ -1615,8 +1788,7 @@ class TestDirectoryFileFiltering:
         monkeypatch.setenv("HF_HOME", str(link_home))
 
         metadata_path = link_home / "hub" / "models--org--repo" / "snapshots" / "abc123" / "config.json.metadata"
-        metadata_path.parent.mkdir(parents=True)
-        metadata_path.write_text("{}")
+        _write_hf_download_metadata(metadata_path)
 
         assert _is_huggingface_cache_file(str(metadata_path)) is True
 
@@ -1649,8 +1821,8 @@ class TestDirectoryFileFiltering:
         hf_ref_head = hf_home / "hub" / "models--org--repo" / "refs" / "HEAD"
         hf_snapshot_main = hf_home / "hub" / "models--org--repo" / "snapshots" / "abc123" / "main"
         hf_ref_main.parent.mkdir(parents=True)
-        hf_ref_main.write_text("abc123\n", encoding="utf-8")
-        hf_ref_head.write_text("abc123\n", encoding="utf-8")
+        hf_ref_main.write_text("c5ee24cb16019beea0893ab7796b1df96625c6b8\n", encoding="utf-8")
+        hf_ref_head.write_text("821d1aa69520101d6e0737f78a042ae25b19e5c0\n", encoding="utf-8")
         hf_snapshot_main.parent.mkdir(parents=True)
         hf_snapshot_main.write_text("payload", encoding="utf-8")
 
@@ -1659,6 +1831,28 @@ class TestDirectoryFileFiltering:
         assert _is_huggingface_cache_file(str(hf_ref_main)) is True
         assert _is_huggingface_cache_file(str(hf_ref_head)) is True
         assert _is_huggingface_cache_file(str(hf_snapshot_main)) is False
+
+    def test_huggingface_ref_names_scan_non_digest_payloads(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Refs are skipped only when they contain real commit-digest pointers."""
+        hf_home = tmp_path / ".cache" / "huggingface"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+        refs_root = hf_home / "hub" / "models--org--repo" / "refs"
+        short_ref = refs_root / "main"
+        malicious_ref = refs_root / "HEAD"
+        short_ref.parent.mkdir(parents=True)
+        short_ref.write_text("abc123\n", encoding="utf-8")
+        create_malicious_pickle(malicious_ref)
+
+        results = scan_model_directory_or_file(str(refs_root), cache_scan_results=False)
+
+        assert _is_huggingface_cache_file(str(short_ref)) is False
+        assert _is_huggingface_cache_file(str(malicious_ref)) is False
+        assert str(malicious_ref) in results.file_metadata
+        assert any(issue.rule_code == "S201" and issue.location == str(malicious_ref) for issue in results.issues)
 
     def test_performance_with_many_files(self):
         """Test that file filtering improves performance with many non-model files."""

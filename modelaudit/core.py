@@ -87,6 +87,7 @@ from modelaudit.utils.file.detection import (
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
     detect_file_format,
+    detect_file_format_for_skip_filter,
     detect_file_format_from_magic,
     detect_flax_msgpack_overlap_routes,
     detect_format_from_extension,
@@ -179,6 +180,7 @@ merge_scan_result = core_results.merge_scan_result
 HEADER_FORMAT_TO_SCANNER_ID = _registry.get_header_format_to_scanner_ids()
 _HF_DOWNLOAD_METADATA_MAX_BYTES = 64 * 1024
 _HF_DOWNLOAD_GIT_BOOKKEEPING_MAX_BYTES = 64 * 1024
+_HF_HUB_GIT_BOOKKEEPING_MAX_BYTES = 64 * 1024
 _HF_CACHE_REF_MAX_BYTES = 4096
 _HF_CACHEDIR_TAG_MAX_BYTES = 4096
 _HF_CACHEDIR_TAG_CONTENT = (
@@ -3373,18 +3375,131 @@ def scan_model_directory_or_file(
 # _should_skip_file has been moved to utils.file_filter module
 
 
-def _is_hf_hub_bookkeeping_path(path_obj: Path) -> bool:
-    """Return True for files stored under known HuggingFace hub bookkeeping directories."""
+def _bookkeeping_stat_size(stat_result: os.stat_result, max_bytes: int) -> int | None:
+    if _stat_is_windows_reparse_point(stat_result):
+        return None
+    if not stat.S_ISREG(stat_result.st_mode):
+        return None
+    if stat_result.st_nlink != 1:
+        return None
+    if stat_result.st_size > max_bytes:
+        return None
+    return stat_result.st_size
+
+
+def _same_bookkeeping_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return all(
+        getattr(left, field) == getattr(right, field)
+        for field in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+    )
+
+
+def _read_regular_bookkeeping_text(path_obj: Path, max_bytes: int) -> str | None:
+    """Read a bounded regular bookkeeping file without following symlinks."""
+    try:
+        before_stat = path_obj.lstat()
+    except OSError:
+        return None
+    if _bookkeeping_stat_size(before_stat, max_bytes) is None:
+        return None
+
+    fd: int | None = None
+    try:
+        fd = os.open(path_obj, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened_stat = os.fstat(fd)
+        if not _same_bookkeeping_identity(before_stat, opened_stat):
+            return None
+        if _bookkeeping_stat_size(opened_stat, max_bytes) is None:
+            return None
+
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 8192))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw_content = b"".join(chunks)
+        if len(raw_content) > max_bytes:
+            return None
+
+        after_stat = os.fstat(fd)
+        if not _same_bookkeeping_identity(opened_stat, after_stat):
+            return None
+        return raw_content.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    finally:
+        if fd is not None:
+            with suppress(OSError):
+                os.close(fd)
+
+
+def _has_scannable_bookkeeping_format(path_obj: Path) -> bool:
+    try:
+        return detect_file_format_for_skip_filter(str(path_obj)) != "unknown"
+    except (OSError, ValueError, RecursionError):
+        return True
+
+
+def _hf_cache_relative_parts(path_obj: Path) -> tuple[Path, tuple[str, ...]] | None:
     hf_cache_root = _find_hf_cache_root(path_obj)
     if hf_cache_root is None:
-        return False
+        return None
 
     try:
         relative_parts = _resolve_hf_cache_path(path_obj).relative_to(hf_cache_root).parts
     except ValueError:
+        return None
+    return hf_cache_root, relative_parts
+
+
+def _is_hf_no_exist_marker(path_obj: Path) -> bool:
+    """Return True only for empty Hugging Face negative-cache markers."""
+    cache_parts = _hf_cache_relative_parts(path_obj)
+    if cache_parts is None:
+        return False
+    _hf_cache_root, relative_parts = cache_parts
+    if not relative_parts or relative_parts[0] != ".no_exist":
+        return False
+    return _regular_bookkeeping_file_size(path_obj, 0) == 0
+
+
+def _is_hf_ref_file(path_obj: Path) -> bool:
+    """Return True for bounded Hugging Face ref files containing a commit digest."""
+    cache_parts = _hf_cache_relative_parts(path_obj)
+    if cache_parts is None:
+        return False
+    _hf_cache_root, relative_parts = cache_parts
+    if not relative_parts or relative_parts[0] != "refs":
+        return False
+    content = _read_regular_bookkeeping_text(path_obj, _HF_CACHE_REF_MAX_BYTES)
+    if content is None:
+        return False
+    lines = content.splitlines()
+    return len(lines) == 1 and _is_hex_digest(lines[0].strip())
+
+
+def _is_hf_hub_bookkeeping_path(path_obj: Path) -> bool:
+    """Return True for bounded benign files under known Hugging Face hub cache directories."""
+    cache_parts = _hf_cache_relative_parts(path_obj)
+    if cache_parts is None:
+        return False
+    _hf_cache_root, relative_parts = cache_parts
+    if not relative_parts or relative_parts[0] not in {"snapshots", "blobs"}:
         return False
 
-    return bool(relative_parts and relative_parts[0] in {"snapshots", "blobs", "refs"})
+    filename = path_obj.name
+    if filename.endswith(".lock"):
+        return _regular_bookkeeping_file_size(path_obj, 0) == 0
+    if filename.endswith(".metadata"):
+        content = _read_regular_bookkeeping_text(path_obj, _HF_DOWNLOAD_METADATA_MAX_BYTES)
+        return content is not None and _is_hf_download_metadata_text(content)
+    if filename in {".gitignore", ".gitattributes"}:
+        content = _read_regular_bookkeeping_text(path_obj, _HF_HUB_GIT_BOOKKEEPING_MAX_BYTES)
+        return content is not None and "\x00" not in content and not _has_scannable_bookkeeping_format(path_obj)
+    return False
 
 
 def _is_hf_download_bookkeeping_path(path_obj: Path) -> bool:
@@ -3492,15 +3607,7 @@ def _regular_bookkeeping_file_size(path_obj: Path, max_bytes: int) -> int | None
         stat_result = path_obj.lstat()
     except OSError:
         return None
-    if _stat_is_windows_reparse_point(stat_result):
-        return None
-    if not stat.S_ISREG(stat_result.st_mode):
-        return None
-    if stat_result.st_nlink != 1:
-        return None
-    if stat_result.st_size > max_bytes:
-        return None
-    return stat_result.st_size
+    return _bookkeeping_stat_size(stat_result, max_bytes)
 
 
 def _is_benign_local_hf_download_bookkeeping_file(
@@ -3519,8 +3626,6 @@ def _is_benign_local_hf_download_bookkeeping_file(
         file_size = _regular_bookkeeping_file_size(path_obj, max_size)
         if file_size is None:
             return False
-        if detect_file_format(str(path_obj)) != "unknown":
-            return False
         if filename.endswith(".lock"):
             if require_existing_target and not _download_sidecar_target_exists(path_obj, download_root):
                 return False
@@ -3528,13 +3633,15 @@ def _is_benign_local_hf_download_bookkeeping_file(
         if filename.endswith(".metadata"):
             if require_existing_target and not _download_sidecar_target_exists(path_obj, download_root):
                 return False
-            content = path_obj.read_text(encoding="utf-8")
+            content = _read_regular_bookkeeping_text(path_obj, _HF_DOWNLOAD_METADATA_MAX_BYTES)
+            if content is None:
+                return False
             return _is_hf_download_metadata_text(content)
         if filename in {".gitignore", ".gitattributes"}:
             if not allow_git_bookkeeping:
                 return False
-            content = path_obj.read_text(encoding="utf-8")
-            return "\x00" not in content
+            content = _read_regular_bookkeeping_text(path_obj, _HF_DOWNLOAD_GIT_BOOKKEEPING_MAX_BYTES)
+            return content is not None and "\x00" not in content and not _has_scannable_bookkeeping_format(path_obj)
     except (OSError, UnicodeDecodeError, RecursionError, ValueError):
         return False
     return False
@@ -3552,6 +3659,10 @@ def _is_huggingface_cache_file(path: str) -> bool:
     """
     import os
 
+    path_obj = Path(path)
+    if _path_has_part(path_obj, ".no_exist") and _is_hf_no_exist_marker(path_obj):
+        return True
+
     filename = os.path.basename(path)
     if not (
         filename.endswith((".lock", ".metadata"))
@@ -3561,24 +3672,11 @@ def _is_huggingface_cache_file(path: str) -> bool:
 
     # Only trust bookkeeping-shaped filenames when they actually live in a
     # recognized HuggingFace cache layout.
-    path_obj = Path(path)
-
     if filename == "CACHEDIR.TAG":
         return _is_hf_cachedir_tag(path_obj)
 
     if filename in ["main", "HEAD"]:
-        if _regular_bookkeeping_file_size(path_obj, _HF_CACHE_REF_MAX_BYTES) is None:
-            return False
-        hf_cache_root = _find_hf_cache_root(path_obj)
-        if hf_cache_root is None:
-            return False
-
-        try:
-            relative_parts = _resolve_hf_cache_path(path_obj).relative_to(hf_cache_root).parts
-        except ValueError:
-            return False
-
-        return bool(relative_parts and relative_parts[0] == "refs")
+        return _is_hf_ref_file(path_obj)
 
     is_hf_bookkeeping_path = _is_hf_hub_bookkeeping_path(path_obj) or _is_hf_download_bookkeeping_path(path_obj)
     if filename.endswith((".lock", ".metadata")):
@@ -3601,12 +3699,10 @@ def _is_hf_cachedir_tag(path_obj: Path) -> bool:
         parent_parts = tuple(part.lower() for part in resolved_parent.parts[-2:])
         if parent_parts != (".cache", "huggingface"):
             return False
-        if _regular_bookkeeping_file_size(path_obj, _HF_CACHEDIR_TAG_MAX_BYTES) is None:
+        content = _read_regular_bookkeeping_text(path_obj, _HF_CACHEDIR_TAG_MAX_BYTES)
+        if content is None:
             return False
-        if detect_file_format(str(path_obj)) != "unknown":
-            return False
-        content = path_obj.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+    except OSError:
         return False
     return content == _HF_CACHEDIR_TAG_CONTENT
 
