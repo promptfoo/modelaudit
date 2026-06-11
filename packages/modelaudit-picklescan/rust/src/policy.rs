@@ -658,6 +658,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
         "torch.fx.experimental.symbolic_shapes.ShapeEnv",
         "evaluate_guards_expression",
     ),
+    ("torch.hub", "download_url_to_file"),
     ("torch.hub", "load"),
     ("torch.hub", "load_state_dict_from_url"),
     ("torch.serialization", "load"),

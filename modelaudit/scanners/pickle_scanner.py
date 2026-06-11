@@ -299,6 +299,7 @@ _EXECUTABLE_NETWORK_LITERAL_SEEDS: tuple[bytes, ...] = (
     b"cloudpickle.load",
     b"dill.load",
     b"download_file(",
+    b"download_url_to_file",
     b"eval(",
     b"exec(",
     b"gethostbyname",
@@ -317,6 +318,7 @@ _EXECUTABLE_NETWORK_LITERAL_SEEDS: tuple[bytes, ...] = (
     b"socket.",
     b"snapshot_download(",
     b"subprocess",
+    b"torch.hub.download_url_to_file",
     b"torch.hub.load",
     b"urllib.",
     b"urlopen",
@@ -325,6 +327,33 @@ _EXECUTABLE_NETWORK_LITERAL_SEEDS: tuple[bytes, ...] = (
 )
 _EXECUTABLE_NETWORK_LITERAL_COMMAND_RE = re.compile(
     rb"(?i)(?<![A-Za-z0-9_./-])(?:bash|curl|nc|netcat|pwsh|powershell|sh|wget)(?:\.exe)?(?=$|[\s;&|'\")])"
+)
+_EXECUTABLE_PICKLE_GLOBAL_FULL_NAMES = frozenset(
+    {
+        "huggingface_hub.hf_hub_download",
+        "huggingface_hub.snapshot_download",
+        "torch.hub.download_url_to_file",
+        "torch.hub.load",
+        "torch.hub.load_state_dict_from_url",
+        "torch.utils.model_zoo.load_url",
+    }
+)
+_EXECUTABLE_PICKLE_GLOBAL_MODULE_PREFIXES = (
+    "aiohttp",
+    "httpx",
+    "urllib",
+)
+_EXECUTABLE_PICKLE_GLOBAL_NAMES = frozenset(
+    {
+        "download_file",
+        "download_url_to_file",
+        "hf_hub_download",
+        "load_state_dict_from_url",
+        "load_url",
+        "snapshot_download",
+        "urlopen",
+        "urlretrieve",
+    }
 )
 _SECRET_ASSIGNMENT_SHAPE_RE = re.compile(
     rb"(?i)\b[a-z0-9_.-]{0,64}(?:api[_-]?key|secret|token|password|passwd|pwd|credential|access[_-]?key)"
@@ -355,6 +384,7 @@ _PICKLE_LITERAL_OPCODE_NAMES = frozenset(
         "BYTEARRAY8",
     }
 )
+_PICKLE_LITERAL_RECORD_MAX_OPCODES = 250_000
 _PICKLE_STRING_OPCODE_NAMES = frozenset(
     {
         "STRING",
@@ -500,6 +530,23 @@ class _PickleLiteralRecord:
     start: int
     end: int
     literal: bytes
+    executable_consumer: bool = False
+
+
+@dataclass
+class _PickleLiteralRecordBuilder:
+    start: int
+    end: int
+    literal: bytes
+    executable_consumer: bool = False
+
+
+@dataclass(frozen=True)
+class _PickleStackValue:
+    text: str | None = None
+    record_indexes: tuple[int, ...] = ()
+    global_module: str | None = None
+    global_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1174,6 +1221,62 @@ def _literal_arg_bytes(arg: object) -> bytes | None:
     return None
 
 
+def _literal_arg_text(arg: object) -> str | None:
+    if isinstance(arg, str):
+        return arg
+    if isinstance(arg, bytes):
+        return arg.decode("utf-8", errors="ignore")
+    return None
+
+
+def _pickle_literal_memo_index(arg: object) -> int | None:
+    if isinstance(arg, bool):
+        return None
+    if isinstance(arg, int):
+        return arg if arg >= 0 else None
+    if isinstance(arg, str):
+        try:
+            index = int(arg)
+        except ValueError:
+            return None
+        return index if index >= 0 else None
+    return None
+
+
+def _pickle_literal_record_value(*values: _PickleStackValue) -> _PickleStackValue:
+    seen: set[int] = set()
+    indexes: list[int] = []
+    for value in values:
+        for index in value.record_indexes:
+            if index in seen:
+                continue
+            seen.add(index)
+            indexes.append(index)
+    return _PickleStackValue(record_indexes=tuple(indexes))
+
+
+def _pickle_stack_value_is_executable_network_consumer(value: _PickleStackValue) -> bool:
+    if value.global_module is None or value.global_name is None:
+        return False
+
+    module = value.global_module.strip()
+    name = value.global_name.strip()
+    lowered_module = module.lower()
+    lowered_name = name.lower()
+    lowered_full_name = f"{lowered_module}.{lowered_name}"
+
+    if is_suspicious_global(module, name):
+        return True
+    if lowered_full_name in _EXECUTABLE_PICKLE_GLOBAL_FULL_NAMES:
+        return True
+    if any(
+        lowered_module == prefix or lowered_module.startswith(f"{prefix}.")
+        for prefix in _EXECUTABLE_PICKLE_GLOBAL_MODULE_PREFIXES
+    ):
+        return True
+    return lowered_name in _EXECUTABLE_PICKLE_GLOBAL_NAMES
+
+
 def _documentation_literal_spans(data: bytes) -> tuple[tuple[int, int], ...]:
     spans: list[tuple[int, int]] = []
     for record in _pickle_literal_records(data):
@@ -1184,22 +1287,261 @@ def _documentation_literal_spans(data: bytes) -> tuple[tuple[int, int], ...]:
 
 
 def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
+    marker = object()
+    unknown = _PickleStackValue()
+    stack: list[_PickleStackValue | object] = []
+    memo: dict[int, _PickleStackValue] = {}
+    builders: list[_PickleLiteralRecordBuilder] = []
+    last_literal_index: int | None = None
+
+    def finish_previous_literal(position: int | None) -> None:
+        nonlocal last_literal_index
+        if last_literal_index is None or not isinstance(position, int):
+            return
+        previous = builders[last_literal_index]
+        if position > previous.start:
+            previous.end = position
+        last_literal_index = None
+
+    def pop_value() -> _PickleStackValue:
+        while stack:
+            value = stack.pop()
+            if isinstance(value, _PickleStackValue):
+                return value
+            return unknown
+        return unknown
+
+    def pop_to_mark() -> tuple[_PickleStackValue, ...]:
+        values: list[_PickleStackValue] = []
+        while stack:
+            value = stack.pop()
+            if value is marker:
+                values.reverse()
+                return tuple(values)
+            if isinstance(value, _PickleStackValue):
+                values.append(value)
+        return tuple(reversed(values))
+
+    def push(value: _PickleStackValue) -> None:
+        stack.append(value)
+
+    def push_container(values: tuple[_PickleStackValue, ...]) -> None:
+        push(_pickle_literal_record_value(*values))
+
+    def mark_executable_consumer(value: _PickleStackValue) -> None:
+        for index in value.record_indexes:
+            if 0 <= index < len(builders):
+                builders[index].executable_consumer = True
+
+    def mark_literal_result_consumers(*values: _PickleStackValue) -> None:
+        mark_executable_consumer(_pickle_literal_record_value(*values))
+
     try:
-        operations = list(pickletools.genops(data))
+        for opcode_index, (opcode, arg, position) in enumerate(pickletools.genops(data), start=1):
+            if opcode_index > _PICKLE_LITERAL_RECORD_MAX_OPCODES:
+                return ()
+
+            finish_previous_literal(position)
+            opcode_name = opcode.name
+
+            if opcode_name == "MARK":
+                stack.append(marker)
+                continue
+
+            if opcode_name in _PICKLE_LITERAL_OPCODE_NAMES:
+                literal = _literal_arg_bytes(arg)
+                if literal is None or not isinstance(position, int):
+                    push(unknown)
+                    continue
+                index = len(builders)
+                builders.append(_PickleLiteralRecordBuilder(position, len(data), literal))
+                last_literal_index = index
+                push(_PickleStackValue(text=_literal_arg_text(arg), record_indexes=(index,)))
+                continue
+
+            if opcode_name == "GLOBAL":
+                parts = _global_parts(arg)
+                if parts is None:
+                    push(unknown)
+                else:
+                    module, name = parts
+                    push(_PickleStackValue(text=f"{module}.{name}", global_module=module, global_name=name))
+                continue
+
+            if opcode_name == "STACK_GLOBAL":
+                name_value = pop_value()
+                module_value = pop_value()
+                if module_value.text is None or name_value.text is None:
+                    push(unknown)
+                else:
+                    push(
+                        _PickleStackValue(
+                            text=f"{module_value.text}.{name_value.text}",
+                            global_module=module_value.text,
+                            global_name=name_value.text,
+                        )
+                    )
+                continue
+
+            if opcode_name in {"MEMOIZE", "PUT", "BINPUT", "LONG_BINPUT"}:
+                if stack and isinstance(stack[-1], _PickleStackValue):
+                    memo_index = len(memo) if opcode_name == "MEMOIZE" else _pickle_literal_memo_index(arg)
+                    if memo_index is not None and len(memo) < _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES:
+                        memo[memo_index] = stack[-1]
+                continue
+
+            if opcode_name in {"GET", "BINGET", "LONG_BINGET"}:
+                lookup_index = _pickle_literal_memo_index(arg)
+                push(memo.get(lookup_index, unknown) if lookup_index is not None else unknown)
+                continue
+
+            if opcode_name == "POP":
+                pop_value()
+                continue
+
+            if opcode_name == "POP_MARK":
+                pop_to_mark()
+                continue
+
+            if opcode_name == "DUP":
+                push(stack[-1] if stack and isinstance(stack[-1], _PickleStackValue) else unknown)
+                continue
+
+            if opcode_name in {"EMPTY_TUPLE", "EMPTY_LIST", "EMPTY_DICT", "EMPTY_SET"}:
+                push(unknown)
+                continue
+
+            if opcode_name in {"TUPLE", "LIST", "DICT", "SET", "FROZENSET"}:
+                push_container(pop_to_mark())
+                continue
+
+            if opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
+                arity = int(opcode_name[-1])
+                if len(stack) < arity:
+                    push(unknown)
+                    continue
+                tuple_values = [pop_value() for _ in range(arity)]
+                tuple_values.reverse()
+                push_container(tuple(tuple_values))
+                continue
+
+            if opcode_name == "APPEND":
+                item = pop_value()
+                target = pop_value()
+                push_container((target, item))
+                continue
+
+            if opcode_name == "SETITEM":
+                value = pop_value()
+                key = pop_value()
+                target = pop_value()
+                push_container((target, key, value))
+                continue
+
+            if opcode_name in {"APPENDS", "SETITEMS", "ADDITEMS"}:
+                marked_values = pop_to_mark()
+                target = pop_value() if stack and isinstance(stack[-1], _PickleStackValue) else unknown
+                push_container((target, *marked_values))
+                continue
+
+            if opcode_name == "REDUCE":
+                args = pop_value()
+                callable_value = pop_value()
+                if _pickle_stack_value_is_executable_network_consumer(callable_value):
+                    mark_literal_result_consumers(args)
+                push(unknown)
+                continue
+
+            if opcode_name == "NEWOBJ":
+                args = pop_value()
+                callable_value = pop_value()
+                if _pickle_stack_value_is_executable_network_consumer(callable_value):
+                    mark_literal_result_consumers(args)
+                push(unknown)
+                continue
+
+            if opcode_name == "NEWOBJ_EX":
+                kwargs = pop_value()
+                args = pop_value()
+                callable_value = pop_value()
+                if _pickle_stack_value_is_executable_network_consumer(callable_value):
+                    mark_literal_result_consumers(args, kwargs)
+                push(unknown)
+                continue
+
+            if opcode_name == "OBJ":
+                obj_values = pop_to_mark()
+                if obj_values and _pickle_stack_value_is_executable_network_consumer(obj_values[0]):
+                    mark_literal_result_consumers(*obj_values[1:])
+                push(unknown)
+                continue
+
+            if opcode_name == "INST":
+                inst_values = pop_to_mark()
+                inst_global = unknown
+                parts = _global_parts(arg)
+                if parts is not None:
+                    module, name = parts
+                    inst_global = _PickleStackValue(global_module=module, global_name=name)
+                if _pickle_stack_value_is_executable_network_consumer(inst_global):
+                    mark_literal_result_consumers(*inst_values)
+                push(unknown)
+                continue
+
+            if opcode_name == "BINPERSID":
+                mark_literal_result_consumers(pop_value())
+                push(unknown)
+                continue
+
+            if opcode_name == "PERSID":
+                push(unknown)
+                continue
+
+            if opcode_name == "BUILD":
+                pop_value()
+                continue
+
+            if opcode_name in {
+                "BINBYTES",
+                "BINBYTES8",
+                "BINFLOAT",
+                "BININT",
+                "BININT1",
+                "BININT2",
+                "BYTEARRAY8",
+                "EXT1",
+                "EXT2",
+                "EXT4",
+                "FLOAT",
+                "INT",
+                "LONG",
+                "LONG1",
+                "LONG4",
+                "NEWFALSE",
+                "NEWTRUE",
+                "NEXT_BUFFER",
+                "NONE",
+                "READONLY_BUFFER",
+                "SHORT_BINBYTES",
+            }:
+                push(unknown)
+                continue
+
+            if opcode_name == "STOP":
+                break
+
     except Exception:
         return ()
 
-    records: list[_PickleLiteralRecord] = []
-    for index, (opcode, arg, position) in enumerate(operations):
-        if position is None or opcode.name not in _PICKLE_LITERAL_OPCODE_NAMES:
-            continue
-        literal = _literal_arg_bytes(arg)
-        if literal is None:
-            continue
-        next_position = operations[index + 1][2] if index + 1 < len(operations) else None
-        end_position = next_position if isinstance(next_position, int) and next_position > position else len(data)
-        records.append(_PickleLiteralRecord(position, end_position, literal))
-    return tuple(records)
+    return tuple(
+        _PickleLiteralRecord(
+            builder.start,
+            builder.end,
+            builder.literal,
+            executable_consumer=builder.executable_consumer,
+        )
+        for builder in builders
+    )
 
 
 def _pickle_literal_has_executable_network_context(literal: bytes) -> bool:
@@ -1227,16 +1569,18 @@ def _network_finding_is_inert_pickle_literal_network_evidence(
     if finding_type == "explicit_network_pattern":
         if finding.get("pattern_type") != "url":
             return False
-    elif finding_type != "network_function":
+    elif finding_type not in {"network_function", "network_library"}:
         return False
     position = finding.get("position")
     if not isinstance(position, int):
         return False
     for record in literal_records:
         if record.start <= position < record.end:
+            if record.executable_consumer:
+                return False
             if _pickle_literal_has_executable_network_context(record.literal):
                 return False
-            if finding_type == "network_function":
+            if finding_type in {"network_function", "network_library"}:
                 return _position_is_within_pickle_literal_url_span(data, record, position)
             return True
     return False
@@ -1270,6 +1614,8 @@ def _pickle_literal_url_stripped_scan_view(data: bytes, *, network_functions_onl
         return data
     stripped: bytearray | None = None
     for record in literal_records:
+        if record.executable_consumer:
+            continue
         if _pickle_literal_has_executable_network_context(record.literal):
             continue
         for match in _PICKLE_LITERAL_URL_RE.finditer(data, record.start, record.end):

