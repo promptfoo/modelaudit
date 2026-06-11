@@ -949,6 +949,22 @@ def _hf_safetensors_shard_excluded_by_selection(
     return not selected_format_route_scanner_ids.intersection(safetensors_route_scanner_ids)
 
 
+def _hf_detected_format_excluded_by_selected_route_formats(
+    detected_format: str,
+    selected_route_formats: set[str],
+) -> bool:
+    """Return whether inferred route formats cannot claim a detected route."""
+    normalized_detected_format = str(detected_format).lower()
+    if normalized_detected_format in selected_route_formats:
+        return False
+
+    from ...scanner_selection import scanner_ids_for_detected_format
+
+    selected_route_scanner_ids = _hf_route_scanner_ids_for_formats(frozenset(selected_route_formats))
+    detected_route_scanner_ids = scanner_ids_for_detected_format(normalized_detected_format)
+    return not selected_route_scanner_ids.intersection(detected_route_scanner_ids)
+
+
 def _get_selected_hf_content_route_formats(
     scannable_extensions: Collection[str] | None,
     scannable_filenames: Collection[str] | None,
@@ -960,14 +976,40 @@ def _get_selected_hf_content_route_formats(
     from ...scanner_registry_metadata import EXTENSION_FORMAT_MAP, get_scanner_registry_metadata
 
     content_route_formats = _get_hf_content_route_formats()
-    selected_extensions = (
+    selected_extensions: set[str] = (
         set() if scannable_extensions is None else {str(extension).lower() for extension in scannable_extensions}
     )
     selected_filenames = (
         set() if scannable_filenames is None else {str(filename).lower() for filename in scannable_filenames}
     )
+    for filename in selected_filenames:
+        suffix = PurePosixPath(filename).suffix.lower()
+        if suffix:
+            selected_extensions.add(suffix)
+
+    scanner_metadata = get_scanner_registry_metadata()
+    extension_claimants: dict[str, set[str]] = {extension: set() for extension in selected_extensions if extension}
+    for scanner_id, scanner_info in scanner_metadata.items():
+        remote_excluded_extensions = {
+            str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])
+        }
+        for key in ("extensions", "content_routed_extensions", "scanner_only_extensions"):
+            for extension in scanner_info.get(key, []):
+                extension_text = str(extension).lower()
+                if extension_text in extension_claimants and extension_text not in remote_excluded_extensions:
+                    extension_claimants[extension_text].add(scanner_id)
+
+    selected_extensions = {
+        extension
+        for extension in selected_extensions
+        if extension in EXTENSION_FORMAT_MAP
+        or (
+            len(extension_claimants.get(extension, set())) == 1
+            and bool(extension_claimants.get(extension, set()).intersection(content_route_formats))
+        )
+    }
     selected_formats: set[str] = set()
-    for scanner_id, scanner_info in get_scanner_registry_metadata().items():
+    for scanner_id, scanner_info in scanner_metadata.items():
         remote_excluded_extensions = {
             str(extension).lower() for extension in scanner_info.get("remote_excluded_extensions", [])
         }
@@ -1015,19 +1057,6 @@ def _select_streamable_hf_files(
         selected_route_scanner_ids = {str(scanner_id).lower() for scanner_id in scannable_scanner_ids}.intersection(
             _get_hf_content_route_scanner_ids()
         )
-    elif scannable_filenames:
-        from ...scanner_registry_metadata import EXTENSION_FORMAT_MAP
-
-        authoritative_extensions = (
-            set()
-            if scannable_extensions is None
-            else {
-                str(extension).lower()
-                for extension in scannable_extensions
-                if str(extension).lower() in EXTENSION_FORMAT_MAP
-            }
-        )
-        selected_route_formats = _get_selected_hf_content_route_formats(authoritative_extensions, None)
     else:
         selected_route_formats = _get_selected_hf_content_route_formats(scannable_extensions, scannable_filenames)
     sniff_renamed_files = not include_all_files and (
@@ -1124,7 +1153,10 @@ def _select_streamable_hf_files(
 
                 if not selected_route_scanner_ids.intersection(scanner_ids_for_detected_format(detected_format)):
                     continue
-            elif selected_route_formats is not None and detected_format not in selected_route_formats:
+            elif selected_route_formats is not None and _hf_detected_format_excluded_by_selected_route_formats(
+                detected_format,
+                selected_route_formats,
+            ):
                 continue
             model_files.append(file_name)
             selected_files.add(file_name)
