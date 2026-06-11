@@ -526,7 +526,8 @@ DOCUMENTATION_FENCED_ACTIONABLE_URL_TOKEN_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_URL_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*[rubfRUBF]*[\"'](?P<url>https?://[^\"'\s]+)[\"']",
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*[rubfRUBF]*[\"'](?P<url>https?://[^\"'\s]+)[\"']"
+    rb"(?=[ \t]*(?:#[^\r\n]*)?(?:\r?\n|;|$))",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_URL_REQUEST_ASSIGNMENT_PATTERN = re.compile(
