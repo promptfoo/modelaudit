@@ -333,11 +333,7 @@ _EXECUTABLE_NETWORK_LITERAL_COMMAND_RE = re.compile(
     rb"(?i)(?<![A-Za-z0-9_./-])(?:bash|curl|nc|netcat|pwsh|powershell|sh|wget)(?:\.exe)?(?=$|[\s;&|'\")])"
 )
 _PYTHON_IDENTIFIER_RE = re.compile(rb"[A-Za-z_][A-Za-z0-9_]*")
-_NETWORK_IMPORT_ALIAS_RE = re.compile(
-    rb"(?i)(?<![A-Za-z0-9_.])import\s+"
-    rb"(?P<module>requests|httpx|aiohttp|socket|urllib(?:\.request)?|http\.client)\s+as\s+"
-    rb"(?P<alias>[A-Za-z_][A-Za-z0-9_]*)"
-)
+_NETWORK_IMPORT_STATEMENT_RE = re.compile(rb"(?i)(?<![A-Za-z0-9_.])import\s+(?P<imports>[^;\r\n]+)")
 _NETWORK_FROM_IMPORT_RE = re.compile(
     rb"(?i)(?<![A-Za-z0-9_.])from\s+"
     rb"(?P<module>requests|httpx|aiohttp|socket|urllib\.request|http\.client)\s+import\s+"
@@ -1341,6 +1337,7 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
     unknown = _PickleStackValue()
     stack: list[_PickleStackValue | object] = []
     memo: dict[int, _PickleStackValue] = {}
+    overflow_memo_value = _PickleStackValue()
     builders: list[_PickleLiteralRecordBuilder] = []
     last_literal_index: int | None = None
 
@@ -1388,7 +1385,7 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
 
     def mark_unresolved_records_executable_consumers() -> None:
         stack_values = tuple(value for value in stack if isinstance(value, _PickleStackValue))
-        mark_literal_result_consumers(*stack_values, *memo.values())
+        mark_literal_result_consumers(*stack_values, *memo.values(), overflow_memo_value)
 
     def build_records() -> tuple[_PickleLiteralRecord, ...]:
         return tuple(
@@ -1415,6 +1412,7 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
 
         stack = []
         memo = {}
+        overflow_memo_value = _PickleStackValue()
         stream_builder_start = len(builders)
         stream_complete = False
         saw_opcode = False
@@ -1473,13 +1471,23 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
                 if opcode_name in {"MEMOIZE", "PUT", "BINPUT", "LONG_BINPUT"}:
                     if stack and isinstance(stack[-1], _PickleStackValue):
                         memo_index = len(memo) if opcode_name == "MEMOIZE" else _pickle_literal_memo_index(arg)
-                        if memo_index is not None and len(memo) < _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES:
-                            memo[memo_index] = stack[-1]
+                        if memo_index is not None:
+                            if memo_index in memo or len(memo) < _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES:
+                                memo[memo_index] = stack[-1]
+                            else:
+                                overflow_memo_value = _pickle_literal_record_value(overflow_memo_value, stack[-1])
                     continue
 
                 if opcode_name in {"GET", "BINGET", "LONG_BINGET"}:
                     lookup_index = _pickle_literal_memo_index(arg)
-                    push(memo.get(lookup_index, unknown) if lookup_index is not None else unknown)
+                    if lookup_index is None:
+                        push(unknown)
+                    elif lookup_index in memo:
+                        push(memo[lookup_index])
+                    elif overflow_memo_value.record_indexes:
+                        push(overflow_memo_value)
+                    else:
+                        push(unknown)
                     continue
 
                 if opcode_name == "POP":
@@ -1666,13 +1674,17 @@ def _pickle_network_from_import_aliases(context: bytes) -> set[bytes]:
 
 def _pickle_network_module_import_aliases(context: bytes) -> dict[bytes, tuple[bytes, ...]]:
     aliases: dict[bytes, tuple[bytes, ...]] = {}
-    for match in _NETWORK_IMPORT_ALIAS_RE.finditer(context):
-        module = match.group("module").lower()
-        alias = match.group("alias").lower()
-        call_names = _NETWORK_IMPORTABLE_MODULE_CALLS.get(module)
-        if call_names is None or _PYTHON_IDENTIFIER_RE.fullmatch(alias) is None:
-            continue
-        aliases[alias] = call_names
+    for match in _NETWORK_IMPORT_STATEMENT_RE.finditer(context):
+        for raw_import in match.group("imports").split(b","):
+            words = raw_import.strip().split()
+            if len(words) < 3 or words[1].lower() != b"as":
+                continue
+            module = words[0].strip(b"()").lower()
+            alias = words[2].strip(b"()").lower()
+            call_names = _NETWORK_IMPORTABLE_MODULE_CALLS.get(module)
+            if call_names is None or _PYTHON_IDENTIFIER_RE.fullmatch(alias) is None:
+                continue
+            aliases[alias] = call_names
     return aliases
 
 
@@ -1772,6 +1784,35 @@ def executable_pickle_literal_network_findings(
                 }
             )
     return findings
+
+
+def _network_finding_dedupe_key(finding: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        finding.get("type"),
+        finding.get("pattern_type"),
+        finding.get("matched_text"),
+        finding.get("position"),
+    )
+
+
+def unique_network_findings(
+    findings: list[dict[str, Any]],
+    *,
+    existing_findings: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    seen = {_network_finding_dedupe_key(finding) for finding in existing_findings or []}
+    unique_findings: list[dict[str, Any]] = []
+    for finding in findings:
+        key = _network_finding_dedupe_key(finding)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_findings.append(finding)
+    return unique_findings
+
+
+def extend_unique_network_findings(findings: list[dict[str, Any]], additions: list[dict[str, Any]]) -> None:
+    findings.extend(unique_network_findings(additions, existing_findings=findings))
 
 
 def filter_inert_pickle_literal_network_findings(
@@ -3538,12 +3579,13 @@ class PickleScanner(BaseScanner):
                 result=result,
             )
             network_findings = filter_inert_pickle_literal_network_findings(network_findings, expensive_data)
-            network_findings.extend(
+            extend_unique_network_findings(
+                network_findings,
                 executable_pickle_literal_network_findings(
                     expensive_data,
                     context=source,
                     position_offset=position_offset,
-                )
+                ),
             )
             self.add_network_communication_findings(network_findings, result, context=source)
         else:

@@ -41,7 +41,9 @@ from .pickle_scanner import (
     PickleScanner,
     _pickle_literal_url_stripped_scan_view,
     executable_pickle_literal_network_findings,
+    extend_unique_network_findings,
     filter_inert_pickle_literal_network_findings,
+    unique_network_findings,
 )
 from .picklescan_adapter import apply_pickle_member_context
 from .pytorch_zip_support import (
@@ -2137,8 +2139,9 @@ class PyTorchZipScanner(BaseScanner):
                             result=result,
                         )
                         network_findings = filter_inert_pickle_literal_network_findings(network_findings, file_data)
-                        network_findings.extend(
-                            executable_pickle_literal_network_findings(file_data, context=f"{path}:{name}")
+                        extend_unique_network_findings(
+                            network_findings,
+                            executable_pickle_literal_network_findings(file_data, context=f"{path}:{name}"),
                         )
                         all_network_findings.extend(network_findings)
 
@@ -2212,7 +2215,10 @@ class PyTorchZipScanner(BaseScanner):
                 all_network_findings or (not entry_limit_exceeded and not raw_member_coverage_incomplete)
             ):
                 self.add_network_communication_findings(
-                    all_network_findings,
+                    unique_network_findings(
+                        all_network_findings,
+                        existing_findings=[issue.details for issue in result.issues if isinstance(issue.details, dict)],
+                    ),
                     result,
                     context=path,
                 )

