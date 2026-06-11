@@ -572,6 +572,7 @@ class _PickleStackValue:
     global_module: str | None = None
     global_name: str | None = None
     opaque_extension: bool = False
+    build_state_consumer: bool = False
 
 
 @dataclass(frozen=True)
@@ -1308,6 +1309,24 @@ def _pickle_stack_value_is_executable_network_consumer(value: _PickleStackValue)
     return lowered_name in _EXECUTABLE_PICKLE_GLOBAL_NAMES
 
 
+def _pickle_stack_value_is_build_state_consumer(value: _PickleStackValue) -> bool:
+    if value.build_state_consumer or _pickle_stack_value_is_executable_network_consumer(value):
+        return True
+    if value.global_module is None or value.global_name is None:
+        return False
+    return value.global_module.strip() == "__main__"
+
+
+def _pickle_constructed_object_value(callable_value: _PickleStackValue) -> _PickleStackValue:
+    return _PickleStackValue(
+        text=callable_value.text,
+        global_module=callable_value.global_module,
+        global_name=callable_value.global_name,
+        opaque_extension=callable_value.opaque_extension,
+        build_state_consumer=_pickle_stack_value_is_build_state_consumer(callable_value),
+    )
+
+
 def _documentation_literal_spans(data: bytes) -> tuple[tuple[int, int], ...]:
     spans: list[tuple[int, int]] = []
     for record in _pickle_literal_records(data):
@@ -1517,7 +1536,7 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
                     callable_value = pop_value()
                     if _pickle_stack_value_is_executable_network_consumer(callable_value):
                         mark_literal_result_consumers(args)
-                    push(unknown)
+                    push(_pickle_constructed_object_value(callable_value))
                     continue
 
                 if opcode_name == "NEWOBJ":
@@ -1525,7 +1544,7 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
                     callable_value = pop_value()
                     if _pickle_stack_value_is_executable_network_consumer(callable_value):
                         mark_literal_result_consumers(args)
-                    push(unknown)
+                    push(_pickle_constructed_object_value(callable_value))
                     continue
 
                 if opcode_name == "NEWOBJ_EX":
@@ -1534,14 +1553,15 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
                     callable_value = pop_value()
                     if _pickle_stack_value_is_executable_network_consumer(callable_value):
                         mark_literal_result_consumers(args, kwargs)
-                    push(unknown)
+                    push(_pickle_constructed_object_value(callable_value))
                     continue
 
                 if opcode_name == "OBJ":
                     obj_values = pop_to_mark()
-                    if obj_values and _pickle_stack_value_is_executable_network_consumer(obj_values[0]):
+                    callable_value = obj_values[0] if obj_values else unknown
+                    if _pickle_stack_value_is_executable_network_consumer(callable_value):
                         mark_literal_result_consumers(*obj_values[1:])
-                    push(unknown)
+                    push(_pickle_constructed_object_value(callable_value))
                     continue
 
                 if opcode_name == "INST":
@@ -1553,7 +1573,7 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
                         inst_global = _PickleStackValue(global_module=module, global_name=name)
                     if _pickle_stack_value_is_executable_network_consumer(inst_global):
                         mark_literal_result_consumers(*inst_values)
-                    push(unknown)
+                    push(_pickle_constructed_object_value(inst_global))
                     continue
 
                 if opcode_name == "BINPERSID":
@@ -1566,7 +1586,10 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
                     continue
 
                 if opcode_name == "BUILD":
-                    mark_literal_result_consumers(pop_value())
+                    state = pop_value()
+                    target = stack[-1] if stack and isinstance(stack[-1], _PickleStackValue) else unknown
+                    if _pickle_stack_value_is_build_state_consumer(target):
+                        mark_literal_result_consumers(state)
                     continue
 
                 if opcode_name in {"EXT1", "EXT2", "EXT4"}:

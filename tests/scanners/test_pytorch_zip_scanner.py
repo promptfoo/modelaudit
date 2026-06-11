@@ -4,6 +4,7 @@ import pickle
 import stat
 import struct
 import time
+import types
 import warnings
 import zipfile
 import zlib
@@ -8281,6 +8282,18 @@ def test_pytorch_zip_allows_url_literal_in_safe_reducer_without_critical_s310(tm
 
     result = PyTorchZipScanner().scan(str(model_path))
 
+    assert not any(issue.rule_code == "S310" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_pytorch_zip_allows_benign_build_url_state_without_critical_s310(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "simple-namespace-url.pt", with_pickle=False, prefix="archive")
+    payload = pickle.dumps(types.SimpleNamespace(url="https://ultralytics.com/license"), protocol=4)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
     assert not any(issue.rule_code == "S310" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 

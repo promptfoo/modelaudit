@@ -5,6 +5,7 @@ import io
 import os
 import pickle
 import pickletools
+import types
 from pathlib import Path
 from typing import Any
 
@@ -1862,6 +1863,15 @@ def test_scan_stream_keeps_build_url_state_actionable() -> None:
         for issue in result.issues
     )
     assert any(issue.rule_code == "S309" and issue.details.get("type") == "url_detected" for issue in result.issues)
+
+
+def test_scan_stream_allows_benign_build_url_state_without_critical_s310() -> None:
+    payload = pickle.dumps(types.SimpleNamespace(url="https://ultralytics.com/license"), protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="simple-namespace-url.pkl")
+
+    assert result.success is True
+    assert not any(issue.rule_code == "S310" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_scan_stream_allows_url_literal_in_safe_reducer_without_critical_s310() -> None:
