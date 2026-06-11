@@ -332,11 +332,15 @@ def _huggingface_stream_preview_needs_content_route_budget(runtime: "_ScanRuntim
 
 
 def _huggingface_stream_preview_budget_files(
-    files: object,
+    metadata: dict[str, Any],
     selected_files: list[dict[str, Any]],
     runtime: "_ScanRuntimeConfig",
 ) -> list[dict[str, Any]]:
     """Return stream dry-run files whose metadata sizes must count toward max-size."""
+    if runtime.hf_stream_include_all_files:
+        return _huggingface_preview_stream_selection_files(metadata, runtime)
+
+    files = metadata.get("files", [])
     if not _huggingface_stream_preview_needs_content_route_budget(runtime):
         return selected_files
 
@@ -370,6 +374,16 @@ def _huggingface_preview_stream_files(metadata: dict[str, Any], runtime: "_ScanR
     files = metadata.get("files", [])
     if runtime.scanner_selection_metadata is not None and runtime.scannable_extensions is None:
         return _selected_huggingface_preview_files(files, runtime)
+
+    return _huggingface_preview_stream_selection_files(metadata, runtime)
+
+
+def _huggingface_preview_stream_selection_files(
+    metadata: dict[str, Any],
+    runtime: "_ScanRuntimeConfig",
+) -> list[dict[str, Any]]:
+    """Return metadata entries selected by the streaming downloader without content probes."""
+    files = metadata.get("files", [])
 
     file_names = _huggingface_preview_file_names(files)
     repo_id = str(metadata.get("repo_id") or metadata.get("model_id") or "unknown")
@@ -607,7 +621,7 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
     if runtime.scanner_selection_metadata is None and not runtime.scan_and_delete and not download_files:
         raise ValueError("No metadata-routed ModelAudit-scannable Hugging Face files found; refusing dry-run")
     budget_files = (
-        _huggingface_stream_preview_budget_files(files, selected_files, runtime)
+        _huggingface_stream_preview_budget_files(metadata, selected_files, runtime)
         if runtime.scan_and_delete
         else (download_files or selected_files)
     )
