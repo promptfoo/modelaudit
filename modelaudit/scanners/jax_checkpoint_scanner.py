@@ -812,11 +812,25 @@ class JaxCheckpointScanner(BaseScanner):
         return False
 
     @staticmethod
+    def _stat_mode(path_stat: os.stat_result) -> int:
+        return int(getattr(path_stat, "st_mode", 0) or 0)
+
+    @classmethod
+    def _is_regular_file(cls, path_stat: os.stat_result) -> bool:
+        return stat.S_ISREG(cls._stat_mode(path_stat))
+
+    @classmethod
+    def _is_directory(cls, path_stat: os.stat_result) -> bool:
+        return stat.S_ISDIR(cls._stat_mode(path_stat))
+
+    @staticmethod
     def _is_link_like_entry(path_stat: os.stat_result) -> bool:
         """Return whether an entry is a symlink or Windows reparse point."""
         reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
         file_attributes = getattr(path_stat, "st_file_attributes", 0) or 0
-        return stat.S_ISLNK(path_stat.st_mode) or bool(reparse_flag and file_attributes & reparse_flag)
+        return stat.S_ISLNK(JaxCheckpointScanner._stat_mode(path_stat)) or bool(
+            reparse_flag and file_attributes & reparse_flag
+        )
 
     @classmethod
     def _has_regular_orbax_sibling_marker(cls, path: Path) -> bool:
@@ -829,7 +843,7 @@ class JaxCheckpointScanner(BaseScanner):
                 marker_stat = marker_path.lstat()
             except (FileNotFoundError, OSError):
                 continue
-            if not cls._is_link_like_entry(marker_stat) and stat.S_ISREG(marker_stat.st_mode):
+            if not cls._is_link_like_entry(marker_stat) and cls._is_regular_file(marker_stat):
                 return True
         return False
 
@@ -842,16 +856,16 @@ class JaxCheckpointScanner(BaseScanner):
         _file_size, prefix = snapshot
         return cls._BOUNDED_ORBAX_RESTORE_FN_KEY_RE.search(prefix) is not None
 
-    @staticmethod
-    def _regular_file_matches_snapshot(current_stat: os.stat_result, expected_stat: os.stat_result) -> bool:
-        return stat.S_ISREG(current_stat.st_mode) and all(
+    @classmethod
+    def _regular_file_matches_snapshot(cls, current_stat: os.stat_result, expected_stat: os.stat_result) -> bool:
+        return cls._is_regular_file(current_stat) and all(
             getattr(current_stat, field) == getattr(expected_stat, field)
             for field in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
         )
 
-    @staticmethod
-    def _directory_matches_snapshot(current_stat: os.stat_result, expected_stat: os.stat_result) -> bool:
-        return stat.S_ISDIR(current_stat.st_mode) and all(
+    @classmethod
+    def _directory_matches_snapshot(cls, current_stat: os.stat_result, expected_stat: os.stat_result) -> bool:
+        return cls._is_directory(current_stat) and all(
             getattr(current_stat, field) == getattr(expected_stat, field)
             for field in ("st_dev", "st_ino", "st_mode", "st_mtime_ns", "st_ctime_ns")
         )
@@ -938,7 +952,7 @@ class JaxCheckpointScanner(BaseScanner):
                 continue
             except OSError:
                 return None
-            if cls._is_link_like_entry(marker_stat) or not stat.S_ISREG(marker_stat.st_mode):
+            if cls._is_link_like_entry(marker_stat) or not cls._is_regular_file(marker_stat):
                 return None
             return True
 
@@ -950,7 +964,7 @@ class JaxCheckpointScanner(BaseScanner):
         except OSError:
             return None
         if checkpoint_stat is not None:
-            if cls._is_link_like_entry(checkpoint_stat) or not stat.S_ISREG(checkpoint_stat.st_mode):
+            if cls._is_link_like_entry(checkpoint_stat) or not cls._is_regular_file(checkpoint_stat):
                 return None
             checkpoint_probe = cls._probe_numbered_checkpoint_file(checkpoint_path, checkpoint_stat)
             if checkpoint_probe is not False:
@@ -993,7 +1007,7 @@ class JaxCheckpointScanner(BaseScanner):
             # resolves containment before the deferred owner scan.
             return True
         if metadata_stat is not None:
-            if not stat.S_ISREG(metadata_stat.st_mode):
+            if not cls._is_regular_file(metadata_stat):
                 return True
             metadata_probe = _probe_jax_json_checkpoint_file_state(metadata_path)
             try:
@@ -1033,9 +1047,9 @@ class JaxCheckpointScanner(BaseScanner):
             if entry.name == "checkpoint":
                 return True
             if cls._ORBAX_NUMBERED_CHECKPOINT_ENTRY_RE.fullmatch(entry.name):
-                if stat.S_ISREG(entry_stat.st_mode):
+                if cls._is_regular_file(entry_stat):
                     checkpoint_probe = cls._probe_numbered_checkpoint_file(entry, entry_stat)
-                elif stat.S_ISDIR(entry_stat.st_mode):
+                elif cls._is_directory(entry_stat):
                     checkpoint_probe = cls._probe_numbered_checkpoint_directory(entry, entry_stat)
                 else:
                     return True
@@ -1047,7 +1061,7 @@ class JaxCheckpointScanner(BaseScanner):
             # Broad prefixes such as ``model_`` are common in ordinary model
             # repositories. Preserve non-numbered legacy checkpoint files only
             # when their bounded contents independently identify JAX/pickle.
-            if stat.S_ISREG(entry_stat.st_mode):
+            if cls._is_regular_file(entry_stat):
                 checkpoint_probe = cls._probe_numbered_checkpoint_file(entry, entry_stat)
                 if checkpoint_probe is None:
                     return True
@@ -1390,7 +1404,7 @@ class JaxCheckpointScanner(BaseScanner):
                     error=e,
                 )
                 continue
-            if not stat.S_ISREG(metadata_stat.st_mode):
+            if not self._is_regular_file(metadata_stat):
                 self._add_orbax_metadata_read_failure(
                     result=result,
                     metadata_path=metadata_path,

@@ -194,7 +194,7 @@ def test_directory_owner_snapshot_ignores_directory_link_count_drift() -> None:
     )
 
 
-def test_windows_reparse_attribute_none_is_treated_as_absent() -> None:
+def test_windows_missing_reparse_attributes_and_mode_are_treated_as_absent() -> None:
     plain_directory_stat = cast(
         os.stat_result,
         SimpleNamespace(
@@ -217,6 +217,31 @@ def test_windows_reparse_attribute_none_is_treated_as_absent() -> None:
 
     assert entry.entry_type == "directory"
     assert not tf_savedmodel_scanner._is_link_like(plain_directory_stat)
+    assert not JaxCheckpointScanner._is_link_like_entry(plain_directory_stat)
+
+    unknown_mode_stat = cast(
+        os.stat_result,
+        SimpleNamespace(
+            st_dev=1,
+            st_ino=2,
+            st_mode=None,
+            st_size=3,
+            st_mtime_ns=4,
+            st_ctime_ns=5,
+            st_nlink=1,
+            st_file_attributes=None,
+        ),
+    )
+    unknown_entry = core_module._directory_owner_snapshot_entry(
+        Path("unknown-mode"),
+        (),
+        entry_stat=unknown_mode_stat,
+    )
+
+    assert unknown_entry.entry_type == "other"
+    assert unknown_entry.mode == 0
+    assert not tf_savedmodel_scanner._is_link_like(unknown_mode_stat)
+    assert not JaxCheckpointScanner._is_link_like_entry(unknown_mode_stat)
 
 
 def _mock_weight_distribution_scanner_availability(monkeypatch: pytest.MonkeyPatch) -> None:

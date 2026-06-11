@@ -394,6 +394,10 @@ class _DirectoryOwnerSnapshotLimitError(RuntimeError):
     """Raised when a logical-owner namespace exceeds its bounded inventory."""
 
 
+def _directory_owner_stat_mode(entry_stat: os.stat_result) -> int:
+    return int(getattr(entry_stat, "st_mode", 0) or 0)
+
+
 def _directory_owner_snapshot_entry(
     entry_path: Path,
     relative_parts: tuple[str, ...],
@@ -404,22 +408,23 @@ def _directory_owner_snapshot_entry(
     """Capture a lexical entry without following a symlink or reparse point."""
     if entry_stat is None:
         entry_stat = entry_path.lstat()
+    entry_mode = _directory_owner_stat_mode(entry_stat)
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     file_attributes = getattr(entry_stat, "st_file_attributes", 0) or 0
-    is_link = stat.S_ISLNK(entry_stat.st_mode) or bool(reparse_flag and file_attributes & reparse_flag)
+    is_link = stat.S_ISLNK(entry_mode) or bool(reparse_flag and file_attributes & reparse_flag)
     if is_link:
         entry_type = "link"
-    elif stat.S_ISREG(entry_stat.st_mode):
+    elif stat.S_ISREG(entry_mode):
         entry_type = "file"
-    elif stat.S_ISDIR(entry_stat.st_mode):
+    elif stat.S_ISDIR(entry_mode):
         entry_type = "directory"
-    elif stat.S_ISFIFO(entry_stat.st_mode):
+    elif stat.S_ISFIFO(entry_mode):
         entry_type = "fifo"
-    elif stat.S_ISSOCK(entry_stat.st_mode):
+    elif stat.S_ISSOCK(entry_mode):
         entry_type = "socket"
-    elif stat.S_ISCHR(entry_stat.st_mode):
+    elif stat.S_ISCHR(entry_mode):
         entry_type = "character_device"
-    elif stat.S_ISBLK(entry_stat.st_mode):
+    elif stat.S_ISBLK(entry_mode):
         entry_type = "block_device"
     else:
         entry_type = "other"
@@ -433,7 +438,7 @@ def _directory_owner_snapshot_entry(
         entry_type=entry_type,
         device=entry_stat.st_dev,
         inode=entry_stat.st_ino,
-        mode=entry_stat.st_mode,
+        mode=entry_mode,
         size=entry_stat.st_size,
         mtime_ns=entry_stat.st_mtime_ns,
         ctime_ns=entry_stat.st_ctime_ns,
@@ -457,8 +462,8 @@ def _bound_directory_owner_scan_path(root_path: Path) -> Iterator[str]:
     try:
         root_stat = os.fstat(root_descriptor)
         if (
-            not stat.S_ISDIR(expected_root_stat.st_mode)
-            or not stat.S_ISDIR(root_stat.st_mode)
+            not stat.S_ISDIR(_directory_owner_stat_mode(expected_root_stat))
+            or not stat.S_ISDIR(_directory_owner_stat_mode(root_stat))
             or not _directory_owner_snapshot_stat_matches(root_stat, expected_root_stat)
         ):
             raise OSError("Directory owner root changed before owner dispatch")
@@ -466,7 +471,7 @@ def _bound_directory_owner_scan_path(root_path: Path) -> Iterator[str]:
         for descriptor_root in (Path("/proc/self/fd") / str(root_descriptor), Path("/dev/fd") / str(root_descriptor)):
             with suppress(OSError):
                 descriptor_stat = descriptor_root.stat()
-                if stat.S_ISDIR(descriptor_stat.st_mode) and _directory_owner_snapshot_stat_matches(
+                if stat.S_ISDIR(_directory_owner_stat_mode(descriptor_stat)) and _directory_owner_snapshot_stat_matches(
                     descriptor_stat,
                     root_stat,
                 ):
@@ -494,7 +499,7 @@ def _directory_owner_snapshot_stat_matches(
 ) -> bool:
     """Return whether one lexical entry kept the same no-follow identity."""
     identity_fields: tuple[str, ...] = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
-    if not (stat.S_ISDIR(current.st_mode) and stat.S_ISDIR(expected.st_mode)):
+    if not (stat.S_ISDIR(_directory_owner_stat_mode(current)) and stat.S_ISDIR(_directory_owner_stat_mode(expected))):
         identity_fields = (*identity_fields, "st_nlink")
     return all(getattr(current, field) == getattr(expected, field) for field in identity_fields)
 
@@ -518,8 +523,8 @@ def _capture_directory_owner_namespace_by_descriptor(
     root_descriptor = os.open(root_path, directory_flags)
     root_stat = os.fstat(root_descriptor)
     if (
-        not stat.S_ISDIR(expected_root_stat.st_mode)
-        or not stat.S_ISDIR(root_stat.st_mode)
+        not stat.S_ISDIR(_directory_owner_stat_mode(expected_root_stat))
+        or not stat.S_ISDIR(_directory_owner_stat_mode(root_stat))
         or not _directory_owner_snapshot_stat_matches(root_stat, expected_root_stat)
     ):
         os.close(root_descriptor)
@@ -563,14 +568,15 @@ def _capture_directory_owner_namespace_by_descriptor(
             entry_stat = lexical_entry.stat(follow_symlinks=False)
             reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
             file_attributes = getattr(entry_stat, "st_file_attributes", 0) or 0
-            is_link = stat.S_ISLNK(entry_stat.st_mode) or bool(reparse_flag and file_attributes & reparse_flag)
+            entry_mode = _directory_owner_stat_mode(entry_stat)
+            is_link = stat.S_ISLNK(entry_mode) or bool(reparse_flag and file_attributes & reparse_flag)
             raw_link_target: str | None = None
             if is_link and os.readlink in os.supports_dir_fd:
                 with suppress(OSError):
                     raw_link_target = os.readlink(lexical_entry.name, dir_fd=directory_descriptor)
 
             entry_path = root_path.joinpath(*relative_parts)
-            if stat.S_ISDIR(entry_stat.st_mode) or owner_class.directory_owner_source_in_scope(relative_parts):
+            if stat.S_ISDIR(entry_mode) or owner_class.directory_owner_source_in_scope(relative_parts):
                 snapshot.append(
                     _directory_owner_snapshot_entry(
                         entry_path,
@@ -580,7 +586,7 @@ def _capture_directory_owner_namespace_by_descriptor(
                     )
                 )
 
-            if not stat.S_ISDIR(entry_stat.st_mode) or is_link:
+            if not stat.S_ISDIR(entry_mode) or is_link:
                 continue
 
             child_descriptor = os.open(
@@ -626,7 +632,7 @@ def _capture_directory_owner_namespace(
         )
 
     root_stat = root_path.lstat()
-    if not stat.S_ISDIR(root_stat.st_mode):
+    if not stat.S_ISDIR(_directory_owner_stat_mode(root_stat)):
         raise OSError("Directory owner root is not a regular directory")
     snapshot = [_directory_owner_snapshot_entry(root_path, (), entry_stat=root_stat)]
     entries_seen = 0
@@ -651,13 +657,12 @@ def _capture_directory_owner_namespace(
                 entry_stat = entry_path.lstat()
                 reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
                 file_attributes = getattr(entry_stat, "st_file_attributes", 0) or 0
-                is_link = stat.S_ISLNK(entry_stat.st_mode) or bool(reparse_flag and file_attributes & reparse_flag)
-                if stat.S_ISDIR(entry_stat.st_mode) and not is_link:
+                entry_mode = _directory_owner_stat_mode(entry_stat)
+                is_link = stat.S_ISLNK(entry_mode) or bool(reparse_flag and file_attributes & reparse_flag)
+                if stat.S_ISDIR(entry_mode) and not is_link:
                     child_directories.append((entry_path, relative_parts, entry_stat))
 
-                if not (
-                    stat.S_ISDIR(entry_stat.st_mode) or owner_class.directory_owner_source_in_scope(relative_parts)
-                ):
+                if not (stat.S_ISDIR(entry_mode) or owner_class.directory_owner_source_in_scope(relative_parts)):
                     continue
                 snapshot.append(
                     _directory_owner_snapshot_entry(

@@ -191,17 +191,29 @@ def _regular_file_identity(file_stat: os.stat_result) -> tuple[int, int, int, in
     return (
         file_stat.st_dev,
         file_stat.st_ino,
-        file_stat.st_mode,
+        _stat_mode(file_stat),
         file_stat.st_size,
         file_stat.st_mtime_ns,
         file_stat.st_ctime_ns,
     )
 
 
+def _stat_mode(file_stat: os.stat_result) -> int:
+    return int(getattr(file_stat, "st_mode", 0) or 0)
+
+
+def _is_regular_file(file_stat: os.stat_result) -> bool:
+    return stat.S_ISREG(_stat_mode(file_stat))
+
+
+def _is_directory(file_stat: os.stat_result) -> bool:
+    return stat.S_ISDIR(_stat_mode(file_stat))
+
+
 def _is_link_like(file_stat: os.stat_result) -> bool:
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     file_attributes = getattr(file_stat, "st_file_attributes", 0) or 0
-    return stat.S_ISLNK(file_stat.st_mode) or bool(reparse_flag and file_attributes & reparse_flag)
+    return stat.S_ISLNK(_stat_mode(file_stat)) or bool(reparse_flag and file_attributes & reparse_flag)
 
 
 @contextlib.contextmanager
@@ -215,8 +227,8 @@ def _open_bound_regular_file(path: Path, expected_stat: os.stat_result) -> Itera
         opened_stat = os.fstat(descriptor)
         if (
             _is_link_like(expected_stat)
-            or not stat.S_ISREG(expected_stat.st_mode)
-            or not stat.S_ISREG(opened_stat.st_mode)
+            or not _is_regular_file(expected_stat)
+            or not _is_regular_file(opened_stat)
             or _regular_file_identity(opened_stat) != _regular_file_identity(expected_stat)
         ):
             raise OSError("file identity changed before bounded read")
@@ -834,7 +846,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
             expected_stat = path_obj.lstat()
         except OSError as error:
             return self._finish_read_failure(result, path, error)
-        if _is_link_like(expected_stat) or not stat.S_ISREG(expected_stat.st_mode):
+        if _is_link_like(expected_stat) or not _is_regular_file(expected_stat):
             return self._finish_read_failure(result, path, OSError("SavedModel source is not a regular file"))
         file_size = expected_stat.st_size
         result.metadata["file_size"] = file_size
@@ -1005,7 +1017,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         ):
                             text_path = Path(file_path)
                             text_stat = text_path.lstat()
-                            if _is_link_like(text_stat) or not stat.S_ISREG(text_stat.st_mode):
+                            if _is_link_like(text_stat) or not _is_regular_file(text_stat):
                                 raise OSError("blacklist source is not a regular file")
                             with _open_bound_regular_file(text_path, text_stat) as f:
                                 content_sample = f.read(_MAX_SAVEDMODEL_TEXT_SCAN_BYTES + 1)
@@ -1114,7 +1126,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 )
                 continue
 
-            if not stat.S_ISDIR(assets_dir_stat.st_mode):
+            if not _is_directory(assets_dir_stat):
                 continue
 
             for root, dir_names, files in os.walk(assets_dir):
@@ -1167,7 +1179,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         )
                         continue
 
-                    if stat.S_ISDIR(child_stat.st_mode):
+                    if _is_directory(child_stat):
                         retained_dirs.append(dir_name)
 
                 dir_names[:] = retained_dirs
@@ -1224,15 +1236,13 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 )
                 continue
 
-            if child_path.name in _CORE_ROOT_MODEL_FILES and stat.S_ISREG(child_stat.st_mode):
+            if child_path.name in _CORE_ROOT_MODEL_FILES and _is_regular_file(child_stat):
                 continue
-            if child_path.name in _CORE_ROOT_ASSET_DIRS and (
-                stat.S_ISDIR(child_stat.st_mode) or _is_link_like(child_stat)
-            ):
+            if child_path.name in _CORE_ROOT_ASSET_DIRS and (_is_directory(child_stat) or _is_link_like(child_stat)):
                 continue
-            if child_path.name in _CORE_ROOT_MODEL_DIRS and stat.S_ISDIR(child_stat.st_mode):
+            if child_path.name in _CORE_ROOT_MODEL_DIRS and _is_directory(child_stat):
                 continue
-            if stat.S_ISDIR(child_stat.st_mode):
+            if _is_directory(child_stat):
                 self._scan_saved_model_supplemental_directory(model_root, child_path, result)
                 continue
 
@@ -1295,7 +1305,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     )
                     continue
 
-                if stat.S_ISDIR(child_stat.st_mode):
+                if _is_directory(child_stat):
                     retained_dirs.append(dir_name)
 
             dir_names[:] = retained_dirs
@@ -1391,7 +1401,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 rule_code="S902",
             )
             return []
-        if not stat.S_ISREG(file_stat.st_mode):
+        if not _is_regular_file(file_stat):
             result.add_check(
                 name=check_name,
                 passed=False,
@@ -1992,7 +2002,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
         try:
             path_obj = Path(path)
             expected_stat = path_obj.lstat()
-            if _is_link_like(expected_stat) or not stat.S_ISREG(expected_stat.st_mode):
+            if _is_link_like(expected_stat) or not _is_regular_file(expected_stat):
                 raise OSError("Keras metadata source is not a regular file")
             with _open_bound_regular_file(path_obj, expected_stat) as f:
                 content = f.read(_MAX_KERAS_METADATA_PARSE_BYTES + 1)
