@@ -55,7 +55,9 @@ def _build_large_pickle_payload(seed: int) -> dict[str, Any]:
 def _create_release_candidate_repository(root: Path) -> Path:
     root.mkdir()
     create_safe_pickle(root / "model.pkl", data=_build_large_pickle_payload(0))
-    create_mock_pytorch_zip(root / "weights.pt", data=_build_large_pickle_payload(1))
+    weights_payload = _build_large_pickle_payload(1)
+    weights_payload["model"]["metadata"]["version"] = "benchmark-release"
+    create_mock_pytorch_zip(root / "weights.pt", data=weights_payload)
     create_mock_manifest(
         root / "manifest.json",
         content={
