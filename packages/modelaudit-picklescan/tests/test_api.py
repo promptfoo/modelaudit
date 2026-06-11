@@ -3066,6 +3066,7 @@ def test_scan_bytes_allows_benign_security_documentation_strings() -> None:
         "https://example.invalid/reference/requests.get(url)",
         "https://example.invalid/reference/httpx.get(url)",
         "https://example.invalid/path?x=1&handler=requests.get(url)",
+        "https://example.invalid/path?x=1&handler=os.system(cmd)",
         "https://github.com/example/project/blob/main/loader.py",
     ],
 )

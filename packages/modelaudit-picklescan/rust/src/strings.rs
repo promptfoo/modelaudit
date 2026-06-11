@@ -219,6 +219,7 @@ fn is_http_url_byte(byte: u8) -> bool {
                 | b'@'
                 | b'!'
                 | b'$'
+                | b'&'
                 | b'*'
                 | b'+'
                 | b'='
@@ -1413,6 +1414,10 @@ mod tests {
             suspicious_string_matches("https://example.invalid/api/subprocess.run(args)")
                 .is_empty()
         );
+        assert!(suspicious_string_matches(
+            "https://example.invalid/path?x=1&handler=os.system(cmd)"
+        )
+        .is_empty());
         assert!(suspicious_string_matches("__reduce__ is a pickle protocol hook").is_empty());
     }
 
