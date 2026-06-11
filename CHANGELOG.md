@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - suppress installed source-trusted inert Hugging Face training metadata and safe NumPy RNG-state reconstruction noise while keeping default-install, unresolved, rebound, or shadowed PyTorch ZIP framework metadata suspicious unless trusted source can be inspected
+- exclude Hugging Face local-dir cache sidecars from scan inventory, routing, issue locations, and SBOM components while preserving hidden artifact scanning
 - keep strongly identified SentencePiece tokenizer `.model` artifacts, including custom-unknown models with disabled special tokens, out of XGBoost routing while preserving fail-closed `.model` ambiguity for malformed tails.
 - tolerate picklescan reports that omit private metadata
 - stream bounded Llamafile runtime coverage across preview gaps and report incomplete runtime reads or bounds

@@ -3,6 +3,7 @@
 import hashlib
 import itertools
 import logging
+import math
 import os
 import stat
 import tempfile
@@ -100,6 +101,7 @@ from modelaudit.utils.file.detection import (
     XML_MODEL_INCONCLUSIVE_FORMAT,
     _is_malformed_sentencepiece_model_proto_candidate_file,
     detect_file_format,
+    detect_file_format_for_skip_filter,
     detect_file_format_from_magic,
     detect_flax_msgpack_overlap_routes,
     detect_format_from_extension,
@@ -194,6 +196,17 @@ determine_exit_code = core_results.determine_exit_code
 merge_scan_result = core_results.merge_scan_result
 
 HEADER_FORMAT_TO_SCANNER_ID = _registry.get_header_format_to_scanner_ids()
+_HF_DOWNLOAD_METADATA_MAX_BYTES = 64 * 1024
+_HF_DOWNLOAD_GIT_BOOKKEEPING_MAX_BYTES = 64 * 1024
+_HF_HUB_GIT_BOOKKEEPING_MAX_BYTES = 64 * 1024
+_HF_CACHE_REF_MAX_BYTES = 4096
+_HF_CACHEDIR_TAG_MAX_BYTES = 4096
+_HF_CACHEDIR_TAG_CONTENT = (
+    "Signature: 8a477f597d28d172789f06886806bc55\n"
+    "# This file is a cache directory tag created by huggingface_hub.\n"
+    "# For information about cache directory tags, see:\n"
+    "#\thttps://bford.info/cachedir/\n"
+)
 
 
 def _record_dvc_output_limit_incomplete(
@@ -263,10 +276,14 @@ def _dvc_omitted_outputs_covered_by_directory_walk(
                 file_path = os.path.join(root, filename)
                 if _is_huggingface_cache_file(file_path):
                     continue
-                if skip_file_types and should_skip_file(
-                    file_path,
-                    metadata_scanner_available=metadata_scanner_available,
-                    scanner_selection_extensions=scanner_selection_extensions,
+                if (
+                    skip_file_types
+                    and should_skip_file(
+                        file_path,
+                        metadata_scanner_available=metadata_scanner_available,
+                        scanner_selection_extensions=scanner_selection_extensions,
+                    )
+                    and not _preserve_hf_download_sidecar_asset(file_path, scanner_selection_extensions)
                 ):
                     continue
                 try:
@@ -304,6 +321,7 @@ _DVC_SCAN_BUDGET_EXHAUSTED_REASON = "dvc_scan_budget_exhausted"
 _DVC_DIRECTORY_WALK_FAILED_REASON = "dvc_directory_walk_failed"
 _DVC_DIRECTORY_SYMLINK_UNSCANNED_REASON = "dvc_directory_symlink_unscanned"
 _DVC_DIRECTORY_SPECIAL_FILE_UNSCANNED_REASON = "dvc_directory_special_file_unscanned"
+_DIRECTORY_SPECIAL_FILE_UNSCANNED_REASON = "directory_special_file_unscanned"
 _MAX_DVC_DIRECTORY_COVERAGE_GAPS = 100
 _DVC_PARENT_FILE_CONFIG_KEY = "_dvc_parent_file"
 _DVC_REMAINING_TOTAL_SIZE_CONFIG_KEY = "_dvc_remaining_total_size"
@@ -370,6 +388,29 @@ def _record_incomplete_dvc_scan_budget(
             "budget_type": budget_type,
             "limit": limit,
         },
+    )
+
+
+def _record_directory_special_file_unscanned(
+    results: ModelAuditResultModel,
+    scan_metadata: dict[str, Any],
+    file_path: str,
+) -> None:
+    """Fail closed when a directory entry is not a regular file."""
+    scan_metadata["success"] = False
+    scan_metadata["has_operational_errors"] = True
+    _add_issue_to_model(
+        results,
+        "Special directory entry could not be scanned",
+        severity=IssueSeverity.INFO.value,
+        location=file_path,
+        details={
+            "analysis_incomplete": True,
+            "operational_error": True,
+            "scan_outcome": "inconclusive",
+            "scan_outcome_reason": _DIRECTORY_SPECIAL_FILE_UNSCANNED_REASON,
+        },
+        issue_type=_DIRECTORY_SPECIAL_FILE_UNSCANNED_REASON,
     )
 
 
@@ -2114,6 +2155,13 @@ def _is_directory_link(path: Path) -> bool:
     return False
 
 
+def _stat_is_windows_reparse_point(stat_result: os.stat_result) -> bool:
+    """Return whether a stat result reports a Windows reparse-point entry."""
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(stat_result, "st_file_attributes", 0)
+    return bool(reparse_flag and file_attributes & reparse_flag)
+
+
 def _resolve_directory_scan_target(
     file_path: Path,
     base_dir: Path,
@@ -2126,6 +2174,9 @@ def _resolve_directory_scan_target(
     """Resolve a directory entry and reject symlink traversal outside the scan root."""
     is_symlink = file_path.is_symlink()
     try:
+        entry_stat = file_path.lstat()
+        if not is_symlink and _stat_is_windows_reparse_point(entry_stat):
+            raise OSError("Windows reparse point cannot be safely scanned")
         # Strict resolution of valid relative file symlinks is unreliable on
         # some Windows versions. Resolve once and verify that target directly.
         resolved_file = file_path.resolve()
@@ -2582,6 +2633,10 @@ def scan_model_directory_or_file(
                         continue
                     if not resolved_file.is_file() and record_dvc_directory_special_file(file_path_obj):
                         continue
+                    if not resolved_file.is_file():
+                        aggregate_hash_complete = False
+                        _record_directory_special_file_unscanned(results, scan_metadata, file_path)
+                        continue
                     snapshot_path = Path(file_path).absolute()
                     snapshot_shard_family_key = _shard_family_key_for_path(str(snapshot_path))
                     route_hf_shard_alias = (
@@ -2591,10 +2646,14 @@ def scan_model_directory_or_file(
 
                     # Skip non-model files early if filtering is enabled
                     # Note: skip_file_types parameter already contains the correct value
-                    if skip_file_types and should_skip_file(
-                        file_path,
-                        metadata_scanner_available=metadata_scanner_available,
-                        scanner_selection_extensions=scanner_selection_extensions,
+                    if (
+                        skip_file_types
+                        and should_skip_file(
+                            file_path,
+                            metadata_scanner_available=metadata_scanner_available,
+                            scanner_selection_extensions=scanner_selection_extensions,
+                        )
+                        and not _preserve_hf_download_sidecar_asset(file_path, scanner_selection_extensions)
                     ):
                         filename_lower = Path(file_path).name.lower()
                         if filename_lower in LICENSE_FILES:
@@ -3630,25 +3689,138 @@ def scan_model_directory_or_file(
 # _should_skip_file has been moved to utils.file_filter module
 
 
-def _is_hf_hub_bookkeeping_path(path_obj: Path) -> bool:
-    """Return True for files stored under known HuggingFace hub bookkeeping directories."""
+def _bookkeeping_stat_size(stat_result: os.stat_result, max_bytes: int) -> int | None:
+    if _stat_is_windows_reparse_point(stat_result):
+        return None
+    if not stat.S_ISREG(stat_result.st_mode):
+        return None
+    if stat_result.st_nlink != 1:
+        return None
+    if stat_result.st_size > max_bytes:
+        return None
+    return stat_result.st_size
+
+
+def _same_bookkeeping_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return all(
+        getattr(left, field) == getattr(right, field)
+        for field in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+    )
+
+
+def _read_regular_bookkeeping_text(path_obj: Path, max_bytes: int) -> str | None:
+    """Read a bounded regular bookkeeping file without following symlinks."""
+    try:
+        before_stat = path_obj.lstat()
+    except OSError:
+        return None
+    if _bookkeeping_stat_size(before_stat, max_bytes) is None:
+        return None
+
+    fd: int | None = None
+    try:
+        fd = os.open(path_obj, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened_stat = os.fstat(fd)
+        if not _same_bookkeeping_identity(before_stat, opened_stat):
+            return None
+        if _bookkeeping_stat_size(opened_stat, max_bytes) is None:
+            return None
+
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 8192))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw_content = b"".join(chunks)
+        if len(raw_content) > max_bytes:
+            return None
+
+        after_stat = os.fstat(fd)
+        if not _same_bookkeeping_identity(opened_stat, after_stat):
+            return None
+        return raw_content.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    finally:
+        if fd is not None:
+            with suppress(OSError):
+                os.close(fd)
+
+
+def _has_scannable_bookkeeping_format(path_obj: Path) -> bool:
+    try:
+        return detect_file_format_for_skip_filter(str(path_obj)) != "unknown"
+    except (OSError, ValueError, RecursionError):
+        return True
+
+
+def _hf_cache_relative_parts(path_obj: Path) -> tuple[Path, tuple[str, ...]] | None:
     hf_cache_root = _find_hf_cache_root(path_obj)
     if hf_cache_root is None:
-        return False
+        return None
 
     try:
         relative_parts = _resolve_hf_cache_path(path_obj).relative_to(hf_cache_root).parts
     except ValueError:
+        return None
+    return hf_cache_root, relative_parts
+
+
+def _is_hf_no_exist_marker(path_obj: Path) -> bool:
+    """Return True only for empty Hugging Face negative-cache markers."""
+    cache_parts = _hf_cache_relative_parts(path_obj)
+    if cache_parts is None:
+        return False
+    _hf_cache_root, relative_parts = cache_parts
+    if not relative_parts or relative_parts[0] != ".no_exist":
+        return False
+    return _regular_bookkeeping_file_size(path_obj, 0) == 0
+
+
+def _is_hf_ref_file(path_obj: Path) -> bool:
+    """Return True for bounded Hugging Face ref files containing a commit digest."""
+    cache_parts = _hf_cache_relative_parts(path_obj)
+    if cache_parts is None:
+        return False
+    _hf_cache_root, relative_parts = cache_parts
+    if not relative_parts or relative_parts[0] != "refs":
+        return False
+    content = _read_regular_bookkeeping_text(path_obj, _HF_CACHE_REF_MAX_BYTES)
+    if content is None:
+        return False
+    lines = content.splitlines()
+    return len(lines) == 1 and _is_hex_digest(lines[0].strip())
+
+
+def _is_hf_hub_bookkeeping_path(path_obj: Path) -> bool:
+    """Return True for bounded benign files under known Hugging Face hub cache directories."""
+    cache_parts = _hf_cache_relative_parts(path_obj)
+    if cache_parts is None:
+        return False
+    _hf_cache_root, relative_parts = cache_parts
+    if not relative_parts or relative_parts[0] not in {"snapshots", "blobs"}:
         return False
 
-    return bool(relative_parts and relative_parts[0] in {"snapshots", "blobs", "refs"})
+    filename = path_obj.name
+    if filename.endswith(".lock"):
+        return _regular_bookkeeping_file_size(path_obj, 0) == 0
+    if filename.endswith(".metadata"):
+        content = _read_regular_bookkeeping_text(path_obj, _HF_DOWNLOAD_METADATA_MAX_BYTES)
+        return content is not None and _is_hf_download_metadata_text(content)
+    if filename in {".gitignore", ".gitattributes"}:
+        content = _read_regular_bookkeeping_text(path_obj, _HF_HUB_GIT_BOOKKEEPING_MAX_BYTES)
+        return content is not None and "\x00" not in content and not _has_scannable_bookkeeping_format(path_obj)
+    return False
 
 
 def _is_hf_download_bookkeeping_path(path_obj: Path) -> bool:
     """Return True for files stored in HuggingFace download bookkeeping directories."""
     import os
 
-    resolved_parent = _resolve_hf_cache_path(path_obj.parent)
+    resolved_path = _resolve_hf_cache_path(path_obj)
     configured_download_roots = {
         _resolve_hf_cache_path(root.parent / "download")
         for root in _get_hf_cache_roots()
@@ -3657,40 +3829,134 @@ def _is_hf_download_bookkeeping_path(path_obj: Path) -> bool:
     hf_home = os.environ.get("HF_HOME")
     if hf_home:
         configured_download_roots.add(_resolve_hf_cache_path(Path(hf_home) / "download"))
-    if resolved_parent in configured_download_roots:
-        return True
+    for download_root in configured_download_roots:
+        try:
+            resolved_path.relative_to(download_root)
+        except ValueError:
+            continue
+        return _is_benign_local_hf_download_bookkeeping_file(
+            path_obj,
+            download_root=download_root,
+            require_existing_target=False,
+            allow_git_bookkeeping=True,
+        )
 
     # Local snapshot downloads keep bookkeeping under the downloaded model
     # directory rather than the global cache root.
-    parts = resolved_parent.parts
-    if len(parts) < 3 or tuple(part.lower() for part in parts[-3:]) != (".cache", "huggingface", "download"):
+    local_download_root = _find_local_hf_download_root(path_obj)
+    if local_download_root is None:
         return False
 
-    local_model_root = resolved_parent.parents[2]
+    local_model_root = local_download_root.parents[2]
     try:
         has_local_model_assets = any(child.is_file() for child in local_model_root.iterdir() if child.name != ".cache")
     except OSError:
         return False
-    return has_local_model_assets and _is_benign_local_hf_download_bookkeeping_file(path_obj)
+    return _is_benign_local_hf_download_bookkeeping_file(
+        path_obj,
+        download_root=local_download_root,
+        require_existing_target=True,
+        allow_git_bookkeeping=has_local_model_assets,
+    )
 
 
-def _is_benign_local_hf_download_bookkeeping_file(path_obj: Path) -> bool:
+def _find_local_hf_download_root(path_obj: Path) -> Path | None:
+    """Return the local `.cache/huggingface/download` root containing a sidecar path."""
+    resolved_parent = _resolve_hf_cache_path(path_obj.parent)
+    parts = resolved_parent.parts
+    for index in range(0, len(parts) - 2):
+        if tuple(part.lower() for part in parts[index : index + 3]) == (".cache", "huggingface", "download"):
+            return Path(*resolved_parent.parts[: index + 3])
+    return None
+
+
+def _is_hex_digest(value: str) -> bool:
+    if len(value) not in {40, 64}:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_hf_download_metadata_text(content: str) -> bool:
+    """Return True for huggingface_hub local-dir download metadata files."""
+    lines = content.splitlines()
+    if len(lines) != 3:
+        return False
+
+    commit_hash, etag, timestamp = lines
+    if not (_is_hex_digest(commit_hash) and _is_hex_digest(etag)):
+        return False
+    try:
+        timestamp_value = float(timestamp)
+    except ValueError:
+        return False
+    return math.isfinite(timestamp_value) and timestamp_value >= 0
+
+
+def _download_sidecar_target_exists(path_obj: Path, download_root: Path) -> bool:
+    """Return whether a local-dir sidecar maps to a real downloaded model file."""
+    filename = path_obj.name
+    if filename.endswith(".metadata"):
+        target_name = filename[: -len(".metadata")]
+    elif filename.endswith(".lock"):
+        target_name = filename[: -len(".lock")]
+    else:
+        return False
+
+    try:
+        relative_parent = _resolve_hf_cache_path(path_obj.parent).relative_to(download_root)
+    except ValueError:
+        return False
+
+    local_model_root = download_root.parents[2]
+    return (local_model_root / relative_parent / target_name).is_file()
+
+
+def _regular_bookkeeping_file_size(path_obj: Path, max_bytes: int) -> int | None:
+    """Return regular-file size for HF bookkeeping candidates without following symlinks."""
+    try:
+        stat_result = path_obj.lstat()
+    except OSError:
+        return None
+    return _bookkeeping_stat_size(stat_result, max_bytes)
+
+
+def _is_benign_local_hf_download_bookkeeping_file(
+    path_obj: Path,
+    *,
+    download_root: Path,
+    require_existing_target: bool,
+    allow_git_bookkeeping: bool,
+) -> bool:
     """Return True only for local download bookkeeping files that do not look scannable."""
-    import json
-
     filename = path_obj.name
     try:
-        if detect_file_format(str(path_obj)) != "unknown":
+        max_size = _HF_DOWNLOAD_METADATA_MAX_BYTES
+        if filename in {".gitignore", ".gitattributes"}:
+            max_size = _HF_DOWNLOAD_GIT_BOOKKEEPING_MAX_BYTES
+        file_size = _regular_bookkeeping_file_size(path_obj, max_size)
+        if file_size is None:
             return False
         if filename.endswith(".lock"):
-            return path_obj.stat().st_size == 0
+            if require_existing_target and not _download_sidecar_target_exists(path_obj, download_root):
+                return False
+            return file_size == 0
         if filename.endswith(".metadata"):
-            with path_obj.open(encoding="utf-8") as handle:
-                return isinstance(json.load(handle), dict)
+            if require_existing_target and not _download_sidecar_target_exists(path_obj, download_root):
+                return False
+            content = _read_regular_bookkeeping_text(path_obj, _HF_DOWNLOAD_METADATA_MAX_BYTES)
+            if content is None:
+                return False
+            return _is_hf_download_metadata_text(content)
         if filename in {".gitignore", ".gitattributes"}:
-            content = path_obj.read_text(encoding="utf-8")
-            return "\x00" not in content and len(content) <= 64 * 1024
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            if not allow_git_bookkeeping:
+                return False
+            content = _read_regular_bookkeeping_text(path_obj, _HF_DOWNLOAD_GIT_BOOKKEEPING_MAX_BYTES)
+            return content is not None and "\x00" not in content and not _has_scannable_bookkeeping_format(path_obj)
+    except (OSError, UnicodeDecodeError, RecursionError, ValueError):
         return False
     return False
 
@@ -3707,25 +3973,24 @@ def _is_huggingface_cache_file(path: str) -> bool:
     """
     import os
 
+    path_obj = Path(path)
+    if _path_has_part(path_obj, ".no_exist") and _is_hf_no_exist_marker(path_obj):
+        return True
+
     filename = os.path.basename(path)
-    if not (filename.endswith((".lock", ".metadata")) or filename in {".gitignore", ".gitattributes", "main", "HEAD"}):
+    if not (
+        filename.endswith((".lock", ".metadata"))
+        or filename in {".gitignore", ".gitattributes", "main", "HEAD", "CACHEDIR.TAG"}
+    ):
         return False
 
     # Only trust bookkeeping-shaped filenames when they actually live in a
     # recognized HuggingFace cache layout.
-    path_obj = Path(path)
+    if filename == "CACHEDIR.TAG":
+        return _is_hf_cachedir_tag(path_obj)
 
     if filename in ["main", "HEAD"]:
-        hf_cache_root = _find_hf_cache_root(path_obj)
-        if hf_cache_root is None:
-            return False
-
-        try:
-            relative_parts = _resolve_hf_cache_path(path_obj).relative_to(hf_cache_root).parts
-        except ValueError:
-            return False
-
-        return bool(relative_parts and relative_parts[0] == "refs")
+        return _is_hf_ref_file(path_obj)
 
     is_hf_bookkeeping_path = _is_hf_hub_bookkeeping_path(path_obj) or _is_hf_download_bookkeeping_path(path_obj)
     if filename.endswith((".lock", ".metadata")):
@@ -3739,6 +4004,51 @@ def _is_huggingface_cache_file(path: str) -> bool:
         return is_hf_bookkeeping_path
 
     return False
+
+
+def _is_hf_cachedir_tag(path_obj: Path) -> bool:
+    """Return True for Hugging Face's cache-directory tag file."""
+    try:
+        resolved_parent = _resolve_hf_cache_path(path_obj.parent)
+        parent_parts = tuple(part.lower() for part in resolved_parent.parts[-2:])
+        if parent_parts != (".cache", "huggingface"):
+            return False
+        content = _read_regular_bookkeeping_text(path_obj, _HF_CACHEDIR_TAG_MAX_BYTES)
+        if content is None:
+            return False
+    except OSError:
+        return False
+    return content == _HF_CACHEDIR_TAG_CONTENT
+
+
+def _has_hf_download_metadata_sidecar(path: str) -> bool:
+    """Return whether a local file is backed by benign Hugging Face download metadata."""
+    path_obj = Path(path)
+    if _find_local_hf_download_root(path_obj) is not None:
+        return False
+
+    for local_root in path_obj.parents:
+        download_root = local_root / ".cache" / "huggingface" / "download"
+        if not download_root.is_dir():
+            continue
+        try:
+            relative_path = path_obj.relative_to(local_root)
+        except ValueError:
+            continue
+        metadata_path = download_root / relative_path.with_name(f"{relative_path.name}.metadata")
+        if metadata_path.is_file() and _is_huggingface_cache_file(str(metadata_path)):
+            return True
+    return False
+
+
+def _preserve_hf_download_sidecar_asset(
+    path: str,
+    scanner_selection_extensions: frozenset[str] | None,
+) -> bool:
+    """Return whether HF local-dir metadata should keep a skipped file in the inventory."""
+    if scanner_selection_extensions is not None:
+        return False
+    return _has_hf_download_metadata_sidecar(path)
 
 
 @cached_scan()
@@ -4959,7 +5269,7 @@ def scan_model_streaming(
                 break
 
             try:
-                if is_hf_cache and _is_huggingface_cache_file(str(source_path)):
+                if base_dir is not None and _is_huggingface_cache_file(str(source_path)):
                     logger.debug(f"Skipping HuggingFace cache file: {source_path}")
                     continue
 
@@ -4977,6 +5287,24 @@ def scan_model_streaming(
                     if resolved_path is None:
                         continue
                     scan_path = resolved_path
+                    if not scan_path.is_file():
+                        aggregate_hash_complete = False
+                        preserve_shard_reconciliation_errors = True
+                        results.has_errors = True
+                        _add_issue_to_model(
+                            results,
+                            "Special directory entry could not be scanned",
+                            severity=IssueSeverity.INFO.value,
+                            location=str(source_path),
+                            details={
+                                "analysis_incomplete": True,
+                                "operational_error": True,
+                                "scan_outcome": "inconclusive",
+                                "scan_outcome_reason": _DIRECTORY_SPECIAL_FILE_UNSCANNED_REASON,
+                            },
+                            issue_type=_DIRECTORY_SPECIAL_FILE_UNSCANNED_REASON,
+                        )
+                        continue
 
                 # Build config before skip filtering so bin-first OpenVINO
                 # sidecars can wait for their selected XML owner.
@@ -5013,6 +5341,7 @@ def scan_model_streaming(
                         metadata_scanner_available=metadata_scanner_available,
                         scanner_selection_extensions=scanner_selection_extensions,
                     )
+                    and not _preserve_hf_download_sidecar_asset(str(source_path), scanner_selection_extensions)
                 ):
                     filename_lower = source_path.name.lower()
                     if filename_lower in LICENSE_FILES:
