@@ -68,6 +68,13 @@ def _add_tar_bytes(tar: tarfile.TarFile, name: str, payload: bytes) -> None:
     tar.addfile(info, io.BytesIO(payload))
 
 
+def _build_nemo_tar_bytes(config_bytes: bytes, *, mode: _NemoTarWriteMode = "w:gz") -> bytes:
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode=mode) as tar:
+        _add_tar_bytes(tar, "model_config.yaml", config_bytes)
+    return archive.getvalue()
+
+
 def _materialize_tmp_paths(value: Any, tmp_path: Path) -> Any:
     """Replace fixture path markers without relying on host-global temp paths."""
     if isinstance(value, str) and value.startswith(_TMP_PATH_MARKER):
@@ -206,6 +213,166 @@ class TestNemoScannerBasic:
             check.details.get("extension_format") == "nemo" and check.details.get("header_format") == "gzip"
             for check in s901_checks
         )
+
+    def test_concatenated_gzip_nemo_fails_closed_after_tar_eof(self, tmp_path: Path) -> None:
+        """A second gzip member after TAR EOF must not be hidden by direct NeMo ownership."""
+        path = tmp_path / "concat.nemo"
+        path.write_bytes(
+            _build_nemo_tar_bytes(b"model:\n  _target_: nemo.Model\n")
+            + _build_nemo_tar_bytes(b"model:\n  _target_: os.system\n  command: echo pwned\n")
+        )
+
+        direct_result = scan_file(str(path), config={"cache_scan_results": False})
+        aggregate_result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        integrity_checks = [
+            check
+            for check in direct_result.checks
+            if check.name == "Compressed TAR Stream Integrity" and check.status == CheckStatus.FAILED
+        ]
+        assert direct_result.scanner_name == "nemo"
+        assert direct_result.success is False
+        assert integrity_checks
+        assert integrity_checks[0].rule_code == "S902"
+        assert "non-zero trailing data" in integrity_checks[0].message
+        assert aggregate_result.success is False
+        assert determine_exit_code(aggregate_result) == 2
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            cached_aggregate = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            assert cached_aggregate.success is False
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_concatenated_gzip_nemo_raw_member_fails_closed_after_tar_eof(self, tmp_path: Path) -> None:
+        """A non-TAR gzip member after TAR EOF must not be hidden by direct NeMo ownership."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": "nemo.Model"}}, mode="w:gz")
+        path.write_bytes(path.read_bytes() + gzip.compress(_build_malicious_pickle()))
+
+        direct_result = scan_file(str(path), config={"cache_scan_results": False})
+        aggregate_result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+        integrity_checks = [
+            check
+            for check in direct_result.checks
+            if check.name == "Compressed TAR Stream Integrity" and check.status == CheckStatus.FAILED
+        ]
+        assert file_detection.validate_file_type(str(path)) is False
+        assert direct_result.scanner_name == "nemo"
+        assert direct_result.success is False
+        assert integrity_checks
+        assert integrity_checks[0].rule_code == "S902"
+        assert "non-zero trailing data" in integrity_checks[0].message
+        assert aggregate_result.success is False
+        assert determine_exit_code(aggregate_result) != 0
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            cached_aggregate = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            assert cached_aggregate.success is False
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_concatenated_gzip_nemo_detects_nonzero_tail_after_zero_padding(self, tmp_path: Path) -> None:
+        """Post-EOF validation must not stop before hidden non-zero gzip member data."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": "nemo.Model"}}, mode="w:gz")
+        path.write_bytes(path.read_bytes() + gzip.compress((b"\0" * (64 * 1024 + 1)) + _build_malicious_pickle()))
+
+        result = scan_file(
+            str(path),
+            config={
+                "cache_scan_results": False,
+                "compressed_max_decompressed_bytes": 2 * 1024 * 1024,
+                "compressed_max_decompression_ratio": 100000.0,
+            },
+        )
+
+        integrity_checks = [
+            check
+            for check in result.checks
+            if check.name == "Compressed TAR Stream Integrity" and check.status == CheckStatus.FAILED
+        ]
+        assert result.scanner_name == "nemo"
+        assert result.success is False
+        assert integrity_checks
+        assert integrity_checks[0].rule_code == "S902"
+        assert "non-zero trailing data" in integrity_checks[0].message
+
+    def test_zero_tail_gzip_nemo_fails_closed_when_post_eof_tail_exceeds_limit(self, tmp_path: Path) -> None:
+        """All-zero post-EOF gzip data is still incomplete when policy limits prevent full validation."""
+        path = _create_nemo_file(tmp_path, {"model": {"_target_": "nemo.Model"}}, mode="w:gz")
+        path.write_bytes(path.read_bytes() + gzip.compress(b"\0" * (128 * 1024)))
+
+        result = scan_file(
+            str(path),
+            config={
+                "cache_scan_results": False,
+                "compressed_max_decompressed_bytes": 64 * 1024,
+                "compressed_max_decompression_ratio": 100000.0,
+            },
+        )
+
+        integrity_checks = [
+            check
+            for check in result.checks
+            if check.name == "Compressed TAR Stream Integrity" and check.status == CheckStatus.FAILED
+        ]
+        assert result.scanner_name == "nemo"
+        assert result.success is False
+        assert integrity_checks
+        assert integrity_checks[0].rule_code == "S902"
+        assert "could not be fully validated" in integrity_checks[0].message
+
+    def test_truncated_gzip_nemo_fails_closed_after_tar_eof(self, tmp_path: Path) -> None:
+        """A readable TAR prefix is not enough when the outer gzip stream is incomplete."""
+        path = tmp_path / "truncated.nemo"
+        payload = _build_nemo_tar_bytes(b"model:\n  _target_: nemo.Model\n")
+        path.write_bytes(payload[:-1])
+
+        result = scan_file(str(path), config={"cache_scan_results": False})
+
+        integrity_checks = [
+            check
+            for check in result.checks
+            if check.name == "Compressed TAR Stream Integrity" and check.status == CheckStatus.FAILED
+        ]
+        assert result.scanner_name == "nemo"
+        assert result.success is False
+        assert integrity_checks
+        assert integrity_checks[0].rule_code == "S902"
+        assert "could not be fully validated" in integrity_checks[0].message
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            cached_aggregate = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            assert cached_aggregate.success is False
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
 
     def test_missing_yaml_dependency_is_reported_as_warning(self, tmp_path, monkeypatch):
         """Missing PyYAML should be a non-passing warning, not a pass."""

@@ -65,6 +65,7 @@ _TensorFlowProtoRoute = Literal[
     "inconclusive",
 ]
 _TensorFlowOuterHint = Literal["unknown", "tf_metagraph", "tf_savedmodel"]
+_GzipTarTrailingStatus = Literal["invalid", "nonzero"]
 _TORCH7_SIGNATURE_READ_BYTES = 4096
 _TORCH7_ASCII_HEADER_MAX_LINE_BYTES = 4096
 _LIGHTGBM_SIGNATURE_READ_BYTES = 8192
@@ -173,6 +174,9 @@ _TAR_USTAR_MAGIC_SIZE = 5
 _TAR_USTAR_MIN_BYTES = _TAR_USTAR_OFFSET + _TAR_USTAR_MAGIC_SIZE
 _TAR_CHECKSUM_OFFSET = 148
 _TAR_CHECKSUM_SIZE = 8
+_TAR_GZIP_POST_EOF_TRAILING_READ_BYTES = 64 * 1024
+_TAR_GZIP_DEFAULT_MAX_TRAILING_DECOMPRESSED_BYTES = 512 * 1024 * 1024
+_TAR_GZIP_DEFAULT_MAX_TRAILING_DECOMPRESSION_RATIO = 250.0
 _TAR_NUMERIC_FIELD_SLICES = (
     (100, 108),  # mode
     (108, 116),  # uid
@@ -3793,6 +3797,97 @@ def _resolve_tar_hardlink_fallback_member(
     return None
 
 
+def _normalize_positive_int(value: Any, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return default
+    return normalized if normalized > 0 else default
+
+
+def _normalize_positive_float(value: Any, default: float) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError):
+        return default
+    return normalized if normalized > 0 else default
+
+
+def _gzip_tar_trailing_data_status(
+    path: Path,
+    *,
+    max_decompressed_bytes: int | None = None,
+    max_decompression_ratio: float | None = None,
+) -> _GzipTarTrailingStatus | None:
+    """Return proven gzip TAR stream-tail status after the TAR EOF padding."""
+    decompressed_limit = _normalize_positive_int(
+        max_decompressed_bytes,
+        _TAR_GZIP_DEFAULT_MAX_TRAILING_DECOMPRESSED_BYTES,
+    )
+    ratio_limit = _normalize_positive_float(
+        max_decompression_ratio,
+        _TAR_GZIP_DEFAULT_MAX_TRAILING_DECOMPRESSION_RATIO,
+    )
+    try:
+        compressed_size = path.stat().st_size
+        with path.open("rb") as raw:
+            if raw.read(len(_GZIP_MAGIC)) != _GZIP_MAGIC:
+                return None
+            raw.seek(0)
+            with tarfile.open(fileobj=raw, mode="r:gz") as archive:
+                archive.getmembers()
+                trailing_size = 0
+                while True:
+                    trailing = archive.fileobj.read(_TAR_GZIP_POST_EOF_TRAILING_READ_BYTES)
+                    if not trailing:
+                        return None
+                    if any(byte != 0 for byte in trailing):
+                        return "nonzero"
+
+                    trailing_size += len(trailing)
+                    if trailing_size > decompressed_limit:
+                        return "invalid"
+                    if compressed_size > 0 and trailing_size / compressed_size > ratio_limit:
+                        return "invalid"
+    except (EOFError, OSError, tarfile.TarError, zlib.error):
+        return "invalid"
+
+
+def has_gzip_tar_nonzero_trailing_data(
+    path: str,
+    *,
+    max_decompressed_bytes: int | None = None,
+    max_decompression_ratio: float | None = None,
+) -> bool:
+    """Return whether a gzip TAR has non-zero trailing data after archive EOF."""
+    return (
+        gzip_tar_trailing_data_status(
+            path,
+            max_decompressed_bytes=max_decompressed_bytes,
+            max_decompression_ratio=max_decompression_ratio,
+        )
+        == "nonzero"
+    )
+
+
+def gzip_tar_trailing_data_status(
+    path: str,
+    *,
+    max_decompressed_bytes: int | None = None,
+    max_decompression_ratio: float | None = None,
+) -> _GzipTarTrailingStatus | None:
+    """Return proven gzip TAR stream-tail status after archive EOF."""
+    return _gzip_tar_trailing_data_status(
+        Path(path),
+        max_decompressed_bytes=max_decompressed_bytes,
+        max_decompression_ratio=max_decompression_ratio,
+    )
+
+
 def _detect_tar_route(path: str) -> str | None:
     """Return the safe content route for a valid TAR-backed artifact."""
     file_path = Path(path)
@@ -3945,7 +4040,10 @@ def is_nemo_archive(path: str) -> bool:
 def _is_tar_archive(path: str) -> bool:
     """Return whether a path is a TAR archive, including compressed wrappers."""
     try:
-        return tarfile.is_tarfile(path)
+        if not tarfile.is_tarfile(path):
+            return False
+        file_path = Path(path)
+        return _gzip_tar_trailing_data_status(file_path) is None
     except Exception:
         return False
 

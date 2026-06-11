@@ -92,6 +92,7 @@ from modelaudit.utils.file.detection import (
     detect_mxnet_symbol_content_route,
     detect_pytorch_binary_supplemental_format,
     detect_xgboost_ubjson_content_route,
+    gzip_tar_trailing_data_status,
     is_executorch_archive,
     is_keras_zip_archive,
     is_pytorch_zip_archive,
@@ -149,6 +150,7 @@ logger = logging.getLogger("modelaudit.core")
 _add_asset_to_results = core_results.add_asset_to_results
 _add_error_asset_to_results = core_results.add_error_asset_to_results
 _DIRECTORY_PRECOUNT_CHILD_LIMIT = 1000
+_COMPRESSED_TAR_STREAM_INCOMPLETE_REASON = "tar_compressed_stream_incomplete"
 
 
 def _count_immediate_children_up_to(path: Path, limit: int) -> int:
@@ -3810,6 +3812,20 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         except OSError as e:
             file_type_valid = True
             format_probe_error = e
+    gzip_tar_trailing_status = (
+        gzip_tar_trailing_data_status(
+            path,
+            max_decompressed_bytes=config.get("compressed_max_decompressed_bytes"),
+            max_decompression_ratio=config.get("compressed_max_decompression_ratio"),
+        )
+        if (
+            format_probe_error is None
+            and ext == ".nemo"
+            and magic_format == "gzip"
+            and header_format in {"gzip", "nemo", "tar"}
+        )
+        else None
+    )
     discrepancy_msg = None
 
     if not file_type_valid:
@@ -3924,7 +3940,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             elif use_large_handler:
                 logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
                 result = scan_large_file(path, scanner, progress_callback, timeout)
-            elif is_xgboost_pickle_spoof:
+            elif is_xgboost_pickle_spoof or (scanner_id == "nemo" and gzip_tar_trailing_status is not None):
                 result = scanner.scan(path)
             else:
                 result = scanner.scan_with_cache(path)
@@ -3992,7 +4008,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 elif use_large_handler:
                     logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
                     result = scan_large_file(path, scanner, progress_callback, timeout)
-                elif unavailable_preferred_scanner_id is not None or is_xgboost_pickle_spoof:
+                elif (
+                    unavailable_preferred_scanner_id is not None
+                    or is_xgboost_pickle_spoof
+                    or (scanner_class.name == "nemo" and gzip_tar_trailing_status is not None)
+                ):
                     result = scanner.scan(path)
                 else:
                     result = scanner.scan_with_cache(path)
@@ -4126,6 +4146,29 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     if is_xgboost_pickle_spoof:
         _mark_xgboost_pickle_extension_spoof(result, path, ext)
+
+    if gzip_tar_trailing_status is not None and result.scanner_name == "nemo":
+        has_integrity_check = any(
+            check.name == "Compressed TAR Stream Integrity" and check.rule_code == "S902" for check in result.checks
+        )
+        if not has_integrity_check:
+            integrity_message = (
+                "Compressed TAR stream contains non-zero trailing data after archive EOF"
+                if gzip_tar_trailing_status == "nonzero"
+                else "Compressed TAR stream could not be fully validated after archive EOF"
+            )
+            result.add_check(
+                name="Compressed TAR Stream Integrity",
+                passed=False,
+                message=integrity_message,
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={"compression": "gzip", "stream_tail_status": gzip_tar_trailing_status},
+                rule_code="S902",
+            )
+            _mark_inconclusive_scan_outcome(result, _COMPRESSED_TAR_STREAM_INCOMPLETE_REASON)
+            _mark_operational_scan_error(result, _COMPRESSED_TAR_STREAM_INCOMPLETE_REASON)
+            result.success = False
 
     if (
         skipped_preferred_scanner_id == "flax_msgpack"
