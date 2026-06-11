@@ -16,7 +16,7 @@ import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 import click
 from pydantic import TypeAdapter
@@ -101,6 +101,7 @@ from .utils.sources.huggingface import (
     download_file_from_hf,
     download_model,
     extract_model_id_from_path,
+    get_model_info,
     is_huggingface_file_url,
     is_huggingface_url,
     parse_huggingface_file_url,
@@ -214,7 +215,7 @@ def _format_huggingface_dry_run_preview_text(preview: dict[str, Any]) -> str:
     target = _escape_terminal_text(preview.get("target", ""))
     source_kind = _escape_terminal_text(str(preview.get("source_kind", "source")).replace("_", " "))
     lines = [
-        f"📊 Dry run preview for {style_text(target, fg='cyan')}:",
+        f"📊 Preview for {style_text(target, fg='cyan')}:",
         f"   Source: Hugging Face {source_kind}",
     ]
     if model_id := preview.get("model_id"):
@@ -3228,18 +3229,17 @@ def _resolve_scan_source_for_path(
                 hf_stream_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
             if runtime.hf_stream_include_all_files:
                 hf_stream_kwargs["include_all_files"] = True
+        hf_preview_kwargs: dict[str, Any] = {"timeout_seconds": runtime.timeout}
+        if runtime.scan_and_delete:
+            hf_preview_kwargs.update(hf_stream_kwargs)
+            hf_preview_kwargs["streaming_selection"] = True
+            hf_preview_kwargs.setdefault("include_all_files", False)
+
         if runtime.show_styled_output:
             click.echo(f"\n📥 Preparing to download from {style_text(display_path, fg='cyan')}")
 
             try:
-                from .utils.sources.huggingface import get_model_info
-
-                preview_kwargs: dict[str, Any] = {"timeout_seconds": runtime.timeout}
-                if runtime.scan_and_delete:
-                    preview_kwargs.update(hf_stream_kwargs)
-                    preview_kwargs["streaming_selection"] = True
-                    preview_kwargs.setdefault("include_all_files", False)
-                model_info = get_model_info(path, **preview_kwargs)
+                model_info = get_model_info(path, **hf_preview_kwargs)
                 size_bytes = int(model_info.get("total_size") or 0)
                 inaccessible_gated_file_count = int(model_info.get("inaccessible_gated_file_count") or 0)
                 unknown_size_count = int(model_info.get("unknown_size_count") or 0)
@@ -4539,6 +4539,8 @@ def scan_command(
     from .models import create_initial_audit_result
 
     audit_result = create_initial_audit_result()
+    if dry_run:
+        cast(Any, audit_result).dry_run = True
     if runtime.scanner_selection_metadata is not None:
         audit_result.scanner_selection = dict(runtime.scanner_selection_metadata)
     path_state = _ScanPathState(
@@ -4966,7 +4968,11 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     else:
         # Check if no files were scanned to show appropriate message
         files_scanned = results.get("files_scanned", 0)
-        if files_scanned == 0:
+        if results.get("dry_run"):
+            output_lines.append(
+                "  " + style_text("✅ Dry-run preview complete; no files were scanned", fg="green", bold=True),
+            )
+        elif files_scanned == 0:
             output_lines.append(
                 "  " + style_text("⚠️  No model files found to scan", fg="yellow", bold=True),
             )
@@ -4985,6 +4991,7 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
     has_acquisition_errors = _results_have_acquisition_error_metadata(results)
     has_blocked_acquisition = _results_have_blocked_acquisition_metadata(results)
     files_scanned = results.get("files_scanned", 0)
+    is_dry_run = bool(results.get("dry_run"))
     has_critical_findings = any(_get_issue_attr(issue, "severity") == "critical" for issue in visible_issues)
     has_warning_findings = any(_get_issue_attr(issue, "severity") == "warning" for issue in visible_issues)
     has_security_findings = has_critical_findings or has_warning_findings
@@ -5017,6 +5024,8 @@ def format_text_output(results: dict[str, Any], verbose: bool = False) -> str:
             status_color = "yellow"
         status_line = style_text(f"{status_icon} {status_msg}", fg=status_color, bold=True)
         output_lines.append(f"  {status_line}")
+    elif is_dry_run:
+        output_lines.append(f"  {style_text('✅ DRY RUN PREVIEW COMPLETE', fg='green', bold=True)}")
     # Check if no files were scanned
     elif files_scanned == 0:
         status_icon = "❌"
