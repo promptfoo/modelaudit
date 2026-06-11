@@ -195,6 +195,61 @@ def _legacy_pytorch_object_stream(
     return bytes(object_stream)
 
 
+def _legacy_pytorch_storage_pid_tuple(
+    key: str,
+    storage_size: int,
+    *,
+    storage_type: bytes = b"ctorch\nByteStorage\n",
+    element_count: bytes | None = None,
+    extra_fields: bytes = b"",
+    view_metadata: bytes = b"N",
+) -> bytes:
+    encoded_key = key.encode("ascii")
+    encoded_count = element_count if element_count is not None else pickle.dumps(storage_size, protocol=2)[2:-1]
+    return (
+        b"("
+        + _binunicode(b"storage")
+        + storage_type
+        + _binunicode(encoded_key)
+        + _binunicode(b"cpu")
+        + encoded_count
+        + view_metadata
+        + extra_fields
+        + b"t"
+    )
+
+
+def _legacy_pytorch_object_stream_from_pid(pid_tuple: bytes) -> bytes:
+    return b"\x80\x02]" + pid_tuple + b"Qa."
+
+
+def _make_legacy_pytorch_container_with_object_stream(
+    storage_payload: bytes,
+    object_stream: bytes,
+    *,
+    storage_keys: tuple[str, ...] = ("0",),
+    declared_storage_size: int | None = None,
+) -> tuple[bytes, int]:
+    storage_size = len(storage_payload) if declared_storage_size is None else declared_storage_size
+    control_streams = (
+        pickle.dumps(0x1950A86A20F9469CFC6C, protocol=2),
+        pickle.dumps(1001, protocol=2),
+        pickle.dumps(
+            {
+                "protocol_version": 1001,
+                "little_endian": True,
+                "type_sizes": {"short": 2, "int": 4, "long": 8},
+            },
+            protocol=2,
+        ),
+        object_stream,
+        pickle.dumps(list(storage_keys), protocol=2),
+    )
+    pickle_end = sum(len(stream) for stream in control_streams)
+    storage_record = b"".join(storage_size.to_bytes(8, "little") + storage_payload for _key in storage_keys)
+    return b"".join(control_streams) + storage_record, pickle_end
+
+
 def _memoized_legacy_pytorch_object_stream(protocol: int) -> bytes:
     payload = bytearray(b"\x80" + bytes([protocol]) + b"]\x94")
     payload += b"(" + _short_binunicode(b"storage") + b"\x94"
@@ -231,6 +286,41 @@ def _make_legacy_pytorch_container(
     pickle_end = sum(len(stream) for stream in control_streams)
     storage_record = b"".join(storage_size.to_bytes(8, "little") + storage_payload for _key in storage_keys)
     return b"".join(control_streams) + storage_record, pickle_end
+
+
+def _persistent_id_checks(result: ScanResult, *, opcode: str | None = None) -> list[Any]:
+    return [
+        check
+        for check in result.checks
+        if check.details.get("pickle_rule_code") == "PERSISTENT_ID"
+        and (opcode is None or check.details.get("opcode") == opcode)
+    ]
+
+
+def _persistent_id_issues(result: ScanResult, *, opcode: str | None = None) -> list[Any]:
+    return [
+        issue
+        for issue in result.issues
+        if issue.details.get("pickle_rule_code") == "PERSISTENT_ID"
+        and (opcode is None or issue.details.get("opcode") == opcode)
+    ]
+
+
+def _trusted_legacy_storage_pid_checks(result: ScanResult) -> list[Any]:
+    return [check for check in result.checks if check.details.get("trusted_legacy_pytorch_context") is True]
+
+
+def _assert_legacy_storage_layout_incomplete(result: ScanResult) -> None:
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "legacy_pytorch_storage_layout_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert not _trusted_legacy_storage_pid_checks(result)
+    assert any(
+        check.name == "Legacy PyTorch Storage Layout"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S902"
+        for check in result.checks
+    )
 
 
 @pytest.mark.parametrize("protocol", [4, 5])
@@ -1748,6 +1838,170 @@ def test_legacy_pytorch_container_accepts_historical_big_endian_storage_header(t
     assert result.metadata["legacy_pytorch_storage_end"] == len(big_endian_payload)
 
 
+def test_legacy_pytorch_container_trusts_canonical_storage_binpersid(tmp_path: Path) -> None:
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 64)
+    path = tmp_path / "legacy-storage.pt"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+
+    trusted_checks = _trusted_legacy_storage_pid_checks(result)
+    assert result.success is True
+    assert result.metadata["legacy_pytorch_container"] is True
+    assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
+    assert result.metadata["legacy_pytorch_storage_end"] == len(payload)
+    assert result.metadata["legacy_pytorch_trusted_storage_persistent_id_count"] == 1
+    assert not _persistent_id_issues(result)
+    assert len(trusted_checks) == 1
+    assert trusted_checks[0].status == CheckStatus.PASSED
+    assert trusted_checks[0].severity == IssueSeverity.INFO
+    assert trusted_checks[0].rule_code == "S212"
+    assert trusted_checks[0].details["opcode"] == "BINPERSID"
+    assert trusted_checks[0].details["pytorch_storage_key"] == "0"
+
+
+def test_legacy_pytorch_bin_extension_uses_framing_not_suffix_for_storage_trust(tmp_path: Path) -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(b"A" * 64)
+    path = tmp_path / "pytorch_model.bin"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is True
+    assert result.metadata["legacy_pytorch_container"] is True
+    assert not _persistent_id_issues(result)
+    assert len(_trusted_legacy_storage_pid_checks(result)) == 1
+
+
+def test_bin_extension_alone_does_not_trust_pytorch_storage_binpersid(tmp_path: Path) -> None:
+    path = tmp_path / "pytorch_model.bin"
+    path.write_bytes(_legacy_pytorch_object_stream(("0",), 1))
+
+    result = PickleScanner().scan(str(path))
+
+    issues = _persistent_id_issues(result, opcode="BINPERSID")
+    assert result.metadata.get("legacy_pytorch_container") is not True
+    assert not _trusted_legacy_storage_pid_checks(result)
+    assert len(issues) == 1
+    assert issues[0].rule_code == "S212"
+    assert issues[0].details["pytorch_storage_key"] == "0"
+
+
+def test_legacy_pytorch_rejects_custom_persid_without_trusting_storage_pid(tmp_path: Path) -> None:
+    canonical_pid = _legacy_pytorch_storage_pid_tuple("0", 64)
+    object_stream = b"\x80\x02]Pexternal://weights\n" + b"a" + canonical_pid + b"Qa."
+    payload, _pickle_end = _make_legacy_pytorch_container_with_object_stream(b"A" * 64, object_stream)
+    path = tmp_path / "legacy-custom-persid.pt"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+
+    _assert_legacy_storage_layout_incomplete(result)
+    issues = _persistent_id_issues(result, opcode="PERSID")
+    assert len(issues) == 1
+    assert issues[0].rule_code == "S212"
+    assert issues[0].details["opcode"] == "PERSID"
+
+
+def test_legacy_pytorch_rejects_extra_binpersid_without_trusting_first_storage_pid(tmp_path: Path) -> None:
+    canonical_pid = _legacy_pytorch_storage_pid_tuple("0", 64)
+    object_stream = b"\x80\x02]" + canonical_pid + b"Qa" + _binunicode(b"external://weights") + b"Qa."
+    payload, _pickle_end = _make_legacy_pytorch_container_with_object_stream(b"A" * 64, object_stream)
+    path = tmp_path / "legacy-extra-binpersid.pt"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+
+    _assert_legacy_storage_layout_incomplete(result)
+    issues = _persistent_id_issues(result, opcode="BINPERSID")
+    assert len(issues) == 1
+    assert issues[0].rule_code == "S212"
+    assert issues[0].details["pytorch_storage_key"] == "0"
+    assert any(
+        check.details.get("pickle_notice_code") == "persistent_id_summary"
+        and check.details.get("persistent_id_count") == 2
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "pid_tuple",
+    [
+        _legacy_pytorch_storage_pid_tuple("0", 64, view_metadata=b""),
+        _legacy_pytorch_storage_pid_tuple("0", 64, element_count=b"\x88"),
+        _legacy_pytorch_storage_pid_tuple("0", 64, extra_fields=_binunicode(b"unexpected")),
+        _legacy_pytorch_storage_pid_tuple("0", 64, storage_type=_binunicode(b"torch.ByteStorage")),
+    ],
+    ids=["five-field", "bool-size", "extra-field", "string-storage-type"],
+)
+def test_legacy_pytorch_rejects_noncanonical_storage_pid_tuple(
+    tmp_path: Path,
+    pid_tuple: bytes,
+) -> None:
+    object_stream = _legacy_pytorch_object_stream_from_pid(pid_tuple)
+    payload, _pickle_end = _make_legacy_pytorch_container_with_object_stream(b"A" * 64, object_stream)
+    path = tmp_path / "legacy-noncanonical-storage.pt"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+
+    _assert_legacy_storage_layout_incomplete(result)
+    assert _persistent_id_issues(result, opcode="BINPERSID")
+
+
+def test_legacy_pytorch_rejects_missing_storage_key_record_without_trusting_partial_pid(
+    tmp_path: Path,
+) -> None:
+    object_stream = _legacy_pytorch_object_stream(("0",), 64)
+    payload, _pickle_end = _make_legacy_pytorch_container_with_object_stream(
+        b"A" * 64,
+        object_stream,
+        storage_keys=("0", "1"),
+    )
+    path = tmp_path / "legacy-missing-storage-key.pt"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+
+    _assert_legacy_storage_layout_incomplete(result)
+    issues = _persistent_id_issues(result, opcode="BINPERSID")
+    assert len(issues) == 1
+    assert issues[0].details["pytorch_storage_key"] == "0"
+
+
+def test_legacy_pytorch_rejects_unlisted_storage_key_record_without_trusting_pid(tmp_path: Path) -> None:
+    object_stream = _legacy_pytorch_object_stream(("1",), 64)
+    payload, _pickle_end = _make_legacy_pytorch_container_with_object_stream(
+        b"A" * 64,
+        object_stream,
+        storage_keys=("0",),
+    )
+    path = tmp_path / "legacy-unlisted-storage-key.pt"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+
+    _assert_legacy_storage_layout_incomplete(result)
+    issues = _persistent_id_issues(result, opcode="BINPERSID")
+    assert len(issues) == 1
+    assert issues[0].details["pytorch_storage_key"] == "1"
+
+
+def test_legacy_pytorch_rejects_truncated_storage_payload_without_trusting_binpersid(
+    tmp_path: Path,
+) -> None:
+    payload, _pickle_end = _make_legacy_pytorch_container(b"A" * 64)
+    path = tmp_path / "legacy-truncated-storage.pt"
+    path.write_bytes(payload[:-1])
+
+    result = PickleScanner().scan(str(path))
+
+    _assert_legacy_storage_layout_incomplete(result)
+    issues = _persistent_id_issues(result, opcode="BINPERSID")
+    assert len(issues) == 1
+    assert issues[0].details["pytorch_storage_key"] == "0"
+
+
 def test_legacy_pytorch_seekable_stream_uses_control_stream_boundary() -> None:
     payload, pickle_end = _make_legacy_pytorch_container(b"A" * 512)
     stream = io.BytesIO(payload)
@@ -2133,6 +2387,8 @@ def test_truncated_legacy_pytorch_control_stream_remains_inconclusive(tmp_path: 
     assert result.metadata.get("legacy_pytorch_container") is not True
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "pickle_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert not _trusted_legacy_storage_pid_checks(result)
+    assert "legacy_pytorch_storage_payload_skipped" not in result.metadata
 
 
 def test_legacy_pytorch_invalid_storage_header_fails_closed(tmp_path: Path) -> None:
@@ -2151,6 +2407,7 @@ def test_legacy_pytorch_invalid_storage_header_fails_closed(tmp_path: Path) -> N
     assert result.metadata["legacy_pytorch_control_streams"] is True
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "legacy_pytorch_storage_layout_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert not _trusted_legacy_storage_pid_checks(result)
     assert any(
         check.name == "Legacy PyTorch Storage Layout"
         and check.status == CheckStatus.FAILED
