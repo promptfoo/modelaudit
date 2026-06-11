@@ -312,13 +312,17 @@ _SUSPICIOUS_LICENSE_URL_PATH_SUFFIXES = (
 )
 _OPAQUE_LICENSE_TOKEN_MIN_CHARS = 128
 _OPAQUE_LICENSE_TOKEN_PATTERN = re.compile(rf"\b[A-Za-z0-9+/=_-]{{{_OPAQUE_LICENSE_TOKEN_MIN_CHARS},}}\b")
-_BASE64_LICENSE_WRAP_LINE_MIN_CHARS = 16
+_BASE64_LICENSE_WRAP_LINE_MIN_CHARS = 4
+_BASE64_LICENSE_WRAP_TOKEN_MIN_CHARS = 8
 _BASE64_LICENSE_WRAP_MAX_LINES = 128
 _BASE64_LICENSE_WRAP_MAX_CHARS = 8192
 _BASE64_LICENSE_WRAP_MAX_DECODED_BYTES = 6144
 _BASE64_LICENSE_WRAP_MAX_SEPARATOR_LINES = 4
+_BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO = 0.25
 _BASE64_LICENSE_WRAP_LINE_PATTERN = re.compile(r"^[A-Za-z0-9+/_-]+={0,2}$")
-_BASE64_LICENSE_WRAP_TOKEN_PATTERN = re.compile(r"\b[A-Za-z0-9+/_-]{16,}={0,2}\b")
+_BASE64_LICENSE_WRAP_TOKEN_PATTERN = re.compile(
+    rf"\b[A-Za-z0-9+/_-]{{{_BASE64_LICENSE_WRAP_TOKEN_MIN_CHARS},}}={{0,2}}\b"
+)
 _BASE64_LICENSE_WRAP_SEPARATOR_PATTERN = re.compile(
     r"^(?:[#>;]|//|--|\*)\s*(?:continued|continuation|wrapped|base64|license(?:\s+terms?)?)?\s*$",
     re.IGNORECASE,
@@ -326,6 +330,10 @@ _BASE64_LICENSE_WRAP_SEPARATOR_PATTERN = re.compile(
 _SUSPICIOUS_LICENSE_URL_MARKERS = ("payload", "exfil", "webhook", "callback")
 _URL_PATH_NORMALIZATION_PASSES = 4
 _PERCENT_ENCODED_BYTE_PATTERN = re.compile(r"%[0-9a-fA-F]{2}")
+
+
+def _url_path_has_unsafe_decoded_char(path: str) -> bool:
+    return any(char == "\\" or ord(char) < 0x20 or ord(char) == 0x7F for char in path)
 
 
 class SafeTensorsScanner(BaseScanner):
@@ -502,23 +510,61 @@ class SafeTensorsScanner(BaseScanner):
 
     @staticmethod
     def _license_document_line_is_wrapped_base64_fragment(line: str) -> bool:
+        stripped = line.strip()
         return (
-            len(line) >= _BASE64_LICENSE_WRAP_LINE_MIN_CHARS
-            and not any(char.isspace() for char in line)
-            and _BASE64_LICENSE_WRAP_LINE_PATTERN.fullmatch(line) is not None
+            len(stripped) >= _BASE64_LICENSE_WRAP_LINE_MIN_CHARS
+            and not any(char.isspace() for char in stripped)
+            and _BASE64_LICENSE_WRAP_LINE_PATTERN.fullmatch(stripped) is not None
+        )
+
+    @staticmethod
+    def _license_document_annotation_looks_documentary(text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return True
+        lower_text = stripped.lower()
+        return (
+            lower_text.startswith(("#", ">", ";", "//", "--", "*"))
+            or SafeTensorsScanner._license_document_line_looks_documentary(lower_text)
+            or _BASE64_LICENSE_WRAP_SEPARATOR_PATTERN.fullmatch(stripped) is not None
         )
 
     @staticmethod
     def _license_document_line_base64_fragments(line: str) -> list[str]:
-        if SafeTensorsScanner._license_document_line_is_wrapped_base64_fragment(line):
-            return [line]
-        return [match.group(0) for match in _BASE64_LICENSE_WRAP_TOKEN_PATTERN.finditer(line)]
+        stripped = line.strip()
+        if SafeTensorsScanner._license_document_line_is_wrapped_base64_fragment(stripped):
+            return [stripped]
+
+        nonspace_len = sum(1 for char in stripped if not char.isspace())
+        if nonspace_len == 0:
+            return []
+
+        fragments: list[str] = []
+        for match in _BASE64_LICENSE_WRAP_TOKEN_PATTERN.finditer(stripped):
+            token = match.group(0)
+            before = stripped[: match.start()]
+            after = stripped[match.end() :]
+            if before.strip() and after.strip():
+                continue
+            if len(token) / nonspace_len < _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO:
+                continue
+            annotation = before if before.strip() else after
+            if not SafeTensorsScanner._license_document_annotation_looks_documentary(annotation):
+                continue
+            fragments.append(token)
+        return fragments
+
+    @staticmethod
+    def _license_document_line_is_bounded_documentary_separator(line: str) -> bool:
+        if len(line) > _LICENSE_DOCUMENT_MAX_LINE_CHARS:
+            return False
+        return SafeTensorsScanner._license_document_line_looks_documentary(line.lower())
 
     @staticmethod
     def _license_document_line_is_wrapped_base64_separator(line: str) -> bool:
-        return (
-            len(line) <= _LICENSE_DOCUMENT_MAX_LINE_CHARS
-            and _BASE64_LICENSE_WRAP_SEPARATOR_PATTERN.fullmatch(line) is not None
+        return len(line) <= _LICENSE_DOCUMENT_MAX_LINE_CHARS and (
+            _BASE64_LICENSE_WRAP_SEPARATOR_PATTERN.fullmatch(line) is not None
+            or SafeTensorsScanner._license_document_line_is_bounded_documentary_separator(line)
         )
 
     @staticmethod
@@ -611,12 +657,16 @@ class SafeTensorsScanner(BaseScanner):
             decoded = unquote(normalized)
             if decoded == normalized:
                 normalized_path = normalized.lower()
-                return normalized_path, not normalized_path.isascii()
+                return normalized_path, not normalized_path.isascii() or _url_path_has_unsafe_decoded_char(
+                    normalized_path
+                )
             normalized = decoded
         normalized_path = normalized.lower()
         return (
             normalized_path,
-            not normalized_path.isascii() or _PERCENT_ENCODED_BYTE_PATTERN.search(normalized_path) is not None,
+            not normalized_path.isascii()
+            or _url_path_has_unsafe_decoded_char(normalized_path)
+            or _PERCENT_ENCODED_BYTE_PATTERN.search(normalized_path) is not None,
         )
 
     @classmethod

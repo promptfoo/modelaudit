@@ -446,6 +446,15 @@ def test_license_document_reconstructs_short_wrapped_base64_tail() -> None:
     assert not SafeTensorsScanner._looks_like_ordinary_license_document(payload)
 
 
+def test_license_document_reconstructs_narrow_annotated_wrapped_base64_tail() -> None:
+    license_text = ordinary_license_text_with_url()
+    tail = "\n".join(f"License grant continuation {line}" for line in executable_wrapped_base64_lines((15,)))
+    payload = f"{license_text}\n{tail}"
+
+    assert SafeTensorsScanner._looks_like_ordinary_license_document(license_text)
+    assert not SafeTensorsScanner._looks_like_ordinary_license_document(payload)
+
+
 def test_license_url_residual_encoding_fails_closed() -> None:
     encoded_prefix = encode_url_path("/releases/download/v1", passes=5)
 
@@ -464,6 +473,12 @@ def test_license_url_residual_encoding_fails_closed() -> None:
     assert not SafeTensorsScanner._url_looks_like_license_reference(fullwidth_percent_release_url())
     assert not SafeTensorsScanner._url_looks_like_license_reference(encoded_fullwidth_percent_release_url())
     assert not SafeTensorsScanner._url_looks_like_license_reference("https://github.com/Lightricks/LTX-2;payload")
+    assert not SafeTensorsScanner._url_looks_like_license_reference(
+        "https://github.com/Lightricks/LTX-2/blob/main/license.py%00.txt"
+    )
+    assert not SafeTensorsScanner._url_looks_like_license_reference(
+        "https://github.com/Lightricks/LTX-2/%5Creleases%5Cdownload%5Cv1/license"
+    )
 
 
 def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -> None:
@@ -522,6 +537,8 @@ def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -
         fullwidth_percent_release_url(),
         encoded_fullwidth_percent_release_url(),
         "https://github.com/Lightricks/LTX-2;payload",
+        "https://github.com/Lightricks/LTX-2/blob/main/license.py%00.txt",
+        "https://github.com/Lightricks/LTX-2/%5Creleases%5Cdownload%5Cv1/license",
         "https://opensource.org/licenses/MIT?u=https://evil.example/x",
         "https://[",
     ],
@@ -707,6 +724,18 @@ def test_license_metadata_standard_wrapped_base64_tail_keeps_length_and_s905(tmp
         (
             "\n".join(f"License grant continuation {line}" for line in executable_wrapped_base64_lines((64, 76, 52))),
             "mixed_width_prefixed",
+        ),
+        (
+            "\n".join(f"License grant continuation {line}" for line in executable_wrapped_base64_lines((15,))),
+            "narrow_prefixed",
+        ),
+        (
+            "\nThis license paragraph continues under applicable law.\n".join(executable_wrapped_base64_lines((76,))),
+            "legal_separator",
+        ),
+        (
+            "\n".join(executable_wrapped_base64_lines((4,))),
+            "tiny_width",
         ),
         (
             "\n".join(executable_wrapped_base64_lines((31,))),
