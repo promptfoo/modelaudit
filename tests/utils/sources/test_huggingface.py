@@ -2118,6 +2118,69 @@ class TestModelDownloadStreaming:
         assert call("test/model", "openvino/openvino_model.xml", _HF_TEST_REVISION, ANY) in (
             mock_detect_content.call_args_list
         )
+        assert call("test/model", "openvino/openvino_model.bin", _HF_TEST_REVISION, ANY) not in (
+            mock_detect_content.call_args_list
+        )
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            [
+                "openvino/openvino_model.bin",
+                "openvino/openvino_model.xml",
+                "openvino/openvino_model_qint8_quantized.bin",
+                "openvino/openvino_model_qint8_quantized.xml",
+            ],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_prefetches_multiple_openvino_bin_companions(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Pinned OpenVINO repositories can stage every exact XML/BIN pair before scanning."""
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / "huggingface" / "test" / "model" / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if filename.endswith(".xml"):
+                path.write_text("<net version='10'></net>", encoding="utf-8")
+            else:
+                path.write_bytes(b"weights")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_detect_content.side_effect = lambda _repo_id, filename, _revision, _budget: (
+            "openvino" if filename.endswith(".xml") else None
+        )
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path,
+                scannable_extensions={".xml"},
+                scannable_scanner_ids={"openvino"},
+            )
+        )
+
+        download_root = tmp_path / "huggingface" / "test" / "model" / "openvino"
+        assert results == [
+            (download_root / "openvino_model.xml", False),
+            (download_root / "openvino_model_qint8_quantized.xml", True),
+        ]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "openvino/openvino_model.xml",
+            "openvino/openvino_model.bin",
+            "openvino/openvino_model_qint8_quantized.xml",
+            "openvino/openvino_model_qint8_quantized.bin",
+        ]
+        assert all(call.args[1].endswith(".xml") for call in mock_detect_content.call_args_list)
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
     @patch(

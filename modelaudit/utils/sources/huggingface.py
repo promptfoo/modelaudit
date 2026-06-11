@@ -1092,6 +1092,16 @@ def _select_streamable_hf_files(
                 )
             model_files.append(file_name)
 
+    exact_openvino_companion_candidates = (
+        {
+            companion
+            for selected_file in model_files
+            if (companion := _openvino_bin_companion_name(selected_file)) is not None
+        }
+        if selected_route_scanner_ids == {"openvino"}
+        else set()
+    )
+
     if sniff_renamed_files:
         inspected_files = 0
         probe_budget = _HuggingFaceProbeBudget(
@@ -1101,6 +1111,8 @@ def _select_streamable_hf_files(
         selected_files = set(model_files)
         for file_name in repo_files:
             if file_name in selected_files:
+                continue
+            if file_name in exact_openvino_companion_candidates:
                 continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
