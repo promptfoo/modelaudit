@@ -1421,6 +1421,35 @@ class TestDirectoryFileFiltering:
 
         assert _is_huggingface_cache_file(str(fifo)) is False
 
+    def test_hf_cachedir_tag_fifo_full_scan_fails_closed_without_hashing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Full directory scans must not block hashing a FIFO cache tag."""
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("mkfifo unavailable")
+        model_dir = tmp_path / "downloaded-model"
+        fifo = model_dir / ".cache" / "huggingface" / "CACHEDIR.TAG"
+        fifo.parent.mkdir(parents=True)
+        os.mkfifo(fifo)
+        monkeypatch.setattr(
+            core_module,
+            "_calculate_file_hash",
+            lambda _path: pytest.fail("special directory entries must not be opened for hashing"),
+        )
+
+        results = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+        assert results.files_scanned == 0
+        assert results.success is False
+        assert determine_exit_code(results) == 2
+        assert any(
+            issue.location == str(fifo)
+            and issue.details.get("scan_outcome_reason") == "directory_special_file_unscanned"
+            for issue in results.issues
+        )
+
     def test_hf_cachedir_tag_socket_is_not_opened(self) -> None:
         """Socket nodes named like cache tags must not be read or skipped."""
         if not hasattr(socket, "AF_UNIX"):

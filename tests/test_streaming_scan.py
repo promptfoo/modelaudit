@@ -1707,6 +1707,38 @@ def test_scan_model_streaming_symlink_outside_directory_without_safe_files_retur
     assert determine_exit_code(result) == 1
 
 
+def test_scan_model_streaming_fifo_cache_tag_fails_closed_without_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Streaming scans should reject special files yielded by a source generator before hashing."""
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("mkfifo unavailable")
+    fifo = tmp_path / ".cache" / "huggingface" / "CACHEDIR.TAG"
+    fifo.parent.mkdir(parents=True)
+    os.mkfifo(fifo)
+    monkeypatch.setattr(
+        "modelaudit.utils.helpers.file_hash.compute_sha256_hash",
+        lambda _path: pytest.fail("special streamed entries must not be opened for hashing"),
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(fifo, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        scan_root=str(tmp_path),
+        cache_enabled=False,
+    )
+
+    assert result.files_scanned == 0
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert any(
+        issue.location == str(fifo) and issue.details.get("scan_outcome_reason") == "directory_special_file_unscanned"
+        for issue in result.issues
+    )
+
+
 def test_scan_model_streaming_hf_cache_symlink_allowed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

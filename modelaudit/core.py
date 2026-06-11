@@ -297,6 +297,7 @@ _DVC_SCAN_BUDGET_EXHAUSTED_REASON = "dvc_scan_budget_exhausted"
 _DVC_DIRECTORY_WALK_FAILED_REASON = "dvc_directory_walk_failed"
 _DVC_DIRECTORY_SYMLINK_UNSCANNED_REASON = "dvc_directory_symlink_unscanned"
 _DVC_DIRECTORY_SPECIAL_FILE_UNSCANNED_REASON = "dvc_directory_special_file_unscanned"
+_DIRECTORY_SPECIAL_FILE_UNSCANNED_REASON = "directory_special_file_unscanned"
 _MAX_DVC_DIRECTORY_COVERAGE_GAPS = 100
 _DVC_PARENT_FILE_CONFIG_KEY = "_dvc_parent_file"
 _DVC_REMAINING_TOTAL_SIZE_CONFIG_KEY = "_dvc_remaining_total_size"
@@ -362,6 +363,29 @@ def _record_incomplete_dvc_scan_budget(
             "budget_type": budget_type,
             "limit": limit,
         },
+    )
+
+
+def _record_directory_special_file_unscanned(
+    results: ModelAuditResultModel,
+    scan_metadata: dict[str, Any],
+    file_path: str,
+) -> None:
+    """Fail closed when a directory entry is not a regular file."""
+    scan_metadata["success"] = False
+    scan_metadata["has_operational_errors"] = True
+    _add_issue_to_model(
+        results,
+        "Special directory entry could not be scanned",
+        severity=IssueSeverity.INFO.value,
+        location=file_path,
+        details={
+            "analysis_incomplete": True,
+            "operational_error": True,
+            "scan_outcome": "inconclusive",
+            "scan_outcome_reason": _DIRECTORY_SPECIAL_FILE_UNSCANNED_REASON,
+        },
+        issue_type=_DIRECTORY_SPECIAL_FILE_UNSCANNED_REASON,
     )
 
 
@@ -1870,6 +1894,13 @@ def _is_directory_link(path: Path) -> bool:
     return False
 
 
+def _stat_is_windows_reparse_point(stat_result: os.stat_result) -> bool:
+    """Return whether a stat result reports a Windows reparse-point entry."""
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    file_attributes = getattr(stat_result, "st_file_attributes", 0)
+    return bool(reparse_flag and file_attributes & reparse_flag)
+
+
 def _resolve_directory_scan_target(
     file_path: Path,
     base_dir: Path,
@@ -1882,6 +1913,9 @@ def _resolve_directory_scan_target(
     """Resolve a directory entry and reject symlink traversal outside the scan root."""
     is_symlink = file_path.is_symlink()
     try:
+        entry_stat = file_path.lstat()
+        if not is_symlink and _stat_is_windows_reparse_point(entry_stat):
+            raise OSError("Windows reparse point cannot be safely scanned")
         # Strict resolution of valid relative file symlinks is unreliable on
         # some Windows versions. Resolve once and verify that target directly.
         resolved_file = file_path.resolve()
@@ -2337,6 +2371,10 @@ def scan_model_directory_or_file(
                     if resolved_file is None:
                         continue
                     if not resolved_file.is_file() and record_dvc_directory_special_file(file_path_obj):
+                        continue
+                    if not resolved_file.is_file():
+                        aggregate_hash_complete = False
+                        _record_directory_special_file_unscanned(results, scan_metadata, file_path)
                         continue
                     snapshot_path = Path(file_path).absolute()
                     snapshot_shard_family_key = _shard_family_key_for_path(str(snapshot_path))
@@ -3454,6 +3492,8 @@ def _regular_bookkeeping_file_size(path_obj: Path, max_bytes: int) -> int | None
         stat_result = path_obj.lstat()
     except OSError:
         return None
+    if _stat_is_windows_reparse_point(stat_result):
+        return None
     if not stat.S_ISREG(stat_result.st_mode):
         return None
     if stat_result.st_nlink != 1:
@@ -4562,6 +4602,24 @@ def scan_model_streaming(
                     if resolved_path is None:
                         continue
                     scan_path = resolved_path
+                    if not scan_path.is_file():
+                        aggregate_hash_complete = False
+                        preserve_shard_reconciliation_errors = True
+                        results.has_errors = True
+                        _add_issue_to_model(
+                            results,
+                            "Special directory entry could not be scanned",
+                            severity=IssueSeverity.INFO.value,
+                            location=str(source_path),
+                            details={
+                                "analysis_incomplete": True,
+                                "operational_error": True,
+                                "scan_outcome": "inconclusive",
+                                "scan_outcome_reason": _DIRECTORY_SPECIAL_FILE_UNSCANNED_REASON,
+                            },
+                            issue_type=_DIRECTORY_SPECIAL_FILE_UNSCANNED_REASON,
+                        )
+                        continue
 
                 if (
                     skip_file_types
