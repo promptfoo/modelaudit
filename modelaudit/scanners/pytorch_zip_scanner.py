@@ -37,7 +37,11 @@ from .archive_member_security import (
     probe_executable_archive_member_signature,
 )
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
-from .pickle_scanner import PickleScanner, filter_inert_pickle_literal_network_findings
+from .pickle_scanner import (
+    PickleScanner,
+    _pickle_literal_url_stripped_scan_view,
+    filter_inert_pickle_literal_network_findings,
+)
 from .picklescan_adapter import apply_pickle_member_context
 from .pytorch_zip_support import (
     RelaxedZipCrcTracker,
@@ -2122,8 +2126,12 @@ class PyTorchZipScanner(BaseScanner):
                         )
                         all_jit_findings.extend(jit_findings)
                     if check_net:
-                        network_findings = self.collect_network_communication_findings(
+                        network_file_data = _pickle_literal_url_stripped_scan_view(
                             file_data,
+                            network_functions_only=True,
+                        )
+                        network_findings = self.collect_network_communication_findings(
+                            network_file_data,
                             context=f"{path}:{name}",
                             result=result,
                         )

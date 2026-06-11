@@ -272,6 +272,28 @@ _NETWORK_SCAN_SEEDS: tuple[bytes, ...] = (
     b"zombie",
 )
 _PICKLE_LITERAL_URL_RE = re.compile(rb"(?i)https?://[A-Za-z0-9\-._~:/?#@!$*+=%-]+")
+_PICKLE_LITERAL_URL_NETWORK_FUNCTION_TOKENS: tuple[bytes, ...] = (
+    b"dns.resolver",
+    b"ftp.connect",
+    b"getaddrinfo",
+    b"gethostbyaddr",
+    b"gethostbyname",
+    b"http.request",
+    b"imap.login",
+    b"mongo.connect",
+    b"redis.connect",
+    b"requests.delete",
+    b"requests.get",
+    b"requests.post",
+    b"requests.put",
+    b"smtp.connect",
+    b"socket.connect",
+    b"socket.create_connection",
+    b"ssh.connect",
+    b"telnet.open",
+    b"urlopen",
+    b"urlretrieve",
+)
 _EXECUTABLE_NETWORK_LITERAL_SEEDS: tuple[bytes, ...] = (
     b"__import__",
     b"cloudpickle.load",
@@ -283,6 +305,8 @@ _EXECUTABLE_NETWORK_LITERAL_SEEDS: tuple[bytes, ...] = (
     b"getaddrinfo",
     b"hf_hub_download(",
     b"http.request",
+    b"httpx.",
+    b"aiohttp.",
     b"joblib.load",
     b"load_state_dict_from_url",
     b"os.popen",
@@ -1235,7 +1259,12 @@ def filter_inert_pickle_literal_network_findings(
     ]
 
 
-def _pickle_literal_url_stripped_scan_view(data: bytes) -> bytes:
+def _literal_url_contains_network_function_text(url: bytes) -> bool:
+    lowered = url.lower()
+    return any(token in lowered for token in _PICKLE_LITERAL_URL_NETWORK_FUNCTION_TOKENS)
+
+
+def _pickle_literal_url_stripped_scan_view(data: bytes, *, network_functions_only: bool = False) -> bytes:
     literal_records = _pickle_literal_records(data)
     if not literal_records:
         return data
@@ -1244,6 +1273,8 @@ def _pickle_literal_url_stripped_scan_view(data: bytes) -> bytes:
         if _pickle_literal_has_executable_network_context(record.literal):
             continue
         for match in _PICKLE_LITERAL_URL_RE.finditer(data, record.start, record.end):
+            if network_functions_only and not _literal_url_contains_network_function_text(match.group()):
+                continue
             if stripped is None:
                 stripped = bytearray(data)
             stripped[match.start() : match.end()] = b" " * (match.end() - match.start())
@@ -2917,11 +2948,12 @@ class PickleScanner(BaseScanner):
         else:
             result.metadata["pickle_jit_raw_detector_skipped"] = True
 
+        network_scan_data = _pickle_literal_url_stripped_scan_view(expensive_data, network_functions_only=True)
         if _contains_any_seed_lowered(expensive_lower, _NETWORK_SCAN_SEEDS, expensive_present_bytes) or (
             _has_domain_or_ip_shape(expensive_data)
         ):
             network_findings = self.collect_network_communication_findings(
-                expensive_data,
+                network_scan_data,
                 context=source,
                 result=result,
             )

@@ -432,6 +432,7 @@ const DANGEROUS_WILDCARD_MODULES: &[&str] = &[
     "ftplib",
     "http",
     "httplib",
+    "httpx",
     "idlelib",
     "imaplib",
     "importlib",
