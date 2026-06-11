@@ -112,6 +112,22 @@ def test_streaming_precomputed_remote_safetensors_result_skips_local_hash(
     assert aggregate.file_metadata[source_path].get("remote_header_only") is True
 
 
+def test_streaming_non_iterable_source_records_operational_error() -> None:
+    class CloseableNonIterable:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    source = CloseableNonIterable()
+    result = scan_model_streaming(cast(Iterator[tuple[Path, bool]], source))
+
+    assert source.closed is True
+    assert result.success is False
+    assert result.has_errors is True
+    assert any("not iterable" in issue.message for issue in result.issues)
+
+
 def _mock_weight_distribution_scanner_availability(monkeypatch: pytest.MonkeyPatch) -> None:
     original_loader = core_module._registry.load_scanner_by_id
 

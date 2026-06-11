@@ -2896,11 +2896,144 @@ class TestModelDownloadStreaming:
         assert scan_result.metadata["hf_revision"] == _HF_TEST_REVISION
         assert scan_result.metadata["tensor_payload_bytes_downloaded"] == 0
         assert scan_result.metadata["remote_shard_family"]["complete"] is True
+        assert all(
+            not str(check.location).startswith("/tmp/modelaudit_hf_safetensors")
+            for check in scan_result.checks
+            if check.location
+        )
+        assert any(check.location == f"hf://test/model@{_HF_TEST_REVISION}/{filename}" for check in scan_result.checks)
         mock_hf_hub_download.assert_not_called()
         assert [call.kwargs["headers"]["Range"] for call in mock_requests_get.call_args_list] == [
             "bytes=0-7",
             f"bytes=0-{7 + header_len}",
         ]
+
+    @patch("huggingface_hub.hf_hub_download")
+    @patch("huggingface_hub.utils.build_hf_headers", return_value={"Authorization": "Bearer hf_secret"})
+    @patch("huggingface_hub.hf_hub_url", return_value="https://huggingface.co/test/model/resolve/rev/model.safetensors")
+    @patch("requests.get")
+    def test_download_model_streaming_accepts_huggingface_cloudfront_range_redirect(
+        self,
+        mock_requests_get: MagicMock,
+        _mock_hf_hub_url: MagicMock,
+        _mock_build_headers: MagicMock,
+        mock_hf_hub_download: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Signed Hugging Face CDN redirects should still be bounded and validated."""
+        filename = "model-00001-of-00001.safetensors"
+        frame, header_len = _make_safetensors_frame(
+            {"tensor": {"dtype": "U8", "shape": [4], "data_offsets": [0, 4]}},
+            b"\x00" * 4,
+        )
+        declared_size = len(frame)
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            lambda *_args, **_kwargs: ([filename], _HF_TEST_REVISION, None),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: ({filename: declared_size}, _HF_TEST_REVISION),
+        )
+        _mock_build_headers.side_effect = lambda *, token=None, headers=None: {
+            "Authorization": "Bearer hf_secret",
+            **(headers or {}),
+        }
+        cloudfront_url = "https://d111111abcdef8.cloudfront.net/model.safetensors?signature=redacted"
+        mock_requests_get.side_effect = [
+            _FakeRangeResponse(b"", headers={"Location": cloudfront_url}, status_code=302),
+            _FakeRangeResponse(
+                frame[:8],
+                headers={
+                    "Content-Range": f"bytes 0-7/{declared_size}",
+                    "Content-Length": "8",
+                    "ETag": '"stable"',
+                },
+                status_code=206,
+                url=cloudfront_url,
+            ),
+            _FakeRangeResponse(b"", headers={"Location": cloudfront_url}, status_code=302),
+            _FakeRangeResponse(
+                frame[: 8 + header_len],
+                headers={
+                    "Content-Range": f"bytes 0-{7 + header_len}/{declared_size}",
+                    "Content-Length": str(8 + header_len),
+                    "ETag": '"stable"',
+                },
+                status_code=206,
+                url=cloudfront_url,
+            ),
+        ]
+
+        results = list(
+            download_model_streaming(
+                f"hf://test/model?revision={_HF_TEST_REVISION}",
+                max_size=1024,
+                scannable_extensions={".safetensors"},
+                scannable_scanner_ids={"safetensors"},
+            )
+        )
+
+        _path, _is_last, scan_result = cast(tuple[Path, bool, Any], results[0])
+        assert scan_result.success is True
+        assert scan_result.metadata["remote_final_host"] == "d111111abcdef8.cloudfront.net"
+        assert mock_requests_get.call_args_list[0].kwargs["headers"]["Authorization"] == "Bearer hf_secret"
+        assert mock_requests_get.call_args_list[1].kwargs["headers"].get("Authorization") is None
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("huggingface_hub.hf_hub_download")
+    @patch("huggingface_hub.utils.build_hf_headers", return_value={})
+    @patch("huggingface_hub.hf_hub_url", return_value="https://huggingface.co/test/model/resolve/rev/model.safetensors")
+    @patch("requests.get")
+    def test_download_model_streaming_stops_safetensors_header_at_remaining_max_size(
+        self,
+        mock_requests_get: MagicMock,
+        _mock_hf_hub_url: MagicMock,
+        _mock_build_headers: MagicMock,
+        mock_hf_hub_download: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A header larger than the remaining max-size budget must not be fetched."""
+        filename = "model-00001-of-00001.safetensors"
+        frame, _header_len = _make_safetensors_frame(
+            {"tensor": {"dtype": "U8", "shape": [64], "data_offsets": [0, 64]}},
+            b"\x00" * 64,
+        )
+        declared_size = len(frame)
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            lambda *_args, **_kwargs: ([filename], _HF_TEST_REVISION, None),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: ({filename: declared_size}, _HF_TEST_REVISION),
+        )
+        _mock_build_headers.side_effect = lambda *, token=None, headers=None: headers or {}
+        mock_requests_get.return_value = _FakeRangeResponse(
+            frame[:8],
+            headers={
+                "Content-Range": f"bytes 0-7/{declared_size}",
+                "Content-Length": "8",
+                "ETag": '"stable"',
+            },
+            status_code=206,
+        )
+
+        results = list(
+            download_model_streaming(
+                f"hf://test/model?revision={_HF_TEST_REVISION}",
+                max_size=16,
+                scannable_extensions={".safetensors"},
+                scannable_scanner_ids={"safetensors"},
+            )
+        )
+
+        _path, _is_last, scan_result = cast(tuple[Path, bool, Any], results[0])
+        assert scan_result.success is False
+        assert scan_result.metadata["remote_bytes_transferred"] == 8
+        assert "remote_safetensors_header_max_size_exceeded" in scan_result.metadata["scan_outcome_reasons"]
+        assert mock_requests_get.call_count == 1
+        mock_hf_hub_download.assert_not_called()
 
     @patch("huggingface_hub.hf_hub_download")
     @patch("huggingface_hub.utils.build_hf_headers", return_value={})

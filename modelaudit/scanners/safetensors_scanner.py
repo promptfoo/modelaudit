@@ -436,12 +436,38 @@ class SafeTensorsScanner(BaseScanner):
         result.metadata["file_size"] = file_size
         structural_validation_failed = False
 
+        def add_integrity_evidence() -> None:
+            if remote_header_only:
+                integrity_details = self.config.get(_REMOTE_HEADER_INTEGRITY_CONFIG_KEY)
+                result.add_check(
+                    name="Remote SafeTensors Header Integrity",
+                    passed=True,
+                    message="SafeTensors header was fetched with bounded remote range validation",
+                    location=path,
+                    details=integrity_details if isinstance(integrity_details, dict) else {},
+                )
+                result.metadata["remote_header_only"] = True
+                result.metadata["content_hash_unavailable_reason"] = "remote_safetensors_header_only"
+            else:
+                self.add_file_integrity_check(path, result)
+
+        def scanned_bytes_for_result() -> int:
+            remote_bytes_scanned = self.config.get(_REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY)
+            return (
+                remote_bytes_scanned
+                if remote_header_only
+                and isinstance(remote_bytes_scanned, int)
+                and not isinstance(remote_bytes_scanned, bool)
+                and remote_bytes_scanned >= 0
+                else file_size
+            )
+
         try:
             self.current_file_path = path
             with open(path, "rb") as f:
                 header_len_bytes = f.read(8)
                 if len(header_len_bytes) != 8:
-                    self.add_file_integrity_check(path, result)
+                    add_integrity_evidence()
                     result.add_check(
                         name="SafeTensors Header Size Check",
                         passed=False,
@@ -451,13 +477,14 @@ class SafeTensorsScanner(BaseScanner):
                         details={"bytes_read": len(header_len_bytes), "required": 8},
                     )
                     self._mark_inconclusive(result, SAFETENSORS_HEADER_INCONCLUSIVE_REASON)
+                    result.bytes_scanned = scanned_bytes_for_result()
                     result.finish(success=False)
                     return result
 
                 header_len = struct.unpack("<Q", header_len_bytes)[0]
                 max_header_bytes = int(self.config.get("max_safetensors_header_bytes", MAX_HEADER_BYTES))
                 if header_len <= 0 or header_len > file_size - 8:
-                    self.add_file_integrity_check(path, result)
+                    add_integrity_evidence()
                     result.add_check(
                         name="Header Length Validation",
                         passed=False,
@@ -467,6 +494,7 @@ class SafeTensorsScanner(BaseScanner):
                         details={"header_len": header_len, "max_allowed": file_size - 8},
                     )
                     self._mark_inconclusive(result, SAFETENSORS_HEADER_INCONCLUSIVE_REASON)
+                    result.bytes_scanned = scanned_bytes_for_result()
                     result.finish(success=False)
                     return result
                 else:
@@ -516,19 +544,7 @@ class SafeTensorsScanner(BaseScanner):
                 )
 
                 # Do not hash an artifact that has already failed the bounded header gate.
-                if remote_header_only:
-                    integrity_details = self.config.get(_REMOTE_HEADER_INTEGRITY_CONFIG_KEY)
-                    result.add_check(
-                        name="Remote SafeTensors Header Integrity",
-                        passed=True,
-                        message="SafeTensors header was fetched with bounded remote range validation",
-                        location=path,
-                        details=integrity_details if isinstance(integrity_details, dict) else {},
-                    )
-                    result.metadata["remote_header_only"] = True
-                    result.metadata["content_hash_unavailable_reason"] = "remote_safetensors_header_only"
-                else:
-                    self.add_file_integrity_check(path, result)
+                add_integrity_evidence()
 
                 header_bytes = f.read(header_len)
                 if len(header_bytes) != header_len:

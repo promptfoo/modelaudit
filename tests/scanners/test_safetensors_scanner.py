@@ -18,7 +18,13 @@ from safetensors.numpy import load_file, save_file
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.safetensors_scanner import SAFETENSORS_READ_INCONCLUSIVE_REASON, SafeTensorsScanner
+from modelaudit.scanners.safetensors_scanner import (
+    _REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY,
+    _REMOTE_HEADER_INTEGRITY_CONFIG_KEY,
+    _REMOTE_HEADER_ONLY_CONFIG_KEY,
+    SAFETENSORS_READ_INCONCLUSIVE_REASON,
+    SafeTensorsScanner,
+)
 
 
 def create_safetensors_file(path: Path) -> None:
@@ -87,6 +93,32 @@ def test_duplicate_safetensors_header_keys_are_inconclusive(tmp_path: Path) -> N
     )
     assert duplicate_check.status == CheckStatus.FAILED
     assert duplicate_check.details["duplicate_keys"] == ["tensor"]
+
+
+def test_remote_invalid_header_length_does_not_hash_sparse_stub(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = tmp_path / "invalid-remote-header.safetensors"
+    file_path.write_bytes(struct.pack("<Q", 1024))
+
+    def fail_integrity_hash(_scanner: SafeTensorsScanner, _path: str, _result: Any) -> None:
+        raise AssertionError("remote header-only scans must not hash sparse stubs")
+
+    monkeypatch.setattr(SafeTensorsScanner, "add_file_integrity_check", fail_integrity_hash)
+    result = SafeTensorsScanner(
+        config={
+            _REMOTE_HEADER_ONLY_CONFIG_KEY: True,
+            _REMOTE_HEADER_BYTES_SCANNED_CONFIG_KEY: 8,
+            _REMOTE_HEADER_INTEGRITY_CONFIG_KEY: {"range_semantics": "strict_206_content_range"},
+        }
+    ).scan(str(file_path))
+
+    assert result.success is False
+    assert result.bytes_scanned == 8
+    assert result.metadata["remote_header_only"] is True
+    integrity_check = next(check for check in result.checks if check.name == "Remote SafeTensors Header Integrity")
+    assert integrity_check.status == CheckStatus.PASSED
 
 
 @pytest.mark.parametrize(

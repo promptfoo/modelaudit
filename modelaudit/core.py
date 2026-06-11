@@ -4343,7 +4343,26 @@ def scan_model_streaming(
     is_hf_cache = base_dir is not None and hf_cache_root is not None
 
     try:
-        for streamed_item in file_generator:
+        try:
+            file_iterator = iter(file_generator)
+        except TypeError as error:
+            logger.error(f"Streaming file source is not iterable: {error}", exc_info=True)
+            results.has_errors = True
+            preserve_shard_reconciliation_errors = True
+            aggregate_hash_complete = False
+            _add_issue_to_model(
+                results,
+                f"Streaming file source is not iterable: {error}",
+                severity=IssueSeverity.INFO.value,
+                details={
+                    "analysis_incomplete": True,
+                    "operational_error": True,
+                    "exception_type": type(error).__name__,
+                },
+            )
+            file_iterator = iter(())
+
+        for streamed_item in file_iterator:
             precomputed_result: ScanResult | None = None
             if len(streamed_item) == 3:
                 file_path, _is_last, precomputed_result = streamed_item

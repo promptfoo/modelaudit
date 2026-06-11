@@ -40,7 +40,6 @@ _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
 _MAX_HF_STREAMING_EXTENSIONLESS_FILES = 128
 _MAX_HF_STREAMING_UNFILTERED_FILES = 128
-_MAX_HF_SAFETENSORS_INDEX_BYTES = 16 * 1024 * 1024
 _HF_SAFETENSORS_STRICT_RANGE_REDIRECTS = 5
 _HF_SAFETENSORS_RANGE_ATTEMPTS = 3
 _HF_DOWNLOAD_WORKER_RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
@@ -116,6 +115,10 @@ class _HuggingFaceStrictRangeRead:
     bytes_transferred: int
 
 
+class _HuggingFaceRangeBudgetExceeded(ValueError):
+    """Raised when a bounded range read would exceed the caller's byte budget."""
+
+
 def _remote_safetensors_source_path(repo_id: str, revision: str, filename: str) -> str:
     return f"hf://{repo_id}@{revision}/{filename}"
 
@@ -138,7 +141,12 @@ def _is_trusted_huggingface_range_host(hostname: str | None) -> bool:
     if hostname is None:
         return False
     host = hostname.rstrip(".").lower()
-    return host in {"huggingface.co", "hf.co"} or host.endswith(".huggingface.co") or host.endswith(".hf.co")
+    return (
+        host in {"huggingface.co", "hf.co"}
+        or host.endswith(".huggingface.co")
+        or host.endswith(".hf.co")
+        or host.endswith(".cloudfront.net")
+    )
 
 
 def _validate_huggingface_range_url(url: str) -> None:
@@ -240,7 +248,7 @@ def _read_huggingface_strict_range(
         request_deadline.check_deadline(repo_id)
         response = requests.get(
             current_url,
-            headers=current_headers,
+            headers=dict(current_headers),
             stream=True,
             timeout=request_deadline.request_timeout(repo_id),
             allow_redirects=False,
@@ -365,6 +373,7 @@ def _scan_remote_huggingface_safetensors_header(
     declared_size: int,
     deadline: float | None,
     shard_details: dict[str, Any] | None = None,
+    max_transferred_bytes: int | None = None,
 ) -> Any:
     """Inspect one remote SafeTensors header without downloading tensor payload bytes."""
     from ...scanners.safetensors_scanner import (
@@ -381,6 +390,8 @@ def _scan_remote_huggingface_safetensors_header(
         attempt_bytes_transferred = 0
         temp_path: str | None = None
         try:
+            if max_transferred_bytes is not None and total_bytes_transferred + 8 > max_transferred_bytes:
+                raise _HuggingFaceRangeBudgetExceeded("remote SafeTensors header length read exceeds max-size budget")
             first_range = _read_huggingface_strict_range(
                 repo_id,
                 filename,
@@ -398,6 +409,9 @@ def _scan_remote_huggingface_safetensors_header(
             final_url = first_range.final_url
             validator = first_range.validator
             if 0 < header_len <= MAX_HEADER_BYTES and header_len <= declared_size - 8:
+                projected_bytes = total_bytes_transferred + attempt_bytes_transferred + 8 + header_len
+                if max_transferred_bytes is not None and projected_bytes > max_transferred_bytes:
+                    raise _HuggingFaceRangeBudgetExceeded("remote SafeTensors header range exceeds max-size budget")
                 header_range = _read_huggingface_strict_range(
                     repo_id,
                     filename,
@@ -447,6 +461,9 @@ def _scan_remote_huggingface_safetensors_header(
                 }
             )
             result = scanner.scan(temp_path)
+            for record in [*result.checks, *result.issues]:
+                if getattr(record, "location", None) == temp_path:
+                    cast(Any, record).location = source_path
             result.metadata.update(integrity_details)
             result.metadata.update(
                 {
@@ -468,7 +485,7 @@ def _scan_remote_huggingface_safetensors_header(
                     passed=bool(shard_details.get("complete")),
                     message=str(shard_details.get("message", "Remote SafeTensors shard coverage evaluated")),
                     severity=None if shard_details.get("complete") else IssueSeverity.INFO,
-                    location=temp_path,
+                    location=source_path,
                     details=shard_details,
                 )
                 if not shard_details.get("complete"):
@@ -481,13 +498,18 @@ def _scan_remote_huggingface_safetensors_header(
         except Exception as exc:
             total_bytes_transferred += attempt_bytes_transferred
             if not _is_retryable_huggingface_range_error(exc) or attempt + 1 >= _HF_SAFETENSORS_RANGE_ATTEMPTS:
+                reason = (
+                    "remote_safetensors_header_max_size_exceeded"
+                    if isinstance(exc, _HuggingFaceRangeBudgetExceeded)
+                    else "remote_safetensors_header_range_failed"
+                )
                 return _remote_safetensors_failure_result(
                     repo_id,
                     filename,
                     revision,
                     declared_size=declared_size,
                     bytes_transferred=total_bytes_transferred,
-                    reason="remote_safetensors_header_range_failed",
+                    reason=reason,
                     error=exc,
                 )
             time.sleep(0.25 * (attempt + 1))
@@ -2401,6 +2423,7 @@ def download_model_streaming(
                     declared_size=declared_size,
                     deadline=deadline,
                     shard_details=shard_details_by_file.get(filename),
+                    max_transferred_bytes=(size_limit - downloaded_total_size if size_limit is not None else None),
                 )
                 transferred = scan_result.metadata.get("remote_bytes_transferred", scan_result.bytes_scanned)
                 transferred_bytes = (
