@@ -8160,6 +8160,7 @@ def test_get_installed_pytorch_version_uses_distribution_metadata_without_import
 
     monkeypatch.delitem(sys.modules, "torch", raising=False)
     monkeypatch.setattr(scanner, "_trusted_python_package_roots", lambda: (trusted_root,))
+    monkeypatch.setattr(scanner, "_resolve_torch_import_origin", lambda: None)
     import_calls = _forbid_torch_import(monkeypatch)
 
     assert scanner._get_installed_pytorch_version() == "2.5.1+cpu"
@@ -8177,6 +8178,7 @@ def test_get_installed_pytorch_version_uses_malformed_metadata_conservatively(
 
     monkeypatch.delitem(sys.modules, "torch", raising=False)
     monkeypatch.setattr(scanner, "_trusted_python_package_roots", lambda: (trusted_root,))
+    monkeypatch.setattr(scanner, "_resolve_torch_import_origin", lambda: None)
     import_calls = _forbid_torch_import(monkeypatch)
 
     installed_version = scanner._get_installed_pytorch_version()
@@ -8436,6 +8438,7 @@ def test_pytorch_zip_installed_torch_metadata_still_emits_runtime_cves_without_i
 
     monkeypatch.delitem(sys.modules, "torch", raising=False)
     monkeypatch.setattr(scanner, "_trusted_python_package_roots", lambda: (trusted_root,))
+    monkeypatch.setattr(scanner, "_resolve_torch_import_origin", lambda: None)
     import_calls = _forbid_torch_import(monkeypatch)
 
     result = scanner.scan(str(model_path))
@@ -8498,6 +8501,7 @@ def test_pytorch_zip_ignores_untrusted_repository_torch_dist_info(
     scanner = PyTorchZipScanner()
     monkeypatch.delitem(sys.modules, "torch", raising=False)
     monkeypatch.setattr(scanner, "_trusted_python_package_roots", lambda: (trusted_root,))
+    monkeypatch.setattr(scanner, "_resolve_torch_import_origin", lambda: None)
     monkeypatch.chdir(repo_root)
     monkeypatch.syspath_prepend(str(repo_root))
     import_calls = _forbid_torch_import(monkeypatch)
@@ -8526,6 +8530,7 @@ def test_pytorch_zip_malformed_torch_metadata_fails_closed_without_import(
 
     monkeypatch.delitem(sys.modules, "torch", raising=False)
     monkeypatch.setattr(scanner, "_trusted_python_package_roots", lambda: (trusted_root,))
+    monkeypatch.setattr(scanner, "_resolve_torch_import_origin", lambda: None)
     import_calls = _forbid_torch_import(monkeypatch)
 
     result = scanner.scan(str(model_path))
