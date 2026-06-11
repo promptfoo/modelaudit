@@ -377,6 +377,39 @@ def _write_rebindable_trusted_torch_utils_package(site_packages: Path) -> None:
     )
 
 
+def _write_cross_module_rebind_target_package(site_packages: Path) -> None:
+    (site_packages / "trusted_target.py").write_text(
+        "\n".join(
+            [
+                "from pathlib import Path",
+                "def rebound_optimizer(path):",
+                "    Path(path).write_text('cross-module', encoding='utf-8')",
+                "    return None",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_runtime_mutable_trusted_transformers_package(site_packages: Path) -> None:
+    package_dir = site_packages / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        "\n".join(
+            [
+                "def OptimizerNames(value, callback=None):",
+                "    if callback is not None:",
+                "        return callback(value)",
+                "    return None",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def _write_sitecustomize_trusting_site_packages(customize_dir: Path, site_packages: Path) -> None:
     customize_dir.mkdir(parents=True, exist_ok=True)
     (customize_dir / "sitecustomize.py").write_text(
@@ -6665,6 +6698,125 @@ def test_scan_file_warns_when_rebound_framework_function_forges_trusted_filename
     assert any(
         finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
         and finding["import_reference"] == "torch._utils._rebuild_tensor"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_framework_metadata_rebound_to_cross_module_source_before_scanner_import(
+    tmp_path: Path,
+) -> None:
+    payload_path = tmp_path / "preimport-rebound-cross-module-optimizer.pkl"
+    marker = tmp_path / "preimport-rebound-cross-module.marker"
+    payload_path.write_bytes(
+        _metadata_reduce_payload("transformers.training_args", "OptimizerNames", str(marker).encode()) + b"."
+    )
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_rebindable_trusted_transformers_package(site_packages)
+    _write_cross_module_rebind_target_package(site_packages)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "import trusted_target\n"
+        "import transformers.training_args as training_args\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "training_args.OptimizerNames = trusted_target.rebound_optimizer\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.OptimizerNames"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_framework_function_default_mutated_before_scanner_import(
+    tmp_path: Path,
+) -> None:
+    payload_path = tmp_path / "preimport-mutated-default-optimizer.pkl"
+    marker = tmp_path / "preimport-mutated-default.marker"
+    payload_path.write_bytes(
+        _metadata_reduce_payload("transformers.training_args", "OptimizerNames", str(marker).encode()) + b"."
+    )
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_runtime_mutable_trusted_transformers_package(site_packages)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "import transformers.training_args as training_args\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "def evil_callback(path):\n"
+        "    marker.write_text('mutated-default', encoding='utf-8')\n"
+        "    return None\n"
+        "training_args.OptimizerNames.__defaults__ = (evil_callback,)\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.OptimizerNames"
         for finding in output["findings"]
     )
 

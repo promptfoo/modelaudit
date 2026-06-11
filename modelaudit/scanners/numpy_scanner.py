@@ -60,6 +60,14 @@ def _finish_with_inconclusive_contract(result: ScanResult, *, default_success: b
 
 
 NUMPY_OBJECT_EMBEDDED_PICKLE_SELECTION_SKIP_REASON = "numpy_object_embedded_pickle_scanner_selection_skip"
+_VALIDATED_NUMPY_OBJECT_DTYPE_RECONSTRUCTION_REFERENCES = frozenset(
+    {
+        "numpy._core.multiarray._reconstruct",
+        "numpy.core.multiarray._reconstruct",
+        "numpy.dtype",
+        "numpy.ndarray",
+    }
+)
 NUMPY_HEADER_MAX_SIZE = 10_000
 NUMPY_V3_HEADER_MAX_BYTES = NUMPY_HEADER_MAX_SIZE * 4
 
@@ -243,6 +251,17 @@ class NumPyScanner(BaseScanner):
             or details.get("pickle_notice_code") == "parse_incomplete"
             or details.get("failure_reason") == "unknown_opcode_or_format_error"
         )
+
+    @staticmethod
+    def _remove_validated_numpy_object_reconstruction_findings(result: ScanResult) -> None:
+        def is_validated_numpy_object_reconstruction(item: Check | Issue) -> bool:
+            return (
+                item.rule_code == "NON_ALLOWLISTED_GLOBAL"
+                and item.details.get("import_reference") in _VALIDATED_NUMPY_OBJECT_DTYPE_RECONSTRUCTION_REFERENCES
+            )
+
+        result.issues = [issue for issue in result.issues if not is_validated_numpy_object_reconstruction(issue)]
+        result.checks = [check for check in result.checks if not is_validated_numpy_object_reconstruction(check)]
 
     def _validate_dtype(self, dtype: Any) -> None:
         """Validate numpy dtype for security"""
@@ -487,6 +506,7 @@ class NumPyScanner(BaseScanner):
                                     for check in embedded_result.checks
                                     if not self._is_trailing_pickle_parse_noise(check)
                                 )
+                                self._remove_validated_numpy_object_reconstruction_findings(result)
                                 result.add_check(
                                     name="File Integrity Check",
                                     passed=False,
@@ -509,6 +529,7 @@ class NumPyScanner(BaseScanner):
 
                             result.issues.extend(embedded_result.issues)
                             result.checks.extend(embedded_result.checks)
+                            self._remove_validated_numpy_object_reconstruction_findings(result)
 
                             # Object-dtype .npy payloads are stored as a pickle stream rather than
                             # fixed-width element data, so the numeric dtype/size validation path

@@ -38,6 +38,12 @@ _JOBLIB_COMPRESSED_PREFIXES = (b"x", b"\x1f\x8b", b"]\x00", b"\xfd7zXZ")
 _JOBLIB_NUMPY_ARRAY_WRAPPER_MODULE = "joblib.numpy_pickle"
 _JOBLIB_NUMPY_ARRAY_WRAPPER_NAME = "NumpyArrayWrapper"
 _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE = f"{_JOBLIB_NUMPY_ARRAY_WRAPPER_MODULE}.{_JOBLIB_NUMPY_ARRAY_WRAPPER_NAME}"
+_VALIDATED_JOBLIB_NUMPY_ARRAY_CONTROL_REFERENCES = frozenset(
+    {
+        _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE,
+        "numpy.dtype",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -796,13 +802,13 @@ class JoblibScanner(BaseScanner):
         def is_validated_wrapper_finding(finding: Any) -> bool:
             return (
                 finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-                and finding.details.get("import_reference") == _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE
+                and finding.details.get("import_reference") in _VALIDATED_JOBLIB_NUMPY_ARRAY_CONTROL_REFERENCES
             )
 
         def is_validated_wrapper_source_notice(finding: Any) -> bool:
             return (
                 finding.details.get("notice_code") == "call_graph_source_unavailable"
-                and finding.details.get("import_reference") == _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE
+                and finding.details.get("import_reference") in _VALIDATED_JOBLIB_NUMPY_ARRAY_CONTROL_REFERENCES
             )
 
         removed = (

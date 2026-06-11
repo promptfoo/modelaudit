@@ -338,6 +338,13 @@ _IMPORT_RUNTIME_BUILTINS_SNAPSHOT = (
     if type(_IMPORT_RUNTIME_BUILTINS) is dict
     else MappingProxyType({})
 )
+_IMPORT_RUNTIME_BUILTIN_VALUE_SNAPSHOTS = (
+    MappingProxyType(
+        {name: _runtime_value_snapshot(value) for name, value in _IMPORT_RUNTIME_BUILTINS.items() if type(name) is str}
+    )
+    if type(_IMPORT_RUNTIME_BUILTINS) is dict
+    else MappingProxyType({})
+)
 _FROZEN_IMPORTLIB_DEPENDENCY_MODULE_ATTRIBUTES = {
     "_thread": ("RLock", "allocate_lock", "get_ident"),
     "_warnings": ("warn",),
@@ -685,9 +692,14 @@ def _loaded_reference_state_without_hooks(
     return True, value
 
 
+def _runtime_value_is_class(value: object) -> bool:
+    return type in type.__getattribute__(type(value), "__mro__")
+
+
 def _trusted_reference_executable_snapshot(value: object) -> _TrustedReferenceExecutableSnapshot:
     type_snapshots: tuple[tuple[type[object], Mapping[str, _TrustedExecutableValueSnapshot]], ...] = ()
-    if type(value) is type:
+    if _runtime_value_is_class(value):
+        class_ = cast(type[object], value)
         type_snapshots = tuple(
             (
                 base,
@@ -698,7 +710,7 @@ def _trusted_reference_executable_snapshot(value: object) -> _TrustedReferenceEx
                     }
                 ),
             )
-            for base in type.__getattribute__(value, "__mro__")
+            for base in type.__getattribute__(class_, "__mro__")
         )
     return _trusted_executable_value_snapshot(value), type_snapshots
 
@@ -722,10 +734,11 @@ def _executable_value_functions(value: object) -> tuple[FunctionType, ...]:
         return tuple(
             function for function in (value.fget, value.fset, value.fdel) if isinstance(function, FunctionType)
         )
-    if type(value) is type:
+    if _runtime_value_is_class(value):
+        class_ = cast(type[object], value)
         functions: list[FunctionType] = []
         for name in ("__new__", "__init__"):
-            for base in type.__getattribute__(value, "__mro__"):
+            for base in type.__getattribute__(class_, "__mro__"):
                 namespace = type.__getattribute__(base, "__dict__")
                 if name in namespace:
                     functions.extend(_executable_value_functions(namespace[name]))
@@ -1026,6 +1039,91 @@ def _trusted_reference_executable_matches_snapshot(
         ):
             return False
     return True
+
+
+_SOURCE_INDEPENDENT_DEFAULT_TYPES = frozenset(
+    {
+        type(None),
+        bool,
+        int,
+        float,
+        complex,
+        str,
+        bytes,
+        type(Ellipsis),
+        type(NotImplemented),
+    }
+)
+_MAX_SOURCE_INDEPENDENT_DEFAULT_DEPTH = 8
+
+
+def _source_independent_default_value(value: object, *, depth: int = 0) -> bool:
+    if depth > _MAX_SOURCE_INDEPENDENT_DEFAULT_DEPTH:
+        return False
+    if type(value) in _SOURCE_INDEPENDENT_DEFAULT_TYPES:
+        return True
+    if type(value) is tuple:
+        return all(_source_independent_default_value(item, depth=depth + 1) for item in value)
+    if type(value) is frozenset:
+        return all(_source_independent_default_value(item, depth=depth + 1) for item in value)
+    return False
+
+
+def _runtime_function_snapshot_is_source_independent(snapshot: _RuntimeValueSnapshot) -> bool:
+    if snapshot[1] is None:
+        return True
+    defaults = snapshot[3]
+    if defaults is not None and (
+        type(defaults) is not tuple or not all(_source_independent_default_value(default) for default in defaults)
+    ):
+        return False
+    keyword_defaults = snapshot[4]
+    if keyword_defaults is not None:
+        if type(keyword_defaults) is not dict:
+            return False
+        keyword_default_items = snapshot[5]
+        if len(keyword_defaults) != len(keyword_default_items):
+            return False
+        if any(
+            type(name) is not str or not _source_independent_default_value(value)
+            for name, value in keyword_default_items
+        ):
+            return False
+    return not snapshot[6]
+
+
+def _trusted_executable_value_runtime_dependencies_are_source_independent(
+    snapshot: _TrustedExecutableValueSnapshot,
+) -> bool:
+    if not snapshot[2] or not _runtime_function_snapshot_is_source_independent(snapshot[0]):
+        return False
+    if type(_IMPORT_RUNTIME_BUILTINS) is not dict:
+        return False
+    for function, _globals_namespace, global_snapshots, builtins_namespace, builtin_snapshots in snapshot[1]:
+        if not _runtime_function_snapshot_is_source_independent(_runtime_value_snapshot(function)):
+            return False
+        if global_snapshots:
+            return False
+        if builtins_namespace is not _IMPORT_RUNTIME_BUILTINS:
+            return False
+        for name, builtin_snapshot in builtin_snapshots:
+            expected = _IMPORT_RUNTIME_BUILTIN_VALUE_SNAPSHOTS.get(name)
+            if expected is None:
+                return False
+            if not _runtime_value_matches_snapshot(builtin_snapshot[0], expected):
+                return False
+            if not _runtime_value_matches_snapshot(_IMPORT_RUNTIME_BUILTINS[name], expected):
+                return False
+    return True
+
+
+def _trusted_reference_runtime_dependencies_are_source_independent(value: object) -> bool:
+    snapshot = _trusted_reference_executable_snapshot(value)
+    return _trusted_executable_value_runtime_dependencies_are_source_independent(snapshot[0]) and all(
+        _trusted_executable_value_runtime_dependencies_are_source_independent(member_snapshot)
+        for _base, namespace in snapshot[1]
+        for member_snapshot in namespace.values()
+    )
 
 
 def _trusted_class_namespace_addition_is_safe(name: str, value: object) -> bool:
@@ -2242,24 +2340,34 @@ def _loaded_site_package_reference_owner_matches(module_name: str, name: str, va
     if type(value) is BuiltinFunctionType:
         return False
     if isinstance(value, FunctionType):
-        return _function_owner_matches_trusted_source(value)
+        return _function_owner_matches_trusted_source(
+            value,
+            expected_module=module_name,
+        ) and _trusted_reference_runtime_dependencies_are_source_independent(value)
     if _runtime_value_is_class(value):
         class_ = cast(type[object], value)
         class_module = type.__getattribute__(class_, "__module__")
-        if type(class_module) is not str or _trusted_python_module_source_path(class_module) is None:
+        if (
+            type(class_module) is not str
+            or class_module != module_name
+            or _trusted_python_module_source_path(class_module) is None
+        ):
             return False
         return (
-            _class_metaclass_call_matches_trusted_source(class_)
-            and _class_pickle_executable_members_match_trusted_source(class_)
-            and _class_pickle_data_descriptors_match_trusted_source(class_)
+            _class_metaclass_call_matches_trusted_source(class_, expected_module=module_name)
+            and _class_pickle_executable_members_match_trusted_source(class_, expected_module=module_name)
+            and _class_pickle_data_descriptors_match_trusted_source(class_, expected_module=module_name)
+            and _trusted_reference_runtime_dependencies_are_source_independent(value)
         )
     functions = _pickle_executable_functions(value)
     if functions:
-        return all(_function_owner_matches_trusted_source(function) for function in functions)
+        return all(
+            _function_owner_matches_trusted_source(function, expected_module=module_name) for function in functions
+        ) and _trusted_reference_runtime_dependencies_are_source_independent(value)
     return not callable(value)
 
 
-def _class_pickle_executable_members_match_trusted_source(class_: type[object]) -> bool:
+def _class_pickle_executable_members_match_trusted_source(class_: type[object], *, expected_module: str) -> bool:
     for base in type.__getattribute__(class_, "__mro__"):
         namespace = type.__getattribute__(base, "__dict__")
         for member_name in _PICKLE_ENTERED_IMPORT_EXECUTION_METHODS:
@@ -2267,21 +2375,27 @@ def _class_pickle_executable_members_match_trusted_source(class_: type[object]) 
                 base,
                 member_name,
                 namespace[member_name],
+                expected_module=expected_module,
             ):
                 return False
     return True
 
 
-def _class_metaclass_call_matches_trusted_source(class_: type[object]) -> bool:
+def _class_metaclass_call_matches_trusted_source(class_: type[object], *, expected_module: str) -> bool:
     metaclass = type(class_)
     for base in type.__getattribute__(metaclass, "__mro__"):
         namespace = type.__getattribute__(base, "__dict__")
         if "__call__" in namespace:
-            return _pickle_executable_member_matches_trusted_source(base, "__call__", namespace["__call__"])
+            return _pickle_executable_member_matches_trusted_source(
+                base,
+                "__call__",
+                namespace["__call__"],
+                expected_module=expected_module,
+            )
     return True
 
 
-def _class_pickle_data_descriptors_match_trusted_source(class_: type[object]) -> bool:
+def _class_pickle_data_descriptors_match_trusted_source(class_: type[object], *, expected_module: str) -> bool:
     for base in type.__getattribute__(class_, "__mro__"):
         namespace = type.__getattribute__(base, "__dict__")
         for member_name, member in namespace.items():
@@ -2289,20 +2403,32 @@ def _class_pickle_data_descriptors_match_trusted_source(class_: type[object]) ->
                 base,
                 member_name,
                 member,
+                expected_module=expected_module,
             ):
                 return False
     return True
 
 
-def _data_descriptor_matches_trusted_source(owner: type[object], name: str, member: object) -> bool:
-    if not _pickle_executable_member_matches_trusted_source(owner, name, member):
+def _data_descriptor_matches_trusted_source(
+    owner: type[object],
+    name: str,
+    member: object,
+    *,
+    expected_module: str,
+) -> bool:
+    if not _pickle_executable_member_matches_trusted_source(owner, name, member, expected_module=expected_module):
         return False
     descriptor_type = type(member)
     for method_name in ("__set__", "__delete__"):
         for base in type.__getattribute__(descriptor_type, "__mro__"):
             namespace = type.__getattribute__(base, "__dict__")
             if method_name in namespace:
-                if not _pickle_executable_member_matches_trusted_source(base, method_name, namespace[method_name]):
+                if not _pickle_executable_member_matches_trusted_source(
+                    base,
+                    method_name,
+                    namespace[method_name],
+                    expected_module=expected_module,
+                ):
                     return False
                 break
     return True
@@ -2316,20 +2442,24 @@ def _runtime_type_member_is_data_descriptor(value: object) -> bool:
     )
 
 
-def _runtime_value_is_class(value: object) -> bool:
-    return type in type.__getattribute__(type(value), "__mro__")
-
-
-def _pickle_executable_member_matches_trusted_source(owner: type[object], name: str, member: object) -> bool:
+def _pickle_executable_member_matches_trusted_source(
+    owner: type[object],
+    name: str,
+    member: object,
+    *,
+    expected_module: str,
+) -> bool:
     if isinstance(member, classmethod | staticmethod):
         member = member.__func__
     if isinstance(member, FunctionType):
-        return _function_owner_matches_trusted_source(member)
+        return _function_owner_matches_trusted_source(member, expected_module=expected_module)
     if type(member) is property:
         functions = tuple(
             function for function in (member.fget, member.fset, member.fdel) if isinstance(function, FunctionType)
         )
-        return bool(functions) and all(_function_owner_matches_trusted_source(function) for function in functions)
+        return bool(functions) and all(
+            _function_owner_matches_trusted_source(function, expected_module=expected_module) for function in functions
+        )
     if _trusted_owner_bound_builtin_descriptor_matches(owner, name, member):
         return True
     return not _runtime_type_member_is_executable(member)
@@ -2399,12 +2529,12 @@ def _pickle_executable_functions(value: object) -> tuple[FunctionType, ...]:
     return tuple(dict.fromkeys(functions))
 
 
-def _function_owner_matches_trusted_source(function: FunctionType) -> bool:
+def _function_owner_matches_trusted_source(function: FunctionType, *, expected_module: str) -> bool:
     globals_namespace = function.__globals__
     if type(globals_namespace) is not dict:
         return False
     owner_module = globals_namespace.get("__name__")
-    if type(owner_module) is not str:
+    if type(owner_module) is not str or owner_module != expected_module:
         return False
     source_path = _trusted_python_module_source_path(owner_module)
     if source_path is None:

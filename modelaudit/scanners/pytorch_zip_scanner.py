@@ -1790,6 +1790,11 @@ class PyTorchZipScanner(BaseScanner):
     @staticmethod
     def _pickle_member_max_severity(member_result: ScanResult) -> str | None:
         severities = [issue.severity.value for issue in member_result.issues if issue.severity is not None]
+        severities.extend(
+            check.severity.value
+            for check in member_result.checks
+            if check.status == CheckStatus.FAILED and check.severity is not None
+        )
         if not severities:
             return None
         return max(severities, key=lambda severity: _PICKLE_MEMBER_SEVERITY_RANK.get(severity, -1))
