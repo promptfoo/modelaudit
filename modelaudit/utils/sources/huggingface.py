@@ -502,15 +502,34 @@ def _probe_huggingface_executorch_prefix(prefix: bytes, *, sample_is_prefix: boo
     )
 
 
-def _is_complete_huggingface_text_or_json(probe: bytes, *, sample_is_prefix: bool) -> bool:
+def _is_complete_huggingface_text_or_json(
+    filename: str,
+    probe: bytes,
+    *,
+    sample_is_prefix: bool,
+    preserve_protobuf_model_candidates: bool = False,
+) -> bool:
     """Return whether a complete bounded probe is owned by benign text or JSON."""
     if sample_is_prefix:
         return False
 
-    from modelaudit.utils.file.detection import _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES
+    from modelaudit.utils.file.detection import (
+        _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES,
+        _has_bounded_protobuf_model_text_candidate_signal_bytes,
+        _is_complete_bounded_printable_text_content_owner_bytes,
+    )
 
-    if not probe.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES):
+    remote_path = Path(filename)
+    if (
+        preserve_protobuf_model_candidates
+        and remote_path.suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        and _has_bounded_protobuf_model_text_candidate_signal_bytes(probe)
+    ):
+        return False
+
+    if _is_complete_bounded_printable_text_content_owner_bytes(remote_path, len(probe), probe):
         return True
+
     normalized = probe.lstrip()
     if normalized.startswith(b"\xef\xbb\xbf"):
         normalized = normalized[3:].lstrip()
@@ -520,6 +539,59 @@ def _is_complete_huggingface_text_or_json(probe: bytes, *, sample_is_prefix: boo
         return isinstance(json.loads(normalized.decode("utf-8")), (dict, list))
     except (UnicodeDecodeError, ValueError, RecursionError):
         return False
+
+
+def _is_complete_huggingface_text_owner_or_json_probe(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    raw_probe: bytes,
+    max_probe_size: int,
+    *,
+    preserve_protobuf_model_candidates: bool = False,
+) -> bool:
+    """Return whether a bounded remote probe proves text or JSON ownership."""
+    probe = raw_probe[:max_probe_size]
+    if _is_complete_huggingface_text_or_json(
+        filename,
+        probe,
+        sample_is_prefix=_huggingface_sample_is_prefix(budget, filename, probe, max_probe_size),
+        preserve_protobuf_model_candidates=preserve_protobuf_model_candidates,
+    ):
+        return True
+
+    from modelaudit.utils.file.detection import (
+        _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES,
+        _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES,
+    )
+
+    if Path(filename).suffix.lower() not in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES:
+        return False
+    known_size = budget.file_sizes.get(filename)
+    if known_size is not None and known_size > _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES:
+        return False
+
+    max_text_probe_bytes = known_size if known_size is not None else _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES + 1
+    raw_text_probe = _read_huggingface_probe(
+        repo_id,
+        filename,
+        revision,
+        budget,
+        raw_probe,
+        max_text_probe_bytes,
+    )
+    return _is_complete_huggingface_text_or_json(
+        filename,
+        raw_text_probe[:_CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES],
+        sample_is_prefix=_huggingface_sample_is_prefix(
+            budget,
+            filename,
+            raw_text_probe[:_CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES],
+            _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES,
+        ),
+        preserve_protobuf_model_candidates=preserve_protobuf_model_candidates,
+    )
 
 
 def _detect_huggingface_protobuf_model_route(
@@ -547,7 +619,15 @@ def _detect_huggingface_protobuf_model_route(
     raw_probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, max_probe_size + 1)
     sample_is_prefix = len(raw_probe) > max_probe_size
     probe = raw_probe[:max_probe_size]
-    if _is_complete_huggingface_text_or_json(probe, sample_is_prefix=sample_is_prefix):
+    if _is_complete_huggingface_text_owner_or_json_probe(
+        repo_id,
+        filename,
+        revision,
+        budget,
+        raw_probe,
+        max_probe_size,
+        preserve_protobuf_model_candidates=True,
+    ):
         return None
 
     coreml_status = _looks_like_coreml_model_proto_prefix(probe, sample_is_prefix=sample_is_prefix)
@@ -606,7 +686,14 @@ def _detect_huggingface_flax_msgpack_route(
     raw_probe = _read_huggingface_probe(repo_id, filename, revision, budget, prefix, max_probe_size + 1)
     sample_is_prefix = len(raw_probe) > max_probe_size
     probe = raw_probe[:max_probe_size]
-    if _is_complete_huggingface_text_or_json(probe, sample_is_prefix=sample_is_prefix):
+    if _is_complete_huggingface_text_owner_or_json_probe(
+        repo_id,
+        filename,
+        revision,
+        budget,
+        raw_probe,
+        max_probe_size,
+    ):
         return None
     probe_state = _probe_flax_msgpack_checkpoint_stream(
         BytesIO(probe),
@@ -743,6 +830,17 @@ def _detect_huggingface_content_route_format(
         return "tflite"
     if detected_format != "unknown":
         return detected_format
+
+    if _is_complete_huggingface_text_owner_or_json_probe(
+        repo_id,
+        filename,
+        revision,
+        budget,
+        prefix,
+        _HF_CONTENT_SNIFF_BYTES,
+        preserve_protobuf_model_candidates=True,
+    ):
+        return None
 
     protobuf_route = _detect_huggingface_protobuf_model_route(repo_id, filename, revision, budget, prefix)
     if protobuf_route is not None:

@@ -27,6 +27,7 @@ from modelaudit.utils.sources.huggingface import (
     _list_repo_files_with_timeout,
     _read_huggingface_prefix,
     _run_huggingface_download_with_deadline,
+    _select_streamable_hf_files,
     _terminate_huggingface_download_process,
     download_file_from_hf,
     download_model,
@@ -2776,6 +2777,108 @@ class TestModelDownloadStreaming:
 
         assert [path.name for path, _is_last in results] == expected_filenames
         assert results[-1][1] is True
+
+    @patch("requests.get")
+    def test_select_streamable_flax_excludes_large_text_owner_merges(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """A complete large tokenizer text file must not be promoted to Flax."""
+        payload = ("#version: 0.2\n" + "e n\n" * 600_000).encode("utf-8")
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "merges.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
+        )
+
+        assert selected_files == ["known.msgpack"]
+
+    @patch("modelaudit.utils.sources.huggingface._HF_CONTENT_SNIFF_MAX_TOTAL_BYTES", 64 * 1024)
+    @patch("requests.get")
+    def test_select_streamable_text_owner_uses_known_size_for_complete_probe_budget(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Known-small tokenizer text should not reserve the full text-owner ceiling."""
+        payload = ("#version: 0.2\n" + "e n\n" * 3_000).encode("utf-8")
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "a.txt", "b.txt", "c.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
+        )
+
+        assert selected_files == ["known.msgpack"]
+
+    @patch("requests.get")
+    def test_select_streamable_protobuf_excludes_non_ascii_bpe_text_owner(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """BPE merge text with non-ASCII tokens must not become a protobuf candidate."""
+        payload = ("#version: 0.2\n" + "Ġ hello\n" * 300_000).encode("utf-8")
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["model.onnx", "merges.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".onnx"},
+            scannable_scanner_ids={"onnx"},
+        )
+
+        assert selected_files == ["model.onnx"]
+
+    @pytest.mark.parametrize(
+        ("filename", "payload", "scannable_extensions", "scannable_scanner_ids", "expected_files"),
+        [
+            (
+                "weights.txt",
+                b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03",
+                {".msgpack", ".flax", ".orbax", ".jax"},
+                {"flax_msgpack"},
+                ["known.msgpack", "weights.txt"],
+            ),
+            (
+                "candidate.txt",
+                b"\x12\xff\xff\xff\xff\xff" + (b"\x00" * ((1024 * 1024) + 1)),
+                {".onnx"},
+                {"onnx"},
+                ["model.onnx", "candidate.txt"],
+            ),
+        ],
+        ids=["flax-msgpack-text-suffix", "protobuf-candidate-text-suffix"],
+    )
+    @patch("requests.get")
+    def test_select_streamable_text_suffix_retains_binary_routes(
+        self,
+        mock_requests_get: MagicMock,
+        filename: str,
+        payload: bytes,
+        scannable_extensions: set[str],
+        scannable_scanner_ids: set[str],
+        expected_files: list[str],
+    ) -> None:
+        """Text-owner suffix handling must not suppress binary model candidates."""
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        repo_files = [expected_files[0], filename]
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            repo_files,
+            _HF_TEST_REVISION,
+            scannable_extensions=scannable_extensions,
+            scannable_scanner_ids=scannable_scanner_ids,
+        )
+
+        assert selected_files == expected_files
 
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
