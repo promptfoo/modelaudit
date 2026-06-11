@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- keep strongly identified SentencePiece tokenizer `.model` artifacts, including custom-unknown models with disabled special tokens, out of XGBoost routing while preserving fail-closed `.model` ambiguity for malformed tails.
 - tolerate picklescan reports that omit private metadata
 - stream bounded Llamafile runtime coverage across preview gaps and report incomplete runtime reads or bounds
 - restrict Jinja SSTI indicators to executable template spans so prose mentions of request handling do not produce critical findings
