@@ -313,6 +313,7 @@ _DVC_EXCLUDED_PATHS_CONFIG_KEY = "_dvc_excluded_paths"
 _DVC_COVERAGE_ROOTS_CONFIG_KEY = "_dvc_coverage_roots"
 DVC_EXTERNAL_COVERED_PATHS_CONFIG_KEY = "_dvc_external_covered_paths"
 DVC_EXTERNAL_COVERED_DIRECTORIES_CONFIG_KEY = "_dvc_external_covered_directories"
+_OPENVINO_SCANNED_XML_COMPANIONS_CONFIG_KEY = "_openvino_scanned_xml_companions"
 
 
 def _record_incomplete_dvc_resolution(
@@ -393,6 +394,15 @@ class _TrustedStreamShardRoot:
 
     path: Path
     token: object
+
+
+@dataclass(frozen=True)
+class _FileIdentitySnapshot:
+    """Stable identity fields for a path-sensitive companion file."""
+
+    lstat: tuple[int, int, int, int, int, int]
+    stat: tuple[int, int, int, int, int, int] | None
+    resolved_path: str | None
 
 
 def _make_trusted_stream_shard_root(path: FilePath) -> object:
@@ -639,6 +649,135 @@ def _snapshot_validated_shard_target(
         if trusted_family_group:
             target["family_group"] = trusted_family_group
     return {str(source.absolute()): target}
+
+
+def _openvino_weights_companion_owner(path: Path) -> Path | None:
+    """Return the OpenVINO XML that owns a same-stem .bin sidecar."""
+    try:
+        from modelaudit.scanners.openvino_scanner import openvino_xml_companion_for_weights
+
+        return openvino_xml_companion_for_weights(path)
+    except Exception:
+        return None
+
+
+def _is_openvino_xml_path(path: Path) -> bool:
+    """Return whether the path is a local OpenVINO XML model."""
+    if path.suffix.lower() != ".xml":
+        return False
+    try:
+        from modelaudit.scanners.openvino_scanner import OpenVinoScanner
+
+        return OpenVinoScanner.can_handle(str(path))
+    except Exception:
+        return False
+
+
+def _openvino_xml_companion_key(path: Path) -> str:
+    """Return a stable lexical key for one scheduled OpenVINO XML scan."""
+    return os.path.normcase(os.path.normpath(str(Path(os.path.abspath(path)))))
+
+
+def _with_openvino_scanned_xml_companion(config: dict[str, Any], xml_path: Path) -> dict[str, Any]:
+    """Record an OpenVINO XML that will cover its same-stem weights sidecar."""
+    configured_companions = config.get(_OPENVINO_SCANNED_XML_COMPANIONS_CONFIG_KEY, ())
+    companion_keys = {
+        str(companion_key) for companion_key in configured_companions if isinstance(companion_key, (str, Path))
+    }
+    companion_keys.add(_openvino_xml_companion_key(xml_path))
+    updated_config = dict(config)
+    updated_config[_OPENVINO_SCANNED_XML_COMPANIONS_CONFIG_KEY] = tuple(sorted(companion_keys))
+    return updated_config
+
+
+def _openvino_xml_companion_will_be_scanned(xml_path: Path, config: dict[str, Any]) -> bool:
+    """Return whether this scan invocation scheduled the owning XML through OpenVINO."""
+    if not policy_from_config(config).allows("openvino"):
+        return False
+    configured_companions = config.get(_OPENVINO_SCANNED_XML_COMPANIONS_CONFIG_KEY, ())
+    if not isinstance(configured_companions, (list, tuple, set, frozenset)):
+        return False
+    return _openvino_xml_companion_key(xml_path) in {
+        str(companion_key) for companion_key in configured_companions if isinstance(companion_key, (str, Path))
+    }
+
+
+def _snapshot_file_identity(path: Path) -> _FileIdentitySnapshot | None:
+    """Snapshot path and target identity for TOCTOU-sensitive companion checks."""
+    try:
+        link_stat = os.lstat(path)
+    except OSError:
+        return None
+
+    stat_fields: tuple[int, int, int, int, int, int] | None = None
+    resolved_path: str | None = None
+    try:
+        target_stat = os.stat(path)
+        stat_fields = (
+            target_stat.st_dev,
+            target_stat.st_ino,
+            target_stat.st_mode,
+            target_stat.st_size,
+            target_stat.st_mtime_ns,
+            target_stat.st_ctime_ns,
+        )
+        resolved_path = str(path.resolve(strict=True))
+    except OSError:
+        # TOCTOU races or inaccessible symlink targets still leave a useful lstat snapshot.
+        logger.debug("Could not snapshot target identity for %s", path, exc_info=True)
+
+    return _FileIdentitySnapshot(
+        lstat=(
+            link_stat.st_dev,
+            link_stat.st_ino,
+            link_stat.st_mode,
+            link_stat.st_size,
+            link_stat.st_mtime_ns,
+            link_stat.st_ctime_ns,
+        ),
+        stat=stat_fields,
+        resolved_path=resolved_path,
+    )
+
+
+def _snapshot_file_size(snapshot: _FileIdentitySnapshot | None) -> int:
+    """Return the target size captured by a file identity snapshot."""
+    if snapshot is None:
+        return 0
+    stat_fields = snapshot.stat or snapshot.lstat
+    return stat_fields[3]
+
+
+def _openvino_xml_weights_companion(path: Path) -> Path | None:
+    """Return a local OpenVINO XML model's same-stem weights sidecar."""
+    if not _is_openvino_xml_path(path):
+        return None
+    try:
+        from modelaudit.scanners.openvino_scanner import openvino_weights_companion_for_xml
+
+        return openvino_weights_companion_for_xml(path)
+    except Exception:
+        return None
+
+
+def _snapshot_openvino_companion_for_hash(xml_path: Path, companion_path: Path) -> _FileIdentitySnapshot | None:
+    """Snapshot an OpenVINO sidecar only when hashing stays in the model directory."""
+    companion_snapshot = _snapshot_file_identity(companion_path)
+    if companion_snapshot is None:
+        return None
+    if not companion_path.is_symlink():
+        return companion_snapshot
+
+    try:
+        model_dir = xml_path.resolve(strict=True).parent
+    except OSError:
+        return None
+    if companion_snapshot.resolved_path is None or not is_within_directory(
+        str(model_dir),
+        companion_snapshot.resolved_path,
+    ):
+        return None
+    return companion_snapshot
 
 
 def _validated_shard_family_scopes(
@@ -2626,6 +2765,46 @@ def scan_model_directory_or_file(
                     seen_complete_hf_shard_families.add(family_dedupe_key)
                 scan_entries.append((representative_file, ordered_family_paths, shard_family_key))
 
+            scheduled_openvino_companion_sizes: dict[str, int] = {}
+            if scanner_selection.allows("openvino"):
+                scheduled_companions_by_key: dict[str, str] = {}
+                for representative_file, _scanned_file_paths, _entry_shard_family_key in scan_entries:
+                    xml_path = Path(representative_file)
+                    companion_path = _openvino_xml_weights_companion(xml_path)
+                    if companion_path is None:
+                        continue
+                    companion_snapshot = _snapshot_openvino_companion_for_hash(xml_path, companion_path)
+                    if companion_snapshot is None:
+                        aggregate_hash_complete = False
+                        continue
+                    xml_key = _openvino_xml_companion_key(xml_path)
+                    companion_path_str = str(companion_path)
+                    scheduled_openvino_companion_sizes[xml_key] = _snapshot_file_size(companion_snapshot)
+                    scheduled_companions_by_key[_openvino_xml_companion_key(companion_path)] = companion_path_str
+
+                if scheduled_companions_by_key:
+                    expanded_scan_entries: list[_ScanEntry] = []
+                    for representative_file, scanned_file_paths, entry_shard_family_key in scan_entries:
+                        representative_key = _openvino_xml_companion_key(Path(representative_file))
+                        if representative_key in scheduled_companions_by_key:
+                            continue
+
+                        expanded_scanned_file_paths = list(scanned_file_paths)
+                        expanded_scanned_path_keys = {
+                            _openvino_xml_companion_key(Path(scanned_file_path))
+                            for scanned_file_path in expanded_scanned_file_paths
+                        }
+                        companion_path = _openvino_xml_weights_companion(Path(representative_file))
+                        if companion_path is not None:
+                            companion_key = _openvino_xml_companion_key(companion_path)
+                            scheduled_companion_path = scheduled_companions_by_key.get(companion_key)
+                            if scheduled_companion_path is not None and companion_key not in expanded_scanned_path_keys:
+                                expanded_scanned_file_paths.append(scheduled_companion_path)
+                        expanded_scan_entries.append(
+                            (representative_file, expanded_scanned_file_paths, entry_shard_family_key)
+                        )
+                    scan_entries = expanded_scan_entries
+
             if isinstance(dvc_parent_file, str) and isinstance(dvc_remaining_total_size, int):
                 remaining_size = dvc_remaining_total_size
                 bounded_scan_entries: list[_ScanEntry] = []
@@ -2666,6 +2845,11 @@ def scan_model_directory_or_file(
             # family once. Shard scans already expand to sibling shards in the
             # advanced handler, so scanning each shard path would duplicate work.
             if scan_entries:
+                scheduled_openvino_xml_companions = {
+                    _openvino_xml_companion_key(Path(representative_file))
+                    for representative_file, _scanned_file_paths, _entry_shard_family_key in scan_entries
+                    if scanner_selection.allows("openvino") and _is_openvino_xml_path(Path(representative_file))
+                }
                 hash_sources: list[str] = []
                 seen_hash_sources: set[str] = set()
                 hash_source_by_path: dict[str, str] = {}
@@ -2766,7 +2950,17 @@ def scan_model_directory_or_file(
                                         shard_family_targets.get(shard_family_key, {}),
                                     )
                                 )
+                            openvino_owner = _openvino_weights_companion_owner(Path(representative_file))
+                            if (
+                                openvino_owner is not None
+                                and _openvino_xml_companion_key(openvino_owner) in scheduled_openvino_xml_companions
+                            ):
+                                file_config = _with_openvino_scanned_xml_companion(file_config, openvino_owner)
                             file_result = scan_file(representative_file, file_config)
+                            file_result.bytes_scanned += scheduled_openvino_companion_sizes.get(
+                                _openvino_xml_companion_key(Path(representative_file)),
+                                0,
+                            )
                         finally:
                             _finish_phase_timing(phase_timings, "file_scan_dispatch", file_scan_started_at)
 
@@ -3645,6 +3839,26 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         sr.finish(success=False)
         return sr
 
+    openvino_owner = _openvino_weights_companion_owner(Path(path))
+    if openvino_owner is not None and _openvino_xml_companion_will_be_scanned(openvino_owner, config):
+        sr = ScanResult(scanner_name="openvino")
+        sr.bytes_scanned = file_size
+        sr.metadata["file_size"] = file_size
+        sr.metadata["openvino_xml_companion"] = str(openvino_owner)
+        sr.add_check(
+            name="OpenVINO Weights Sidecar Routing",
+            passed=True,
+            message="OpenVINO weights sidecar covered by adjacent XML model scan",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "xml_companion": str(openvino_owner),
+                "sidecar_file": path,
+            },
+        )
+        sr.finish(success=True)
+        return sr
+
     hdf5_signature_offset = find_hdf5_signature_offset(path)
     safetensors_overlap_scanner_ids = detect_safetensors_overlap_scanner_ids(path)
     try:
@@ -4370,6 +4584,7 @@ def scan_model_streaming(
     start_time = time.time()
     results = create_initial_audit_result()
     file_hashes: list[str] = []
+    hashed_stream_file_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
     aggregate_hash_complete = True
     top_level_hashed_bytes = 0
     files_processed = 0
@@ -4393,6 +4608,9 @@ def scan_model_streaming(
     nearby_license_cache: dict[str, list[str]] = {}
     pending_delete_failures: dict[Path, Exception] = {}
     validated_shard_targets: ValidatedShardTargets = {}
+    preserved_openvino_companion_snapshots: dict[Path, _FileIdentitySnapshot] = {}
+    deferred_openvino_sidecars: dict[Path, Path] = {}
+    consumed_openvino_companions: set[Path] = set()
     preserve_shard_reconciliation_errors = False
 
     def delete_streamed_source(source_path: Path, context: str) -> None:
@@ -4442,16 +4660,142 @@ def scan_model_streaming(
             }
         )
 
+    def record_openvino_companion_stability_failure(
+        xml_path: Path,
+        companion_path: Path,
+        reason: str,
+    ) -> None:
+        """Record a durable operational failure when a streamed OpenVINO sidecar changes."""
+        failure = ScanResult(scanner_name="openvino")
+        _mark_inconclusive_scan_outcome(failure, reason)
+        _mark_operational_scan_error(failure, reason)
+        failure.add_check(
+            name="OpenVINO Weights Companion Stability",
+            passed=False,
+            message="OpenVINO weights companion changed while preserving XML/BIN scan context",
+            severity=IssueSeverity.INFO,
+            location=str(companion_path),
+            details={
+                "xml_file": str(xml_path),
+                "companion_file": str(companion_path),
+                "analysis_incomplete": True,
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reason": reason,
+            },
+        )
+        failure.finish(success=False)
+        results.aggregate_scan_result(
+            {
+                "bytes_scanned": 0,
+                "files_scanned": 0,
+                "has_errors": True,
+                "success": False,
+                "issues": _serialize_streamed_records(
+                    list(failure.issues),
+                    str(companion_path),
+                    str(companion_path),
+                ),
+                "checks": _serialize_streamed_records(
+                    list(failure.checks),
+                    str(companion_path),
+                    str(companion_path),
+                ),
+                "scanners": [failure.scanner_name],
+                "file_metadata": {str(companion_path): dict(failure.metadata)},
+            }
+        )
+
+    def append_streamed_file_hash(
+        scan_path: Path,
+        scan_config: dict[str, Any],
+        *,
+        progress_label: str,
+    ) -> str | None:
+        """Hash one streamed source once before it can be deleted or consumed."""
+        nonlocal aggregate_hash_complete, top_level_hashed_bytes
+
+        scan_path_key = Path(os.path.abspath(scan_path))
+        scan_path_identity = _snapshot_file_identity(scan_path)
+        if scan_path_identity is not None and (scan_path_key, scan_path_identity) in hashed_stream_file_instances:
+            return None
+
+        defer_hash_for_max_total_size = _should_defer_hash_for_max_total_size(
+            scan_config,
+            hashed_bytes=top_level_hashed_bytes,
+        )
+        defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(str(scan_path), scan_config)
+        if defer_hash_for_max_total_size or defer_hash_for_max_file_size:
+            aggregate_hash_complete = False
+            return None
+        if _should_defer_hash_for_safetensors_header_limit(str(scan_path), scan_config):
+            return None
+
+        if progress_callback:
+            progress_callback(
+                f"Hashing {progress_label}",
+                (files_processed / (files_processed + 1)) * 100,
+            )
+        with suppress(OSError):
+            top_level_hashed_bytes += scan_path.stat().st_size
+        file_hash = compute_sha256_hash(scan_path)
+        file_hashes.append(file_hash)
+        if scan_path_identity is not None:
+            hashed_stream_file_instances.add((scan_path_key, scan_path_identity))
+        return file_hash
+
+    def append_streamed_openvino_companion_hash(
+        xml_path: Path,
+        companion_path: Path,
+        scan_config: dict[str, Any],
+    ) -> None:
+        """Hash an OpenVINO sidecar only after preserving its directory boundary."""
+        nonlocal aggregate_hash_complete
+
+        if companion_path.is_symlink():
+            try:
+                resolved_companion = companion_path.resolve(strict=True)
+                model_dir = xml_path.resolve(strict=True).parent
+            except OSError:
+                aggregate_hash_complete = False
+                return
+            if not is_within_directory(str(model_dir), str(resolved_companion)):
+                aggregate_hash_complete = False
+                return
+        append_streamed_file_hash(
+            companion_path,
+            scan_config,
+            progress_label=companion_path.name,
+        )
+
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
     is_hf_cache = base_dir is not None and hf_cache_root is not None
 
     try:
-        for file_path, _is_last in file_generator:
+        file_iterator = iter(file_generator)
+        scanning_deferred_openvino_sidecars = False
+        while True:
+            try:
+                file_path, _is_last = next(file_iterator)
+            except StopIteration:
+                if not scanning_deferred_openvino_sidecars and deferred_openvino_sidecars:
+                    file_iterator = iter((sidecar_path, True) for sidecar_path in deferred_openvino_sidecars.values())
+                    scanning_deferred_openvino_sidecars = True
+                    continue
+                break
+
             source_path = Path(file_path)
+            source_key = Path(os.path.abspath(source_path))
+            if source_key in consumed_openvino_companions:
+                continue
             scan_path = source_path
             report_path = str(source_path)
             pinned_scan_context: Any | None = None
+            preserve_source_after_scan = False
+            openvino_scan_companion_path: Path | None = None
+            openvino_scan_companion_key: Path | None = None
+            openvino_companion_pre_scan_identity: _FileIdentitySnapshot | None = None
+            openvino_companion_bytes_scanned = 0
 
             # Check for interruption before starting work on the yielded file.
             try:
@@ -4489,10 +4833,41 @@ def scan_model_streaming(
                         continue
                     scan_path = resolved_path
 
-                if skip_file_types and should_skip_file(
-                    str(source_path),
-                    metadata_scanner_available=metadata_scanner_available,
-                    scanner_selection_extensions=scanner_selection_extensions,
+                # Build config before skip filtering so bin-first OpenVINO
+                # sidecars can wait for their selected XML owner.
+                scan_config = {
+                    "timeout": timeout - int(time.time() - start_time),
+                    **scan_kwargs,
+                }
+
+                openvino_sidecar_owner = _openvino_weights_companion_owner(scan_path)
+                if (
+                    openvino_sidecar_owner is not None
+                    and scanner_selection.allows("openvino")
+                    and not scanning_deferred_openvino_sidecars
+                ):
+                    is_lfs_sidecar, _lfs_info = check_lfs_pointer(str(scan_path))
+                    if not is_lfs_sidecar:
+                        preserve_source_after_scan = True
+                        deferred_openvino_sidecars.setdefault(Path(os.path.abspath(scan_path)), source_path)
+                        sidecar_snapshot = _snapshot_file_identity(scan_path)
+                        if sidecar_snapshot is not None:
+                            preserved_openvino_companion_snapshots[Path(os.path.abspath(scan_path))] = sidecar_snapshot
+                        continue
+
+                scan_unconsumed_openvino_sidecar = (
+                    openvino_sidecar_owner is not None
+                    and scanner_selection.allows("openvino")
+                    and scanning_deferred_openvino_sidecars
+                )
+                if (
+                    skip_file_types
+                    and not scan_unconsumed_openvino_sidecar
+                    and should_skip_file(
+                        str(source_path),
+                        metadata_scanner_available=metadata_scanner_available,
+                        scanner_selection_extensions=scanner_selection_extensions,
+                    )
                 ):
                     filename_lower = source_path.name.lower()
                     if filename_lower in LICENSE_FILES:
@@ -4510,6 +4885,27 @@ def scan_model_streaming(
                     else:
                         logger.debug(f"Skipping non-model file: {source_path}")
                     continue
+
+                if scanner_selection.allows("openvino") and _is_openvino_xml_path(scan_path):
+                    candidate_companion = _openvino_xml_weights_companion(scan_path)
+                    if candidate_companion is not None:
+                        openvino_scan_companion_path = candidate_companion
+                        openvino_scan_companion_key = Path(os.path.abspath(candidate_companion))
+                        openvino_companion_pre_scan_identity = _snapshot_file_identity(candidate_companion)
+                        openvino_companion_bytes_scanned = _snapshot_file_size(openvino_companion_pre_scan_identity)
+                        preserved_snapshot = preserved_openvino_companion_snapshots.get(openvino_scan_companion_key)
+                        if (
+                            preserved_snapshot is not None
+                            and openvino_companion_pre_scan_identity is not None
+                            and preserved_snapshot != openvino_companion_pre_scan_identity
+                        ):
+                            record_openvino_companion_stability_failure(
+                                scan_path,
+                                candidate_companion,
+                                "openvino_weights_changed_before_xml_scan",
+                            )
+                            preserve_shard_reconciliation_errors = True
+                            aggregate_hash_complete = False
 
                 # Build config dict for scan_file
                 scan_config = {
@@ -4563,28 +4959,17 @@ def scan_model_streaming(
                             files_processed += 1
                             continue
 
-                file_hash: str | None = None
-                defer_hash_for_max_total_size = _should_defer_hash_for_max_total_size(
+                file_hash = append_streamed_file_hash(
+                    scan_path,
                     scan_config,
-                    hashed_bytes=top_level_hashed_bytes,
+                    progress_label=source_path.name,
                 )
-                defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(str(scan_path), scan_config)
-                if defer_hash_for_max_total_size or defer_hash_for_max_file_size:
-                    aggregate_hash_complete = False
-                if (
-                    not _should_defer_hash_for_safetensors_header_limit(str(scan_path), scan_config)
-                    and not defer_hash_for_max_file_size
-                    and not defer_hash_for_max_total_size
-                ):
-                    if progress_callback:
-                        progress_callback(
-                            f"Hashing {source_path.name}",
-                            (files_processed / (files_processed + 1)) * 100,
-                        )
-                    with suppress(OSError):
-                        top_level_hashed_bytes += scan_path.stat().st_size
-                    file_hash = compute_sha256_hash(scan_path)
-                    file_hashes.append(file_hash)
+                if openvino_scan_companion_path is not None:
+                    append_streamed_openvino_companion_hash(
+                        scan_path,
+                        openvino_scan_companion_path,
+                        scan_config,
+                    )
 
                 # Scan the file
                 if progress_callback:
@@ -4594,6 +4979,19 @@ def scan_model_streaming(
                     str(scan_path),
                     config=scan_config,
                 )
+                scan_result.bytes_scanned += openvino_companion_bytes_scanned
+                if (
+                    openvino_scan_companion_path is not None
+                    and openvino_companion_pre_scan_identity is not None
+                    and _snapshot_file_identity(openvino_scan_companion_path) != openvino_companion_pre_scan_identity
+                ):
+                    record_openvino_companion_stability_failure(
+                        scan_path,
+                        openvino_scan_companion_path,
+                        "openvino_weights_changed_during_xml_scan",
+                    )
+                    preserve_shard_reconciliation_errors = True
+                    aggregate_hash_complete = False
                 if pre_scan_shard_target:
                     _ensure_streamed_shard_coverage_placeholder(scan_result, source_path)
 
@@ -4708,7 +5106,13 @@ def scan_model_streaming(
                 if pinned_scan_context is not None:
                     pinned_scan_context.__exit__(None, None, None)
                 # Delete file after scanning if requested
-                delete_streamed_source(source_path, "after scanning")
+                if not preserve_source_after_scan:
+                    delete_streamed_source(source_path, "after scanning")
+                if openvino_scan_companion_path is not None and openvino_scan_companion_key is not None:
+                    delete_streamed_source(openvino_scan_companion_path, "after OpenVINO XML scan")
+                    consumed_openvino_companions.add(openvino_scan_companion_key)
+                    deferred_openvino_sidecars.pop(openvino_scan_companion_key, None)
+                    preserved_openvino_companion_snapshots.pop(openvino_scan_companion_key, None)
 
         _reconcile_cross_directory_shard_coverage(
             results,
