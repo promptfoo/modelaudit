@@ -43,7 +43,7 @@ _HF_DOWNLOAD_WORKER_RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
 _POSIX_TERMINATE_SIGNAL = getattr(signal, "SIGTERM", 15)
 _POSIX_KILL_SIGNAL = getattr(signal, "SIGKILL", 9)
 _HF_SAFETENSORS_SHARD_PATTERN = re.compile(
-    r"(^|/)(?P<stem>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})\.safetensors$",
+    r"(?P<stem>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})\.safetensors",
     re.IGNORECASE,
 )
 
@@ -387,7 +387,7 @@ def _detect_huggingface_xgboost_ubjson_route(
     prefix: bytes,
 ) -> str | None:
     """Return a bounded XGBoost UBJSON route for a suffix-skipped remote file."""
-    if Path(filename).suffix and _HF_SAFETENSORS_SHARD_PATTERN.search(filename) is None:
+    if Path(filename).suffix and _parse_hf_safetensors_shard(filename) is None:
         return None
 
     from modelaudit.utils.file.detection import (
@@ -936,7 +936,7 @@ def _hf_safetensors_shard_excluded_by_selection(
     selected_route_formats: set[str] | None,
 ) -> bool:
     """Return whether no selected scanner can claim a declared SafeTensors shard."""
-    if _HF_SAFETENSORS_SHARD_PATTERN.search(filename) is None:
+    if _parse_hf_safetensors_shard(filename) is None:
         return False
 
     # SafeTensors content routes intentionally include overlap-capable scanners
@@ -953,7 +953,7 @@ def _hf_safetensors_shard_excluded_by_selection(
 
 
 def _parse_hf_safetensors_shard(filename: str) -> tuple[str, int, int] | None:
-    match = _HF_SAFETENSORS_SHARD_PATTERN.search(filename)
+    match = _HF_SAFETENSORS_SHARD_PATTERN.fullmatch(filename)
     if match is None:
         return None
     index = int(match.group("index"))

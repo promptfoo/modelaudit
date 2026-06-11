@@ -2986,6 +2986,56 @@ class TestModelDownloadStreaming:
             "hidden.payload",
         ]
 
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_non_overlap_shard_families_are_directory_scoped(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Shard-family completeness must not merge same-stem shards from different directories."""
+        repo_files = [
+            "MODEL.UBJ",
+            "a/model-00001-of-00002.safetensors",
+            "b/model-00002-of-00002.safetensors",
+        ]
+        mock_detect_content.side_effect = lambda _repo_id, filename, _revision, _budget: (
+            "xgboost" if filename.startswith("b/") else "safetensors"
+        )
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"downloaded")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        with patch(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            return_value=(repo_files, _HF_TEST_REVISION, None),
+        ):
+            results = list(
+                download_model_streaming(
+                    "https://huggingface.co/test/model",
+                    scannable_extensions={".ubj"},
+                )
+            )
+
+        assert results == [
+            (tmp_path / "MODEL.UBJ", False),
+            (tmp_path / "b/model-00002-of-00002.safetensors", True),
+        ]
+        assert [call.args[1] for call in mock_detect_content.call_args_list] == [
+            "a/model-00001-of-00002.safetensors",
+            "b/model-00002-of-00002.safetensors",
+        ]
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "MODEL.UBJ",
+            "b/model-00002-of-00002.safetensors",
+        ]
+
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
         return_value=(
