@@ -5293,6 +5293,130 @@ def test_scan_huggingface_file_streaming_dry_run_does_not_download_or_scan() -> 
     mock_format_scan_output.assert_not_called()
 
 
+def test_scan_huggingface_file_streaming_dry_run_passes_timeout_to_metadata() -> None:
+    """Direct-file dry-run metadata should share the user-requested acquisition budget."""
+    with (
+        patch("modelaudit.cli._get_huggingface_file_metadata", return_value={"size_bytes": 2048}) as mock_metadata,
+        patch("modelaudit.cli.download_file_from_hf") as mock_download_file,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--stream",
+                "--timeout",
+                "7",
+                "--format",
+                "json",
+                "https://huggingface.co/test/model/resolve/main/model.bin",
+            ],
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 0, result.output
+    preview = json.loads(result.output)
+    assert preview["dry_run"] is True
+    assert mock_metadata.call_args.args == ("test/model", "main", "model.bin")
+    assert mock_metadata.call_args.kwargs["timeout_seconds"] == 7
+    mock_download_file.assert_not_called()
+    mock_scan_local.assert_not_called()
+    mock_format_scan_output.assert_not_called()
+
+
+def test_get_huggingface_file_metadata_fails_closed_when_deadline_expires() -> None:
+    """Direct-file metadata lookup must not start after its timeout budget is exhausted."""
+    with (
+        patch("modelaudit.cli.time.monotonic", side_effect=[100.0, 101.001]),
+        patch("huggingface_hub.HfApi") as mock_hf_api,
+        patch("modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline") as mock_worker,
+        pytest.raises(TimeoutError, match="Hugging Face acquisition timed out for test/model"),
+    ):
+        cli_module._get_huggingface_file_metadata(
+            "test/model",
+            "main",
+            "model.bin",
+            timeout_seconds=1,
+        )
+
+    mock_worker.assert_not_called()
+    mock_hf_api.assert_not_called()
+
+
+def test_get_huggingface_file_metadata_uses_deadline_worker() -> None:
+    """Direct-file metadata SDK calls should be bounded by the shared acquisition deadline."""
+
+    def run_worker(
+        operation: str,
+        operation_kwargs: dict[str, Any],
+        deadline: float,
+        repo_id: str,
+    ) -> dict[str, Any]:
+        assert operation == "get_path_sizes"
+        assert repo_id == "test/model"
+        assert operation_kwargs["repo_id"] == "test/model"
+        assert operation_kwargs["filenames"] == ["model.bin"]
+        assert operation_kwargs["requested_revision"] == "main"
+        assert operation_kwargs["resolved_revision"] is None
+        assert 0 < operation_kwargs["request_timeout"] <= 7
+        assert 0 < deadline - cli_module.time.monotonic() <= 7
+        return {
+            "value": {
+                "revision": _HF_TEST_REVISION,
+                "sizes": [{"path": "model.bin", "size": 2048}],
+            }
+        }
+
+    with (
+        patch("huggingface_hub.HfApi") as mock_hf_api,
+        patch(
+            "modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline", side_effect=run_worker
+        ) as mock_worker,
+    ):
+        metadata = cli_module._get_huggingface_file_metadata(
+            "test/model",
+            "main",
+            "model.bin",
+            timeout_seconds=7,
+        )
+
+    assert metadata == {"size_bytes": 2048, "resolved_revision": _HF_TEST_REVISION}
+    mock_worker.assert_called_once()
+    mock_hf_api.assert_not_called()
+
+
+def test_huggingface_path_size_worker_passes_timeout_to_repo_info() -> None:
+    """The bounded metadata worker should pass its request timeout to repo_info."""
+    from modelaudit.utils.sources._huggingface_download_worker import _run_operation
+
+    api = MagicMock()
+    api.repo_info.return_value = types.SimpleNamespace(sha=_HF_TEST_REVISION)
+    api.get_paths_info.return_value = [types.SimpleNamespace(path="model.bin", size=2048)]
+
+    with patch("huggingface_hub.HfApi", return_value=api):
+        result = _run_operation(
+            "get_path_sizes",
+            {
+                "repo_id": "test/model",
+                "filenames": ["model.bin"],
+                "requested_revision": "main",
+                "resolved_revision": None,
+                "request_timeout": 7,
+            },
+        )
+
+    assert result == {
+        "value": {
+            "revision": _HF_TEST_REVISION,
+            "sizes": [{"path": "model.bin", "size": 2048}],
+        }
+    }
+    api.repo_info.assert_called_once_with("test/model", files_metadata=False, timeout=7, revision="main")
+    api.get_paths_info.assert_called_once_with("test/model", ["model.bin"], revision=_HF_TEST_REVISION)
+
+
 def test_scan_huggingface_file_streaming_dry_run_allows_known_file_within_max_size() -> None:
     """Direct-file capped dry-run previews should succeed when immutable metadata is within the limit."""
     with (

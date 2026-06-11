@@ -310,7 +310,13 @@ def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeCo
     )
 
 
-def _get_huggingface_file_metadata(repo_id: str, revision: str, filename: str) -> dict[str, Any]:
+def _get_huggingface_file_metadata(
+    repo_id: str,
+    revision: str,
+    filename: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
     """Fetch direct Hugging Face file metadata without downloading file content."""
     try:
         from huggingface_hub import HfApi
@@ -320,11 +326,62 @@ def _get_huggingface_file_metadata(repo_id: str, revision: str, filename: str) -
             "Install with 'pip install modelaudit[huggingface]'"
         ) from exc
 
+    def remaining_request_timeout() -> float | None:
+        if deadline is None:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+        return min(30.0, remaining)
+
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+    if deadline is not None:
+        from .utils.sources.huggingface import _run_huggingface_worker_with_deadline
+
+        worker_result = _run_huggingface_worker_with_deadline(
+            "get_path_sizes",
+            {
+                "repo_id": repo_id,
+                "filenames": [filename],
+                "requested_revision": revision,
+                "resolved_revision": None,
+                "request_timeout": remaining_request_timeout(),
+            },
+            deadline,
+            repo_id,
+        )
+        value = worker_result.get("value")
+        if not isinstance(value, dict):
+            raise RuntimeError(f"Hugging Face file metadata unavailable for {repo_id}/{filename} at {revision}")
+        resolved_revision = value.get("revision")
+        raw_sizes = value.get("sizes")
+        if not isinstance(raw_sizes, list):
+            raise RuntimeError(f"Hugging Face file metadata unavailable for {repo_id}/{filename} at {revision}")
+        file_size: int | None = None
+        found_file = False
+        for item in raw_sizes:
+            if not isinstance(item, dict) or item.get("path") != filename:
+                continue
+            found_file = True
+            raw_size = item.get("size")
+            file_size = (
+                raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
+            )
+            break
+        if not found_file:
+            raise FileNotFoundError(f"Hugging Face file metadata unavailable for {repo_id}/{filename} at {revision}")
+        bounded_metadata: dict[str, Any] = {"size_bytes": file_size}
+        if isinstance(resolved_revision, str) and resolved_revision and resolved_revision != revision:
+            bounded_metadata["resolved_revision"] = resolved_revision
+        return bounded_metadata
+
     api = HfApi()
-    repo_info = api.repo_info(repo_id, revision=revision, files_metadata=False)
+    repo_info_kwargs: dict[str, Any] = {"revision": revision, "files_metadata": False}
+    repo_info = api.repo_info(repo_id, **repo_info_kwargs)
     resolved_revision = getattr(repo_info, "sha", None)
     metadata_revision = resolved_revision if isinstance(resolved_revision, str) and resolved_revision else revision
-    paths_info = api.get_paths_info(repo_id, [filename], revision=metadata_revision)
+    paths_info_kwargs: dict[str, Any] = {"revision": metadata_revision}
+    paths_info = api.get_paths_info(repo_id, [filename], **paths_info_kwargs)
     file_info = next((item for item in paths_info if getattr(item, "path", None) == filename), None)
     if file_info is None:
         raise FileNotFoundError(f"Hugging Face file metadata unavailable for {repo_id}/{filename} at {revision}")
@@ -342,7 +399,7 @@ def _build_huggingface_file_dry_run_preview(path: str, runtime: "_ScanRuntimeCon
     from .utils.sources.huggingface import _format_size, _is_huggingface_commit_sha, parse_huggingface_file_url
 
     repo_id, revision, filename = parse_huggingface_file_url(path)
-    file_metadata = _get_huggingface_file_metadata(repo_id, revision, filename)
+    file_metadata = _get_huggingface_file_metadata(repo_id, revision, filename, timeout_seconds=runtime.timeout)
     size_bytes = file_metadata.get("size_bytes")
     size_limit = runtime.max_download_bytes
     if isinstance(size_limit, int) and not isinstance(size_limit, bool) and size_limit > 0:
