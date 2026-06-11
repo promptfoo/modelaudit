@@ -2031,6 +2031,9 @@ def _build_huggingface_model_info(
             inaccessible_gated_bytes += size or 0
             inaccessible_gated_files.append(filename)
             file_info["access"] = "gated"
+            if size is None:
+                unknown_size_count += 1
+                unknown_size_files.append(filename)
         elif size is None:
             unknown_size_count += 1
             unknown_size_files.append(filename)
