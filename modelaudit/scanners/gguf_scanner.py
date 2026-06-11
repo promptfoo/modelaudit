@@ -1058,12 +1058,9 @@ class GgufScanner(BaseScanner):
             if in_fence:
                 doc_lines += 1
                 continue
-            if cls._line_contains_security_evidence(line):
-                continue
-            if lowered.startswith(("#", "//", "*", "-", ">")):
-                doc_lines += 1
-                continue
-            if cls._line_looks_like_documentation(lowered):
+            if lowered.startswith(("#", "//", "*", "-", ">")) or cls._line_looks_like_documentation(lowered):
+                if cls._line_contains_security_evidence(line):
+                    continue
                 doc_lines += 1
 
         return doc_lines > len(lines) / 2
