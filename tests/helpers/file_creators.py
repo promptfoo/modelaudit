@@ -5,12 +5,53 @@ These utilities create various model file formats for testing purposes.
 All functions accept a Path and create the file at that location.
 """
 
+import base64
 import json
 import pickle
 import struct
 import zipfile
+import zlib
 from pathlib import Path
 from typing import Any
+
+_VALID_JPEG_1X1 = base64.b64decode(
+    "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////"
+    "2wBDAf//////////////////////////////////////////////////////////////////////////////////////"
+    "wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAP/xAAVEAEBAAAAAAAAAAAAAAAAAAAAAf/"
+    "aAAwDAQACEAMQAAAB/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/"
+    "aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//9k="
+)
+_MALICIOUS_PICKLE = bytes.fromhex(
+    "80059525000000000000008c05706f736978948c0673797374656d9493948c0a6563686f2070776e656494859452942e"
+)
+
+
+def _png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
+    checksum = zlib.crc32(chunk_type + payload) & 0xFFFFFFFF
+    return struct.pack(">I", len(payload)) + chunk_type + payload + struct.pack(">I", checksum)
+
+
+_VALID_PNG_1X1 = (
+    b"\x89PNG\r\n\x1a\n"
+    + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+    + _png_chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00\x00"))
+    + _png_chunk(b"IEND", b"")
+)
+
+
+def valid_png_bytes() -> bytes:
+    """Return a complete 1x1 PNG fixture for media-routing regressions."""
+    return _VALID_PNG_1X1
+
+
+def valid_jpeg_bytes() -> bytes:
+    """Return a complete 1x1 JPEG fixture for media-routing regressions."""
+    return _VALID_JPEG_1X1
+
+
+def malicious_pickle_bytes() -> bytes:
+    """Return a tiny binary pickle payload that resolves to os.system."""
+    return _MALICIOUS_PICKLE
 
 
 def _tar_octal_field(value: int, length: int) -> bytes:
