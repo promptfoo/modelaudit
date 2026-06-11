@@ -32,11 +32,15 @@ CRITICAL_SYSTEM_PATHS = [
 ]
 
 DEFAULT_MAX_TAR_ENTRY_SIZE = 1024 * 1024 * 1024
-DEFAULT_MAX_DECOMPRESSED_BYTES = 512 * 1024 * 1024
+DEFAULT_MAX_DECOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
 DEFAULT_MAX_DECOMPRESSION_RATIO = 250.0
 ARCHIVE_MEMBER_COPY_CHUNK_BYTES = 64 * 1024
 MAX_TAR_PYTHON_ANALYSIS_BYTES = 10 * 1024 * 1024
 TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY = "_tar_security_only_nested_member_entries"
+TAR_ENTRY_EXTRACTION_INCOMPLETE_REASON = "tar_entry_extraction_incomplete"
+TAR_SPECIAL_MEMBER_INCOMPLETE_REASON = "tar_special_member_unsupported"
+TAR_SPARSE_MEMBER_INCOMPLETE_REASON = "tar_sparse_member_unsupported"
+TAR_SPARSE_PAX_SIZE_FIELDS = frozenset({"GNU.sparse.size", "GNU.sparse.realsize"})
 
 _GZIP_MAGIC = b"\x1f\x8b"
 _BZIP2_MAGIC = b"BZh"
@@ -52,6 +56,7 @@ class TarScanner(BaseScanner):
 
     name = "tar"
     description = "Scans TAR archive files and their contents recursively"
+    default_max_file_read_size: ClassVar[int] = 0
     supported_extensions: ClassVar[list[str]] = [
         ".tar",
         ".tar.gz",
@@ -101,10 +106,6 @@ class TarScanner(BaseScanner):
         if path_check:
             return path_check
 
-        size_check = self._check_size_limit(path)
-        if size_check:
-            return size_check
-
         result = self._create_result()
         result.metadata["file_size"] = self.get_file_size(path)
 
@@ -147,26 +148,28 @@ class TarScanner(BaseScanner):
         configured_file_limit = self.config.get("max_file_size")
         configured_entry_limit = self.config.get("max_entry_size")
 
-        # The top-level scan cap is the operator-facing hard stop (for example
-        # CLI --max-size), so it must win when explicitly set.
+        if configured_entry_limit is not None:
+            if configured_entry_limit == 0:
+                entry_limit = 1024 * 1024 * 1024 * 1024
+            else:
+                entry_limit = self._normalize_positive_int_config(
+                    configured_entry_limit,
+                    DEFAULT_MAX_TAR_ENTRY_SIZE,
+                )
+        else:
+            entry_limit = DEFAULT_MAX_TAR_ENTRY_SIZE
+
+        # Core enforces max_file_size for the top-level archive. For members it
+        # can only make extraction stricter; it must not raise the bounded TAR
+        # default just because a large container was allowed.
         if configured_file_limit is not None and configured_file_limit != 0:
-            return self._normalize_positive_int_config(
+            file_limit = self._normalize_positive_int_config(
                 configured_file_limit,
                 DEFAULT_MAX_TAR_ENTRY_SIZE,
             )
+            return min(entry_limit, file_limit)
 
-        if configured_entry_limit is not None:
-            if configured_entry_limit == 0:
-                return 1024 * 1024 * 1024 * 1024
-            return self._normalize_positive_int_config(
-                configured_entry_limit,
-                DEFAULT_MAX_TAR_ENTRY_SIZE,
-            )
-
-        if configured_file_limit == 0:
-            return DEFAULT_MAX_TAR_ENTRY_SIZE
-
-        return DEFAULT_MAX_TAR_ENTRY_SIZE
+        return entry_limit
 
     def _rewrite_nested_result_context(
         self,
@@ -213,6 +216,54 @@ class TarScanner(BaseScanner):
             archive_location,
             preserve_non_delimited_suffix=False,
         )
+
+    @staticmethod
+    def _member_declares_sparse_data(member: tarfile.TarInfo) -> bool:
+        try:
+            if member.issparse():
+                return True
+        except AttributeError:
+            pass
+        return any(field in member.pax_headers for field in TAR_SPARSE_PAX_SIZE_FIELDS)
+
+    @classmethod
+    def _tar_member_kind(cls, member: tarfile.TarInfo) -> str:
+        """Return a stable inventory type for a TAR member."""
+        if cls._member_declares_sparse_data(member):
+            return "tar_sparse"
+        if member.isfile():
+            return "tar_file"
+        if member.isdir():
+            return "tar_directory"
+        if member.issym():
+            return "tar_symlink"
+        if member.islnk():
+            return "tar_hardlink"
+        if member.isfifo():
+            return "tar_fifo"
+        if member.isdev():
+            return "tar_device"
+        return "tar_special"
+
+    @classmethod
+    def _member_inventory_entry(
+        cls,
+        archive_path: str,
+        member: tarfile.TarInfo,
+        *,
+        scan_status: str,
+        scan_outcome_reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Build a bounded metadata entry for a TAR member without reading its content."""
+        entry: dict[str, Any] = {
+            "path": f"{archive_path}:{member.name}",
+            "type": cls._tar_member_kind(member),
+            "size": member.size,
+            "scan_status": scan_status,
+        }
+        if scan_outcome_reason is not None:
+            entry["scan_outcome_reason"] = scan_outcome_reason
+        return entry
 
     @staticmethod
     def _resolve_link_target(
@@ -496,6 +547,42 @@ class TarScanner(BaseScanner):
             },
         )
 
+    def _record_unscannable_member(
+        self,
+        result: ScanResult,
+        contents: list[dict[str, Any]],
+        path: str,
+        member: tarfile.TarInfo,
+        *,
+        reason: str,
+        message: str,
+    ) -> None:
+        """Record a TAR member that is intentionally not extracted or scanned."""
+        mark_archive_scan_incomplete(result, reason)
+        result.add_check(
+            name="TAR Member Coverage",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.INFO,
+            rule_code="S902",
+            location=f"{path}:{member.name}",
+            details={
+                "entry": member.name,
+                "member_type": self._tar_member_kind(member),
+                "size": member.size,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+        )
+        contents.append(
+            self._member_inventory_entry(
+                path,
+                member,
+                scan_status="incomplete",
+                scan_outcome_reason=reason,
+            )
+        )
+
     def _scan_tar_file(self, path: str, depth: int = 0) -> ScanResult:
         result = ScanResult(scanner_name=self.name)
         contents: list[dict[str, Any]] = []
@@ -563,6 +650,7 @@ class TarScanner(BaseScanner):
                 temp_base = os.path.join(tempfile.gettempdir(), "extract_tar")
                 resolved_name, is_safe = sanitize_archive_path(name, temp_base)
                 if not is_safe:
+                    contents.append(self._member_inventory_entry(path, member, scan_status="rejected"))
                     result.add_check(
                         name="Path Traversal Protection",
                         passed=False,
@@ -575,6 +663,7 @@ class TarScanner(BaseScanner):
                     continue
 
                 if member.issym() or member.islnk():
+                    contents.append(self._member_inventory_entry(path, member, scan_status="link_validated"))
                     target = member.linkname
                     link_kind = "Symlink" if member.issym() else "Hard link"
                     if target:
@@ -616,9 +705,34 @@ class TarScanner(BaseScanner):
                     continue
 
                 if member.isdir():
+                    contents.append(self._member_inventory_entry(path, member, scan_status="directory"))
+                    continue
+
+                if self._member_declares_sparse_data(member):
+                    scan_complete = False
+                    self._record_unscannable_member(
+                        result,
+                        contents,
+                        path,
+                        member,
+                        reason=TAR_SPARSE_MEMBER_INCOMPLETE_REASON,
+                        message=f"TAR sparse entry {name} was not extracted; sparse member coverage is incomplete",
+                    )
                     continue
 
                 if not member.isfile():
+                    scan_complete = False
+                    self._record_unscannable_member(
+                        result,
+                        contents,
+                        path,
+                        member,
+                        reason=TAR_SPECIAL_MEMBER_INCOMPLETE_REASON,
+                        message=(
+                            f"TAR special entry {name} has unsupported type {member.type!r}; "
+                            "member coverage is incomplete"
+                        ),
+                    )
                     continue
 
                 try:
@@ -693,7 +807,15 @@ class TarScanner(BaseScanner):
                         os.unlink(tmp_path)
                 except _TarEntryExtractionIncomplete as exc:
                     scan_complete = False
-                    mark_archive_scan_incomplete(result, "tar_entry_extraction_incomplete")
+                    mark_archive_scan_incomplete(result, TAR_ENTRY_EXTRACTION_INCOMPLETE_REASON)
+                    contents.append(
+                        self._member_inventory_entry(
+                            path,
+                            member,
+                            scan_status="incomplete",
+                            scan_outcome_reason=TAR_ENTRY_EXTRACTION_INCOMPLETE_REASON,
+                        )
+                    )
                     result.add_check(
                         name="TAR Entry Scan",
                         passed=False,
@@ -706,7 +828,7 @@ class TarScanner(BaseScanner):
                             "exception": str(exc),
                             "exception_type": type(exc).__name__,
                             "analysis_incomplete": True,
-                            "scan_outcome_reason": "tar_entry_extraction_incomplete",
+                            "scan_outcome_reason": TAR_ENTRY_EXTRACTION_INCOMPLETE_REASON,
                         },
                     )
                 except Exception as exc:

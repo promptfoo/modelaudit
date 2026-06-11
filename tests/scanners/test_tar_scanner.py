@@ -1339,14 +1339,176 @@ class TestTarScanner:
         finally:
             os.unlink(tmp_path)
 
+    def test_scan_large_valid_tar_bypasses_generic_max_file_read_size(self, tmp_path: Path) -> None:
+        """TAR-owned streaming should not inherit the generic whole-file read rejection."""
+        archive_path = tmp_path / "large_by_padding.tar"
+        payload = b"safe metadata"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("metadata.txt")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        assert archive_path.stat().st_size > 1024
+
+        result = TarScanner(config={"max_file_read_size": 1024, "max_entry_size": 4096}).scan(str(archive_path))
+
+        assert result.success is True
+        assert result.scanner_name == "tar"
+        assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+        assert not any(
+            check.name == "File Size Limit" and check.status == CheckStatus.FAILED for check in result.checks
+        )
+        entry_checks = [check for check in result.checks if check.name == "Entry Count Limit Check"]
+        assert len(entry_checks) == 1
+        assert entry_checks[0].status == CheckStatus.PASSED
+        assert result.metadata["contents"][0]["path"] == f"{archive_path}:metadata.txt"
+
+    def test_large_tar_path_traversal_still_fails_after_read_cap_bypass(self, tmp_path: Path) -> None:
+        """Bypassing the generic read cap must not bypass TAR traversal protection."""
+        archive_path = tmp_path / "large_traversal.tar"
+        payload = b"evil"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("../evil.txt")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        assert archive_path.stat().st_size > 1024
+
+        result = TarScanner(config={"max_file_read_size": 1024}).scan(str(archive_path))
+
+        traversal_checks = [check for check in result.checks if check.name == "Path Traversal Protection"]
+        assert result.success is False
+        assert len(traversal_checks) == 1
+        assert traversal_checks[0].rule_code == "S405"
+        assert traversal_checks[0].severity == IssueSeverity.CRITICAL
+        assert traversal_checks[0].details["entry"] == "../evil.txt"
+        assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
+    def test_large_tar_oversized_member_records_inventory_after_read_cap_bypass(self, tmp_path: Path) -> None:
+        """Large skipped members should produce TAR-specific incomplete coverage and inventory."""
+        archive_path = tmp_path / "large_oversized_member.tar"
+        payload = b"A" * 128
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = TarScanner(config={"max_file_read_size": 1024, "max_entry_size": 64}).scan(str(archive_path))
+
+        entry_checks = [check for check in result.checks if check.name == "TAR Entry Scan"]
+        assert result.success is False
+        assert len(entry_checks) == 1
+        assert "exceeds maximum size of 64 bytes" in entry_checks[0].message
+        assert "tar_entry_extraction_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert "max_file_read_size_exceeded" not in result.metadata["scan_outcome_reasons"]
+        assert result.metadata["contents"] == [
+            {
+                "path": f"{archive_path}:payload.bin",
+                "type": "tar_file",
+                "size": len(payload),
+                "scan_status": "incomplete",
+                "scan_outcome_reason": "tar_entry_extraction_incomplete",
+            }
+        ]
+
+    def test_large_malformed_tar_reports_format_validation_not_generic_size_limit(self, tmp_path: Path) -> None:
+        """Malformed TAR-looking files should reach TAR validation even over the generic read cap."""
+        archive_path = tmp_path / "malformed.tar"
+        archive_path.write_bytes(b"not a tar stream" * 256)
+
+        result = TarScanner(config={"max_file_read_size": 1024}).scan(str(archive_path))
+
+        format_checks = [check for check in result.checks if check.name == "TAR File Format Validation"]
+        assert result.success is False
+        assert len(format_checks) == 1
+        assert format_checks[0].rule_code == "S902"
+        assert "not a valid tar file" in format_checks[0].message.lower()
+        assert "tar_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert "max_file_read_size_exceeded" not in result.metadata["scan_outcome_reasons"]
+
+    def test_compressed_tar_bomb_over_read_cap_still_hits_wrapper_limit(self, tmp_path: Path) -> None:
+        """Compressed TAR limits remain active after the scanner-level read cap is bypassed."""
+        archive_path = tmp_path / "bombish.tar.gz"
+        payload = b"B" * 10_000
+
+        with tarfile.open(archive_path, "w:gz") as archive:
+            info = tarfile.TarInfo("payload.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = TarScanner(
+            config={
+                "max_file_read_size": 1,
+                "compressed_max_decompressed_bytes": 1024,
+            }
+        ).scan(str(archive_path))
+
+        limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+        assert result.success is False
+        assert len(limit_checks) == 1
+        assert limit_checks[0].status == CheckStatus.FAILED
+        assert "decompressed size exceeded" in limit_checks[0].message.lower()
+        assert "max_file_read_size_exceeded" not in result.metadata["scan_outcome_reasons"]
+
+    def test_core_max_file_size_still_rejects_oversized_tar_before_tar_scan(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The operator hard stop remains a core-level limit, distinct from scanner read caps."""
+        archive_path = tmp_path / "operator_limit.tar"
+        payload = b"safe"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("metadata.txt")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        def fail_scan(_self: TarScanner, _path: str) -> ScanResult:
+            raise AssertionError("core max_file_size should reject before TarScanner.scan")
+
+        monkeypatch.setattr(TarScanner, "scan", fail_scan)
+
+        result = core.scan_file(str(archive_path), config={"max_file_size": 1, "cache_enabled": False})
+
+        assert result.scanner_name == "size_check"
+        assert result.success is False
+        assert any(
+            check.name == "File Size Limit Check" and check.status == CheckStatus.FAILED for check in result.checks
+        )
+
+    @pytest.mark.slow
+    @pytest.mark.integration
+    def test_real_hf_bert_large_tar_gz_reaches_tar_terminal_outcome(self, tmp_path: Path) -> None:
+        """Opt-in real-model reproduction for task 38's pinned Hugging Face artifact."""
+        if os.environ.get("MODELAUDIT_RUN_HF_T38_REAL_MODEL") != "1":
+            pytest.skip("set MODELAUDIT_RUN_HF_T38_REAL_MODEL=1 to download the pinned 1.25 GB HF artifact")
+
+        from modelaudit.utils.sources.huggingface import download_file_from_hf
+
+        url = (
+            "https://huggingface.co/google-bert/bert-large-uncased/resolve/"
+            "6da4b6a26a1877e173fca3225479512db81a5e5b/whole-word-masking.tar.gz"
+        )
+        model_path = download_file_from_hf(url, cache_dir=tmp_path / "hf-cache", max_size=2 * 1024 * 1024 * 1024)
+
+        result = core.scan_model_directory_or_file(str(model_path), cache_enabled=False, max_file_size=2 * 1024**3)
+
+        metadata = result.file_metadata[str(model_path)]
+        assert "tar" in metadata["scanner_dependency_ids"]
+        assert "max_file_read_size_exceeded" not in metadata.get("scan_outcome_reasons", [])
+        assert "tar_entry_extraction_incomplete" in metadata.get("scan_outcome_reasons", [])
+        assert any(asset.path == str(model_path) and asset.contents for asset in result.assets)
+
     def test_get_max_entry_size_uses_bounded_default(self) -> None:
         """Unconfigured TAR entry extraction should still have a bounded default."""
         assert TarScanner()._get_max_entry_size() == DEFAULT_MAX_TAR_ENTRY_SIZE
 
-    def test_get_max_entry_size_prefers_explicit_file_size_limit(self) -> None:
-        """The top-level file-size limit should remain the hard extraction cap."""
+    def test_get_max_entry_size_prefers_explicit_entry_limit(self) -> None:
+        """The TAR entry limit should not be raised by a larger top-level archive cap."""
         scanner = TarScanner(config={"max_file_size": 4096, "max_entry_size": 128})
-        assert scanner._get_max_entry_size() == 4096
+        assert scanner._get_max_entry_size() == 128
 
     def test_get_max_entry_size_uses_entry_limit_when_file_size_is_unlimited(self) -> None:
         """An explicit TAR-entry limit should apply when the top-level file size is unlimited."""
@@ -1691,7 +1853,7 @@ class TestTarScanner:
         assert core.determine_exit_code(aggregate) == 1
 
     def test_scan_skips_non_regular_tar_members(self, tmp_path: Path) -> None:
-        """Valid non-file TAR members should not abort scanning later regular files."""
+        """Non-file TAR members should be explicit incomplete coverage without hiding later files."""
         archive_path = tmp_path / "fifo-first.tar"
         payload = b"payload"
 
@@ -1706,9 +1868,63 @@ class TestTarScanner:
 
         result = self.scanner.scan(str(archive_path))
 
-        assert result.success is True
+        assert result.success is False
         assert result.bytes_scanned == len(payload)
-        assert all("named_pipe" not in issue.message for issue in result.issues)
+        assert "tar_special_member_unsupported" in result.metadata["scan_outcome_reasons"]
+        coverage_checks = [check for check in result.checks if check.name == "TAR Member Coverage"]
+        assert len(coverage_checks) == 1
+        assert coverage_checks[0].details["entry"] == "named_pipe"
+        assert coverage_checks[0].details["member_type"] == "tar_fifo"
+        assert any(entry["path"] == f"{archive_path}:data.bin" for entry in result.metadata["contents"])
+
+    @pytest.mark.parametrize(
+        ("member_type", "expected_kind"),
+        [(tarfile.CHRTYPE, "tar_device"), (tarfile.BLKTYPE, "tar_device")],
+    )
+    def test_scan_reports_device_tar_members_incomplete(
+        self, tmp_path: Path, member_type: bytes, expected_kind: str
+    ) -> None:
+        """Device entries are not extracted and remain explicit incomplete coverage."""
+        archive_path = tmp_path / "device.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("dev/null")
+            info.type = member_type
+            archive.addfile(info)
+
+        result = self.scanner.scan(str(archive_path))
+
+        coverage_checks = [check for check in result.checks if check.name == "TAR Member Coverage"]
+        assert result.success is False
+        assert len(coverage_checks) == 1
+        assert coverage_checks[0].details["member_type"] == expected_kind
+        assert "tar_special_member_unsupported" in result.metadata["scan_outcome_reasons"]
+
+    def test_scan_reports_sparse_tar_members_incomplete(self, tmp_path: Path) -> None:
+        """Sparse TAR members are skipped explicitly rather than expanded or trusted."""
+        archive_path = tmp_path / "sparse.tar"
+        sparse_size = 1024 * 1024 * 1024 * 2
+        with tarfile.open(archive_path, "w", format=tarfile.PAX_FORMAT) as archive:
+            info = tarfile.TarInfo("sparse.bin")
+            info.size = 0
+            info.pax_headers = {"GNU.sparse.size": str(sparse_size)}
+            archive.addfile(info, tarfile.io.BytesIO(b""))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        coverage_checks = [check for check in result.checks if check.name == "TAR Member Coverage"]
+        assert result.success is False
+        assert len(coverage_checks) == 1
+        assert coverage_checks[0].details["member_type"] == "tar_sparse"
+        assert "tar_sparse_member_unsupported" in result.metadata["scan_outcome_reasons"]
+        assert result.metadata["contents"] == [
+            {
+                "path": f"{archive_path}:sparse.bin",
+                "type": "tar_sparse",
+                "size": sparse_size,
+                "scan_status": "incomplete",
+                "scan_outcome_reason": "tar_sparse_member_unsupported",
+            }
+        ]
 
     def test_scan_empty_tar(self, tmp_path: Path) -> None:
         """An empty TAR archive should scan successfully with no critical issues."""
