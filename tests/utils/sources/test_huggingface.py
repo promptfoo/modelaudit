@@ -3181,6 +3181,45 @@ class TestGetModelInfo:
         mock_api.list_repo_tree.assert_not_called()
 
     @patch("huggingface_hub.HfApi")
+    def test_get_model_info_fallback_sibling_sizes_are_unknown(self, mock_hf_api_class: MagicMock) -> None:
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.model_info.return_value = SimpleNamespace(
+            modelId="test/model",
+            sha=TEST_COMMIT_SHA,
+            siblings=[SimpleNamespace(rfilename="model.safetensors")],
+        )
+        mock_api.list_repo_tree.side_effect = RuntimeError("tree unavailable")
+
+        info = get_model_info("https://huggingface.co/test/model")
+
+        assert info["files"] == [{"name": "model.safetensors"}]
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_info_tree_unknown_sizes_are_not_reported_as_zero(self, mock_hf_api_class: MagicMock) -> None:
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.model_info.return_value = SimpleNamespace(
+            modelId="test/model",
+            sha=TEST_COMMIT_SHA,
+            siblings=[],
+        )
+        mock_api.list_repo_tree.return_value = [
+            SimpleNamespace(path="model.safetensors", size=None),
+            SimpleNamespace(path="empty.safetensors", size=0),
+            SimpleNamespace(path=".gitattributes", size=12),
+        ]
+
+        info = get_model_info("https://huggingface.co/test/model")
+
+        assert info["total_size"] == 0
+        assert info["file_count"] == 2
+        assert info["files"] == [
+            {"name": "model.safetensors"},
+            {"name": "empty.safetensors", "size": 0},
+        ]
+
+    @patch("huggingface_hub.HfApi")
     def test_get_model_info_without_author(self, mock_hf_api_class: MagicMock) -> None:
         """Default to empty string when author is missing."""
         mock_api = MagicMock()
@@ -3222,23 +3261,62 @@ class TestGetHuggingFaceFileInfo:
         mock_api.repo_info.assert_called_once_with("test/model", revision="main", files_metadata=False)
         mock_api.get_paths_info.assert_called_once_with("test/model", "model.bin", revision=TEST_COMMIT_SHA)
 
+    @patch("modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline")
     @patch("huggingface_hub.HfApi")
     def test_get_huggingface_file_info_passes_timeout_to_revision_lookup(
         self,
         mock_hf_api_class: MagicMock,
+        mock_worker: MagicMock,
     ) -> None:
         mock_api = MagicMock()
         mock_hf_api_class.return_value = mock_api
         mock_api.repo_info.return_value = SimpleNamespace(sha=TEST_COMMIT_SHA)
-        mock_api.get_paths_info.return_value = [SimpleNamespace(path="model.bin", size=512)]
+        mock_worker.return_value = {
+            "value": {
+                "revision": TEST_COMMIT_SHA,
+                "sizes": [{"path": "model.bin", "size": 512}],
+            }
+        }
 
-        get_huggingface_file_info(
+        info = get_huggingface_file_info(
             "https://huggingface.co/test/model/resolve/main/model.bin",
             timeout_seconds=7,
         )
 
+        assert info["size"] == 512
         mock_api.repo_info.assert_called_once_with("test/model", revision="main", files_metadata=False, timeout=7)
-        mock_api.get_paths_info.assert_called_once_with("test/model", "model.bin", revision=TEST_COMMIT_SHA)
+        mock_api.get_paths_info.assert_not_called()
+        mock_worker.assert_called_once()
+        operation, operation_kwargs, deadline, repo_id = mock_worker.call_args.args
+        assert operation == "get_path_sizes"
+        assert operation_kwargs == {
+            "repo_id": "test/model",
+            "filenames": ["model.bin"],
+            "requested_revision": "main",
+            "resolved_revision": TEST_COMMIT_SHA,
+        }
+        assert isinstance(deadline, float)
+        assert repo_id == "test/model"
+
+    @patch("modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline")
+    @patch("huggingface_hub.HfApi")
+    def test_get_huggingface_file_info_path_lookup_timeout_propagates(
+        self,
+        mock_hf_api_class: MagicMock,
+        mock_worker: MagicMock,
+    ) -> None:
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.repo_info.return_value = SimpleNamespace(sha=TEST_COMMIT_SHA)
+        mock_worker.side_effect = TimeoutError("Hugging Face acquisition timed out for test/model")
+
+        with pytest.raises(Exception, match="timed out for test/model"):
+            get_huggingface_file_info(
+                "https://huggingface.co/test/model/resolve/main/model.bin",
+                timeout_seconds=1,
+            )
+
+        mock_api.get_paths_info.assert_not_called()
 
     @patch("huggingface_hub.HfApi")
     def test_get_huggingface_file_info_rejects_missing_immutable_revision_with_size_cap(

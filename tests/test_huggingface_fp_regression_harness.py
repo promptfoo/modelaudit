@@ -629,18 +629,18 @@ def test_hf_repo_dry_run_max_size_refuses_unselected_content_route_candidates() 
     mock_scan.assert_not_called()
 
 
-def test_hf_repo_dry_run_allows_harmless_unselected_sidecars() -> None:
+def test_hf_repo_dry_run_allows_metadata_routed_sidecars() -> None:
     runner = CliRunner()
     metadata = {
         "repo_id": "test/model",
         "model_id": "test/model",
         "revision": "a" * 40,
-        "total_size": 30,
+        "total_size": 35,
         "file_count": 3,
         "files": [
             {"name": "model.safetensors", "size": 20},
-            {"name": "assets/thumbnail.png", "size": 5},
-            {"name": "train_script.py", "size": 5},
+            {"name": "README.md", "size": 10},
+            {"name": "config.json", "size": 5},
         ],
     }
 
@@ -656,6 +656,35 @@ def test_hf_repo_dry_run_allows_harmless_unselected_sidecars() -> None:
     assert result.exit_code == 0, result.output
     assert parsed["files_scanned"] == 0
     assert "Download: skipped (--dry-run)" in result.stderr
+    mock_read_prefix.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
+def test_hf_repo_dry_run_refuses_unselected_media_sidecar_without_probing() -> None:
+    runner = CliRunner()
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": "a" * 40,
+        "total_size": 25,
+        "file_count": 2,
+        "files": [
+            {"name": "model.safetensors", "size": 20},
+            {"name": "assets/thumbnail.png", "size": 5},
+        ],
+    }
+
+    with (
+        _mock_hf_model_info(return_value=metadata),
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+        patch("modelaudit.utils.sources.huggingface._read_huggingface_prefix") as mock_read_prefix,
+    ):
+        result = runner.invoke(cli, ["scan", "--dry-run", "--format", "json", "hf://test/model"])
+
+    assert result.exit_code == 2
+    assert "cannot account for content-routed files without reading model bytes" in result.output
     mock_read_prefix.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan.assert_not_called()

@@ -114,29 +114,6 @@ from .utils.sources.pytorch_hub import (
 
 logger = logging.getLogger("modelaudit")
 _JSON_VALUE_ADAPTER = TypeAdapter(Any)
-_HF_DRY_RUN_HARMLESS_UNSELECTED_SUFFIXES = frozenset(
-    {
-        ".cfg",
-        ".csv",
-        ".gif",
-        ".gitignore",
-        ".ini",
-        ".ipynb",
-        ".jpeg",
-        ".jpg",
-        ".lock",
-        ".log",
-        ".png",
-        ".py",
-        ".pyw",
-        ".svg",
-        ".toml",
-        ".tsv",
-        ".webp",
-        ".yaml",
-        ".yml",
-    }
-)
 
 
 def _display_path(path: str) -> str:
@@ -269,12 +246,7 @@ def _huggingface_preview_has_uncertain_unselected_files(files: object, selected_
         name = item.get("name")
         if isinstance(name, str) and name in all_names:
             selected_names.add(name)
-    for name in all_names.difference(selected_names):
-        suffix = PurePosixPath(name.lower()).suffix
-        if suffix and suffix in _HF_DRY_RUN_HARMLESS_UNSELECTED_SUFFIXES:
-            continue
-        return True
-    return False
+    return bool(all_names.difference(selected_names))
 
 
 def _huggingface_preview_download_files(metadata: dict[str, Any]) -> list[dict[str, Any]]:

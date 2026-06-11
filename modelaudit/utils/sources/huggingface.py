@@ -1460,10 +1460,10 @@ def _verify_huggingface_selection_within_max_size(
     return total_size
 
 
-def _collect_huggingface_tree_file_metadata(repo_files: Iterable[Any]) -> tuple[int, list[dict[str, int | str]]]:
+def _collect_huggingface_tree_file_metadata(repo_files: Iterable[Any]) -> tuple[int, list[dict[str, int | str | None]]]:
     """Return recursive Hub file metadata, skipping folders and git metadata."""
     total_size = 0
-    files: list[dict[str, int | str]] = []
+    files: list[dict[str, int | str | None]] = []
     for item in repo_files:
         if isinstance(item, dict):
             path = item.get("path")
@@ -1476,9 +1476,11 @@ def _collect_huggingface_tree_file_metadata(repo_files: Iterable[Any]) -> tuple[
 
         if not isinstance(path, str) or not has_size or path == ".gitattributes":
             continue
-        file_size = raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else 0
-        total_size += file_size
-        files.append({"name": path, "size": file_size})
+        file_entry: dict[str, int | str | None] = {"name": path}
+        if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0:
+            total_size += raw_size
+            file_entry["size"] = raw_size
+        files.append(file_entry)
     return total_size, files
 
 
@@ -1518,7 +1520,7 @@ def get_model_info(url: str, timeout_seconds: float | None = None) -> dict:
         # Use list_repo_tree to get accurate file sizes
         # (model_info.siblings often returns None for size)
         total_size = 0
-        files: list[dict[str, int | str]] = []
+        files: list[dict[str, int | str | None]] = []
         try:
             if deadline is None:
                 repo_files = api.list_repo_tree(repo_id, recursive=True, revision=list_revision)
@@ -1544,7 +1546,7 @@ def get_model_info(url: str, timeout_seconds: float | None = None) -> dict:
             siblings = model_info.siblings or []
             for sibling in siblings:
                 if sibling.rfilename != ".gitattributes":
-                    files.append({"name": sibling.rfilename, "size": 0})
+                    files.append({"name": sibling.rfilename})
 
         return {
             "repo_id": repo_id,
@@ -1580,6 +1582,7 @@ def get_huggingface_file_info(
         if max_size is not None and max_size < 0:
             raise ValueError("Maximum file size must be non-negative")
 
+        deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
         api = HfApi()
         repo_info_kwargs: dict[str, Any] = {"revision": revision, "files_metadata": False}
         if timeout_seconds is not None:
@@ -1592,12 +1595,46 @@ def get_huggingface_file_info(
         if not isinstance(resolved_revision, str) or not resolved_revision:
             resolved_revision = revision
 
-        path_info = api.get_paths_info(repo_id, filename, revision=resolved_revision)
-        file_metadata = path_info[0] if path_info else None
-        if file_metadata is None:
-            raise ValueError(f"File not found: {filename}")
-
-        file_size = getattr(file_metadata, "size", None)
+        if deadline is None:
+            path_info = api.get_paths_info(repo_id, filename, revision=resolved_revision)
+            file_metadata = path_info[0] if path_info else None
+            if file_metadata is None:
+                raise ValueError(f"File not found: {filename}")
+            file_size = getattr(file_metadata, "size", None)
+        else:
+            worker_result = _run_huggingface_worker_with_deadline(
+                "get_path_sizes",
+                {
+                    "repo_id": repo_id,
+                    "filenames": [filename],
+                    "requested_revision": revision,
+                    "resolved_revision": resolved_revision,
+                },
+                deadline,
+                repo_id,
+            )
+            value = worker_result.get("value")
+            if not isinstance(value, dict):
+                raise ValueError(f"Unable to determine file size for {display_url}; refusing dry-run")
+            checked_revision = value.get("revision")
+            if isinstance(checked_revision, str) and checked_revision:
+                resolved_revision = checked_revision
+            raw_sizes = value.get("sizes")
+            if not isinstance(raw_sizes, list):
+                raise ValueError(f"Unable to determine file size for {display_url}; refusing dry-run")
+            sizes: dict[str, int | None] = {}
+            for item in raw_sizes:
+                if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                    continue
+                raw_size = item.get("size")
+                sizes[item["path"]] = (
+                    raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
+                )
+            if filename not in sizes:
+                raise ValueError(f"File not found: {filename}")
+            file_size = sizes[filename]
+            if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
+                raise ValueError(f"Unable to determine file size for {display_url}; refusing dry-run")
         if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
             raise ValueError(f"Unable to determine file size for {display_url}; refusing dry-run")
 
