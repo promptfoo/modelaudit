@@ -428,6 +428,45 @@ class TestSecretsDetector:
 
         assert _basic_auth_findings(findings)
 
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"headers": [["Authorization", f"Basic {_basic_auth_token(b'pair-list:pass')}"]]},
+            {"headers": [("Authorization", f"Basic {_basic_auth_token(b'pair-tuple:pass')}")]},
+            {
+                "headers": [
+                    ("Accept", "application/json"),
+                    ("Proxy-Authorization", f"Basic {_basic_auth_token(b'proxy-pair:pass')}"),
+                ]
+            },
+        ],
+    )
+    def test_basic_auth_structured_headers_pair_arrays_are_detected(self, data: dict[str, object]) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_dict(data)
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"pairs": [["Authorization", f"Basic {_basic_auth_token(b'pair-list:pass')}"]]},
+            {"pairs": [("Proxy-Authorization", f"Basic {_basic_auth_token(b'proxy-pair:pass')}")]},
+        ],
+    )
+    def test_basic_auth_structured_non_header_pair_arrays_do_not_gain_header_context(
+        self,
+        data: dict[str, object],
+    ) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_dict(data)
+
+        assert _basic_auth_findings(findings) == []
+
     def test_basic_auth_structured_long_bytes_header_value_is_detected(self) -> None:
         detector = SecretsDetector()
         token = _basic_auth_token(b"long-bytes:pass")

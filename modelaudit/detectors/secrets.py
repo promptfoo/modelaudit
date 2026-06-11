@@ -424,6 +424,15 @@ def _canonical_basic_auth_header_key(value: object) -> str | None:
     return _canonical_basic_auth_header_name(str(value))
 
 
+def _is_basic_auth_headers_container_key(value: object) -> bool:
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("ascii")
+        except UnicodeDecodeError:
+            return False
+    return _normalize_basic_auth_header_name(str(value)) == "headers"
+
+
 class SecretsDetector:
     """Detects embedded secrets, API keys, and credentials in model data."""
 
@@ -851,6 +860,20 @@ class SecretsDetector:
             return findings
         return self.scan_bytes(value, context)
 
+    def _scan_basic_auth_structured_header_value(
+        self,
+        value: Any,
+        header_name: str | None,
+        context: str,
+    ) -> list[dict[str, Any]]:
+        if isinstance(value, str):
+            return self._scan_basic_auth_header_text_value(value, header_name, context)
+        if isinstance(value, bytes):
+            return self._scan_basic_auth_header_bytes_value(value, header_name, context)
+        if isinstance(value, dict):
+            return self.scan_dict(value, context, header_name)
+        return []
+
     def scan_bytes(self, data: bytes, context: str = "") -> list[dict[str, Any]]:
         """Scan binary data for embedded secrets.
 
@@ -1116,21 +1139,24 @@ class SecretsDetector:
 
             # Check the value
             header_name = _canonical_basic_auth_header_key(key) or basic_auth_header_name
-            if isinstance(value, str):
-                findings.extend(self._scan_basic_auth_header_text_value(value, header_name, key_context))
-            elif isinstance(value, bytes):
-                findings.extend(self._scan_basic_auth_header_bytes_value(value, header_name, key_context))
-            elif isinstance(value, dict):
-                findings.extend(self.scan_dict(value, key_context, header_name))
-            elif isinstance(value, list | tuple):
+            if isinstance(value, list | tuple):
+                headers_container = _is_basic_auth_headers_container_key(key)
                 for i, item in enumerate(value):
                     item_context = f"{key_context}[{i}]"
-                    if isinstance(item, str):
-                        findings.extend(self._scan_basic_auth_header_text_value(item, header_name, item_context))
-                    elif isinstance(item, bytes):
-                        findings.extend(self._scan_basic_auth_header_bytes_value(item, header_name, item_context))
-                    elif isinstance(item, dict):
-                        findings.extend(self.scan_dict(item, item_context, header_name))
+                    if headers_container and isinstance(item, list | tuple) and len(item) == 2:
+                        pair_header_name = _canonical_basic_auth_header_key(item[0])
+                        if pair_header_name is not None:
+                            findings.extend(
+                                self._scan_basic_auth_structured_header_value(
+                                    item[1],
+                                    pair_header_name,
+                                    f"{item_context}[1]",
+                                )
+                            )
+                            continue
+                    findings.extend(self._scan_basic_auth_structured_header_value(item, header_name, item_context))
+            else:
+                findings.extend(self._scan_basic_auth_structured_header_value(value, header_name, key_context))
 
         return findings
 
