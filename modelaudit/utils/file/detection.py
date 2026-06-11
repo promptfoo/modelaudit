@@ -5665,16 +5665,12 @@ def _could_start_bounded_media_route(file_path: Path, sample: bytes) -> bool:
             len(sample) >= len(_PNG_SIGNATURE) + 8
             and sample[len(_PNG_SIGNATURE) : len(_PNG_SIGNATURE) + 8] == b"\x00\x00\x00\rIHDR"
         )
-    return (
-        len(sample) >= 4
-        and sample.startswith(b"\xff\xd8")
-        and sample[2] == 0xFF
-        and sample[3]
-        not in {
-            0x00,
-            0xFF,
-        }
-    )
+    if len(sample) < 3 or not sample.startswith(b"\xff\xd8") or sample[2] != 0xFF:
+        return False
+    marker_offset = 2
+    while marker_offset < len(sample) and sample[marker_offset] == 0xFF:
+        marker_offset += 1
+    return marker_offset >= len(sample) or sample[marker_offset] != 0x00
 
 
 def _detect_bounded_media_route_from_sample(

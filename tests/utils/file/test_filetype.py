@@ -259,6 +259,16 @@ def test_media_pickle_polyglot_keeps_pickle_route(tmp_path: Path, filename: str,
     assert detect_file_format_for_skip_filter(str(media_path)) == "pickle"
 
 
+def test_jpeg_fill_byte_media_pickle_polyglot_keeps_pickle_route(tmp_path: Path) -> None:
+    media_path = tmp_path / "fill-polyglot.jpg"
+    jpeg_with_fill = valid_jpeg_bytes()[:3] + b"\xff" + valid_jpeg_bytes()[3:]
+    media_path.write_bytes(jpeg_with_fill + malicious_pickle_bytes())
+
+    assert detect_file_format(str(media_path)) == "pickle"
+    assert detect_file_format_from_magic(str(media_path)) == "pickle"
+    assert detect_file_format_for_skip_filter(str(media_path)) == "pickle"
+
+
 def test_padded_media_pickle_polyglot_fails_closed_past_probe_limit(tmp_path: Path) -> None:
     media_path = tmp_path / "padded-polyglot.png"
     media_path.write_bytes(valid_png_bytes() + (b"\0" * (MEDIA_ROUTE_READ_BYTES + 2)) + malicious_pickle_bytes())
