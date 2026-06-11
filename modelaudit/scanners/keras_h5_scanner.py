@@ -1091,7 +1091,7 @@ class KerasH5Scanner(BaseScanner):
             results = worker_result["results"]
             if len(results) == len(requests):
                 return results
-        return [worker_result for _request in requests]
+        return [worker_result] * len(requests)
 
     @classmethod
     def _run_hdf5_attribute_worker(cls, request: dict[str, Any]) -> dict[str, Any]:
