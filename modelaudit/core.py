@@ -126,8 +126,11 @@ from modelaudit.utils.helpers.types import (
 from modelaudit.utils.lfs import check_lfs_pointer, get_lfs_issue_details, get_lfs_remediation_steps
 from modelaudit.utils.repository_context import (
     REPOSITORY_CURRENT_FILE_CONFIG_KEY,
+    REPOSITORY_FILE_INVENTORY_CONFIG_KEY,
     REPOSITORY_SCAN_ROOT_CONFIG_KEY,
+    RepositoryFileInventory,
     normalize_repository_member_path,
+    repository_file_inventory_context_from_config,
 )
 from modelaudit.utils.sources._huggingface_cache import (
     _find_hf_cache_root,
@@ -2010,6 +2013,12 @@ def validate_scan_config(config: dict[str, Any]) -> ScanConfigModel:
         raise ValueError(f"Invalid scan configuration: {e}") from e
 
 
+def _normalize_repository_inventory_config(config: dict[str, Any]) -> dict[str, Any]:
+    if REPOSITORY_FILE_INVENTORY_CONFIG_KEY in config:
+        config[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = repository_file_inventory_context_from_config(config)
+    return config
+
+
 def create_scan_config(**kwargs: Any) -> ScanConfigModel:
     """Create a validated scan configuration from keyword arguments."""
     return ScanConfigModel(**kwargs)
@@ -2110,6 +2119,7 @@ def scan_model_directory_or_file(
         **kwargs,
     }
     config = normalize_scanner_selection_config(config)
+    config = _normalize_repository_inventory_config(config)
     scanner_selection = policy_from_config(config)
     scanner_selection_extensions = selected_scanner_extensions(scanner_selection) if scanner_selection.active else None
     if scanner_selection.active:
@@ -2233,6 +2243,7 @@ def scan_model_directory_or_file(
 
             # First pass: collect all file paths that need scanning
             files_to_scan: list[str] = []
+            repository_inventory_files: list[str] = []
             shard_family_representatives: dict[_ShardFamilyKey, str] = {}
             shard_family_paths: dict[_ShardFamilyKey, set[str]] = {}
             shard_family_targets: dict[_ShardFamilyKey, ValidatedShardTargets] = {}
@@ -2362,6 +2373,9 @@ def scan_model_directory_or_file(
                         continue
                     if not resolved_file.is_file() and record_dvc_directory_special_file(file_path_obj):
                         continue
+                    repository_member = _repository_member_path_for_scan(str(file_path_obj), base_dir)
+                    if repository_member is not None:
+                        repository_inventory_files.append(repository_member)
                     snapshot_path = Path(file_path).absolute()
                     snapshot_shard_family_key = _shard_family_key_for_path(str(snapshot_path))
                     route_hf_shard_alias = (
@@ -2642,6 +2656,12 @@ def scan_model_directory_or_file(
                         limit=dvc_total_size_limit if isinstance(dvc_total_size_limit, int) else max_total_size,
                     )
 
+            if not isinstance(config.get(REPOSITORY_FILE_INVENTORY_CONFIG_KEY), RepositoryFileInventory):
+                if REPOSITORY_FILE_INVENTORY_CONFIG_KEY not in config:
+                    config[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = tuple(repository_inventory_files)
+                config[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = repository_file_inventory_context_from_config(config)
+            repository_inventory_context = config[REPOSITORY_FILE_INVENTORY_CONFIG_KEY]
+
             # Second pass: scan every non-shard path independently and every shard
             # family once. Shard scans already expand to sibling shards in the
             # advanced handler, so scanning each shard path would duplicate work.
@@ -2732,6 +2752,7 @@ def scan_model_directory_or_file(
                         file_scan_started_at = _start_phase_timing(phase_timings)
                         try:
                             file_config = dict(config)
+                            file_config[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = repository_inventory_context
                             file_config.setdefault(REPOSITORY_SCAN_ROOT_CONFIG_KEY, str(base_dir))
                             repository_current_file = _repository_member_path_for_scan(representative_file, base_dir)
                             if repository_current_file is not None:
@@ -4354,6 +4375,7 @@ def scan_model_streaming(
     files_processed = 0
     skip_file_types: bool = bool(kwargs.get("skip_file_types", False))
     scan_kwargs = normalize_scanner_selection_config(kwargs)
+    scan_kwargs = _normalize_repository_inventory_config(scan_kwargs)
     try:
         max_total_size = int(scan_kwargs.get("max_total_size", 0) or 0)
     except (TypeError, ValueError):
@@ -4362,6 +4384,9 @@ def scan_model_streaming(
     scanner_selection_extensions = selected_scanner_extensions(scanner_selection) if scanner_selection.active else None
     if scanner_selection.active:
         results.scanner_selection = scanner_selection.to_metadata()
+    repository_inventory_context = repository_file_inventory_context_from_config(scan_kwargs)
+    if repository_inventory_context.files:
+        scan_kwargs[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = repository_inventory_context
     metadata_scanner_available: bool = scanner_selection.allows("metadata") and _registry.has_scanner_class(
         "MetadataScanner"
     )

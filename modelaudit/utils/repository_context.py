@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+import struct
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -12,6 +14,7 @@ REPOSITORY_FILE_INVENTORY_CONFIG_KEY: Final[str] = "_modelaudit_repository_file_
 REPOSITORY_SCAN_ROOT_CONFIG_KEY: Final[str] = "_modelaudit_repository_scan_root"
 REPOSITORY_CURRENT_FILE_CONFIG_KEY: Final[str] = "_modelaudit_repository_current_file"
 MAX_REPOSITORY_INVENTORY_FILES: Final[int] = 100_000
+MAX_SAFETENSORS_HEADER_BYTES: Final[int] = 10 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -100,6 +103,60 @@ def _repository_parent(path: PurePosixPath) -> str:
     return "" if parent == "." else parent
 
 
+def _is_plausible_local_safetensors_file(path: Path) -> bool:
+    try:
+        file_size = path.stat().st_size
+    except OSError:
+        return False
+    if file_size <= 8:
+        return False
+    try:
+        with path.open("rb") as handle:
+            header_prefix = handle.read(8)
+            if len(header_prefix) != 8:
+                return False
+            (header_size,) = struct.unpack("<Q", header_prefix)
+            if header_size <= 0 or header_size > MAX_SAFETENSORS_HEADER_BYTES:
+                return False
+            if 8 + header_size > file_size:
+                return False
+            header = handle.read(header_size)
+    except Exception:
+        return False
+    try:
+        return isinstance(json.loads(header.decode("utf-8")), dict)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+
+
+def _local_repository_member_path(config: Mapping[str, Any], member_path: str) -> Path | None:
+    scan_root = config.get(REPOSITORY_SCAN_ROOT_CONFIG_KEY)
+    if not isinstance(scan_root, str) or not scan_root.strip():
+        return None
+    normalized_member = normalize_repository_member_path(member_path)
+    if normalized_member is None:
+        return None
+    try:
+        root = Path(scan_root).resolve()
+        candidate = (root / normalized_member).resolve()
+        candidate.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return candidate
+
+
+def _repository_inventory_safetensors_candidate_is_plausible(
+    config: Mapping[str, Any],
+    member_path: str,
+) -> bool:
+    local_path = _local_repository_member_path(config, member_path)
+    if local_path is None:
+        return True
+    if not local_path.exists():
+        return True
+    return local_path.is_file() and _is_plausible_local_safetensors_file(local_path)
+
+
 def safetensors_alternative_filenames_for_member(member_name: str) -> frozenset[str]:
     """Return exact SafeTensors filenames that plausibly replace a PyTorch member."""
     name = PurePosixPath(member_name.replace("\\", "/")).name
@@ -159,4 +216,9 @@ def repository_has_safetensors_sibling(
     if not allowed_names:
         return False
 
-    return bool(context.safetensors_by_parent.get(current_parent, frozenset()) & allowed_names)
+    candidate_names = context.safetensors_by_parent.get(current_parent, frozenset()) & allowed_names
+    for candidate_name in candidate_names:
+        candidate_member = f"{current_parent}/{candidate_name}" if current_parent else candidate_name
+        if _repository_inventory_safetensors_candidate_is_plausible(config, candidate_member):
+            return True
+    return False

@@ -1,7 +1,9 @@
 """Scanner for PyTorch zip-archived model files (.pt, .pth)."""
 
 import ast
+import importlib.machinery
 import io
+import json
 import logging
 import os
 import pickletools
@@ -2824,8 +2826,6 @@ class PyTorchZipScanner(BaseScanner):
                 meta_entry = self._find_zip_entry(safe_entries, meta_file)
                 if meta_entry is not None:
                     try:
-                        import json
-
                         metadata_bytes = self._read_bounded_version_metadata(
                             zipfile_obj,
                             meta_entry,
@@ -2838,7 +2838,10 @@ class PyTorchZipScanner(BaseScanner):
                         # Look for framework-specific version fields in metadata.
                         # Avoid generic "version" keys, which often describe model/config
                         # schema versions and can cause false CVE attributions.
-                        for key in ["pytorch_version", "torch_version", "framework_version"]:
+                        version_keys = ["pytorch_version", "torch_version"]
+                        if self._metadata_declares_pytorch_framework(meta_data):
+                            version_keys.append("framework_version")
+                        for key in version_keys:
                             if key in meta_data and isinstance(meta_data[key], str):
                                 candidate = meta_data[key].strip()
                                 if self._looks_like_pytorch_version(candidate):
@@ -2866,36 +2869,76 @@ class PyTorchZipScanner(BaseScanner):
                 for opcode, arg, pos in pickletools.genops(f):
                     opcodes.append((opcode, arg, pos))
 
+            string_opcode_names = {"UNICODE", "STRING", "SHORT_BINSTRING", "SHORT_BINUNICODE", "BINUNICODE"}
+
             # Look for GLOBAL opcodes that reference torch.__version__
             for i, (opcode, arg, _pos) in enumerate(opcodes):
-                if opcode.name == "GLOBAL" and arg and "torch" in arg and ("version" in arg or "__version__" in arg):
+                if opcode.name == "GLOBAL" and self._is_torch_version_global_arg(arg):
                     # Found a reference to torch version - try to get the value
                     # Look for subsequent opcodes that might contain the version string
                     for j in range(i + 1, min(i + 10, len(opcodes))):
                         next_opcode, next_arg, _next_pos = opcodes[j]
                         if (
-                            next_opcode.name
-                            in ["UNICODE", "STRING", "SHORT_BINSTRING", "SHORT_BINUNICODE", "BINUNICODE"]
+                            next_opcode.name in string_opcode_names
                             and next_arg
                             and isinstance(next_arg, str)
-                            and self._looks_like_version(next_arg)
+                            and self._looks_like_pytorch_version(next_arg)
                         ):
                             return next_arg
 
-            # Look for any version-like strings in the pickle
-            for opcode, arg, _pos in opcodes:
-                if (
-                    opcode.name in ["UNICODE", "STRING", "SHORT_BINSTRING", "SHORT_BINUNICODE", "BINUNICODE"]
-                    and arg
-                    and isinstance(arg, str)
-                    and self._looks_like_pytorch_version(arg)
-                ):
-                    return arg
+            # Look for explicit torch/PyTorch version keys followed by a version literal.
+            # Generic keys like "version" are model/config schema metadata, not
+            # PyTorch producer evidence.
+            explicit_version_keys = {
+                "__version__",
+                "producer_pytorch_version",
+                "pytorch_version",
+                "pytorch_framework_version",
+                "torch.__version__",
+                "torch_version",
+            }
+            for i, (opcode, arg, _pos) in enumerate(opcodes):
+                if opcode.name not in string_opcode_names or not isinstance(arg, str):
+                    continue
+                normalized_key = arg.strip().lower()
+                if normalized_key not in explicit_version_keys:
+                    continue
+                for next_opcode, next_arg, _next_pos in opcodes[i + 1 : min(i + 8, len(opcodes))]:
+                    if (
+                        next_opcode.name in string_opcode_names
+                        and isinstance(next_arg, str)
+                        and self._looks_like_pytorch_version(next_arg)
+                    ):
+                        return next_arg
 
         except Exception as exc:
             logger.debug("Unable to infer PyTorch version from pickle metadata: %s", exc)
 
         return None
+
+    @classmethod
+    def _is_torch_version_global_arg(cls, value: object) -> bool:
+        global_name = cls._coerce_pickle_string_arg(value)
+        if global_name is None:
+            return False
+        parts = global_name.split()
+        if len(parts) == 2:
+            module, name = parts
+        elif "." in global_name:
+            module, name = global_name.rsplit(".", 1)
+        else:
+            return False
+        return module == "torch" and name == "__version__"
+
+    @staticmethod
+    def _metadata_declares_pytorch_framework(metadata: dict[str, Any]) -> bool:
+        for key in ("framework", "library", "backend"):
+            value = metadata.get(key)
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                if isinstance(item, str) and item.strip().lower() in {"pytorch", "torch"}:
+                    return True
+        return False
 
     def _looks_like_version(self, text: str) -> bool:
         """Check if a string looks like a version number"""
@@ -2950,20 +2993,8 @@ class PyTorchZipScanner(BaseScanner):
 
     def _resolve_installed_pytorch_version(self) -> tuple[str | None, str | None]:
         """Resolve active PyTorch runtime metadata from trusted environment paths."""
-        import sys
-
-        torch_module = sys.modules.get("torch")
-        if torch_module is not None:
-            try:
-                module_version = getattr(torch_module, "__version__", None)
-            except Exception as exc:
-                logger.debug("Unable to read already-imported torch.__version__: %s", exc)
-            else:
-                if isinstance(module_version, str) and module_version.strip():
-                    module_path = getattr(torch_module, "__file__", None)
-                    return module_version.strip(), str(module_path) if isinstance(module_path, str) else None
-                if module_version is not None:
-                    logger.debug("Ignoring non-string already-imported torch.__version__: %r", module_version)
+        trusted_roots = self._trusted_python_package_roots()
+        import_origin = self._resolve_torch_import_origin()
 
         try:
             from importlib import metadata
@@ -2971,9 +3002,13 @@ class PyTorchZipScanner(BaseScanner):
             logger.debug("Unable to load importlib.metadata for PyTorch version detection: %s", exc)
             return None, None
 
-        distribution, metadata_path = self._trusted_torch_distribution(metadata)
+        distribution, metadata_path = self._trusted_torch_distribution(
+            metadata,
+            trusted_roots=trusted_roots,
+            import_origin=import_origin,
+        )
         if distribution is None:
-            return None, None
+            return self._trusted_imported_torch_module_version(trusted_roots)
 
         try:
             package_version: object = distribution.version
@@ -3001,6 +3036,7 @@ class PyTorchZipScanner(BaseScanner):
     @staticmethod
     def _trusted_python_package_roots() -> tuple[os.PathLike[str], ...]:
         import site
+        import sys
         import sysconfig
 
         roots: list[os.PathLike[str]] = []
@@ -3015,13 +3051,30 @@ class PyTorchZipScanner(BaseScanner):
             if resolved and resolved not in {os.fspath(root) for root in roots}:
                 roots.append(Path(resolved))
 
+        known_roots: list[Path] = []
+
+        def add_known_root(value: object) -> None:
+            if not isinstance(value, str) or not value.strip():
+                return
+            with suppress(OSError, RuntimeError, TypeError, ValueError):
+                known_roots.append(Path(os.path.realpath(value)).resolve())
+
         for scheme_key in ("purelib", "platlib"):
-            add_root(sysconfig.get_path(scheme_key))
+            add_known_root(sysconfig.get_path(scheme_key))
         with suppress(Exception):
             for package_root in site.getsitepackages():
-                add_root(package_root)
+                add_known_root(package_root)
         with suppress(Exception):
-            add_root(site.getusersitepackages())
+            add_known_root(site.getusersitepackages())
+
+        for search_path in sys.path:
+            with suppress(OSError, RuntimeError, TypeError, ValueError):
+                resolved_search_path = Path(os.path.realpath(search_path)).resolve()
+                if any(resolved_search_path == root for root in known_roots):
+                    add_root(str(resolved_search_path))
+
+        for root in known_roots:
+            add_root(str(root))
 
         return tuple(roots)
 
@@ -3051,12 +3104,79 @@ class PyTorchZipScanner(BaseScanner):
             return Path(located).resolve()
         return root
 
-    def _trusted_torch_distribution(self, metadata: Any) -> tuple[Any | None, Path | None]:
-        for raw_root in self._trusted_python_package_roots():
+    @staticmethod
+    def _resolve_torch_import_origin() -> Path | None:
+        with suppress(Exception):
+            spec = importlib.machinery.PathFinder.find_spec("torch")
+            if spec is None:
+                return None
+            raw_origin = spec.origin
+            if isinstance(raw_origin, str) and raw_origin not in {"built-in", "frozen", "namespace"}:
+                return Path(raw_origin).resolve()
+            locations = getattr(spec, "submodule_search_locations", None)
+            if locations:
+                for location in locations:
+                    if isinstance(location, str) and location.strip():
+                        return Path(location).resolve()
+        return None
+
+    def _trusted_imported_torch_module_version(
+        self,
+        trusted_roots: tuple[os.PathLike[str], ...],
+    ) -> tuple[str | None, str | None]:
+        import sys
+
+        torch_module = sys.modules.get("torch")
+        if torch_module is None:
+            return None, None
+
+        module_path = getattr(torch_module, "__file__", None)
+        if not isinstance(module_path, str) or not module_path.strip():
+            return None, None
+
+        with suppress(OSError, RuntimeError, TypeError, ValueError):
+            resolved_module_path = Path(module_path).resolve()
+            if not any(self._path_is_relative_to(resolved_module_path, Path(raw_root)) for raw_root in trusted_roots):
+                logger.debug("Ignoring already-imported torch module outside trusted package roots")
+                return None, None
+
+            try:
+                module_version = getattr(torch_module, "__version__", None)
+            except Exception as exc:
+                logger.debug("Unable to read already-imported torch.__version__: %s", exc)
+                return None, None
+            if isinstance(module_version, str) and module_version.strip():
+                return module_version.strip(), str(resolved_module_path)
+            if module_version is not None:
+                logger.debug("Ignoring non-string already-imported torch.__version__: %r", module_version)
+        return None, None
+
+    def _trusted_torch_distribution(
+        self,
+        metadata: Any,
+        *,
+        trusted_roots: tuple[os.PathLike[str], ...],
+        import_origin: Path | None,
+    ) -> tuple[Any | None, Path | None]:
+        resolved_roots: list[Path] = []
+        for raw_root in trusted_roots:
             try:
                 trusted_root = Path(raw_root).resolve()
             except (OSError, RuntimeError, TypeError, ValueError):
                 continue
+            if trusted_root not in resolved_roots:
+                resolved_roots.append(trusted_root)
+
+        trusted_import_root = None
+        if import_origin is not None:
+            trusted_import_root = next(
+                (root for root in resolved_roots if self._path_is_relative_to(import_origin, root)),
+                None,
+            )
+
+        search_roots = [trusted_import_root] if trusted_import_root is not None else resolved_roots
+        fallback_distribution: tuple[Any, Path] | None = None
+        for trusted_root in search_roots:
             try:
                 distributions = metadata.distributions(path=[str(trusted_root)])
             except Exception:
@@ -3071,9 +3191,12 @@ class PyTorchZipScanner(BaseScanner):
                     continue
                 metadata_path = self._distribution_metadata_path(distribution, trusted_root)
                 if not self._path_is_relative_to(metadata_path, trusted_root):
-                    logger.debug("Ignoring torch metadata outside trusted root: %s", metadata_path)
+                    logger.debug("Ignoring torch metadata outside trusted root")
                     continue
-                return distribution, metadata_path
+                if fallback_distribution is None:
+                    fallback_distribution = (distribution, metadata_path)
+        if fallback_distribution is not None:
+            return fallback_distribution
         return None, None
 
     def _select_pytorch_version_for_check(
@@ -3759,10 +3882,13 @@ class PyTorchZipScanner(BaseScanner):
                     return False
                 if 8 + header_size > file_size:
                     return False
-                header = handle.read(min(header_size, 64))
+                header = handle.read(header_size)
         except Exception:
             return False
-        return header.lstrip().startswith(b"{")
+        try:
+            return isinstance(json.loads(header.decode("utf-8")), dict)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return False
 
     def _analyze_pickle_imports(self, pickle_result: ScanResult) -> dict[str, Any]:
         """Analyze pickle imports to distinguish legitimate vs malicious patterns"""
