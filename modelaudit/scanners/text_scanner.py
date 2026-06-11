@@ -451,7 +451,14 @@ DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN = re.compile(
 )
 DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN = re.compile(
     rb"\|\s*(?:sudo\s+)?(?:(?:/[A-Za-z0-9._-]+)*/)?"
-    rb"(?:bash|sh|zsh|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh)\b",
+    rb"(?:bash|sh|zsh|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh|python(?:\d+(?:\.\d+)*)?|perl|ruby|node|php)\b",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_SESSION_HTTP_CALL_PATTERN = re.compile(
+    rb"\b(?:requests\.)?Session\s*\([^)]*\)\s*\.\s*"
+    rb"(?:get|head|post|put|patch|delete|request)\s*\("
+    rb"|\b[A-Za-z_][A-Za-z0-9_]*session[A-Za-z0-9_]*\s*\.\s*"
+    rb"(?:get|head|post|put|patch|delete|request)\s*\(",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_ACTIONABLE_URL_TOKEN_PATTERN = re.compile(
@@ -1574,12 +1581,15 @@ class TextScanner(BaseScanner):
                 for key, _value in parse_qsl(parsed_url.query, keep_blank_values=True)
             ):
                 return False
+            raw_port = parsed_url.port
         except ValueError:
             return False
+        scheme = parsed_url.scheme.casefold()
         return (
-            parsed_url.scheme.casefold() in {"http", "https"}
+            scheme in {"http", "https"}
             and parsed_url.hostname is not None
             and parsed_url.hostname.casefold() in DOCUMENTATION_FENCED_PASSIVE_MEDIA_URL_HOSTS
+            and (raw_port is None or (scheme == "http" and raw_port == 80) or (scheme == "https" and raw_port == 443))
             and DOCUMENTATION_FENCED_ACTIONABLE_URL_TOKEN_PATTERN.search(url.encode()) is None
             and parsed_url.path.casefold().endswith(DOCUMENTATION_FENCED_PASSIVE_MEDIA_URL_SUFFIXES)
         )
@@ -1602,9 +1612,11 @@ class TextScanner(BaseScanner):
 
     @classmethod
     def _documentation_fenced_passive_network_example_is_informational(cls, fenced_code: bytes) -> bool:
-        if DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN.search(
-            fenced_code
-        ) or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(fenced_code):
+        if (
+            DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN.search(fenced_code)
+            or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(fenced_code)
+            or DOCUMENTATION_FENCED_SESSION_HTTP_CALL_PATTERN.search(fenced_code)
+        ):
             return False
         if any(
             match.group("method").lower() not in {b"get", b"head"}

