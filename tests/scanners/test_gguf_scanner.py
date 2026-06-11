@@ -1532,6 +1532,63 @@ def test_gguf_metadata_value_requires_concrete_security_evidence(
     assert all(check.rule_code == "S902" for check in checks)
 
 
+def test_gguf_metadata_remote_fetch_detects_url_assignment_after_many_benign_urls(tmp_path: Path) -> None:
+    benign_assignments = "\n".join(f"u{index} = 'https://example.invalid/{index}'" for index in range(64))
+    value = f"{benign_assignments}\ntarget = 'https://evil.example/payload'\nrequests.delete(target)"
+    path = create_mock_gguf(tmp_path / "capped-url-assignments.gguf", metadata={"callback": value})
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert checks
+    assert any(check.details["evidence_type"] == "remote_fetch" for check in checks)
+    assert all(check.rule_code == "S902" for check in checks)
+
+
+def test_gguf_metadata_remote_fetch_detects_alias_after_many_benign_aliases(tmp_path: Path) -> None:
+    benign_aliases = "\n".join(f"import requests as r{index}" for index in range(8))
+    value = f"{benign_aliases}\nimport requests as target_client\ntarget_client.delete('https://evil.example/payload')"
+    path = create_mock_gguf(tmp_path / "capped-client-aliases.gguf", metadata={"callback": value})
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert checks
+    assert any(check.details["evidence_type"] == "remote_fetch" for check in checks)
+    assert all(check.rule_code == "S902" for check in checks)
+
+
+def test_gguf_metadata_remote_fetch_detects_function_alias_after_many_benign_aliases(tmp_path: Path) -> None:
+    benign_aliases = "\n".join(f"import requests as r{index}" for index in range(8))
+    value = (
+        f"{benign_aliases}\nfrom requests import delete as target_delete\ntarget_delete('https://evil.example/payload')"
+    )
+    path = create_mock_gguf(tmp_path / "capped-function-aliases.gguf", metadata={"callback": value})
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert checks
+    assert any(check.details["evidence_type"] == "remote_fetch" for check in checks)
+    assert all(check.rule_code == "S902" for check in checks)
+
+
+@pytest.mark.parametrize(
+    "value_suffix",
+    [
+        "logger.info('https://evil.example/not-a-fetch')",
+        "from requests import delete as benign_delete\nrender_link('https://evil.example/not-a-fetch')",
+    ],
+)
+def test_gguf_metadata_remote_fetch_alias_cap_non_network_calls_stay_clean(value_suffix: str) -> None:
+    benign_aliases = "\n".join(f"import requests as r{index}" for index in range(8))
+    value = f"{benign_aliases}\n{value_suffix}"
+
+    evidence = GgufScanner._metadata_value_security_evidence("callback", value)
+
+    assert evidence == []
+
+
 def test_gguf_metadata_fetch_command_words_in_prose_are_not_remote_fetch() -> None:
     value = "curl examples are documented at https://huggingface.co/docs/hub/security"
 

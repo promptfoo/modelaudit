@@ -50,6 +50,7 @@ GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON = "gguf_duplicate_metadata_keys"
 GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON = "gguf_metadata_limit_exceeded"
 GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON = "gguf_tensor_limit_exceeded"
 _GGUF_MAX_METADATA_VALUE_SECURITY_CHECKS = 64
+_GGUF_NETWORK_REFERENCE_LIMIT = 64
 _GGUF_INERT_TOKENIZER_ARRAY_KEYS = frozenset({"tokenizer.ggml.merges", "tokenizer.ggml.tokens"})
 _GGUF_REPORT_BOUNDED_TOKENIZER_ARRAY_KEYS = frozenset(
     {
@@ -230,6 +231,17 @@ class _GgufTensorInfo(NamedTuple):
     dims: tuple[int, ...]
     tensor_type: int
     offset: int
+
+
+class _GgufRemoteUrlAssignments(NamedTuple):
+    items: tuple[tuple[int, str], ...]
+    truncated_after_position: int | None
+
+
+class _GgufNetworkApiAliases(NamedTuple):
+    tokens: tuple[str, ...]
+    truncated_after_position: int | None
+    truncated_tokens: tuple[str, ...]
 
 
 class GgufScanner(BaseScanner):
@@ -1683,8 +1695,10 @@ class GgufScanner(BaseScanner):
 
     @staticmethod
     def _api_argument_window(value: str, after_position: int) -> str | None:
-        open_position = value.find("(", after_position, after_position + 128)
-        if open_position == -1:
+        open_position = after_position
+        while open_position < len(value) and value[open_position].isspace():
+            open_position += 1
+        if open_position >= len(value) or value[open_position] != "(":
             return None
         end_limit = min(len(value), open_position + 2048)
         depth = 0
@@ -1720,17 +1734,21 @@ class GgufScanner(BaseScanner):
         return argument_window is not None and cls._has_remote_url(argument_window)
 
     @staticmethod
-    def _remote_url_variable_assignments(value: str) -> tuple[tuple[int, str], ...]:
+    def _remote_url_variable_assignments(value: str) -> _GgufRemoteUrlAssignments:
         assignments: list[tuple[int, str]] = []
         for match in _GGUF_NETWORK_URL_ASSIGNMENT_PATTERN.finditer(value):
+            if len(assignments) >= _GGUF_NETWORK_REFERENCE_LIMIT:
+                return _GgufRemoteUrlAssignments(tuple(assignments), match.start())
             assignments.append((match.start(), match.group("name")))
-            if len(assignments) >= 64:
-                break
-        return tuple(assignments)
+        return _GgufRemoteUrlAssignments(tuple(assignments), None)
 
     @staticmethod
-    def _remote_url_variable_names_before(assignments: tuple[tuple[int, str], ...], position: int) -> set[str]:
-        return {name for assignment_position, name in assignments if assignment_position < position}
+    def _remote_url_variable_names_before(assignments: _GgufRemoteUrlAssignments, position: int) -> set[str]:
+        return {name for assignment_position, name in assignments.items if assignment_position < position}
+
+    @staticmethod
+    def _remote_url_assignments_truncated_before(assignments: _GgufRemoteUrlAssignments, position: int) -> bool:
+        return assignments.truncated_after_position is not None and assignments.truncated_after_position < position
 
     @classmethod
     def _argument_window_uses_variable(cls, argument_window: str, names: set[str]) -> bool:
@@ -1743,26 +1761,89 @@ class GgufScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _network_api_alias_tokens(value: str) -> tuple[str, ...]:
+    def _argument_window_variable_names(argument_window: str) -> set[str]:
+        names: set[str] = set()
+        quote: str | None = None
+        escaped = False
+        cursor = 0
+        for match in re.finditer(r"\b[a-z_][a-z0-9_]*\b", argument_window):
+            for character in argument_window[cursor : match.start()]:
+                if quote is not None:
+                    if escaped:
+                        escaped = False
+                        continue
+                    if character == "\\":
+                        escaped = True
+                        continue
+                    if character == quote:
+                        quote = None
+                    continue
+                if character in {"'", '"'}:
+                    quote = character
+            if quote is not None:
+                cursor = match.end()
+                continue
+            name = match.group(0)
+            if name in {"false", "none", "true"}:
+                cursor = match.end()
+                continue
+            next_position = match.end()
+            while next_position < len(argument_window) and argument_window[next_position].isspace():
+                next_position += 1
+            if next_position < len(argument_window) and argument_window[next_position] in {"=", "("}:
+                cursor = match.end()
+                continue
+            names.add(name)
+            cursor = match.end()
+        return names
+
+    @staticmethod
+    def _hidden_remote_url_variable_assigned_before(
+        value: str,
+        names: set[str],
+        start: int | None,
+        end: int,
+    ) -> bool:
+        if start is None or start >= end:
+            return False
+        search_window = value[start:end]
+        for name in names:
+            pattern = re.compile(
+                rf"""(?is)\b{re.escape(name)}\s*=\s*(?:[rubf]{{0,2}})?(?P<quote>['"])(?:https?|ftp)://[^'"\s<>]+(?P=quote)""",
+            )
+            if pattern.search(search_window):
+                return True
+        return False
+
+    @staticmethod
+    def _network_api_alias_tokens(value: str) -> _GgufNetworkApiAliases:
         tokens: list[str] = []
         for match in _GGUF_NETWORK_CLIENT_ALIAS_PATTERN.finditer(value):
             module = match.group("module")
             alias = match.group("alias")
             for method in _GGUF_NETWORK_CLIENT_ALIAS_METHODS[module]:
+                if len(tokens) >= _GGUF_NETWORK_REFERENCE_LIMIT:
+                    truncated_tokens = tuple(
+                        f"{alias}.{omitted_method}" for omitted_method in _GGUF_NETWORK_CLIENT_ALIAS_METHODS[module]
+                    )
+                    return _GgufNetworkApiAliases(tuple(tokens), match.start(), truncated_tokens)
                 tokens.append(f"{alias}.{method}")
-            if len(tokens) >= 64:
-                return tuple(tokens[:64])
 
         for match in _GGUF_URLLIB_REQUEST_ALIAS_PATTERN.finditer(value):
             alias = match.group("alias")
             for method in _GGUF_NETWORK_CLIENT_ALIAS_METHODS["urllib.request"]:
+                if len(tokens) >= _GGUF_NETWORK_REFERENCE_LIMIT:
+                    truncated_tokens = tuple(
+                        f"{alias}.{omitted_method}"
+                        for omitted_method in _GGUF_NETWORK_CLIENT_ALIAS_METHODS["urllib.request"]
+                    )
+                    return _GgufNetworkApiAliases(tuple(tokens), match.start(), truncated_tokens)
                 tokens.append(f"{alias}.{method}")
-            if len(tokens) >= 64:
-                return tuple(tokens[:64])
 
         for match in _GGUF_NETWORK_FUNCTION_IMPORT_PATTERN.finditer(value):
             module = match.group("module")
             methods = _GGUF_NETWORK_CLIENT_ALIAS_METHODS[module]
+            omitted_tokens: list[str] = []
             for imported_name in match.group("imports").split(","):
                 parts = imported_name.strip().split()
                 if not parts:
@@ -1770,10 +1851,58 @@ class GgufScanner(BaseScanner):
                 function_name = parts[0]
                 alias = parts[2] if len(parts) >= 3 and parts[1] == "as" else function_name
                 if function_name in methods and _GGUF_SHELL_VARIABLE_NAME_PATTERN.fullmatch(alias):
+                    if len(tokens) >= _GGUF_NETWORK_REFERENCE_LIMIT:
+                        omitted_tokens.append(alias)
+                        continue
                     tokens.append(alias)
-            if len(tokens) >= 64:
-                return tuple(tokens[:64])
-        return tuple(tokens)
+            if omitted_tokens:
+                return _GgufNetworkApiAliases(tuple(tokens), match.start(), tuple(omitted_tokens))
+        return _GgufNetworkApiAliases(tuple(tokens), None, ())
+
+    @classmethod
+    def _argument_window_has_remote_variable_evidence(
+        cls,
+        value: str,
+        argument_window: str,
+        assignments: _GgufRemoteUrlAssignments,
+        api_position: int,
+    ) -> bool:
+        remote_url_variables = cls._remote_url_variable_names_before(assignments, api_position)
+        if remote_url_variables and cls._argument_window_uses_variable(argument_window, remote_url_variables):
+            return True
+        if not cls._remote_url_assignments_truncated_before(assignments, api_position):
+            return False
+        return cls._hidden_remote_url_variable_assigned_before(
+            value,
+            cls._argument_window_variable_names(argument_window),
+            assignments.truncated_after_position,
+            api_position,
+        )
+
+    @classmethod
+    def _truncated_alias_remote_fetch_pattern(
+        cls,
+        value: str,
+        aliases: _GgufNetworkApiAliases,
+        assignments: _GgufRemoteUrlAssignments,
+    ) -> bool:
+        if aliases.truncated_after_position is None:
+            return False
+
+        for api_name in aliases.truncated_tokens:
+            for api_position in cls._iter_substring_positions(value, api_name):
+                if api_position < aliases.truncated_after_position:
+                    continue
+                if not cls._has_network_api_boundary(value, api_position, api_name):
+                    continue
+                argument_window = cls._api_argument_window(value, api_position + len(api_name))
+                if argument_window is None:
+                    continue
+                if cls._has_remote_url(argument_window):
+                    return True
+                if cls._argument_window_has_remote_variable_evidence(value, argument_window, assignments, api_position):
+                    return True
+        return False
 
     @classmethod
     def _shell_remote_fetch_pattern(cls, value: str) -> str | None:
@@ -1799,7 +1928,8 @@ class GgufScanner(BaseScanner):
             return None
 
         remote_url_assignments = cls._remote_url_variable_assignments(value_lower)
-        for api_name in (*_GGUF_METADATA_NETWORK_APIS, *cls._network_api_alias_tokens(value_lower)):
+        api_aliases = cls._network_api_alias_tokens(value_lower)
+        for api_name in (*_GGUF_METADATA_NETWORK_APIS, *api_aliases.tokens):
             for api_position in cls._iter_substring_positions(value_lower, api_name):
                 if not cls._has_network_api_boundary(value_lower, api_position, api_name):
                     continue
@@ -1809,9 +1939,15 @@ class GgufScanner(BaseScanner):
                     continue
                 if cls._has_remote_url(argument_window):
                     return "network_api"
-                remote_url_variables = cls._remote_url_variable_names_before(remote_url_assignments, api_position)
-                if remote_url_variables and cls._argument_window_uses_variable(argument_window, remote_url_variables):
+                if cls._argument_window_has_remote_variable_evidence(
+                    value_lower,
+                    argument_window,
+                    remote_url_assignments,
+                    api_position,
+                ):
                     return "network_api"
+        if cls._truncated_alias_remote_fetch_pattern(value_lower, api_aliases, remote_url_assignments):
+            return "network_api"
         return None
 
     @classmethod
