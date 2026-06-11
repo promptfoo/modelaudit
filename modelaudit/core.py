@@ -86,6 +86,7 @@ from modelaudit.utils.file.detection import (
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
     detect_file_format,
+    detect_file_format_for_skip_filter,
     detect_file_format_from_magic,
     detect_flax_msgpack_overlap_routes,
     detect_format_from_extension,
@@ -1937,6 +1938,42 @@ def _resolve_directory_scan_target(
     return resolved_file, is_hf_cache_symlink, False
 
 
+def _hf_cache_snapshot_alias_has_safe_parent_components(snapshot_path: Path, hf_cache_root: Path | None) -> bool:
+    """Return whether a snapshot alias parent path avoids symlink components."""
+    if hf_cache_root is None:
+        return False
+
+    absolute_path = Path(os.path.abspath(snapshot_path.expanduser()))
+    cache_root = Path(os.path.abspath(hf_cache_root.expanduser()))
+    try:
+        relative_parts = absolute_path.relative_to(cache_root).parts
+    except ValueError:
+        return False
+    if len(relative_parts) < 3 or relative_parts[0].lower() != "snapshots" or relative_parts[1] in {"", ".", ".."}:
+        return False
+    current = cache_root
+    for part in relative_parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            return False
+    return True
+
+
+def _should_scan_hf_cache_alias_lexically_for_onnx(snapshot_path: Path, hf_cache_root: Path | None) -> bool:
+    """Return whether an HF cache alias should be scanned via its snapshot path for ONNX sidecars."""
+    suffix = snapshot_path.suffix.lower()
+    if suffix == ".onnx":
+        return True
+    if suffix:
+        return False
+    if not _hf_cache_snapshot_alias_has_safe_parent_components(snapshot_path, hf_cache_root):
+        return False
+    try:
+        return detect_file_format_for_skip_filter(str(snapshot_path)) == "onnx"
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def _unclassified_symlink_names(root: str, dirs: list[str], files: list[str]) -> list[str]:
     """Return file-like symlinks omitted from ``os.walk``'s file classification."""
     classified_files = set(files)
@@ -2329,7 +2366,10 @@ def scan_model_directory_or_file(
                     route_hf_shard_alias = (
                         is_hf_cache_symlink and resolved_file.exists() and snapshot_shard_family_key is not None
                     )
-                    route_hf_onnx_alias = is_hf_cache_symlink and snapshot_path.suffix.lower() == ".onnx"
+                    route_hf_onnx_alias = is_hf_cache_symlink and _should_scan_hf_cache_alias_lexically_for_onnx(
+                        snapshot_path,
+                        hf_cache_root,
+                    )
                     scan_source = snapshot_path if route_hf_shard_alias or route_hf_onnx_alias else resolved_file
 
                     # Skip non-model files early if filtering is enabled
