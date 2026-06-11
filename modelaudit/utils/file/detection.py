@@ -299,7 +299,18 @@ _HF_TOKENIZER_JSON_FILENAMES = frozenset({"tokenizer.json"})
 _HF_TOKENIZER_ROOT_KEYS = frozenset({"version", "added_tokens"})
 _HF_TOKENIZER_MODEL_TYPES = frozenset({"BPE", "Unigram", "WordPiece", "WordLevel"})
 _HF_TOKENIZER_TEMPLATE_KEYS = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
-_JSON_PROBE_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
+_HF_TOKENIZER_JAX_ROUTE_KEYS = frozenset(
+    {
+        "framework",
+        "backend",
+        "serialization",
+        "checkpoint_type",
+    }
+    | _JAX_JSON_CHECKPOINT_MARKER_KEYS
+)
+_HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_KEYS = (
+    _HF_TOKENIZER_TEMPLATE_KEYS | _MXNET_SYMBOL_ROOT_KEYS | {"learner"} | _HF_TOKENIZER_JAX_ROUTE_KEYS
+)
 LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT = "llamafile_routing_inconclusive"
 NEMO_ROUTING_INCONCLUSIVE_FORMAT = "nemo_routing_inconclusive"
 XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT = "xgboost_ubjson_routing_inconclusive"
@@ -662,16 +673,6 @@ class _HFTokenizerJSONProbeState:
     has_template_evidence: bool = False
 
 
-def _json_probe_string_has_template_indicator(probe: bytes, start: int, end: int) -> bool:
-    raw_value = probe[start:end]
-    for indicator in _JSON_PROBE_TEMPLATE_INDICATORS:
-        if indicator.encode("utf-8") in raw_value:
-            return True
-
-    value = _json_probe_decode_string(probe, start, end)
-    return bool(value and any(indicator in value for indicator in _JSON_PROBE_TEMPLATE_INDICATORS))
-
-
 def _json_probe_skip_string_or_raise(probe: bytes, offset: int) -> int:
     end = _json_probe_skip_string(probe, offset)
     if end is None:
@@ -695,10 +696,7 @@ def _json_probe_skip_value_with_template_scan(
 
     first = probe[offset]
     if first == ord('"'):
-        end = _json_probe_skip_string_or_raise(probe, offset)
-        if _json_probe_string_has_template_indicator(probe, offset, end):
-            state.has_template_evidence = True
-        return end
+        return _json_probe_skip_string_or_raise(probe, offset)
 
     if first == ord("{"):
         return _json_probe_skip_object_with_template_scan(probe, offset, state, depth=depth + 1)
@@ -858,6 +856,57 @@ def _hf_tokenizer_probe_model_object(
     return None, saw_model_type and saw_vocab
 
 
+def _hf_tokenizer_suffix_has_route_conflict(file_path: Path, file_size: int) -> bool:
+    """Return whether a bounded suffix exposes late scanner-owned root evidence."""
+    if file_size <= TOKENIZER_JSON_ROUTING_READ_BYTES:
+        return False
+
+    try:
+        read_size = min(file_size, _STRUCTURED_JSON_TRAILING_READ_BYTES)
+        with file_path.open("rb") as stream:
+            stream.seek(max(0, file_size - read_size))
+            suffix = stream.read(read_size)
+    except OSError:
+        return True
+
+    return any(f'"{key}"'.encode() in suffix for key in _HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_KEYS)
+
+
+def _hf_tokenizer_json_has_bounded_key_evidence(path: str | Path, keys: frozenset[str]) -> bool:
+    """Return whether bounded tokenizer JSON chunks expose any key in keys."""
+    file_path = Path(path)
+    if file_path.name.lower() not in _HF_TOKENIZER_JSON_FILENAMES or file_path.suffix.lower() != ".json":
+        return False
+    try:
+        if not file_path.is_file():
+            return False
+        file_size = file_path.stat().st_size
+        if file_size < 4:
+            return False
+        read_size = min(file_size, TOKENIZER_JSON_ROUTING_READ_BYTES)
+        prefix = read_magic_bytes(str(file_path), read_size)
+        chunks = [prefix]
+        if file_size > read_size:
+            tail_size = min(file_size, _STRUCTURED_JSON_TRAILING_READ_BYTES)
+            with file_path.open("rb") as stream:
+                stream.seek(max(0, file_size - tail_size))
+                chunks.append(stream.read(tail_size))
+    except OSError:
+        return False
+
+    return any(f'"{key}"'.encode() in chunk for chunk in chunks for key in keys)
+
+
+def huggingface_tokenizer_json_has_template_route_evidence(path: str | Path) -> bool:
+    """Return whether bounded tokenizer JSON evidence should route to Jinja scanning."""
+    return _hf_tokenizer_json_has_bounded_key_evidence(path, _HF_TOKENIZER_TEMPLATE_KEYS)
+
+
+def huggingface_tokenizer_json_has_jax_route_evidence(path: str | Path) -> bool:
+    """Return whether bounded tokenizer JSON evidence should route to JAX scanning."""
+    return _hf_tokenizer_json_has_bounded_key_evidence(path, _HF_TOKENIZER_JAX_ROUTE_KEYS)
+
+
 def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
     """Return whether bounded filename and schema evidence proves tokenizer JSON ownership."""
     file_path = Path(path)
@@ -921,7 +970,12 @@ def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
         if value_offset >= len(probe):
             return False
 
-        if key in _MXNET_SYMBOL_ROOT_KEYS or key == "learner" or key in _HF_TOKENIZER_TEMPLATE_KEYS:
+        if (
+            key in _MXNET_SYMBOL_ROOT_KEYS
+            or key == "learner"
+            or key in _HF_TOKENIZER_TEMPLATE_KEYS
+            or key in _HF_TOKENIZER_JAX_ROUTE_KEYS
+        ):
             return False
         if key in _HF_TOKENIZER_ROOT_KEYS:
             root_keys.add(key)
@@ -934,7 +988,12 @@ def is_huggingface_tokenizer_json_file(path: str | Path) -> bool:
             if state.has_template_evidence:
                 return False
             if next_offset is None:
-                return sample_is_prefix and root_keys >= _HF_TOKENIZER_ROOT_KEYS and saw_model_schema
+                return (
+                    sample_is_prefix
+                    and root_keys >= _HF_TOKENIZER_ROOT_KEYS
+                    and saw_model_schema
+                    and not _hf_tokenizer_suffix_has_route_conflict(file_path, file_size)
+                )
         else:
             try:
                 next_offset = _json_probe_skip_value_with_template_scan(
@@ -1287,6 +1346,10 @@ def _could_be_renamed_mxnet_symbol(file_path: Path, prefix: bytes) -> bool:
 
 def _detect_content_routed_mxnet_symbol(file_path: Path, prefix: bytes) -> str | None:
     """Route plausible JSON symbol content or preserve bounded ambiguity."""
+    if huggingface_tokenizer_json_has_template_route_evidence(
+        file_path
+    ) or huggingface_tokenizer_json_has_jax_route_evidence(file_path):
+        return None
     if is_huggingface_tokenizer_json_file(file_path):
         return None
     if file_path.name.lower().endswith("-symbol.json"):

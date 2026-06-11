@@ -93,6 +93,8 @@ from modelaudit.utils.file.detection import (
     detect_pytorch_binary_supplemental_format,
     detect_xgboost_ubjson_content_route,
     is_executorch_archive,
+    is_huggingface_tokenizer_json_file,
+    is_jax_json_checkpoint_file,
     is_keras_zip_archive,
     is_pytorch_zip_archive,
     is_skops_archive,
@@ -1234,6 +1236,16 @@ def _select_non_hdf5_preferred_scanner_id(
 
     if header_format == "tar" and ext == ".nemo":
         return "nemo"
+
+    if (
+        config is not None
+        and ext == ".json"
+        and header_format == "unknown"
+        and policy_from_config(config).allows("jax_checkpoint")
+        and not is_huggingface_tokenizer_json_file(path)
+        and is_jax_json_checkpoint_file(path)
+    ):
+        return "jax_checkpoint"
 
     return _registry.get_scanner_id_for_header_format(header_format)
 

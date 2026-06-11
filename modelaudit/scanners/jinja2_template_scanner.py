@@ -40,7 +40,9 @@ except ImportError:
     HAS_RESOURCE_LIMITS = False
 
 from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
-from modelaudit.utils.file.detection import is_huggingface_tokenizer_json_file
+from modelaudit.utils.file.detection import (
+    huggingface_tokenizer_json_has_template_route_evidence,
+)
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
 
@@ -465,7 +467,9 @@ class Jinja2TemplateScanner(BaseScanner):
                 "generation_config.json",
             ]
         ):
-            return not (filename == "tokenizer.json" and is_huggingface_tokenizer_json_file(path))
+            if filename == "tokenizer.json":
+                return huggingface_tokenizer_json_has_template_route_evidence(path)
+            return True
 
         # YAML files in ML contexts
         if ext in [".yaml", ".yml"]:

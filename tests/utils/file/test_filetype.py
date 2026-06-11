@@ -1450,6 +1450,7 @@ def test_detect_large_hf_tokenizer_json_is_not_binary_json_route(
             "arg_nodes": [0],
             "heads": [[0, 0, 0]],
         },
+        {"framework": "jax", "payload": "jax.experimental.host_callback.call(os.system, 'id')"},
     ],
 )
 def test_hf_tokenizer_json_does_not_hide_late_security_root_keys(
@@ -1492,6 +1493,60 @@ def test_hf_tokenizer_json_nested_template_evidence_is_not_claimed(
 
     assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
     assert detect_file_format(str(tokenizer_path)) == "unknown"
+
+
+def test_hf_tokenizer_json_allows_vocab_jinja_markers_when_schema_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "model": {
+                "type": "Unigram",
+                "vocab": [["{{", -1.0], *[[f"piece_{index}", -float(index)] for index in range(80)]],
+            },
+        },
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is True
+    assert detect_file_format(str(tokenizer_path)) == "unknown"
+
+
+@pytest.mark.parametrize(
+    "extra_fields",
+    [
+        {"chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}"},
+        {"learner": {"gradient_booster": {}, "malicious_code": "os.system()"}},
+        {
+            "nodes": [{"op": "Custom", "name": "load", "attrs": {"library": "../../tmp/libevil.so"}}],
+            "arg_nodes": [0],
+            "heads": [[0, 0, 0]],
+        },
+        {"framework": "jax", "payload": "jax.experimental.host_callback.call(os.system, 'id')"},
+    ],
+)
+def test_hf_tokenizer_json_with_late_root_overlap_after_probe_is_not_claimed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra_fields: dict[str, Any],
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "model": {
+                "type": "Unigram",
+                "vocab": [[f"piece_{index}", -float(index)] for index in range(80)],
+            },
+            **extra_fields,
+        },
+    )
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
 
 
 def test_hf_tokenizer_json_over_routing_budget_is_claimed_after_schema_probe(

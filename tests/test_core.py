@@ -9725,6 +9725,111 @@ def test_scan_file_oversized_hf_tokenizer_json_does_not_fail_closed_as_mxnet(tmp
     assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
 
 
+@pytest.mark.parametrize("scanners", [None, ["jinja2_template"], ["mxnet"], ["jax_checkpoint"]])
+def test_scan_file_large_hf_tokenizer_json_with_vocab_jinja_tokens_is_benign_for_selected_scanners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scanners: list[str] | None,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_dir = tmp_path / "onnx"
+    tokenizer_dir.mkdir()
+    tokenizer_path = _write_hf_tokenizer_json(
+        tokenizer_dir / "tokenizer.json",
+        {
+            "model": {
+                "type": "Unigram",
+                "vocab": [["{{", -1.0], *[[f"piece_{index}", -float(index)] for index in range(80)]],
+            },
+        },
+    )
+    config: dict[str, Any] = {"cache_scan_results": False}
+    if scanners is not None:
+        config["scanners"] = scanners
+
+    result = scan_file(str(tokenizer_path), config=config)
+
+    assert result.success is True
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert "jax_json_checkpoint_analysis_size_limit" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+
+
+def test_scan_file_oversized_tokenizer_json_late_chat_template_preserves_jinja_detection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "model": {
+                "type": "Unigram",
+                "vocab": [[f"piece_{index}", -float(index)] for index in range(80)],
+            },
+            "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_oversized_tokenizer_json_late_mxnet_root_preserves_mxnet_detection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "model": {
+                "type": "Unigram",
+                "vocab": [[f"piece_{index}", -float(index)] for index in range(80)],
+            },
+            "nodes": [{"op": "Custom", "name": "load", "attrs": {"library": "../../tmp/libevil.so"}}],
+            "arg_nodes": [0],
+            "heads": [[0, 0, 0]],
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
+def test_scan_file_oversized_tokenizer_json_late_jax_root_preserves_selected_jax_detection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "model": {
+                "type": "Unigram",
+                "vocab": [[f"piece_{index}", -float(index)] for index in range(80)],
+            },
+            "framework": "jax",
+            "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False, "scanners": ["jax_checkpoint"]})
+
+    assert result.scanner_name == "jax_checkpoint"
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
 def test_scan_file_tokenizer_json_nested_template_preserves_jinja_detection(tmp_path: Path) -> None:
     tokenizer_path = _write_hf_tokenizer_json(
         tmp_path / "tokenizer.json",

@@ -15,7 +15,11 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
-from ..utils.file.detection import JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES, is_jax_json_checkpoint_file
+from ..utils.file.detection import (
+    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
+    is_huggingface_tokenizer_json_file,
+    is_jax_json_checkpoint_file,
+)
 from ._evidence_redaction import redact_evidence_string
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -776,6 +780,8 @@ class JaxCheckpointScanner(BaseScanner):
 
         # Handle file-based checkpoints
         if os.path.isfile(path):
+            if is_huggingface_tokenizer_json_file(path):
+                return False
             ext = os.path.splitext(path)[1].lower()
             if ext in cls.supported_extensions:
                 return cls._is_likely_jax_file(path) or is_jax_json_checkpoint_file(path)
