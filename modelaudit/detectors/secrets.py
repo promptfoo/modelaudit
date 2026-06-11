@@ -359,6 +359,7 @@ BASIC_AUTH_HEADER_NAMES = {
     "authorization": "Authorization",
     "proxyauthorization": "Proxy-Authorization",
 }
+BASIC_AUTH_CONTINUATION_PREFIX_PATTERN = re.compile(r"^\s*(?:-\s*)?$")
 BASIC_AUTH_VALUE_PREFIX_PATTERN = re.compile(r"^\s*Basic\s+", re.IGNORECASE)
 
 
@@ -585,7 +586,7 @@ class SecretsDetector:
             return False
         if BASIC_AUTH_HEADER_PREFIX_PATTERN.search(line_prefix) is not None:
             return True
-        if line_prefix.strip():
+        if BASIC_AUTH_CONTINUATION_PREFIX_PATTERN.fullmatch(line_prefix) is None:
             return False
 
         previous_end = line_start
@@ -624,12 +625,13 @@ class SecretsDetector:
         self,
         findings: list[dict[str, Any]],
         token: str,
+        matched_text: str,
         pattern: re.Pattern[str],
         position: int,
         context: str,
         safe_context: str,
     ) -> bool:
-        if self._is_whitelisted(token):
+        if self._is_whitelisted(token) or self._is_whitelisted(matched_text):
             return True
 
         confidence = max(
@@ -817,6 +819,7 @@ class SecretsDetector:
                     if not self._record_basic_auth_finding(
                         findings,
                         token,
+                        match.group(0),
                         pattern,
                         match.start(1),
                         context,

@@ -162,6 +162,7 @@ class TestSecretsDetector:
                 f"Proxy-Authorization:\r\n\tBasic {_basic_auth_token(b'wrapped-proxy:pass')}",
                 _basic_auth_token(b"wrapped-proxy:pass"),
             ),
+            (f"Authorization:\n  - Basic {_basic_auth_token(b'listed:pass')}", _basic_auth_token(b"listed:pass")),
         ],
     )
     def test_basic_auth_valid_headers_are_detected(self, text: str, token: str) -> None:
@@ -190,6 +191,7 @@ class TestSecretsDetector:
             "X-Authorization: Basic dXNlcjpwYXNz",
             f"Authorization notes:\n  Basic {_basic_auth_token(b'wrapped:pass')}",
             f"Authorization: documented value\n  Basic {_basic_auth_token(b'wrapped:pass')}",
+            f"Authorization notes:\n  - Basic {_basic_auth_token(b'listed:pass')}",
             f"Authorization: Basic {'A' * (BASIC_AUTH_TOKEN_MAX_LENGTH + 1)}",
         ],
     )
@@ -208,6 +210,14 @@ class TestSecretsDetector:
         findings = detector.scan_dict({"headers": {header_name: f"Basic {token}"}})
 
         assert _basic_auth_findings(findings)
+
+    def test_basic_auth_full_value_whitelist_still_suppresses_detection(self) -> None:
+        token = _basic_auth_token(b"user:pass")
+        detector = SecretsDetector(config={"whitelist": [f"Basic {token}"]})
+
+        findings = detector.scan_text(f"Authorization: Basic {token}", context="headers.txt")
+
+        assert _basic_auth_findings(findings) == []
 
     def test_basic_auth_valid_token_without_header_key_is_ignored_in_structured_data(self) -> None:
         detector = SecretsDetector()
