@@ -721,7 +721,11 @@ class SecretsDetector:
     ) -> list[dict[str, Any]]:
         if header_name is not None and BASIC_AUTH_VALUE_PREFIX_BYTES_PATTERN.match(value):
             value_text = value[:BASIC_AUTH_HEADER_VALUE_CONTEXT_MAX_BYTES].decode("ascii", errors="ignore")
-            return self.scan_text(f"{header_name}: {value_text}", context, is_binary_source=False)
+            findings = self.scan_text(f"{header_name}: {value_text}", context, is_binary_source=False)
+            if self._findings_truncated:
+                return findings
+            findings.extend(self.scan_bytes(value, context))
+            return findings
         return self.scan_bytes(value, context)
 
     def scan_bytes(self, data: bytes, context: str = "") -> list[dict[str, Any]]:

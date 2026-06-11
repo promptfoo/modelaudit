@@ -623,6 +623,8 @@ class TextScanner(BaseScanner):
         ext = os.path.splitext(path)[1].lower()
         if ext not in cls.supported_extensions:
             return False
+        if ext == ".env":
+            return True
 
         return any(filename.startswith(prefix) for prefix in ["vocab", "token", "label"])
 

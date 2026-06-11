@@ -351,6 +351,18 @@ class TestSecretsDetector:
         assert basic_findings
         assert token not in json.dumps(basic_findings, sort_keys=True)
 
+    def test_basic_auth_structured_long_bytes_header_value_keeps_trailing_secret_coverage(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"long-bytes:pass")
+        aws_key = "AKIA1234567890ABCDEF"
+        value = b"Basic " + token.encode("ascii") + b" " + (b"x" * 9000) + f"\naws_key={aws_key}\n".encode()
+
+        findings = detector.scan_dict({"Authorization": value})
+
+        assert _basic_auth_findings(findings)
+        assert any(finding.get("secret_type") == "AWS Access Key" for finding in findings)
+        assert aws_key not in json.dumps(findings, sort_keys=True)
+
     def test_basic_auth_full_value_whitelist_still_suppresses_detection(self) -> None:
         token = _basic_auth_token(b"user:pass")
         detector = SecretsDetector(config={"whitelist": [f"Basic {token}"]})

@@ -822,6 +822,7 @@ def test_remote_prefilters_preserve_text_scanner_extensionless_documentation() -
     assert filenames == frozenset({"readme", "model_card", "requirements.txt", ".env"})
     files = [
         {"path": "s3://bucket/.env"},
+        {"path": "s3://bucket/prod.env"},
         {"path": "s3://bucket/README"},
         {"path": "s3://bucket/model.bin"},
     ]
@@ -832,7 +833,7 @@ def test_remote_prefilters_preserve_text_scanner_extensionless_documentation() -
             scannable_extensions=extensions,
             scannable_filenames=filenames,
         )
-        == files[:2]
+        == files[:3]
     )
     assert (
         filter_jfrog_scannable_files(
@@ -840,7 +841,7 @@ def test_remote_prefilters_preserve_text_scanner_extensionless_documentation() -
             scannable_extensions=extensions,
             scannable_filenames=filenames,
         )
-        == files[:2]
+        == files[:3]
     )
 
 
