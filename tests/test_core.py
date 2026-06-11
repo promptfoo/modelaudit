@@ -4092,6 +4092,23 @@ def test_scan_file_treats_valid_flax_ndarray_tensor_bytes_as_data(tmp_path: Path
     assert not any(issue.message == r"Suspicious code pattern detected: eval\s*\(" for issue in result.issues)
 
 
+def test_scan_file_treats_small_valid_flax_ndarray_tensor_bytes_as_data_by_default(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "small_flax_model.msgpack"
+    checkpoint.write_bytes(_pack_flax_ndarray_ext_checkpoint(b"eval('x')" + (b"\0" * 27)))
+
+    result = scan_file(
+        str(checkpoint),
+        config={"cache_scan_results": False},
+    )
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is True
+    assert not any(issue.message == r"Suspicious code pattern detected: eval\s*\(" for issue in result.issues)
+
+
 def test_scan_file_treats_nested_flax_ndarray_tensor_bytes_as_data(tmp_path: Path) -> None:
     if not flax_msgpack_scanner.HAS_MSGPACK:
         pytest.skip("msgpack unavailable")

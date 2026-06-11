@@ -2826,7 +2826,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 return _StreamValue("ExtType", value=msgpack.ExtType(code, data))
             return _StreamValue("ExtType", value=data)
 
-        if code == 1 and length > self.max_msgpack_decode_bytes:
+        if code == 1:
             return self._consume_flax_ndarray_ext_scalar(cursor, length, location, result, summary, path=path)
 
         if length > self.max_msgpack_decode_bytes:

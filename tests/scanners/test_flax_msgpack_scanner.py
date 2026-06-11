@@ -1582,6 +1582,21 @@ def test_flax_msgpack_direct_ndarray_ext_treats_valid_tensor_bytes_as_data(tmp_p
     assert all(check.name != "Msgpack Parse Check" for check in result.checks)
 
 
+def test_flax_msgpack_ndarray_ext_under_decode_budget_treats_valid_tensor_bytes_as_data(tmp_path: Path) -> None:
+    path = tmp_path / "small_text_like_tensor_bytes_ndarray_ext.msgpack"
+    body_prefix = b"eval('x')" + (b"\0" * 24)
+    body_prefix += b"\0" * (-len(body_prefix) % 4)
+    _write_sparse_large_flax_ndarray_ext(path, len(body_prefix), body_prefix=body_prefix)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["jax_metadata"]["tensor_count"] == 1
+    assert all(issue.message != r"Suspicious code pattern detected: eval\s*\(" for issue in result.issues)
+    assert all(check.name != "Msgpack Parse Check" for check in result.checks)
+
+
 def test_flax_msgpack_large_flax_ndarray_ext_scans_dtype_metadata(tmp_path: Path) -> None:
     path = tmp_path / "malicious_dtype_ndarray_ext.msgpack"
     tensor_size = (64 * 1024) + 4
