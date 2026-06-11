@@ -4,6 +4,7 @@ import hashlib
 import itertools
 import logging
 import os
+import shutil
 import stat
 import tempfile
 import time
@@ -2257,6 +2258,72 @@ def _hash_files_by_path(
     return content_hashes
 
 
+@contextmanager
+def _staged_directory_owner_scan_path(
+    root_path: Path,
+    owner_snapshot: tuple[_DirectoryOwnerSnapshotEntry, ...],
+    owner_hashes: dict[str, str],
+    *,
+    config: dict[str, Any],
+    deadline: float,
+) -> Iterator[str]:
+    """Yield a copied owner snapshot when descriptor-backed paths are unavailable."""
+    with tempfile.TemporaryDirectory(prefix="modelaudit-directory-owner-") as temporary_directory:
+        staged_root = Path(temporary_directory) / (root_path.name or "owner-root")
+        staged_root.mkdir()
+        for owner_entry in owner_snapshot:
+            if owner_entry.entry_type == "directory" and owner_entry.relative_parts:
+                staged_root.joinpath(*owner_entry.relative_parts).mkdir(parents=True, exist_ok=True)
+
+        staged_source_by_original: dict[str, str] = {}
+        for source_path in owner_hashes:
+            relative_parts = Path(os.path.relpath(source_path, root_path)).parts
+            staged_source = staged_root.joinpath(*relative_parts)
+            staged_source.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source_path, staged_source, follow_symlinks=False)
+            staged_source_by_original[source_path] = str(staged_source)
+
+        staged_hashes = _hash_files_by_path(
+            list(staged_source_by_original.values()),
+            config=config,
+            routing_paths={staged_source: staged_source for staged_source in staged_source_by_original.values()},
+            deadline=deadline,
+        )
+        if any(
+            staged_hashes.get(staged_source) != owner_hashes[source_path]
+            for source_path, staged_source in staged_source_by_original.items()
+        ):
+            raise OSError("Directory owner staged snapshot did not match pre-dispatch hashes")
+
+        yield str(staged_root)
+
+
+@contextmanager
+def _directory_owner_scan_path(
+    root_path: Path,
+    owner_snapshot: tuple[_DirectoryOwnerSnapshotEntry, ...],
+    owner_hashes: dict[str, str],
+    *,
+    config: dict[str, Any],
+    deadline: float,
+) -> Iterator[str]:
+    """Yield a bound or hash-verified copied path for logical directory-owner scanning."""
+    with ExitStack() as scan_path_stack:
+        try:
+            owner_scan_path = scan_path_stack.enter_context(_bound_directory_owner_scan_path(root_path))
+        except OSError:
+            owner_scan_path = scan_path_stack.enter_context(
+                _staged_directory_owner_scan_path(
+                    root_path,
+                    owner_snapshot,
+                    owner_hashes,
+                    config=config,
+                    deadline=deadline,
+                ),
+            )
+        yield owner_scan_path
+
+
 def _is_directory_link(path: Path) -> bool:
     """Return whether a directory entry is a symlink, junction, or other Windows reparse point."""
     if path.is_symlink():
@@ -3420,6 +3487,7 @@ def scan_model_directory_or_file(
                         owner_block_reason = "directory_owner_snapshot_incomplete"
                         owner_block_details = {"unhashable_source_count": 1}
 
+                    owner_snapshot_before_dispatch = directory_owner_initial_snapshot
                     if owner_block_reason is None:
                         try:
                             owner_snapshot_before_dispatch = _capture_directory_owner_namespace(
@@ -3479,7 +3547,13 @@ def scan_model_directory_or_file(
                         owner_scan_started = False
                         owner_scan_returned = False
                         try:
-                            with _bound_directory_owner_scan_path(owner_root_path) as directory_owner_scan_path:
+                            with _directory_owner_scan_path(
+                                owner_root_path,
+                                owner_snapshot_before_dispatch,
+                                owner_hashes_before,
+                                config=owner_hash_config,
+                                deadline=start_time + timeout,
+                            ) as directory_owner_scan_path:
                                 owner_scan_started = True
                                 directory_owner_result = directory_owner_class(config=owner_config).scan(
                                     directory_owner_scan_path,

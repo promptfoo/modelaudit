@@ -1191,7 +1191,7 @@ def test_directory_scan_uses_descriptor_cwd_when_owner_fd_paths_are_unavailable(
     assert result.file_metadata[str(model_dir)]["directory_owner_scan"] is True
 
 
-def test_directory_scan_fails_closed_without_descriptor_owner_binding(
+def test_directory_scan_uses_staged_snapshot_without_descriptor_owner_binding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1209,27 +1209,35 @@ def test_directory_scan_fails_closed_without_descriptor_owner_binding(
         encoding="utf-8",
     )
     original_stat = Path.stat
+    owner_paths: list[Path] = []
+    original_scan = JaxCheckpointScanner.scan
 
     def hide_descriptor_aliases(candidate: Path, *args: Any, **kwargs: Any) -> os.stat_result:
         if str(candidate).startswith(("/proc/self/fd/", "/dev/fd/")):
             raise FileNotFoundError(str(candidate))
         return original_stat(candidate, *args, **kwargs)
 
+    def record_owner_scan(scanner: JaxCheckpointScanner, owner_path: str) -> ScanResult:
+        if Path(owner_path).is_dir():
+            owner_paths.append(Path(owner_path).resolve())
+        return original_scan(scanner, owner_path)
+
     monkeypatch.setattr(Path, "stat", hide_descriptor_aliases)
     monkeypatch.setattr(os, "fchdir", None, raising=False)
+    monkeypatch.setattr(JaxCheckpointScanner, "scan", record_owner_scan)
 
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
     owner_metadata = result.file_metadata[str(model_dir)]
 
     assert result.files_scanned == 2
     assert result.bytes_scanned == metadata_path.stat().st_size + state_path.stat().st_size
-    assert owner_metadata["directory_owner_scan"] is False
-    assert owner_metadata["directory_owner_bytes_scanned"] == 0
-    assert "directory_owner_scan_failed" in owner_metadata["scan_outcome_reasons"]
-    assert owner_metadata["operational_error"] is True
+    assert owner_paths and owner_paths[0] != model_dir.resolve()
+    assert owner_metadata["directory_owner_scan"] is True
+    assert owner_metadata["directory_owner_bytes_scanned"] == metadata_path.stat().st_size
+    assert owner_metadata.get("operational_error") is not True
     assert any(issue.rule_code == "S302" and issue.location == str(metadata_path) for issue in result.issues)
     assert any(issue.rule_code == "S902" and issue.location == str(state_path) for issue in result.issues)
-    assert determine_exit_code(result) == 2
+    assert determine_exit_code(result) == 1
 
 
 def test_directory_scan_keeps_child_walk_when_owner_snapshot_is_unavailable(
