@@ -488,6 +488,20 @@ class TensorFlowSavedModelScanner(BaseScanner):
             return (
                 relative_parts[-1].lower().endswith((".txt", ".md", ".json", ".yaml", ".yml", ".py", ".cfg", ".conf"))
             )
+        if root_name in _CORE_ROOT_MODEL_FILES:
+            return len(relative_parts) == 1 and root_name in {"saved_model.pb", "keras_metadata.pb"}
+        return root_name not in _CORE_ROOT_MODEL_DIRS
+
+    @classmethod
+    def directory_owner_source_counts_toward_limits(cls, relative_parts: tuple[str, ...]) -> bool:
+        """Charge only canonical SavedModel sources against owner scan budgets."""
+        if not relative_parts:
+            return False
+        root_name = relative_parts[0]
+        if root_name in _CORE_ROOT_ASSET_DIRS:
+            return len(relative_parts) > 1
+        if root_name == "variables":
+            return cls.directory_owner_source_in_scope(relative_parts)
         return len(relative_parts) == 1 and root_name in {"saved_model.pb", "keras_metadata.pb"}
 
     def __init__(self, config: dict[str, Any] | None = None):

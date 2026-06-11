@@ -18,6 +18,7 @@ from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils.file.detection import (
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
+    _probe_jax_json_checkpoint_file,
     has_jax_json_checkpoint_structure,
     is_confirmed_jax_json_checkpoint_file,
     is_jax_json_checkpoint_file,
@@ -981,14 +982,14 @@ class JaxCheckpointScanner(BaseScanner):
         if metadata_stat is not None:
             if not stat.S_ISREG(metadata_stat.st_mode):
                 return True
-            is_jax_metadata = is_jax_json_checkpoint_file(metadata_path)
+            metadata_probe = _probe_jax_json_checkpoint_file(metadata_path, unavailable_is_ambiguous=True)
             try:
                 final_metadata_stat = metadata_path.lstat()
             except OSError:
                 return True
             if not cls._regular_file_matches_snapshot(final_metadata_stat, metadata_stat):
                 return True
-            if is_jax_metadata:
+            if metadata_probe is not False:
                 return True
 
         # Keep routing bounded without treating entry count alone as a JAX

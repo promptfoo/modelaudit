@@ -2842,6 +2842,21 @@ def test_orbax_metadata_read_failure_is_inconclusive(
     )
 
 
+def test_unreadable_orbax_metadata_keeps_directory_owner_routing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_dir = tmp_path / "unreadable_orbax"
+    _write_orbax_metadata(checkpoint_dir, {"type": "orbax_checkpoint"})
+
+    def fail_read(_descriptor: int, _size: int) -> bytes:
+        raise OSError("simulated Orbax metadata routing read failure")
+
+    monkeypatch.setattr(detection_module.os, "read", fail_read)
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is True
+
+
 def test_orbax_object_numpy_checkpoint_is_inconclusive(tmp_path: Path) -> None:
     np = pytest.importorskip("numpy")
     checkpoint_dir = tmp_path / "orbax_object_numpy"

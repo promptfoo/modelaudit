@@ -490,17 +490,22 @@ def _write_orbax_metadata(directory: Path, *, restore_fn: str | None = None) -> 
     return metadata_path
 
 
+@pytest.mark.skipif(
+    not (hasattr(os, "fchdir") or Path("/proc/self/fd").is_dir() or Path("/dev/fd").is_dir()),
+    reason="descriptor-bound directory owner path is unavailable",
+)
 def test_directory_scan_dispatches_orbax_owner_and_preserves_malicious_finding(tmp_path: Path) -> None:
     model_dir = tmp_path / "orbax-model"
     metadata_path = _write_orbax_metadata(model_dir, restore_fn="os.system")
 
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+    owner_metadata = result.file_metadata[str(model_dir)]
 
     assert result.files_scanned == 1
     assert result.bytes_scanned == metadata_path.stat().st_size
     assert "jax_checkpoint" in result.scanner_names
-    assert result.file_metadata[str(model_dir)]["directory_owner_scan"] is True
-    assert result.file_metadata[str(model_dir)]["directory_owner_bytes_scanned"] == metadata_path.stat().st_size
+    assert owner_metadata["directory_owner_scan"] is True
+    assert owner_metadata["directory_owner_bytes_scanned"] == metadata_path.stat().st_size
     assert any(
         issue.rule_code == "S302" and issue.severity == IssueSeverity.CRITICAL and issue.location == str(metadata_path)
         for issue in result.issues
@@ -662,6 +667,45 @@ def test_large_savedmodel_root_sibling_does_not_block_owner_dispatch(tmp_path: P
         issue.severity == IssueSeverity.CRITICAL and "PyFunc operation detected" in issue.message
         for issue in result.issues
     )
+
+
+def test_savedmodel_supplemental_sources_are_rechecked_after_owner_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_tf_protos()
+    from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
+
+    model_dir = tmp_path / "saved-model"
+    model_dir.mkdir()
+    (model_dir / "saved_model.pb").write_bytes(_build_malicious_tf_savedmodel())
+    supplemental_path = model_dir / "supplemental" / "payload.dat"
+    supplemental_path.parent.mkdir()
+    supplemental_path.write_bytes(_build_malicious_pickle(protocol=1))
+    original_scan = TensorFlowSavedModelScanner.scan
+    supplemental_rewritten = False
+
+    def rewrite_supplemental_after_owner_scan(
+        scanner: TensorFlowSavedModelScanner,
+        owner_path: str,
+    ) -> ScanResult:
+        nonlocal supplemental_rewritten
+        owner_result = original_scan(scanner, owner_path)
+        supplemental_path.write_bytes(b"benign supplemental payload")
+        supplemental_rewritten = True
+        return owner_result
+
+    monkeypatch.setattr(TensorFlowSavedModelScanner, "scan", rewrite_supplemental_after_owner_scan)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    owner_metadata = result.file_metadata[str(model_dir)]
+    assert supplemental_rewritten is True
+    assert owner_metadata["directory_owner_scan"] is True
+    assert "directory_owner_source_changed" in owner_metadata["scan_outcome_reasons"]
+    assert owner_metadata["operational_error"] is True
+    assert result.content_hash is None
+    assert determine_exit_code(result) == 2
 
 
 def test_savedmodel_owner_snapshot_does_not_rehash_opaque_variable_shards(
@@ -1068,6 +1112,66 @@ def test_directory_scan_fails_closed_when_owner_root_is_swapped_and_restored(
     assert "directory_owner_source_changed" in owner_metadata["scan_outcome_reasons"]
     assert owner_metadata["operational_error"] is True
     assert result.content_hash is None
+    assert determine_exit_code(result) == 2
+
+
+@pytest.mark.skipif(not hasattr(os, "fchdir"), reason="descriptor cwd fallback is unavailable")
+def test_directory_scan_uses_descriptor_cwd_when_owner_fd_paths_are_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "orbax-model"
+    _write_orbax_metadata(model_dir)
+    original_stat = Path.stat
+    owner_paths: list[tuple[str, Path]] = []
+
+    def hide_descriptor_aliases(candidate: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+        if str(candidate).startswith(("/proc/self/fd/", "/dev/fd/")):
+            raise FileNotFoundError(str(candidate))
+        return original_stat(candidate, *args, **kwargs)
+
+    def record_owner_scan(_scanner: JaxCheckpointScanner, owner_path: str) -> ScanResult:
+        if Path(owner_path).is_dir():
+            owner_paths.append((owner_path, Path(owner_path).resolve()))
+        owner_result = ScanResult(scanner_name=JaxCheckpointScanner.name)
+        owner_result.finish()
+        return owner_result
+
+    monkeypatch.setattr(Path, "stat", hide_descriptor_aliases)
+    monkeypatch.setattr(JaxCheckpointScanner, "scan", record_owner_scan)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    assert owner_paths == [(os.curdir, model_dir.resolve())]
+    assert result.file_metadata[str(model_dir)]["directory_owner_scan"] is True
+
+
+def test_directory_scan_fails_closed_without_descriptor_owner_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "orbax-model"
+    metadata_path = _write_orbax_metadata(model_dir, restore_fn="os.system")
+    original_stat = Path.stat
+
+    def hide_descriptor_aliases(candidate: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+        if str(candidate).startswith(("/proc/self/fd/", "/dev/fd/")):
+            raise FileNotFoundError(str(candidate))
+        return original_stat(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", hide_descriptor_aliases)
+    monkeypatch.setattr(os, "fchdir", None, raising=False)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+    owner_metadata = result.file_metadata[str(model_dir)]
+
+    assert result.files_scanned == 1
+    assert result.bytes_scanned == metadata_path.stat().st_size
+    assert owner_metadata["directory_owner_scan"] is False
+    assert owner_metadata["directory_owner_bytes_scanned"] == 0
+    assert "directory_owner_scan_failed" in owner_metadata["scan_outcome_reasons"]
+    assert owner_metadata["operational_error"] is True
+    assert any(issue.rule_code == "S302" and issue.location == str(metadata_path) for issue in result.issues)
     assert determine_exit_code(result) == 2
 
 

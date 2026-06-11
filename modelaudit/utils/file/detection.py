@@ -5106,11 +5106,11 @@ def _read_jax_json_checkpoint_prefix(file_path: Path) -> tuple[int, bytes] | Lit
     return expected_stat.st_size, b"".join(chunks)
 
 
-def _probe_jax_json_checkpoint_file(file_path: Path) -> bool | None:
+def _probe_jax_json_checkpoint_file(file_path: Path, *, unavailable_is_ambiguous: bool = False) -> bool | None:
     """Return True for JAX JSON, None for bounded ambiguity or retargets, else False."""
     snapshot = _read_jax_json_checkpoint_prefix(file_path)
     if snapshot == _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE:
-        return False
+        return None if unavailable_is_ambiguous else False
     if snapshot is None:
         return None
     file_size, prefix = snapshot
