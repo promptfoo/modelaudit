@@ -26,6 +26,8 @@ from modelaudit.utils.file.detection import (
 )
 from modelaudit.utils.sources._huggingface_download_worker import _run_operation as _run_huggingface_worker_operation
 from modelaudit.utils.sources.huggingface import (
+    _build_huggingface_model_info,
+    _extract_huggingface_repo_files,
     _get_huggingface_path_sizes,
     _HuggingFaceProbeBudget,
     _list_huggingface_repo_files_at_revision,
@@ -3956,45 +3958,593 @@ class TestGetModelInfo:
     """Test retrieving model metadata from HuggingFace."""
 
     @patch("huggingface_hub.HfApi")
-    def test_get_model_info_with_author(self, mock_hf_api_class):
+    def test_get_model_info_with_author(self, mock_hf_api_class: MagicMock) -> None:
         """Ensure author is returned when available."""
         mock_api = MagicMock()
         mock_hf_api_class.return_value = mock_api
 
-        model_info = SimpleNamespace(
+        mock_api.repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
             modelId="test/model",
             author="test-author",
+            siblings=[
+                SimpleNamespace(rfilename=".gitattributes", size=10),
+                SimpleNamespace(rfilename="config.json", size=100),
+                SimpleNamespace(rfilename="README.md", size=50),
+            ],
         )
-        mock_api.model_info.return_value = model_info
-
-        # Mock list_repo_tree which is used to get accurate file sizes
-        # (implementation skips .gitattributes and README.md)
-        mock_api.list_repo_tree.return_value = [
+        mock_api.get_paths_info.return_value = [
             SimpleNamespace(path="config.json", size=100),
-            SimpleNamespace(path="README.md", size=50),  # This will be skipped
+            SimpleNamespace(path="README.md", size=50),
         ]
 
         info = get_model_info("https://huggingface.co/test/model")
 
         assert info["author"] == "test-author"
-        assert info["total_size"] == 100
-        assert info["file_count"] == 1
+        assert info["total_size"] == 150
+        assert info["file_count"] == 2
+        assert info["files"] == [
+            {"name": "config.json", "size": 100, "access": "available"},
+            {"name": "README.md", "size": 50, "access": "available"},
+        ]
+        mock_api.repo_info.assert_called_once_with("test/model", files_metadata=True)
+        mock_api.get_paths_info.assert_called_once_with(
+            "test/model",
+            ["config.json", "README.md"],
+            revision=_HF_TEST_REVISION,
+        )
 
     @patch("huggingface_hub.HfApi")
-    def test_get_model_info_without_author(self, mock_hf_api_class):
+    def test_get_model_info_passes_requested_revision_to_repo_info(self, mock_hf_api_class: MagicMock) -> None:
+        """Preview inventory should honor requested revisions before pinning to the returned commit SHA."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+
+        mock_api.repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            modelId="test/model",
+            author="test-author",
+            siblings=[SimpleNamespace(rfilename="config.json", size=100)],
+        )
+        mock_api.get_paths_info.return_value = [SimpleNamespace(path="config.json", size=100)]
+
+        info = get_model_info("https://huggingface.co/test/model?revision=refs%2Fpr%2F1")
+
+        assert info["revision"] == _HF_TEST_REVISION
+        assert info["total_size"] == 100
+        mock_api.repo_info.assert_called_once_with("test/model", files_metadata=True, revision="refs/pr/1")
+        mock_api.get_paths_info.assert_called_once_with(
+            "test/model",
+            ["config.json"],
+            revision=_HF_TEST_REVISION,
+        )
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_info_without_author(self, mock_hf_api_class: MagicMock) -> None:
         """Default to empty string when author is missing."""
         mock_api = MagicMock()
         mock_hf_api_class.return_value = mock_api
 
-        model_info = SimpleNamespace(
-            siblings=[],
+        mock_api.repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            siblings=[SimpleNamespace(rfilename="config.json", size=42)],
             modelId="test/model",
         )
-        mock_api.model_info.return_value = model_info
+        mock_api.get_paths_info.return_value = [SimpleNamespace(path="config.json", size=42)]
 
         info = get_model_info("https://huggingface.co/test/model")
 
         assert info["author"] == ""
+        assert info["total_size"] == 42
+        assert info["file_count"] == 1
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_info_counts_recursive_selected_lfs_bytes(self, mock_hf_api_class: MagicMock) -> None:
+        """Preview inventory should use the same recursive selected files as downloads."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            modelId="test/model",
+            author="tester",
+            siblings=[
+                SimpleNamespace(rfilename=".gitattributes", size=64),
+                SimpleNamespace(rfilename="README.md", size=12),
+                SimpleNamespace(rfilename="nested/config.json", size=20),
+                SimpleNamespace(rfilename="nested/model.safetensors", size=10_000),
+                SimpleNamespace(rfilename="preview.png", size=500),
+            ],
+        )
+        mock_api.get_paths_info.return_value = [
+            SimpleNamespace(path="README.md", size=12),
+            SimpleNamespace(path="nested/config.json", size=20),
+            SimpleNamespace(path="nested/model.safetensors", size=10_000),
+        ]
+
+        with patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None):
+            info = get_model_info("hf://test/model")
+
+        assert info["file_count"] == 3
+        assert info["repo_file_count"] == 5
+        assert info["total_size"] == 10_032
+        assert info["accessible_size"] == 10_032
+        assert info["inventory_status"] == "complete"
+        assert [file_info["name"] for file_info in info["files"]] == [
+            "README.md",
+            "nested/config.json",
+            "nested/model.safetensors",
+        ]
+
+    def test_get_model_info_preview_matches_download_recursive_selection(self, tmp_path: Path) -> None:
+        """Preview metadata and snapshot download should select the same recursive files."""
+        repo_files = [
+            ".gitattributes",
+            "README.md",
+            "nested/config.json",
+            "nested/model.safetensors",
+            "assets/preview.png",
+            "renamed.jpg",
+        ]
+        expected_files = [
+            "README.md",
+            "nested/config.json",
+            "nested/model.safetensors",
+            "renamed.jpg",
+        ]
+        mock_api = MagicMock()
+        mock_api.repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            modelId="test/model",
+            siblings=[
+                SimpleNamespace(rfilename=".gitattributes", size=64),
+                SimpleNamespace(rfilename="README.md", size=12),
+                SimpleNamespace(rfilename="nested/config.json", size=20),
+                SimpleNamespace(rfilename="nested/model.safetensors", size=10_000),
+                SimpleNamespace(rfilename="assets/preview.png", size=500),
+                SimpleNamespace(rfilename="renamed.jpg", size=2000),
+            ],
+        )
+        mock_api.get_paths_info.return_value = [
+            SimpleNamespace(path="README.md", size=12),
+            SimpleNamespace(path="nested/config.json", size=20),
+            SimpleNamespace(path="nested/model.safetensors", size=10_000),
+            SimpleNamespace(path="renamed.jpg", size=2000),
+        ]
+
+        def detect_side_effect(_repo_id: str, filename: str, _revision: str, _budget: object) -> str | None:
+            return "pytorch" if filename == "renamed.jpg" else None
+
+        download_root = tmp_path / "downloaded"
+
+        def snapshot_side_effect(**kwargs: object) -> str:
+            allow_patterns = cast(list[str], kwargs["allow_patterns"])
+            for filename in allow_patterns:
+                path = download_root / filename
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"x")
+            return str(download_root)
+
+        with (
+            patch("huggingface_hub.HfApi", return_value=mock_api),
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            patch("modelaudit.utils.sources.huggingface._get_model_size_with_deadline", return_value=None),
+            patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format") as mock_detect,
+            patch("huggingface_hub.snapshot_download", side_effect=snapshot_side_effect) as mock_snapshot_download,
+        ):
+            mock_detect.side_effect = detect_side_effect
+            info = get_model_info("hf://test/model")
+            downloaded_path = download_model("hf://test/model", cache_dir=tmp_path / "cache")
+
+        assert [file_info["name"] for file_info in info["files"]] == expected_files
+        assert info["total_size"] == 12_032
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == expected_files
+        assert sorted(
+            path.relative_to(downloaded_path).as_posix() for path in downloaded_path.rglob("*") if path.is_file()
+        ) == sorted(expected_files)
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_info_streaming_selection_uses_streamable_policy(
+        self,
+        mock_hf_api_class: MagicMock,
+    ) -> None:
+        """Streaming preview inventory should match streaming prefilter semantics."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            modelId="test/model",
+            siblings=[
+                SimpleNamespace(rfilename=".gitattributes", size=64),
+                SimpleNamespace(rfilename="README.md", size=100),
+                SimpleNamespace(rfilename="model_card", size=50),
+                SimpleNamespace(rfilename="model.safetensors", size=10_000),
+                SimpleNamespace(rfilename="src/helper.py", size=400),
+            ],
+        )
+        mock_api.get_paths_info.return_value = [
+            SimpleNamespace(path="README.md", size=100),
+            SimpleNamespace(path="model_card", size=50),
+        ]
+
+        with patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None):
+            info = get_model_info(
+                "hf://test/model",
+                streaming_selection=True,
+                scannable_extensions={".md"},
+                scannable_filenames={"model_card"},
+                scannable_scanner_ids={"metadata"},
+                include_all_files=False,
+            )
+
+        assert info["file_count"] == 2
+        assert info["total_size"] == 150
+        assert [file_info["name"] for file_info in info["files"]] == ["README.md", "model_card"]
+        mock_api.get_paths_info.assert_called_once_with(
+            "test/model",
+            ["README.md", "model_card"],
+            revision=_HF_TEST_REVISION,
+        )
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_info_timeout_deadline_reaches_probes_and_path_sizes(
+        self,
+        mock_hf_api_class: MagicMock,
+    ) -> None:
+        """Preview timeout should bound content probes and path-size metadata."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            modelId="test/model",
+            siblings=[
+                SimpleNamespace(rfilename="model.safetensors", size=1000),
+                SimpleNamespace(rfilename="renamed.payload", size=2000),
+            ],
+        )
+        probe_deadlines: list[float | None] = []
+        path_size_deadlines: list[float | None] = []
+
+        def detect_side_effect(
+            _repo_id: str,
+            _filename: str,
+            _revision: str,
+            budget: _HuggingFaceProbeBudget,
+        ) -> str | None:
+            probe_deadlines.append(budget.deadline)
+            return "pytorch"
+
+        def path_sizes_side_effect(
+            _repo_id: str,
+            _filenames: list[str],
+            **kwargs: object,
+        ) -> tuple[dict[str, int | None], str]:
+            deadline = kwargs.get("deadline")
+            path_size_deadlines.append(deadline if isinstance(deadline, float) else None)
+            return {"model.safetensors": 1000, "renamed.payload": 2000}, _HF_TEST_REVISION
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
+                side_effect=detect_side_effect,
+            ),
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                side_effect=path_sizes_side_effect,
+            ),
+        ):
+            info = get_model_info("hf://test/model", timeout_seconds=12)
+
+        assert info["total_size"] == 3000
+        repo_info_timeout = mock_api.repo_info.call_args.kwargs["timeout"]
+        assert 0 < repo_info_timeout <= 12
+        assert probe_deadlines and all(deadline is not None for deadline in probe_deadlines)
+        assert path_size_deadlines and all(deadline is not None for deadline in path_size_deadlines)
+        assert path_size_deadlines[0] == probe_deadlines[0]
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_info_still_counts_renamed_detected_payload(
+        self,
+        mock_hf_api_class: MagicMock,
+    ) -> None:
+        """Bookkeeping skips must not suppress content-detected payload inventory."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            modelId="test/model",
+            siblings=[
+                SimpleNamespace(rfilename=".gitattributes", size=64),
+                SimpleNamespace(rfilename="model.safetensors", size=1000),
+                SimpleNamespace(rfilename="preview.jpg", size=2000),
+            ],
+        )
+        mock_api.get_paths_info.return_value = [
+            SimpleNamespace(path="model.safetensors", size=1000),
+            SimpleNamespace(path="preview.jpg", size=2000),
+        ]
+
+        with patch(
+            "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
+            return_value="pytorch",
+        ) as mock_detect_content:
+            info = get_model_info("hf://test/model")
+
+        assert info["file_count"] == 2
+        assert info["total_size"] == 3000
+        assert [file_info["name"] for file_info in info["files"]] == ["model.safetensors", "preview.jpg"]
+        mock_detect_content.assert_called_once_with("test/model", "preview.jpg", _HF_TEST_REVISION, ANY)
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_info_marks_gated_content_probe_only_inventory_incomplete(
+        self,
+        mock_hf_api_class: MagicMock,
+    ) -> None:
+        """Gated content-probe candidates must not disappear into complete empty inventory."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            modelId="test/model",
+            gated="auto",
+            siblings=[
+                SimpleNamespace(rfilename=".gitattributes", size=64),
+                SimpleNamespace(rfilename="hidden.payload", size=None, lfs=SimpleNamespace(size=4096)),
+            ],
+        )
+        mock_api.get_paths_info.side_effect = RuntimeError("403 Forbidden: gated repository")
+
+        with patch(
+            "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
+            side_effect=PermissionError("401 Unauthorized: gated file https://huggingface.co/test/model?token=secret"),
+        ) as mock_detect_content:
+            info = get_model_info("https://huggingface.co/test/model")
+
+        assert info["revision"] == _HF_TEST_REVISION
+        assert info["inventory_status"] == "gated_inaccessible"
+        assert info["total_size"] == 4096
+        assert info["accessible_size"] == 0
+        assert info["inaccessible_gated_bytes"] == 4096
+        assert info["inaccessible_gated_file_count"] == 1
+        assert info["inaccessible_gated_files"] == ["hidden.payload"]
+        assert info["unknown_size_count"] == 0
+        assert info["file_count"] == 1
+        assert info["files"] == [{"name": "hidden.payload", "size": 4096, "access": "gated"}]
+        assert "secret" not in str(info["inventory_error"])
+        mock_api.get_paths_info.assert_called_once_with(
+            "test/model",
+            ["hidden.payload"],
+            revision=_HF_TEST_REVISION,
+        )
+        mock_detect_content.assert_called_once_with("test/model", "hidden.payload", _HF_TEST_REVISION, ANY)
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_info_counts_unknown_size_for_gated_selected_file(
+        self,
+        mock_hf_api_class: MagicMock,
+    ) -> None:
+        """Gated selected files with no disclosed size should be gated and unknown-size."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            modelId="test/model",
+            gated="auto",
+            siblings=[SimpleNamespace(rfilename="model.safetensors", size=None, lfs=None)],
+        )
+        mock_api.get_paths_info.side_effect = RuntimeError("403 Forbidden: gated repository")
+
+        info = get_model_info("https://huggingface.co/test/model")
+
+        assert info["inventory_status"] == "gated_inaccessible"
+        assert info["total_size"] == 0
+        assert info["accessible_size"] == 0
+        assert info["inaccessible_gated_bytes"] == 0
+        assert info["inaccessible_gated_file_count"] == 1
+        assert info["inaccessible_gated_files"] == ["model.safetensors"]
+        assert info["unknown_size_count"] == 1
+        assert info["unknown_size_files"] == ["model.safetensors"]
+        assert info["files"] == [{"name": "model.safetensors", "size": None, "access": "gated"}]
+
+    @pytest.mark.parametrize("selected_sizes", [{}, {"model.safetensors": None}])
+    def test_get_model_info_counts_missing_path_size_metadata_for_gated_selected_file(
+        self,
+        selected_sizes: dict[str, int | None],
+    ) -> None:
+        """Gated selected files with absent path-size metadata should use disclosed LFS size."""
+        mock_api = MagicMock()
+        mock_api.repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            modelId="test/model",
+            gated="auto",
+            siblings=[SimpleNamespace(rfilename="model.safetensors", size=None, lfs=SimpleNamespace(size=4096))],
+        )
+
+        with (
+            patch("huggingface_hub.HfApi", return_value=mock_api),
+            patch(
+                "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                return_value=(selected_sizes, _HF_TEST_REVISION),
+            ),
+        ):
+            info = get_model_info("https://huggingface.co/test/model")
+
+        assert info["inventory_status"] == "gated_inaccessible"
+        assert info["total_size"] == 4096
+        assert info["accessible_size"] == 0
+        assert info["inaccessible_gated_bytes"] == 4096
+        assert info["inaccessible_gated_file_count"] == 1
+        assert info["inaccessible_gated_files"] == ["model.safetensors"]
+        assert info["unknown_size_count"] == 0
+        assert info["files"] == [{"name": "model.safetensors", "size": 4096, "access": "gated"}]
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_info_counts_unknown_size_for_gated_probe_candidate(
+        self,
+        mock_hf_api_class: MagicMock,
+    ) -> None:
+        """Gated probe candidates without size metadata should not preview as known zero bytes."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            modelId="test/model",
+            gated="auto",
+            siblings=[SimpleNamespace(rfilename="hidden.payload", size=None, lfs=None)],
+        )
+        mock_api.get_paths_info.return_value = [SimpleNamespace(path="hidden.payload", size=None)]
+
+        with patch(
+            "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
+            side_effect=PermissionError("401 Unauthorized: gated file https://huggingface.co/test/model?token=secret"),
+        ) as mock_detect_content:
+            info = get_model_info("https://huggingface.co/test/model")
+
+        assert info["inventory_status"] == "gated_inaccessible"
+        assert info["total_size"] == 0
+        assert info["accessible_size"] == 0
+        assert info["inaccessible_gated_bytes"] == 0
+        assert info["inaccessible_gated_file_count"] == 1
+        assert info["inaccessible_gated_files"] == ["hidden.payload"]
+        assert info["unknown_size_count"] == 1
+        assert info["unknown_size_files"] == ["hidden.payload"]
+        assert info["files"] == [{"name": "hidden.payload", "size": None, "access": "gated"}]
+        mock_detect_content.assert_called_once_with("test/model", "hidden.payload", _HF_TEST_REVISION, ANY)
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_info_marks_mixed_gated_content_probe_inventory_incomplete(
+        self,
+        mock_hf_api_class: MagicMock,
+    ) -> None:
+        """Mixed gated probe candidates must remain visible beside selected files."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            modelId="test/model",
+            gated="auto",
+            siblings=[
+                SimpleNamespace(rfilename=".gitattributes", size=64),
+                SimpleNamespace(rfilename="model.safetensors", size=1000),
+                SimpleNamespace(rfilename="hidden.payload", size=None, lfs=SimpleNamespace(size=4096)),
+            ],
+        )
+        mock_api.get_paths_info.return_value = [SimpleNamespace(path="model.safetensors", size=1000)]
+
+        with (
+            patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".safetensors"}),
+            patch(
+                "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
+                side_effect=PermissionError("403 Forbidden: gated file https://huggingface.co/test/model?token=secret"),
+            ) as mock_detect_content,
+        ):
+            info = get_model_info("https://huggingface.co/test/model")
+
+        assert info["inventory_status"] == "gated_inaccessible"
+        assert info["total_size"] == 5096
+        assert info["accessible_size"] == 1000
+        assert info["inaccessible_gated_bytes"] == 4096
+        assert info["inaccessible_gated_file_count"] == 1
+        assert info["inaccessible_gated_files"] == ["hidden.payload"]
+        assert info["unknown_size_count"] == 0
+        assert info["file_count"] == 2
+        assert info["files"] == [
+            {"name": "model.safetensors", "size": 1000, "access": "available"},
+            {"name": "hidden.payload", "size": 4096, "access": "gated"},
+        ]
+        mock_api.get_paths_info.assert_called_once_with(
+            "test/model",
+            ["model.safetensors", "hidden.payload"],
+            revision=_HF_TEST_REVISION,
+        )
+        mock_detect_content.assert_called_once_with("test/model", "hidden.payload", _HF_TEST_REVISION, ANY)
+
+    @patch("huggingface_hub.HfApi")
+    def test_get_model_info_distinguishes_gated_inaccessible_bytes(
+        self,
+        mock_hf_api_class: MagicMock,
+    ) -> None:
+        """Gated selected sizes should be explicit instead of reported as zero."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            modelId="test/model",
+            gated="auto",
+            siblings=[
+                SimpleNamespace(rfilename="config.json", size=20),
+                SimpleNamespace(rfilename="model.safetensors", size=None, lfs=SimpleNamespace(size=4096)),
+                SimpleNamespace(rfilename="assets/preview.png", size=500),
+            ],
+        )
+        mock_api.get_paths_info.side_effect = RuntimeError(
+            "401 Unauthorized: Cannot access gated repo https://huggingface.co/test/model?token=secret"
+        )
+
+        with patch(
+            "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
+            side_effect=ValueError("Hugging Face selective filtering incomplete: unable to inspect skipped file (401)"),
+        ) as mock_detect_content:
+            info = get_model_info("https://huggingface.co/test/model")
+
+        assert info["inventory_status"] == "gated_inaccessible"
+        assert info["total_size"] == 4616
+        assert info["accessible_size"] == 0
+        assert info["inaccessible_gated_bytes"] == 4616
+        assert info["inaccessible_gated_file_count"] == 3
+        assert info["inaccessible_gated_files"] == ["config.json", "model.safetensors", "assets/preview.png"]
+        assert info["unknown_size_count"] == 0
+        assert info["files"] == [
+            {"name": "config.json", "size": 20, "access": "gated"},
+            {"name": "model.safetensors", "size": 4096, "access": "gated"},
+            {"name": "assets/preview.png", "size": 500, "access": "gated"},
+        ]
+        assert "secret" not in str(info["inventory_error"])
+        mock_detect_content.assert_called_once_with("test/model", "assets/preview.png", _HF_TEST_REVISION, ANY)
+
+    @pytest.mark.integration
+    @pytest.mark.skipif(
+        os.environ.get("MODELAUDIT_RUN_HF_REAL_REPRO") != "1",
+        reason="set MODELAUDIT_RUN_HF_REAL_REPRO=1 to run pinned Hugging Face reproduction",
+    )
+    def test_real_hf_rank18_pinned_inventory_and_bounded_scan(self, tmp_path: Path) -> None:
+        """Pinned rank 18 reproduction without downloading model weights."""
+        from huggingface_hub import HfApi, hf_hub_download
+
+        from modelaudit.core import scan_model_directory_or_file
+
+        repo_id = "hexgrad/Kokoro-82M"
+        revision = "f3ff3571791e39611d31c381e3a41a3af07b4987"
+        api = HfApi()
+        repo_info = api.repo_info(repo_id, revision=revision, files_metadata=True)
+        repo_files = _extract_huggingface_repo_files(repo_info)
+        assert getattr(repo_info, "sha", None) == revision
+        assert repo_files is not None
+
+        info = _build_huggingface_model_info(repo_id, repo_info, repo_files, revision)
+
+        assert info["inventory_status"] == "complete"
+        assert info["file_count"] == 63
+        assert info["total_size"] == 358_025_999
+        config_info = next(file_info for file_info in info["files"] if file_info["name"] == "config.json")
+        assert config_info["size"] <= 10 * 1024 * 1024
+
+        downloaded_config = Path(
+            hf_hub_download(
+                repo_id=repo_id,
+                filename="config.json",
+                revision=revision,
+                local_dir=tmp_path / "hf-real-repro",
+            )
+        )
+        assert downloaded_config.stat().st_size == config_info["size"]
+
+        result = scan_model_directory_or_file(str(downloaded_config), cache_enabled=False)
+
+        assert result.files_scanned == 1
+        assert result.bytes_scanned == downloaded_config.stat().st_size
 
 
 class TestHuggingFaceFileURLs:

@@ -3469,6 +3469,112 @@ def test_scan_huggingface_metadata_preview_escapes_model_id(tmp_path: Path) -> N
     assert "org/model\nFORGED\u202e" not in result.output
 
 
+def test_scan_huggingface_preview_matches_final_recursive_inventory(tmp_path: Path) -> None:
+    downloaded_dir = tmp_path / "downloaded"
+    nested_dir = downloaded_dir / "nested"
+    nested_dir.mkdir(parents=True)
+    config_payload = b'{"model_type":"bert"}'
+    (nested_dir / "config.json").write_bytes(config_payload + (b" " * (512 - len(config_payload))))
+    (nested_dir / "README.md").write_bytes(b"A" * 1024)
+
+    with (
+        patch("modelaudit.cli.is_huggingface_url", return_value=True),
+        patch(
+            "modelaudit.utils.sources.huggingface.get_model_info",
+            return_value={
+                "model_id": "org/model",
+                "total_size": 1536,
+                "file_count": 2,
+                "inventory_status": "complete",
+                "inaccessible_gated_bytes": 0,
+                "unknown_size_count": 0,
+            },
+        ),
+        patch("modelaudit.cli.download_model", return_value=downloaded_dir),
+        patch("shutil.rmtree"),
+    ):
+        result = CliRunner().invoke(cli, ["scan", "--no-cache", "--format", "text", "hf://org/model"])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, output
+    assert "Size: 1.50 KB (2 files)" in output
+    assert "Files: 2" in output
+    assert output.count("Size: 1.50 KB") >= 2
+
+
+def test_scan_huggingface_preview_reports_gated_and_unknown_access(tmp_path: Path) -> None:
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "config.json").write_text("{}")
+
+    with (
+        patch("modelaudit.cli.is_huggingface_url", return_value=True),
+        patch(
+            "modelaudit.utils.sources.huggingface.get_model_info",
+            return_value={
+                "model_id": "org/gated-model",
+                "total_size": 4096,
+                "file_count": 3,
+                "inventory_status": "partial_unknown_size",
+                "inaccessible_gated_bytes": 2048,
+                "inaccessible_gated_file_count": 1,
+                "unknown_size_count": 1,
+            },
+        ),
+        patch("modelaudit.cli.download_model", return_value=downloaded_dir),
+        patch(
+            "modelaudit.cli.scan_model_directory_or_file",
+            return_value=create_mock_scan_result(files_scanned=1, issues=[]),
+        ),
+        patch("shutil.rmtree"),
+    ):
+        result = CliRunner().invoke(cli, ["scan", "--no-cache", "--format", "text", "hf://org/gated-model"])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, output
+    assert "Size: At least 4.00 KB (3 files)" in output
+    assert "Access: 1 selected file(s) are gated/inaccessible" in output
+    assert "Access: 1 selected file size(s) unavailable" in output
+
+
+def test_scan_huggingface_preview_reports_unknown_size_gated_access(tmp_path: Path) -> None:
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "config.json").write_text("{}")
+
+    with (
+        patch("modelaudit.cli.is_huggingface_url", return_value=True),
+        patch(
+            "modelaudit.utils.sources.huggingface.get_model_info",
+            return_value={
+                "model_id": "org/unknown-size-gated-model",
+                "total_size": 0,
+                "file_count": 1,
+                "inventory_status": "gated_inaccessible",
+                "inaccessible_gated_bytes": 0,
+                "inaccessible_gated_file_count": 1,
+                "unknown_size_count": 1,
+            },
+        ),
+        patch("modelaudit.cli.download_model", return_value=downloaded_dir),
+        patch(
+            "modelaudit.cli.scan_model_directory_or_file",
+            return_value=create_mock_scan_result(files_scanned=1, issues=[]),
+        ),
+        patch("shutil.rmtree"),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--no-cache", "--format", "text", "hf://org/unknown-size-gated-model"],
+        )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, output
+    assert "Size: Unknown size (1 files)" in output
+    assert "Access: 1 selected file(s) are gated/inaccessible" in output
+    assert "Access: 1 selected file size(s) unavailable" in output
+
+
 def test_scan_huggingface_metadata_preflight_verbose_log_is_sanitized(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -4610,6 +4716,84 @@ def test_scan_huggingface_streaming_preserves_selected_extensionless_filenames(
     assert result.exit_code == 0
     assert "" not in mock_download_streaming.call_args.kwargs["scannable_extensions"]
     assert mock_download_streaming.call_args.kwargs["scannable_filenames"] == frozenset({"readme", "model_card"})
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.get_model_info")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_preview_uses_selected_stream_policy(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_get_model_info: MagicMock,
+    mock_is_hf_url: MagicMock,
+) -> None:
+    """Streaming preview should use the same selected scanner policy as acquisition."""
+    mock_is_hf_url.return_value = True
+    mock_download_streaming.return_value = iter(())
+    mock_scan_streaming.return_value = create_mock_scan_result(bytes_scanned=2048, files_scanned=1, issues=[])
+    mock_get_model_info.return_value = {
+        "model_id": "test/model",
+        "total_size": 2048,
+        "file_count": 1,
+        "inventory_status": "complete",
+        "inaccessible_gated_bytes": 0,
+        "unknown_size_count": 0,
+    }
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--stream", "--timeout", "7", "--scanners", "metadata", "--format", "text", "hf://test/model"],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, output
+    assert "Size: 2.00 KB (1 files)" in output
+    preview_kwargs = mock_get_model_info.call_args.kwargs
+    stream_kwargs = mock_download_streaming.call_args.kwargs
+    assert preview_kwargs["timeout_seconds"] == 7
+    assert preview_kwargs["streaming_selection"] is True
+    assert preview_kwargs["include_all_files"] is False
+    assert preview_kwargs["scannable_extensions"] == stream_kwargs["scannable_extensions"]
+    assert preview_kwargs["scannable_filenames"] == stream_kwargs["scannable_filenames"]
+    assert preview_kwargs["scannable_scanner_ids"] == stream_kwargs["scannable_scanner_ids"]
+    assert preview_kwargs["scannable_filenames"] == frozenset({"readme", "model_card"})
+    assert "metadata" in preview_kwargs["scannable_scanner_ids"]
+    assert stream_kwargs["timeout_seconds"] == 7
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.get_model_info")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_preview_preserves_include_all_files_policy(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_get_model_info: MagicMock,
+    mock_is_hf_url: MagicMock,
+) -> None:
+    """Default streaming preview should include the bounded unfiltered inventory."""
+    mock_is_hf_url.return_value = True
+    mock_download_streaming.return_value = iter(())
+    mock_scan_streaming.return_value = create_mock_scan_result(bytes_scanned=4096, files_scanned=2, issues=[])
+    mock_get_model_info.return_value = {
+        "model_id": "test/model",
+        "total_size": 4096,
+        "file_count": 2,
+        "inventory_status": "complete",
+        "inaccessible_gated_bytes": 0,
+        "unknown_size_count": 0,
+    }
+
+    result = CliRunner().invoke(cli, ["scan", "--stream", "--format", "text", "hf://test/model"])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, output
+    preview_kwargs = mock_get_model_info.call_args.kwargs
+    assert preview_kwargs["streaming_selection"] is True
+    assert preview_kwargs["include_all_files"] is True
+    assert "scannable_extensions" not in preview_kwargs
+    assert mock_download_streaming.call_args.kwargs["include_all_files"] is True
 
 
 @patch("modelaudit.cli.is_huggingface_url")

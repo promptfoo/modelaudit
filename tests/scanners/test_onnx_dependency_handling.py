@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from modelaudit.scanners import get_scanner_for_file
-from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, IssueSeverity
+from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, CheckStatus, IssueSeverity
 from modelaudit.scanners.onnx_scanner import OnnxScanner
 from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
 
@@ -21,8 +21,8 @@ def test_onnx_file_routes_to_onnx_scanner_by_extension(tmp_path: Path) -> None:
     assert scanner.name == "onnx"
 
 
-def test_onnx_scanner_reports_missing_dependency_as_warning(tmp_path: Path) -> None:
-    """When ONNX runtime dependencies are missing, scan must not report clean."""
+def test_onnx_scanner_missing_dependency_is_operational_capability_outcome(tmp_path: Path) -> None:
+    """When ONNX dependencies are missing, report incomplete capability without a security finding."""
     model_path = tmp_path / "model.onnx"
     model_path.write_bytes(b"not-a-real-onnx-model")
 
@@ -36,11 +36,18 @@ def test_onnx_scanner_reports_missing_dependency_as_warning(tmp_path: Path) -> N
     ):
         result = scanner.scan(str(model_path))
 
-    assert not result.success
-    assert any(
-        issue.severity == IssueSeverity.WARNING and "onnx package not installed" in issue.message.lower()
-        for issue in result.issues
-    )
+    assert result.success is False
+    assert result.bytes_scanned == model_path.stat().st_size
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "onnx_dependency_unavailable"
+    assert result.metadata["missing_dependency"] == "onnx"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    check = next(check for check in result.checks if check.name == "ONNX Capability Check")
+    assert check.status == CheckStatus.FAILED
+    assert check.severity == IssueSeverity.INFO
+    assert check.details["required_package"] == "onnx"
 
 
 def test_tentative_protobuf_candidate_without_onnx_dependency_is_inconclusive(tmp_path: Path) -> None:

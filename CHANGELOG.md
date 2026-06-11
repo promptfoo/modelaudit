@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - treat canonical storage persistent IDs as informational only after legacy PyTorch framing, storage tuples, and storage payloads validate completely
 - prefer validated SafeTensors framing over invalid pickle and weak-magic collisions while retaining security-bearing pickle overlaps
 - report gated or unauthorized Hugging Face acquisitions as failed, inconclusive source outcomes without claiming artifact coverage, and preserve partial findings from interrupted Hugging Face streaming scans
+- show Hugging Face preview access notices when selected gated files have unknown sizes
 - treat known ONNX Runtime `com.microsoft` optimized-export operators as low-noise vendor metadata while preserving S1111 for unknown custom domains and ambiguous vendor claims
 - recognize current GGUF IQ3_S, IQ4_XS, and BF16 tensor types while preserving bounded inconclusive handling for unsupported or malformed tensor metadata
 - scope both ONNX weight scanners to bounded semantic weight lineage across nested graphs, control flow, local functions, constants, Gather/Einsum, and static views; fail closed on ambiguous or sparse coverage; and evaluate extreme tails per conceptual output without suppressing repeated malicious patterns or flagging clean heavy tails
