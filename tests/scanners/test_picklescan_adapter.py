@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from modelaudit_picklescan import (
@@ -14,6 +18,7 @@ from modelaudit_picklescan import (
     ScanOptions,
     ScanStatus,
     Severity,
+    scan_bytes,
 )
 
 from modelaudit.cache.cache_policy import should_cache_scan_result
@@ -28,6 +33,11 @@ from modelaudit.scanners.picklescan_adapter import (
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
 
+_PINNED_DISTILBERT_URL = (
+    "https://huggingface.co/distilbert/distilbert-base-uncased/resolve/"
+    "12040accade4e8a0f71eabdb258fecc2e7e948be/pytorch_model.bin"
+)
+
 
 def _benign_tail_import_references() -> list[dict[str, object]]:
     return [
@@ -40,6 +50,42 @@ def _benign_tail_import_references() -> list[dict[str, object]]:
             "is_dangerous": False,
         },
     ]
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyPickleReport:
+    source: str
+    status: ScanStatus
+    verdict: SafetyVerdict
+    findings: tuple[Finding, ...] = ()
+    notices: tuple[Notice, ...] = ()
+    errors: tuple[ScanError, ...] = ()
+    coverage: CoverageSummary = field(default_factory=CoverageSummary)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    duration_s: float = 0.0
+
+    @property
+    def has_security_findings(self) -> bool:
+        return bool(self.findings)
+
+    @property
+    def is_clean(self) -> bool:
+        return self.status == ScanStatus.COMPLETE and self.verdict == SafetyVerdict.CLEAN and not self.findings
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "status": self.status.value,
+            "verdict": self.verdict.value,
+            "findings": [finding.to_dict() for finding in self.findings],
+            "notices": [notice.to_dict() for notice in self.notices],
+            "errors": [error.to_dict() for error in self.errors],
+            "coverage": self.coverage.to_dict(),
+            "metadata": dict(self.metadata),
+            "duration_s": self.duration_s,
+            "has_security_findings": self.has_security_findings,
+            "is_clean": self.is_clean,
+        }
 
 
 def test_scan_options_from_config_parses_string_values() -> None:
@@ -114,11 +160,80 @@ def test_pickle_report_to_scan_result_maps_clean_report_to_successful_result() -
     assert any(check.name == "Standalone Pickle Scan" and check.status.value == "passed" for check in result.checks)
 
 
+def test_pickle_report_to_scan_result_tolerates_legacy_report_without_private_metadata() -> None:
+    report = _LegacyPickleReport(
+        source="legacy-safe.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        coverage=CoverageSummary(bytes_scanned=12, bytes_total=12, opcode_count=3),
+        metadata={"protocols": [4], "opcode_count": 3},
+    )
+
+    result = pickle_report_to_scan_result(cast(PickleReport, report))
+
+    assert result.success is True
+    assert result.bytes_scanned == 12
+    assert result.metadata["protocols"] == [4]
+    assert result.metadata["pickle_report_status"] == "complete"
+    assert result.metadata["pickle_verdict"] == "clean"
+    assert result.metadata["pickle_coverage"]["opcode_count"] == 3
+    assert result.issues == []
+    assert "_private_metadata" not in result.to_dict(include_private_metadata=True)
+
+
+def test_pickle_report_to_scan_result_preserves_legacy_report_findings_without_private_metadata() -> None:
+    report = _LegacyPickleReport(
+        source="legacy-malicious.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="Found REDUCE opcode invoking dangerous global: os.system",
+                severity=Severity.CRITICAL,
+                location="legacy-malicious.pkl (pos 4)",
+                rule_code="DANGEROUS_CALL",
+                details={
+                    "opcode": "REDUCE",
+                    "module": "os",
+                    "name": "system",
+                    "import_reference": "os.system",
+                },
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(cast(PickleReport, report))
+
+    assert result.success is True
+    assert len(result.issues) == 1
+    assert result.issues[0].rule_code == "S201"
+    assert result.issues[0].details["pickle_rule_code"] == "DANGEROUS_CALL"
+    assert "_private_metadata" not in result.to_dict(include_private_metadata=True)
+
+
+def test_pickle_report_to_scan_result_treats_malformed_private_metadata_as_absent() -> None:
+    report = PickleReport(
+        source="malformed-private-metadata.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={"opcode_count": 1},
+    )
+    object.__setattr__(report, "private_metadata", "not-a-mapping")
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is True
+    assert result.metadata["opcode_count"] == 1
+    assert result.issues == []
+    assert "_private_metadata" not in result.to_dict(include_private_metadata=True)
+
+
 def test_pickle_report_to_scan_result_deep_copies_private_metadata_for_cache_serialization() -> None:
     report = PickleReport(
         source="safe.pkl",
         status=ScanStatus.COMPLETE,
         verdict=SafetyVerdict.CLEAN,
+        metadata={"opcode_count": 3, "protocols": [4]},
         private_metadata={
             "call_graph_source_fingerprints": {
                 "reusable": True,
@@ -131,6 +246,13 @@ def test_pickle_report_to_scan_result_deep_copies_private_metadata_for_cache_ser
                 "module_sources": {"helper": "/tmp/src/helper.py"},
                 "loaded_module_sources": {},
                 "fingerprints": {"/tmp/src/helper.py": "1111"},
+                "read_fingerprints": {
+                    "/tmp/src/helper.py": {
+                        "read_limit": 1024,
+                        "require_complete": True,
+                        "fingerprint": "2222",
+                    }
+                },
             }
         },
     )
@@ -150,7 +272,16 @@ def test_pickle_report_to_scan_result_deep_copies_private_metadata_for_cache_ser
         "module_sources": {"helper": "/tmp/src/helper.py"},
         "loaded_module_sources": {},
         "fingerprints": {"/tmp/src/helper.py": "1111"},
+        "read_fingerprints": {
+            "/tmp/src/helper.py": {
+                "read_limit": 1024,
+                "require_complete": True,
+                "fingerprint": "2222",
+            }
+        },
     }
+    assert result.to_dict()["metadata"]["opcode_count"] == 3
+    assert result.to_dict()["metadata"]["protocols"] == [4]
     assert "call_graph_source_fingerprints" not in result.to_dict()["metadata"]
 
     result.merge(
@@ -211,6 +342,38 @@ def test_pickle_report_to_scan_result_preserves_security_findings() -> None:
     assert result.issues[0].details["function"] == "system"
     assert result.issues[0].details["pickle_rule_code"] == "DANGEROUS_GLOBAL"
     assert result.issues[0].details["pickle_source"] == "payload.pkl"
+
+
+@pytest.mark.parametrize(
+    ("case_name", "payload", "expected_pickle_rule", "expected_legacy_rule", "expected_details"),
+    [
+        ("reduce", b"cos\nsystem\n)R.", "DANGEROUS_CALL", "S201", {"opcode": "REDUCE"}),
+        ("constructor", b"\x80\x04cos\nsystem\n)}\x92.", "DANGEROUS_CALL", "S204", {"opcode": "NEWOBJ_EX"}),
+        ("extension", b"\x80\x04\x82\x01)R.", "DANGEROUS_CALL", "S201", {"opaque_extension": True}),
+        ("unsafe-global", b"cos\nsystem\n.", "DANGEROUS_GLOBAL", "S101", {"function": "system"}),
+    ],
+)
+def test_pickle_report_to_scan_result_preserves_live_malicious_picklescan_controls(
+    case_name: str,
+    payload: bytes,
+    expected_pickle_rule: str,
+    expected_legacy_rule: str,
+    expected_details: dict[str, object],
+) -> None:
+    report = scan_bytes(payload, source=f"{case_name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert any(finding.rule_code == expected_pickle_rule for finding in report.findings)
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is True
+    assert any(
+        issue.rule_code == expected_legacy_rule
+        and issue.details.get("pickle_rule_code") == expected_pickle_rule
+        and all(issue.details.get(key) == value for key, value in expected_details.items())
+        for issue in result.issues
+    )
 
 
 def test_pickle_report_to_scan_result_preserves_legacy_import_rule_for_global_opcode() -> None:
@@ -1926,3 +2089,49 @@ def test_apply_pickle_member_context_prepends_member_location_without_position_m
 
     assert result.issues[0].location == "archive.pt:data.pkl custom-location"
     assert result.issues[0].details["pickle_filename"] == "data.pkl"
+
+
+@pytest.mark.integration
+@pytest.mark.slow
+def test_pinned_distilbert_hf_scan_completes_without_private_metadata_error(tmp_path: Path) -> None:
+    if os.environ.get("MODELAUDIT_RUN_HF_INTEGRATION") != "1":
+        pytest.skip("set MODELAUDIT_RUN_HF_INTEGRATION=1 to run the pinned Hugging Face scan")
+
+    from click.testing import CliRunner
+
+    from modelaudit.cli import cli
+
+    output_path = tmp_path / "distilbert-report.json"
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--no-cache",
+            "--cache-dir",
+            str(tmp_path / "modelaudit-cache"),
+            "--max-size",
+            "2GB",
+            "--timeout",
+            "3600",
+            "--format",
+            "json",
+            "--output",
+            str(output_path),
+            _PINNED_DISTILBERT_URL,
+        ],
+        env={
+            "PROMPTFOO_DISABLE_TELEMETRY": "1",
+            "HF_HOME": str(tmp_path / "hf-home"),
+            "HF_HUB_CACHE": str(tmp_path / "hf-cache"),
+        },
+    )
+
+    assert result.exit_code in {0, 1}, result.output[-2000:]
+    assert "AttributeError" not in result.output
+    assert "private_metadata" not in result.output
+
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    assert report["success"] is True
+    assert report["has_errors"] is False
+    assert report["files_scanned"] == 1
+    assert "12040accade4e8a0f71eabdb258fecc2e7e948be" in json.dumps(report)
