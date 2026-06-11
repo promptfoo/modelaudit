@@ -48,13 +48,20 @@ GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON = "gguf_metadata_limit_exceeded"
 GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON = "gguf_tensor_limit_exceeded"
 _GGUF_MAX_METADATA_VALUE_SECURITY_CHECKS = 64
 _GGUF_INERT_TOKENIZER_ARRAY_KEYS = frozenset({"tokenizer.ggml.merges", "tokenizer.ggml.tokens"})
+_GGUF_REPORT_BOUNDED_TOKENIZER_ARRAY_KEYS = frozenset(
+    {
+        "tokenizer.ggml.merges",
+        "tokenizer.ggml.scores",
+        "tokenizer.ggml.token_type",
+        "tokenizer.ggml.tokens",
+    }
+)
 _GGUF_METADATA_COMMAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "python_command_api",
         re.compile(
             r"(?i)(?:\b(?:os\.system|os\.popen|subprocess\."
-            r"(?:popen|call|run|check_call|check_output|getoutput|getstatusoutput))"
-            r"|(?<![\w.])(?:eval|exec|__import__))\s*\(",
+            r"(?:popen|call|run|check_call|check_output|getoutput|getstatusoutput)))\s*\(",
         ),
     ),
     (
@@ -88,7 +95,7 @@ _GGUF_FETCH_OPTIONS_WITH_VALUE = frozenset(
         "--data-binary",
         "--data-raw",
         "--data-urlencode",
-        "-f",
+        "-F",
         "--form",
         "--form-string",
         "-h",
@@ -116,12 +123,17 @@ _GGUF_FETCH_OPTIONS_WITH_VALUE = frozenset(
         "-x",
         "--request",
         "--url",
+        "-K",
+        "--config",
         "-uri",
         "-outfile",
     }
 )
 _GGUF_FETCH_DESTINATION_OPTIONS_WITH_VALUE = frozenset({"--url", "-uri"})
-_GGUF_FETCH_SHORT_OPTIONS_WITH_SEPARATE_VALUE = frozenset({"a", "d", "h", "m", "o", "u", "x"})
+_GGUF_CURL_FETCH_SHORT_OPTIONS_WITH_VALUE = frozenset({"a", "d", "F", "H", "K", "m", "o", "u", "x", "X"})
+_GGUF_WGET_FETCH_SHORT_OPTIONS_WITH_VALUE = frozenset({"O", "a", "d", "h", "m", "o", "u", "x"})
+_GGUF_POWERSHELL_FETCH_SHORT_OPTIONS_WITH_VALUE = frozenset()
+_GGUF_PYTHON_EXEC_CALLS = ("eval", "exec", "__import__")
 _GGUF_METADATA_NETWORK_APIS = (
     "httpx.get",
     "httpx.post",
@@ -220,6 +232,7 @@ class GgufScanner(BaseScanner):
     DEFAULT_MAX_TENSORS: ClassVar[int] = 50_000
     DEFAULT_MAX_TENSOR_INFO_BYTES: ClassVar[int] = 16 * 1024 * 1024
     DEFAULT_MAX_REPORTED_TENSORS: ClassVar[int] = 1024
+    DEFAULT_MAX_REPORTED_TOKENIZER_METADATA_ARRAY_ITEMS: ClassVar[int] = 1024
     # Include common GGML variant extensions as well
     supported_extensions: ClassVar[list[str]] = [
         ".gguf",
@@ -267,6 +280,10 @@ class GgufScanner(BaseScanner):
         self.max_reported_tensors = self._normalize_positive_int_config(
             self.config.get("gguf_max_reported_tensors"),
             self.DEFAULT_MAX_REPORTED_TENSORS,
+        )
+        self.max_reported_tokenizer_metadata_array_items = self._normalize_positive_int_config(
+            self.config.get("gguf_max_reported_tokenizer_metadata_array_items"),
+            self.DEFAULT_MAX_REPORTED_TOKENIZER_METADATA_ARRAY_ITEMS,
         )
 
     @staticmethod
@@ -475,7 +492,7 @@ class GgufScanner(BaseScanner):
 
                 self._report_metadata_value_security_checks(key, value, result)
 
-            result.metadata["metadata"] = metadata
+            result.metadata["metadata"] = self._metadata_for_reporting(metadata, result)
             self._report_duplicate_metadata_keys(metadata_key_occurrences, result)
             self._scan_embedded_chat_templates(chat_templates, result)
             if metadata_key_limit_exceeded:
@@ -985,6 +1002,36 @@ class GgufScanner(BaseScanner):
     def _is_inert_tokenizer_array_key(key: str, value: Any) -> bool:
         return key in _GGUF_INERT_TOKENIZER_ARRAY_KEYS and isinstance(value, list)
 
+    def _metadata_report_view(self, metadata: dict[str, Any]) -> tuple[dict[str, Any], dict[str, dict[str, int]]]:
+        reported: dict[str, Any] = {}
+        truncation: dict[str, dict[str, int]] = {}
+        limit = self.max_reported_tokenizer_metadata_array_items
+
+        for key, value in metadata.items():
+            if key in _GGUF_REPORT_BOUNDED_TOKENIZER_ARRAY_KEYS and isinstance(value, list) and len(value) > limit:
+                reported[key] = value[:limit]
+                truncation[key] = {
+                    "original_count": len(value),
+                    "reported_count": limit,
+                    "truncated_count": len(value) - limit,
+                    "max_reported_items": limit,
+                }
+                continue
+            reported[key] = value
+
+        return reported, truncation
+
+    def _metadata_for_reporting(self, metadata: dict[str, Any], result: ScanResult) -> dict[str, Any]:
+        reported, truncation = self._metadata_report_view(metadata)
+        if truncation:
+            result.metadata["metadata_arrays_truncated"] = True
+            result.metadata["metadata_array_truncation"] = truncation
+            result.metadata["max_reported_tokenizer_metadata_array_items"] = (
+                self.max_reported_tokenizer_metadata_array_items
+            )
+
+        return reported
+
     @staticmethod
     def _metadata_decode_variants(value: str) -> tuple[str, ...]:
         variants: list[str] = []
@@ -1170,7 +1217,7 @@ class GgufScanner(BaseScanner):
             or cls._destructive_rm_pattern(line)
             or cls._shell_remote_fetch_pattern(line) is not None
             or cls._network_api_remote_fetch_pattern(line) is not None
-            or any(pattern.search(line) for _pattern_name, pattern in _GGUF_METADATA_COMMAND_PATTERNS)
+            or cls._metadata_command_pattern(line) is not None
         )
 
     @classmethod
@@ -1178,7 +1225,7 @@ class GgufScanner(BaseScanner):
         if (
             cls._contains_path_traversal(text)
             or cls._destructive_rm_pattern(text)
-            or any(pattern.search(text) for _pattern_name, pattern in _GGUF_METADATA_COMMAND_PATTERNS)
+            or cls._metadata_command_pattern(text) is not None
         ):
             return False
         if cls._shell_remote_fetch_pattern(text) is None and cls._network_api_remote_fetch_pattern(text) is None:
@@ -1227,7 +1274,7 @@ class GgufScanner(BaseScanner):
         command = word.strip("\"'").replace("\\", "/").rsplit("/", 1)[-1]
         if command.endswith(".exe"):
             return command[:-4]
-        return command
+        return command.lower()
 
     @staticmethod
     def _is_destructive_rm_target(word: str) -> bool:
@@ -1336,9 +1383,53 @@ class GgufScanner(BaseScanner):
             start = position + 1
 
     @staticmethod
+    def _previous_nonspace_character(value: str, position: int) -> str:
+        index = position - 1
+        while index >= 0 and value[index].isspace():
+            index -= 1
+        return value[index] if index >= 0 else ""
+
+    @staticmethod
+    def _next_nonspace_position(value: str, position: int) -> int:
+        index = position
+        while index < len(value) and value[index].isspace():
+            index += 1
+        return index
+
+    @staticmethod
+    def _has_python_identifier_boundary(value: str, position: int, token: str) -> bool:
+        before = value[position - 1] if position else ""
+        after_position = position + len(token)
+        after = value[after_position] if after_position < len(value) else ""
+        if before and (before.isalnum() or before == "_"):
+            return False
+        return not (after and (after.isalnum() or after == "_"))
+
+    @classmethod
+    def _standalone_python_exec_call_pattern(cls, value: str) -> str | None:
+        value_lower = value.lower()
+        for call_name in _GGUF_PYTHON_EXEC_CALLS:
+            for position in cls._iter_substring_positions(value_lower, call_name):
+                if not cls._has_python_identifier_boundary(value_lower, position, call_name):
+                    continue
+                if cls._previous_nonspace_character(value_lower, position) == ".":
+                    continue
+                open_position = cls._next_nonspace_position(value_lower, position + len(call_name))
+                if open_position < len(value_lower) and value_lower[open_position] == "(":
+                    return "python_command_api"
+        return None
+
+    @classmethod
+    def _metadata_command_pattern(cls, value: str) -> str | None:
+        for pattern_name, pattern in _GGUF_METADATA_COMMAND_PATTERNS:
+            if pattern.search(value):
+                return pattern_name
+        return cls._standalone_python_exec_call_pattern(value)
+
+    @staticmethod
     def _is_remote_url_token(word: str) -> bool:
         token = word.strip("\"'<>[]{}(),")
-        return any(token.startswith(scheme) for scheme in _GGUF_REMOTE_URL_SCHEMES)
+        return any(token.lower().startswith(scheme) for scheme in _GGUF_REMOTE_URL_SCHEMES)
 
     @classmethod
     def _shell_url_variable_names(cls, words: list[str]) -> set[str]:
@@ -1377,19 +1468,37 @@ class GgufScanner(BaseScanner):
         return "".join(name_chars) in names
 
     @staticmethod
-    def _is_fetch_option_with_value(word: str) -> bool:
-        if word in _GGUF_FETCH_OPTIONS_WITH_VALUE:
-            return True
-        if "=" in word:
-            option_name, _option_value = word.split("=", 1)
-            return option_name in _GGUF_FETCH_OPTIONS_WITH_VALUE
-        if word.startswith("-") and not word.startswith("--") and len(word) > 2:
-            short_options = word[1:].lower()
-            return any(
-                option in _GGUF_FETCH_SHORT_OPTIONS_WITH_SEPARATE_VALUE and index == len(short_options) - 1
-                for index, option in enumerate(short_options)
-            )
-        return False
+    def _fetch_short_options_with_value(command: str) -> frozenset[str]:
+        if command == "curl":
+            return _GGUF_CURL_FETCH_SHORT_OPTIONS_WITH_VALUE
+        if command == "wget":
+            return _GGUF_WGET_FETCH_SHORT_OPTIONS_WITH_VALUE
+        return _GGUF_POWERSHELL_FETCH_SHORT_OPTIONS_WITH_VALUE
+
+    @classmethod
+    def _fetch_option_value_mode(cls, word: str, command: str) -> str:
+        if not word.startswith("-"):
+            return "none"
+        if word in {"-", "--"}:
+            return "none"
+
+        if word.startswith("--"):
+            option_name, separator, _option_value = word.partition("=")
+            if option_name in _GGUF_FETCH_OPTIONS_WITH_VALUE:
+                return "attached" if separator else "separate"
+            return "none"
+
+        option_name, separator, _option_value = word.partition("=")
+        if option_name in _GGUF_FETCH_OPTIONS_WITH_VALUE:
+            return "attached" if separator else "separate"
+
+        short_options = word[1:]
+        value_options = cls._fetch_short_options_with_value(command)
+        for index, option in enumerate(short_options):
+            if option not in value_options:
+                continue
+            return "separate" if index == len(short_options) - 1 else "attached"
+        return "none"
 
     @staticmethod
     def _is_fetch_destination_option_with_value(word: str) -> bool:
@@ -1410,11 +1519,10 @@ class GgufScanner(BaseScanner):
                 ):
                     return True
                 if candidate.startswith("-"):
-                    if not cls._is_fetch_option_with_value(candidate) and any(
-                        scheme in candidate for scheme in _GGUF_REMOTE_URL_SCHEMES
-                    ):
+                    value_mode = cls._fetch_option_value_mode(candidate, command)
+                    if value_mode == "none" and any(scheme in candidate.lower() for scheme in _GGUF_REMOTE_URL_SCHEMES):
                         return True
-                    if cls._is_fetch_option_with_value(candidate):
+                    if value_mode != "none":
                         if "=" in candidate:
                             _option_name, option_value = candidate.split("=", 1)
                             if cls._is_fetch_destination_option_with_value(candidate) and (
@@ -1424,9 +1532,11 @@ class GgufScanner(BaseScanner):
                                 return True
                             index += 1
                             continue
-                        index += 1
+                        if value_mode == "separate":
+                            index += 1
                         if (
-                            cls._is_fetch_destination_option_with_value(candidate)
+                            value_mode == "separate"
+                            and cls._is_fetch_destination_option_with_value(candidate)
                             and index < len(words)
                             and (
                                 cls._is_remote_url_token(words[index])
@@ -1434,6 +1544,9 @@ class GgufScanner(BaseScanner):
                             )
                         ):
                             return True
+                        if value_mode == "attached":
+                            index += 1
+                            continue
                     index += 1
                     continue
                 break
@@ -1451,7 +1564,8 @@ class GgufScanner(BaseScanner):
 
     @staticmethod
     def _has_remote_url(value: str) -> bool:
-        return any(scheme in value for scheme in _GGUF_REMOTE_URL_SCHEMES)
+        value_lower = value.lower()
+        return any(scheme in value_lower for scheme in _GGUF_REMOTE_URL_SCHEMES)
 
     @staticmethod
     def _has_token_boundary(value: str, position: int, token: str) -> bool:
@@ -1577,7 +1691,7 @@ class GgufScanner(BaseScanner):
             return None
 
         for pattern_name, commands in _GGUF_METADATA_SHELL_FETCH_COMMANDS:
-            if cls._has_fetch_command_with_url(value_lower, commands):
+            if cls._has_fetch_command_with_url(value, commands):
                 return pattern_name
         return None
 
@@ -1633,10 +1747,9 @@ class GgufScanner(BaseScanner):
         if cls._destructive_rm_pattern(value):
             evidence.append({"evidence_type": "command_execution", "pattern": "destructive_rm"})
         else:
-            for pattern_name, pattern in _GGUF_METADATA_COMMAND_PATTERNS:
-                if pattern.search(value):
-                    evidence.append({"evidence_type": "command_execution", "pattern": pattern_name})
-                    break
+            command_pattern = cls._metadata_command_pattern(value)
+            if command_pattern is not None:
+                evidence.append({"evidence_type": "command_execution", "pattern": command_pattern})
 
         shell_remote_fetch_pattern = cls._shell_remote_fetch_pattern(value)
         if shell_remote_fetch_pattern is not None:
@@ -1847,6 +1960,14 @@ class GgufScanner(BaseScanner):
                         metadata["error_reading_metadata"] = str(e)
                         break
 
+                reported_gguf_metadata, truncation = self._metadata_report_view(gguf_metadata)
+                if truncation:
+                    metadata["metadata_arrays_truncated"] = True
+                    metadata["metadata_array_truncation"] = truncation
+                    metadata["max_reported_tokenizer_metadata_array_items"] = (
+                        self.max_reported_tokenizer_metadata_array_items
+                    )
+
                 # Extract key model information
                 model_info = {}
 
@@ -1864,8 +1985,8 @@ class GgufScanner(BaseScanner):
                 ]
 
                 for field in key_fields:
-                    if field in gguf_metadata:
-                        model_info[field.replace(".", "_")] = gguf_metadata[field]
+                    if field in reported_gguf_metadata:
+                        model_info[field.replace(".", "_")] = reported_gguf_metadata[field]
 
                 if model_info:
                     metadata["model_info"] = model_info

