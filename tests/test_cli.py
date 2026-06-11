@@ -4808,6 +4808,18 @@ def test_scan_path_state_redacts_stream_fallback_for_sbom() -> None:
     assert path_state.scanned_paths == ["stream://https://bucket.s3.amazonaws.com/model.bin"]
 
 
+def test_scan_path_state_omits_empty_local_streaming_inventory_for_sbom(tmp_path: Path) -> None:
+    """A local streamed inventory with no assets must not fall back to re-inventorying the directory."""
+    model_dir = tmp_path / "only-sidecars"
+    model_dir.mkdir()
+    path_state = _ScanPathState()
+
+    path_state.track_streaming_paths_for_sbom(create_initial_audit_result(), str(model_dir))
+
+    assert path_state.sbom_paths_resolved is True
+    assert path_state.scanned_paths == []
+
+
 def test_scan_path_state_preserves_local_asset_path_for_sbom() -> None:
     local_path = "model\nname.pkl"
     scan_result = create_mock_scan_result(assets=[{"path": local_path, "type": "pickle"}])
@@ -5881,6 +5893,38 @@ def test_cli_streaming_local_download_sidecars_excluded_from_inventory_and_sbom(
     sbom_data = json.loads(sbom_file.read_text())
     component_names = {component["name"] for component in sbom_data["components"]}
     assert component_names == {"config.json", "vocab.txt"}
+
+
+def test_cli_streaming_empty_hf_cache_sidecars_do_not_populate_sbom(tmp_path: Path) -> None:
+    """A zero-asset streaming scan should not re-inventory skipped Hugging Face cache tags for SBOM."""
+    model_dir = tmp_path / "downloaded-model"
+    cachedir_tag = model_dir / ".cache" / "huggingface" / "CACHEDIR.TAG"
+    cachedir_tag.parent.mkdir(parents=True)
+    cachedir_tag.write_text(
+        "Signature: 8a477f597d28d172789f06886806bc55\n"
+        "# This file is a cache directory tag created by huggingface_hub.\n"
+        "# For information about cache directory tags, see:\n"
+        "#\thttps://bford.info/cachedir/\n",
+        encoding="utf-8",
+    )
+    sbom_file = tmp_path / "stream-empty.sbom.json"
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--stream", "--format", "json", "--no-cache", "--sbom", str(sbom_file), str(model_dir)],
+    )
+
+    assert result.exit_code == 2, result.output
+    output_payload = parse_click_json_output(result.output)
+    assert output_payload["files_scanned"] == 0
+    assert output_payload["assets"] == []
+    assert output_payload["file_metadata"] == {}
+    assert output_payload["success"] is True
+
+    sbom_text = sbom_file.read_text()
+    sbom_data = json.loads(sbom_text)
+    assert sbom_data.get("components", []) == []
+    assert "CACHEDIR.TAG" not in sbom_text
 
 
 def test_exit_code_scan_errors(tmp_path):

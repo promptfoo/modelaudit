@@ -3456,6 +3456,8 @@ def _regular_bookkeeping_file_size(path_obj: Path, max_bytes: int) -> int | None
         return None
     if not stat.S_ISREG(stat_result.st_mode):
         return None
+    if stat_result.st_nlink != 1:
+        return None
     if stat_result.st_size > max_bytes:
         return None
     return stat_result.st_size

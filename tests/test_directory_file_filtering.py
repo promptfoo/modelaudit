@@ -7,6 +7,7 @@ import json
 import lzma
 import os
 import pickle
+import socket
 import struct
 import sys
 import tarfile
@@ -1352,8 +1353,8 @@ class TestDirectoryFileFiltering:
             for issue in results.issues
         )
 
-    def test_local_download_metadata_hardlink_can_be_benign_bookkeeping(self, tmp_path: Path) -> None:
-        """A regular in-tree hardlink with benign metadata bytes is still bookkeeping."""
+    def test_local_download_metadata_hardlink_is_not_skipped(self, tmp_path: Path) -> None:
+        """Multiply linked sidecars are not trusted as benign bookkeeping."""
         model_dir = tmp_path / "downloaded-model"
         model_dir.mkdir()
         (model_dir / "config.json").write_text('{"model_type":"bert"}', encoding="utf-8")
@@ -1368,9 +1369,9 @@ class TestDirectoryFileFiltering:
 
         results = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
 
-        assert _is_huggingface_cache_file(str(sidecar)) is True
-        assert str(sidecar) not in results.file_metadata
-        assert results.files_scanned == 1
+        assert _is_huggingface_cache_file(str(sidecar)) is False
+        assert str(sidecar) in results.file_metadata
+        assert results.files_scanned == 2
 
     def test_local_download_metadata_deep_json_falls_through_to_scan(self, tmp_path: Path) -> None:
         """A pathological JSON sidecar must not raise or get skipped as benign metadata."""
@@ -1419,6 +1420,21 @@ class TestDirectoryFileFiltering:
         os.mkfifo(fifo)
 
         assert _is_huggingface_cache_file(str(fifo)) is False
+
+    def test_hf_cachedir_tag_socket_is_not_opened(self) -> None:
+        """Socket nodes named like cache tags must not be read or skipped."""
+        if not hasattr(socket, "AF_UNIX"):
+            pytest.skip("Unix sockets unavailable")
+        with tempfile.TemporaryDirectory(prefix="ma-", dir="/tmp") as short_root:
+            model_dir = Path(short_root) / "downloaded-model"
+            socket_path = model_dir / ".cache" / "huggingface" / "CACHEDIR.TAG"
+            socket_path.parent.mkdir(parents=True)
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                server.bind(str(socket_path))
+                assert _is_huggingface_cache_file(str(socket_path)) is False
+            finally:
+                server.close()
 
     def test_malicious_local_download_metadata_sidecar_is_scanned(self, tmp_path: Path) -> None:
         """Scannable bytes with a sidecar name must not be hidden by local_dir filtering."""

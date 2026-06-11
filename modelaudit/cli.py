@@ -1420,7 +1420,7 @@ class _ScanPathState:
                 self.scanned_paths.append(_display_scan_path(asset.path))
                 added_path = True
 
-        if not added_path and fallback_path is not None:
+        if not added_path and fallback_path is not None and not os.path.exists(fallback_path):
             self.scanned_paths.append(_display_scan_path(fallback_path))
 
     def defer_temp_cleanup(self, temp_path: str | None, *, cache_enabled: bool, verbose: bool) -> None:
