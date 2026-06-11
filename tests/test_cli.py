@@ -3358,6 +3358,42 @@ def test_format_text_output_check_only_incomplete_coverage_without_findings_is_n
     assert "NO ISSUES FOUND" not in clean_output
 
 
+def test_format_text_output_consolidated_check_incomplete_coverage_is_not_clean() -> None:
+    """Consolidated check findings should still surface incomplete coverage."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [],
+        "checks": [
+            {
+                "name": "DVC Output Resolution",
+                "status": "failed",
+                "message": "DVC output resolution incomplete",
+                "severity": "info",
+                "location": "model.dvc",
+                "details": {
+                    "component_count": 2,
+                    "findings": [
+                        {"analysis_incomplete": True, "scan_outcome_reason": "dvc_output_limit_exceeded"},
+                        {"component": "covered-sibling"},
+                    ],
+                },
+            },
+        ],
+        "file_metadata": {},
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "Incomplete security coverage" in clean_output
+    assert "model.dvc: dvc_output_limit_exceeded" in clean_output
+    assert "SCAN COVERAGE INCOMPLETE" in clean_output
+    assert "No security issues detected" not in clean_output
+    assert "NO ISSUES FOUND" not in clean_output
+
+
 def test_format_text_output_issue_only_incomplete_coverage_with_security_findings_is_explicit() -> None:
     """Issue-only coverage gaps should not hide security findings."""
     results = {

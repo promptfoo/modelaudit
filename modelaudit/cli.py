@@ -46,6 +46,7 @@ from .core import (
     scan_model_directory_or_file,
 )
 from .core_results import (
+    details_have_incomplete_coverage,
     metadata_has_incomplete_coverage,
     records_have_incomplete_coverage_for_path,
     results_have_inconclusive_outcome,
@@ -1497,7 +1498,7 @@ class _ScanPathState:
                 details = details if isinstance(details, dict) else None
                 if details is None:
                     continue
-                if not (details.get("operational_error") is True or metadata_has_incomplete_coverage(details)):
+                if not (details.get("operational_error") is True or details_have_incomplete_coverage(details)):
                     continue
                 if path_matches_shard_family(getattr(record, "location", None), shard_paths):
                     return True
@@ -4566,7 +4567,7 @@ def _incomplete_coverage_summaries(results: dict[str, Any]) -> list[tuple[str, s
         fallback_location = collection_name[:-1]
         for record in records:
             details = _get_issue_attr(record, "details", {})
-            if not metadata_has_incomplete_coverage(details):
+            if not details_have_incomplete_coverage(details):
                 continue
             location = (
                 _get_issue_attr(record, "location")
@@ -4597,7 +4598,7 @@ def _append_incomplete_coverage_summary(
     summaries.append(summary)
 
 
-def _incomplete_coverage_reason(metadata: Any) -> str:
+def _incomplete_coverage_reason(metadata: Any, *, _depth: int = 0) -> str:
     if not isinstance(metadata, dict):
         return "incomplete coverage"
 
@@ -4625,6 +4626,16 @@ def _incomplete_coverage_reason(metadata: Any) -> str:
         return "analysis_incomplete"
     if metadata.get("scan_outcome") == "inconclusive":
         return "inconclusive"
+
+    if _depth < 4:
+        findings = metadata.get("findings")
+        if isinstance(findings, dict) and details_have_incomplete_coverage(findings):
+            return _incomplete_coverage_reason(findings, _depth=_depth + 1)
+        if isinstance(findings, (list, tuple, set, frozenset)):
+            for finding in findings:
+                if details_have_incomplete_coverage(finding):
+                    return _incomplete_coverage_reason(finding, _depth=_depth + 1)
+
     return "incomplete coverage"
 
 

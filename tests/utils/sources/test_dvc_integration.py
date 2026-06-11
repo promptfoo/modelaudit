@@ -2915,10 +2915,31 @@ class TestDvcCliIntegration:
         )
         assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
 
+    @pytest.mark.parametrize(
+        "shard_failure_details",
+        [
+            {
+                "analysis_incomplete": True,
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reason": "shard_scan_error",
+            },
+            {
+                "component_count": 2,
+                "findings": [
+                    {
+                        "analysis_incomplete": True,
+                        "scan_outcome": "inconclusive",
+                        "scan_outcome_reason": "shard_scan_error",
+                    },
+                ],
+            },
+        ],
+    )
     def test_cli_incomplete_shard_prior_coverage_keeps_capped_dvc_gap(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        shard_failure_details: dict[str, Any],
     ) -> None:
         """An incomplete prior shard-family scan must not cover omitted DVC shard outputs."""
         from click.testing import CliRunner
@@ -2954,11 +2975,7 @@ class TestDvcCliIntegration:
                 status=CheckStatus.FAILED,
                 message="Error scanning shard",
                 location=str(second_shard),
-                details={
-                    "analysis_incomplete": True,
-                    "scan_outcome": "inconclusive",
-                    "scan_outcome_reason": "shard_scan_error",
-                },
+                details=shard_failure_details,
             )
         )
         original_scan = cli_module.scan_model_directory_or_file
