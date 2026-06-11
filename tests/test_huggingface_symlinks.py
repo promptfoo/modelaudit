@@ -2,10 +2,13 @@
 
 import json
 import os
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+import modelaudit.core as core_module
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.scanner_results import CheckStatus
 from modelaudit.scanners.base import IssueSeverity
@@ -111,6 +114,98 @@ class TestHuggingFaceSymlinks:
         metadata_blob.write_text(metadata_payload, encoding="utf-8")
         metadata_link = snapshots_dir / "metadata.json"
         os.symlink("../../blobs/metadata-blob", metadata_link)
+
+        results = scan_model_directory_or_file(str(snapshots_dir))
+
+        restore_checks = [check for check in results.checks if check.name == "Orbax Restore Function Check"]
+        assert results.files_scanned == 1
+        assert results.bytes_scanned == metadata_blob.stat().st_size
+        assert len(restore_checks) == 1
+        assert restore_checks[0].status == CheckStatus.FAILED
+        assert restore_checks[0].severity == IssueSeverity.CRITICAL
+        assert restore_checks[0].location == str(metadata_link)
+        assert restore_checks[0].details["restore_fn"] == "os.system"
+
+    def test_hf_orbax_owner_reparse_blob_scanned_once(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Trusted HF owner aliases should accept Windows reparse-point classification."""
+        hf_home = tmp_path / ".cache" / "huggingface"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+        cache_dir = hf_home / "hub" / "models--org--orbax"
+        snapshots_dir = cache_dir / "snapshots" / "abc123"
+        blobs_dir = cache_dir / "blobs"
+        snapshots_dir.mkdir(parents=True)
+        blobs_dir.mkdir(parents=True)
+
+        metadata_blob = blobs_dir / "metadata-blob"
+        metadata_payload = json.dumps(
+            {"type": "orbax_checkpoint", "restore_fn": "os.system"},
+            separators=(",", ":"),
+        )
+        metadata_blob.write_text(metadata_payload, encoding="utf-8")
+        metadata_link = snapshots_dir / "metadata.json"
+        os.symlink("../../blobs/metadata-blob", metadata_link)
+
+        original_is_symlink = Path.is_symlink
+        original_lstat = Path.lstat
+        original_resolve = Path.resolve
+        original_walk = os.walk
+        original_unclassified_symlink_names = core_module._unclassified_symlink_names
+        reparse_flag = getattr(core_module.stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        monkeypatch.setattr(core_module.stat, "FILE_ATTRIBUTE_REPARSE_POINT", reparse_flag, raising=False)
+
+        class _ReparseStat:
+            st_file_attributes = reparse_flag
+
+            def __init__(self, wrapped: os.stat_result) -> None:
+                self._wrapped = wrapped
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._wrapped, name)
+
+        def is_metadata_alias(candidate: Path) -> bool:
+            return Path(os.path.abspath(candidate)) == metadata_link
+
+        def is_symlink_without_windows_reparse(candidate: Path) -> bool:
+            if is_metadata_alias(candidate):
+                return False
+            return original_is_symlink(candidate)
+
+        def lstat_with_reparse(candidate: Path) -> os.stat_result | _ReparseStat:
+            candidate_stat = original_lstat(candidate)
+            if is_metadata_alias(candidate):
+                return _ReparseStat(candidate_stat)
+            return candidate_stat
+
+        def resolve_reparse(candidate: Path, strict: bool = False) -> Path:
+            if is_metadata_alias(candidate):
+                return metadata_blob
+            return original_resolve(candidate, strict=strict)
+
+        def walk_without_reparse_file(
+            top: str,
+            topdown: bool = True,
+            onerror: Callable[[OSError], object] | None = None,
+            followlinks: bool = False,
+        ) -> Iterator[tuple[str, list[str], list[str]]]:
+            if Path(os.path.abspath(top)) == snapshots_dir:
+                yield str(snapshots_dir), [], []
+                return
+            yield from original_walk(top, topdown=topdown, onerror=onerror, followlinks=followlinks)
+
+        def unclassified_without_reparse_file(root: str, dirs: list[str], files: list[str]) -> list[str]:
+            if Path(os.path.abspath(root)) == snapshots_dir:
+                return []
+            return original_unclassified_symlink_names(root, dirs, files)
+
+        monkeypatch.setattr(Path, "is_symlink", is_symlink_without_windows_reparse)
+        monkeypatch.setattr(Path, "lstat", lstat_with_reparse)
+        monkeypatch.setattr(Path, "resolve", resolve_reparse)
+        monkeypatch.setattr(os, "walk", walk_without_reparse_file)
+        monkeypatch.setattr(core_module, "_unclassified_symlink_names", unclassified_without_reparse_file)
 
         results = scan_model_directory_or_file(str(snapshots_dir))
 

@@ -3139,7 +3139,7 @@ def scan_model_directory_or_file(
                     not is_hf_cache
                     or hf_cache_root is None
                     or trusted_hf_blobs_root is None
-                    or not owner_source.is_symlink()
+                    or not _is_directory_link(owner_source)
                     or not _path_has_part(owner_source, "snapshots")
                 ):
                     return None
