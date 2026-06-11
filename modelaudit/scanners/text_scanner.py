@@ -592,7 +592,7 @@ DOCUMENTATION_FENCED_EXECUTED_FETCH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_FETCH_RESPONSE_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:\(\s*){0,8}"
     rb"(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
     re.IGNORECASE,
 )
@@ -1600,21 +1600,27 @@ class TextScanner(BaseScanner):
 
     @classmethod
     def _documentation_fenced_line_enters_clone_checkout(cls, line: bytes, checkout_path: bytes) -> bool:
-        stripped = line.strip()
-        if not stripped or stripped.startswith(b"#") or checkout_path == b".":
+        cd_target = cls._documentation_fenced_line_cd_target(line)
+        if cd_target is None or checkout_path == b".":
             return False
-        path_reference = rb"(?:\./)?" + re.escape(checkout_path)
-        return (
-            re.match(
-                cls._documentation_fenced_shell_command_prefix_pattern()
-                + rb"cd\s+"
-                + path_reference
-                + rb"\s*(?:$|[;&|])",
-                stripped,
-                flags=re.IGNORECASE,
-            )
-            is not None
+        return cd_target == checkout_path
+
+    @classmethod
+    def _documentation_fenced_line_cd_target(cls, line: bytes) -> bytes | None:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(b"#"):
+            return None
+        match = re.match(
+            cls._documentation_fenced_shell_command_prefix_pattern() + rb"cd\s+(?P<target>[^\s;&|]+)\s*(?:$|[;&|])",
+            stripped,
+            flags=re.IGNORECASE,
         )
+        if match is None:
+            return None
+        target = match.group("target").strip().strip(b"'\"").rstrip(b"/")
+        while target.startswith(b"./"):
+            target = target[2:]
+        return target or b"."
 
     @classmethod
     def _documentation_fenced_line_executes_relative_checkout_path(cls, line: bytes) -> bool:
@@ -1645,6 +1651,7 @@ class TextScanner(BaseScanner):
                 prefix
                 + rb"(?:python(?:[0-9.]+)?|py)\s+(?:-[A-Za-z0-9_.=\-]+\s+){0,8}"
                 + rb"(?:setup\.py|[A-Za-z0-9_./\-]+\.py)(?:\s|$)",
+                prefix + rb"(?:python(?:[0-9.]+)?|py)\s+(?:-[A-Za-z0-9_.=\-]+\s+){0,8}-m\s+(?:pip|uv)\b",
                 prefix + rb"(?:bash|sh|zsh|node|ruby|perl)\s+" + rb"[A-Za-z0-9_./\-]+\.(?:sh|js|rb|pl)(?:\s|$)",
                 prefix + rb"(?:make|cmake|npm|yarn|pnpm|pip|uv)\b",
             )
@@ -1699,12 +1706,14 @@ class TextScanner(BaseScanner):
             return False
         inside_checkout = False
         for raw_line in payload[line_end + 1 : range_end].splitlines():
-            if inside_checkout and cls._documentation_fenced_line_executes_inside_clone_checkout(raw_line):
-                return True
             if cls._documentation_fenced_line_executes_clone_checkout(raw_line, checkout_path):
                 return True
-            if cls._documentation_fenced_line_enters_clone_checkout(raw_line, checkout_path):
-                inside_checkout = True
+            cd_target = cls._documentation_fenced_line_cd_target(raw_line)
+            if cd_target is not None:
+                inside_checkout = cls._documentation_fenced_line_enters_clone_checkout(raw_line, checkout_path)
+                continue
+            if inside_checkout and cls._documentation_fenced_line_executes_inside_clone_checkout(raw_line):
+                return True
         return False
 
     @staticmethod
