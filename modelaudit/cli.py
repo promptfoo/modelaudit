@@ -242,7 +242,28 @@ def _is_huggingface_dry_run_preview_path(path: str) -> bool:
 
 def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeConfig") -> dict[str, Any]:
     """Preview a Hugging Face repository scan without artifact downloads or scanners."""
-    from .utils.sources.huggingface import get_model_info
+    from .utils.sources.huggingface import (
+        get_model_info,
+        plan_huggingface_model_download,
+        plan_huggingface_streaming_download,
+    )
+
+    if runtime.scan_and_delete:
+        plan = plan_huggingface_streaming_download(
+            path,
+            runtime.max_download_bytes,
+            timeout_seconds=runtime.timeout,
+            scannable_extensions=runtime.scannable_extensions,
+            scannable_filenames=runtime.scannable_filenames,
+            scannable_scanner_ids=runtime.scannable_scanner_ids,
+            include_all_files=runtime.hf_stream_include_all_files,
+        )
+    else:
+        plan = plan_huggingface_model_download(
+            path,
+            runtime.max_download_bytes,
+            timeout_seconds=runtime.timeout,
+        )
 
     model_info = get_model_info(path)
     total_size = model_info.get("total_size")
@@ -257,6 +278,7 @@ def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeCo
             if isinstance(total_size, int) and not isinstance(total_size, bool)
             else None,
             "human_size": _preview_size_text(total_size),
+            "selected_file_count": len(plan.selected_files),
             "metadata_only": True,
         },
     )
@@ -291,11 +313,25 @@ def _get_huggingface_file_metadata(repo_id: str, revision: str, filename: str) -
 
 def _build_huggingface_file_dry_run_preview(path: str, runtime: "_ScanRuntimeConfig") -> dict[str, Any]:
     """Preview a direct Hugging Face file scan without downloading it."""
-    from .utils.sources.huggingface import parse_huggingface_file_url
+    from .utils.sources.huggingface import _format_size, _is_huggingface_commit_sha, parse_huggingface_file_url
 
     repo_id, revision, filename = parse_huggingface_file_url(path)
     file_metadata = _get_huggingface_file_metadata(repo_id, revision, filename)
     size_bytes = file_metadata.get("size_bytes")
+    size_limit = runtime.max_download_bytes
+    if isinstance(size_limit, int) and not isinstance(size_limit, bool) and size_limit > 0:
+        resolved_revision = file_metadata.get("resolved_revision")
+        checked_revision = resolved_revision if isinstance(resolved_revision, str) else revision
+        if not _is_huggingface_commit_sha(checked_revision):
+            raise ValueError(
+                f"Unable to determine immutable revision for {_display_scan_path(path)}; refusing capped download"
+            )
+        if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes < 0:
+            raise ValueError(f"Unable to determine file size for {_display_scan_path(path)}; refusing capped download")
+        if size_bytes > size_limit:
+            raise ValueError(
+                f"File size ({_format_size(size_bytes)}) exceeds maximum allowed size ({_format_size(size_limit)})"
+            )
     return _build_huggingface_dry_run_preview(
         path,
         runtime,

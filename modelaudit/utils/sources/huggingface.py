@@ -53,6 +53,8 @@ __all__ = [
     "is_huggingface_url",
     "parse_huggingface_file_url",
     "parse_huggingface_url",
+    "plan_huggingface_model_download",
+    "plan_huggingface_streaming_download",
     "redact_huggingface_url_for_display",
     "redact_huggingface_urls_in_text",
 ]
@@ -100,6 +102,19 @@ class _HuggingFaceProbeBudget:
                 f"Hugging Face selective filtering incomplete: inconsistent skipped file size for {repo_id}/{filename}"
             )
         self.file_sizes[filename] = file_size
+
+
+@dataclass(frozen=True)
+class HuggingFaceDownloadPlan:
+    namespace: str
+    repo_name: str
+    repo_id: str
+    deadline: float | None
+    size_limit: int | None
+    repo_revision: str
+    selected_files: list[str]
+    selected_sizes: dict[str, int]
+    download_revision: str
 
 
 def _parse_huggingface_response_file_size(response: Any, bytes_read: int, max_bytes: int) -> int | None:
@@ -2045,8 +2060,6 @@ def download_model(
 
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
 
-        size_limit = _normalize_download_size_limit(max_size)
-
         # Enable/disable progress bars based on parameter
         if not show_progress:
             disable_progress_bars()
@@ -2055,46 +2068,10 @@ def download_model(
             # Force progress bar to show even in non-TTY environments
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
-        # List files in the repository to identify model files
-        listing_timeout = 30.0
-        if deadline is not None:
-            listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
-            if listing_timeout <= 0:
-                raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
-        repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
-            repo_id,
-            listing_timeout,
-            deadline=deadline,
-        )
-        if repo_files is None:
-            raise ValueError(
-                "Hugging Face selective filtering incomplete: "
-                f"failed listing files in repository {repo_id}: {repo_listing_error}"
-            )
-        if repo_revision is None:
-            raise ValueError(
-                "Hugging Face selective filtering incomplete: "
-                f"{repo_listing_error or 'repository listing did not include an immutable commit SHA'}"
-            )
-
-        # Find model files in the repository (using centralized model extensions)
-        model_extensions = _get_model_extensions()
-        model_files = _select_huggingface_model_files(
-            repo_id,
-            repo_files,
-            repo_revision,
-            model_extensions,
-            deadline=deadline,
-        )
-        model_files = _include_huggingface_openvino_companions(
-            repo_id,
-            repo_files,
-            repo_revision,
-            model_files,
-            deadline=deadline,
-        )
-        if deadline is not None and time.monotonic() >= deadline:
-            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+        plan = plan_huggingface_model_download(url, max_size, deadline=deadline)
+        deadline = plan.deadline
+        size_limit = plan.size_limit
+        model_files = plan.selected_files
 
         # Download strategy:
         # - When cache_dir is provided: Use local_dir to place files directly there (safer)
@@ -2104,7 +2081,7 @@ def download_model(
             "repo_id": repo_id,
             "tqdm_class": None,  # Use default tqdm
         }
-        download_kwargs["revision"] = repo_revision
+        download_kwargs["revision"] = plan.download_revision
 
         if cache_dir is not None:
             # User provided cache directory - use local_dir for direct placement
@@ -2114,18 +2091,7 @@ def download_model(
             # This is safer as it doesn't risk deleting user's global cache
             pass
 
-        # If we found specific model files, download them
-        if model_files:
-            _revision, _ = _ensure_huggingface_selection_within_max_size(
-                repo_id,
-                model_files,
-                size_limit,
-                resolved_revision=repo_revision,
-                deadline=deadline,
-            )
-            download_kwargs["allow_patterns"] = _build_literal_allow_patterns(model_files)
-        else:
-            _raise_no_scannable_hf_files(repo_id)
+        download_kwargs["allow_patterns"] = _build_literal_allow_patterns(model_files)
 
         local_path = _run_huggingface_download_with_deadline(
             "snapshot_download",
@@ -2165,6 +2131,156 @@ def download_model(
         raise Exception(
             f"Failed to download model from {display_url}: {redact_huggingface_urls_in_text(str(e))}"
         ) from e
+
+
+def plan_huggingface_model_download(
+    url: str,
+    max_size: int | None = None,
+    *,
+    timeout_seconds: float | None = None,
+    deadline: float | None = None,
+) -> HuggingFaceDownloadPlan:
+    """Plan the bounded Hugging Face files a standard acquisition would download."""
+    namespace, repo_name = parse_huggingface_url(url)
+    repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
+    size_limit = _normalize_download_size_limit(max_size)
+    if deadline is None and timeout_seconds is not None:
+        deadline = time.monotonic() + timeout_seconds
+
+    listing_timeout = 30.0
+    if deadline is not None:
+        listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
+        if listing_timeout <= 0:
+            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+    repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
+        repo_id,
+        listing_timeout,
+        deadline=deadline,
+    )
+    if repo_files is None:
+        raise ValueError(
+            "Hugging Face selective filtering incomplete: "
+            f"failed listing files in repository {repo_id}: {repo_listing_error}"
+        )
+    if repo_revision is None:
+        raise ValueError(
+            "Hugging Face selective filtering incomplete: "
+            f"{repo_listing_error or 'repository listing did not include an immutable commit SHA'}"
+        )
+
+    model_files = _select_huggingface_model_files(
+        repo_id,
+        repo_files,
+        repo_revision,
+        _get_model_extensions(),
+        deadline=deadline,
+    )
+    model_files = _include_huggingface_openvino_companions(
+        repo_id,
+        repo_files,
+        repo_revision,
+        model_files,
+        deadline=deadline,
+    )
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+    if not model_files:
+        _raise_no_scannable_hf_files(repo_id)
+    revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
+        repo_id,
+        model_files,
+        size_limit,
+        resolved_revision=repo_revision,
+        deadline=deadline,
+    )
+    return HuggingFaceDownloadPlan(
+        namespace=namespace,
+        repo_name=repo_name,
+        repo_id=repo_id,
+        deadline=deadline,
+        size_limit=size_limit,
+        repo_revision=repo_revision,
+        selected_files=model_files,
+        selected_sizes=selected_sizes,
+        download_revision=revision or repo_revision,
+    )
+
+
+def plan_huggingface_streaming_download(
+    url: str,
+    max_size: int | None = None,
+    *,
+    timeout_seconds: float | None = None,
+    scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
+    scannable_scanner_ids: Collection[str] | None = None,
+    include_all_files: bool = False,
+) -> HuggingFaceDownloadPlan:
+    """Plan the bounded Hugging Face files a streaming acquisition would download."""
+    namespace, repo_name = parse_huggingface_url(url)
+    repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
+    size_limit = _normalize_download_size_limit(max_size)
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+
+    listing_timeout = 30.0
+    if deadline is not None:
+        listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
+        if listing_timeout <= 0:
+            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+    repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
+        repo_id,
+        listing_timeout,
+        deadline=deadline,
+    )
+    if repo_files is None:
+        if repo_listing_error and repo_listing_error.startswith("timed out after"):
+            raise Exception(f"Timeout listing files in repository {repo_id}")
+        raise Exception(f"Failed listing files in repository {repo_id}: {repo_listing_error}")
+    if repo_revision is None:
+        raise Exception(
+            f"Failed listing files in repository {repo_id}: "
+            f"{repo_listing_error or 'repository listing did not include an immutable commit SHA'}"
+        )
+
+    model_files = _select_streamable_hf_files(
+        repo_id,
+        repo_files,
+        repo_revision,
+        scannable_extensions,
+        scannable_filenames,
+        scannable_scanner_ids,
+        include_all_files=include_all_files,
+        deadline=deadline,
+    )
+    openvino_companion_suppression_enabled = scannable_scanner_ids is None or "openvino" in {
+        str(scanner_id).lower() for scanner_id in scannable_scanner_ids
+    }
+    model_files = _include_huggingface_openvino_companions(
+        repo_id,
+        repo_files,
+        repo_revision,
+        model_files,
+        include_openvino_companions=openvino_companion_suppression_enabled,
+        deadline=deadline,
+    )
+    revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
+        repo_id,
+        model_files,
+        size_limit,
+        resolved_revision=repo_revision,
+        deadline=deadline,
+    )
+    return HuggingFaceDownloadPlan(
+        namespace=namespace,
+        repo_name=repo_name,
+        repo_id=repo_id,
+        deadline=deadline,
+        size_limit=size_limit,
+        repo_revision=repo_revision,
+        selected_files=model_files,
+        selected_sizes=selected_sizes,
+        download_revision=revision or repo_revision,
+    )
 
 
 def download_model_streaming(
@@ -2210,8 +2326,6 @@ def download_model_streaming(
             "Install with 'pip install modelaudit[huggingface]'"
         ) from e
 
-    namespace, repo_name = parse_huggingface_url(url)
-    repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
     display_url = redact_huggingface_url_for_display(url)
 
     try:
@@ -2220,9 +2334,6 @@ def download_model_streaming(
 
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
 
-        size_limit = _normalize_download_size_limit(max_size)
-        deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
-
         # Configure progress display
         if not show_progress:
             disable_progress_bars()
@@ -2230,56 +2341,26 @@ def download_model_streaming(
             enable_progress_bars()
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
-        # List files with timeout without leaking a blocking worker thread.
-        listing_timeout = 30.0
-        if deadline is not None:
-            listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
-            if listing_timeout <= 0:
-                raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
-        repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
-            repo_id,
-            listing_timeout,
-            deadline=deadline,
-        )
-        if repo_files is None:
-            if repo_listing_error and repo_listing_error.startswith("timed out after"):
-                raise Exception(f"Timeout listing files in repository {repo_id}")
-            raise Exception(f"Failed listing files in repository {repo_id}: {repo_listing_error}")
-        if repo_revision is None:
-            raise Exception(
-                f"Failed listing files in repository {repo_id}: "
-                f"{repo_listing_error or 'repository listing did not include an immutable commit SHA'}"
-            )
-
-        model_files = _select_streamable_hf_files(
-            repo_id,
-            repo_files,
-            repo_revision,
-            scannable_extensions,
-            scannable_filenames,
-            scannable_scanner_ids,
+        plan = plan_huggingface_streaming_download(
+            url,
+            max_size,
+            timeout_seconds=timeout_seconds,
+            scannable_extensions=scannable_extensions,
+            scannable_filenames=scannable_filenames,
+            scannable_scanner_ids=scannable_scanner_ids,
             include_all_files=include_all_files,
-            deadline=deadline,
         )
+        namespace = plan.namespace
+        repo_name = plan.repo_name
+        repo_id = plan.repo_id
+        deadline = plan.deadline
+        size_limit = plan.size_limit
+        model_files = plan.selected_files
+        selected_sizes = plan.selected_sizes
+        download_revision = plan.download_revision
         openvino_companion_suppression_enabled = scannable_scanner_ids is None or "openvino" in {
             str(scanner_id).lower() for scanner_id in scannable_scanner_ids
         }
-        model_files = _include_huggingface_openvino_companions(
-            repo_id,
-            repo_files,
-            repo_revision,
-            model_files,
-            include_openvino_companions=openvino_companion_suppression_enabled,
-            deadline=deadline,
-        )
-        revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
-            repo_id,
-            model_files,
-            size_limit,
-            resolved_revision=repo_revision,
-            deadline=deadline,
-        )
-        download_revision = revision or repo_revision
 
         # Setup cache directory
         download_path = None
