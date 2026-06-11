@@ -185,6 +185,20 @@ def _redact_url_reference(value: str) -> str:
     return _URL_REFERENCE_PATTERN.sub(replace_url, value)
 
 
+def openvino_xml_companion_for_weights(path: str | os.PathLike[str]) -> Path | None:
+    """Return the owning OpenVINO XML path for a same-stem weights sidecar."""
+    weights_path = Path(path)
+    if weights_path.suffix.lower() != ".bin":
+        return None
+
+    xml_path = weights_path.with_suffix(".xml")
+    if not xml_path.is_file():
+        return None
+    if not OpenVinoScanner.can_handle(str(xml_path)):
+        return None
+    return xml_path
+
+
 class OpenVinoScanner(BaseScanner):
     """Scanner for OpenVINO IR (.xml/.bin) model files."""
 
@@ -192,6 +206,35 @@ class OpenVinoScanner(BaseScanner):
     description = "Scans OpenVINO IR models for suspicious layers and external references"
     supported_extensions: ClassVar[list[str]] = [".xml"]
     CAN_HANDLE_MAX_PARSE_BYTES: ClassVar[int] = 1024 * 1024
+
+    def _record_bin_size(self, result: ScanResult, bin_path: Path) -> None:
+        bin_size = self.get_file_size(str(bin_path))
+        result.metadata["bin_size"] = bin_size
+
+        configured_limit = self.config.get("max_file_size", 0)
+        max_file_size = configured_limit if isinstance(configured_limit, int) and configured_limit > 0 else 0
+        if max_file_size and bin_size > max_file_size:
+            reason = "openvino_weights_file_size_exceeded"
+            result.metadata["operational_error"] = True
+            result.metadata["operational_error_reason"] = reason
+            result.metadata["analysis_incomplete"] = True
+            result.metadata["scan_outcome"] = "inconclusive"
+            result.metadata["scan_outcome_reason"] = reason
+            result.metadata["scan_outcome_reasons"] = [reason]
+            result.add_check(
+                name="OpenVINO Weights File Size Limit",
+                passed=False,
+                message=f"Associated .bin weights file too large to scan: {bin_size} bytes (max: {max_file_size})",
+                severity=IssueSeverity.INFO,
+                location=str(bin_path),
+                details={
+                    "file_size": bin_size,
+                    "max_file_size": max_file_size,
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": reason,
+                },
+            )
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -244,9 +287,9 @@ class OpenVinoScanner(BaseScanner):
                     ),
                 )
             elif bin_path.is_file():
-                result.metadata["bin_size"] = self.get_file_size(str(bin_path))
+                self._record_bin_size(result, bin_path)
         elif bin_path.is_file():
-            result.metadata["bin_size"] = self.get_file_size(str(bin_path))
+            self._record_bin_size(result, bin_path)
         else:
             result.add_check(
                 name="OpenVINO Weights File Check",

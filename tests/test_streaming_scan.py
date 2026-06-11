@@ -34,6 +34,7 @@ from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
+from tests.helpers import create_malicious_pickle
 
 
 @pytest.fixture
@@ -1390,6 +1391,156 @@ def test_scan_model_streaming_does_not_reconcile_duplicate_shard_targets(
     assert result.success is False
     assert determine_exit_code(result) == 2
     assert any(check.details.get("scan_outcome_reason") == "missing_model_shards" for check in result.checks)
+
+
+def _write_openvino_pair(model_dir: Path, *, stem: str = "model", xml_content: str | None = None) -> tuple[Path, Path]:
+    xml_path = model_dir / f"{stem}.xml"
+    bin_path = model_dir / f"{stem}.bin"
+    xml_path.write_text(xml_content or "<net version='10'></net>", encoding="utf-8")
+    bin_path.write_bytes(b"\x00" * 16)
+    return xml_path, bin_path
+
+
+def test_scan_model_streaming_preserves_openvino_companion_when_bin_arrives_first(tmp_path: Path) -> None:
+    """A streamed OpenVINO .bin sidecar must not be deleted before its XML owner is scanned."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+
+    result = scan_model_streaming(
+        file_generator=iter([(bin_path, False), (xml_path, True)]),
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+    )
+
+    assert determine_exit_code(result) == 0
+    assert "pytorch_binary" not in result.scanner_names
+    assert not xml_path.exists()
+    assert not bin_path.exists()
+    assert result.file_metadata[str(xml_path)]["bin_size"] == 16
+    assert not any(check.rule_code == "S701" for check in result.checks)
+    assert not any(check.rule_code == "S901" for check in result.checks)
+
+
+def test_scan_model_streaming_openvino_xml_with_prefetched_companion(tmp_path: Path) -> None:
+    """HF-style streaming can yield only XML after pre-staging the .bin companion."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+
+    result = scan_model_streaming(
+        file_generator=iter([(xml_path, True)]),
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+    )
+
+    assert determine_exit_code(result) == 0
+    assert result.scanner_names == ["openvino"]
+    assert not xml_path.exists()
+    assert not bin_path.exists()
+    assert result.file_metadata[str(xml_path)]["bin_size"] == 16
+    assert not any("weights file not found" in check.message.lower() for check in result.checks)
+
+
+def test_scan_model_streaming_openvino_missing_companion_still_reports_s701(tmp_path: Path) -> None:
+    """Missing OpenVINO weights must not be suppressed by companion-preservation logic."""
+    xml_path = tmp_path / "model.xml"
+    xml_path.write_text("<net version='10'></net>", encoding="utf-8")
+
+    result = scan_model_streaming(
+        file_generator=iter([(xml_path, True)]),
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+    )
+
+    assert any(
+        check.rule_code == "S701" and "weights file not found" in check.message.lower() for check in result.checks
+    )
+
+
+def test_scan_model_streaming_openvino_symlink_escape_fails_closed(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """A streamed OpenVINO weights symlink escaping the model dir remains a critical finding."""
+    model_dir = tmp_path / "model"
+    outside_dir = tmp_path / "outside"
+    model_dir.mkdir()
+    outside_dir.mkdir()
+    xml_path = model_dir / "model.xml"
+    bin_path = model_dir / "model.bin"
+    escaped_weights = outside_dir / "secret.bin"
+    xml_path.write_text("<net version='10'></net>", encoding="utf-8")
+    escaped_weights.write_bytes(b"secret-weights")
+    bin_path.symlink_to(escaped_weights)
+
+    result = scan_model_streaming(
+        file_generator=iter([(xml_path, True)]),
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+    )
+
+    assert determine_exit_code(result) == 1
+    assert not xml_path.exists()
+    assert not bin_path.exists()
+    assert escaped_weights.exists()
+    assert any(
+        check.name == "OpenVINO Weights Symlink Boundary Check"
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("resolved_path") == str(escaped_weights.resolve())
+        for check in result.checks
+    )
+
+
+def test_scan_model_streaming_openvino_companion_swap_fails_closed(tmp_path: Path) -> None:
+    """A sidecar changed during XML scanning makes the streamed result operationally incomplete."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+    real_scan_file = scan_file
+
+    def swap_companion(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        if Path(path) == xml_path:
+            bin_path.write_bytes(b"changed")
+        return real_scan_file(path, config=config)
+
+    with patch("modelaudit.core.scan_file", side_effect=swap_companion):
+        result = scan_model_streaming(
+            file_generator=iter([(xml_path, True)]),
+            timeout=30,
+            delete_after_scan=False,
+            cache_enabled=False,
+        )
+
+    assert determine_exit_code(result) == 2
+    assert any(
+        check.name == "OpenVINO Weights Companion Stability"
+        and check.details.get("scan_outcome_reason") == "openvino_weights_changed_during_xml_scan"
+        for check in result.checks
+    )
+
+
+def test_scan_model_directory_or_file_openvino_bin_sidecar_not_pytorch(tmp_path: Path) -> None:
+    """Local directory scans should not route declared OpenVINO weights as PyTorch binaries."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, skip_file_types=True)
+
+    assert determine_exit_code(result) == 0
+    assert "pytorch_binary" not in result.scanner_names
+    assert result.file_metadata[str(xml_path)]["bin_size"] == bin_path.stat().st_size
+    assert not any(check.rule_code == "S901" for check in result.checks)
+
+
+def test_non_openvino_xml_near_match_does_not_hide_malicious_bin(tmp_path: Path) -> None:
+    """A same-stem .bin remains independently scanned when the XML is not OpenVINO."""
+    xml_path = tmp_path / "document.xml"
+    xml_path.write_text("<project><model name='not-openvino'/></project>", encoding="utf-8")
+    bin_path = create_malicious_pickle(tmp_path / "document.bin")
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, skip_file_types=True)
+
+    assert determine_exit_code(result) == 1
+    assert "openvino" not in result.scanner_names
+    assert any(issue.location == str(bin_path) and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_scan_model_streaming_skips_non_model_files(tmp_path: Path) -> None:
