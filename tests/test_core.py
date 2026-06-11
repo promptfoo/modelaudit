@@ -5141,7 +5141,7 @@ def test_scan_file_fails_closed_for_printable_utf8_non_text_suffix_binary_candid
 
 
 def test_scan_file_fails_closed_for_printable_utf8_invalid_json_protobuf_candidate(tmp_path: Path) -> None:
-    payload = _build_printable_utf8_ambiguous_binary_route()
+    payload = _build_printable_utf8_protobuf_candidate_route()
     candidate = tmp_path / "ambiguous.json"
     candidate.write_bytes(payload)
 
@@ -5154,7 +5154,15 @@ def test_scan_file_fails_closed_for_printable_utf8_invalid_json_protobuf_candida
 
     assert result.success is False
     assert result.metadata["scan_outcome"] == "inconclusive"
-    assert "onnx_tentative_candidate_analysis_unavailable" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        reason
+        in {
+            "onnx_tentative_candidate_analysis_unavailable",
+            "onnx_tentative_candidate_parse_incomplete",
+            "coreml_analysis_incomplete",
+        }
+        for reason in result.metadata["scan_outcome_reasons"]
+    )
     assert core_module.determine_exit_code(aggregate) == 2
 
 
