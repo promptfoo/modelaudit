@@ -1361,6 +1361,28 @@ def test_flax_msgpack_binary_anchor_scanner_fails_closed_for_same_window_unclose
     assert coverage_check.details["pattern"] == _UNBOUNDED_GETATTR_PATTERN
 
 
+def test_flax_msgpack_text_stream_fails_closed_for_ordered_anchor_split_across_overlap() -> None:
+    scanner = FlaxMsgpackScanner()
+    result = ScanResult("flax_msgpack")
+    first_chunk = "getattr(object" + ("a" * _STREAM_TEXT_OVERLAP_CHARS) + ", '_"
+    second_chunk = "_custom_hook__')"
+
+    scanner._analyze_streamed_text_chunks(
+        [first_chunk, second_chunk],
+        "root.params.expression",
+        result,
+        full_length=len(first_chunk) + len(second_chunk),
+        finding_location="root.params.expression",
+        coverage_details={"string_size": len(first_chunk) + len(second_chunk)},
+        check_jax_transform=True,
+    )
+
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    coverage_check = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
+    assert coverage_check.details["pattern"] == _UNBOUNDED_GETATTR_PATTERN
+
+
 def test_flax_msgpack_large_binary_fails_closed_for_split_stream_unsafe_custom_pattern(tmp_path: Path) -> None:
     path = tmp_path / "large_binary_custom_stream_unsafe_pattern.msgpack"
     payload = (b"\x00" * 128) + b"foo" + (b"x" * (64 * 1024 + 4096 + 100)) + b"bar"
@@ -1399,6 +1421,20 @@ def test_flax_msgpack_large_binary_preserves_custom_pattern_anchor_order_across_
     assert result.success is True
     assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON not in result.metadata.get("scan_outcome_reasons", [])
     assert all(check.name != "Flax MessagePack Binary Pattern Coverage" for check in result.checks)
+
+
+def test_flax_msgpack_large_binary_preserves_normalized_history_for_whitespace_pattern(tmp_path: Path) -> None:
+    path = tmp_path / "large_binary_normalized_history.msgpack"
+    payload = (b"\x00" * 128) + b"eval" + (b" " * (_STREAM_TEXT_OVERLAP_CHARS + 1024)) + b"("
+    create_msgpack_file(path, {"params": {"blob": payload}})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Code Pattern Security Check" and check.details["pattern"] == r"eval\s*\("
+        for check in result.checks
+    )
 
 
 @pytest.mark.parametrize(

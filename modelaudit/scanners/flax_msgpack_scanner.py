@@ -415,9 +415,13 @@ def _advance_ordered_literal_anchors(
     value: str,
     anchor_matchers: tuple[tuple[str, re.Pattern[str]], ...],
     start_index: int,
-    search_floor: int = 0,
+    overlap_length: int = 0,
 ) -> int:
-    search_offset = search_floor if start_index > 0 else 0
+    search_offset = 0
+    if start_index > 0 and overlap_length > 0:
+        remaining_anchor_lengths = [len(anchor) for anchor, _ in anchor_matchers[start_index:]]
+        if remaining_anchor_lengths:
+            search_offset = max(0, overlap_length - max(remaining_anchor_lengths) + 1)
     index = start_index
     while index < len(anchor_matchers):
         match = anchor_matchers[index][1].search(value, search_offset)
@@ -2551,31 +2555,42 @@ class FlaxMsgpackScanner(BaseScanner):
         saw_getattr_call_candidate = False
         saw_getattr_dunder_candidate = False
         raw_tail = b""
+        normalized_tail = ""
 
-        def inspect_window(raw_bytes: bytes, normalized_search_floor: int) -> None:
+        def inspect_window(raw_bytes: bytes, normalized_window: str, normalized_overlap_length: int) -> None:
             nonlocal saw_getattr_call_candidate, saw_getattr_dunder_candidate
             raw_window_lower = raw_bytes.lower()
+            normalized_window_lower = normalized_window.lower()
             transform_candidates = [
-                transform for anchor, transform in self._binary_stream_transform_matchers if anchor in raw_window_lower
+                transform
+                for anchor, transform in self._binary_stream_transform_matchers
+                if anchor in raw_window_lower or transform in normalized_window_lower
             ]
             pattern_candidates = [
                 (pattern, compiled_pattern, lowered_pattern)
                 for anchor, pattern, compiled_pattern, lowered_pattern in self._binary_stream_pattern_matchers
                 if pattern not in self._stream_unsafe_pattern_anchors
                 and pattern not in matched_patterns
-                and anchor in raw_window_lower
+                and (anchor in raw_window_lower or anchor.decode("utf-8") in normalized_window_lower)
             ]
             unsafe_pattern_candidates = []
             for pattern, compiled_pattern, lowered_pattern in self._compiled_suspicious_patterns:
                 if pattern not in self._stream_unsafe_pattern_anchors or pattern in matched_patterns:
                     continue
                 anchors = self._stream_unsafe_pattern_anchors[pattern]
-                if anchors is None or any(anchor.lower().encode("utf-8") in raw_window_lower for anchor in anchors):
+                if anchors is None or any(
+                    anchor.lower().encode("utf-8") in raw_window_lower or anchor.lower() in normalized_window_lower
+                    for anchor in anchors
+                ):
                     unsafe_pattern_candidates.append((pattern, compiled_pattern, lowered_pattern))
             inspect_split_getattr_candidate = (
                 track_split_getattr_pattern
                 and _UNBOUNDED_GETATTR_PATTERN not in matched_patterns
-                and (b"getattr" in raw_window_lower or (saw_getattr_call_candidate and b"__" in raw_window_lower))
+                and (
+                    b"getattr" in raw_window_lower
+                    or "getattr" in normalized_window_lower
+                    or (saw_getattr_call_candidate and (b"__" in raw_window_lower or "__" in normalized_window_lower))
+                )
             )
             if (
                 not transform_candidates
@@ -2586,7 +2601,6 @@ class FlaxMsgpackScanner(BaseScanner):
                 return
 
             raw_window = raw_bytes.decode("utf-8", errors="replace")
-            normalized_window = _WHITESPACE_RUN_PATTERN.sub(" ", raw_window)
             if inspect_split_getattr_candidate:
                 previously_saw_getattr_call = saw_getattr_call_candidate
                 raw_getattr_call_end = _find_getattr_call_end(raw_window)
@@ -2640,7 +2654,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     normalized_window,
                     anchor_matchers,
                     previous_anchor_count,
-                    normalized_search_floor,
+                    normalized_overlap_length,
                 )
                 seen_pattern_anchor_counts[pattern] = next_anchor_index
                 if next_anchor_index == len(anchor_matchers):
@@ -2658,12 +2672,13 @@ class FlaxMsgpackScanner(BaseScanner):
         chunk = first_chunk
         while True:
             raw_window_bytes = raw_tail + chunk
-            normalized_search_floor = 0
-            if raw_tail:
-                normalized_tail = _WHITESPACE_RUN_PATTERN.sub(" ", raw_tail.decode("utf-8", errors="replace"))
-                normalized_search_floor = len(normalized_tail)
-            inspect_window(raw_window_bytes, normalized_search_floor)
+            normalized_chunk = _WHITESPACE_RUN_PATTERN.sub(" ", chunk.decode("utf-8", errors="replace"))
+            if normalized_tail.endswith(" ") and normalized_chunk.startswith(" "):
+                normalized_chunk = normalized_chunk[1:]
+            normalized_window = normalized_tail + normalized_chunk
+            inspect_window(raw_window_bytes, normalized_window, len(normalized_tail))
             raw_tail = raw_window_bytes[-_STREAM_TEXT_OVERLAP_CHARS:]
+            normalized_tail = normalized_window[-_STREAM_TEXT_OVERLAP_CHARS:]
             if remaining <= 0:
                 break
             chunk = cursor._read_exact(min(remaining, _STREAM_TEXT_CHUNK_BYTES))
