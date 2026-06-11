@@ -442,7 +442,8 @@ DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN = re.compile(
-    rb"\|\s*(?:(?:/[A-Za-z0-9._-]+)*/)?(?:bash|sh|zsh|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh)\b",
+    rb"\|\s*(?:sudo\s+)?(?:(?:/[A-Za-z0-9._-]+)*/)?"
+    rb"(?:bash|sh|zsh|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh)\b",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_ACTIONABLE_URL_TOKEN_PATTERN = re.compile(
