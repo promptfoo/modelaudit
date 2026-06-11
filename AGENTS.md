@@ -48,7 +48,7 @@ PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest -n auto -m "not slow and not integra
 2. **Plan:** For anything non-trivial, present a short multi-step plan; refine iteratively.
 3. **Implement:** Preserve security focus, follow `BaseScanner` patterns (see `docs/agents/architecture.md`), handle missing deps gracefully, and update `SCANNER_REGISTRY` when adding scanners.
 4. **Verify:** Run the validation commands above. Format/linters must be clean. Use targeted `pytest` when appropriate, and type-check modified tests as part of the normal `mypy modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/` pass.
-5. **Report:** Summarize changes with file references and note residual risks or follow-ups.
+5. **Report:** Summarize changes with file references and note residual risks or follow-ups. If investigation disproves the issue or finds only baseline/external noise, report the evidence and stop instead of manufacturing a code change.
 
 ## Branch & Git Hygiene
 
@@ -75,6 +75,8 @@ gh pr create --title "feat: descriptive title" --body "Brief description"
 
 - Use non-interactive flags (`--no-edit`, `-m`). One command per invocation; avoid long `&&` chains.
 - When updating an existing PR, confirm the actual head branch with `gh pr view <number> --json headRefName` and sync that branch before editing or pushing.
+- Before final "ready", review, merge-safety, or publication claims, refresh the remote head, current base/merge-base, unresolved actionable threads, mergeability, and relevant CI/checks against the same head. If the head or base moved, treat prior conclusions as stale and re-run the affected validation.
+- After pushing, confirm the remote branch matches the intended local head before requesting review, resolving threads, or making merge/CI claims.
 - If `.git/index.lock` exists and no git process is running, remove the lock file.
 - Add only intended paths; avoid committing artifacts. Prefer `gh run rerun <run-id>` over force-pushing to rerun CI.
 - Keep CHANGELOG entries in `[Unreleased]` when adding user-visible changes (Keep a Changelog format).
@@ -121,15 +123,19 @@ PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest -n auto -m "not slow and not integra
 - Use typed pytest tests: add `-> None`, annotate fixtures like `tmp_path: Path` / `monkeypatch: pytest.MonkeyPatch`, and prefer `pathlib` over `os.path`.
 - Keep fixtures deterministic and self-contained under `tmp_path`; never rely on host paths or global temp filenames.
 - If a new regression test must run on reduced CI lanes, add the file to `allowed_test_files` in `tests/conftest.py`.
-- Match local validation to the CI lane that will exercise the change when possible; if optional dependencies or Python-version gates prevent that, call it out explicitly in the PR.
+- Match local validation to the CI lane that will exercise the change when possible. When CI fails, identify the exact lane and validate against that lane's package boundary, Python/platform, and optional-dependency profile; if local reproduction is blocked, call out why in the PR.
 - Disable telemetry for local validation unless the task explicitly tests telemetry behavior: prefix pytest runs with `PROMPTFOO_DISABLE_TELEMETRY=1` (or `NO_ANALYTICS=1`). Requests to contact `a.promptfoo.app` during normal unit, scanner, or integration-excluded test runs are ok and expected for this project; approve them when the test runner requests access. Telemetry tests should still mock the transport or make network intent explicit before running.
+- For reproductions and external-artifact scans, verify the imported `modelaudit` / `modelaudit_picklescan` path and isolate mutable caches, credentials, telemetry, and module state before attributing behavior to scanner code.
+- For remote/model QA, record the immutable revision plus declared artifacts, sizes, recognized formats, and required companion files before scanning. Classify docs, metadata, cache files, generated sidecars, and resource-blocked files separately from executable model artifacts.
+- Use pinned, bounded real artifacts to corroborate routing or real-format behavior, but keep deterministic malicious-positive and benign near-match fixtures as the regression source of truth.
 - For file routing, prefiltering, or archive-triage changes, add at least one malicious positive regression and one benign near-match negative regression.
 - Reuse shared fixture helpers for container formats. For PyTorch ZIP tests, prefer
   `tests.helpers.create_mock_pytorch_zip`; if you hand-roll a ZIP-backed `.pt`/`.pkl`,
   include minimal PyTorch markers like `version` or `byteorder` so routing matches
   production.
 - Prefer trusted file structure or bounded content sniffing over suffix-only routing. Extension checks are a fallback, not a source of truth.
-- When a scan intentionally fails closed for coverage or safety reasons, make the behavior operationally explicit and test the message plus the relevant `success`, exit-code, and cache semantics.
+- When a scan intentionally fails closed for coverage, safety, or scanner-error reasons, make the behavior operationally explicit and test the message plus the relevant `success`, exit-code, status/verdict, finding precedence, and cache semantics.
+- If broad validation fails outside the diff, rerun exact failing nodes when possible and compare against current `main` or exact-head CI before treating the failure as branch-caused.
 
 ## CVE Detection Checklist
 
