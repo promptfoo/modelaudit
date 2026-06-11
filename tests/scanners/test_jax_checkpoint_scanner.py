@@ -2556,6 +2556,27 @@ def test_metadata_symlink_selects_owner_without_content_probe(
     assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is True
 
 
+@pytest.mark.usefixtures("requires_symlinks")
+def test_dangling_metadata_symlink_fails_closed_during_direct_scan(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "dangling-orbax-metadata"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "metadata.json").symlink_to(checkpoint_dir / "missing-metadata.json")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_dir)) is True
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "jax_orbax_metadata_read_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Orbax Metadata Read Check"
+        and check.status == CheckStatus.FAILED
+        and check.location == str(checkpoint_dir / "metadata.json")
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize(
     "metadata",
     [

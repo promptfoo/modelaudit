@@ -441,14 +441,6 @@ def _directory_owner_snapshot_entry(
     )
 
 
-def _directory_owner_root_is_link_like(root_path: Path) -> bool:
-    """Return whether the requested logical owner root is a lexical link."""
-    try:
-        return _directory_owner_snapshot_entry(root_path, ()).entry_type == "link"
-    except OSError:
-        return False
-
-
 @contextmanager
 def _bound_directory_owner_scan_path(root_path: Path) -> Iterator[str]:
     """Yield a descriptor-backed owner root when the platform exposes one."""
@@ -2828,8 +2820,8 @@ def scan_model_directory_or_file(
                         directory_owner_snapshot_failure_reason,
                         directory_owner_snapshot_failure_details,
                     ) = directory_owner_snapshot_failure(error)
-                    directory_owner_snapshot_failure_allows_child_walk = _directory_owner_root_is_link_like(
-                        owner_root_path,
+                    directory_owner_snapshot_failure_allows_child_walk = (
+                        directory_owner_snapshot_failure_reason == "directory_owner_snapshot_incomplete"
                     )
                     if directory_owner_snapshot_failure_allows_child_walk:
                         directory_owner_snapshot_failure_details["child_walk_continued"] = True

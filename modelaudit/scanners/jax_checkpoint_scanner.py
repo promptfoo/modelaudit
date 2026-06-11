@@ -1378,68 +1378,70 @@ class JaxCheckpointScanner(BaseScanner):
 
         for metadata_file in metadata_files:
             metadata_path = path_obj / metadata_file
-            if metadata_path.exists():
-                if not metadata_path.is_file():
-                    self._add_orbax_metadata_read_failure(
-                        result=result,
-                        metadata_path=metadata_path,
-                        metadata_file=metadata_file,
-                        error="metadata path is not a regular file",
-                    )
-                    continue
-                try:
-                    file_size = metadata_path.stat().st_size
-                except OSError as e:
-                    self._add_orbax_metadata_read_failure(
-                        result=result,
-                        metadata_path=metadata_path,
-                        metadata_file=metadata_file,
-                        error=e,
-                    )
-                    continue
+            try:
+                metadata_stat = metadata_path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                self._add_orbax_metadata_read_failure(
+                    result=result,
+                    metadata_path=metadata_path,
+                    metadata_file=metadata_file,
+                    error=e,
+                )
+                continue
+            if not stat.S_ISREG(metadata_stat.st_mode):
+                self._add_orbax_metadata_read_failure(
+                    result=result,
+                    metadata_path=metadata_path,
+                    metadata_file=metadata_file,
+                    error="metadata path is not a regular file",
+                )
+                continue
 
-                accounting.files_scanned += 1
-                accounting.bytes_scanned += min(file_size, JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES)
+            file_size = metadata_stat.st_size
+            accounting.files_scanned += 1
+            accounting.bytes_scanned += min(file_size, JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES)
 
-                if file_size > JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
-                    self._handle_oversized_orbax_metadata(
-                        metadata_path=metadata_path,
-                        metadata_file=metadata_file,
-                        file_size=file_size,
-                        result=result,
-                    )
-                    continue
+            if file_size > JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
+                self._handle_oversized_orbax_metadata(
+                    metadata_path=metadata_path,
+                    metadata_file=metadata_file,
+                    file_size=file_size,
+                    result=result,
+                )
+                continue
 
-                try:
-                    with open(metadata_path, encoding="utf-8") as f:
-                        metadata = json.load(f)
+            try:
+                with open(metadata_path, encoding="utf-8") as f:
+                    metadata = json.load(f)
 
-                    # Analyze metadata for suspicious content
-                    self._analyze_orbax_metadata(metadata, str(metadata_path), result)
+                # Analyze metadata for suspicious content
+                self._analyze_orbax_metadata(metadata, str(metadata_path), result)
 
-                except json.JSONDecodeError as e:
-                    mark_inconclusive_scan_result(result, "jax_orbax_metadata_parse_failed")
-                    result.add_check(
-                        name="Orbax Metadata JSON Validation",
-                        passed=False,
-                        message=f"Invalid JSON in Orbax metadata: {e}",
-                        severity=IssueSeverity.INFO,
-                        location=str(metadata_path),
-                        rule_code="S902",
-                        details={
-                            "error": str(e),
-                            "file": metadata_file,
-                            "analysis_incomplete": True,
-                            "scan_outcome_reason": "jax_orbax_metadata_parse_failed",
-                        },
-                    )
-                except Exception as e:
-                    self._add_orbax_metadata_read_failure(
-                        result=result,
-                        metadata_path=metadata_path,
-                        metadata_file=metadata_file,
-                        error=e,
-                    )
+            except json.JSONDecodeError as e:
+                mark_inconclusive_scan_result(result, "jax_orbax_metadata_parse_failed")
+                result.add_check(
+                    name="Orbax Metadata JSON Validation",
+                    passed=False,
+                    message=f"Invalid JSON in Orbax metadata: {e}",
+                    severity=IssueSeverity.INFO,
+                    location=str(metadata_path),
+                    rule_code="S902",
+                    details={
+                        "error": str(e),
+                        "file": metadata_file,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "jax_orbax_metadata_parse_failed",
+                    },
+                )
+            except Exception as e:
+                self._add_orbax_metadata_read_failure(
+                    result=result,
+                    metadata_path=metadata_path,
+                    metadata_file=metadata_file,
+                    error=e,
+                )
 
         # Scan checkpoint files
         directory_entries_seen = 0

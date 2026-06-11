@@ -1197,6 +1197,17 @@ def test_directory_scan_fails_closed_without_descriptor_owner_binding(
 ) -> None:
     model_dir = tmp_path / "orbax-model"
     metadata_path = _write_orbax_metadata(model_dir, restore_fn="os.system")
+    state_path = model_dir / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "serialization": "orbax",
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+            }
+        ),
+        encoding="utf-8",
+    )
     original_stat = Path.stat
 
     def hide_descriptor_aliases(candidate: Path, *args: Any, **kwargs: Any) -> os.stat_result:
@@ -1210,12 +1221,44 @@ def test_directory_scan_fails_closed_without_descriptor_owner_binding(
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
     owner_metadata = result.file_metadata[str(model_dir)]
 
-    assert result.files_scanned == 1
-    assert result.bytes_scanned == metadata_path.stat().st_size
+    assert result.files_scanned == 2
+    assert result.bytes_scanned == metadata_path.stat().st_size + state_path.stat().st_size
     assert owner_metadata["directory_owner_scan"] is False
     assert owner_metadata["directory_owner_bytes_scanned"] == 0
     assert "directory_owner_scan_failed" in owner_metadata["scan_outcome_reasons"]
     assert owner_metadata["operational_error"] is True
+    assert any(issue.rule_code == "S302" and issue.location == str(metadata_path) for issue in result.issues)
+    assert any(issue.rule_code == "S902" and issue.location == str(state_path) for issue in result.issues)
+    assert determine_exit_code(result) == 2
+
+
+def test_directory_scan_keeps_child_walk_when_owner_snapshot_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "orbax-model"
+    metadata_path = _write_orbax_metadata(model_dir, restore_fn="os.system")
+    original_capture = core_module._capture_directory_owner_namespace
+    capture_calls = 0
+
+    def fail_initial_owner_snapshot(*args: Any, **kwargs: Any) -> Any:
+        nonlocal capture_calls
+        capture_calls += 1
+        if capture_calls == 1:
+            raise OSError("simulated Windows directory snapshot failure")
+        return original_capture(*args, **kwargs)
+
+    monkeypatch.setattr(core_module, "_capture_directory_owner_namespace", fail_initial_owner_snapshot)
+
+    result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+    owner_metadata = result.file_metadata[str(model_dir)]
+
+    assert owner_metadata["directory_owner_scan"] is False
+    assert "directory_owner_snapshot_incomplete" in owner_metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Directory Owner Source Snapshot" and check.details["child_walk_continued"] is True
+        for check in result.checks
+    )
     assert any(issue.rule_code == "S302" and issue.location == str(metadata_path) for issue in result.issues)
     assert determine_exit_code(result) == 2
 
