@@ -1101,6 +1101,7 @@ def _select_huggingface_model_files(
     model_extensions: Collection[str],
     *,
     allow_inaccessible_probe_errors: bool = False,
+    inaccessible_probe_files: list[str] | None = None,
     deadline: float | None = None,
 ) -> list[str]:
     """Select extension-matching files plus bounded content-routed renamed model files."""
@@ -1135,6 +1136,8 @@ def _select_huggingface_model_files(
                     filename,
                     redact_huggingface_urls_in_text(str(exc)),
                 )
+                if inaccessible_probe_files is not None and filename not in inaccessible_probe_files:
+                    inaccessible_probe_files.append(filename)
                 continue
             raise
         if detected_format is None:
@@ -1905,13 +1908,20 @@ def _build_huggingface_model_info(
 ) -> dict[str, Any]:
     """Build selected recursive inventory metadata using the downloader's selection policy."""
     model_extensions = _get_model_extensions()
+    inaccessible_probe_files: list[str] = []
+    allow_inaccessible_probe_errors = _is_huggingface_gated_repo(repo_info)
     model_files = _select_huggingface_model_files(
         repo_id,
         repo_files,
         repo_revision,
         model_extensions,
-        allow_inaccessible_probe_errors=_is_huggingface_gated_repo(repo_info),
+        allow_inaccessible_probe_errors=allow_inaccessible_probe_errors,
+        inaccessible_probe_files=inaccessible_probe_files if allow_inaccessible_probe_errors else None,
     )
+    inventory_files = model_files
+    if not inventory_files and inaccessible_probe_files:
+        inventory_files = list(dict.fromkeys(inaccessible_probe_files))
+    inaccessible_probe_file_set = set(inaccessible_probe_files)
     repo_metadata_sizes = _extract_huggingface_repo_file_sizes(repo_info)
 
     path_size_error: str | None = None
@@ -1919,7 +1929,7 @@ def _build_huggingface_model_info(
     try:
         selected_sizes, size_revision = _get_huggingface_path_sizes(
             repo_id,
-            model_files,
+            inventory_files,
             resolved_revision=repo_revision,
         )
     except Exception as exc:
@@ -1936,15 +1946,15 @@ def _build_huggingface_model_info(
     unknown_size_files: list[str] = []
     inaccessible_gated_files: list[str] = []
 
-    for filename in model_files:
+    for filename in inventory_files:
         path_size = selected_sizes.get(filename)
         size = path_size if isinstance(path_size, int) and not isinstance(path_size, bool) else None
-        inaccessible_gated = False
-        if size is None and path_size_gated:
+        inaccessible_gated = filename in inaccessible_probe_file_set
+        if size is None and (path_size_gated or inaccessible_gated):
             metadata_size = repo_metadata_sizes.get(filename)
             if metadata_size is not None:
                 size = metadata_size
-                inaccessible_gated = True
+            inaccessible_gated = True
 
         file_info: dict[str, Any] = {"name": filename, "size": size}
         if inaccessible_gated:
@@ -1978,7 +1988,7 @@ def _build_huggingface_model_info(
         "inaccessible_gated_files": inaccessible_gated_files[:20],
         "unknown_size_count": unknown_size_count,
         "unknown_size_files": unknown_size_files[:20],
-        "file_count": len(model_files),
+        "file_count": len(inventory_files),
         "repo_file_count": len(repo_files),
         "files": files,
         "inventory_status": inventory_status,

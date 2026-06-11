@@ -3633,6 +3633,49 @@ class TestGetModelInfo:
         mock_detect_content.assert_called_once_with("test/model", "preview.jpg", _HF_TEST_REVISION, ANY)
 
     @patch("huggingface_hub.HfApi")
+    def test_get_model_info_marks_gated_content_probe_only_inventory_incomplete(
+        self,
+        mock_hf_api_class: MagicMock,
+    ) -> None:
+        """Gated content-probe candidates must not disappear into complete empty inventory."""
+        mock_api = MagicMock()
+        mock_hf_api_class.return_value = mock_api
+        mock_api.repo_info.return_value = SimpleNamespace(
+            sha=_HF_TEST_REVISION,
+            modelId="test/model",
+            gated="auto",
+            siblings=[
+                SimpleNamespace(rfilename=".gitattributes", size=64),
+                SimpleNamespace(rfilename="hidden.payload", size=None, lfs=SimpleNamespace(size=4096)),
+            ],
+        )
+        mock_api.get_paths_info.side_effect = RuntimeError("403 Forbidden: gated repository")
+
+        with patch(
+            "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
+            side_effect=PermissionError("401 Unauthorized: gated file https://huggingface.co/test/model?token=secret"),
+        ) as mock_detect_content:
+            info = get_model_info("https://huggingface.co/test/model")
+
+        assert info["revision"] == _HF_TEST_REVISION
+        assert info["inventory_status"] == "gated_inaccessible"
+        assert info["total_size"] == 4096
+        assert info["accessible_size"] == 0
+        assert info["inaccessible_gated_bytes"] == 4096
+        assert info["inaccessible_gated_file_count"] == 1
+        assert info["inaccessible_gated_files"] == ["hidden.payload"]
+        assert info["unknown_size_count"] == 0
+        assert info["file_count"] == 1
+        assert info["files"] == [{"name": "hidden.payload", "size": 4096, "access": "gated"}]
+        assert "secret" not in str(info["inventory_error"])
+        mock_api.get_paths_info.assert_called_once_with(
+            "test/model",
+            ["hidden.payload"],
+            revision=_HF_TEST_REVISION,
+        )
+        mock_detect_content.assert_called_once_with("test/model", "hidden.payload", _HF_TEST_REVISION, ANY)
+
+    @patch("huggingface_hub.HfApi")
     def test_get_model_info_distinguishes_gated_inaccessible_bytes(
         self,
         mock_hf_api_class: MagicMock,
