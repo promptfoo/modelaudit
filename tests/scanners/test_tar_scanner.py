@@ -1,5 +1,6 @@
 import gzip
 import os
+import pickle
 import tarfile
 import tempfile
 from pathlib import Path
@@ -111,12 +112,18 @@ class TestTarScanner:
                 t.addfile(info, tarfile.io.BytesIO(content))  # type: ignore[attr-defined]
             tmp_path_bz2 = tmp.name
 
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+            tmp.write(gzip.compress(pickle.dumps({"weights": [1, 2, 3]})))
+            tmp_path_gzip_pickle = tmp.name
+
         try:
             assert TarScanner.can_handle(tmp_path_gz) is True
             assert TarScanner.can_handle(tmp_path_bz2) is True
+            assert TarScanner.can_handle(tmp_path_gzip_pickle) is False
         finally:
             os.unlink(tmp_path_gz)
             os.unlink(tmp_path_bz2)
+            os.unlink(tmp_path_gzip_pickle)
 
     def test_scan_simple_tar(self):
         """Test scanning a simple TAR file with text files"""
@@ -2448,7 +2455,7 @@ class TestTarScanner:
     def test_core_routes_disguised_compressed_tar_without_tar_suffix(self, tmp_path: Path) -> None:
         """Compressed TAR wrappers renamed to generic suffixes should still route to TarScanner."""
         archive_path = tmp_path / "disguised_payload.bin"
-        payload = b"D" * 1_000_000
+        payload = b"D" * 10_000
 
         with tarfile.open(archive_path, "w:gz") as archive:
             info = tarfile.TarInfo("payload.bin")

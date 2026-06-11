@@ -10,9 +10,10 @@ import os
 import re
 import tarfile
 import tempfile
-from contextlib import ExitStack
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Any, ClassVar, cast
+from typing import Any, BinaryIO, ClassVar, cast
 
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
@@ -55,6 +56,7 @@ TAR_SPARSE_PAX_SIZE_FIELDS = frozenset({"GNU.sparse.size", "GNU.sparse.realsize"
 _GZIP_MAGIC = b"\x1f\x8b"
 _BZIP2_MAGIC = b"BZh"
 _XZ_MAGIC = b"\xfd7zXZ\x00"
+_TAR_HEADER_PROBE_BYTES = 2 * tarfile.BLOCKSIZE
 
 
 class _TarEntryExtractionIncomplete(ValueError):
@@ -121,6 +123,12 @@ class _TarBoundedStream:
 
 def _tar_padded_size(size: int) -> int:
     return ((max(size, 0) + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
+
+
+@contextmanager
+def _open_binary_stream(path: str) -> Iterator[BinaryIO]:
+    with open(path, "rb") as raw:
+        yield raw
 
 
 class _ModelAuditTarInfo(tarfile.TarInfo):
@@ -218,11 +226,11 @@ class TarScanner(BaseScanner):
 
         filename = os.path.basename(path).lower()
         if filename.endswith((".tar.gz", ".tgz")):
-            return cls._detect_compressed_tar_wrapper(path) == "gzip"
+            return cls._compressed_tar_has_valid_header(path, "gzip")
         if filename.endswith((".tar.bz2", ".tbz2")):
-            return cls._detect_compressed_tar_wrapper(path) == "bzip2"
+            return cls._compressed_tar_has_valid_header(path, "bzip2")
         if filename.endswith((".tar.xz", ".txz")):
-            return cls._detect_compressed_tar_wrapper(path) == "xz"
+            return cls._compressed_tar_has_valid_header(path, "xz")
 
         try:
             return tarfile.is_tarfile(path)
@@ -354,7 +362,7 @@ class TarScanner(BaseScanner):
     def _open_tar_stream(self, path: str, stack: ExitStack) -> tuple[tarfile.TarFile, _TarBoundedStream, str | None]:
         """Open a TAR stream through a bounded decompressed-byte reader."""
         compression_codec = self._detect_compressed_tar_wrapper(path)
-        raw = stack.enter_context(open(path, "rb"))  # noqa: SIM115
+        raw = stack.enter_context(_open_binary_stream(path))
         if compression_codec == "gzip":
             decompressed: Any = stack.enter_context(gzip.GzipFile(fileobj=raw, mode="rb"))
         elif compression_codec == "bzip2":
@@ -556,6 +564,48 @@ class TarScanner(BaseScanner):
         if header.startswith(_XZ_MAGIC):
             return "xz"
         return None
+
+    @staticmethod
+    def _looks_like_empty_tar_prefix(prefix: bytes) -> bool:
+        return len(prefix) >= _TAR_HEADER_PROBE_BYTES and prefix[:_TAR_HEADER_PROBE_BYTES] == (
+            b"\0" * _TAR_HEADER_PROBE_BYTES
+        )
+
+    @staticmethod
+    def _tar_header_probe_is_valid(prefix: bytes) -> bool:
+        if TarScanner._looks_like_empty_tar_prefix(prefix):
+            return True
+        if len(prefix) < tarfile.BLOCKSIZE:
+            return False
+        try:
+            tarfile.TarInfo.frombuf(prefix[: tarfile.BLOCKSIZE], encoding="utf-8", errors="surrogateescape")
+        except tarfile.HeaderError:
+            return False
+        return True
+
+    @staticmethod
+    def _read_compressed_tar_header_probe(path: str, compression_codec: str) -> bytes | None:
+        try:
+            with open(path, "rb") as raw:
+                if compression_codec == "gzip":
+                    with gzip.GzipFile(fileobj=raw, mode="rb") as stream:
+                        return stream.read(_TAR_HEADER_PROBE_BYTES)
+                if compression_codec == "bzip2":
+                    with bz2.BZ2File(raw, mode="rb") as stream:
+                        return stream.read(_TAR_HEADER_PROBE_BYTES)
+                if compression_codec == "xz":
+                    with lzma.LZMAFile(raw, mode="rb") as stream:
+                        return stream.read(_TAR_HEADER_PROBE_BYTES)
+        except (EOFError, OSError, lzma.LZMAError):
+            return None
+        return None
+
+    @classmethod
+    def _compressed_tar_has_valid_header(cls, path: str, compression_codec: str) -> bool:
+        if cls._detect_compressed_tar_wrapper(path) != compression_codec:
+            return False
+        prefix = cls._read_compressed_tar_header_probe(path, compression_codec)
+        return prefix is not None and cls._tar_header_probe_is_valid(prefix)
 
     @staticmethod
     def _finalize_tar_stream_size(consumed_size: int) -> int:
@@ -919,6 +969,25 @@ class TarScanner(BaseScanner):
             details={"depth": depth, "max_depth": self.max_depth},
             rule_code=None,
         )
+
+        if self._is_empty_tar_archive(path):
+            result.add_check(
+                name="Entry Count Limit Check",
+                passed=True,
+                message="Entry count (0) is within limits",
+                location=path,
+                details={"entries": 0, "max_entries": self.max_entries},
+                rule_code=None,
+            )
+            self._add_tar_aggregate_size_check(
+                result,
+                path,
+                passed=True,
+                archive_uncompressed_size=0,
+            )
+            result.metadata["contents"] = contents
+            result.finish(success=True)
+            return result
 
         entry_count = 0
         archive_uncompressed_size = 0

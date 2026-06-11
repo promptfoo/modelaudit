@@ -188,18 +188,34 @@ def test_compound_tar_wrappers_route_to_tar_scanner(
     assert scanner.name == "tar"
 
 
-def test_truncated_compound_tar_wrapper_routes_to_tar_scanner_incomplete(tmp_path: Path) -> None:
+def test_truncated_compound_tar_wrapper_routes_to_compressed_scanner_incomplete(tmp_path: Path) -> None:
     archive_path = tmp_path / "truncated.tar.gz"
     archive_path.write_bytes(b"\x1f\x8b\x08\x00\x00\x00\x00\x00")
 
     scanner = get_scanner_for_file(str(archive_path))
 
     assert scanner is not None
-    assert scanner.name == "tar"
+    assert scanner.name == "compressed"
     result = scanner.scan(str(archive_path))
     assert result.success is False
-    assert "tar_scan_incomplete" in result.metadata["scan_outcome_reasons"]
-    assert any(check.name == "TAR File Scan" for check in result.checks)
+    assert "compressed_stream_decode_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "Compressed Wrapper Stream Decode" for check in result.checks)
+
+
+def test_gzip_wrapped_pickle_named_tar_gz_routes_to_compressed_scanner(tmp_path: Path) -> None:
+    archive_path = tmp_path / "malicious.tar.gz"
+    archive_path.write_bytes(gzip.compress(pickle.dumps({"payload": _MaliciousPayload()})))
+
+    scanner = get_scanner_for_file(str(archive_path))
+
+    assert scanner is not None
+    assert scanner.name == "compressed"
+    result = scanner.scan(str(archive_path))
+    routing_checks = [check for check in result.checks if check.name == "Compressed Wrapper Inner Scanner Routing"]
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+    assert routing_checks and routing_checks[0].details["inner_scanner"] == "pickle"
+    assert critical_issues
+    assert any("eval" in issue.message.lower() for issue in critical_issues)
 
 
 @pytest.mark.parametrize(

@@ -168,6 +168,8 @@ _ZIP_MAGIC_SIGNATURES = (
     b"PK\x07\x08",  # data descriptor
 )
 _TAR_BLOCK_SIZE = 512
+_TAR_EMPTY_ARCHIVE_PROBE_BYTES = 2 * _TAR_BLOCK_SIZE
+_TAR_FORMAT_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
 _TAR_USTAR_OFFSET = 257
 _TAR_USTAR_MAGIC_SIZE = 5
 _TAR_USTAR_MIN_BYTES = _TAR_USTAR_OFFSET + _TAR_USTAR_MAGIC_SIZE
@@ -3816,7 +3818,11 @@ def _resolve_tar_hardlink_fallback_member(
     return None
 
 
-def _detect_tar_route(path: str) -> str | None:
+def _path_claims_tar_container(file_path: Path) -> bool:
+    return file_path.name.lower().endswith(_TAR_FORMAT_SUFFIXES)
+
+
+def _detect_tar_route(path: str, *, allow_incomplete_generic_tar_route: bool = False) -> str | None:
     """Return the safe content route for a valid TAR-backed artifact."""
     file_path = Path(path)
     if not file_path.is_file():
@@ -3862,7 +3868,13 @@ def _detect_tar_route(path: str) -> str | None:
                         occupied_names.add(physical_destination)
                     member_size = max(member.size, 0)
                     if member_size > body_skip_budget:
-                        return "tar"
+                        if _tar_links_resolve_to_regular_member(
+                            root_config_links,
+                            members_by_normalized_name,
+                            link_resolution_budget,
+                        ):
+                            return "nemo"
+                        return "tar" if allow_incomplete_generic_tar_route else NEMO_ROUTING_INCONCLUSIVE_FORMAT
                     body_skip_budget -= member_size
                 elif member.issym():
                     destination_name = _resolve_safe_tar_path_through_symlinks(
@@ -3949,7 +3961,7 @@ def _detect_tar_route(path: str) -> str | None:
     except _NemoRouteResolutionLimitExceeded:
         return NEMO_ROUTING_INCONCLUSIVE_FORMAT
     except _NemoRouteProbeBudgetExceeded:
-        return "tar"
+        return "tar" if allow_incomplete_generic_tar_route else NEMO_ROUTING_INCONCLUSIVE_FORMAT
     except (EOFError, OSError, tarfile.TarError):
         return None
 
@@ -4027,6 +4039,15 @@ def _has_valid_tar_checksum_header(header: bytes) -> bool:
 
 def _looks_like_uncompressed_tar_header(header: bytes) -> bool:
     return _has_tar_ustar_signature(header) or _has_valid_tar_checksum_header(header)
+
+
+def _looks_like_empty_tar_archive_header(header: bytes, file_size: int) -> bool:
+    return (
+        file_size >= _TAR_EMPTY_ARCHIVE_PROBE_BYTES
+        and file_size % _TAR_BLOCK_SIZE == 0
+        and len(header) >= _TAR_EMPTY_ARCHIVE_PROBE_BYTES
+        and header[:_TAR_EMPTY_ARCHIVE_PROBE_BYTES] == b"\0" * _TAR_EMPTY_ARCHIVE_PROBE_BYTES
+    )
 
 
 def _has_zip_magic(prefix: bytes) -> bool:
@@ -5712,10 +5733,16 @@ def detect_file_format_from_magic(path: str) -> str:
             return _detect_renamed_tensorflow_protobuf(file_path, size)
 
         with file_path.open("rb") as f:
-            header = f.read(min(size, _TAR_BLOCK_SIZE))
+            header = f.read(min(size, _TAR_EMPTY_ARCHIVE_PROBE_BYTES))
 
-            if _looks_like_uncompressed_tar_header(header):
-                return _detect_tar_route(path) or "tar"
+            if _looks_like_uncompressed_tar_header(header) or _looks_like_empty_tar_archive_header(header, size):
+                return (
+                    _detect_tar_route(
+                        path,
+                        allow_incomplete_generic_tar_route=_path_claims_tar_container(file_path),
+                    )
+                    or "tar"
+                )
 
             magic4 = header[:4]
             magic8 = header[:8]
@@ -5742,7 +5769,12 @@ def detect_file_format_from_magic(path: str) -> str:
             if format_result == "zip" and file_path.suffix.lower() == ".mar" and is_torchserve_mar_archive(path):
                 return "torchserve_mar"
             if format_result in {"gzip", "bzip2", "xz"}:
-                tar_route = _detect_tar_route(path)
+                tar_route = _detect_tar_route(
+                    path,
+                    allow_incomplete_generic_tar_route=_path_claims_tar_container(file_path),
+                )
+                if _path_claims_tar_container(file_path) and tar_route is not None:
+                    return tar_route
                 if tar_route in {"nemo", NEMO_ROUTING_INCONCLUSIVE_FORMAT}:
                     return tar_route
             if format_result != "unknown":
@@ -5890,7 +5922,7 @@ def detect_file_format_for_skip_filter(path: str) -> str:
     if size < 4:
         return "unknown"
 
-    initial_read_size = min(size, max(64, _TAR_BLOCK_SIZE))
+    initial_read_size = min(size, max(64, _TAR_EMPTY_ARCHIVE_PROBE_BYTES))
     with file_path.open("rb") as f:
         prefix = f.read(initial_read_size)
 
@@ -5899,8 +5931,14 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         magic8 = header[:8]
         magic16 = header[:16]
 
-        if _looks_like_uncompressed_tar_header(prefix):
-            return _detect_tar_route(path) or "tar"
+        if _looks_like_uncompressed_tar_header(prefix) or _looks_like_empty_tar_archive_header(prefix, size):
+            return (
+                _detect_tar_route(
+                    path,
+                    allow_incomplete_generic_tar_route=_path_claims_tar_container(file_path),
+                )
+                or "tar"
+            )
 
         llamafile_format = _detect_llamafile_route_format(file_path, magic4)
         if llamafile_format is not None:
@@ -5915,7 +5953,10 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if format_result == "zip":
             return "zip"
         if format_result in {"gzip", "bzip2", "xz", "lz4", "zlib"}:
-            tar_route = _detect_tar_route(path)
+            tar_route = _detect_tar_route(
+                path,
+                allow_incomplete_generic_tar_route=_path_claims_tar_container(file_path),
+            )
             if tar_route is not None:
                 return tar_route
             return format_result
@@ -6022,7 +6063,7 @@ def detect_file_format(path: str) -> str:
 
     # Read first bytes for format detection using a single file handle
     with file_path.open("rb") as f:
-        header = f.read(min(size, _TAR_BLOCK_SIZE))
+        header = f.read(min(size, _TAR_EMPTY_ARCHIVE_PROBE_BYTES))
 
     magic4 = header[:4]
     magic8 = header[:8]
@@ -6070,6 +6111,7 @@ def detect_file_format(path: str) -> str:
         or magic8.startswith(_SEVENZIP_MAGIC)
         or _has_rar_magic(magic8)
         or _looks_like_uncompressed_tar_header(header)
+        or _looks_like_empty_tar_archive_header(header, size)
     )
     if not compression_precedes_safetensors and not has_known_container_magic:
         safetensors_route = _detect_safetensors_content_route(file_path, magic8, size)
@@ -6104,16 +6146,18 @@ def detect_file_format(path: str) -> str:
             return "pickle"
 
     # Compound tar wrappers should route to TAR scanner semantics.
-    if filename_lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
-        tar_route = _detect_tar_route(path)
+    if _path_claims_tar_container(file_path) and filename_lower.endswith(
+        (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
+    ):
+        tar_route = _detect_tar_route(path, allow_incomplete_generic_tar_route=True)
         if tar_route is not None:
             return tar_route
         if _detect_compression_format(header) is not None:
-            return "tar"
+            return "compressed"
         torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
         if _is_torch7_signature(torch7_prefix):
             return "torch7"
-        return "tar"
+        return "unknown"
 
     if ext in _COMPRESSED_EXTENSION_CODECS:
         tar_route = _detect_tar_route(path)
@@ -6130,8 +6174,14 @@ def detect_file_format(path: str) -> str:
         return "sevenzip"
     if _has_rar_magic(magic8):
         return "rar"
-    if _looks_like_uncompressed_tar_header(header):
-        return _detect_tar_route(path) or "tar"
+    if _looks_like_uncompressed_tar_header(header) or _looks_like_empty_tar_archive_header(header, size):
+        return (
+            _detect_tar_route(
+                path,
+                allow_incomplete_generic_tar_route=_path_claims_tar_container(file_path),
+            )
+            or "tar"
+        )
     if compression_format:
         tar_route = _detect_tar_route(path)
         if tar_route is not None:
@@ -6482,11 +6532,20 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
         if ext_format == "tar":
             filename_lower = Path(path).name.lower()
             if filename_lower.endswith((".tar.gz", ".tgz")):
-                return header_format in {"tar", "gzip", "nemo"}
+                return header_format in {"tar", "nemo"} or (
+                    header_format == "gzip"
+                    and _detect_tar_route(path, allow_incomplete_generic_tar_route=True) is not None
+                )
             if filename_lower.endswith((".tar.bz2", ".tbz2")):
-                return header_format in {"tar", "bzip2", "nemo"}
+                return header_format in {"tar", "nemo"} or (
+                    header_format == "bzip2"
+                    and _detect_tar_route(path, allow_incomplete_generic_tar_route=True) is not None
+                )
             if filename_lower.endswith((".tar.xz", ".txz")):
-                return header_format in {"tar", "xz", "nemo"}
+                return header_format in {"tar", "nemo"} or (
+                    header_format == "xz"
+                    and _detect_tar_route(path, allow_incomplete_generic_tar_route=True) is not None
+                )
             return header_format in {"tar", "nemo"}
 
         # Standalone compressed wrappers must match their declared codecs.

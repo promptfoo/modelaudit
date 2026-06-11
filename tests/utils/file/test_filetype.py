@@ -2836,11 +2836,37 @@ def test_detect_file_format_rejects_invalid_zlib_header_near_match(tmp_path: Pat
 
 def test_detect_file_format_tar_wrappers_preserve_tar_routing(tmp_path: Path) -> None:
     tar_gz = tmp_path / "archive.tar.gz"
-    tar_gz.write_bytes(gzip.compress(b"fake tar payload"))
+    with tarfile.open(tar_gz, "w:gz") as archive:
+        info = tarfile.TarInfo("weights.bin")
+        payload = b"weights"
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+
     assert detect_file_format(str(tar_gz)) == "tar"
-    assert detect_file_format_from_magic(str(tar_gz)) == "gzip"
+    assert detect_file_format_from_magic(str(tar_gz)) == "tar"
     assert detect_format_from_extension(str(tar_gz)) == "tar"
     assert validate_file_type(str(tar_gz)) is True
+
+
+def test_detect_file_format_tar_wrapper_requires_inner_tar_header(tmp_path: Path) -> None:
+    tar_gz = tmp_path / "archive.tar.gz"
+    tar_gz.write_bytes(gzip.compress(pickle.dumps({"weights": [1, 2, 3]})))
+
+    assert detect_file_format(str(tar_gz)) == "compressed"
+    assert detect_file_format_from_magic(str(tar_gz)) == "gzip"
+    assert detect_format_from_extension(str(tar_gz)) == "tar"
+    assert validate_file_type(str(tar_gz)) is False
+
+
+def test_detect_file_format_empty_tar_archive(tmp_path: Path) -> None:
+    archive_path = tmp_path / "empty.tar"
+    with tarfile.open(archive_path, "w"):
+        pass
+
+    assert detect_file_format(str(archive_path)) == "tar"
+    assert detect_file_format_from_magic(str(archive_path)) == "tar"
+    assert detect_file_format_for_skip_filter(str(archive_path)) == "tar"
+    assert validate_file_type(str(archive_path)) is True
 
 
 def test_detect_file_format_disguised_compressed_tar_by_content(tmp_path: Path) -> None:
@@ -3290,6 +3316,50 @@ def test_detect_file_format_propagates_inconclusive_compressed_nemo_route(
     assert detect_file_format(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
     assert detect_file_format_from_magic(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
     assert detect_file_format_for_skip_filter(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_fails_closed_when_nemo_body_skip_budget_is_exhausted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.utils.file.detection._NEMO_ROUTE_MAX_BODY_SKIP_BYTES", 64)
+    archive_path = tmp_path / "renamed-model.jpg"
+    with tarfile.open(archive_path, "w") as archive:
+        first_payload = b"x" * 128
+        first_info = tarfile.TarInfo("large-weights.bin")
+        first_info.size = len(first_payload)
+        archive.addfile(first_info, io.BytesIO(first_payload))
+
+        config_payload = b"model:\n  _target_: os.system\n"
+        config_info = tarfile.TarInfo("model_config.yaml")
+        config_info.size = len(config_payload)
+        archive.addfile(config_info, io.BytesIO(config_payload))
+
+    assert detect_file_format(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_canonical_tar_body_skip_budget_hands_to_tar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.utils.file.detection._NEMO_ROUTE_MAX_BODY_SKIP_BYTES", 64)
+    archive_path = tmp_path / "large-archive.tar"
+    with tarfile.open(archive_path, "w") as archive:
+        first_payload = b"x" * 128
+        first_info = tarfile.TarInfo("large-weights.bin")
+        first_info.size = len(first_payload)
+        archive.addfile(first_info, io.BytesIO(first_payload))
+
+        config_payload = b"model:\n  _target_: os.system\n"
+        config_info = tarfile.TarInfo("model_config.yaml")
+        config_info.size = len(config_payload)
+        archive.addfile(config_info, io.BytesIO(config_payload))
+
+    assert detect_file_format(str(archive_path)) == "tar"
+    assert detect_file_format_from_magic(str(archive_path)) == "tar"
+    assert detect_file_format_for_skip_filter(str(archive_path)) == "tar"
 
 
 def test_detect_file_format_disguised_llamafile_by_content(tmp_path: Path) -> None:
