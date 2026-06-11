@@ -7,13 +7,14 @@ import os
 import struct
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
 
-from modelaudit.cli import cli
+from modelaudit.cli import _selected_huggingface_preview_files, cli
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file, scan_model_streaming
 from modelaudit.scanner_results import IssueSeverity
 from modelaudit.scanner_selection import scanner_selection_config_from_inputs
@@ -220,6 +221,21 @@ def test_huggingface_streaming_selector_respects_selected_scanner_ids() -> None:
     assert "renamed.payload" in pytorch_selected
 
 
+def test_hf_preview_filename_selection_uses_posix_hub_paths() -> None:
+    runtime: Any = SimpleNamespace(
+        scannable_extensions=frozenset({".missing"}),
+        scannable_filenames=frozenset({"config.json"}),
+    )
+    files = [
+        {"name": "nested/config.json", "size": 10},
+        {"name": r"nested\config.json", "size": 10},
+    ]
+
+    selected = _selected_huggingface_preview_files(files, runtime)
+
+    assert [item["name"] for item in selected] == ["nested/config.json"]
+
+
 def test_hf_repo_dry_run_preview_does_not_download_or_scan() -> None:
     runner = CliRunner()
     metadata = {
@@ -245,7 +261,7 @@ def test_hf_repo_dry_run_preview_does_not_download_or_scan() -> None:
         )
 
     parsed = parse_click_json_output(result.stdout)
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.output
     assert result.stdout.lstrip().startswith("{")
     assert parsed["files_scanned"] == 0
     assert "Download: skipped (--dry-run)" in result.stderr

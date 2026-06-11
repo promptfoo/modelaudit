@@ -14,7 +14,7 @@ import sys
 import time
 import unicodedata
 from dataclasses import dataclass, field
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, NoReturn
 
 import click
@@ -315,7 +315,10 @@ def _selected_huggingface_preview_files(files: object, runtime: "_ScanRuntimeCon
         if extensions is None:
             selected.append(item)
             continue
-        if any(name_lower.endswith(extension) for extension in extensions) or Path(name_lower).name in filenames:
+        if (
+            any(name_lower.endswith(extension) for extension in extensions)
+            or PurePosixPath(name_lower).name in filenames
+        ):
             selected.append(item)
     return selected
 
