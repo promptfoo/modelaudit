@@ -110,7 +110,17 @@ _GGUF_FETCH_OPTIONS_WITH_VALUE = frozenset(
     }
 )
 _GGUF_FETCH_DESTINATION_OPTIONS_WITH_VALUE = frozenset({"--url", "-uri"})
+_GGUF_FETCH_SHORT_OPTIONS_WITH_SEPARATE_VALUE = frozenset({"a", "d", "h", "m", "o", "u", "x"})
 _GGUF_METADATA_NETWORK_APIS = (
+    "httpx.get",
+    "httpx.post",
+    "httpx.put",
+    "httpx.patch",
+    "httpx.delete",
+    "httpx.head",
+    "httpx.options",
+    "httpx.request",
+    "httpx.stream",
     "requests.get",
     "requests.post",
     "requests.put",
@@ -1201,6 +1211,8 @@ class GgufScanner(BaseScanner):
         if "=" in word:
             option_name, _option_value = word.split("=", 1)
             return option_name in _GGUF_FETCH_OPTIONS_WITH_VALUE
+        if word.startswith("-") and not word.startswith("--") and len(word) > 2:
+            return any(option in _GGUF_FETCH_SHORT_OPTIONS_WITH_SEPARATE_VALUE for option in word[1:])
         return False
 
     @staticmethod
@@ -1405,12 +1417,10 @@ class GgufScanner(BaseScanner):
         return evidence
 
     @classmethod
-    def _iter_metadata_strings(cls, value: Any, *, max_items: int = 1024) -> Iterable[tuple[str, str]]:
+    def _iter_metadata_strings(cls, value: Any) -> Iterable[tuple[str, str]]:
         stack: list[tuple[str, Any]] = [("", value)]
-        visited = 0
-        while stack and visited < max_items:
+        while stack:
             path, current = stack.pop()
-            visited += 1
             if isinstance(current, str):
                 yield path, current
                 continue

