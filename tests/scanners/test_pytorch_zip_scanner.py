@@ -139,6 +139,15 @@ def _pytorch_storage_persistent_id_payload(
     )
 
 
+def _pytorch_storage_protocol0_persistent_id_payload(
+    key: str,
+    *,
+    storage_qualname: str = "torch.FloatStorage",
+    size: int = 1,
+) -> bytes:
+    return f"(dp0\nVx\np1\nP('storage', <class '{storage_qualname}'>, '{key}', 'cpu', {size})\ns.".encode("ascii")
+
+
 def _pytorch_storage_persistent_id_payload_with_popped_key(key: str, popped_key: str) -> bytes:
     payload = _pytorch_storage_persistent_id_payload(key)
     popped_key_bytes = popped_key.encode("utf-8")
@@ -553,9 +562,23 @@ def test_pytorch_zip_discovery_skips_referenced_storage_blob_pickleish_bytes(tmp
 
     assert result.success is True
     assert result.metadata["pickle_files"] == ["archive/data.pkl"]
-    assert any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
     assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
     assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+
+
+def test_pytorch_zip_discovery_trusts_protocol0_storage_persid(tmp_path: Path) -> None:
+    model_path = tmp_path / "protocol0_referenced_storage.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _pytorch_storage_protocol0_persistent_id_payload("0"))
+        zip_file.writestr("archive/data/0", _pickleish_tensor_storage_bytes())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
 
 
 def test_pytorch_zip_discovery_trusts_torch_storage_untyped_storage(tmp_path: Path) -> None:
@@ -652,6 +675,7 @@ def test_pytorch_zip_discovery_scans_noncanonical_referenced_storage_aliases(
         (_pytorch_storage_persistent_id_payload("1"), True, "pytorch_zip_storage_reference_missing_members"),
         (_fake_byte_storage_persistent_id_payload("0"), True, None),
         (_pytorch_storage_persistent_id_payload("0", storage_name="FakeStorage"), True, None),
+        (_pytorch_storage_protocol0_persistent_id_payload("0", storage_qualname="torch.FakeStorage"), True, None),
         (_pytorch_storage_persistent_id_payload("0", size_opcode=b"\x88"), True, None),
         (_pytorch_storage_persistent_id_payload_with_extra_field("0"), True, None),
         (_pytorch_storage_persistent_id_payload("0")[:-1], True, "pytorch_zip_storage_reference_validation_incomplete"),

@@ -1078,6 +1078,64 @@ def _pytorch_storage_keys_from_pickle_bytes(pickle_data: bytes) -> tuple[set[str
             return None
         return storage_key
 
+    def split_protocol0_persid_fields(text: str) -> list[str] | None:
+        if not text.startswith("(") or not text.endswith(")"):
+            return None
+        fields: list[str] = []
+        start = 1
+        in_quote: str | None = None
+        escaped = False
+        for index, char in enumerate(text[1:-1], start=1):
+            if escaped:
+                escaped = False
+                continue
+            if in_quote is not None:
+                if char == "\\":
+                    escaped = True
+                elif char == in_quote:
+                    in_quote = None
+                continue
+            if char in {"'", '"'}:
+                in_quote = char
+            elif char == ",":
+                fields.append(text[start:index].strip())
+                start = index + 1
+        if in_quote is not None:
+            return None
+        fields.append(text[start:-1].strip())
+        return fields
+
+    def quoted_protocol0_field_value(field: str) -> str | None:
+        if len(field) < 2 or field[0] not in {"'", '"'} or field[-1] != field[0]:
+            return None
+        value = field[1:-1]
+        return None if "\\" in value else value
+
+    def storage_key_from_protocol0_persid(pid_text: Any) -> str | None:
+        text = _coerce_pickle_string_arg(pid_text)
+        if text is None:
+            return None
+        fields = split_protocol0_persid_fields(text)
+        if fields is None or len(fields) != 5:
+            return None
+        if quoted_protocol0_field_value(fields[0]) != "storage":
+            return None
+        storage_type_field = fields[1]
+        if not storage_type_field.startswith("<class '") or not storage_type_field.endswith("'>"):
+            return None
+        module, separator, name = storage_type_field[len("<class '") : -len("'>")].rpartition(".")
+        if not separator or (module, name) not in _PYTORCH_STORAGE_GLOBALS:
+            return None
+        storage_key = quoted_protocol0_field_value(fields[2])
+        if storage_key is None or not _is_ascii_decimal_digits(storage_key):
+            return None
+        if quoted_protocol0_field_value(fields[3]) is None:
+            return None
+        storage_size = fields[4]
+        if not storage_size.isascii() or not storage_size.isdecimal():
+            return None
+        return storage_key
+
     try:
         for opcode_count, (opcode, arg, _pos) in enumerate(pickletools.genops(pickle_data), start=1):
             if opcode_count > _PYTORCH_STORAGE_TRUST_MAX_OPCODES:
@@ -1156,6 +1214,11 @@ def _pytorch_storage_keys_from_pickle_bytes(pickle_data: bytes) -> tuple[set[str
             elif opcode_name == "BINPERSID":
                 pid = stack.pop() if stack else None
                 storage_key = storage_key_from_pid(pid)
+                if storage_key is not None:
+                    referenced_keys.add(storage_key)
+                stack.append(None)
+            elif opcode_name == "PERSID":
+                storage_key = storage_key_from_protocol0_persid(arg)
                 if storage_key is not None:
                     referenced_keys.add(storage_key)
                 stack.append(None)
