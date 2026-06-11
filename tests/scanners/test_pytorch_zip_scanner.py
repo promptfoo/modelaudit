@@ -8341,6 +8341,47 @@ def test_pytorch_zip_static_getattr_module_initialization_side_effect_keeps_s115
     assert _critical_s115_getattr_issues(result)
 
 
+def test_pytorch_zip_static_getattr_executable_class_body_keeps_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "class-body-side-effect.txt"
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n"
+        f"    open({str(marker)!r}, 'w').write('loaded')\n\n"
+        "    def forward(self):\n"
+        "        return None\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
+def test_pytorch_zip_static_getattr_class_namespace_write_keeps_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "def evil(self):\n"
+        "    return None\n\n"
+        "class Detect:\n"
+        "    def forward(self):\n"
+        "        return None\n"
+        "    locals()['forward'] = evil\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
 def test_pytorch_zip_static_getattr_decorated_class_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -8401,6 +8442,29 @@ def test_pytorch_zip_static_getattr_control_flow_post_class_rewrite_keeps_s115(
         "    return None\n\n"
         "if True:\n"
         "    Detect.forward = evil\n",
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
+def test_pytorch_zip_static_getattr_post_class_binding_target_keeps_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Evil:\n"
+        "    def forward(self):\n"
+        "        return None\n\n"
+        "class Detect:\n"
+        "    def forward(self):\n"
+        "        return None\n\n"
+        "for Detect in [Evil]:\n"
+        "    pass\n",
     )
     model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
 

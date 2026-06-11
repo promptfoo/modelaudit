@@ -564,6 +564,49 @@ def test_scan_bytes_static_getattr_module_initialization_side_effect_stays_criti
     assert all(finding.severity == Severity.CRITICAL for finding in findings)
 
 
+def test_scan_bytes_static_getattr_executable_class_body_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "class-body-side-effect.txt"
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n"
+        f"    open({str(marker)!r}, 'w').write('loaded')\n\n"
+        "    def forward(self):\n"
+        "        return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="class-body-side-effect-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_class_namespace_write_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "def evil(self):\n"
+        "    return None\n\n"
+        "class Detect:\n"
+        "    def forward(self):\n"
+        "        return None\n"
+        "    locals()['forward'] = evil\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="class-namespace-write-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
 def test_scan_bytes_static_getattr_decorated_class_stays_critical(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -645,6 +688,16 @@ def test_scan_bytes_static_getattr_decorated_class_stays_critical(
             "    return None\n\n"
             "if True:\n"
             "    Detect.forward = evil\n"
+        ),
+        (
+            "class Evil:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "for Detect in [Evil]:\n"
+            "    pass\n"
         ),
     ],
 )

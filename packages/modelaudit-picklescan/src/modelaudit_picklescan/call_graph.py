@@ -4994,6 +4994,15 @@ def _statement_rebinds_name(statement: ast.stmt, name: str) -> bool:
         return _assignment_target_binds_name(statement.target, name)
     if isinstance(statement, ast.Delete):
         return any(_assignment_target_binds_name(target, name) for target in statement.targets)
+    if isinstance(statement, ast.For | ast.AsyncFor):
+        return _assignment_target_binds_name(statement.target, name)
+    if isinstance(statement, ast.With | ast.AsyncWith):
+        return any(
+            item.optional_vars is not None and _assignment_target_binds_name(item.optional_vars, name)
+            for item in statement.items
+        )
+    if isinstance(statement, ast.ExceptHandler):
+        return statement.name == name
     return False
 
 
