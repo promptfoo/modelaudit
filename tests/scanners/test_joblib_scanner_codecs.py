@@ -29,7 +29,6 @@ from modelaudit.scanners.joblib_scanner import (
     _pickle_without_joblib_numpy_array_data,
     _SafeJoblibUnpickler,
     _validated_numpy_dtype,
-    _validated_reference_positions,
     np,
 )
 
@@ -57,34 +56,68 @@ def _scan_payload(
     filename: str,
     *,
     trust_numpy_array_wrapper: bool = True,
+    trust_numpy_dtype: bool = True,
+    picklescan_trust_numpy_dtype: bool | None = None,
 ) -> ScanResult:
     path = tmp_path / filename
     path.write_bytes(payload)
     original_reference_is_trusted = picklescan_api.import_only_reference_is_proven_trusted
     original_requires_origin_review = picklescan_api.import_only_module_requires_origin_review
+    if picklescan_trust_numpy_dtype is None:
+        picklescan_trust_numpy_dtype = trust_numpy_dtype
 
-    def trust_joblib_wrapper(module: str, name: str) -> bool:
+    def trust_embedded_pickle_reference(module: str, name: str) -> bool:
         if (module, name) in {
             ("joblib.numpy_pickle", "NumpyArrayWrapper"),
-            ("numpy", "dtype"),
             ("numpy", "memmap"),
             ("numpy", "matrix"),
             ("numpy", "ndarray"),
         }:
             return trust_numpy_array_wrapper
+        if (module, name) == ("numpy", "dtype"):
+            return picklescan_trust_numpy_dtype
+        return original_reference_is_trusted(module, name)
+
+    def trust_joblib_validated_reference(module: str, name: str) -> bool:
+        if (module, name) in {
+            ("joblib.numpy_pickle", "NumpyArrayWrapper"),
+            ("numpy", "memmap"),
+            ("numpy", "matrix"),
+            ("numpy", "ndarray"),
+        }:
+            return trust_numpy_array_wrapper
+        if (module, name) == ("numpy", "dtype"):
+            return trust_numpy_dtype
         return original_reference_is_trusted(module, name)
 
     def requires_origin_review(module: str, name: str) -> bool:
         if (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper"):
             return not trust_numpy_array_wrapper
+        if (module, name) == ("numpy", "dtype"):
+            return not picklescan_trust_numpy_dtype
         return original_requires_origin_review(module, name)
 
     _clear_source_sensitive_caches()
     try:
         with (
-            patch("modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted", trust_joblib_wrapper),
-            patch("modelaudit_picklescan.api.import_only_reference_is_proven_trusted", trust_joblib_wrapper),
+            patch(
+                "modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted",
+                trust_joblib_validated_reference,
+            ),
+            patch(
+                "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
+                trust_embedded_pickle_reference,
+            ),
+            patch("modelaudit_picklescan.api.import_only_reference_is_proven_trusted", trust_embedded_pickle_reference),
             patch("modelaudit_picklescan.api.import_only_module_requires_origin_review", requires_origin_review),
+            patch(
+                "modelaudit_picklescan.call_graph.import_only_reference_is_proven_trusted",
+                trust_embedded_pickle_reference,
+            ),
+            patch(
+                "modelaudit_picklescan.call_graph.import_only_module_requires_origin_review",
+                requires_origin_review,
+            ),
         ):
             return JoblibScanner().scan(str(path))
     finally:
@@ -571,6 +604,103 @@ def test_scan_keeps_untrusted_numpy_wrapper_origin_review_after_valid_raw_array(
     assert any(has_numpy_wrapper_origin_review(finding) for finding in (*result.issues, *result.checks))
 
 
+class _StaticEmbeddedPickleScanner:
+    def __init__(self, result: ScanResult) -> None:
+        self._result = result
+
+    def scan_stream(self, _file_like: object, _file_size: int, *, source: str) -> ScanResult:
+        del _file_like, _file_size, source
+        return self._result
+
+
+def test_scan_keeps_untrusted_numpy_dtype_origin_review_after_valid_raw_array(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _joblib_numpy_list_payload(resumed_ops=_binunicode("done"))
+    embedded_result = ScanResult("pickle")
+    embedded_result.metadata["analysis_incomplete"] = True
+    embedded_result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    embedded_result.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
+    embedded_result.metadata["pickle_report_status"] = "inconclusive"
+    embedded_result.metadata["pickle_verdict"] = "suspicious"
+    embedded_result.metadata["import_references"] = [
+        {
+            "import_reference": "numpy.dtype",
+            "module": "numpy",
+            "name": "dtype",
+            "position": 128,
+            "requires_origin_verification": True,
+        }
+    ]
+    embedded_result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="validated dtype",
+        severity=IssueSeverity.WARNING,
+        details={"import_reference": "numpy.dtype", "module": "numpy", "name": "dtype", "position": 128},
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+    )
+    embedded_result.finish(success=False)
+
+    def trust_only_wrapper(module: str, name: str) -> bool:
+        return (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper")
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted",
+        trust_only_wrapper,
+    )
+    scanner = JoblibScanner()
+    scanner.pickle_scanner = _StaticEmbeddedPickleScanner(embedded_result)
+    result = ScanResult("joblib", scanner=scanner)
+
+    scanner._scan_pickle_payload(
+        payload,
+        result,
+        "untrusted_numpy_dtype_origin_review.joblib",
+    )
+    result.finish(success=not result.has_errors)
+
+    assert result.success is False
+    assert result.metadata["pickle_verdict"] == "suspicious"
+    assert "trusted_incomplete_tail" not in result.metadata
+
+    def has_numpy_dtype_origin_review(finding: object) -> bool:
+        details = getattr(finding, "details", None)
+        return isinstance(details, dict) and details.get("import_reference") == "numpy.dtype"
+
+    assert any(has_numpy_dtype_origin_review(finding) for finding in (*result.issues, *result.checks))
+
+
+def test_scan_preserves_unvalidated_numpy_dtype_origin_review_before_valid_raw_array(tmp_path: Path) -> None:
+    payload = _joblib_numpy_list_payload(
+        leading_ops=b"cnumpy\ndtype\n0",
+        resumed_ops=_binunicode("done"),
+    )
+
+    result = _scan_payload(
+        tmp_path,
+        payload,
+        "unvalidated_numpy_dtype_origin_review.joblib",
+        trust_numpy_dtype=True,
+        picklescan_trust_numpy_dtype=False,
+    )
+
+    assert result.success is False
+    assert "trusted_incomplete_tail" not in result.metadata
+    assert any(
+        check.status == CheckStatus.FAILED
+        and check.details.get("import_reference") == "numpy.dtype"
+        and check.details.get("position") == 4
+        for check in result.checks
+    )
+    assert not any(
+        check.status == CheckStatus.FAILED
+        and check.details.get("import_reference") == "numpy.dtype"
+        and check.details.get("position") == 128
+        for check in result.checks
+    )
+
+
 def test_scan_accepts_numpy_matrix_array_payload(tmp_path: Path) -> None:
     payload = _joblib_numpy_list_payload(subclass=("numpy", "matrix"))
 
@@ -609,11 +739,13 @@ def test_scan_preserves_unvalidated_codec_encode_after_numpy_array_payload(tmp_p
     assert "trusted_incomplete_tail" not in result.metadata
 
 
-def test_validated_reference_positions_include_stack_global() -> None:
-    payload = b"\x80\x04\x8c\x05numpy\x94\x8c\x05dtype\x94\x93cnumpy\nndarray\n."
+def test_sanitized_joblib_payload_records_validated_control_occurrences() -> None:
+    sanitized = _pickle_without_joblib_numpy_array_data(_joblib_numpy_list_payload())
 
-    assert _validated_reference_positions(payload, {1}) == frozenset({payload.index(b"\x93")})
-    assert _validated_reference_positions(payload, {2}) == frozenset({payload.index(b"cnumpy\nndarray\n")})
+    assert sanitized is not None
+    assert sanitized.validated_control_occurrences["joblib.numpy_pickle.NumpyArrayWrapper"] == frozenset({1})
+    assert sanitized.validated_control_occurrences["numpy.ndarray"] == frozenset({1})
+    assert sanitized.validated_control_occurrences["numpy.dtype"] == frozenset({1})
 
 
 def test_validated_joblib_wrapper_cleanup_preserves_unvalidated_dtype_occurrence(
@@ -630,8 +762,8 @@ def test_validated_joblib_wrapper_cleanup_preserves_unvalidated_dtype_occurrence
     result.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
     result.metadata["pickle_report_status"] = "inconclusive"
     result.metadata["pickle_verdict"] = "suspicious"
-    validated_details = {"import_reference": "numpy.dtype", "position": 10}
-    unvalidated_details = {"import_reference": "numpy.dtype", "position": 99}
+    validated_details = {"import_reference": "numpy.dtype", "module": "numpy", "name": "dtype", "position": 10}
+    unvalidated_details = {"import_reference": "numpy.dtype", "module": "numpy", "name": "dtype", "position": 99}
     result.checks.extend(
         [
             Check(
@@ -669,7 +801,7 @@ def test_validated_joblib_wrapper_cleanup_preserves_unvalidated_dtype_occurrence
         ]
     )
 
-    JoblibScanner._remove_validated_numpy_array_wrapper_findings(result, frozenset({10}))
+    JoblibScanner._remove_validated_numpy_array_wrapper_findings(result, {"numpy.dtype": frozenset({1})})
 
     remaining_check_positions = [check.details.get("position") for check in result.checks]
     remaining_issue_positions = [issue.details.get("position") for issue in result.issues]
@@ -701,11 +833,11 @@ def test_validated_joblib_wrapper_cleanup_preserves_untrusted_dtype_origin(
         passed=False,
         message="validated dtype",
         severity=IssueSeverity.WARNING,
-        details={"import_reference": "numpy.dtype", "position": 10},
+        details={"import_reference": "numpy.dtype", "module": "numpy", "name": "dtype", "position": 10},
         rule_code="NON_ALLOWLISTED_GLOBAL",
     )
 
-    JoblibScanner._remove_validated_numpy_array_wrapper_findings(result, frozenset({10}))
+    JoblibScanner._remove_validated_numpy_array_wrapper_findings(result, {"numpy.dtype": frozenset({1})})
 
     assert [check.details.get("position") for check in result.checks] == [10]
     assert [issue.details.get("position") for issue in result.issues] == [10]

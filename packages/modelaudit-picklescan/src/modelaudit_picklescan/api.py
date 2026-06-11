@@ -1628,6 +1628,7 @@ def _is_source_independent_call_graph_fingerprint_metadata(metadata: Mapping[str
 def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = None) -> PickleReport:
     import_references = report.metadata.get("import_references")
     callable_invocations = report.metadata.get("callable_invocations", ())
+    suppress_safe_numpy_reconstruct = _pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload)
     enrichment_errors: list[tuple[str, Exception]] = []
     source_fingerprints: Mapping[str, Any] | None = None
     inert_initialization_modules: frozenset[str] = frozenset()
@@ -1652,6 +1653,13 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
             _trusted_reconstruction_global_positions(callable_invocations),
             _trusted_reconstruction_references(callable_invocations),
         )
+        if not suppress_safe_numpy_reconstruct:
+            numpy_reconstruct_positions = _numpy_reconstruct_global_positions(callable_invocations)
+            invocation_classification = (
+                invocation_classification[0],
+                invocation_classification[1] - numpy_reconstruct_positions,
+                invocation_classification[2] - _NUMPY_RECONSTRUCT_REFERENCES,
+            )
     except Exception as error:
         invocation_classification = None
         callable_invocations_complete = False
@@ -1713,6 +1721,7 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
                 analyzed_invocation_global_positions,
                 invocation_load_safe_modules,
                 invocation_classification[1] if invocation_classification is not None else frozenset(),
+                suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
             )
         except Exception as error:
             enrichment_errors.append(("python_import_allowlist_loaded_identity", error))
@@ -1773,7 +1782,6 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
         for finding in updated_report.findings
         if finding.severity == Severity.CRITICAL
     }
-    suppress_safe_numpy_reconstruct = _pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload)
     rce_findings = tuple(
         _call_graph_finding_to_report_finding(updated_report, finding)
         for finding in call_graph_findings
@@ -1931,6 +1939,8 @@ def _with_untrusted_invoked_allowlisted_import_findings(
     analyzed_invocation_global_positions: frozenset[int],
     invocation_load_safe_modules: frozenset[str],
     trusted_reconstruction_global_positions: frozenset[int],
+    *,
+    suppress_safe_numpy_reconstruct: bool,
 ) -> PickleReport:
     if not invoked_global_positions:
         return report
@@ -1966,6 +1976,7 @@ def _with_untrusted_invoked_allowlisted_import_findings(
                 analyzed_invocation_global_positions,
                 invocation_load_safe_modules,
                 trusted_reconstruction_global_positions,
+                suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
             )
         ):
             continue
@@ -2012,8 +2023,12 @@ def _invoked_allowlisted_import_reference_is_proven_safe(
     analyzed_invocation_global_positions: frozenset[int],
     invocation_load_safe_modules: frozenset[str],
     trusted_reconstruction_global_positions: frozenset[int],
+    *,
+    suppress_safe_numpy_reconstruct: bool,
 ) -> bool:
     if not import_only_reference_is_proven_trusted(module, name):
+        return False
+    if (module, name) in _NUMPY_RECONSTRUCT_REFERENCES and not suppress_safe_numpy_reconstruct:
         return False
     if position in trusted_reconstruction_global_positions:
         return True
@@ -2146,6 +2161,18 @@ def _invoked_global_positions(callable_invocations: object) -> frozenset[int]:
         invocation = _mapping(raw_invocation)
         position = _optional_int(invocation.get("global_position"))
         if position is not None:
+            positions.add(position)
+    return frozenset(positions)
+
+
+def _numpy_reconstruct_global_positions(callable_invocations: object) -> frozenset[int]:
+    positions: set[int] = set()
+    for raw_invocation in _sequence(callable_invocations):
+        invocation = _mapping(raw_invocation)
+        position = _optional_int(invocation.get("global_position"))
+        module = str(invocation.get("module", ""))
+        name = str(invocation.get("name", ""))
+        if position is not None and (module, name) in _NUMPY_RECONSTRUCT_REFERENCES:
             positions.add(position)
     return frozenset(positions)
 
@@ -2528,7 +2555,7 @@ def _numpy_ndarray_build_state_is_safe(state: object) -> bool:
         and _abstract_int_tuple_is_safe(state[1])
         and isinstance(state[2], _AbstractNumpyDType)
         and isinstance(state[3], bool)
-        and _abstract_bytes_value_is_safe(state[4])
+        and (_abstract_bytes_value_is_safe(state[4]) or _abstract_value_is_inert(state[4]))
     )
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import bz2
 import io
 import lzma
@@ -151,7 +152,7 @@ class _JoblibDtypeValidationContext:
     metadata_in_progress: list[object] = field(default_factory=list)
     validated_codec_encode_reduction_ids: set[int] = field(default_factory=set)
     validated_codec_encode_global_ids: set[int] = field(default_factory=set)
-    validated_numpy_array_control_global_ids: set[int] = field(default_factory=set)
+    validated_numpy_dtype_global_ids: set[int] = field(default_factory=set)
 
     def consume(self, amount: int = 1) -> None:
         if amount > self.remaining_work:
@@ -161,6 +162,14 @@ class _JoblibDtypeValidationContext:
     def clear_caches(self) -> None:
         self.dtype_cache.clear()
         self.metadata_cache.clear()
+
+
+@dataclass(frozen=True)
+class _SanitizedJoblibPayload:
+    payload: bytes
+    raw_array_count: int
+    has_only_validated_codec_encodes: bool
+    validated_control_occurrences: dict[str, frozenset[int]]
 
 
 def _is_safe_dtype_metadata(
@@ -250,6 +259,7 @@ def _validated_numpy_dtype(
         or not all(type(argument) is bool for argument in dtype_object.args[1:])
     ):
         raise pickle.UnpicklingError("Invalid NumpyArrayWrapper dtype")
+    dtype_reference = dtype_object.reference
 
     object_id = id(dtype_object)
     cached_dtype = context.dtype_cache.get(object_id)
@@ -270,12 +280,10 @@ def _validated_numpy_dtype(
             raise pickle.UnpicklingError("Invalid NumpyArrayWrapper dtype specification") from exc
         if dtype.hasobject:
             raise pickle.UnpicklingError("Object arrays require nested pickle analysis")
-        reference = dtype_object.reference
-        if isinstance(reference, _JoblibPickleGlobal) and reference.occurrence_id is not None:
-            context.validated_numpy_array_control_global_ids.add(reference.occurrence_id)
-
         state = dtype_object.state
         if state is None:
+            if dtype_reference.occurrence_id is not None:
+                context.validated_numpy_dtype_global_ids.add(dtype_reference.occurrence_id)
             context.dtype_cache[object_id] = (dtype_object, dtype)
             return dtype
         if not isinstance(state, tuple) or len(state) not in {8, 9}:
@@ -350,6 +358,8 @@ def _validated_numpy_dtype(
             context=context,
         ):
             raise pickle.UnpicklingError("Invalid NumpyArrayWrapper dtype metadata")
+        if dtype_reference.occurrence_id is not None:
+            context.validated_numpy_dtype_global_ids.add(dtype_reference.occurrence_id)
         context.dtype_cache[object_id] = (dtype_object, dtype)
         return dtype
     finally:
@@ -367,6 +377,8 @@ class _SafeJoblibUnpickler(pickle._Unpickler):  # type: ignore[attr-defined]
         self.raw_array_spans: list[tuple[int, int]] = []
         self.codec_encode_reduction_ids: set[int] = set()
         self.codec_encode_global_ids: set[int] = set()
+        self.global_ids_by_reference: dict[str, list[int]] = {}
+        self.validated_numpy_array_control_global_ids: set[int] = set()
         self.dtype_validation_context = _JoblibDtypeValidationContext()
         self._global_count = 0
         self._reduction_count = 0
@@ -399,6 +411,7 @@ class _SafeJoblibUnpickler(pickle._Unpickler):  # type: ignore[attr-defined]
     def find_class(self, module: str, name: str) -> _JoblibPickleGlobal:
         self._global_count += 1
         reference = _JoblibPickleGlobal(module, name, self._global_count)
+        self.global_ids_by_reference.setdefault(f"{module}.{name}", []).append(self._global_count)
         if reference == _JoblibPickleGlobal("_codecs", "encode"):
             self.codec_encode_global_ids.add(self._global_count)
         return reference
@@ -551,10 +564,25 @@ class _SafeJoblibUnpickler(pickle._Unpickler):  # type: ignore[attr-defined]
         self._stream.seek(raw_size, io.SEEK_CUR)
         self.raw_array_spans.append((raw_start, self._stream.tell()))
         if isinstance(subclass, _JoblibPickleGlobal) and subclass.occurrence_id is not None:
-            self.dtype_validation_context.validated_numpy_array_control_global_ids.add(subclass.occurrence_id)
-        reference = instance.reference
-        if isinstance(reference, _JoblibPickleGlobal) and reference.occurrence_id is not None:
-            self.dtype_validation_context.validated_numpy_array_control_global_ids.add(reference.occurrence_id)
+            self.validated_numpy_array_control_global_ids.add(subclass.occurrence_id)
+        wrapper_reference = cast(_JoblibPickleGlobal, instance.reference)
+        if wrapper_reference.occurrence_id is not None:
+            self.validated_numpy_array_control_global_ids.add(wrapper_reference.occurrence_id)
+        self.validated_numpy_array_control_global_ids.update(
+            self.dtype_validation_context.validated_numpy_dtype_global_ids
+        )
+
+    def validated_control_occurrences(self) -> dict[str, frozenset[int]]:
+        occurrences: dict[str, frozenset[int]] = {}
+        for import_reference, global_ids in self.global_ids_by_reference.items():
+            validated = {
+                occurrence
+                for occurrence, global_id in enumerate(global_ids, start=1)
+                if global_id in self.validated_numpy_array_control_global_ids
+            }
+            if validated:
+                occurrences[import_reference] = frozenset(validated)
+        return occurrences
 
 
 _SafeJoblibUnpickler.dispatch[pickle.REDUCE[0]] = _SafeJoblibUnpickler.load_reduce
@@ -571,38 +599,7 @@ _SafeJoblibUnpickler.dispatch[pickle.EXT2[0]] = _SafeJoblibUnpickler.load_unsupp
 _SafeJoblibUnpickler.dispatch[pickle.EXT4[0]] = _SafeJoblibUnpickler.load_unsupported_reference
 
 
-def _validated_reference_positions(payload: bytes, occurrence_ids: set[int]) -> frozenset[int]:
-    if not occurrence_ids:
-        return frozenset()
-    positions: set[int] = set()
-    occurrence_id = 0
-    try:
-        for opcode, _arg, position in pickletools.genops(payload):
-            if opcode.name not in {"GLOBAL", "STACK_GLOBAL"}:
-                continue
-            occurrence_id += 1
-            if occurrence_id in occurrence_ids:
-                if position is None:
-                    continue
-                positions.add(position)
-    except Exception:
-        return frozenset()
-    return frozenset(positions)
-
-
-def _import_reference_origin_is_trusted(import_reference: object) -> bool:
-    if not isinstance(import_reference, str):
-        return False
-    module, separator, name = import_reference.rpartition(".")
-    if not separator or not module or not name:
-        return False
-    try:
-        return import_only_reference_is_proven_trusted(module, name)
-    except Exception:
-        return False
-
-
-def _pickle_without_joblib_numpy_array_data(payload: bytes) -> tuple[bytes, int, bool, frozenset[int]] | None:
+def _pickle_without_joblib_numpy_array_data(payload: bytes) -> _SanitizedJoblibPayload | None:
     """Remove only raw ndarray spans proven by static NumpyArrayWrapper state."""
     if b"NumpyArrayWrapper" not in payload:
         return None
@@ -631,12 +628,12 @@ def _pickle_without_joblib_numpy_array_data(payload: bytes) -> tuple[bytes, int,
         and parser.codec_encode_global_ids == parser.dtype_validation_context.validated_codec_encode_global_ids
         and parser.codec_encode_reduction_ids == parser.dtype_validation_context.validated_codec_encode_reduction_ids
     )
-    sanitized_payload = bytes(sanitized)
-    validated_control_positions = _validated_reference_positions(
-        sanitized_payload,
-        parser.dtype_validation_context.validated_numpy_array_control_global_ids,
+    return _SanitizedJoblibPayload(
+        payload=bytes(sanitized),
+        raw_array_count=len(parser.raw_array_spans),
+        has_only_validated_codec_encodes=has_only_validated_codec_encodes,
+        validated_control_occurrences=parser.validated_control_occurrences(),
     )
-    return sanitized_payload, len(parser.raw_array_spans), has_only_validated_codec_encodes, validated_control_positions
 
 
 class JoblibScanner(BaseScanner):
@@ -776,9 +773,12 @@ class JoblibScanner(BaseScanner):
     def _scan_pickle_payload(self, payload: bytes, result: ScanResult, context: str) -> None:
         """Analyze a raw or decompressed pickle payload with CVE and opcode checks."""
         sanitized = _pickle_without_joblib_numpy_array_data(payload)
-        scan_payload, raw_array_count, has_only_validated_codec_encodes, validated_control_positions = (
-            sanitized if sanitized is not None else (payload, 0, False, frozenset())
+        scan_payload = sanitized.payload if sanitized is not None else payload
+        raw_array_count = sanitized.raw_array_count if sanitized is not None else 0
+        has_only_validated_codec_encodes = (
+            sanitized.has_only_validated_codec_encodes if sanitized is not None else False
         )
+        validated_control_occurrences = sanitized.validated_control_occurrences if sanitized is not None else {}
         self._detect_cve_patterns(scan_payload, result, context)
         self._scan_for_joblib_specific_threats(scan_payload, result, context)
 
@@ -803,7 +803,7 @@ class JoblibScanner(BaseScanner):
         if has_only_validated_codec_encodes:
             self._remove_validated_dtype_codec_findings(result)
         if raw_array_count and self._numpy_array_wrapper_origin_is_trusted():
-            self._remove_validated_numpy_array_wrapper_findings(result, validated_control_positions)
+            self._remove_validated_numpy_array_wrapper_findings(result, validated_control_occurrences)
         result.metadata.pop("trusted_incomplete_tail", None)
         result.metadata.pop("trusted_incomplete_tail_reason", None)
         has_security_findings = any(
@@ -849,70 +849,108 @@ class JoblibScanner(BaseScanner):
     @staticmethod
     def _remove_validated_numpy_array_wrapper_findings(
         result: ScanResult,
-        validated_control_positions: frozenset[int],
+        validated_control_occurrences: dict[str, frozenset[int]],
     ) -> None:
-        def is_validated_control_position(finding: Any) -> bool:
-            return finding.details.get("position") in validated_control_positions
+        def validated_candidate_reference(finding: Any) -> str | None:
+            details = getattr(finding, "details", {})
+            if not isinstance(details, dict):
+                return None
+            import_reference = details.get("import_reference")
+            if import_reference not in _VALIDATED_JOBLIB_NUMPY_ARRAY_CONTROL_REFERENCES:
+                return None
+            if (
+                getattr(finding, "rule_code", None) == "NON_ALLOWLISTED_GLOBAL"
+                or details.get("notice_code") == "call_graph_source_unavailable"
+            ):
+                return str(import_reference)
+            return None
 
-        def is_validated_wrapper_finding(finding: Any) -> bool:
-            return (
-                finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-                and finding.details.get("import_reference") in _VALIDATED_JOBLIB_NUMPY_ARRAY_CONTROL_REFERENCES
-                and is_validated_control_position(finding)
-                and _import_reference_origin_is_trusted(finding.details.get("import_reference"))
-            )
-
-        def is_validated_wrapper_source_notice(finding: Any) -> bool:
-            return (
-                finding.details.get("notice_code") == "call_graph_source_unavailable"
-                and finding.details.get("import_reference") in _VALIDATED_JOBLIB_NUMPY_ARRAY_CONTROL_REFERENCES
-                and is_validated_control_position(finding)
-                and _import_reference_origin_is_trusted(finding.details.get("import_reference"))
-            )
-
-        def is_validated_origin_review_reference(reference: Any) -> bool:
-            if not isinstance(reference, dict):
+        def reference_origin_is_trusted(finding: Any) -> bool:
+            details = getattr(finding, "details", {})
+            if not isinstance(details, dict):
                 return False
-            return (
-                reference.get("requires_origin_verification") is True
-                and reference.get("import_reference") in _VALIDATED_JOBLIB_NUMPY_ARRAY_CONTROL_REFERENCES
-                and reference.get("position") in validated_control_positions
-                and _import_reference_origin_is_trusted(reference.get("import_reference"))
-            )
+            module = details.get("module")
+            name = details.get("name")
+            if not isinstance(module, str) or not isinstance(name, str):
+                return False
+            try:
+                return import_only_reference_is_proven_trusted(module, name)
+            except Exception:
+                return False
 
-        removed = (
-            any(is_validated_wrapper_finding(issue) for issue in result.issues)
-            or any(is_validated_wrapper_source_notice(issue) for issue in result.issues)
-            or any(is_validated_wrapper_finding(check) for check in result.checks)
-            or any(is_validated_wrapper_source_notice(check) for check in result.checks)
-        )
-        import_references = result.metadata.get("import_references")
-        origin_review_references = (
-            [
+        def reference_dict_origin_is_trusted(reference: dict[str, Any]) -> bool:
+            module = reference.get("module")
+            name = reference.get("name")
+            if not isinstance(module, str) or not isinstance(name, str):
+                return False
+            try:
+                return import_only_reference_is_proven_trusted(module, name)
+            except Exception:
+                return False
+
+        def finding_position(finding: Any) -> int:
+            details = getattr(finding, "details", {})
+            position = details.get("position") if isinstance(details, dict) else None
+            return position if type(position) is int else 1 << 62
+
+        def reference_position(reference: dict[str, Any]) -> int:
+            position = reference.get("position")
+            return position if type(position) is int else 1 << 62
+
+        def origin_review_references_are_validated() -> bool:
+            import_references = result.metadata.get("import_references")
+            if not isinstance(import_references, list | tuple):
+                return False
+            origin_review_references = [
                 reference
                 for reference in import_references
-                if isinstance(reference, dict) and reference.get("requires_origin_verification") is True
+                if isinstance(reference, dict)
+                and reference.get("requires_origin_verification") is True
+                and reference.get("import_reference") in _VALIDATED_JOBLIB_NUMPY_ARRAY_CONTROL_REFERENCES
             ]
-            if isinstance(import_references, list | tuple)
-            else []
-        )
-        if origin_review_references and all(
-            is_validated_origin_review_reference(reference) for reference in origin_review_references
-        ):
-            removed = True
+            if not origin_review_references:
+                return False
+
+            seen_occurrences: dict[str, int] = {}
+            seen_positions: dict[str, int] = {}
+            for reference in sorted(origin_review_references, key=reference_position):
+                import_reference = str(reference.get("import_reference"))
+                position = reference_position(reference)
+                if seen_positions.get(import_reference) != position:
+                    seen_occurrences[import_reference] = seen_occurrences.get(import_reference, 0) + 1
+                seen_positions[import_reference] = position
+                occurrence = seen_occurrences[import_reference]
+                if occurrence not in validated_control_occurrences.get(
+                    import_reference, frozenset()
+                ) or not reference_dict_origin_is_trusted(reference):
+                    return False
+            return True
+
+        candidates: list[tuple[int, int, str, Any]] = []
+        for sequence, finding in enumerate((*result.issues, *result.checks)):
+            import_reference = validated_candidate_reference(finding)
+            if import_reference is not None:
+                candidates.append((finding_position(finding), sequence, import_reference, finding))
+
+        validated_finding_ids: set[int] = set()
+        seen_occurrences: dict[str, int] = {}
+        seen_positions: dict[str, int] = {}
+        for _position, _sequence, import_reference, finding in sorted(candidates):
+            if seen_positions.get(import_reference) != _position:
+                seen_occurrences[import_reference] = seen_occurrences.get(import_reference, 0) + 1
+            seen_positions[import_reference] = _position
+            occurrence = seen_occurrences[import_reference]
+            if occurrence in validated_control_occurrences.get(
+                import_reference, frozenset()
+            ) and reference_origin_is_trusted(finding):
+                validated_finding_ids.add(builtins.id(finding))
+
+        removed = bool(validated_finding_ids) or origin_review_references_are_validated()
         if not removed:
             return
 
-        result.issues = [
-            issue
-            for issue in result.issues
-            if not is_validated_wrapper_finding(issue) and not is_validated_wrapper_source_notice(issue)
-        ]
-        result.checks = [
-            check
-            for check in result.checks
-            if not is_validated_wrapper_finding(check) and not is_validated_wrapper_source_notice(check)
-        ]
+        result.issues = [issue for issue in result.issues if builtins.id(issue) not in validated_finding_ids]
+        result.checks = [check for check in result.checks if builtins.id(check) not in validated_finding_ids]
         has_security_findings = any(
             issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues
         ) or any(

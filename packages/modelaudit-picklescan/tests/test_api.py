@@ -229,6 +229,7 @@ _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD = (
     b"K\x00tq\x10b\x89h\x03X\x0c\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00"
     b"q\x11h\x05\x86q\x12Rq\x13tq\x14b."
 )
+_MALFORMED_NUMPY_RECONSTRUCT_PAYLOAD = b"cnumpy._core.multiarray\n_reconstruct\n(NtR."
 
 
 def _force_framework_metadata_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -7076,6 +7077,47 @@ def test_scan_bytes_suppresses_safe_numpy_ndarray_reconstruct_call_graph_noise()
     assert not any(finding.severity == Severity.CRITICAL for finding in report.findings)
 
 
+def test_scan_bytes_warns_on_malformed_numpy_reconstruct_before_and_after_numpy_import() -> None:
+    pytest.importorskip("numpy")
+    script = f"""
+import json
+import sys
+
+from modelaudit_picklescan import scan_bytes
+
+payload = {_MALFORMED_NUMPY_RECONSTRUCT_PAYLOAD!r}
+before_loaded = any(name == "numpy" or name.startswith("numpy.") for name in sys.modules)
+before = scan_bytes(payload, source="malformed-numpy-reconstruct-before.pkl")
+import numpy  # noqa: F401
+after = scan_bytes(payload, source="malformed-numpy-reconstruct-after.pkl")
+
+def summarize(report):
+    return {{
+        "verdict": report.verdict.value,
+        "findings": [
+            [finding.rule_code, finding.details.get("import_reference")]
+            for finding in report.findings
+        ],
+    }}
+
+print(json.dumps({{"before_loaded": before_loaded, "before": summarize(before), "after": summarize(after)}}))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    summary = json.loads(completed.stdout)
+    expected_finding = ["NON_ALLOWLISTED_GLOBAL", "numpy._core.multiarray._reconstruct"]
+
+    assert summary["before_loaded"] is False
+    assert summary["before"]["verdict"] == SafetyVerdict.SUSPICIOUS.value
+    assert expected_finding in summary["before"]["findings"]
+    assert summary["after"]["verdict"] == SafetyVerdict.SUSPICIOUS.value
+    assert expected_finding in summary["after"]["findings"]
+
+
 def test_safe_numpy_ndarray_reconstruct_dataflow_fails_closed_after_opcode_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7113,6 +7155,21 @@ def test_safe_numpy_ndarray_reconstruct_dataflow_fails_closed_on_unsafe_follow_o
         and finding.details.get("import_reference") in {"numpy.core.multiarray._reconstruct", "builtins.eval"}
         for finding in report.findings
     )
+
+
+def test_safe_numpy_ndarray_reconstruct_dataflow_accepts_inert_object_array_state() -> None:
+    numpy = pytest.importorskip("numpy")
+    buffer = io.BytesIO()
+    numpy.save(buffer, numpy.array([{"key": "value"}], dtype=object), allow_pickle=True)
+    buffer.seek(0)
+    version = numpy.lib.format.read_magic(buffer)
+    if version == (1, 0):
+        numpy.lib.format.read_array_header_1_0(buffer)
+    elif version == (2, 0):
+        numpy.lib.format.read_array_header_2_0(buffer)
+    payload = buffer.read()
+
+    assert package_api._pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload)
 
 
 def test_safe_numpy_reconstruct_call_graph_suppression_requires_trusted_origin(

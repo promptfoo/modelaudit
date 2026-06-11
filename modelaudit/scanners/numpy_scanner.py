@@ -7,6 +7,8 @@ import io
 import struct
 import sys
 import warnings
+from collections.abc import Callable
+from importlib import import_module
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
 from modelaudit_picklescan.call_graph import import_only_reference_is_proven_trusted
@@ -15,6 +17,25 @@ from ..core_results import mark_operational_scan_error
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
+
+_PicklescanOwnerProof = Callable[[str, str, object], bool]
+_PicklescanPayloadProof = Callable[[bytes | None], bool]
+_picklescan_loaded_site_package_reference_owner_matches: _PicklescanOwnerProof | None
+_picklescan_payload_has_only_safe_numpy_ndarray_reconstruction: _PicklescanPayloadProof | None
+try:
+    from modelaudit_picklescan.call_graph import (
+        _loaded_site_package_reference_owner_matches as _picklescan_loaded_site_package_reference_owner_matches,
+    )
+except ImportError:
+    _picklescan_loaded_site_package_reference_owner_matches = None
+try:
+    from modelaudit_picklescan import api as _picklescan_api
+
+    _picklescan_payload_has_only_safe_numpy_ndarray_reconstruction = (
+        _picklescan_api._pickle_payload_has_only_safe_numpy_ndarray_reconstruction
+    )
+except (ImportError, AttributeError):
+    _picklescan_payload_has_only_safe_numpy_ndarray_reconstruction = None
 
 # Import NumPy with compatibility handling
 try:
@@ -70,18 +91,40 @@ _VALIDATED_NUMPY_OBJECT_DTYPE_RECONSTRUCTION_REFERENCES = frozenset(
         "numpy.ndarray",
     }
 )
+_VALIDATED_NUMPY_OBJECT_DTYPE_RECONSTRUCT_REFERENCES = frozenset(
+    {
+        "numpy._core.multiarray._reconstruct",
+        "numpy.core.multiarray._reconstruct",
+    }
+)
+_NUMPY_OBJECT_SAFE_RECONSTRUCT_PROOF_MAX_BYTES = 10 * 1024 * 1024
 NUMPY_HEADER_MAX_SIZE = 10_000
 NUMPY_V3_HEADER_MAX_BYTES = NUMPY_HEADER_MAX_SIZE * 4
 
 
-def _import_reference_origin_is_trusted(import_reference: object) -> bool:
-    if not isinstance(import_reference, str):
-        return False
-    module, separator, name = import_reference.rpartition(".")
-    if not separator or not module or not name:
-        return False
+def _numpy_object_reconstruction_reference_is_trusted(module: str, name: str) -> bool:
     try:
-        return import_only_reference_is_proven_trusted(module, name)
+        if import_only_reference_is_proven_trusted(module, name):
+            return True
+    except Exception:
+        pass
+
+    try:
+        if _picklescan_loaded_site_package_reference_owner_matches is None:
+            return False
+        module_object = import_module(module)
+        value = getattr(module_object, name)
+        return _picklescan_loaded_site_package_reference_owner_matches(module, name, value)
+    except Exception:
+        return False
+
+
+def _numpy_object_payload_has_safe_reconstruct_proof(payload: bytes) -> bool:
+    try:
+        return (
+            _picklescan_payload_has_only_safe_numpy_ndarray_reconstruction is not None
+            and _picklescan_payload_has_only_safe_numpy_ndarray_reconstruction(payload)
+        )
     except Exception:
         return False
 
@@ -267,13 +310,27 @@ class NumPyScanner(BaseScanner):
         )
 
     @staticmethod
-    def _remove_validated_numpy_object_reconstruction_findings(result: ScanResult) -> None:
+    def _remove_validated_numpy_object_reconstruction_findings(
+        result: ScanResult,
+        *,
+        safe_numpy_reconstruct_payload: bool,
+    ) -> None:
         def is_validated_numpy_object_reconstruction(item: Check | Issue) -> bool:
-            return (
-                item.rule_code == "NON_ALLOWLISTED_GLOBAL"
-                and item.details.get("import_reference") in _VALIDATED_NUMPY_OBJECT_DTYPE_RECONSTRUCTION_REFERENCES
-                and _import_reference_origin_is_trusted(item.details.get("import_reference"))
-            )
+            if (
+                item.rule_code != "NON_ALLOWLISTED_GLOBAL"
+                or item.details.get("import_reference") not in _VALIDATED_NUMPY_OBJECT_DTYPE_RECONSTRUCTION_REFERENCES
+            ):
+                return False
+            if (
+                item.details.get("import_reference") in _VALIDATED_NUMPY_OBJECT_DTYPE_RECONSTRUCT_REFERENCES
+                and not safe_numpy_reconstruct_payload
+            ):
+                return False
+            module = item.details.get("module")
+            name = item.details.get("name")
+            if not isinstance(module, str) or not isinstance(name, str):
+                return False
+            return _numpy_object_reconstruction_reference_is_trusted(module, name)
 
         result.issues = [issue for issue in result.issues if not is_validated_numpy_object_reconstruction(issue)]
         result.checks = [check for check in result.checks if not is_validated_numpy_object_reconstruction(check)]
@@ -502,6 +559,16 @@ class NumPyScanner(BaseScanner):
                             )
 
                             f.seek(data_offset)
+                            embedded_payload_proof = f.read(
+                                min(
+                                    file_size - data_offset,
+                                    _NUMPY_OBJECT_SAFE_RECONSTRUCT_PROOF_MAX_BYTES + 1,
+                                )
+                            )
+                            safe_numpy_reconstruct_payload = _numpy_object_payload_has_safe_reconstruct_proof(
+                                embedded_payload_proof
+                            )
+                            f.seek(data_offset)
                             embedded_result = self._scan_embedded_pickle_payload(
                                 f,
                                 file_size - data_offset,
@@ -510,6 +577,10 @@ class NumPyScanner(BaseScanner):
 
                             pickle_end_offset = embedded_result.metadata.get("first_pickle_end_pos")
                             if isinstance(pickle_end_offset, int) and pickle_end_offset < file_size:
+                                if data_offset <= pickle_end_offset <= data_offset + len(embedded_payload_proof):
+                                    safe_numpy_reconstruct_payload = _numpy_object_payload_has_safe_reconstruct_proof(
+                                        embedded_payload_proof[: pickle_end_offset - data_offset]
+                                    )
                                 trailing_bytes = file_size - pickle_end_offset
                                 result.issues.extend(
                                     issue
@@ -521,7 +592,10 @@ class NumPyScanner(BaseScanner):
                                     for check in embedded_result.checks
                                     if not self._is_trailing_pickle_parse_noise(check)
                                 )
-                                self._remove_validated_numpy_object_reconstruction_findings(result)
+                                self._remove_validated_numpy_object_reconstruction_findings(
+                                    result,
+                                    safe_numpy_reconstruct_payload=safe_numpy_reconstruct_payload,
+                                )
                                 result.add_check(
                                     name="File Integrity Check",
                                     passed=False,
@@ -544,7 +618,10 @@ class NumPyScanner(BaseScanner):
 
                             result.issues.extend(embedded_result.issues)
                             result.checks.extend(embedded_result.checks)
-                            self._remove_validated_numpy_object_reconstruction_findings(result)
+                            self._remove_validated_numpy_object_reconstruction_findings(
+                                result,
+                                safe_numpy_reconstruct_payload=safe_numpy_reconstruct_payload,
+                            )
 
                             # Object-dtype .npy payloads are stored as a pickle stream rather than
                             # fixed-width element data, so the numeric dtype/size validation path
