@@ -4435,7 +4435,15 @@ def scan_model_streaming(
                 }
                 if base_dir is not None:
                     scan_config.setdefault(REPOSITORY_SCAN_ROOT_CONFIG_KEY, str(base_dir))
-                    repository_current_file = _repository_member_path_for_scan(str(source_path), base_dir)
+                    repository_member_base_dir = base_dir
+                    configured_repository_root = scan_config.get(REPOSITORY_SCAN_ROOT_CONFIG_KEY)
+                    if isinstance(configured_repository_root, str) and configured_repository_root.strip():
+                        with suppress(OSError, RuntimeError, ValueError):
+                            repository_member_base_dir = Path(configured_repository_root).resolve()
+                    repository_current_file = _repository_member_path_for_scan(
+                        str(source_path),
+                        repository_member_base_dir,
+                    )
                     if repository_current_file is not None:
                         scan_config[REPOSITORY_CURRENT_FILE_CONFIG_KEY] = repository_current_file
                 initial_shard_target = _snapshot_validated_shard_target(

@@ -261,6 +261,19 @@ def _assert_pytorch_version_provenance(
     return provenance
 
 
+def _write_torch_distribution_metadata(root: Path, version: str) -> Path:
+    safe_version = version.replace("+", "_").replace("-", "_")
+    dist_info = root / f"torch-{safe_version}.dist-info"
+    dist_info.mkdir(parents=True, exist_ok=True)
+    (dist_info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: torch\nVersion: {version}\n")
+    return dist_info
+
+
+def _write_minimal_safetensors(path: Path) -> None:
+    header = b"{}"
+    path.write_bytes(struct.pack("<Q", len(header)) + header)
+
+
 def _forbid_torch_import(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     import builtins
 
@@ -7997,18 +8010,42 @@ def test_pytorch_zip_version_selection_ignores_metadata_when_torch_unavailable(
     assert source is None
 
 
+def test_pytorch_zip_unknown_runtime_emits_skipped_cve_applicability_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
+    scanner = PyTorchZipScanner()
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    monkeypatch.setattr(scanner, "_trusted_python_package_roots", lambda: ())
+
+    result = scanner.scan(str(model_path))
+
+    skipped_checks = [
+        check
+        for check in result.checks
+        if check.status == CheckStatus.SKIPPED
+        and check.details.get("runtime_cve_applicability") == "unknown"
+        and check.details.get("runtime_version_known") is False
+    ]
+    skipped_cve_ids = {str(check.details["cve_id"]) for check in skipped_checks}
+    assert skipped_cve_ids == set(_PYTORCH_RUNTIME_CVE_IDS)
+    for check in skipped_checks:
+        assert check.severity == IssueSeverity.INFO
+        assert check.details["runtime_cve_version_gate"] == "local_environment_only"
+        assert check.details["analysis_incomplete"] is True
+    assert result.success is True
+    _assert_no_runtime_pytorch_cve_failures(result, _PYTORCH_RUNTIME_CVE_IDS)
+
+
 def test_get_installed_pytorch_version_returns_none_when_torch_not_installed_without_importing_torch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Scanner should not import torch while collecting version context."""
     scanner = PyTorchZipScanner()
 
-    def missing_distribution(name: str) -> str:
-        assert name == "torch"
-        raise importlib_metadata.PackageNotFoundError(name)
-
     monkeypatch.delitem(sys.modules, "torch", raising=False)
-    monkeypatch.setattr(importlib_metadata, "version", missing_distribution)
+    monkeypatch.setattr(scanner, "_trusted_python_package_roots", lambda: ())
     import_calls = _forbid_torch_import(monkeypatch)
 
     assert scanner._get_installed_pytorch_version() is None
@@ -8017,15 +8054,17 @@ def test_get_installed_pytorch_version_returns_none_when_torch_not_installed_wit
 
 def test_get_installed_pytorch_version_returns_none_when_metadata_unavailable_without_importing_torch(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     scanner = PyTorchZipScanner()
 
-    def unavailable_distribution(name: str) -> str:
-        assert name == "torch"
+    def unavailable_distributions(*args: object, **kwargs: object) -> Iterator[object]:
+        del args, kwargs
         raise RuntimeError("metadata unavailable")
 
     monkeypatch.delitem(sys.modules, "torch", raising=False)
-    monkeypatch.setattr(importlib_metadata, "version", unavailable_distribution)
+    monkeypatch.setattr(scanner, "_trusted_python_package_roots", lambda: (tmp_path / "site-packages",))
+    monkeypatch.setattr(importlib_metadata, "distributions", unavailable_distributions)
     import_calls = _forbid_torch_import(monkeypatch)
 
     assert scanner._get_installed_pytorch_version() is None
@@ -8034,33 +8073,32 @@ def test_get_installed_pytorch_version_returns_none_when_metadata_unavailable_wi
 
 def test_get_installed_pytorch_version_uses_distribution_metadata_without_importing_torch(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Installed torch package metadata is active runtime evidence even before import."""
     scanner = PyTorchZipScanner()
-
-    def distribution_version(name: str) -> str:
-        assert name == "torch"
-        return "2.5.1+cpu"
+    trusted_root = tmp_path / "site-packages"
+    dist_info = _write_torch_distribution_metadata(trusted_root, "2.5.1+cpu")
 
     monkeypatch.delitem(sys.modules, "torch", raising=False)
-    monkeypatch.setattr(importlib_metadata, "version", distribution_version)
+    monkeypatch.setattr(scanner, "_trusted_python_package_roots", lambda: (trusted_root,))
     import_calls = _forbid_torch_import(monkeypatch)
 
     assert scanner._get_installed_pytorch_version() == "2.5.1+cpu"
+    assert scanner._get_installed_pytorch_metadata_path() == str(dist_info.resolve())
     assert not any(name == "torch" or name.startswith("torch.") for name in import_calls)
 
 
 def test_get_installed_pytorch_version_uses_malformed_metadata_conservatively(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     scanner = PyTorchZipScanner()
-
-    def malformed_distribution_version(name: str) -> str:
-        assert name == "torch"
-        return " not-a-version "
+    trusted_root = tmp_path / "site-packages"
+    _write_torch_distribution_metadata(trusted_root, "not-a-version")
 
     monkeypatch.delitem(sys.modules, "torch", raising=False)
-    monkeypatch.setattr(importlib_metadata, "version", malformed_distribution_version)
+    monkeypatch.setattr(scanner, "_trusted_python_package_roots", lambda: (trusted_root,))
     import_calls = _forbid_torch_import(monkeypatch)
 
     installed_version = scanner._get_installed_pytorch_version()
@@ -8078,11 +8116,12 @@ def test_get_installed_pytorch_version_prefers_already_imported_torch_module(
     fake_torch: Any = ModuleType("torch")
     fake_torch.__version__ = "2.4.1+cpu"
 
-    def fail_metadata_lookup(name: str) -> str:
-        raise AssertionError(f"metadata lookup should not run for already-imported {name}")
+    def fail_metadata_lookup(*args: object, **kwargs: object) -> Iterator[object]:
+        del args, kwargs
+        raise AssertionError("metadata lookup should not run for already-imported torch")
 
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    monkeypatch.setattr(importlib_metadata, "version", fail_metadata_lookup)
+    monkeypatch.setattr(importlib_metadata, "distributions", fail_metadata_lookup)
     import_calls = _forbid_torch_import(monkeypatch)
 
     assert scanner._get_installed_pytorch_version() == "2.4.1+cpu"
@@ -8195,13 +8234,11 @@ def test_pytorch_zip_installed_torch_metadata_still_emits_runtime_cves_without_i
     """Installed torch distribution metadata is enough runtime evidence without importing torch."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
     scanner = PyTorchZipScanner()
-
-    def distribution_version(name: str) -> str:
-        assert name == "torch"
-        return "2.5.1"
+    trusted_root = tmp_path / "site-packages"
+    dist_info = _write_torch_distribution_metadata(trusted_root, "2.5.1")
 
     monkeypatch.delitem(sys.modules, "torch", raising=False)
-    monkeypatch.setattr(importlib_metadata, "version", distribution_version)
+    monkeypatch.setattr(scanner, "_trusted_python_package_roots", lambda: (trusted_root,))
     import_calls = _forbid_torch_import(monkeypatch)
 
     result = scanner.scan(str(model_path))
@@ -8213,6 +8250,37 @@ def test_pytorch_zip_installed_torch_metadata_still_emits_runtime_cves_without_i
         assert check.details["detected_pytorch_version"] == "2.5.1"
         assert check.details["pytorch_version_source"] == "local_environment"
         assert check.details["installed_pytorch_version"] == "2.5.1"
+        assert check.details["installed_pytorch_metadata_path"] == str(dist_info.resolve())
+    assert not any(name == "torch" or name.startswith("torch.") for name in import_calls)
+
+
+def test_pytorch_zip_ignores_untrusted_repository_torch_dist_info(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    model_path = create_mock_pytorch_zip(repo_root / "model.pt", prefix="archive")
+    trusted_root = tmp_path / "trusted-site-packages"
+    trusted_dist_info = _write_torch_distribution_metadata(trusted_root, "2.5.1")
+    _write_torch_distribution_metadata(repo_root, "2.10.0")
+
+    scanner = PyTorchZipScanner()
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    monkeypatch.setattr(scanner, "_trusted_python_package_roots", lambda: (trusted_root,))
+    monkeypatch.chdir(repo_root)
+    monkeypatch.syspath_prepend(str(repo_root))
+    import_calls = _forbid_torch_import(monkeypatch)
+
+    result = scanner.scan(str(model_path))
+
+    failed_checks = _failed_runtime_pytorch_version_checks(result, _TASK_23_RUNTIME_CVE_IDS)
+    failed_cve_ids = {(check.details or {}).get("cve_id") for check in failed_checks}
+    assert failed_cve_ids == {"CVE-2025-32434", "CVE-2026-24747"}
+    for check in failed_checks:
+        assert check.details["detected_pytorch_version"] == "2.5.1"
+        assert check.details["installed_pytorch_metadata_path"] == str(trusted_dist_info.resolve())
+        assert str(repo_root) not in check.details["installed_pytorch_metadata_path"]
     assert not any(name == "torch" or name.startswith("torch.") for name in import_calls)
 
 
@@ -8223,13 +8291,11 @@ def test_pytorch_zip_malformed_torch_metadata_fails_closed_without_import(
     """Malformed installed torch metadata is treated as vulnerable runtime evidence."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
     scanner = PyTorchZipScanner()
-
-    def malformed_distribution_version(name: str) -> str:
-        assert name == "torch"
-        return "not-a-version"
+    trusted_root = tmp_path / "site-packages"
+    _write_torch_distribution_metadata(trusted_root, "not-a-version")
 
     monkeypatch.delitem(sys.modules, "torch", raising=False)
-    monkeypatch.setattr(importlib_metadata, "version", malformed_distribution_version)
+    monkeypatch.setattr(scanner, "_trusted_python_package_roots", lambda: (trusted_root,))
     import_calls = _forbid_torch_import(monkeypatch)
 
     result = scanner.scan(str(model_path))
@@ -8365,6 +8431,18 @@ def test_pytorch_zip_repository_inventory_requires_same_directory_safetensors(tm
     assert check.details["safetensors_available"] is False
 
 
+def test_pytorch_zip_repository_inventory_requires_related_safetensors_name(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "pytorch_model.bin", prefix="archive")
+    scanner = PyTorchZipScanner(
+        config={REPOSITORY_FILE_INVENTORY_CONFIG_KEY: ("pytorch_model.bin", "unrelated.safetensors")}
+    )
+
+    result = scanner.scan(str(model_path))
+
+    check = _weights_only_analysis_check(result)
+    assert check.details["safetensors_available"] is False
+
+
 def test_pytorch_zip_local_safetensors_check_ignores_deceptive_directory_and_suffix(tmp_path: Path) -> None:
     model_path = create_mock_pytorch_zip(tmp_path / "pytorch_model.bin", prefix="archive")
     (tmp_path / "model.safetensors").mkdir()
@@ -8374,6 +8452,16 @@ def test_pytorch_zip_local_safetensors_check_ignores_deceptive_directory_and_suf
 
     check = _weights_only_analysis_check(result)
     assert check.details["safetensors_available"] is False
+
+
+def test_pytorch_zip_local_safetensors_check_accepts_framed_related_file(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "pytorch_model.bin", prefix="archive")
+    _write_minimal_safetensors(tmp_path / "model.safetensors")
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    check = _weights_only_analysis_check(result)
+    assert check.details["safetensors_available"] is True
 
 
 def test_pytorch_zip_directory_scan_uses_repository_inventory_for_nested_sibling(tmp_path: Path) -> None:
@@ -8408,6 +8496,31 @@ def test_pytorch_zip_streaming_scan_uses_repository_inventory(tmp_path: Path) ->
 
     repository_config: dict[str, Any] = {
         REPOSITORY_FILE_INVENTORY_CONFIG_KEY: ["pytorch_model.bin", "model.safetensors"]
+    }
+    result = scan_model_streaming(
+        file_generator=file_generator(),
+        scan_root=str(repo_root),
+        delete_after_scan=False,
+        timeout=30,
+        cache_enabled=False,
+        **repository_config,
+    )
+
+    check = next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
+    assert check.details["safetensors_available"] is True
+
+
+def test_pytorch_zip_streaming_scan_uses_repository_inventory_for_nested_sibling(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    nested_dir = repo_root / "sub"
+    nested_dir.mkdir(parents=True)
+    model_path = create_mock_pytorch_zip(nested_dir / "pytorch_model.bin", prefix="archive")
+
+    def file_generator() -> Iterator[tuple[Path, bool]]:
+        yield model_path, True
+
+    repository_config: dict[str, Any] = {
+        REPOSITORY_FILE_INVENTORY_CONFIG_KEY: ["sub/pytorch_model.bin", "sub/model.safetensors"]
     }
     result = scan_model_streaming(
         file_generator=file_generator(),

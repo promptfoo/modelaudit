@@ -83,6 +83,7 @@ from .utils.helpers.interrupt_handler import interruptible_scan
 from .utils.repository_context import (
     REPOSITORY_CURRENT_FILE_CONFIG_KEY,
     REPOSITORY_FILE_INVENTORY_CONFIG_KEY,
+    REPOSITORY_SCAN_ROOT_CONFIG_KEY,
 )
 from .utils.sources.cloud_storage import (
     download_from_cloud,
@@ -101,6 +102,7 @@ from .utils.sources.huggingface import (
     is_huggingface_file_url,
     is_huggingface_url,
     parse_huggingface_file_url,
+    parse_huggingface_url,
     redact_huggingface_url_for_display,
     redact_huggingface_urls_in_text,
 )
@@ -2684,6 +2686,7 @@ def _resolve_scan_source_for_path(
                 cache_dir=hf_cache_dir,
                 max_size=runtime.max_download_bytes,
                 repository_file_inventory=direct_repository_file_inventory,
+                timeout_seconds=runtime.timeout,
             )
             source_model_id, source_model_source = extract_model_id_from_path(path)
 
@@ -2793,6 +2796,11 @@ def _resolve_scan_source_for_path(
                     hf_stream_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
                 if runtime.hf_stream_include_all_files:
                     hf_stream_kwargs["include_all_files"] = True
+                stream_namespace, stream_repo_name = parse_huggingface_url(path)
+                stream_hf_cache_root = hf_cache_dir / "huggingface"
+                stream_repository_scan_root = stream_hf_cache_root / stream_namespace
+                if stream_repo_name:
+                    stream_repository_scan_root = stream_repository_scan_root / stream_repo_name
                 file_generator = download_model_streaming(
                     path,
                     cache_dir=hf_cache_dir,
@@ -2807,6 +2815,7 @@ def _resolve_scan_source_for_path(
                 if trusted_source_provenance is not None:
                     streaming_kwargs["_trusted_source_provenance"] = trusted_source_provenance
                 streaming_kwargs[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = stream_repository_file_inventory
+                streaming_kwargs[REPOSITORY_SCAN_ROOT_CONFIG_KEY] = str(stream_repository_scan_root)
                 streaming_kwargs.update(_scanner_selection_overrides(runtime))
 
                 streaming_result = scan_model_streaming(
@@ -2819,6 +2828,7 @@ def _resolve_scan_source_for_path(
                     ),
                     timeout=runtime.timeout,
                     delete_after_scan=True,
+                    scan_root=str(stream_hf_cache_root) if runtime.cache_enabled else None,
                     blacklist_patterns=list(blacklist) if blacklist else None,
                     max_file_size=runtime.max_file_size,
                     max_total_size=runtime.max_total_size,

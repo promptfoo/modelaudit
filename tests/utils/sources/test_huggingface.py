@@ -3600,18 +3600,26 @@ class TestHuggingFaceFileURLs:
         downloaded_file = tmp_path / "downloaded_file.bin"
         downloaded_file.write_bytes(b"x" * 1024)
         mock_hf_hub_download.return_value = str(downloaded_file)
-        mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(sha=TEST_COMMIT_SHA)
-        mock_hf_api.return_value.get_paths_info.return_value = [SimpleNamespace(size=1024)]
+        mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(
+            sha=TEST_COMMIT_SHA,
+            siblings=[SimpleNamespace(rfilename="model.bin")],
+        )
+        mock_hf_api.return_value.get_paths_info.return_value = [SimpleNamespace(path="model.bin", size=1024)]
 
         result = download_file_from_hf(
             "https://huggingface.co/test/model/resolve/main/model.bin",
             max_size=1024,
         )
 
-        mock_hf_api.return_value.repo_info.assert_called_once_with("test/model", revision="main")
+        mock_hf_api.return_value.repo_info.assert_called_once_with(
+            "test/model",
+            revision="main",
+            timeout=30.0,
+            files_metadata=False,
+        )
         mock_hf_api.return_value.get_paths_info.assert_called_once_with(
             "test/model",
-            "model.bin",
+            ["model.bin"],
             revision=TEST_COMMIT_SHA,
         )
         mock_hf_hub_download.assert_called_once_with(
@@ -3640,7 +3648,9 @@ class TestHuggingFaceFileURLs:
                 SimpleNamespace(rfilename="model.safetensors"),
             ],
         )
-        mock_hf_api.return_value.get_paths_info.return_value = [SimpleNamespace(size=len(b"weights"))]
+        mock_hf_api.return_value.get_paths_info.return_value = [
+            SimpleNamespace(path="pytorch_model.bin", size=len(b"weights"))
+        ]
         inventory: list[str] = []
 
         result = download_file_from_hf(
@@ -3651,6 +3661,75 @@ class TestHuggingFaceFileURLs:
 
         assert result == downloaded_file
         assert inventory == ["pytorch_model.bin", "model.safetensors"]
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="pytorch_model.bin",
+            revision=TEST_COMMIT_SHA,
+            cache_dir=None,
+        )
+
+    @patch("huggingface_hub.HfApi")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_file_inventory_pins_uncapped_download_to_listed_revision(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_hf_api: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        downloaded_file = tmp_path / "downloaded_file.bin"
+        downloaded_file.write_bytes(b"weights")
+        mock_hf_hub_download.return_value = str(downloaded_file)
+        mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(
+            sha=TEST_COMMIT_SHA,
+            siblings=[
+                SimpleNamespace(rfilename="pytorch_model.bin"),
+                SimpleNamespace(rfilename="model.safetensors"),
+            ],
+        )
+        inventory: list[str] = []
+
+        result = download_file_from_hf(
+            "https://huggingface.co/test/model/resolve/main/pytorch_model.bin",
+            repository_file_inventory=inventory,
+        )
+
+        assert result == downloaded_file
+        assert inventory == ["pytorch_model.bin", "model.safetensors"]
+        mock_hf_api.return_value.get_paths_info.assert_not_called()
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="pytorch_model.bin",
+            revision=TEST_COMMIT_SHA,
+            cache_dir=None,
+        )
+
+    @patch("huggingface_hub.HfApi")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_file_inventory_listing_failure_is_best_effort_without_size_cap(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_hf_api: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        downloaded_file = tmp_path / "downloaded_file.bin"
+        downloaded_file.write_bytes(b"weights")
+        mock_hf_hub_download.return_value = str(downloaded_file)
+        mock_hf_api.return_value.repo_info.side_effect = RuntimeError("offline")
+        inventory: list[str] = []
+
+        result = download_file_from_hf(
+            "https://huggingface.co/test/model/resolve/main/pytorch_model.bin",
+            repository_file_inventory=inventory,
+        )
+
+        assert result == downloaded_file
+        assert inventory == []
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="pytorch_model.bin",
+            revision="main",
+            cache_dir=None,
+        )
 
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
@@ -3660,8 +3739,13 @@ class TestHuggingFaceFileURLs:
         mock_hf_api: MagicMock,
     ) -> None:
         """Oversized direct files should not reach hf_hub_download."""
-        mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(sha=TEST_COMMIT_SHA)
-        mock_hf_api.return_value.get_paths_info.return_value = [SimpleNamespace(size=11 * 1024 * 1024)]
+        mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(
+            sha=TEST_COMMIT_SHA,
+            siblings=[SimpleNamespace(rfilename="model.bin")],
+        )
+        mock_hf_api.return_value.get_paths_info.return_value = [
+            SimpleNamespace(path="model.bin", size=11 * 1024 * 1024)
+        ]
 
         with pytest.raises(Exception, match="exceeds maximum allowed size") as exc_info:
             download_file_from_hf(
@@ -3683,8 +3767,11 @@ class TestHuggingFaceFileURLs:
         file_size: object,
     ) -> None:
         """Capped direct files fail closed when HuggingFace metadata has no valid size."""
-        mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(sha=TEST_COMMIT_SHA)
-        mock_hf_api.return_value.get_paths_info.return_value = [SimpleNamespace(size=file_size)]
+        mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(
+            sha=TEST_COMMIT_SHA,
+            siblings=[SimpleNamespace(rfilename="model.bin")],
+        )
+        mock_hf_api.return_value.get_paths_info.return_value = [SimpleNamespace(path="model.bin", size=file_size)]
 
         with pytest.raises(Exception, match="Unable to determine file size"):
             download_file_from_hf(
@@ -3706,8 +3793,11 @@ class TestHuggingFaceFileURLs:
         downloaded_file = tmp_path / "downloaded_file.bin"
         downloaded_file.write_bytes(b"oversized")
         mock_hf_hub_download.return_value = str(downloaded_file)
-        mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(sha=TEST_COMMIT_SHA)
-        mock_hf_api.return_value.get_paths_info.return_value = [SimpleNamespace(size=4)]
+        mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(
+            sha=TEST_COMMIT_SHA,
+            siblings=[SimpleNamespace(rfilename="model.bin")],
+        )
+        mock_hf_api.return_value.get_paths_info.return_value = [SimpleNamespace(path="model.bin", size=4)]
 
         with pytest.raises(Exception, match=r"Downloaded file size .* exceeds maximum allowed size"):
             download_file_from_hf(
@@ -3725,8 +3815,11 @@ class TestHuggingFaceFileURLs:
     ) -> None:
         """Capped direct files fail closed if the downloaded cache path cannot be verified."""
         mock_hf_hub_download.return_value = str(tmp_path / "missing.bin")
-        mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(sha=TEST_COMMIT_SHA)
-        mock_hf_api.return_value.get_paths_info.return_value = [SimpleNamespace(size=4)]
+        mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(
+            sha=TEST_COMMIT_SHA,
+            siblings=[SimpleNamespace(rfilename="model.bin")],
+        )
+        mock_hf_api.return_value.get_paths_info.return_value = [SimpleNamespace(path="model.bin", size=4)]
 
         with pytest.raises(Exception, match="Unable to verify downloaded file size"):
             download_file_from_hf(
@@ -3742,7 +3835,10 @@ class TestHuggingFaceFileURLs:
         mock_hf_api: MagicMock,
     ) -> None:
         """Metadata preflight errors should not expose direct URL credentials."""
-        mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(sha=TEST_COMMIT_SHA)
+        mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(
+            sha=TEST_COMMIT_SHA,
+            siblings=[SimpleNamespace(rfilename="model.bin")],
+        )
         mock_hf_api.return_value.get_paths_info.side_effect = Exception(
             "HEAD failed for https://huggingface.co/test/model/resolve/main/model.bin?token=hf_secret"
         )

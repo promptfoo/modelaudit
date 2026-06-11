@@ -1149,14 +1149,18 @@ def _list_repo_files_with_timeout(
     repo_id: str,
     timeout_seconds: float = 30,
     *,
+    requested_revision: str | None = None,
     deadline: float | None = None,
 ) -> tuple[list[str] | None, str | None, str | None]:
     """Return repository files, their immutable revision, or a failure reason."""
     if deadline is not None:
+        operation_kwargs: dict[str, Any] = {"repo_id": repo_id, "request_timeout": timeout_seconds}
+        if requested_revision is not None:
+            operation_kwargs["revision"] = requested_revision
         try:
             worker_result = _run_huggingface_worker_with_deadline(
                 "list_repo_files",
-                {"repo_id": repo_id, "request_timeout": timeout_seconds},
+                operation_kwargs,
                 deadline,
                 repo_id,
             )
@@ -1180,7 +1184,10 @@ def _list_repo_files_with_timeout(
     from huggingface_hub import HfApi
 
     try:
-        repo_info = HfApi().repo_info(repo_id, timeout=timeout_seconds, files_metadata=False)
+        repo_info_kwargs: dict[str, Any] = {"timeout": timeout_seconds, "files_metadata": False}
+        if requested_revision is not None:
+            repo_info_kwargs["revision"] = requested_revision
+        repo_info = HfApi().repo_info(repo_id, **repo_info_kwargs)
     except Exception as exc:
         return None, None, str(exc)
 
@@ -1934,6 +1941,7 @@ def download_file_from_hf(
     max_size: int | None = None,
     *,
     repository_file_inventory: list[str] | None = None,
+    timeout_seconds: float | None = None,
 ) -> Path:
     """Download a single file from HuggingFace using direct file URL.
 
@@ -1942,6 +1950,7 @@ def download_file_from_hf(
         cache_dir: Optional cache directory for downloads
         max_size: Optional maximum file size to download; 0 disables the limit
         repository_file_inventory: Optional list filled with repository member names from metadata
+        timeout_seconds: Optional end-to-end acquisition deadline in seconds
 
     Returns:
         Path to the downloaded file
@@ -1955,7 +1964,7 @@ def download_file_from_hf(
     display_url = redact_huggingface_url_for_display(url)
 
     try:
-        from huggingface_hub import HfApi, hf_hub_download
+        from huggingface_hub import hf_hub_download
     except ImportError as e:
         raise ImportError(
             "huggingface-hub package is required for HuggingFace URL support. "
@@ -1968,24 +1977,49 @@ def download_file_from_hf(
 
         size_limit = max_size or None
         download_revision = branch
-        api = HfApi() if size_limit is not None or repository_file_inventory is not None else None
-        repo_info = None
-        if api is not None:
-            repo_info = api.repo_info(repo_id, revision=branch)
-            if repository_file_inventory is not None:
-                repository_file_inventory[:] = _extract_huggingface_repo_files(repo_info) or []
+        deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+        repo_files: list[str] | None = None
+        repo_revision: str | None = None
+        repo_listing_error: str | None = None
+        if size_limit is not None or repository_file_inventory is not None:
+            listing_timeout = 30.0
+            if deadline is not None:
+                listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
+                if listing_timeout <= 0:
+                    raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+            repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
+                repo_id,
+                listing_timeout,
+                requested_revision=branch,
+                deadline=deadline,
+            )
+            inventory_revision: str | None = None
+            if _is_huggingface_commit_sha(repo_revision):
+                assert isinstance(repo_revision, str)
+                inventory_revision = repo_revision
+            elif _is_huggingface_commit_sha(branch):
+                inventory_revision = branch
+            if repository_file_inventory is not None and repo_files is not None and inventory_revision is not None:
+                repository_file_inventory[:] = repo_files
+                download_revision = inventory_revision
 
         if size_limit is not None:
-            assert api is not None
-            assert repo_info is not None
-            pinned_revision = getattr(repo_info, "sha", None)
+            pinned_revision = repo_revision
             if not _is_huggingface_commit_sha(pinned_revision):
-                raise ValueError(f"Unable to determine immutable revision for {display_url}; refusing capped download")
+                error_suffix = f": {repo_listing_error}" if repo_listing_error else ""
+                raise ValueError(
+                    f"Unable to determine immutable revision for {display_url}; refusing capped download{error_suffix}"
+                )
             assert isinstance(pinned_revision, str)
 
-            path_info = api.get_paths_info(repo_id, filename, revision=pinned_revision)
-            file_metadata = path_info[0] if path_info else None
-            file_size = getattr(file_metadata, "size", None)
+            path_sizes, _resolved_revision = _get_huggingface_path_sizes(
+                repo_id,
+                [filename],
+                requested_revision=branch,
+                resolved_revision=pinned_revision,
+                deadline=deadline,
+            )
+            file_size = path_sizes.get(filename)
             if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
                 raise ValueError(f"Unable to determine file size for {display_url}; refusing capped download")
             if file_size > size_limit:
@@ -1994,12 +2028,18 @@ def download_file_from_hf(
                 )
             download_revision = pinned_revision
 
-        # Use hf_hub_download for single file downloads
-        local_path = hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            revision=download_revision,
-            cache_dir=str(cache_dir) if cache_dir else None,
+        download_kwargs: dict[str, Any] = {
+            "repo_id": repo_id,
+            "filename": filename,
+            "revision": download_revision,
+            "cache_dir": str(cache_dir) if cache_dir else None,
+        }
+        local_path = _run_huggingface_download_with_deadline(
+            "hf_hub_download",
+            download_kwargs,
+            deadline,
+            repo_id,
+            direct_download=hf_hub_download,
         )
         downloaded_path = Path(local_path)
         if size_limit is not None:
