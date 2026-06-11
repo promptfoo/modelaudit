@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from glob import escape as escape_glob
 from io import BytesIO
 from pathlib import Path, PurePosixPath
-from typing import Any, cast
+from typing import Any, Literal, cast, overload
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from ..helpers.disk_space import check_disk_space
@@ -55,7 +55,7 @@ _HF_SAFETENSORS_OVERLAP_SIGNATURES: tuple[tuple[str, bytes], ...] = (
     ("compressed", b"\x1f\x8b"),
     ("torch7", b"T7\x00\x00"),
 )
-_HF_SAFETENSORS_PAYLOAD_OVERLAP_SCANNER_IDS: frozenset[str] = frozenset({"compressed", "torch7", "zip"})
+_HF_SAFETENSORS_PAYLOAD_OVERLAP_SCANNER_IDS: frozenset[str] = frozenset({"compressed", "keras_h5", "torch7", "zip"})
 _HF_DOWNLOAD_WORKER_RESULT_PREFIX = "MODELAUDIT_HF_DOWNLOAD_RESULT="
 _POSIX_TERMINATE_SIGNAL = getattr(signal, "SIGTERM", 15)
 _POSIX_KILL_SIGNAL = getattr(signal, "SIGKILL", 9)
@@ -402,7 +402,7 @@ def _remote_safetensors_payload_overlap_gap_scanner_ids(
     if header_len <= 0 or header_len > declared_size - 8 or declared_size <= 8 + header_len:
         return []
     if active_scanner_ids is None:
-        return []
+        return sorted(_HF_SAFETENSORS_PAYLOAD_OVERLAP_SCANNER_IDS)
 
     active = {str(scanner_id).lower() for scanner_id in active_scanner_ids}
     return sorted(_HF_SAFETENSORS_PAYLOAD_OVERLAP_SCANNER_IDS.intersection(active))
@@ -2677,6 +2677,7 @@ def download_model(
         ) from e
 
 
+@overload
 def download_model_streaming(
     url: str,
     cache_dir: Path | None = None,
@@ -2689,6 +2690,40 @@ def download_model_streaming(
     scannable_scanner_ids: Collection[str] | None = None,
     include_all_files: bool = False,
     scanner_config: dict[str, Any] | None = None,
+    _include_scan_results: Literal[False] = False,
+) -> Iterator[tuple[Path, bool]]: ...
+
+
+@overload
+def download_model_streaming(
+    url: str,
+    cache_dir: Path | None = None,
+    show_progress: bool = True,
+    max_size: int | None = None,
+    *,
+    timeout_seconds: float | None = None,
+    scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
+    scannable_scanner_ids: Collection[str] | None = None,
+    include_all_files: bool = False,
+    scanner_config: dict[str, Any] | None = None,
+    _include_scan_results: Literal[True],
+) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any]]: ...
+
+
+def download_model_streaming(
+    url: str,
+    cache_dir: Path | None = None,
+    show_progress: bool = True,
+    max_size: int | None = None,
+    *,
+    timeout_seconds: float | None = None,
+    scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
+    scannable_scanner_ids: Collection[str] | None = None,
+    include_all_files: bool = False,
+    scanner_config: dict[str, Any] | None = None,
+    _include_scan_results: bool = False,
 ) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any]]:
     """Download a model from HuggingFace one file at a time (streaming mode).
 
@@ -2706,10 +2741,12 @@ def download_model_streaming(
         scannable_scanner_ids: Optional exact scanner IDs from scanner selection policy
         include_all_files: Include otherwise-unrecognized files under a bounded fail-closed limit
         scanner_config: Optional scanner configuration to preserve in remote native scans
+        _include_scan_results: Internal opt-in for precomputed trusted source-native scan results
 
     Yields:
-        Tuple of (Path, bool) for downloaded files, or (Path, bool, ScanResult)
-        for trusted source-native header scans.
+        Tuple of (Path, bool) for downloaded files. Internal scan callers that pass
+        _include_scan_results may receive (Path, bool, ScanResult) for trusted
+        source-native header scans.
 
     Raises:
         ValueError: If URL is invalid
@@ -2781,9 +2818,10 @@ def download_model_streaming(
             include_all_files=include_all_files,
             deadline=deadline,
         )
-        safetensors_header_streaming_allowed = scannable_scanner_ids is None or "safetensors" in {
-            str(scanner_id).lower() for scanner_id in scannable_scanner_ids
-        }
+        safetensors_header_streaming_allowed = _include_scan_results and (
+            scannable_scanner_ids is None
+            or "safetensors" in {str(scanner_id).lower() for scanner_id in scannable_scanner_ids}
+        )
         safetensors_header_files = (
             {filename for filename in model_files if PurePosixPath(filename).suffix.lower() == ".safetensors"}
             if safetensors_header_streaming_allowed

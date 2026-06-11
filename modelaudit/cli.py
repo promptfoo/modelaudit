@@ -2783,6 +2783,7 @@ def _resolve_scan_source_for_path(
                     show_progress=runtime.show_progress,
                     max_size=runtime.max_download_bytes,
                     timeout_seconds=runtime.timeout,
+                    _include_scan_results=True,
                     **hf_stream_kwargs,
                 )
 

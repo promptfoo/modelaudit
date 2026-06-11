@@ -2192,7 +2192,7 @@ class TestModelDownloadStreaming:
         mock_requests_get.side_effect = get_side_effect
         mock_hf_hub_download.side_effect = download_side_effect
 
-        results = list(download_model_streaming("https://huggingface.co/test/model"))
+        results = list(download_model_streaming("https://huggingface.co/test/model", _include_scan_results=True))
 
         assert results == [(tmp_path / "pytorch_model.bin", False), (tmp_path / "evil.payload", True)]
         assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
@@ -2557,7 +2557,7 @@ class TestModelDownloadStreaming:
             lambda _repo_id, scanned_filename, _revision, **_kwargs: _fake_remote_safetensors_scan(scanned_filename),
         )
 
-        results = list(download_model_streaming("https://huggingface.co/test/model"))
+        results = list(download_model_streaming("https://huggingface.co/test/model", _include_scan_results=True))
 
         assert len(results) == 1
         path, is_last, scan_result = cast(tuple[Path, bool, Any], results[0])
@@ -2565,6 +2565,36 @@ class TestModelDownloadStreaming:
         assert is_last is True
         assert scan_result.metadata["hf_filename"] == filename
         mock_hf_hub_download.assert_not_called()
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["model.safetensors"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_public_default_preserves_two_tuple_contract(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Public streaming callers should keep receiving documented 2-tuples."""
+        downloaded_path = tmp_path / "model.safetensors"
+        downloaded_path.write_bytes(b"downloaded")
+        mock_hf_hub_download.return_value = str(downloaded_path)
+
+        with patch(
+            "modelaudit.utils.sources.huggingface._scan_remote_huggingface_safetensors_header",
+            side_effect=AssertionError("public streaming API should not precompute scan results"),
+        ) as mock_scan_header:
+            results = list(download_model_streaming("https://huggingface.co/test/model"))
+
+        assert results == [(downloaded_path, True)]
+        mock_scan_header.assert_not_called()
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="test/model",
+            filename="model.safetensors",
+            revision=_HF_TEST_REVISION,
+        )
 
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -2790,6 +2820,7 @@ class TestModelDownloadStreaming:
                 scannable_extensions={".safetensors"},
                 scannable_filenames={"readme"},
                 scannable_scanner_ids={"safetensors", "metadata"},
+                _include_scan_results=True,
             )
         )
 
@@ -2846,6 +2877,7 @@ class TestModelDownloadStreaming:
                 "https://huggingface.co/test/model",
                 scannable_extensions={".safetensors"},
                 scannable_filenames={"readme"},
+                _include_scan_results=True,
             )
         )
 
@@ -2915,6 +2947,7 @@ class TestModelDownloadStreaming:
                 max_size=1024,
                 scannable_extensions={".safetensors"},
                 scannable_scanner_ids={"safetensors"},
+                _include_scan_results=True,
             )
         )
 
@@ -2977,6 +3010,7 @@ class TestModelDownloadStreaming:
                 scannable_extensions={".safetensors"},
                 scannable_scanner_ids={"safetensors"},
                 scanner_config={"max_safetensors_header_bytes": 16},
+                _include_scan_results=True,
             )
         )
 
@@ -3028,6 +3062,7 @@ class TestModelDownloadStreaming:
                 max_size=header_len + 32,
                 scannable_extensions={".safetensors"},
                 scannable_scanner_ids={"safetensors", "torch7"},
+                _include_scan_results=True,
             )
         )
 
@@ -3082,6 +3117,7 @@ class TestModelDownloadStreaming:
                 max_size=1024,
                 scannable_extensions={".safetensors"},
                 scannable_scanner_ids={"safetensors", "zip"},
+                _include_scan_results=True,
             )
         )
 
@@ -3101,7 +3137,7 @@ class TestModelDownloadStreaming:
     @patch("huggingface_hub.utils.build_hf_headers", return_value={})
     @patch("huggingface_hub.hf_hub_url", return_value="https://huggingface.co/test/model/resolve/rev/model.safetensors")
     @patch("requests.get")
-    def test_download_model_streaming_default_scanners_do_not_assume_payload_overlap(
+    def test_download_model_streaming_default_scanners_fail_closed_for_payload_overlap_gap(
         self,
         mock_requests_get: MagicMock,
         _mock_hf_hub_url: MagicMock,
@@ -3109,7 +3145,7 @@ class TestModelDownloadStreaming:
         mock_hf_hub_download: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Header-only mode should fail closed on evidence, not every ordinary tensor payload."""
+        """Default scanner selection includes payload-overlap scanners, so remote headers fail closed."""
         filename = "model-00001-of-00001.safetensors"
         frame, header_len = _make_safetensors_frame(
             {"tensor": {"dtype": "U8", "shape": [4], "data_offsets": [0, 4]}},
@@ -3134,14 +3170,69 @@ class TestModelDownloadStreaming:
                 f"hf://test/model?revision={_HF_TEST_REVISION}",
                 max_size=1024,
                 scannable_extensions={".safetensors"},
+                _include_scan_results=True,
             )
         )
 
         _path, _is_last, scan_result = cast(tuple[Path, bool, Any], results[0])
-        assert scan_result.success is True
-        assert "remote_overlap_scanner_ids" not in scan_result.metadata
+        assert scan_result.success is False
+        assert "remote_safetensors_overlap_coverage_incomplete" in scan_result.metadata["scan_outcome_reasons"]
+        assert scan_result.metadata["remote_overlap_scanner_ids"] == ["compressed", "keras_h5", "torch7", "zip"]
         assert scan_result.metadata["tensor_payload_bytes_downloaded"] == 0
         assert mock_requests_get.call_count == 2
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("huggingface_hub.hf_hub_download")
+    @patch("huggingface_hub.utils.build_hf_headers", return_value={})
+    @patch("huggingface_hub.hf_hub_url", return_value="https://huggingface.co/test/model/resolve/rev/model.safetensors")
+    @patch("requests.get")
+    def test_download_model_streaming_fails_closed_for_active_keras_h5_payload_overlap(
+        self,
+        mock_requests_get: MagicMock,
+        _mock_hf_hub_url: MagicMock,
+        _mock_build_headers: MagicMock,
+        mock_hf_hub_download: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Remote SafeTensors payloads may hide HDF5 userblocks owned by keras_h5."""
+        filename = "model-00001-of-00001.safetensors"
+        frame, header_len = _make_safetensors_frame(
+            {"tensor": {"dtype": "U8", "shape": [8], "data_offsets": [0, 8]}},
+            b"\x89HDF\r\n\x1a\n",
+        )
+        declared_size = len(frame)
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            lambda *_args, **_kwargs: ([filename], _HF_TEST_REVISION, None),
+        )
+        monkeypatch.setattr(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: ({filename: declared_size}, _HF_TEST_REVISION),
+        )
+        mock_requests_get.side_effect = [
+            _strict_range_response(frame[:8], declared_size),
+            _strict_range_response(frame[: 8 + header_len], declared_size),
+        ]
+
+        results = list(
+            download_model_streaming(
+                f"hf://test/model?revision={_HF_TEST_REVISION}",
+                max_size=1024,
+                scannable_extensions={".safetensors"},
+                scannable_scanner_ids={"safetensors", "keras_h5"},
+                _include_scan_results=True,
+            )
+        )
+
+        _path, _is_last, scan_result = cast(tuple[Path, bool, Any], results[0])
+        overlap_check = next(
+            check for check in scan_result.checks if check.name == "Remote SafeTensors Overlap Coverage"
+        )
+        assert scan_result.success is False
+        assert "remote_safetensors_overlap_coverage_incomplete" in scan_result.metadata["scan_outcome_reasons"]
+        assert scan_result.metadata["remote_overlap_scanner_ids"] == ["keras_h5"]
+        assert overlap_check.details["remote_overlap_scanner_ids"] == ["keras_h5"]
+        assert scan_result.metadata["tensor_payload_bytes_downloaded"] == 0
         mock_hf_hub_download.assert_not_called()
 
     @patch("huggingface_hub.hf_hub_download")
@@ -3211,6 +3302,7 @@ class TestModelDownloadStreaming:
                 max_size=4096,
                 scannable_extensions={".safetensors"},
                 scannable_scanner_ids={"safetensors"},
+                _include_scan_results=True,
             )
         )
 
@@ -3287,6 +3379,7 @@ class TestModelDownloadStreaming:
                 max_size=4096,
                 scannable_extensions={".safetensors"},
                 scannable_scanner_ids={"safetensors"},
+                _include_scan_results=True,
             )
         )
 
@@ -3361,6 +3454,7 @@ class TestModelDownloadStreaming:
                 max_size=4096,
                 scannable_extensions={".safetensors"},
                 scannable_scanner_ids={"safetensors"},
+                _include_scan_results=True,
             )
         )
 
@@ -3438,6 +3532,7 @@ class TestModelDownloadStreaming:
                 max_size=1024,
                 scannable_extensions={".safetensors"},
                 scannable_scanner_ids={"safetensors"},
+                _include_scan_results=True,
             )
         )
 
@@ -3492,6 +3587,7 @@ class TestModelDownloadStreaming:
                 max_size=16,
                 scannable_extensions={".safetensors"},
                 scannable_scanner_ids={"safetensors"},
+                _include_scan_results=True,
             )
         )
 
@@ -3560,6 +3656,7 @@ class TestModelDownloadStreaming:
                 max_size=1024,
                 scannable_extensions={".safetensors"},
                 scannable_scanner_ids={"safetensors"},
+                _include_scan_results=True,
             )
         )
 
@@ -3613,6 +3710,7 @@ class TestModelDownloadStreaming:
                 max_size=1024,
                 scannable_extensions={".safetensors"},
                 scannable_scanner_ids={"safetensors"},
+                _include_scan_results=True,
             )
         )
 
@@ -3718,6 +3816,7 @@ class TestModelDownloadStreaming:
                 "https://huggingface.co/test/model",
                 scannable_extensions={".safetensors"},
                 scannable_scanner_ids={"safetensors"},
+                _include_scan_results=True,
             )
         )
 
@@ -3761,6 +3860,7 @@ class TestModelDownloadStreaming:
                 "https://huggingface.co/test/model",
                 scannable_extensions={".safetensors"},
                 scannable_scanner_ids={"safetensors"},
+                _include_scan_results=True,
             )
         )
 
