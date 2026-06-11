@@ -86,8 +86,14 @@ _GGUF_PREFIX_OPTIONS_WITH_VALUE = frozenset(
     {"-c", "--close-from", "-g", "--group", "-h", "--host", "-p", "--prompt", "-t", "--command-timeout", "-u", "--user"}
 )
 _GGUF_METADATA_SHELL_FETCH_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("shell_download", ("curl", "wget")),
-    ("powershell_download", ("invoke-webrequest", "iwr")),
+    ("shell_download", ("curl", "fetch", "wget")),
+    ("powershell_download", ("invoke-restmethod", "invoke-webrequest", "irm", "iwr")),
+)
+_GGUF_POWERSHELL_FETCH_COMMANDS = frozenset({"invoke-restmethod", "invoke-webrequest", "irm", "iwr"})
+_GGUF_SHELL_FETCH_COMMAND_PATTERN = re.compile(
+    r"(?i)(?:^|[\s;&|`()/'\"\\])"
+    r"(?:curl|fetch|wget|invoke-restmethod|invoke-webrequest|irm|iwr)"
+    r"(?=$|\s|\$\{ifs(?:[^}]*)?\}|\$ifs\b)"
 )
 _GGUF_FETCH_OPTIONS_WITH_VALUE = frozenset(
     {
@@ -133,6 +139,7 @@ _GGUF_FETCH_OPTIONS_WITH_VALUE = frozenset(
         "--url",
         "-K",
         "--config",
+        "-method",
         "-uri",
         "-outfile",
     }
@@ -1210,6 +1217,8 @@ class GgufScanner(BaseScanner):
             for marker in (
                 "..",
                 "curl",
+                "invoke-restmethod",
+                "irm",
                 "wget",
                 "invoke-webrequest",
                 "iwr",
@@ -1345,7 +1354,7 @@ class GgufScanner(BaseScanner):
     @staticmethod
     def _is_destructive_rm_target(word: str) -> bool:
         target = word.strip("\"'").replace("\\", "/")
-        return target.startswith(("/", "~", "$", "..")) or "/.." in target
+        return bool(target)
 
     @staticmethod
     def _rm_option_flags(word: str) -> tuple[bool, bool]:
@@ -1538,14 +1547,21 @@ class GgufScanner(BaseScanner):
         return any(token.lower().startswith(scheme) for scheme in _GGUF_REMOTE_URL_SCHEMES)
 
     @classmethod
+    def _shell_url_variable_name(cls, word: str) -> str | None:
+        if "=" not in word or word.startswith("-"):
+            return None
+        name, value = word.split("=", 1)
+        name = name.strip("\"'")
+        if _GGUF_SHELL_VARIABLE_NAME_PATTERN.fullmatch(name) and cls._is_remote_url_token(value):
+            return name
+        return None
+
+    @classmethod
     def _shell_url_variable_names(cls, words: list[str]) -> set[str]:
         names: set[str] = set()
         for word in words:
-            if "=" not in word or word.startswith("-"):
-                continue
-            name, value = word.split("=", 1)
-            name = name.strip("\"'")
-            if _GGUF_SHELL_VARIABLE_NAME_PATTERN.fullmatch(name) and cls._is_remote_url_token(value):
+            name = cls._shell_url_variable_name(word)
+            if name is not None:
                 names.add(name)
         return names
 
@@ -1588,7 +1604,7 @@ class GgufScanner(BaseScanner):
         if word in {"-", "--"}:
             return "none"
 
-        normalized_word = word.lower() if command in {"invoke-webrequest", "iwr"} else word
+        normalized_word = word.lower() if command in _GGUF_POWERSHELL_FETCH_COMMANDS else word
         if normalized_word.startswith("--"):
             option_name, separator, _option_value = normalized_word.partition("=")
             if option_name in _GGUF_FETCH_OPTIONS_WITH_VALUE:
@@ -1610,21 +1626,26 @@ class GgufScanner(BaseScanner):
     @staticmethod
     def _is_fetch_destination_option_with_value(word: str, command: str) -> bool:
         option_name = word.split("=", 1)[0]
-        if command in {"invoke-webrequest", "iwr"}:
+        if command in _GGUF_POWERSHELL_FETCH_COMMANDS:
             option_name = option_name.lower()
         return option_name in _GGUF_FETCH_DESTINATION_OPTIONS_WITH_VALUE
 
     @classmethod
     def _fetch_segment_has_remote_url(cls, words: list[str], command: str, shell_url_variables: set[str]) -> bool:
+        same_segment_url_variables: set[str] = set()
         for command_index, word in enumerate(words):
             if cls._shell_command_name(word) != command:
+                name = cls._shell_url_variable_name(word)
+                if name is not None:
+                    same_segment_url_variables.add(name)
                 continue
+            available_url_variables = shell_url_variables | same_segment_url_variables
             index = command_index + 1
             while index < len(words):
                 candidate = words[index]
                 if cls._is_remote_url_token(candidate) or cls._shell_word_references_variable(
                     candidate,
-                    shell_url_variables,
+                    available_url_variables,
                 ):
                     return True
                 if candidate.startswith("-"):
@@ -1636,7 +1657,7 @@ class GgufScanner(BaseScanner):
                             _option_name, option_value = candidate.split("=", 1)
                             if cls._is_fetch_destination_option_with_value(candidate, command) and (
                                 cls._is_remote_url_token(option_value)
-                                or cls._shell_word_references_variable(option_value, shell_url_variables)
+                                or cls._shell_word_references_variable(option_value, available_url_variables)
                             ):
                                 return True
                             index += 1
@@ -1649,7 +1670,7 @@ class GgufScanner(BaseScanner):
                             and index < len(words)
                             and (
                                 cls._is_remote_url_token(words[index])
-                                or cls._shell_word_references_variable(words[index], shell_url_variables)
+                                or cls._shell_word_references_variable(words[index], available_url_variables)
                             )
                         ):
                             return True
@@ -1909,11 +1930,7 @@ class GgufScanner(BaseScanner):
         value_lower = value.lower()
         if not cls._has_remote_url(value_lower):
             return None
-        if not any(
-            command in value_lower
-            for _pattern_name, commands in _GGUF_METADATA_SHELL_FETCH_COMMANDS
-            for command in commands
-        ):
+        if not _GGUF_SHELL_FETCH_COMMAND_PATTERN.search(value):
             return None
 
         for pattern_name, commands in _GGUF_METADATA_SHELL_FETCH_COMMANDS:
