@@ -1852,7 +1852,6 @@ class TextScanner(BaseScanner):
                         after = line[match.end() : match.end() + 1]
                         if before in {b".", b"_"} or after in {b".", b"_"}:
                             continue
-                        absolute_position = line_start + match.start()
                         tld = match.group().rsplit(b".", 1)[-1].decode("utf-8", errors="ignore").casefold()
                         if tld not in DOCUMENTATION_BARE_DOMAIN_TLDS:
                             if DOCUMENTATION_CONFIG_MAPPING_PREFIX_PATTERN.search(line[: match.start()]) is not None:
