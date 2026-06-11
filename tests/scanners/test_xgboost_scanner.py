@@ -110,6 +110,18 @@ def _sentencepiece_model_proto_with_trainer_varint_field_52() -> bytes:
     return _sentencepiece_model_proto() + _proto_field(2, 2, _proto_varint(len(trainer_spec)) + trainer_spec)
 
 
+def _sentencepiece_model_proto_with_trainer_string_field_54() -> bytes:
+    seed_sentencepieces_file = b"seed_sentencepieces.tsv"
+    trainer_spec = (
+        _proto_field(3, 0, _proto_varint(1))
+        + _proto_field(4, 0, _proto_varint(64))
+        + _proto_field(40, 0, _proto_varint(0))
+        + _proto_field(45, 2, _proto_varint(len(b"<unk>")) + b"<unk>")
+        + _proto_field(54, 2, _proto_varint(len(seed_sentencepieces_file)) + seed_sentencepieces_file)
+    )
+    return _sentencepiece_model_proto() + _proto_field(2, 2, _proto_varint(len(trainer_spec)) + trainer_spec)
+
+
 def _large_real_sentencepiece_model_proto_shape() -> bytes:
     """Mirror large uMT5-style spiece.model prefixes without committing a large fixture."""
     pieces = [
@@ -429,6 +441,12 @@ class TestXGBoostScannerBasic:
     def test_can_handle_rejects_sentencepiece_with_trainer_varint_field_52(self, tmp_path: Path) -> None:
         tokenizer_model = tmp_path / "tokenizer.model"
         tokenizer_model.write_bytes(_sentencepiece_model_proto_with_trainer_varint_field_52())
+
+        assert not XGBoostScanner.can_handle(str(tokenizer_model))
+
+    def test_can_handle_rejects_sentencepiece_with_trainer_string_field_54(self, tmp_path: Path) -> None:
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(_sentencepiece_model_proto_with_trainer_string_field_54())
 
         assert not XGBoostScanner.can_handle(str(tokenizer_model))
 
@@ -1848,6 +1866,36 @@ class TestXGBoostFailClosedEndToEnd:
     ) -> None:
         tokenizer_model = tmp_path / "tokenizer.model"
         tokenizer_model.write_bytes(_sentencepiece_model_proto_with_trainer_varint_field_52())
+
+        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+        streaming = scan_model_streaming(
+            file_generator=iterate_files_streaming(tmp_path),
+            scan_root=str(tmp_path),
+            delete_after_scan=False,
+            cache_enabled=False,
+            skip_file_types=True,
+        )
+        cli_result = CliRunner().invoke(
+            cli,
+            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
+            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+        )
+        cli_payload = parse_click_json_output(cli_result.output)
+
+        assert direct.success is True
+        assert direct.scanner_name == "unknown"
+        _assert_no_xgboost_s1004(aggregate)
+        _assert_no_xgboost_s1004(streaming)
+        assert cli_result.exit_code == 0
+        assert "xgboost" not in cli_payload.get("scanner_names", [])
+        assert not any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
+
+    def test_sentencepiece_model_with_trainer_string_field_54_is_not_xgboost_false_positive(
+        self, tmp_path: Path
+    ) -> None:
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(_sentencepiece_model_proto_with_trainer_string_field_54())
 
         direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
         aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
