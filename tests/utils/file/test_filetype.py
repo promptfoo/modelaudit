@@ -1668,11 +1668,29 @@ def test_hf_tokenizer_json_over_routing_budget_is_claimed_after_schema_probe(
     assert detect_file_format(str(tokenizer_path)) == "unknown"
 
 
-def test_hf_tokenizer_json_model_vocab_over_structure_budget_is_not_claimed(
+def test_hf_tokenizer_json_completed_value_at_probe_boundary_checks_suffix_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"',
+        padding_size=64,
+    )
+    boundary = tokenizer_path.read_text(encoding="utf-8").index(',"chat_template"')
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", boundary)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", boundary)
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+
+
+def test_hf_tokenizer_json_model_vocab_over_structure_budget_is_not_claimed_across_gap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 256)
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
     tokenizer_path = _write_hf_tokenizer_json(
         tmp_path / "tokenizer.json",
         {
@@ -1685,7 +1703,7 @@ def test_hf_tokenizer_json_model_vocab_over_structure_budget_is_not_claimed(
 
     assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES
     assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
-    assert detect_file_format(str(tokenizer_path)) == "unknown"
+    assert detect_file_format(str(tokenizer_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
 
 
 def test_hf_tokenizer_json_route_key_after_value_ending_at_probe_boundary_routes_jinja(

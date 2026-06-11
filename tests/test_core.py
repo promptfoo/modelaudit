@@ -9937,11 +9937,13 @@ def test_scan_file_oversized_tokenizer_model_template_after_vocab_preserves_jinj
     )
 
 
-def test_scan_file_oversized_tokenizer_model_vocab_after_structure_probe_is_not_claimed(
+def test_scan_file_tokenizer_model_vocab_after_structure_probe_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 256)
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    monkeypatch.setattr(core_module, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
     tokenizer_path = _write_hf_tokenizer_json(
         tmp_path / "tokenizer.json",
         {
@@ -9955,12 +9957,11 @@ def test_scan_file_oversized_tokenizer_model_vocab_after_structure_probe_is_not_
     result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
 
     assert file_detection.is_huggingface_tokenizer_json_file(tokenizer_path) is False
-    assert result.success is True
-    assert result.scanner_name == "unknown"
-    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata.get("scan_outcome_reasons", [])
     assert "jax_json_checkpoint_analysis_size_limit" not in result.metadata.get("scan_outcome_reasons", [])
     assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
-    assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
+    assert any(check.name == "MXNet Symbol Routing" for check in result.checks)
 
 
 def test_scan_file_tokenizer_route_key_after_value_ending_at_probe_boundary_preserves_jinja(

@@ -49,8 +49,6 @@ from modelaudit.utils.file.detection import (
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
 
-JINJA_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY = "_jinja_skip_jax_json_overlap"
-
 # Optional GGUF support with graceful fallback
 try:
     from gguf.gguf_reader import GGUFReader  # type: ignore[import-untyped]
