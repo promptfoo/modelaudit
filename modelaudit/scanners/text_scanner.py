@@ -1045,7 +1045,7 @@ class TextScanner(BaseScanner):
             if line_indent >= value_indent:
                 continue
             if DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(line) is not None:
-                return value_indent > line_indent
+                return True
             if DOCUMENTATION_NESTED_CONFIG_LIST_ITEM_PATTERN.fullmatch(line) is not None:
                 for parent_index in range(line_index - 1, -1, -1):
                     parent_line = lines[parent_index]
@@ -1054,10 +1054,7 @@ class TextScanner(BaseScanner):
                     parent_indent = cls._documentation_line_indent(parent_line)
                     if parent_indent >= line_indent:
                         continue
-                    return (
-                        value_indent > line_indent
-                        and DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(parent_line) is not None
-                    )
+                    return DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(parent_line) is not None
                 return False
             return False
         return False
