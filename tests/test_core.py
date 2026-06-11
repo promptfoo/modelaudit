@@ -10011,6 +10011,35 @@ def _create_truncated_tensor_onnx(path: Path) -> Path:
     return path
 
 
+def _create_future_ir_onnx_candidate(path: Path) -> Path:
+    onnx = pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+
+    x_value = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
+    y_value = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
+    node = helper.make_node("Relu", ["input"], ["output"], name="relu")
+    graph = helper.make_graph([node], "graph", [x_value], [y_value])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 999999
+    path.write_bytes(model.SerializeToString())
+    return prefix_mock_onnx_with_unknown_field(path, value_size=0, count=4097, field_number=8)
+
+
+def _create_missing_value_metadata_onnx_candidate(path: Path) -> Path:
+    onnx = pytest.importorskip("onnx")
+
+    model = onnx.ModelProto()
+    model.ir_version = 7
+    model.opset_import.add().version = 13
+    model.graph.name = "graph"
+    node = model.graph.node.add()
+    node.op_type = "Relu"
+    node.input.append("input")
+    node.output.append("output")
+    path.write_bytes(model.SerializeToString())
+    return prefix_mock_onnx_with_unknown_field(path, value_size=0, count=4097, field_number=8)
+
+
 def _format_validation_check(result: ScanResult) -> Any:
     return next(check for check in result.checks if check.name == "Format Validation")
 
@@ -10021,6 +10050,26 @@ def _actionable_s901_issues(result: ScanResult) -> list[Any]:
         for issue in result.issues
         if issue.rule_code == "S901" and issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
     ]
+
+
+def _assert_schema_rejected_pt_onnx_keeps_s901(path: Path) -> ScanResult:
+    result = scan_file(str(path), config={"cache_enabled": False})
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert "validated_format" not in result.metadata
+    assert any(
+        check.name == "ONNX Schema Validation"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("schema_validation_reason") == "onnx_schema_validation_failed"
+        for check in result.checks
+    )
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+    assert determine_exit_code(aggregate) != 0
+    return result
 
 
 def test_scan_file_routes_misnamed_onnx_by_header(tmp_path: Path) -> None:
@@ -10092,13 +10141,11 @@ def test_scan_file_keeps_s901_when_malicious_pt_onnx_finding_is_suppressed(tmp_p
         "rule_code": "S902",
         "severity": "critical",
     } in result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY]
-    assert result._private_metadata[SUPPRESSED_FAILED_CHECKS_METADATA_KEY] == [
-        {
-            "name": "Python Operator Detection",
-            "rule_code": "S902",
-            "severity": "critical",
-        }
-    ]
+    assert {
+        "name": "Python Operator Detection",
+        "rule_code": "S902",
+        "severity": "critical",
+    } in result._private_metadata[SUPPRESSED_FAILED_CHECKS_METADATA_KEY]
     assert format_check.severity == IssueSeverity.WARNING
     assert format_check.rule_code == "S901"
     assert _actionable_s901_issues(result)
@@ -10169,6 +10216,28 @@ def test_scan_file_keeps_s901_for_malformed_pt_onnx_candidate(tmp_path: Path) ->
     assert format_check.severity == IssueSeverity.WARNING
     assert format_check.rule_code == "S901"
     assert _actionable_s901_issues(result)
+
+
+def test_scan_file_keeps_s901_for_checker_rejected_pt_onnx_payload(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    invalid_payload = tmp_path / "checker-rejected.pt"
+    invalid_payload.write_bytes((b"\x42\x00" * 4097) + b"\x08\x01\x3a\x00")
+
+    _assert_schema_rejected_pt_onnx_keeps_s901(invalid_payload)
+
+
+def test_scan_file_keeps_s901_for_unsupported_future_ir_pt_onnx(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    future_ir = _create_future_ir_onnx_candidate(tmp_path / "future-ir.pt")
+
+    _assert_schema_rejected_pt_onnx_keeps_s901(future_ir)
+
+
+def test_scan_file_keeps_s901_for_missing_required_graph_metadata_pt_onnx(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    missing_metadata = _create_missing_value_metadata_onnx_candidate(tmp_path / "missing-metadata.pt")
+
+    _assert_schema_rejected_pt_onnx_keeps_s901(missing_metadata)
 
 
 def test_scan_file_keeps_s901_for_spoofed_pt_protobuf_prefix(tmp_path: Path) -> None:

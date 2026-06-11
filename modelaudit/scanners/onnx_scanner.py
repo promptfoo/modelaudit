@@ -73,6 +73,7 @@ STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset(
 )
 SCHEMA_VALIDATED_ONNX_DOMAINS: frozenset[str] = frozenset({"ai.onnx.preview"})
 ONNX_STRUCTURE_INCONCLUSIVE_REASON = "onnx_structure_validation_failed"
+ONNX_SCHEMA_INCONCLUSIVE_REASON = "onnx_schema_validation_failed"
 ONNX_RAW_DETECTION_INCONCLUSIVE_REASON = "onnx_raw_detection_analysis_incomplete"
 ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON = "onnx_weight_distribution_analysis_incomplete"
 ONNX_TENTATIVE_CANDIDATE_UNAVAILABLE_REASON = "onnx_tentative_candidate_analysis_unavailable"
@@ -80,6 +81,7 @@ ONNX_TENTATIVE_CANDIDATE_PARSE_INCOMPLETE_REASON = "onnx_tentative_candidate_par
 _ONNX_FORMAT_INTEGRITY_CHECK_NAMES: frozenset[str] = frozenset(
     {
         "ONNX Structure Validation",
+        "ONNX Schema Validation",
         "Tensor Size Validation",
         "Tensor Validation",
         "External Data Size Validation",
@@ -2560,6 +2562,27 @@ def _onnx_format_integrity_validated(result: ScanResult) -> bool:
     )
 
 
+def _mark_onnx_schema_incomplete(
+    result: ScanResult,
+    path: str,
+    *,
+    message: str,
+    details: dict[str, Any],
+) -> None:
+    result.add_check(
+        name="ONNX Schema Validation",
+        passed=False,
+        message=message,
+        severity=IssueSeverity.INFO,
+        location=path,
+        rule_code="S902",
+        details={
+            "schema_validation_reason": ONNX_SCHEMA_INCONCLUSIVE_REASON,
+            **details,
+        },
+    )
+
+
 class OnnxScanner(BaseScanner):
     """Scanner for ONNX model files."""
 
@@ -2720,6 +2743,43 @@ class OnnxScanner(BaseScanner):
                     "has_graph": has_graph,
                 },
             )
+
+        if model.ir_version > 0 and has_graph:
+            checker = getattr(onnx, "checker", None)
+            check_model = getattr(checker, "check_model", None)
+            if not callable(check_model):
+                _mark_onnx_schema_incomplete(
+                    result,
+                    path,
+                    message="ONNX schema checker is unavailable; analysis incomplete",
+                    details={"checker_available": False},
+                )
+            else:
+                try:
+                    self.check_interrupted()
+                    check_model(model)
+                    self.check_interrupted()
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    redacted_error = redact_untrusted_error_message(e)
+                    _mark_onnx_schema_incomplete(
+                        result,
+                        path,
+                        message=f"ONNX schema validation failed; analysis incomplete: {redacted_error}",
+                        details={
+                            "checker_available": True,
+                            "exception": redacted_error,
+                            "exception_type": type(e).__name__,
+                        },
+                    )
+                else:
+                    result.add_check(
+                        name="ONNX Schema Validation",
+                        passed=True,
+                        message="ONNX schema validation passed",
+                        location=path,
+                    )
 
         result.metadata.update(
             {
