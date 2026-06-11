@@ -123,6 +123,35 @@ def _write_gguf_with_tensor_type(
         f.write(b"\0" * tensor_data_size)
 
 
+def _write_gguf_with_tensor_records(
+    path: Path,
+    records: list[tuple[bytes, int, tuple[int, ...], int]],
+) -> None:
+    with path.open("wb") as f:
+        f.write(b"GGUF")
+        f.write(struct.pack("<I", 3))
+        f.write(struct.pack("<Q", len(records)))
+        f.write(struct.pack("<Q", 0))
+
+        offset = 0
+        for tensor_name, tensor_type, dims, tensor_data_size in records:
+            f.write(struct.pack("<Q", len(tensor_name)))
+            f.write(tensor_name)
+            f.write(struct.pack("<I", len(dims)))
+            for dimension in dims:
+                f.write(struct.pack("<Q", dimension))
+            f.write(struct.pack("<I", tensor_type))
+            f.write(struct.pack("<Q", offset))
+            offset += tensor_data_size
+
+        pad_to_tensor_data = (32 - (f.tell() % 32)) % 32
+        if pad_to_tensor_data:
+            f.write(b"\0" * pad_to_tensor_data)
+
+        for _tensor_name, _tensor_type, _dims, tensor_data_size in records:
+            f.write(b"\0" * tensor_data_size)
+
+
 def _write_gguf_string_metadata_entries(
     path: Path,
     entries: list[tuple[str, str]],
@@ -1056,6 +1085,127 @@ def test_gguf_bf16_tensor_type_30_is_supported(tmp_path: Path) -> None:
     assert not any(check.name == "Tensor Data Bounds Check" for check in result.checks)
     _assert_no_warning_or_critical_issues(result)
     assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    ("tensor_type", "tensor_name", "tensor_data_size"),
+    [
+        (21, b"blk.0.ffn_down.weight.iq3_s", 110),
+        (23, b"blk.0.ffn_up.weight.iq4_xs", 136),
+    ],
+)
+def test_gguf_rank250_iq_tensor_types_are_supported(
+    tmp_path: Path,
+    tensor_type: int,
+    tensor_name: bytes,
+    tensor_data_size: int,
+) -> None:
+    path = tmp_path / f"rank250_type{tensor_type}.gguf"
+    _write_gguf_with_tensor_type(
+        path,
+        tensor_type=tensor_type,
+        tensor_name=tensor_name,
+        dims=(256,),
+        tensor_data_size=tensor_data_size,
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert direct.success is True
+    assert direct.metadata["tensors"] == [{"name": tensor_name.decode(), "type": tensor_type, "dims": [256]}]
+    assert not any(check.name == "Tensor Type Validation" for check in direct.checks)
+    assert not any("unknown ggml type" in issue.message.lower() for issue in direct.issues)
+    assert not any(check.name == "Tensor Data Bounds Check" for check in direct.checks)
+    _assert_no_warning_or_critical_issues(direct)
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    ("tensor_type", "tensor_name", "expected_size"),
+    [
+        (21, b"iq3_s_truncated", 110),
+        (23, b"iq4_xs_truncated", 136),
+    ],
+)
+def test_gguf_rank250_iq_tensor_types_reach_bounds_validation(
+    tmp_path: Path,
+    tensor_type: int,
+    tensor_name: bytes,
+    expected_size: int,
+) -> None:
+    path = tmp_path / f"rank250_type{tensor_type}_truncated.gguf"
+    _write_gguf_with_tensor_type(
+        path,
+        tensor_type=tensor_type,
+        tensor_name=tensor_name,
+        dims=(256,),
+        tensor_data_size=expected_size - 1,
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert not any(check.name == "Tensor Type Validation" for check in direct.checks)
+    bounds_checks = [check for check in direct.checks if check.name == "Tensor Data Bounds Check"]
+    assert len(bounds_checks) == 1
+    assert bounds_checks[0].status == CheckStatus.FAILED
+    assert bounds_checks[0].details["tensor_name"] == tensor_name.decode()
+    assert bounds_checks[0].details["expected"] == expected_size
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_gguf_rank250_mixed_current_tensor_types_are_supported(tmp_path: Path) -> None:
+    path = tmp_path / "rank250_current_types.gguf"
+    _write_gguf_with_tensor_records(
+        path,
+        [
+            (b"blk.0.attn_q.weight.iq3_s", 21, (256,), 110),
+            (b"blk.0.attn_k.weight.iq4_xs", 23, (256,), 136),
+            (b"blk.0.ffn_norm.weight.bf16", 30, (8,), 16),
+        ],
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert direct.success is True
+    assert direct.metadata["tensors"] == [
+        {"name": "blk.0.attn_q.weight.iq3_s", "type": 21, "dims": [256]},
+        {"name": "blk.0.attn_k.weight.iq4_xs", "type": 23, "dims": [256]},
+        {"name": "blk.0.ffn_norm.weight.bf16", "type": 30, "dims": [8]},
+    ]
+    assert not any(check.name == "Tensor Type Validation" for check in direct.checks)
+    assert not any("unknown ggml type" in issue.message.lower() for issue in direct.issues)
+    _assert_no_warning_or_critical_issues(direct)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_gguf_rank250_current_types_do_not_mask_unknown_future_type(tmp_path: Path) -> None:
+    path = tmp_path / "rank250_current_plus_unknown.gguf"
+    _write_gguf_with_tensor_records(
+        path,
+        [
+            (b"blk.0.attn_q.weight.iq3_s", 21, (256,), 110),
+            (b"blk.0.attn_k.weight.iq4_xs", 23, (256,), 136),
+            (b"blk.0.ffn_norm.weight.bf16", 30, (8,), 16),
+            (b"blk.0.future.weight", 999, (8,), 32),
+        ],
+    )
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert GGUF_STRUCTURE_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    type_checks = [check for check in direct.checks if check.name == "Tensor Type Validation"]
+    assert len(type_checks) == 1
+    assert type_checks[0].details["tensor_type"] == 999
+    assert type_checks[0].details["tensor_name"] == "blk.0.future.weight"
+    assert any("unknown ggml type 999" in issue.message.lower() for issue in direct.issues)
+    _assert_no_warning_or_critical_issues(direct)
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_gguf_bf16_truncated_tensor_data_reports_bounds_check(tmp_path: Path) -> None:
