@@ -4548,12 +4548,25 @@ def test_scan_inconclusive_without_issues_reports_inconclusive(
         },
     )
 
-    result = CliRunner().invoke(cli, ["scan", str(test_file)])
+    result = CliRunner().invoke(cli, ["scan", "--format", "json", str(test_file)])
 
     assert result.exit_code == 2
-    assert "Inconclusive" in result.output
+    output_payload = json.loads(result.output)
+    assert output_payload["success"] is False
+    assert output_payload["has_errors"] is False
+    assert output_payload["issues"] == []
+    assert output_payload["checks"] == []
+    assert output_payload["file_metadata"][str(test_file)]["scan_outcome"] == "inconclusive"
+    assert output_payload["file_metadata"][str(test_file)]["scan_outcome_reasons"] == ["pickle_analysis_incomplete"]
+    assert "Inconclusive" not in result.output
     assert "Clean" not in result.output
-    mock_scan.assert_called_once()
+
+    text_result = CliRunner().invoke(cli, ["scan", "--format", "text", str(test_file)])
+
+    assert text_result.exit_code == 2
+    assert "Inconclusive" in text_result.output
+    assert "Clean" not in text_result.output
+    assert mock_scan.call_count == 2
 
 
 def test_scan_stream_help():
