@@ -1659,6 +1659,39 @@ class TextScanner(BaseScanner):
         return path_reference + rb"(?:/[A-Za-z0-9_./\-]{1,4096})?"
 
     @classmethod
+    def _documentation_fenced_checkout_depth_for_target(cls, checkout_path: bytes, target: bytes) -> int | None:
+        if not cls._documentation_fenced_checkout_target_is_within_checkout(checkout_path, target):
+            return None
+        if checkout_path == b"." or target == checkout_path:
+            return 0
+        suffix = target[len(checkout_path) + 1 :]
+        return sum(1 for part in suffix.split(b"/") if part not in {b"", b"."})
+
+    @classmethod
+    def _documentation_fenced_checkout_depth_after_directory_change(
+        cls,
+        checkout_path: bytes,
+        current_depth: int | None,
+        target: bytes,
+    ) -> int | None:
+        explicit_depth = cls._documentation_fenced_checkout_depth_for_target(checkout_path, target)
+        if explicit_depth is not None:
+            return explicit_depth
+        if target.startswith(b"/") or current_depth is None:
+            return None
+        depth = current_depth
+        for part in target.split(b"/"):
+            if part in {b"", b"."}:
+                continue
+            if part == b"..":
+                if depth == 0:
+                    return None
+                depth -= 1
+                continue
+            depth += 1
+        return depth
+
+    @classmethod
     def _documentation_fenced_line_pops_directory_stack(cls, line: bytes) -> bool:
         stripped = line.strip()
         if not stripped or stripped.startswith(b"#"):
@@ -1781,26 +1814,27 @@ class TextScanner(BaseScanner):
         line_end = payload.find(b"\n", position, range_end)
         if line_end == -1:
             return False
-        inside_checkout = False
-        directory_stack: list[bool] = []
+        checkout_depth: int | None = None
+        directory_stack: list[int | None] = []
         for raw_line in payload[line_end + 1 : range_end].splitlines():
             if cls._documentation_fenced_line_executes_clone_checkout(raw_line, checkout_path):
                 return True
             if cls._documentation_fenced_line_pops_directory_stack(raw_line):
                 if directory_stack:
-                    inside_checkout = directory_stack.pop()
+                    checkout_depth = directory_stack.pop()
                 continue
             directory_change = cls._documentation_fenced_line_directory_change(raw_line)
             if directory_change is not None:
                 command, target = directory_change
                 if command == b"pushd":
-                    directory_stack.append(inside_checkout)
-                inside_checkout = cls._documentation_fenced_checkout_target_is_within_checkout(
+                    directory_stack.append(checkout_depth)
+                checkout_depth = cls._documentation_fenced_checkout_depth_after_directory_change(
                     checkout_path,
+                    checkout_depth,
                     target,
                 )
                 continue
-            if inside_checkout and cls._documentation_fenced_line_executes_inside_clone_checkout(raw_line):
+            if checkout_depth is not None and cls._documentation_fenced_line_executes_inside_clone_checkout(raw_line):
                 return True
         return False
 
@@ -2226,6 +2260,36 @@ class TextScanner(BaseScanner):
         return imported_targets
 
     @classmethod
+    def _documentation_fenced_propagate_variable_alias_positions(
+        cls,
+        fenced_code: bytes,
+        alias_positions: dict[bytes, list[int]],
+        string_spans: tuple[tuple[int, int, str, bool], ...],
+        string_span_starts: tuple[int, ...],
+    ) -> None:
+        changed = True
+        while changed:
+            changed = False
+            for match in DOCUMENTATION_FENCED_IMPORTED_NETWORK_FUNCTION_ALIAS_ASSIGNMENT_PATTERN.finditer(fenced_code):
+                if cls._documentation_fenced_match_is_line_comment(
+                    fenced_code,
+                    match.start(),
+                ) or cls._documentation_python_string_spans_contain_absolute_position(
+                    fenced_code,
+                    match.start(),
+                    string_spans,
+                    string_span_starts,
+                ):
+                    continue
+                if not any(position < match.start() for position in alias_positions.get(match.group("source"), [])):
+                    continue
+                target_positions = alias_positions.setdefault(match.group("target"), [])
+                if match.start() in target_positions:
+                    continue
+                target_positions.append(match.start())
+                changed = True
+
+    @classmethod
     def _documentation_fenced_has_imported_network_alias_call(
         cls,
         fenced_code: bytes,
@@ -2254,11 +2318,52 @@ class TextScanner(BaseScanner):
             ):
                 alias_positions.setdefault(match.group("target"), []).append(match.start())
 
+        cls._documentation_fenced_propagate_variable_alias_positions(
+            fenced_code,
+            alias_positions,
+            string_spans,
+            string_span_starts,
+        )
         return any(
             any(position < call_match.start() for position in alias_positions.get(call_match.group("target"), []))
             for call_match in DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN.finditer(fenced_code)
             if not cls._documentation_fenced_match_is_line_comment(fenced_code, call_match.start())
         )
+
+    @classmethod
+    def _documentation_fenced_call_argument_end(
+        cls,
+        fenced_code: bytes,
+        argument_start: int,
+        string_spans: tuple[tuple[int, int, str, bool], ...],
+        max_length: int = 4096,
+    ) -> int:
+        limit = min(len(fenced_code), argument_start + max_length)
+        depth = 1
+        position = argument_start
+        while position < limit:
+            containing_string_span = next(
+                (span for span in string_spans if span[0] <= position < span[1]),
+                None,
+            )
+            if containing_string_span is not None:
+                position = min(containing_string_span[1], limit)
+                continue
+            if cls._documentation_fenced_match_is_line_comment(fenced_code, position):
+                line_end = fenced_code.find(b"\n", position, limit)
+                if line_end == -1:
+                    return limit
+                position = line_end + 1
+                continue
+            char = fenced_code[position]
+            if char in b"([{":
+                depth += 1
+            elif char in b")]}":
+                depth -= 1
+                if depth == 0:
+                    return position
+            position += 1
+        return limit
 
     @classmethod
     def _documentation_fenced_has_executed_fetch_response(
@@ -2316,6 +2421,12 @@ class TextScanner(BaseScanner):
             if any(position < match.start() for position in response_assignments.get(match.group("source"), [])):
                 response_assignments.setdefault(match.group("target"), []).append(match.start())
 
+        cls._documentation_fenced_propagate_variable_alias_positions(
+            fenced_code,
+            response_assignments,
+            string_spans,
+            string_span_starts,
+        )
         for exec_pattern in (
             DOCUMENTATION_FENCED_EXECUTED_RESPONSE_PATTERN,
             DOCUMENTATION_FENCED_EXECUTED_RESPONSE_ARGUMENT_PATTERN,
@@ -2340,10 +2451,11 @@ class TextScanner(BaseScanner):
             ):
                 continue
             argument_start = exec_match.end()
-            argument_end = min(len(fenced_code), argument_start + 4096)
-            line_end = fenced_code.find(b"\n", argument_start, argument_end)
-            if line_end != -1:
-                argument_end = line_end
+            argument_end = cls._documentation_fenced_call_argument_end(
+                fenced_code,
+                argument_start,
+                string_spans,
+            )
             executor_arguments = fenced_code[argument_start:argument_end]
             for target, positions in response_assignments.items():
                 if not any(position < exec_match.start() for position in positions):
@@ -2405,6 +2517,12 @@ class TextScanner(BaseScanner):
             if receiver_is_session or receiver_is_module_alias:
                 alias_positions.setdefault(match.group("target"), []).append(match.start())
 
+        cls._documentation_fenced_propagate_variable_alias_positions(
+            fenced_code,
+            alias_positions,
+            string_spans,
+            string_span_starts,
+        )
         return any(
             any(position < call_match.start() for position in alias_positions.get(call_match.group("target"), []))
             for call_match in DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN.finditer(fenced_code)

