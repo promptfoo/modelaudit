@@ -4371,10 +4371,18 @@ def test_scan_bytes_does_not_treat_benign_stdlib_module_references_as_dangerous(
     if expected_reference == "tarfile.TarInfo" and report.status == ScanStatus.INCONCLUSIVE:
         assert report.verdict in {SafetyVerdict.UNKNOWN, SafetyVerdict.SUSPICIOUS}
         assert report.metadata.get("analysis_incomplete") is True
+        assert all(
+            finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+            and finding.severity == Severity.WARNING
+            and finding.details.get("import_reference") == expected_reference
+            and finding.details.get("module") == "tarfile"
+            and finding.details.get("name") == "TarInfo"
+            for finding in report.findings
+        )
     else:
         assert report.status == ScanStatus.COMPLETE
         assert report.verdict == SafetyVerdict.CLEAN
-    assert report.findings == ()
+        assert report.findings == ()
     assert any(
         ref["import_reference"] == expected_reference and ref["is_dangerous"] is False
         for ref in report.metadata["import_references"]
