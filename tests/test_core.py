@@ -224,6 +224,20 @@ def _build_protocolless_binary_benign_scalar_pickle() -> bytes:
     return b"\x8c\x02os\x94."
 
 
+def _build_legacy_pytorch_storage_tail_pickle() -> bytes:
+    """Build a minimal legacy PyTorch-style pickle followed by raw storage bytes."""
+    return (
+        b"\x80\x04("
+        b"\x8c\x07storage\x94"
+        b"\x8c\x05torch\x94"
+        b"\x8c\x0cFloatStorage\x94\x93"
+        b"\x8c\x01k\x94"
+        b"\x8c\x03cpu\x94"
+        b"K\x01tQ."
+        b"\x00RAW"
+    )
+
+
 def _write_pickle_safetensors_polyglot(path: Path, header_length: int) -> None:
     """Write a valid SafeTensors file whose bytes are also a dangerous pickle."""
     pickle_tail = b"\n0cos\nsystem\n(Vecho modelaudit-polyglot\ntR."
@@ -7224,6 +7238,39 @@ def test_scan_file_routes_misnamed_pytorch_zip_by_content(tmp_path: Path) -> Non
 
     assert result.scanner_name == "pytorch_zip"
     assert any("data.pkl" in (issue.location or "") for issue in result.issues)
+
+
+def test_scan_model_directory_or_file_trusts_legacy_pytorch_storage_tail(tmp_path: Path) -> None:
+    model_path = tmp_path / "weights.pt"
+    model_path.write_bytes(_build_legacy_pytorch_storage_tail_pickle())
+
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    metadata = aggregate.file_metadata[str(model_path)]
+
+    assert determine_exit_code(aggregate) == 1
+    assert metadata["trusted_incomplete_tail"] is True
+    assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(issue.rule_code == "S901" for issue in aggregate.issues)
+    assert any(issue.rule_code == "S212" for issue in aggregate.issues)
+
+
+def test_scan_model_directory_or_file_trusts_nested_legacy_pytorch_storage_tail(tmp_path: Path) -> None:
+    archive_path = tmp_path / "legacy-storage-tail.zip"
+    _create_misnamed_zip(archive_path, {"weights.pt": _build_legacy_pytorch_storage_tail_pickle()})
+
+    aggregate = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
+    metadata = aggregate.file_metadata[str(archive_path)]
+
+    assert determine_exit_code(aggregate) == 1
+    assert metadata["trusted_incomplete_tail"] is True
+    assert "zip_analysis_incomplete" in metadata["scan_outcome_reasons"]
+    assert not any(issue.rule_code == "S901" for issue in aggregate.issues)
+    assert any(
+        issue.rule_code == "S902"
+        and issue.details.get("zip_entry") == "weights.pt"
+        and issue.location == f"{archive_path}:weights.pt"
+        for issue in aggregate.issues
+    )
 
 
 @pytest.mark.parametrize(

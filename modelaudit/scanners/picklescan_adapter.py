@@ -70,11 +70,58 @@ _BENIGN_SERIALIZATION_TAIL_MODULE_PREFIXES = frozenset(
         "sklearn",
     }
 )
-_LEGACY_PYTORCH_TAIL_MODULE_PREFIXES = frozenset(
+_LEGACY_PYTORCH_STORAGE_NAMES = frozenset(
     {
-        "collections",
-        "numpy",
-        "torch",
+        "BFloat16Storage",
+        "BoolStorage",
+        "ByteStorage",
+        "CharStorage",
+        "ComplexDoubleStorage",
+        "ComplexFloatStorage",
+        "DoubleStorage",
+        "FloatStorage",
+        "HalfStorage",
+        "IntStorage",
+        "LongStorage",
+        "QInt32Storage",
+        "QInt8Storage",
+        "QUInt2x4Storage",
+        "QUInt4x2Storage",
+        "QUInt8Storage",
+        "ShortStorage",
+        "Storage",
+        "UntypedStorage",
+    }
+)
+_LEGACY_PYTORCH_REBUILD_IMPORTS = frozenset(
+    {
+        ("torch", "_rebuild_tensor"),
+        ("torch", "_rebuild_tensor_v2"),
+        ("torch._tensor", "_rebuild_from_type_v2"),
+        ("torch._utils", "_rebuild_device_tensor_from_numpy"),
+        ("torch._utils", "_rebuild_meta_tensor_no_storage"),
+        ("torch._utils", "_rebuild_nested_tensor"),
+        ("torch._utils", "_rebuild_parameter"),
+        ("torch._utils", "_rebuild_parameter_with_state"),
+        ("torch._utils", "_rebuild_qtensor"),
+        ("torch._utils", "_rebuild_sparse_tensor"),
+        ("torch._utils", "_rebuild_tensor"),
+        ("torch._utils", "_rebuild_tensor_v2"),
+        ("torch._utils", "_rebuild_tensor_v3"),
+        ("torch._utils", "_rebuild_wrapper_subclass"),
+    }
+)
+_LEGACY_PYTORCH_AUXILIARY_IMPORTS = frozenset(
+    {
+        ("collections", "OrderedDict"),
+        ("numpy", "dtype"),
+        ("numpy", "ndarray"),
+        ("numpy._core.multiarray", "_reconstruct"),
+        ("numpy._core.multiarray", "scalar"),
+        ("numpy.core.multiarray", "_reconstruct"),
+        ("numpy.core.multiarray", "scalar"),
+        ("torch", "Size"),
+        ("torch.serialization", "_get_layout"),
     }
 )
 
@@ -452,6 +499,7 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
         if (
             legacy_pytorch_storage_tail
             and source_ext in {".bin", ".pt", ".pth", ".pkl", ".pickle"}
+            and not _is_pytorch_zip_pickle_member_source(report.source)
             and _is_unknown_opcode_tail_parse_error(exception_message)
         ):
             return True
@@ -510,7 +558,12 @@ def _is_legacy_pytorch_storage_tail(report: PickleReport) -> bool:
 
 def _is_pytorch_storage_persistent_id_finding(finding: Finding) -> bool:
     """Return True when the finding is PyTorch's own externalized tensor-storage persistent_id."""
-    return bool(finding.details.get("pytorch_storage_persistent_id"))
+    opcode = finding.details.get("opcode")
+    return (
+        finding.rule_code == "PERSISTENT_ID"
+        and opcode == "BINPERSID"
+        and finding.details.get("pytorch_storage_persistent_id") is True
+    )
 
 
 def _has_only_legacy_pytorch_tail_imports(report: PickleReport) -> bool:
@@ -518,21 +571,45 @@ def _has_only_legacy_pytorch_tail_imports(report: PickleReport) -> bool:
     import_references = report.metadata.get("import_references")
     if not _is_reference_sequence(import_references) or not import_references:
         return False
+    if report.metadata.get("import_references_truncated") is True:
+        return False
 
-    saw_torch = False
+    saw_storage_persistent_id_reference = False
     for reference in import_references:
         if not isinstance(reference, Mapping) or bool(reference.get("is_dangerous")):
             return False
         module = reference.get("module")
-        if not isinstance(module, str):
+        name = reference.get("name")
+        if not isinstance(module, str) or not isinstance(name, str):
             return False
-        top_level = module.split(".", 1)[0]
-        if top_level not in _LEGACY_PYTORCH_TAIL_MODULE_PREFIXES:
-            return False
-        if top_level == "torch":
-            saw_torch = True
+        if _is_legacy_pytorch_storage_persistent_id_reference(reference):
+            saw_storage_persistent_id_reference = True
+            continue
+        if (module, name) in _LEGACY_PYTORCH_REBUILD_IMPORTS or (module, name) in _LEGACY_PYTORCH_AUXILIARY_IMPORTS:
+            continue
+        return False
 
-    return saw_torch
+    return saw_storage_persistent_id_reference
+
+
+def _is_legacy_pytorch_storage_persistent_id_reference(reference: Mapping[str, Any]) -> bool:
+    """Return True for canonical torch storage imports proven to back a persistent storage ID."""
+    return (
+        reference.get("pytorch_storage_persistent_id") is True
+        and reference.get("module") == "torch"
+        and reference.get("name") in _LEGACY_PYTORCH_STORAGE_NAMES
+    )
+
+
+def _is_pytorch_zip_pickle_member_source(source: str) -> bool:
+    """Return True for PyTorch ZIP data.pkl member sources, which do not have raw storage tails."""
+    if source.endswith(" (decompressed)"):
+        source = source[: -len(" (decompressed)")]
+    if ":" not in source:
+        return False
+    _archive_path, member_name = source.rsplit(":", 1)
+    normalized_member = member_name.replace("\\", "/").lstrip("/")
+    return normalized_member == "data.pkl" or normalized_member.endswith("/data.pkl")
 
 
 def _pickle_source_extension(source: str) -> str:
