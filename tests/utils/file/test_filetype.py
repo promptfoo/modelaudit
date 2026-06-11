@@ -18,6 +18,7 @@ import pytest
 from modelaudit.scanner_registry_metadata import get_extension_format_map
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
+    _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES,
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
     JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES,
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
@@ -392,9 +393,23 @@ def test_detect_renamed_flax_checkpoint_under_skipped_suffix(tmp_path: Path, suf
 
 
 @pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml"])
+def test_detect_large_plain_skipped_suffix_within_complete_text_bound_does_not_route_as_flax(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    document = tmp_path / f"notes{suffix}"
+    document.write_text("#version: 0.2\n" + ("Ġtoken token\n" * 220_000), encoding="utf-8")
+
+    assert 2 * FLAX_MSGPACK_STRUCTURE_READ_BYTES < document.stat().st_size < _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
+    assert detect_file_format_from_magic(str(document)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(document)) == "unknown"
+    assert detect_file_format(str(document)) == "unknown"
+
+
+@pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml"])
 def test_detect_oversized_ambiguous_skipped_suffix_fails_closed_as_flax(tmp_path: Path, suffix: str) -> None:
     document = tmp_path / f"notes{suffix}"
-    document.write_bytes(b" " * (2 * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1) + 2))
+    document.write_bytes(b"a" * (_CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES + 1))
 
     assert detect_file_format_from_magic(str(document)) == "flax_msgpack"
     assert detect_file_format_for_skip_filter(str(document)) == "flax_msgpack"

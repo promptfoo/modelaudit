@@ -229,6 +229,13 @@ def _build_printable_utf8_ambiguous_binary_route() -> bytes:
     return (b'""' + ("é" * 17).encode("utf-8")) * 4097
 
 
+def _build_large_tokenizer_merges_text() -> str:
+    """Build a deterministic BPE merges file above the binary-routing fast path."""
+    line = "Ġtoken token\n"
+    repeat_count = (3 * 1024 * 1024) // len(line.encode("utf-8")) + 1
+    return "#version: 0.2\n" + line * repeat_count
+
+
 def _write_pickle_safetensors_polyglot(path: Path, header_length: int) -> None:
     """Write a valid SafeTensors file whose bytes are also a dangerous pickle."""
     pickle_tail = b"\n0cos\nsystem\n(Vecho modelaudit-polyglot\ntR."
@@ -5048,6 +5055,22 @@ def test_scan_file_keeps_bounded_utf8_tokenizer_text_out_of_flax_scanner(
     assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
 
 
+def test_scan_file_keeps_large_text_owner_tokenizer_text_out_of_flax_scanner(tmp_path: Path) -> None:
+    text_path = tmp_path / "merges.txt"
+    text_path.write_text(_build_large_tokenizer_merges_text(), encoding="utf-8")
+
+    assert 2 * 1024 * 1024 < text_path.stat().st_size < 10 * 1024 * 1024
+    assert file_detection.detect_file_format(str(text_path)) == "unknown"
+    assert file_detection.detect_file_format_from_magic(str(text_path)) == "unknown"
+    assert file_detection.detect_file_format_for_skip_filter(str(text_path)) == "unknown"
+
+    result = scan_file(str(text_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+    assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+
+
 def test_scan_file_keeps_nested_utf8_tokenizer_text_member_out_of_flax_scanner(tmp_path: Path) -> None:
     archive = tmp_path / "tokenizer-bundle.zip"
     _create_misnamed_zip(archive, {"tokenizer/merges.txt": "#version: 0.2\nĠ t\n".encode()})
@@ -5061,11 +5084,49 @@ def test_scan_file_keeps_nested_utf8_tokenizer_text_member_out_of_flax_scanner(t
     assert result.metadata["contents"] == [{"path": f"{archive}:tokenizer/merges.txt", "type": "unknown", "size": 19}]
 
 
+def test_scan_file_keeps_large_nested_tokenizer_text_member_out_of_flax_scanner(tmp_path: Path) -> None:
+    archive = tmp_path / "large-tokenizer-bundle.zip"
+    payload = _build_large_tokenizer_merges_text().encode("utf-8")
+    _create_misnamed_zip(archive, {"tokenizer/merges.txt": payload})
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
+    assert result.success is True
+    assert not result.issues
+    assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+    assert result.metadata["contents"] == [
+        {"path": f"{archive}:tokenizer/merges.txt", "type": "unknown", "size": len(payload)}
+    ]
+
+
 def test_scan_file_fails_closed_for_printable_utf8_non_text_suffix_binary_candidate(tmp_path: Path) -> None:
     payload = _build_printable_utf8_ambiguous_binary_route()
     candidate = tmp_path / "ambiguous.jpg"
     candidate.write_bytes(payload)
 
+    assert file_detection.detect_file_format(str(candidate)) == "flax_msgpack"
+    assert file_detection.detect_file_format_from_magic(str(candidate)) == "flax_msgpack"
+    assert file_detection.detect_file_format_for_skip_filter(str(candidate)) == "flax_msgpack"
+
+    result = scan_file(str(candidate), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(candidate), cache_scan_results=False)
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "flax_msgpack_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_fails_closed_for_large_printable_utf8_non_text_suffix_binary_candidate(tmp_path: Path) -> None:
+    unit = _build_printable_utf8_ambiguous_binary_route()
+    payload = unit * ((2 * 1024 * 1024) // len(unit) + 1)
+    candidate = tmp_path / "ambiguous.jpg"
+    candidate.write_bytes(payload)
+
+    assert candidate.stat().st_size > 2 * 1024 * 1024
     assert file_detection.detect_file_format(str(candidate)) == "flax_msgpack"
     assert file_detection.detect_file_format_from_magic(str(candidate)) == "flax_msgpack"
     assert file_detection.detect_file_format_for_skip_filter(str(candidate)) == "flax_msgpack"

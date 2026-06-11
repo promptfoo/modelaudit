@@ -21,6 +21,7 @@ from modelaudit import core as core_module
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
+    _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES,
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
@@ -466,9 +467,25 @@ class TestDirectoryFileFiltering:
         assert determine_exit_code(results) == 1
         assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
 
+    def test_large_plain_text_document_suffix_within_complete_text_bound_is_skipped(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        document = tmp_path / "notes.txt"
+        document.write_text("#version: 0.2\n" + ("Ġtoken token\n" * 220_000), encoding="utf-8")
+
+        assert (
+            2 * FLAX_MSGPACK_STRUCTURE_READ_BYTES < document.stat().st_size < _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 0
+        assert "flax_msgpack" not in results.scanner_names
+
     def test_oversized_plain_text_document_suffix_fails_closed_in_directory_scan(self, tmp_path: Path) -> None:
         document = tmp_path / "notes.txt"
-        document.write_bytes(b" " * (2 * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1) + 2))
+        document.write_bytes(b"a" * (_CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES + 1))
 
         results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
 

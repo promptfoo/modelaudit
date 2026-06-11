@@ -52,6 +52,7 @@ _TF_METAGRAPH_MAX_ROUTING_PAYLOAD_BYTES = _TF_METAGRAPH_MAX_VALIDATE_BYTES
 _TF_METAGRAPH_MAX_ROUTING_FIELDS = 32768
 _TF_METAGRAPH_MAX_ROUTING_DEPTH = 64
 _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES = 2 * 1024 * 1024
+_CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES = 10 * 1024 * 1024
 _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES = b"\t\n\r" + bytes(range(0x20, 0x7F))
 _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS = frozenset({"\t", "\n", "\r", "\f"})
 _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES = frozenset({".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".json"})
@@ -5363,7 +5364,13 @@ def _is_complete_bounded_printable_text(file_path: Path, file_size: int) -> bool
 
 def _is_complete_bounded_printable_text_content_owner(file_path: Path, file_size: int) -> bool:
     """Return whether printable text can safely own this complete file."""
-    if file_size > _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES:
+    suffix = file_path.suffix.lower()
+    max_complete_text_bytes = (
+        _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
+        if suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        else _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+    )
+    if file_size > max_complete_text_bytes:
         return False
     try:
         payload = read_magic_bytes(str(file_path), file_size)
@@ -5371,7 +5378,7 @@ def _is_complete_bounded_printable_text_content_owner(file_path: Path, file_size
         return False
     if not payload.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES):
         return True
-    if file_path.suffix.lower() not in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES:
+    if suffix not in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES:
         return False
     try:
         text = payload.decode("utf-8-sig")
