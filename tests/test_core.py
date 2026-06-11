@@ -1148,9 +1148,9 @@ def test_directory_scan_rejects_non_regular_savedmodel_marker_before_dispatch(
     assert result.files_scanned == 0
     assert result.has_errors is True
     assert any(
-        issue.message == "Non-regular directory entry was not scanned"
+        issue.message == "Special directory entry could not be scanned"
         and issue.location == str(marker_path)
-        and issue.details["scan_outcome_reason"] == "directory_entry_non_regular"
+        and issue.details["scan_outcome_reason"] == "directory_special_file_unscanned"
         for issue in result.issues
     )
     assert determine_exit_code(result) == 2

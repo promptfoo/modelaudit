@@ -3185,17 +3185,26 @@ def scan_model_directory_or_file(
             pending_dvc_output_limit_checks: list[tuple[str, DvcResolution]] = []
             directory_coverage_gaps: dict[tuple[str, str], set[str]] = {}
 
-            def trusted_hf_owner_source_target(owner_source: Path) -> Path | None:
+            def trusted_hf_owner_source_target(
+                owner_source: Path,
+                *,
+                owner_entry: _DirectoryOwnerSnapshotEntry,
+            ) -> Path | None:
                 if (
                     not is_hf_cache
                     or hf_cache_root is None
                     or trusted_hf_blobs_root is None
-                    or not _is_directory_link(owner_source)
+                    or owner_entry.entry_type != "link"
                     or not _path_has_part(owner_source, "snapshots")
                 ):
                     return None
                 try:
                     resolved_target = owner_source.resolve(strict=True)
+                    if resolved_target == owner_source.absolute() and owner_entry.raw_link_target is not None:
+                        raw_target = Path(owner_entry.raw_link_target)
+                        if not raw_target.is_absolute():
+                            raw_target = owner_source.parent / raw_target
+                        resolved_target = raw_target.resolve(strict=True)
                     target_stat = os.stat(resolved_target, follow_symlinks=False)
                 except (OSError, RuntimeError):
                     return None
@@ -3295,6 +3304,19 @@ def scan_model_directory_or_file(
                     },
                 )
 
+            def record_owner_unscanned_entry(
+                file_path: Path,
+                owner_entry: _DirectoryOwnerSnapshotEntry,
+            ) -> None:
+                nonlocal aggregate_hash_complete
+                if record_dvc_directory_special_file(file_path):
+                    return
+                if owner_entry.entry_type == "link":
+                    record_non_regular_directory_entry(file_path)
+                    return
+                aggregate_hash_complete = False
+                _record_directory_special_file_unscanned(results, scan_metadata, str(file_path))
+
             directory_discovery_started_at = _start_phase_timing(phase_timings)
             owner_root_path = Path(os.path.abspath(path))
             if directory_owner_class is not None and directory_owner_result is None:
@@ -3330,7 +3352,10 @@ def scan_model_directory_or_file(
                             ):
                                 directory_owner_budget_source_paths.add(owner_source)
                         elif owner_entry.entry_type != "directory":
-                            trusted_target = trusted_hf_owner_source_target(Path(owner_source))
+                            trusted_target = trusted_hf_owner_source_target(
+                                Path(owner_source),
+                                owner_entry=owner_entry,
+                            )
                             if trusted_target is None:
                                 directory_owner_non_regular_sources.add(owner_source)
                             else:
@@ -3385,14 +3410,14 @@ def scan_model_directory_or_file(
                         and initial_owner_entry.entry_type != "file"
                         and str(Path(os.path.abspath(file_path_obj))) not in directory_owner_content_source_paths
                     ):
-                        if not record_dvc_directory_special_file(file_path_obj):
-                            record_non_regular_directory_entry(file_path_obj)
+                        record_owner_unscanned_entry(file_path_obj, initial_owner_entry)
                         continue
                     if not file_path_obj.is_file() and not file_path_obj.is_symlink():
                         if is_directory_owner_source:
                             directory_owner_unavailable_sources.add(str(file_path_obj))
                         if not record_dvc_directory_special_file(file_path_obj):
-                            record_non_regular_directory_entry(file_path_obj)
+                            aggregate_hash_complete = False
+                            _record_directory_special_file_unscanned(results, scan_metadata, file_path)
                         continue
                     resolved_file = resolve_covered_dvc_file_symlink(file_path_obj)
                     is_dvc_covered_file_symlink = resolved_file is not None
