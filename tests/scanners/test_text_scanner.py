@@ -1998,6 +1998,14 @@ def _bert_like_multilingual_vocabulary(*tail_tokens: str) -> str:
     return "\n".join(tokens) + "\n"
 
 
+class _LineIterationGuardBytes(bytes):
+    def find(self, *args: Any, **kwargs: Any) -> int:
+        raise AssertionError("line iteration must not call bytes.find")
+
+    def splitlines(self, *args: Any, **kwargs: Any) -> list[bytes]:
+        raise AssertionError("line iteration must not materialize all lines")
+
+
 @pytest.mark.parametrize("token", ["zombie", "trojan"])
 def test_text_scanner_multilingual_tokenizer_vocab_content_omits_isolated_cc_tokens(
     tmp_path: Path,
@@ -2143,7 +2151,10 @@ def test_text_scanner_tokenizer_vocab_cc_retarget_limit_fails_closed(tmp_path: P
     assert any(
         check.name == "Text Content Security Coverage"
         and check.details.get("scan_outcome_reason") == "text_content_security_classification_limit"
+        and check.details.get("classification_limit_sources") == ["tokenizer_vocabulary"]
         and check.details.get("max_classification_occurrences") == MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES
+        and check.details.get("max_tokenizer_vocabulary_cc_retarget_occurrences")
+        == MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES
         for check in result.checks
     )
 
@@ -2184,6 +2195,69 @@ def test_text_scanner_tokenizer_vocab_cc_indicator_entries_are_omitted(
         )
         + "\n",
         encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.details.get("type") == "cc_pattern"
+    ]
+    assert any(
+        check.name == "Network Communication Detection" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_tokenizer_vocab_line_iteration_avoids_find_and_splitlines() -> None:
+    payload = _LineIterationGuardBytes(
+        b"\n".join(
+            [
+                b"[PAD]",
+                b"[UNK]",
+                b"[CLS]",
+                b"[SEP]",
+                b"[MASK]",
+                b"market",
+                b"earnings",
+                b"zombie@@",
+                b"neutral",
+                b"safe-token",
+                b"##ing",
+            ]
+        )
+        + b"\n"
+    )
+
+    assert TextScanner._tokenizer_vocabulary_line_evidence(payload) == (11, 11, 5, 2)
+
+
+@pytest.mark.parametrize("line_separator", [b"\n", b"\r\n", b"\r"])
+def test_text_scanner_tokenizer_vocab_line_separators_omit_suffix_marked_cc_token(
+    tmp_path: Path,
+    line_separator: bytes,
+) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_bytes(
+        line_separator.join(
+            [
+                b"[PAD]",
+                b"[UNK]",
+                b"[CLS]",
+                b"[SEP]",
+                b"[MASK]",
+                b"market",
+                b"earnings",
+                b"zombie@@",
+                b"neutral",
+                b"safe-token",
+                b"##ing",
+            ]
+        )
+        + line_separator
     )
 
     result = TextScanner().scan(str(text_path))
@@ -2503,7 +2577,9 @@ def test_text_scanner_documentation_classification_limit_is_inconclusive(tmp_pat
     assert any(
         check.name == "Text Content Security Coverage"
         and check.details.get("scan_outcome_reason") == "text_content_security_classification_limit"
+        and check.details.get("classification_limit_sources") == ["documentation"]
         and check.details.get("max_classification_occurrences") == 1_024
+        and check.details.get("max_documentation_classification_occurrences") == 1_024
         for check in result.checks
     )
 
@@ -2534,9 +2610,14 @@ def test_text_scanner_documentation_classification_exact_limit_ignores_passive_f
         },
     ]
 
-    _classified, incomplete = TextScanner._downgrade_sidecar_network_findings("README.md", payload, findings)
+    _classified, incomplete, limit_sources = TextScanner._downgrade_sidecar_network_findings(
+        "README.md",
+        payload,
+        findings,
+    )
 
     assert incomplete is False
+    assert limit_sources == set()
 
 
 def test_text_scanner_documentation_classification_limit_is_shared(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2553,9 +2634,14 @@ def test_text_scanner_documentation_classification_limit_is_shared(monkeypatch: 
 
     monkeypatch.setattr(TextScanner, "_documentation_cc_finding_is_benign_prose", classmethod(count_checks))
 
-    _classified, incomplete = TextScanner._downgrade_sidecar_network_findings("README.md", payload, findings)
+    _classified, incomplete, limit_sources = TextScanner._downgrade_sidecar_network_findings(
+        "README.md",
+        payload,
+        findings,
+    )
 
     assert incomplete is True
+    assert limit_sources == {"documentation"}
     assert checks == 1_024
 
 
@@ -2579,9 +2665,14 @@ def test_text_scanner_documentation_retarget_caches_absent_token_searches(
 
     monkeypatch.setattr(TextScanner, "_find_documentation_token", staticmethod(count_searches))
 
-    _classified, incomplete = TextScanner._downgrade_sidecar_network_findings("README.md", payload, [finding])
+    _classified, incomplete, limit_sources = TextScanner._downgrade_sidecar_network_findings(
+        "README.md",
+        payload,
+        [finding],
+    )
 
     assert incomplete is False
+    assert limit_sources == set()
     assert calls_by_token[b"from requests"] == 1
     assert calls_by_token[b"requests.connect"] == 1
     assert calls_by_token[b"requests.request"] == 1

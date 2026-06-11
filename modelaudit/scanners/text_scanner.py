@@ -691,6 +691,22 @@ class TextScanner(BaseScanner):
             return False
         return not any(value <= 0x20 or value == 0x7F for value in line)
 
+    @staticmethod
+    def _find_next_line_separator(payload: bytes, start: int) -> tuple[int, int]:
+        payload_length = len(payload)
+        index = start
+        while index < payload_length:
+            value = payload[index]
+            if value == 0x0A:
+                return index, index + 1
+            if value == 0x0D:
+                next_start = index + 1
+                if next_start < payload_length and payload[next_start] == 0x0A:
+                    next_start += 1
+                return index, next_start
+            index += 1
+        return payload_length, payload_length
+
     @classmethod
     def _tokenizer_vocabulary_line_evidence(cls, payload: bytes) -> tuple[int, int, int, int]:
         token_lines = 0
@@ -700,13 +716,9 @@ class TextScanner(BaseScanner):
         line_start = 0
         payload_length = len(payload)
         while line_start < payload_length:
-            line_end = payload.find(b"\n", line_start)
-            if line_end < 0:
-                line_end = payload_length
+            line_end, next_line_start = cls._find_next_line_separator(payload, line_start)
             raw_line = payload[line_start:line_end]
-            if raw_line.endswith(b"\r"):
-                raw_line = raw_line[:-1]
-            line_start = line_end + 1 if line_end < payload_length else payload_length
+            line_start = next_line_start
             line = raw_line.strip()
             if not line:
                 continue
@@ -741,15 +753,14 @@ class TextScanner(BaseScanner):
             and subword_lines >= MIN_STRONG_TOKENIZER_VOCABULARY_SUBWORD_LINES
         )
 
-    @staticmethod
-    def _finding_line_parts(payload: bytes, finding: dict[str, Any]) -> tuple[bytes, int] | None:
+    @classmethod
+    def _finding_line_parts(cls, payload: bytes, finding: dict[str, Any]) -> tuple[bytes, int] | None:
         position = finding.get("position")
         if not isinstance(position, int) or position < 0 or position > len(payload):
             return None
-        line_start = max(payload.rfind(b"\n", 0, position) + 1, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
-        line_end = payload.find(b"\n", position)
-        if line_end < 0:
-            line_end = len(payload)
+        previous_separator = max(payload.rfind(b"\n", 0, position), payload.rfind(b"\r", 0, position))
+        line_start = max(previous_separator + 1, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        line_end, _ = cls._find_next_line_separator(payload, position)
         line_end = min(line_end, position + MAX_TEXT_FINDING_CONTEXT_BYTES)
         return payload[line_start:line_end], position - line_start
 
@@ -1696,9 +1707,10 @@ class TextScanner(BaseScanner):
         path: str,
         payload: bytes,
         findings: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], bool]:
+    ) -> tuple[list[dict[str, Any]], bool, set[str]]:
         classified_findings: list[dict[str, Any]] = []
         classification_incomplete = False
+        classification_limit_sources: set[str] = set()
         remaining_occurrences = MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES
         documentation_sidecar = cls._is_documentation_sidecar(path)
         lowered_payload = payload.lower() if documentation_sidecar else b""
@@ -1718,19 +1730,23 @@ class TextScanner(BaseScanner):
                     index == last_retargetable_index,
                 )
                 classification_incomplete = classification_incomplete or retarget_incomplete
+                if retarget_incomplete:
+                    classification_limit_sources.add("documentation")
             if tokenizer_vocabulary_sidecar:
                 retargeted_finding, tokenizer_retarget_incomplete = (
                     cls._retarget_or_omit_tokenizer_vocabulary_cc_finding(payload, finding)
                 )
                 classification_incomplete = classification_incomplete or tokenizer_retarget_incomplete
                 retarget_incomplete = retarget_incomplete or tokenizer_retarget_incomplete
+                if tokenizer_retarget_incomplete:
+                    classification_limit_sources.add("tokenizer_vocabulary")
                 if retargeted_finding is None:
                     continue
                 finding = retargeted_finding
             if not retarget_incomplete and cls._sidecar_network_finding_is_informational(path, payload, finding):
                 finding = {**finding, "severity": "INFO"}
             classified_findings.append(finding)
-        return classified_findings, classification_incomplete
+        return classified_findings, classification_incomplete, classification_limit_sources
 
     @staticmethod
     def _is_unreadable_path_result(result: ScanResult) -> bool:
@@ -1859,23 +1875,45 @@ class TextScanner(BaseScanner):
                     max_findings=max_findings,
                 )
                 network_findings, finding_limit = self._split_detector_finding_limit(network_findings)
-                network_findings, classification_incomplete = self._downgrade_sidecar_network_findings(
-                    path,
-                    inspected_payload,
-                    network_findings,
+                network_findings, classification_incomplete, classification_limit_sources = (
+                    self._downgrade_sidecar_network_findings(
+                        path,
+                        inspected_payload,
+                        network_findings,
+                    )
                 )
                 if network_findings or not truncated:
                     self.add_network_communication_findings(network_findings, result, context=path)
                 if classification_incomplete:
                     detector_incomplete = True
+                    classification_limits = {
+                        "documentation": MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES,
+                        "tokenizer_vocabulary": MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES,
+                    }
+                    active_classification_limits = [
+                        classification_limits[source]
+                        for source in classification_limit_sources
+                        if source in classification_limits
+                    ]
+                    classification_details: dict[str, Any] = {
+                        "classification_limit_sources": sorted(classification_limit_sources),
+                    }
+                    if len(active_classification_limits) == 1:
+                        classification_details["max_classification_occurrences"] = active_classification_limits[0]
+                    if "documentation" in classification_limit_sources:
+                        classification_details["max_documentation_classification_occurrences"] = (
+                            MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES
+                        )
+                    if "tokenizer_vocabulary" in classification_limit_sources:
+                        classification_details["max_tokenizer_vocabulary_cc_retarget_occurrences"] = (
+                            MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES
+                        )
                     self._mark_content_security_scan_incomplete(
                         result,
                         path,
                         reason=TEXT_CONTENT_SECURITY_CLASSIFICATION_LIMIT_REASON,
                         message="Text network finding classification exceeded the work limit",
-                        details={
-                            "max_classification_occurrences": MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES,
-                        },
+                        details=classification_details,
                     )
                 if finding_limit is not None:
                     if self._passive_network_reporting_limit(
