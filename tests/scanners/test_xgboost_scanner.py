@@ -24,14 +24,18 @@ from typing import Any, cast
 from unittest.mock import ANY, Mock, patch
 
 import pytest
+from click.testing import CliRunner
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
-from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.cli import cli
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file, scan_model_streaming
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.tar_scanner import TarScanner
 from modelaudit.scanners.xgboost_scanner import XGBOOST_JSON_ROUTING_CHUNK_BYTES, XGBoostScanner
 from modelaudit.scanners.zip_scanner import ZipScanner
+from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
+from tests.cli_output import parse_click_json_output
 
 
 class FakeBooster:
@@ -87,6 +91,27 @@ def _sentencepiece_model_proto() -> bytes:
         ("<0x04>", 6),
     ]
     return b"".join(_sentencepiece_piece(piece, piece_type) for piece, piece_type in pieces)
+
+
+_SENTENCEPIECE_FIXTURE_DIR = Path(__file__).resolve().parents[1] / "assets" / "samples" / "sentencepiece"
+_SENTENCEPIECE_OFFICIAL_FIXTURES = (
+    "custom_unknown_disabled_specials.model",
+    "custom_unknown_disabled_specials_byte_fallback.model",
+)
+_SENTENCEPIECE_MALFORMED_TAILS = (
+    pytest.param(b"\x12\x80", id="truncated-length-varint"),
+    pytest.param(b"\x80", id="truncated-tag-varint"),
+    pytest.param(_proto_field(2, 2, _proto_varint(4) + b"x"), id="truncated-length-payload"),
+    pytest.param(_proto_varint((2 << 3) | 6), id="invalid-wire-type-6"),
+    pytest.param(_proto_varint((2 << 3) | 7), id="invalid-wire-type-7"),
+    pytest.param(b"\x00not a protobuf tail", id="arbitrary-tail"),
+)
+
+
+def _write_official_sentencepiece_fixture(tmp_path: Path, fixture_name: str) -> Path:
+    tokenizer_model = tmp_path / "tokenizer.model"
+    tokenizer_model.write_bytes((_SENTENCEPIECE_FIXTURE_DIR / fixture_name).read_bytes())
+    return tokenizer_model
 
 
 @pytest.fixture
@@ -199,6 +224,18 @@ def _assert_inconclusive_metadata(result: ModelAuditResultModel, path: Path, rea
     assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     assert metadata.get("analysis_incomplete") is True
     assert reason in metadata.get("scan_outcome_reasons", [])
+
+
+def _assert_no_xgboost_s1004(result: ModelAuditResultModel) -> None:
+    assert "xgboost" not in result.scanner_names
+    assert determine_exit_code(result) == 0
+    assert not any(issue.rule_code == "S1004" for issue in result.issues)
+
+
+def _assert_xgboost_s1004(result: ModelAuditResultModel) -> None:
+    assert "xgboost" in result.scanner_names
+    assert determine_exit_code(result) == 2
+    assert any(issue.rule_code == "S1004" for issue in result.issues)
 
 
 def _ubjson_key(key: bytes) -> bytes:
@@ -341,9 +378,32 @@ class TestXGBoostScannerBasic:
 
         assert not XGBoostScanner.can_handle(str(tokenizer_model))
 
+    @pytest.mark.parametrize("fixture_name", _SENTENCEPIECE_OFFICIAL_FIXTURES)
+    def test_can_handle_rejects_dependency_sentencepiece_with_disabled_specials(
+        self, tmp_path: Path, fixture_name: str
+    ) -> None:
+        tokenizer_model = _write_official_sentencepiece_fixture(tmp_path, fixture_name)
+
+        assert not XGBoostScanner.can_handle(str(tokenizer_model))
+
+    def test_can_handle_rejects_strong_sentencepiece_with_well_formed_tail(self, tmp_path: Path) -> None:
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(_sentencepiece_model_proto() + _proto_field(2, 2, _proto_varint(0)))
+
+        assert not XGBoostScanner.can_handle(str(tokenizer_model))
+
     def test_can_handle_keeps_malformed_sentencepiece_like_model_on_xgboost_route(self, tmp_path: Path) -> None:
         tokenizer_model = tmp_path / "tokenizer.model"
         tokenizer_model.write_bytes(b"\x0a\x0e\x0a\x05<unk>\x15\x00" + (b"\0" * 64))
+
+        assert XGBoostScanner.can_handle(str(tokenizer_model))
+
+    @pytest.mark.parametrize("tail", _SENTENCEPIECE_MALFORMED_TAILS)
+    def test_can_handle_keeps_strong_sentencepiece_with_malformed_tail_on_xgboost_route(
+        self, tmp_path: Path, tail: bytes
+    ) -> None:
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(_sentencepiece_model_proto() + tail)
 
         assert XGBoostScanner.can_handle(str(tokenizer_model))
 
@@ -1733,6 +1793,36 @@ class TestXGBoostFailClosedEndToEnd:
         assert determine_exit_code(aggregate) == 0
         assert not any(issue.rule_code == "S1004" for issue in aggregate.issues)
 
+    @pytest.mark.parametrize("fixture_name", _SENTENCEPIECE_OFFICIAL_FIXTURES)
+    def test_dependency_sentencepiece_model_with_disabled_specials_is_not_xgboost_false_positive(
+        self, tmp_path: Path, fixture_name: str
+    ) -> None:
+        tokenizer_model = _write_official_sentencepiece_fixture(tmp_path, fixture_name)
+
+        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+        streaming = scan_model_streaming(
+            file_generator=iterate_files_streaming(tmp_path),
+            scan_root=str(tmp_path),
+            delete_after_scan=False,
+            cache_enabled=False,
+            skip_file_types=True,
+        )
+        cli_result = CliRunner().invoke(
+            cli,
+            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
+            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+        )
+        cli_payload = parse_click_json_output(cli_result.output)
+
+        assert direct.success is True
+        assert direct.scanner_name == "unknown"
+        _assert_no_xgboost_s1004(aggregate)
+        _assert_no_xgboost_s1004(streaming)
+        assert cli_result.exit_code == 0
+        assert "xgboost" not in cli_payload.get("scanner_names", [])
+        assert not any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
+
     def test_malformed_sentencepiece_like_model_still_fails_closed_in_xgboost(self, tmp_path: Path) -> None:
         tokenizer_model = tmp_path / "tokenizer.model"
         tokenizer_model.write_bytes(b"\x0a\x0e\x0a\x05<unk>\x15\x00" + (b"\0" * 64))
@@ -1743,6 +1833,39 @@ class TestXGBoostFailClosedEndToEnd:
         assert result.scanner_name == "xgboost"
         assert "xgboost_binary_structure_unrecognized" in result.metadata["scan_outcome_reasons"]
         assert any(issue.rule_code == "S1004" for issue in result.issues)
+
+    @pytest.mark.parametrize("tail", _SENTENCEPIECE_MALFORMED_TAILS)
+    def test_sentencepiece_model_with_malformed_tail_still_fails_closed_in_xgboost(
+        self, tmp_path: Path, tail: bytes
+    ) -> None:
+        tokenizer_model = tmp_path / "tokenizer.model"
+        tokenizer_model.write_bytes(_sentencepiece_model_proto() + tail)
+
+        direct = scan_file(str(tokenizer_model), config={"cache_enabled": False})
+        aggregate = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+        streaming = scan_model_streaming(
+            file_generator=iterate_files_streaming(tmp_path),
+            scan_root=str(tmp_path),
+            delete_after_scan=False,
+            cache_enabled=False,
+            skip_file_types=True,
+        )
+        cli_result = CliRunner().invoke(
+            cli,
+            ["scan", "--stream", "--no-cache", "--format", "json", str(tmp_path)],
+            env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+        )
+        cli_payload = parse_click_json_output(cli_result.output)
+
+        assert direct.success is False
+        assert direct.scanner_name == "xgboost"
+        assert "xgboost_binary_structure_unrecognized" in direct.metadata["scan_outcome_reasons"]
+        assert any(issue.rule_code == "S1004" for issue in direct.issues)
+        _assert_xgboost_s1004(aggregate)
+        _assert_xgboost_s1004(streaming)
+        assert cli_result.exit_code == 2
+        assert "xgboost" in cli_payload.get("scanner_names", [])
+        assert any(issue.get("rule_code") == "S1004" for issue in cli_payload.get("issues", []))
 
     def test_xgboost_binary_model_extension_still_scans_cleanly(self, tmp_path: Path) -> None:
         binary_model = tmp_path / "native.model"
