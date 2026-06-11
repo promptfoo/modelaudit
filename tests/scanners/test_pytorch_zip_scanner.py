@@ -600,7 +600,7 @@ def test_pytorch_zip_suppresses_safe_numpy_rng_state_reconstruct_call_graph_nois
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
-def test_pytorch_zip_keeps_numpy_rng_state_reconstruct_critical_for_attacker_class(tmp_path: Path) -> None:
+def test_pytorch_zip_keeps_numpy_rng_state_reconstruct_malicious_for_attacker_class(tmp_path: Path) -> None:
     model_path = tmp_path / "rng_state_attacker_class.pth"
     payload = _SAFE_NUMPY_NDARRAY_RECONSTRUCT_PAYLOAD.replace(
         b"cnumpy._core.multiarray\n_reconstruct\n",
@@ -616,10 +616,13 @@ def test_pytorch_zip_keeps_numpy_rng_state_reconstruct_critical_for_attacker_cla
 
     result = PyTorchZipScanner().scan(str(model_path))
 
+    assert result.success is False
+    assert result.metadata["pickle_verdict"] == "malicious"
+    # Python 3.10 does not emit the same call-graph finding, but the attacker class must remain critical.
     assert any(
-        issue.rule_code == "DANGEROUS_CALL_GRAPH"
+        issue.rule_code == "S104"
         and issue.severity == IssueSeverity.CRITICAL
-        and issue.details.get("import_reference") == "numpy.core.multiarray._reconstruct"
+        and issue.details.get("import_reference") == "builtins.eval"
         for issue in result.issues
     )
 
