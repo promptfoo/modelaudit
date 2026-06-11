@@ -354,8 +354,10 @@ FLOAT_LIKE_PATTERN = re.compile(r"[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?")
 REDACTED_CONTEXT_SECRET = "<redacted-secret>"
 BASIC_AUTH_HEADER_PREFIX_PATTERN = re.compile(
     r"(?:^|[^\w-])(?:"
-    r"(?:http[-_]?)?(?:proxy[-_]?authorization|proxyauthorization|authorization)"
+    r"(?:http[-_]?)?(?:"
+    r"proxy[-_]?authorization|proxyauthorization|authorization"
     r"|basic[-_]?auth|auth[-_]?header|authorization[-_]?header|proxy[-_]?auth[-_]?header"
+    r")"
     r")"
     r"\s*(?:\\?[\"'])?\s*(?:\\?\])?\s*[:=]\s*"
     r"(?:\\?[\"']|\[\s*(?:\\?[\"'])?|\(\s*(?:\\?[\"'])?)?\s*(?:[>|][+-]?\s*)?$",
@@ -375,6 +377,10 @@ BASIC_AUTH_HEADERS_CONSTRUCTOR_START_PATTERN = re.compile(
 BASIC_AUTH_HEADERS_CONSTRUCTOR_TUPLE_PREFIX_PATTERN = re.compile(
     r"\[\s*\\?[\"']\s*"
     r"(?:proxy-authorization|authorization)\s*\\?[\"']\s*,\s*\\?[\"']?\s*$",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADERS_INIT_START_PATTERN = re.compile(
+    r"(?:^|[^\w$])(?:\\?[\"']\s*)?headers\s*(?:\\?[\"'])?\s*:\s*\[",
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS = 256
@@ -639,6 +645,8 @@ class SecretsDetector:
             return True
         if SecretsDetector._basic_auth_prefix_has_headers_constructor_context(bounded_prefix):
             return True
+        if SecretsDetector._basic_auth_prefix_has_headers_init_context(bounded_prefix):
+            return True
         if BASIC_AUTH_CONTINUATION_PREFIX_PATTERN.fullmatch(line_prefix) is None:
             return False
 
@@ -677,6 +685,19 @@ class SecretsDetector:
         return False
 
     @staticmethod
+    def _basic_auth_prefix_has_headers_init_context(prefix: str) -> bool:
+        tuple_match = BASIC_AUTH_HEADERS_CONSTRUCTOR_TUPLE_PREFIX_PATTERN.search(prefix)
+        if tuple_match is None:
+            return False
+
+        for headers_match in BASIC_AUTH_HEADERS_INIT_START_PATTERN.finditer(prefix[: tuple_match.start()]):
+            if SecretsDetector._basic_auth_headers_init_array_remains_open(
+                prefix[headers_match.end() : tuple_match.start()]
+            ):
+                return True
+        return False
+
+    @staticmethod
     def _basic_auth_headers_constructor_remains_open(value: str) -> bool:
         paren_depth = 1
         bracket_depth = 1
@@ -709,6 +730,33 @@ class SecretsDetector:
                     return False
 
         return paren_depth > 0 and bracket_depth > 0
+
+    @staticmethod
+    def _basic_auth_headers_init_array_remains_open(value: str) -> bool:
+        bracket_depth = 1
+        quote: str | None = None
+        escaped = False
+
+        for character in value:
+            if escaped:
+                escaped = False
+                continue
+            if quote is not None:
+                if character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                continue
+            if character in {"'", '"', "`"}:
+                quote = character
+            elif character == "[":
+                bracket_depth += 1
+            elif character == "]":
+                bracket_depth -= 1
+                if bracket_depth <= 0:
+                    return False
+
+        return bracket_depth > 0
 
     @staticmethod
     def _basic_auth_token_decodes_to_credentials(token: str) -> bool:

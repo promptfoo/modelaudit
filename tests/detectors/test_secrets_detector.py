@@ -167,6 +167,22 @@ class TestSecretsDetector:
                 f"HTTP_PROXY_AUTHORIZATION=Basic {_basic_auth_token(b'proxy-env:pass')}",
                 _basic_auth_token(b"proxy-env:pass"),
             ),
+            (
+                f"HTTP_BASIC_AUTH=Basic {_basic_auth_token(b'http-basic:pass')}",
+                _basic_auth_token(b"http-basic:pass"),
+            ),
+            (
+                f"HTTP_AUTH_HEADER=Basic {_basic_auth_token(b'http-auth-header:pass')}",
+                _basic_auth_token(b"http-auth-header:pass"),
+            ),
+            (
+                f"HTTP_AUTHORIZATION_HEADER=Basic {_basic_auth_token(b'http-authorization-header:pass')}",
+                _basic_auth_token(b"http-authorization-header:pass"),
+            ),
+            (
+                f"HTTP_PROXY_AUTH_HEADER=Basic {_basic_auth_token(b'http-proxy-auth-header:pass')}",
+                _basic_auth_token(b"http-proxy-auth-header:pass"),
+            ),
             ("Proxy-Authorization:\tBasic\tQWxhZGRpbjpvcGVuIHNlc2FtZQ==", "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="),
             ("aUtHoRiZaTiOn: bAsIc dTpw", "dTpw"),
             ("GET / HTTP/1.1\r\nHost: example.test\r\nAuthorization: Basic YTo/Pz8/\r\n", "YTo/Pz8/"),
@@ -298,6 +314,20 @@ class TestSecretsDetector:
                 _basic_auth_token(b"headers-constructor-proxy:pass"),
             ),
             (
+                'fetch("/model", { headers: [["Authorization", "Basic '
+                f'{_basic_auth_token(b"fetch-headers:pass")}"]] }})',
+                _basic_auth_token(b"fetch-headers:pass"),
+            ),
+            (
+                f'const init = {{ headers: [["Authorization", "Basic {_basic_auth_token(b"init-headers:pass")}"]] }}',
+                _basic_auth_token(b"init-headers:pass"),
+            ),
+            (
+                'fetch("/model", { headers: [["Accept", "application/json"], '
+                f'["Proxy-Authorization", "Basic {_basic_auth_token(b"fetch-proxy-headers:pass")}"]] }})',
+                _basic_auth_token(b"fetch-proxy-headers:pass"),
+            ),
+            (
                 f"Authorization: Basic {_basic_auth_token(bytes.fromhex('ceb4cebfcebaceb9cebcceae3a70c3a47373'))}",
                 _basic_auth_token(bytes.fromhex("ceb4cebfcebaceb9cebcceae3a70c3a47373")),
             ),
@@ -341,6 +371,11 @@ class TestSecretsDetector:
             "https://user:pass@example.test/model.bin",
             f"https://example.test/?header=Authorization%3A%20Basic%20{_basic_auth_token(b'percent:pass')}",
             f'("Authorization", "Basic {_basic_auth_token(b"tuple:pass")}")',
+            f'[["Authorization", "Basic {_basic_auth_token(b"array:pass")}"]]',
+            (
+                'const pairs = [["Accept", "application/json"], '
+                f'["Proxy-Authorization", "Basic {_basic_auth_token(b"array-proxy:pass")}"]]'
+            ),
             f'notes.append("Authorization notes", "Basic {_basic_auth_token(b"notes:pass")}")',
             f"\u0391uthorization: Basic {_basic_auth_token(b'confusable-alpha:pass')}",
             f"Authorizati\u043en: Basic {_basic_auth_token(b'confusable-o:pass')}",
