@@ -10822,6 +10822,28 @@ class TestZipScanner:
         )
         assert not any(issue.rule_code in {"S901", "S902"} for issue in result.issues)
 
+    def test_scan_zip_uses_logical_legal_member_name_for_network_classification(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "legal_text_member_with_url.zip"
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr(
+                "LICENSE",
+                "MIT License\n\n"
+                "Copyright (c) 2026 Example\n"
+                "Permission is hereby granted.\n"
+                "See https://www.apache.org/licenses/LICENSE-2.0 for the full license text.\n",
+            )
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        license_network_issues = [
+            issue
+            for issue in result.issues
+            if issue.rule_code == "S309" and issue.details.get("zip_entry") == "LICENSE"
+        ]
+        assert license_network_issues
+        assert all(issue.severity == IssueSeverity.INFO for issue in license_network_issues)
+
     def test_scan_zip_keeps_malicious_pickle_named_license_on_pickle_route(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "malicious_license_member.zip"
         with zipfile.ZipFile(archive_path, "w") as z:
@@ -10841,6 +10863,16 @@ class TestZipScanner:
 
         assert result.success is False
         assert any(issue.rule_code == "S201" and issue.details.get("zip_entry") == "NOTICE" for issue in result.issues)
+
+    def test_scan_zip_keeps_requests_pickle_named_license_on_pickle_route(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "requests_license_member.zip"
+        with zipfile.ZipFile(archive_path, "w") as z:
+            z.writestr("LICENSE", b"crequests\nget\n(S'http://example.com'\ntR.")
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert any(issue.rule_code == "S201" and issue.details.get("zip_entry") == "LICENSE" for issue in result.issues)
 
     def test_scan_zip_does_not_text_route_invalid_legal_member(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "invalid_legal_member.zip"

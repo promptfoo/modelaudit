@@ -1691,6 +1691,7 @@ class TextScanner(BaseScanner):
         truncated = len(payload) > read_limit
         inspected_payload = payload[:read_limit]
         inspected_bytes = len(inspected_payload)
+        classification_path = self._routed_filename(path)
 
         detector_incomplete = False
         if check_secrets:
@@ -1738,7 +1739,7 @@ class TextScanner(BaseScanner):
                 )
                 network_findings, finding_limit = self._split_detector_finding_limit(network_findings)
                 network_findings, classification_incomplete = self._downgrade_sidecar_network_findings(
-                    path,
+                    classification_path,
                     inspected_payload,
                     network_findings,
                 )
@@ -1757,7 +1758,7 @@ class TextScanner(BaseScanner):
                     )
                 if finding_limit is not None:
                     if self._passive_network_reporting_limit(
-                        path,
+                        classification_path,
                         inspected_payload,
                         network_findings,
                         finding_limit,

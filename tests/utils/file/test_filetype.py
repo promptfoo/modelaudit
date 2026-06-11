@@ -2574,7 +2574,7 @@ def test_detect_file_format_does_not_treat_license_prose_as_encoded_payload_budg
     path.write_text(
         "Apache License\nCopyright 2026 Example\n"
         "Redistribution for operating systems and documentation.\n"
-        + " ".join(alpha_word(index) for index in range(96)),
+        + " ".join(alpha_word(index) for index in range(file_detection._LEGAL_TEXT_MAX_ENCODED_CANDIDATES + 16)),
         encoding="utf-8",
     )
 
@@ -2590,6 +2590,7 @@ def test_detect_file_format_does_not_treat_license_prose_as_encoded_payload_budg
         ("NOTICE", b"\x80\x04cposix\nsystem\n(S'id'\ntR."),
         ("LICENSE", b"csocket\nsocket\n(S'MIT License'\ntR."),
         ("NOTICE", b"cwebbrowser\nopen\n(S'http://example.com'\ntR."),
+        ("LICENSE", b"crequests\nget\n(S'http://example.com'\ntR."),
         ("LICENSE", pickle.dumps({"safe": True}, protocol=0) + b'cposix\nsystem\n(S"echo pwned"\ntR.'),
         ("NOTICE", base64.b64encode(b"os.system('id')")),
         ("LICENSE", b"os.system('id')".hex().encode("ascii")),

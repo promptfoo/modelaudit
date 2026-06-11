@@ -3263,9 +3263,6 @@ def _encoded_pickle_route(payload: bytes) -> str | None:
         ("hex", _LEGAL_TEXT_HEX_TOKEN_RE, binascii.unhexlify),
     ):
         for match in token_re.finditer(payload):
-            candidate_count += 1
-            if candidate_count > _LEGAL_TEXT_MAX_ENCODED_CANDIDATES:
-                return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
             token = match.group(0)
             token_key = (decoder_name, token)
             if token_key in seen_tokens:
@@ -3282,6 +3279,9 @@ def _encoded_pickle_route(payload: bytes) -> str | None:
                 return route
             if decoder_name == "base64" and _is_plain_alphabetic_base64_word(token):
                 continue
+            candidate_count += 1
+            if candidate_count > _LEGAL_TEXT_MAX_ENCODED_CANDIDATES:
+                return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
             if token_count >= _LEGAL_TEXT_MAX_ENCODED_TOKENS or len(decoded) > decoded_budget:
                 return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
             token_count += 1
