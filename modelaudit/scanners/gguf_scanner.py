@@ -941,8 +941,10 @@ class GgufScanner(BaseScanner):
     @classmethod
     def _contains_path_traversal(cls, value: str) -> bool:
         for candidate in cls._metadata_decode_variants(value):
+            if ".." not in candidate:
+                continue
             normalized = candidate.replace("\\", "/")
-            if any(part == ".." for part in normalized.split("/")):
+            if normalized == ".." or normalized.startswith("../") or normalized.endswith("/..") or "/../" in normalized:
                 return True
         return False
 
@@ -951,8 +953,18 @@ class GgufScanner(BaseScanner):
         segments: list[list[str]] = []
         current_segment: list[str] = []
         current_word: list[str] = []
+        quote: str | None = None
 
-        for character in value.lower():
+        for character in value:
+            if quote is not None:
+                if character == quote:
+                    quote = None
+                    continue
+                current_word.append(character)
+                continue
+            if character in {"'", '"'}:
+                quote = character
+                continue
             if character.isspace():
                 if current_word:
                     current_segment.append("".join(current_word))
@@ -975,11 +987,33 @@ class GgufScanner(BaseScanner):
         return segments
 
     @staticmethod
-    def _destructive_rm_segment(words: list[str]) -> bool:
+    def _shell_command_name(word: str) -> str:
+        command = word.strip("\"'").replace("\\", "/").rsplit("/", 1)[-1]
+        if command.endswith(".exe"):
+            return command[:-4]
+        return command
+
+    @staticmethod
+    def _is_destructive_rm_target(word: str) -> bool:
+        target = word.strip("\"'").replace("\\", "/")
+        return target.startswith(("/", "~", "$", "..")) or "/.." in target
+
+    @staticmethod
+    def _rm_option_flags(word: str) -> tuple[bool, bool]:
+        option = word.lower().split("=", 1)[0]
+        if option in {"--recursive", "--force"}:
+            return option == "--recursive", option == "--force"
+        if option.startswith("--"):
+            return False, False
+        short_options = option.lstrip("-")
+        return "r" in short_options, "f" in short_options
+
+    @classmethod
+    def _destructive_rm_segment(cls, words: list[str]) -> bool:
         index = 0
         while index < len(words):
             word = words[index]
-            if word in _GGUF_DESTRUCTIVE_COMMAND_PREFIXES:
+            if cls._shell_command_name(word) in _GGUF_DESTRUCTIVE_COMMAND_PREFIXES:
                 index += 1
                 while index < len(words) and words[index].startswith("-"):
                     index += 1
@@ -991,27 +1025,31 @@ class GgufScanner(BaseScanner):
                 continue
             break
 
-        if index >= len(words) or words[index] != "rm":
+        if index >= len(words) or cls._shell_command_name(words[index]) != "rm":
             return False
 
         has_recursive = False
         has_force = False
+        has_target = False
         index += 1
-        while index < len(words) and words[index].startswith("-"):
-            option = words[index].lower()
-            has_recursive = has_recursive or "r" in option
-            has_force = has_force or "f" in option
+        while index < len(words):
+            word = words[index]
+            if word.startswith("-"):
+                option_recursive, option_force = cls._rm_option_flags(word)
+                has_recursive = has_recursive or option_recursive
+                has_force = has_force or option_force
+            else:
+                has_target = has_target or cls._is_destructive_rm_target(word)
             index += 1
 
-        if not (has_recursive and has_force) or index >= len(words):
-            return False
-
-        target = words[index].replace("\\", "/")
-        return target.startswith(("/", "~", "$", "..")) or "/.." in target
+        return has_recursive and has_force and has_target
 
     @classmethod
     def _destructive_rm_pattern(cls, value: str) -> bool:
-        return any(cls._destructive_rm_segment(segment) for segment in cls._shell_command_segments(value))
+        value_lower = value.lower()
+        if "rm" not in value_lower:
+            return False
+        return any(cls._destructive_rm_segment(segment) for segment in cls._shell_command_segments(value_lower))
 
     @staticmethod
     def _iter_substring_positions(value: str, needle: str) -> Iterable[int]:
@@ -1040,7 +1078,7 @@ class GgufScanner(BaseScanner):
     @classmethod
     def _fetch_segment_has_remote_url(cls, words: list[str], command: str) -> bool:
         for command_index, word in enumerate(words):
-            if word != command:
+            if cls._shell_command_name(word) != command:
                 continue
             index = command_index + 1
             while index < len(words):
