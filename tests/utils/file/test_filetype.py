@@ -411,6 +411,42 @@ def test_detect_small_plain_skipped_suffix_does_not_route_as_flax(tmp_path: Path
     assert detect_file_format(str(document)) == "unknown"
 
 
+def test_detect_multilingual_readme_does_not_route_as_flax(tmp_path: Path) -> None:
+    readme = tmp_path / "README.md"
+    readme.write_text(
+        "# Model Card\n"
+        "This documentation includes multilingual examples: こんにちは, résumé, naïve, 😀.\n"
+        "Literal escaped bytes stay prose: \\x81\\xa6params\\x81\\xa1w\\x93\\x01\\x02\\x03\n",
+        encoding="utf-8",
+    )
+
+    assert detect_file_format_from_magic(str(readme)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(readme)) == "unknown"
+    assert detect_file_format(str(readme)) == "unknown"
+
+
+def test_detect_binary_polyglot_readme_still_routes_later_flax_checkpoint(tmp_path: Path) -> None:
+    msgpack = pytest.importorskip("msgpack")
+    readme = tmp_path / "README.md"
+    readme.write_bytes(
+        b"# Model Card\nThis prefix is valid UTF-8 documentation.\n"
+        + msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+    )
+
+    assert detect_file_format_from_magic(str(readme)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(readme)) == "flax_msgpack"
+    assert detect_file_format(str(readme)) == "flax_msgpack"
+
+
+def test_detect_binary_ambiguous_text_suffix_still_fails_closed_as_flax(tmp_path: Path) -> None:
+    document = tmp_path / "notes.md"
+    document.write_bytes(b"\xc0" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 2))
+
+    assert detect_file_format_from_magic(str(document)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(document)) == "flax_msgpack"
+    assert detect_file_format(str(document)) == "flax_msgpack"
+
+
 @pytest.mark.parametrize(
     ("prefix", "has_pickle_overlap"),
     [

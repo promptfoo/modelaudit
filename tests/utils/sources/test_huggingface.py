@@ -1,6 +1,7 @@
 """Tests for HuggingFace URL handling."""
 
 import importlib
+import json
 import os
 import pickle
 import signal
@@ -21,6 +22,7 @@ import pytest
 from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
 from modelaudit.utils.sources._huggingface_download_worker import _run_operation as _run_huggingface_worker_operation
 from modelaudit.utils.sources.huggingface import (
+    _detect_huggingface_content_route_format,
     _get_huggingface_path_sizes,
     _HuggingFaceProbeBudget,
     _list_huggingface_repo_files_at_revision,
@@ -45,6 +47,10 @@ from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 from tests.helpers import create_mock_coreml, create_mock_onnx
 
 _HF_TEST_REVISION = "a" * 40
+_HF_MULTILINGUAL_E5_README_REVISION = "614241f622f53c4eeff9890bdc4f31cfecc418b3"
+_HF_MULTILINGUAL_E5_README_URL = (
+    f"https://huggingface.co/intfloat/multilingual-e5-small/resolve/{_HF_MULTILINGUAL_E5_README_REVISION}/README.md"
+)
 
 
 class _FakeRangeResponse:
@@ -70,6 +76,19 @@ class _FakeRangeResponse:
 
     def iter_content(self, chunk_size: int) -> Iterator[bytes]:
         yield self.payload[:chunk_size]
+
+
+def _fake_bounded_range_response(payload: bytes) -> Callable[..., _FakeRangeResponse]:
+    def get_side_effect(_url: str, **kwargs: object) -> _FakeRangeResponse:
+        max_bytes = len(payload)
+        headers = kwargs.get("headers", {})
+        if isinstance(headers, dict):
+            range_header = headers.get("Range")
+            if isinstance(range_header, str) and range_header.startswith("bytes=0-"):
+                max_bytes = int(range_header.removeprefix("bytes=0-")) + 1
+        return _FakeRangeResponse(payload[:max_bytes], headers={"Content-Length": str(len(payload))})
+
+    return get_side_effect
 
 
 def _make_tar_payload() -> bytes:
@@ -2108,6 +2127,51 @@ class TestModelDownloadStreaming:
         assert all(call.kwargs["revision"] == _HF_TEST_REVISION for call in mock_hf_hub_download.call_args_list)
         assert all(f"/resolve/{_HF_TEST_REVISION}/" in call.args[0] for call in mock_requests_get.call_args_list)
 
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_rejects_complete_multilingual_readme_text(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Remote content routing should treat complete bounded UTF-8 README probes as text."""
+        readme_payload = (
+            "# Model Card\n"
+            + ("This multilingual README has こんにちは, café, naïve, résumé, and 😀 examples.\n" * 256)
+        ).encode()
+        mock_requests_get.side_effect = _fake_bounded_range_response(readme_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_content_route_format(
+            "intfloat/multilingual-e5-small",
+            "README.md",
+            _HF_MULTILINGUAL_E5_README_REVISION,
+            budget,
+        )
+
+        assert detected_format is None
+
+    @patch("requests.get")
+    def test_detect_huggingface_flax_route_preserves_binary_readme_checkpoint(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Remote README names should not suppress MessagePack checkpoint structure."""
+        msgpack = pytest.importorskip("msgpack")
+        hidden_payload = msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
+        mock_requests_get.side_effect = _fake_bounded_range_response(hidden_payload)
+        budget = _HuggingFaceProbeBudget(remaining_bytes=64 * 1024 * 1024)
+
+        detected_format = _detect_huggingface_content_route_format(
+            "intfloat/multilingual-e5-small",
+            "README.md",
+            _HF_MULTILINGUAL_E5_README_REVISION,
+            budget,
+        )
+
+        assert detected_format == "flax_msgpack"
+
     @patch("modelaudit.utils.sources.huggingface.time.monotonic", return_value=100.0)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
@@ -2776,6 +2840,91 @@ class TestModelDownloadStreaming:
 
         assert [path.name for path, _is_last in results] == expected_filenames
         assert results[-1][1] is True
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["known.msgpack", "README.md"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_selected_flax_skips_multilingual_readme_text(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Remote Flax selection should not promote complete UTF-8 README text."""
+        readme_payload = (
+            "# Model Card\n"
+            + ("This multilingual README has こんにちは, café, naïve, résumé, and 😀 examples.\n" * 256)
+        ).encode()
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / filename
+            path.write_bytes(b"\x81\xa6params\x80")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_requests_get.side_effect = _fake_bounded_range_response(readme_payload)
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+                scannable_scanner_ids={"flax_msgpack"},
+            )
+        )
+
+        assert [path.name for path, _is_last in results] == ["known.msgpack"]
+        mock_hf_hub_download.assert_called_once()
+        assert mock_hf_hub_download.call_args.kwargs["filename"] == "known.msgpack"
+        assert all(
+            f"/resolve/{_HF_TEST_REVISION}/README.md" in call.args[0] for call in mock_requests_get.call_args_list
+        )
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["known.msgpack", "README.md"], _HF_TEST_REVISION, None),
+    )
+    @patch("requests.get")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_selected_flax_preserves_binary_readme_checkpoint(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_requests_get: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Remote README names must not suppress structurally valid Flax MessagePack."""
+        msgpack = pytest.importorskip("msgpack")
+        hidden_payload = msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / filename
+            path.write_bytes(hidden_payload if filename == "README.md" else b"\x81\xa6params\x80")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_requests_get.side_effect = _fake_bounded_range_response(hidden_payload)
+
+        results = list(
+            download_model_streaming(
+                "https://huggingface.co/test/model",
+                scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+                scannable_scanner_ids={"flax_msgpack"},
+            )
+        )
+
+        assert [path.name for path, _is_last in results] == ["known.msgpack", "README.md"]
+        assert results[-1][1] is True
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+            "known.msgpack",
+            "README.md",
+        ]
 
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -3815,3 +3964,65 @@ class TestHuggingFaceFileURLs:
             mock_import.side_effect = side_effect
             with pytest.raises(ImportError, match="huggingface-hub package is required"):
                 download_file_from_hf("https://huggingface.co/test/model/resolve/main/file.bin")
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("MODELAUDIT_RUN_LIVE_HF_QA") != "1",
+    reason="Set MODELAUDIT_RUN_LIVE_HF_QA=1 to run live pinned Hugging Face QA",
+)
+def test_live_pinned_multilingual_e5_readme_does_not_emit_flax_routing_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pinned live README QA for the multilingual-e5-small Flax routing regression."""
+    from click.testing import CliRunner
+
+    from modelaudit.cli import cli
+
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf-home"))
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hf-cache"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+    monkeypatch.setenv("PROMPTFOO_DISABLE_TELEMETRY", "1")
+    monkeypatch.setenv("NO_ANALYTICS", "1")
+    for token_env in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN"):
+        monkeypatch.delenv(token_env, raising=False)
+
+    output_path = tmp_path / "scan.json"
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--quiet",
+            "--format",
+            "json",
+            "--output",
+            str(output_path),
+            "--no-cache",
+            "--max-size",
+            "1MB",
+            "--timeout",
+            "30",
+            _HF_MULTILINGUAL_E5_README_URL,
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    report = json.loads(output_path.read_text())
+    metadata = next(iter(report["file_metadata"].values()))
+    assert report["success"] is True
+    assert report["has_errors"] is False
+    assert report["files_scanned"] == 1
+    assert report["scanner_names"] == ["text"]
+    assert metadata["file_size"] == 497538
+    assert metadata["scanner_dependency_ids"] == ["text"]
+    assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
+    assert "MessagePack Routing Analysis Incomplete" not in [check["name"] for check in report.get("checks", [])]
+    assert all(issue["severity"] == "info" for issue in report["issues"])
+    assert "flax_msgpack_routing_incomplete" not in [
+        issue.get("details", {}).get("scan_outcome_reason") for issue in report["issues"]
+    ]
+    assert "token=" not in result.output
+    assert "Authorization" not in result.output

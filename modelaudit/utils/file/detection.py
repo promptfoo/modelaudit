@@ -9,6 +9,7 @@ import re
 import struct
 import sys
 import tarfile
+import unicodedata
 import zipfile
 import zlib
 from collections.abc import Iterator
@@ -5352,7 +5353,22 @@ def _is_complete_bounded_printable_text(file_path: Path, file_size: int) -> bool
         payload = read_magic_bytes(str(file_path), file_size)
     except OSError:
         return False
-    return not payload.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES)
+    return _is_complete_bounded_text_payload(payload)
+
+
+def _is_complete_bounded_text_payload(payload: bytes) -> bool:
+    """Return whether a complete bounded payload is validated text, including UTF-8 prose."""
+    if not payload.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES):
+        return True
+    if any(byte in _CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES for byte in payload):
+        return False
+    try:
+        decoded = payload.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False
+    return not any(
+        unicodedata.category(character) in {"Cc", "Cs"} and character not in "\t\n\r\f" for character in decoded
+    )
 
 
 def _preserve_inconclusive_protobuf_model_routing(file_path: Path, file_size: int) -> bool:

@@ -507,9 +507,9 @@ def _is_complete_huggingface_text_or_json(probe: bytes, *, sample_is_prefix: boo
     if sample_is_prefix:
         return False
 
-    from modelaudit.utils.file.detection import _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES
+    from modelaudit.utils.file.detection import _is_complete_bounded_text_payload
 
-    if not probe.translate(None, _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES):
+    if _is_complete_bounded_text_payload(probe):
         return True
     normalized = probe.lstrip()
     if normalized.startswith(b"\xef\xbb\xbf"):

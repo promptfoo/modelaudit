@@ -466,6 +466,55 @@ class TestDirectoryFileFiltering:
         assert determine_exit_code(results) == 1
         assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
 
+    def test_multilingual_readme_stays_on_text_route(self, tmp_path: Path) -> None:
+        readme = tmp_path / "README.md"
+        readme.write_text(
+            "# Model Card\n"
+            + ("This multilingual README includes こんにちは, café, naïve, résumé, and 😀 examples.\n" * 256),
+            encoding="utf-8",
+        )
+
+        assert file_detection.detect_file_format_from_magic(str(readme)) == "unknown"
+        assert file_detection.detect_file_format_for_skip_filter(str(readme)) == "unknown"
+        assert file_detection.detect_file_format(str(readme)) == "unknown"
+
+        results = scan_model_directory_or_file(str(readme), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["text"]
+        assert determine_exit_code(results) == 0
+        metadata = results.file_metadata[str(readme)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["text"]
+        assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
+        assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    def test_binary_polyglot_readme_still_scans_as_flax(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        readme = tmp_path / "README.md"
+        readme.write_bytes(
+            b"# Model Card\nThis prefix is valid UTF-8 documentation.\n"
+            + msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        results = scan_model_directory_or_file(str(readme), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["flax_msgpack"]
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
+
+    def test_ambiguous_binary_readme_fails_closed_as_flax(self, tmp_path: Path) -> None:
+        readme = tmp_path / "README.md"
+        readme.write_bytes(b"\xc0" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 2))
+
+        results = scan_model_directory_or_file(str(readme), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["flax_msgpack"]
+        assert determine_exit_code(results) == 2
+        metadata = results.file_metadata[str(readme)].model_dump(mode="python")
+        assert "flax_msgpack_routing_incomplete" in metadata["scan_outcome_reasons"]
+
     def test_oversized_plain_text_document_suffix_fails_closed_in_directory_scan(self, tmp_path: Path) -> None:
         document = tmp_path / "notes.txt"
         document.write_bytes(b" " * (2 * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1) + 2))
