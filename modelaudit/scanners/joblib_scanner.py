@@ -148,6 +148,7 @@ class _JoblibDtypeValidationContext:
     metadata_in_progress: list[object] = field(default_factory=list)
     validated_codec_encode_reduction_ids: set[int] = field(default_factory=set)
     validated_codec_encode_global_ids: set[int] = field(default_factory=set)
+    validated_numpy_array_control_global_ids: set[int] = field(default_factory=set)
 
     def consume(self, amount: int = 1) -> None:
         if amount > self.remaining_work:
@@ -266,6 +267,9 @@ def _validated_numpy_dtype(
             raise pickle.UnpicklingError("Invalid NumpyArrayWrapper dtype specification") from exc
         if dtype.hasobject:
             raise pickle.UnpicklingError("Object arrays require nested pickle analysis")
+        reference = dtype_object.reference
+        if isinstance(reference, _JoblibPickleGlobal) and reference.occurrence_id is not None:
+            context.validated_numpy_array_control_global_ids.add(reference.occurrence_id)
 
         state = dtype_object.state
         if state is None:
@@ -542,6 +546,9 @@ class _SafeJoblibUnpickler(pickle._Unpickler):  # type: ignore[attr-defined]
         raw_size = item_count * dtype.itemsize
         self._stream.seek(raw_size, io.SEEK_CUR)
         self.raw_array_spans.append((raw_start, self._stream.tell()))
+        reference = instance.reference
+        if isinstance(reference, _JoblibPickleGlobal) and reference.occurrence_id is not None:
+            self.dtype_validation_context.validated_numpy_array_control_global_ids.add(reference.occurrence_id)
 
 
 _SafeJoblibUnpickler.dispatch[pickle.REDUCE[0]] = _SafeJoblibUnpickler.load_reduce
@@ -558,7 +565,26 @@ _SafeJoblibUnpickler.dispatch[pickle.EXT2[0]] = _SafeJoblibUnpickler.load_unsupp
 _SafeJoblibUnpickler.dispatch[pickle.EXT4[0]] = _SafeJoblibUnpickler.load_unsupported_reference
 
 
-def _pickle_without_joblib_numpy_array_data(payload: bytes) -> tuple[bytes, int, bool] | None:
+def _validated_reference_positions(payload: bytes, occurrence_ids: set[int]) -> frozenset[int]:
+    if not occurrence_ids:
+        return frozenset()
+    positions: set[int] = set()
+    occurrence_id = 0
+    try:
+        for opcode, _arg, position in pickletools.genops(payload):
+            if opcode.name not in {"GLOBAL", "STACK_GLOBAL"}:
+                continue
+            occurrence_id += 1
+            if occurrence_id in occurrence_ids:
+                if position is None:
+                    continue
+                positions.add(position)
+    except Exception:
+        return frozenset()
+    return frozenset(positions)
+
+
+def _pickle_without_joblib_numpy_array_data(payload: bytes) -> tuple[bytes, int, bool, frozenset[int]] | None:
     """Remove only raw ndarray spans proven by static NumpyArrayWrapper state."""
     if b"NumpyArrayWrapper" not in payload:
         return None
@@ -587,7 +613,12 @@ def _pickle_without_joblib_numpy_array_data(payload: bytes) -> tuple[bytes, int,
         and parser.codec_encode_global_ids == parser.dtype_validation_context.validated_codec_encode_global_ids
         and parser.codec_encode_reduction_ids == parser.dtype_validation_context.validated_codec_encode_reduction_ids
     )
-    return bytes(sanitized), len(parser.raw_array_spans), has_only_validated_codec_encodes
+    sanitized_payload = bytes(sanitized)
+    validated_control_positions = _validated_reference_positions(
+        sanitized_payload,
+        parser.dtype_validation_context.validated_numpy_array_control_global_ids,
+    )
+    return sanitized_payload, len(parser.raw_array_spans), has_only_validated_codec_encodes, validated_control_positions
 
 
 class JoblibScanner(BaseScanner):
@@ -727,8 +758,8 @@ class JoblibScanner(BaseScanner):
     def _scan_pickle_payload(self, payload: bytes, result: ScanResult, context: str) -> None:
         """Analyze a raw or decompressed pickle payload with CVE and opcode checks."""
         sanitized = _pickle_without_joblib_numpy_array_data(payload)
-        scan_payload, raw_array_count, has_only_validated_codec_encodes = (
-            sanitized if sanitized is not None else (payload, 0, False)
+        scan_payload, raw_array_count, has_only_validated_codec_encodes, validated_control_positions = (
+            sanitized if sanitized is not None else (payload, 0, False, frozenset())
         )
         self._detect_cve_patterns(scan_payload, result, context)
         self._scan_for_joblib_specific_threats(scan_payload, result, context)
@@ -754,7 +785,7 @@ class JoblibScanner(BaseScanner):
         if has_only_validated_codec_encodes:
             self._remove_validated_dtype_codec_findings(result)
         if raw_array_count and self._numpy_array_wrapper_origin_is_trusted():
-            self._remove_validated_numpy_array_wrapper_findings(result)
+            self._remove_validated_numpy_array_wrapper_findings(result, validated_control_positions)
         result.metadata.pop("trusted_incomplete_tail", None)
         result.metadata.pop("trusted_incomplete_tail_reason", None)
         has_security_findings = any(
@@ -798,17 +829,25 @@ class JoblibScanner(BaseScanner):
             return False
 
     @staticmethod
-    def _remove_validated_numpy_array_wrapper_findings(result: ScanResult) -> None:
+    def _remove_validated_numpy_array_wrapper_findings(
+        result: ScanResult,
+        validated_control_positions: frozenset[int],
+    ) -> None:
+        def is_validated_control_position(finding: Any) -> bool:
+            return finding.details.get("position") in validated_control_positions
+
         def is_validated_wrapper_finding(finding: Any) -> bool:
             return (
                 finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
                 and finding.details.get("import_reference") in _VALIDATED_JOBLIB_NUMPY_ARRAY_CONTROL_REFERENCES
+                and is_validated_control_position(finding)
             )
 
         def is_validated_wrapper_source_notice(finding: Any) -> bool:
             return (
                 finding.details.get("notice_code") == "call_graph_source_unavailable"
                 and finding.details.get("import_reference") in _VALIDATED_JOBLIB_NUMPY_ARRAY_CONTROL_REFERENCES
+                and is_validated_control_position(finding)
             )
 
         removed = (

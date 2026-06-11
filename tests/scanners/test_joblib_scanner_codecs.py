@@ -18,7 +18,7 @@ import modelaudit_picklescan.api as picklescan_api
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
-from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Issue
 from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.joblib_scanner import (
     JoblibScanner,
@@ -28,6 +28,7 @@ from modelaudit.scanners.joblib_scanner import (
     _pickle_without_joblib_numpy_array_data,
     _SafeJoblibUnpickler,
     _validated_numpy_dtype,
+    _validated_reference_positions,
     np,
 )
 
@@ -595,6 +596,71 @@ def test_scan_preserves_unvalidated_codec_encode_after_numpy_array_payload(tmp_p
 
     assert any(issue.details.get("associated_global") == "_codecs.encode" for issue in result.issues)
     assert "trusted_incomplete_tail" not in result.metadata
+
+
+def test_validated_reference_positions_include_stack_global() -> None:
+    payload = b"\x80\x04\x8c\x05numpy\x94\x8c\x05dtype\x94\x93cnumpy\nndarray\n."
+
+    assert _validated_reference_positions(payload, {1}) == frozenset({payload.index(b"\x93")})
+    assert _validated_reference_positions(payload, {2}) == frozenset({payload.index(b"cnumpy\nndarray\n")})
+
+
+def test_validated_joblib_wrapper_cleanup_preserves_unvalidated_dtype_occurrence() -> None:
+    result = ScanResult("joblib")
+    result.metadata["analysis_incomplete"] = True
+    result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    result.metadata["scan_outcome_message"] = "Scan analysis incomplete."
+    result.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
+    result.metadata["pickle_report_status"] = "inconclusive"
+    result.metadata["pickle_verdict"] = "suspicious"
+    validated_details = {"import_reference": "numpy.dtype", "position": 10}
+    unvalidated_details = {"import_reference": "numpy.dtype", "position": 99}
+    result.checks.extend(
+        [
+            Check(
+                name="Standalone Pickle Finding",
+                status=CheckStatus.FAILED,
+                message="validated dtype",
+                severity=IssueSeverity.WARNING,
+                details=validated_details,
+                rule_code="NON_ALLOWLISTED_GLOBAL",
+            ),
+            Check(
+                name="Standalone Pickle Finding",
+                status=CheckStatus.FAILED,
+                message="unvalidated dtype",
+                severity=IssueSeverity.WARNING,
+                details=unvalidated_details,
+                rule_code="NON_ALLOWLISTED_GLOBAL",
+            ),
+        ]
+    )
+    result.issues.extend(
+        [
+            Issue(
+                message="validated dtype",
+                severity=IssueSeverity.WARNING,
+                details=validated_details,
+                rule_code="NON_ALLOWLISTED_GLOBAL",
+            ),
+            Issue(
+                message="unvalidated dtype",
+                severity=IssueSeverity.WARNING,
+                details=unvalidated_details,
+                rule_code="NON_ALLOWLISTED_GLOBAL",
+            ),
+        ]
+    )
+
+    JoblibScanner._remove_validated_numpy_array_wrapper_findings(result, frozenset({10}))
+
+    remaining_check_positions = [check.details.get("position") for check in result.checks]
+    remaining_issue_positions = [issue.details.get("position") for issue in result.issues]
+    assert remaining_check_positions == [99]
+    assert remaining_issue_positions == [99]
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["pickle_report_status"] == "inconclusive"
+    assert result.metadata["pickle_verdict"] == "suspicious"
 
 
 def test_scan_preserves_unrelated_codec_global_before_validated_dtype_use(tmp_path: Path) -> None:
