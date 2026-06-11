@@ -529,6 +529,18 @@ fn direct_literal_text(value: &StackValue, payload: &[u8], max_bytes: usize) -> 
     }
 }
 
+fn stack_value_memo_read(value: Option<&StackValue>) -> bool {
+    match value {
+        Some(StackValue::Text { memo_read, .. } | StackValue::TextSpan { memo_read, .. }) => {
+            *memo_read
+        }
+        Some(StackValue::Global(reference) | StackValue::Constructed(reference)) => {
+            reference.memo_read
+        }
+        _ => false,
+    }
+}
+
 fn safe_static_getattr_attribute(attribute_name: &str) -> bool {
     let mut chars = attribute_name.chars();
     let Some(first) = chars.next() else {
@@ -6023,6 +6035,8 @@ impl<'a> ScanState<'a> {
         name_value: Option<StackValue>,
         position: usize,
     ) -> GlobalRef {
+        let memo_read = stack_value_memo_read(module_value.as_ref())
+            || stack_value_memo_read(name_value.as_ref());
         let module = resolve_global_operand(module_value.as_ref(), self.payload);
         let name = resolve_global_operand(name_value.as_ref(), self.payload);
 
@@ -6033,7 +6047,7 @@ impl<'a> ScanState<'a> {
                 position,
                 malformed: false,
                 memo_index: None,
-                memo_read: false,
+                memo_read,
             },
             (module, name) => {
                 let malformed = GlobalRef {
@@ -6042,7 +6056,7 @@ impl<'a> ScanState<'a> {
                     position,
                     malformed: true,
                     memo_index: None,
-                    memo_read: false,
+                    memo_read,
                 };
                 self.add_finding(Finding {
                     message: "Malformed STACK_GLOBAL operands prevent reliable callable resolution"

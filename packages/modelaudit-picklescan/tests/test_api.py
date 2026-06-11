@@ -205,6 +205,41 @@ def _static_getattr_with_memo_alias_payload(
     return payload + b"\x86R."
 
 
+def _memoized_stack_global_operand(module: bytes, name: bytes, module_index: int, name_index: int) -> bytes:
+    return (
+        _short_binunicode(module)
+        + b"q"
+        + bytes([module_index])
+        + b"0"
+        + _short_binunicode(name)
+        + b"q"
+        + bytes([name_index])
+        + b"0"
+        + b"h"
+        + bytes([module_index])
+        + b"h"
+        + bytes([name_index])
+        + b"\x93"
+    )
+
+
+def _static_getattr_with_stack_global_memo_operand_payload(
+    *,
+    alias_callable: bool = False,
+    alias_target: bool = False,
+) -> bytes:
+    payload = b"\x80\x04"
+    if alias_callable:
+        payload += _memoized_stack_global_operand(b"__builtin__", b"getattr", 0, 1)
+    else:
+        payload += _global(b"__builtin__", b"getattr")
+    if alias_target:
+        payload += _memoized_stack_global_operand(b"ultralytics.nn.modules.head", b"Detect", 2, 3)
+    else:
+        payload += _global(b"ultralytics.nn.modules.head", b"Detect")
+    return payload + _binunicode(b"forward") + b"\x86R."
+
+
 def _clear_ultralytics_modules() -> None:
     for module_name in tuple(sys.modules):
         if module_name == "ultralytics" or module_name.startswith("ultralytics."):
@@ -375,6 +410,38 @@ def test_scan_bytes_static_getattr_oversized_attribute_stays_critical_without_me
     findings = _dangerous_getattr_findings(report)
     assert findings
     assert all("getattr_attribute_name" not in invocation for invocation in report.metadata["callable_invocations"])
+
+
+@pytest.mark.parametrize(
+    ("payload", "direct_field"),
+    [
+        (_static_getattr_with_stack_global_memo_operand_payload(alias_callable=True), "getattr_callable_is_direct"),
+        (_static_getattr_with_stack_global_memo_operand_payload(alias_target=True), "getattr_target_is_direct"),
+    ],
+)
+def test_scan_bytes_static_getattr_stack_global_memo_operands_stay_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+    direct_field: str,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
+
+    report = scan_bytes(payload, source="stack-global-memo-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+    getattr_invocation = next(
+        invocation
+        for invocation in report.metadata["callable_invocations"]
+        if invocation.get("import_reference") == "__builtin__.getattr"
+    )
+    assert getattr_invocation[direct_field] is False
 
 
 def test_scan_bytes_repeated_static_getattr_reconstructions_suppress_each_position(

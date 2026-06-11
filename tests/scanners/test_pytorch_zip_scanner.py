@@ -8029,6 +8029,12 @@ def _pickle_binunicode(data: bytes) -> bytes:
     return b"X" + len(data).to_bytes(4, "little") + data
 
 
+def _pickle_short_binunicode(data: bytes) -> bytes:
+    if len(data) > 0xFF:
+        raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
+    return b"\x8c" + bytes([len(data)]) + data
+
+
 def _static_getattr_reduce_payload(
     *,
     attribute: bytes = b"forward",
@@ -8058,6 +8064,41 @@ def _static_getattr_reduce_payload(
         payload += _pickle_binunicode(attribute)
     payload += b"\x86R"
     return payload + (b"." if stop else b"")
+
+
+def _memoized_stack_global_operand(module: bytes, name: bytes, module_index: int, name_index: int) -> bytes:
+    return (
+        _pickle_short_binunicode(module)
+        + b"q"
+        + bytes([module_index])
+        + b"0"
+        + _pickle_short_binunicode(name)
+        + b"q"
+        + bytes([name_index])
+        + b"0"
+        + b"h"
+        + bytes([module_index])
+        + b"h"
+        + bytes([name_index])
+        + b"\x93"
+    )
+
+
+def _static_getattr_with_stack_global_memo_operand_payload(
+    *,
+    alias_callable: bool = False,
+    alias_target: bool = False,
+) -> bytes:
+    payload = b"\x80\x04"
+    if alias_callable:
+        payload += _memoized_stack_global_operand(b"__builtin__", b"getattr", 0, 1)
+    else:
+        payload += _pickle_global(b"__builtin__", b"getattr")
+    if alias_target:
+        payload += _memoized_stack_global_operand(b"ultralytics.nn.modules.head", b"Detect", 2, 3)
+    else:
+        payload += _pickle_global(b"ultralytics.nn.modules.head", b"Detect")
+    return payload + _pickle_binunicode(b"forward") + b"\x86R."
 
 
 def _static_getattr_protocol0_unicode_payload() -> bytes:
@@ -8160,6 +8201,30 @@ def test_pytorch_zip_static_getattr_protocol0_reconstruction_does_not_emit_s115(
 )
 def test_pytorch_zip_static_getattr_unsafe_context_keeps_s115(tmp_path: Path, payload: bytes) -> None:
     _clear_ultralytics_modules()
+    model_path = _write_getattr_reconstruction_zip(tmp_path, payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _static_getattr_with_stack_global_memo_operand_payload(alias_callable=True),
+        _static_getattr_with_stack_global_memo_operand_payload(alias_target=True),
+    ],
+)
+def test_pytorch_zip_static_getattr_stack_global_memo_operands_keep_s115(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
     model_path = _write_getattr_reconstruction_zip(tmp_path, payload)
 
     result = PyTorchZipScanner().scan(str(model_path))
