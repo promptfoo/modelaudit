@@ -389,6 +389,49 @@ def _huggingface_stream_preview_unbudgeted_content_route_files(
     ]
 
 
+def _huggingface_stream_preview_content_route_candidate_files(
+    metadata: dict[str, Any],
+    selected_files: list[dict[str, Any]],
+    runtime: "_ScanRuntimeConfig",
+) -> list[dict[str, Any]]:
+    """Return unselected files that the streaming selector would content-probe."""
+    if runtime.hf_stream_include_all_files or not _huggingface_stream_preview_needs_content_route_budget(runtime):
+        return []
+
+    from .utils.sources import huggingface as huggingface_source
+
+    files = metadata.get("files", [])
+    openvino_companion_names = _huggingface_stream_preview_openvino_companion_names(files, selected_files, runtime)
+    candidates: list[dict[str, Any]] = []
+    for item in _huggingface_preview_unselected_files(files, selected_files):
+        name = item.get("name")
+        if not isinstance(name, str):
+            continue
+        if huggingface_source._is_huggingface_repo_bookkeeping_file(name):
+            continue
+        if name in openvino_companion_names:
+            continue
+        candidates.append(item)
+    return candidates
+
+
+def _huggingface_stream_preview_enforce_content_route_candidate_limit(
+    metadata: dict[str, Any],
+    selected_files: list[dict[str, Any]],
+    runtime: "_ScanRuntimeConfig",
+) -> None:
+    """Mirror the streaming selector's bounded content-probe candidate count."""
+    candidates = _huggingface_stream_preview_content_route_candidate_files(metadata, selected_files, runtime)
+    from .utils.sources import huggingface as huggingface_source
+
+    if len(candidates) > huggingface_source._HF_CONTENT_SNIFF_MAX_FILES:
+        repo_id = str(metadata.get("repo_id") or metadata.get("model_id") or "unknown")
+        raise ValueError(
+            "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "
+            f"for {repo_id} ({huggingface_source._HF_CONTENT_SNIFF_MAX_FILES} files)"
+        )
+
+
 def _huggingface_preview_download_files(metadata: dict[str, Any]) -> list[dict[str, Any]]:
     """Return metadata entries the downloader can select without reading model bytes."""
     files = metadata.get("files", [])
@@ -672,6 +715,8 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
     selected_display_size = sum(size for size in selected_display_sizes if size is not None)
     budget_sizes = [_huggingface_preview_file_size(item) for item in budget_files]
     budget_size = sum(size for size in budget_sizes if size is not None)
+    if runtime.scan_and_delete and max_download_bytes is not None:
+        _huggingface_stream_preview_enforce_content_route_candidate_limit(metadata, selected_files, runtime)
     if max_download_bytes is not None and any(size is None for size in budget_sizes):
         raise ValueError("Selected Hugging Face file sizes are unknown; refusing dry-run with max size")
     if (

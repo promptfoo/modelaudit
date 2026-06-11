@@ -4823,6 +4823,56 @@ def test_scan_huggingface_streaming_dry_run_pytorch_zip_fails_on_unbudgeted_rena
 @patch("modelaudit.utils.sources.huggingface.get_model_info")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_dry_run_max_size_enforces_content_probe_candidate_limit(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_get_model_info: MagicMock,
+    mock_is_hf_url: MagicMock,
+) -> None:
+    """Max-size dry-run must mirror the real selector's content-probe count bound."""
+    mock_is_hf_url.return_value = True
+    payload_files = [{"name": f"payload-{index}.blob", "size": 1} for index in range(300)]
+    mock_get_model_info.return_value = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": _HF_TEST_REVISION,
+        "total_size": 1324,
+        "file_count": 301,
+        "files": [
+            {"name": "model.pt", "size": 1024},
+            *payload_files,
+        ],
+    }
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--dry-run",
+            "--stream",
+            "--scanners",
+            "pytorch_zip",
+            "--max-size",
+            "1MB",
+            "--format",
+            "text",
+            "hf://test/model",
+        ],
+    )
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 2, output
+    assert "skipped file inspection limit exceeded for test/model (256 files)" in output
+    assert mock_get_model_info.call_args.kwargs["include_metadata_files"] is True
+    assert mock_get_model_info.call_args.kwargs["sniff_content"] is False
+    mock_download_streaming.assert_not_called()
+    mock_scan_streaming.assert_not_called()
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.get_model_info")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
 def test_scan_huggingface_streaming_dry_run_openvino_companion_no_max_is_not_selected(
     mock_scan_streaming: MagicMock,
     mock_download_streaming: MagicMock,
