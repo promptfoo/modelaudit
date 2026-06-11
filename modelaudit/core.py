@@ -1184,6 +1184,32 @@ def _snapshot_openvino_companion_for_hash(xml_path: Path, companion_path: Path) 
     return companion_snapshot
 
 
+def _openvino_weights_sidecar_needs_independent_scan(
+    path: Path,
+    scanner_selection: ScannerSelectionPolicy,
+) -> bool:
+    """Return whether an OpenVINO weights sidecar has trusted non-OpenVINO content routing."""
+    if path.suffix.lower() != ".bin" or not path.is_file():
+        return False
+
+    try:
+        magic_format = detect_file_format_from_magic(str(path))
+    except Exception:
+        magic_format = "unknown"
+
+    if magic_format in {"zip", EXECUTABLE_ZIP_POLYGLOT_FORMAT} and allows_zip_structure_analysis(
+        scanner_selection,
+        str(path),
+    ):
+        return True
+
+    try:
+        supplemental_scanner_id = detect_pytorch_binary_supplemental_format(str(path))
+    except Exception:
+        return False
+    return supplemental_scanner_id is not None and scanner_selection.allows(supplemental_scanner_id)
+
+
 def _validated_shard_family_scopes(
     source_path: str,
     target: dict[str, int | str],
@@ -3506,9 +3532,9 @@ def scan_model_directory_or_file(
                     seen_complete_hf_shard_families.add(family_dedupe_key)
                 scan_entries.append((representative_file, ordered_family_paths, shard_family_key))
 
-            scheduled_openvino_companion_sizes: dict[str, int] = {}
+            covered_openvino_companion_sizes: dict[str, int] = {}
             if scanner_selection.allows("openvino"):
-                scheduled_companions_by_key: dict[str, str] = {}
+                covered_companions_by_key: dict[str, str] = {}
                 for representative_file, _scanned_file_paths, _entry_shard_family_key in scan_entries:
                     xml_path = Path(representative_file)
                     companion_path = _openvino_xml_weights_companion(xml_path)
@@ -3518,16 +3544,18 @@ def scan_model_directory_or_file(
                     if companion_snapshot is None:
                         aggregate_hash_complete = False
                         continue
+                    if _openvino_weights_sidecar_needs_independent_scan(companion_path, scanner_selection):
+                        continue
                     xml_key = _openvino_xml_companion_key(xml_path)
                     companion_path_str = str(companion_path)
-                    scheduled_openvino_companion_sizes[xml_key] = _snapshot_file_size(companion_snapshot)
-                    scheduled_companions_by_key[_openvino_xml_companion_key(companion_path)] = companion_path_str
+                    covered_openvino_companion_sizes[xml_key] = _snapshot_file_size(companion_snapshot)
+                    covered_companions_by_key[_openvino_xml_companion_key(companion_path)] = companion_path_str
 
-                if scheduled_companions_by_key:
+                if covered_companions_by_key:
                     expanded_scan_entries: list[_ScanEntry] = []
                     for representative_file, scanned_file_paths, entry_shard_family_key in scan_entries:
                         representative_key = _openvino_xml_companion_key(Path(representative_file))
-                        if representative_key in scheduled_companions_by_key:
+                        if representative_key in covered_companions_by_key:
                             continue
 
                         expanded_scanned_file_paths = list(scanned_file_paths)
@@ -3538,9 +3566,9 @@ def scan_model_directory_or_file(
                         companion_path = _openvino_xml_weights_companion(Path(representative_file))
                         if companion_path is not None:
                             companion_key = _openvino_xml_companion_key(companion_path)
-                            scheduled_companion_path = scheduled_companions_by_key.get(companion_key)
-                            if scheduled_companion_path is not None and companion_key not in expanded_scanned_path_keys:
-                                expanded_scanned_file_paths.append(scheduled_companion_path)
+                            covered_companion_path = covered_companions_by_key.get(companion_key)
+                            if covered_companion_path is not None and companion_key not in expanded_scanned_path_keys:
+                                expanded_scanned_file_paths.append(covered_companion_path)
                         expanded_scan_entries.append(
                             (representative_file, expanded_scanned_file_paths, entry_shard_family_key)
                         )
@@ -3693,11 +3721,7 @@ def scan_model_directory_or_file(
             # family once. Shard scans already expand to sibling shards in the
             # advanced handler, so scanning each shard path would duplicate work.
             if scan_entries or (directory_owner_class is not None and directory_owner_result is None):
-                scheduled_openvino_xml_companions = {
-                    _openvino_xml_companion_key(Path(representative_file))
-                    for representative_file, _scanned_file_paths, _entry_shard_family_key in scan_entries
-                    if scanner_selection.allows("openvino") and _is_openvino_xml_path(Path(representative_file))
-                }
+                covered_openvino_xml_companions = set(covered_openvino_companion_sizes)
                 hash_sources: list[str] = []
                 seen_hash_sources: set[str] = set()
                 hash_source_by_path: dict[str, str] = {}
@@ -4110,11 +4134,11 @@ def scan_model_directory_or_file(
                             openvino_owner = _openvino_weights_companion_owner(Path(representative_file))
                             if (
                                 openvino_owner is not None
-                                and _openvino_xml_companion_key(openvino_owner) in scheduled_openvino_xml_companions
+                                and _openvino_xml_companion_key(openvino_owner) in covered_openvino_xml_companions
                             ):
                                 file_config = _with_openvino_scanned_xml_companion(file_config, openvino_owner)
                             file_result = scan_file(representative_file, file_config)
-                            file_result.bytes_scanned += scheduled_openvino_companion_sizes.get(
+                            file_result.bytes_scanned += covered_openvino_companion_sizes.get(
                                 _openvino_xml_companion_key(Path(representative_file)),
                                 0,
                             )
