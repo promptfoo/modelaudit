@@ -686,7 +686,7 @@ class ScanResult:
             self._record_member_file_hash_omission(omitted)
 
     def _merge_member_file_hash_records(self, records: Mapping[str, Any]) -> None:
-        sortable_records: list[tuple[str, int, list[str], Mapping[str, Any]]] = []
+        sortable_records: list[tuple[str, int, str, list[str], Mapping[str, Any]]] = []
         for member_key, record in records.items():
             if not isinstance(member_key, str) or not isinstance(record, Mapping):
                 continue
@@ -695,11 +695,12 @@ class ScanResult:
                 (
                     _member_path_segments_key(path_segments),
                     _member_occurrence_from_record(record),
+                    member_key,
                     path_segments,
                     record,
                 )
             )
-        for _, _, path_segments, record in sorted(sortable_records):
+        for _, _, _, path_segments, record in sorted(sortable_records):
             self._add_member_file_hash_record(path_segments, record)
 
     def merge_member_result(self, other: "ScanResult", member_path: str) -> None:

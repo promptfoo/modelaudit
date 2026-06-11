@@ -725,6 +725,33 @@ def test_merge_member_result_preserves_occurrences_after_nested_child_private_st
     assert [record["file_hashes"]["sha256"] for record in records] == ["b" * 64, "c" * 64]
 
 
+def test_merge_member_hash_records_tolerates_duplicate_child_occurrences() -> None:
+    parent = ScanResult(scanner_name="zip")
+    parent.metadata["file_hashes"] = {"sha256": "a" * 64}
+    child = ScanResult(scanner_name="zip")
+    child.metadata["member_file_hashes"] = {
+        "legacy-first": {
+            "file_hashes": {"sha256": "b" * 64},
+            "path_segments": ["payload.pkl"],
+            "occurrence": 1,
+        },
+        "legacy-second": {
+            "file_hashes": {"sha256": "c" * 64},
+            "path_segments": ["payload.pkl"],
+            "occurrence": 1,
+        },
+    }
+
+    parent.merge(child)
+
+    records = sorted(
+        _member_records_for_segments(parent, ["payload.pkl"]),
+        key=lambda record: record["occurrence"],
+    )
+    assert [record["occurrence"] for record in records] == [1, 2]
+    assert [record["file_hashes"]["sha256"] for record in records] == ["b" * 64, "c" * 64]
+
+
 def test_merge_member_result_keeps_partial_and_inconclusive_hashes_child_scoped() -> None:
     parent = ScanResult(scanner_name="zip")
     parent.metadata["file_hashes"] = {"sha256": "a" * 64}
