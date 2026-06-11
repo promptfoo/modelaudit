@@ -1423,6 +1423,13 @@ class _ScanPathState:
         if not added_path and fallback_path is not None and not os.path.exists(fallback_path):
             self.scanned_paths.append(_display_scan_path(fallback_path))
 
+    def track_directory_paths_for_sbom(self, scan_result: ModelAuditResultModel) -> None:
+        """Track completed directory scan assets, including an authoritative empty set."""
+        self.sbom_paths_resolved = True
+        for asset in scan_result.assets:
+            if asset.path:
+                self.scanned_paths.append(_display_scan_path(asset.path))
+
     def defer_temp_cleanup(self, temp_path: str | None, *, cache_enabled: bool, verbose: bool) -> None:
         """Track temporary artifacts for post-SBOM cleanup."""
         if temp_path and os.path.exists(temp_path) and not cache_enabled:
@@ -2201,7 +2208,7 @@ def _write_scan_sbom(
     asset_paths = list(
         dict.fromkeys(asset.path for asset in audit_result.assets if asset.path and asset.type != "skipped")
     )
-    if asset_paths and scan_and_delete:
+    if asset_paths and (scan_and_delete or not path_state.sbom_paths_resolved):
         paths_for_sbom = [_display_scan_path(path) for path in asset_paths]
     elif path_state.sbom_paths_resolved:
         paths_for_sbom = path_state.scanned_paths
@@ -2567,6 +2574,8 @@ def _scan_local_or_downloaded_path(
         path_state.record_dvc_coverage(actual_path, scan_results, scanner_config=runtime.config)
         if is_dvc_pointer:
             path_state.track_streaming_paths_for_sbom(scan_results, None)
+        elif os.path.isdir(actual_path):
+            path_state.track_directory_paths_for_sbom(scan_results)
         else:
             path_state.scanned_paths.append(_display_scan_path(actual_path))
 
