@@ -5,6 +5,8 @@ import json
 import math
 import os
 import re
+import subprocess
+import sys
 from collections.abc import Callable
 from contextlib import suppress
 from typing import Any, ClassVar
@@ -49,6 +51,156 @@ try:
     HAS_H5PY = True
 except Exception:
     HAS_H5PY = False
+
+_HDF5_ATTRIBUTE_WORKER_CODE = r"""
+import base64
+import json
+import os
+import sys
+
+for _name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_name, "1")
+
+_request = json.loads(sys.stdin.read())
+_memory_limit = int(_request.get("memory_limit_bytes") or 0)
+if _memory_limit > 0:
+    try:
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_AS, (_memory_limit, _memory_limit))
+    except Exception:
+        pass
+
+try:
+    import h5py
+    import numpy as np
+except BaseException as exc:
+    print(json.dumps({"status": "error", "error_type": type(exc).__name__, "error": str(exc)[:200]}))
+    raise SystemExit(0)
+
+
+def _emit(payload):
+    print(json.dumps(payload, separators=(",", ":")))
+
+
+def _jsonable(value):
+    if isinstance(value, bytes):
+        return {"__bytes__": base64.b64encode(value).decode("ascii")}
+    if isinstance(value, np.ndarray):
+        return [_jsonable(item) for item in value.reshape(-1).tolist()]
+    if isinstance(value, np.generic):
+        return _jsonable(value.item())
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return str(value)
+
+
+def _decode_names(value):
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, bytes):
+        return [value.decode("utf-8", errors="ignore")]
+    if isinstance(value, str):
+        return [value]
+    try:
+        items = list(value)
+    except TypeError:
+        items = [value]
+    names = []
+    for item in items:
+        if isinstance(item, bytes):
+            names.append(item.decode("utf-8", errors="ignore"))
+        elif isinstance(item, str):
+            names.append(item)
+    return [name for name in names if name]
+
+
+def _is_variable_string(attr_id):
+    attr_type = attr_id.get_type()
+    return attr_type.get_class() == h5py.h5t.STRING and attr_type.is_variable_str()
+
+
+def _read_variable_string(attr_id, *, max_bytes, max_items, mode):
+    space = attr_id.get_space()
+    point_count = int(space.get_simple_extent_npoints())
+    if point_count <= 0 or point_count > max_items:
+        return {"status": "skipped", "reason": "point_count_exceeded", "point_count": point_count}
+
+    per_item_bytes = min(int(_request["max_text_chars"]), max(max_bytes // point_count, 1)) + 1
+    if point_count * per_item_bytes > max_bytes + max_items:
+        return {"status": "skipped", "reason": "storage_size_exceeded", "storage_size": point_count * per_item_bytes}
+
+    dims = tuple(int(dimension) for dimension in space.get_simple_extent_dims())
+    buffer_shape = dims if dims else ()
+    memory_type = h5py.h5t.C_S1.copy()
+    memory_type.set_size(per_item_bytes)
+    buffer = np.zeros(buffer_shape, dtype=f"S{per_item_bytes}")
+    attr_id.read(buffer, memory_type)
+    raw_items = [buffer.item()] if buffer_shape == () else buffer.reshape(-1).tolist()
+
+    values = []
+    total_bytes = 0
+    truncated = False
+    for raw_item in raw_items:
+        raw_bytes = bytes(raw_item) if isinstance(raw_item, bytes) else str(raw_item).encode("utf-8", "ignore")
+        total_bytes += len(raw_bytes)
+        if len(raw_bytes) >= per_item_bytes or total_bytes > max_bytes:
+            truncated = True
+        values.append(raw_bytes.decode("utf-8", errors="ignore"))
+    values = [value for value in values if value]
+    if len(values) > max_items:
+        values = values[:max_items]
+        truncated = True
+    if mode == "names":
+        return {"status": "value", "value": values, "truncated": truncated}
+    return {"status": "value", "value": values[0] if len(values) == 1 else values, "truncated": truncated}
+
+
+try:
+    file_path = _request["file_path"]
+    object_path = _request["object_path"]
+    attr_name = _request["attr_name"]
+    mode = _request["mode"]
+    max_bytes = int(_request["max_bytes"])
+    max_items = int(_request["max_items"])
+
+    with h5py.File(file_path, "r") as h5_file:
+        obj = h5_file if object_path in {"", "/"} else h5_file.get(object_path, getlink=False)
+        if obj is None:
+            _emit({"status": "error", "reason": "object_missing"})
+            raise SystemExit(0)
+        if attr_name not in obj.attrs:
+            _emit({"status": "missing"})
+            raise SystemExit(0)
+
+        attr_id = obj.attrs.get_id(attr_name)
+        space = attr_id.get_space()
+        point_count = int(space.get_simple_extent_npoints())
+        if point_count > max_items:
+            _emit({"status": "skipped", "reason": "point_count_exceeded", "point_count": point_count})
+            raise SystemExit(0)
+
+        if _is_variable_string(attr_id):
+            _emit(_read_variable_string(attr_id, max_bytes=max_bytes, max_items=max_items, mode=mode))
+            raise SystemExit(0)
+
+        storage_size = int(attr_id.get_storage_size())
+        if storage_size > max_bytes:
+            _emit({"status": "skipped", "reason": "storage_size_exceeded", "storage_size": storage_size})
+            raise SystemExit(0)
+
+        value = obj.attrs[attr_name]
+        if mode == "names":
+            names = _decode_names(value)
+            truncated = len(names) > max_items
+            _emit({"status": "value", "value": names[:max_items], "truncated": truncated})
+        else:
+            _emit({"status": "value", "value": _jsonable(value), "truncated": False})
+except Exception as exc:
+    _emit({"status": "error", "error_type": type(exc).__name__, "error": str(exc)[:200]})
+"""
 
 _KERAS_VERSION_SEPARATOR = r"[._-]?"
 _KERAS_LOCAL_VERSION_SUFFIX = r"\+[a-z0-9]+(?:[._-][a-z0-9]+)*"
@@ -185,6 +337,7 @@ class KerasH5Scanner(BaseScanner):
     default_max_file_read_size: ClassVar[int] = 0
     _JSON_ATTRIBUTE_PARSE_FAILED: ClassVar[object] = object()
     _HDF5_ATTRIBUTE_READ_SKIPPED: ClassVar[object] = object()
+    _HDF5_ATTRIBUTE_MISSING: ClassVar[object] = object()
     _SAFE_K_BACKEND_LAMBDA_FUNCTIONS: ClassVar[frozenset[str]] = frozenset(
         {"abs", "elu", "hard_sigmoid", "l2_normalize", "relu", "sigmoid", "softmax", "softplus", "softsign", "tanh"}
     )
@@ -352,6 +505,9 @@ class KerasH5Scanner(BaseScanner):
     _MAX_HDF5_JSON_ATTRIBUTE_BYTES: ClassVar[int] = 10 * 1024 * 1024
     _MAX_HDF5_NAME_ATTRIBUTE_BYTES: ClassVar[int] = 10 * 1024 * 1024
     _MAX_HDF5_SOFT_LINK_RESOLUTION_DEPTH: ClassVar[int] = 32
+    _HDF5_ATTRIBUTE_WORKER_FILE_SIZE_THRESHOLD: ClassVar[int] = DEFAULT_MAX_FILE_READ_SIZE
+    _HDF5_ATTRIBUTE_WORKER_MEMORY_BYTES: ClassVar[int] = 256 * 1024 * 1024
+    _HDF5_ATTRIBUTE_WORKER_TIMEOUT_SECONDS: ClassVar[float] = 15.0
     _MAX_SERIALIZED_CONFIG_NODES: ClassVar[int] = 10_000
     _MODEL_CONTAINER_CLASSES: ClassVar[frozenset[str]] = frozenset({"Model", "Functional", "Sequential"})
     _WRAPPED_LAYER_SCAN_MODEL: ClassVar[dict[str, Any]] = {"class_name": "Sequential", "config": {"layers": []}}
@@ -445,18 +601,17 @@ class KerasH5Scanner(BaseScanner):
             with h5py.File(path, "r") as f:
                 result.bytes_scanned = file_size
                 raw_keras_version: str | None = None
-                keras_version_attr = (
-                    self._read_bounded_hdf5_attribute(
-                        f.attrs,
-                        "keras_version",
-                        result,
-                        max_bytes=self._MAX_HDF5_REFERENCE_TEXT_CHARS,
-                        fail_closed=False,
-                    )
-                    if "keras_version" in f.attrs
-                    else None
+                keras_version_attr = self._read_bounded_hdf5_attribute(
+                    f.attrs,
+                    "keras_version",
+                    result,
+                    max_bytes=self._MAX_HDF5_REFERENCE_TEXT_CHARS,
+                    fail_closed=False,
                 )
-                if keras_version_attr is self._HDF5_ATTRIBUTE_READ_SKIPPED:
+                if (
+                    keras_version_attr is self._HDF5_ATTRIBUTE_MISSING
+                    or keras_version_attr is self._HDF5_ATTRIBUTE_READ_SKIPPED
+                ):
                     keras_version_attr = None
                 if isinstance(keras_version_attr, bytes):
                     keras_version_attr = keras_version_attr.decode("utf-8", errors="ignore")
@@ -465,14 +620,23 @@ class KerasH5Scanner(BaseScanner):
                     result.metadata["keras_version"] = redact_evidence_string(raw_keras_version)
                 self._current_h5_keras_version = raw_keras_version
 
+                model_config_attr = self._read_bounded_hdf5_attribute(
+                    f.attrs,
+                    "model_config",
+                    result,
+                    max_bytes=self.max_hdf5_json_attribute_bytes,
+                    fail_closed=True,
+                )
+                has_model_config = model_config_attr is not self._HDF5_ATTRIBUTE_MISSING
+
                 # CVE-2026-1669 applies to weight loading too. Inspect full
                 # Keras files and weights-like HDF5 layouts while leaving
                 # unrelated generic HDF5 artifacts quiet.
-                if "model_config" in f.attrs or self._has_weights_like_hdf5_layout(f, path):
+                if has_model_config or self._has_weights_like_hdf5_layout(f, path):
                     self._check_hdf5_external_references(f, result, path)
 
                 # Check if this is a Keras model file
-                if "model_config" not in f.attrs:
+                if not has_model_config:
                     # Check if this might be a TensorFlow SavedModel H5 file instead
                     # Look for common TensorFlow H5 structure patterns
                     is_tensorflow_h5 = any(
@@ -504,7 +668,10 @@ class KerasH5Scanner(BaseScanner):
                     return result
 
                 # Parse model config
-                model_config = self._load_json_hdf5_attribute(f.attrs, "model_config", result)
+                if model_config_attr is self._HDF5_ATTRIBUTE_READ_SKIPPED:
+                    model_config = self._JSON_ATTRIBUTE_PARSE_FAILED
+                else:
+                    model_config = self._load_json_attribute(model_config_attr, result, "model_config")
 
                 # Scan model configuration
                 if model_config is self._JSON_ATTRIBUTE_PARSE_FAILED:
@@ -523,14 +690,14 @@ class KerasH5Scanner(BaseScanner):
                     )
 
                 # Check for custom objects in the model
-                if "custom_objects" in f.attrs:
-                    custom_objects_attr = self._read_bounded_hdf5_attribute(
-                        f.attrs,
-                        "custom_objects",
-                        result,
-                        max_bytes=self.max_hdf5_json_attribute_bytes,
-                        fail_closed=False,
-                    )
+                custom_objects_attr = self._read_bounded_hdf5_attribute(
+                    f.attrs,
+                    "custom_objects",
+                    result,
+                    max_bytes=self.max_hdf5_json_attribute_bytes,
+                    fail_closed=False,
+                )
+                if custom_objects_attr is not self._HDF5_ATTRIBUTE_MISSING:
                     custom_objects_truncated = custom_objects_attr is self._HDF5_ATTRIBUTE_READ_SKIPPED
                     if custom_objects_attr is None or custom_objects_truncated:
                         custom_objects_list = []
@@ -553,8 +720,18 @@ class KerasH5Scanner(BaseScanner):
                     )
 
                 # Check for custom metrics and custom loss
-                if "training_config" in f.attrs:
-                    training_config = self._load_json_hdf5_attribute(f.attrs, "training_config", result)
+                training_config_attr = self._read_bounded_hdf5_attribute(
+                    f.attrs,
+                    "training_config",
+                    result,
+                    max_bytes=self.max_hdf5_json_attribute_bytes,
+                    fail_closed=True,
+                )
+                if training_config_attr is not self._HDF5_ATTRIBUTE_MISSING:
+                    if training_config_attr is self._HDF5_ATTRIBUTE_READ_SKIPPED:
+                        training_config = self._JSON_ATTRIBUTE_PARSE_FAILED
+                    else:
+                        training_config = self._load_json_attribute(training_config_attr, result, "training_config")
                     if training_config is not self._JSON_ATTRIBUTE_PARSE_FAILED:
                         self._scan_training_config(training_config, result)
 
@@ -717,6 +894,139 @@ class KerasH5Scanner(BaseScanner):
             rule_code="S902",
         )
 
+    def _mark_hdf5_attribute_native_limit(
+        self,
+        result: ScanResult,
+        attr_name: str,
+        *,
+        fail_closed: bool,
+        reason: str | None = None,
+    ) -> None:
+        """Record that native HDF5 attribute handling exceeded the isolated worker budget."""
+        scan_reason = f"keras_h5_{attr_name}_native_attribute_limit_exceeded"
+        if fail_closed:
+            self._mark_inconclusive_scan_result(result, scan_reason)
+        result.add_check(
+            name="Keras H5 Attribute Native Memory Limit",
+            passed=False,
+            message=f"Keras H5 {attr_name} metadata could not be inspected within the native memory budget",
+            severity=IssueSeverity.INFO,
+            location=self.current_file_path,
+            details={
+                "attribute": attr_name,
+                "max_worker_memory_bytes": self._HDF5_ATTRIBUTE_WORKER_MEMORY_BYTES,
+                "analysis_incomplete": fail_closed,
+                "scan_outcome_reason": scan_reason,
+                "reason": reason or "worker_failed",
+            },
+            rule_code="S902",
+        )
+
+    @staticmethod
+    def _decode_hdf5_attribute_worker_value(value: Any) -> Any:
+        if isinstance(value, dict) and set(value) == {"__bytes__"}:
+            with suppress(Exception):
+                import base64
+
+                return base64.b64decode(value["__bytes__"])
+            return b""
+        if isinstance(value, list):
+            return [KerasH5Scanner._decode_hdf5_attribute_worker_value(item) for item in value]
+        return value
+
+    @classmethod
+    def _hdf5_attribute_context(cls, attrs: Any) -> tuple[str, str] | None:
+        """Return file and object paths for an AttributeManager without opening attrs."""
+        try:
+            from h5py import h5f, h5i
+
+            object_id = attrs._id
+            file_path = os.fsdecode(h5f.get_name(object_id))
+            object_path = os.fsdecode(h5i.get_name(object_id)) or "/"
+        except Exception:
+            return None
+        if not file_path:
+            return None
+        return file_path, object_path
+
+    @classmethod
+    def _should_use_hdf5_attribute_worker(cls, attrs: Any) -> bool:
+        context = cls._hdf5_attribute_context(attrs)
+        if context is None:
+            return False
+        file_path, _object_path = context
+        with suppress(OSError):
+            return os.path.getsize(file_path) > cls._HDF5_ATTRIBUTE_WORKER_FILE_SIZE_THRESHOLD
+        return False
+
+    @classmethod
+    def _read_hdf5_attribute_in_worker(
+        cls,
+        attrs: Any,
+        attr_name: str,
+        *,
+        mode: str,
+        max_bytes: int,
+        max_items: int,
+    ) -> dict[str, Any]:
+        context = cls._hdf5_attribute_context(attrs)
+        if context is None:
+            return {"status": "error", "reason": "missing_context"}
+        file_path, object_path = context
+        request = {
+            "file_path": file_path,
+            "object_path": object_path,
+            "attr_name": attr_name,
+            "mode": mode,
+            "max_bytes": max_bytes,
+            "max_items": max_items,
+            "max_text_chars": cls._MAX_HDF5_REFERENCE_TEXT_CHARS,
+            "memory_limit_bytes": cls._HDF5_ATTRIBUTE_WORKER_MEMORY_BYTES,
+        }
+        env = os.environ.copy()
+        for env_name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            env.setdefault(env_name, "1")
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-c", _HDF5_ATTRIBUTE_WORKER_CODE],
+                input=json.dumps(request),
+                text=True,
+                capture_output=True,
+                timeout=cls._HDF5_ATTRIBUTE_WORKER_TIMEOUT_SECONDS,
+                env=env,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return {"status": "error", "reason": "worker_timeout"}
+        except Exception as exc:
+            return {"status": "error", "reason": type(exc).__name__}
+
+        stdout = completed.stdout.strip()
+        if completed.returncode != 0 or not stdout:
+            return {
+                "status": "error",
+                "reason": "worker_failed",
+                "returncode": completed.returncode,
+                "stderr": completed.stderr[-200:],
+            }
+        try:
+            return json.JSONDecoder().decode(stdout.splitlines()[-1])
+        except json.JSONDecodeError:
+            return {"status": "error", "reason": "worker_output_invalid"}
+
+    @classmethod
+    def _hdf5_attribute_exists(cls, attrs: Any, attr_name: str) -> bool:
+        if cls._should_use_hdf5_attribute_worker(attrs):
+            worker_result = cls._read_hdf5_attribute_in_worker(
+                attrs,
+                attr_name,
+                mode="raw",
+                max_bytes=1,
+                max_items=1,
+            )
+            return worker_result.get("status") != "missing"
+        return attr_name in attrs
+
     def _read_bounded_hdf5_attribute(
         self,
         attrs: Any,
@@ -727,6 +1037,44 @@ class KerasH5Scanner(BaseScanner):
         fail_closed: bool,
     ) -> Any:
         """Read a small HDF5 attribute without materializing unbounded variable-length values."""
+        if self._should_use_hdf5_attribute_worker(attrs):
+            worker_result = self._read_hdf5_attribute_in_worker(
+                attrs,
+                attr_name,
+                mode="raw",
+                max_bytes=max_bytes,
+                max_items=self._MAX_HDF5_LINK_VISITS,
+            )
+            worker_status = worker_result.get("status")
+            if worker_status == "missing":
+                return self._HDF5_ATTRIBUTE_MISSING
+            if worker_status == "value":
+                return self._decode_hdf5_attribute_worker_value(worker_result.get("value"))
+            if worker_status == "skipped":
+                attr_size = worker_result.get("storage_size")
+                if not isinstance(attr_size, int):
+                    attr_size = max_bytes + 1
+                self._mark_hdf5_attribute_size_limit(
+                    result,
+                    attr_name,
+                    attr_size=attr_size,
+                    max_bytes=max_bytes,
+                    fail_closed=fail_closed,
+                )
+                return self._HDF5_ATTRIBUTE_READ_SKIPPED
+
+            if fail_closed:
+                self._mark_hdf5_attribute_native_limit(
+                    result,
+                    attr_name,
+                    fail_closed=fail_closed,
+                    reason=str(worker_result.get("reason") or worker_result.get("error_type") or "worker_failed"),
+                )
+            return self._HDF5_ATTRIBUTE_READ_SKIPPED
+
+        if attr_name not in attrs:
+            return self._HDF5_ATTRIBUTE_MISSING
+
         attr_id = attrs.get_id(attr_name)
         if self._hdf5_attribute_is_variable_string(attr_id):
             raw_prefix = self._read_hdf5_variable_string_prefix(attr_id, max_bytes + 1)
@@ -775,7 +1123,7 @@ class KerasH5Scanner(BaseScanner):
             max_bytes=self.max_hdf5_json_attribute_bytes,
             fail_closed=True,
         )
-        if attr_value is self._HDF5_ATTRIBUTE_READ_SKIPPED:
+        if attr_value is self._HDF5_ATTRIBUTE_MISSING or attr_value is self._HDF5_ATTRIBUTE_READ_SKIPPED:
             return self._JSON_ATTRIBUTE_PARSE_FAILED
         return self._load_json_attribute(attr_value, result, attr_name)
 
@@ -851,7 +1199,7 @@ class KerasH5Scanner(BaseScanner):
                 continue
 
             layer = h5_file.get(layer_name, getlink=False)
-            if isinstance(layer, h5py.Group) and "weight_names" in layer.attrs:
+            if isinstance(layer, h5py.Group) and cls._hdf5_attribute_exists(layer.attrs, "weight_names"):
                 return True
 
         return False
@@ -982,21 +1330,51 @@ class KerasH5Scanner(BaseScanner):
                 if isinstance(layer_group, h5py.Group) and not add_weight_names(layer_group, layer_path):
                     return
 
-        def add_keras3_auxiliary_roots() -> None:
-            if h5_file.get("vars", getlink=True) is not None:
-                add_root("vars")
-
-            optimizer_link = h5_file.get("optimizer", getlink=True)
-            if isinstance(optimizer_link, (h5py.ExternalLink, h5py.SoftLink)):
-                add_root("optimizer")
+        def add_keras3_saveable_var_roots(*, excluded_prefixes: tuple[str, ...] = ()) -> None:
+            nonlocal inspected_name_count, roots_truncated
+            remaining_link_visits = max(cls._MAX_HDF5_LINK_VISITS - inspected_name_count, 0)
+            if remaining_link_visits == 0:
+                roots_truncated = True
                 return
-            if not isinstance(optimizer_link, h5py.HardLink):
-                return
-            optimizer_group = h5_file.get("optimizer", getlink=False)
-            if isinstance(optimizer_group, h5py.Group) and optimizer_group.get("vars", getlink=True) is not None:
-                add_root("optimizer/vars")
+            normalized_excluded_prefixes = tuple(prefix.strip("/") for prefix in excluded_prefixes if prefix.strip("/"))
 
-        if "model_config" in h5_file.attrs:
+            def add_vars_root(name: str, _link: Any) -> None:
+                if any(name == prefix or name.startswith(f"{prefix}/") for prefix in normalized_excluded_prefixes):
+                    return
+                if name == "vars" or name.endswith("/vars"):
+                    add_root(name)
+
+            visited_link_count, links_truncated = cls._visit_hdf5_links(
+                h5_file,
+                add_vars_root,
+                max_links=remaining_link_visits,
+            )
+            inspected_name_count += visited_link_count
+            if links_truncated:
+                roots_truncated = True
+
+        def add_keras3_layer_roots(layers_group: Any, *, layer_prefix: str) -> None:
+            for layer_name in layers_group:
+                if not consume_name_budget():
+                    break
+                layer_path = f"{layer_prefix}/{layer_name}" if layer_prefix else str(layer_name)
+                layer_link = layers_group.get(layer_name, getlink=True)
+                if isinstance(layer_link, (h5py.ExternalLink, h5py.SoftLink)):
+                    if not add_root(layer_path):
+                        break
+                    continue
+                if not isinstance(layer_link, h5py.HardLink):
+                    continue
+
+                layer = layers_group.get(layer_name, getlink=False)
+                if (
+                    isinstance(layer, h5py.Group)
+                    and layer.get("vars", getlink=True) is not None
+                    and not add_root(f"{layer_path}/vars")
+                ):
+                    break
+
+        if cls._hdf5_attribute_exists(h5_file.attrs, "model_config"):
             for root_name in cls._KERAS_WEIGHT_ROOT_GROUPS:
                 root_link = h5_file.get(root_name, getlink=True)
                 if isinstance(root_link, (h5py.ExternalLink, h5py.SoftLink)):
@@ -1022,7 +1400,12 @@ class KerasH5Scanner(BaseScanner):
         layers_link = h5_file.get("layers", getlink=True)
         if isinstance(layers_link, (h5py.ExternalLink, h5py.SoftLink)):
             add_root("layers")
-            add_keras3_auxiliary_roots()
+            excluded_prefixes: tuple[str, ...] = ()
+            if isinstance(layers_link, h5py.SoftLink):
+                target_path, target_link, incomplete = cls._resolve_hdf5_soft_link(h5_file, "layers", layers_link)
+                if not incomplete and target_path is not None and isinstance(target_link, h5py.HardLink):
+                    excluded_prefixes = (target_path,)
+            add_keras3_saveable_var_roots(excluded_prefixes=excluded_prefixes)
             return roots, roots_truncated
         if not isinstance(layers_link, h5py.HardLink):
             return roots, False
@@ -1031,26 +1414,8 @@ class KerasH5Scanner(BaseScanner):
         if not isinstance(layers, h5py.Group):
             return roots, False
 
-        add_keras3_auxiliary_roots()
-        for layer_name in layers:
-            if not consume_name_budget():
-                break
-            layer_path = f"layers/{layer_name}"
-            layer_link = layers.get(layer_name, getlink=True)
-            if isinstance(layer_link, (h5py.ExternalLink, h5py.SoftLink)):
-                if not add_root(layer_path):
-                    break
-                continue
-            if not isinstance(layer_link, h5py.HardLink):
-                continue
-
-            layer = layers.get(layer_name, getlink=False)
-            if (
-                isinstance(layer, h5py.Group)
-                and layer.get("vars", getlink=True) is not None
-                and not add_root(f"{layer_path}/vars")
-            ):
-                break
+        add_keras3_layer_roots(layers, layer_prefix="layers")
+        add_keras3_saveable_var_roots()
 
         return roots, roots_truncated
 
@@ -1097,6 +1462,25 @@ class KerasH5Scanner(BaseScanner):
     @classmethod
     def _read_bounded_hdf5_name_attribute(cls, attrs: Any, attr_name: str) -> tuple[list[str], bool]:
         """Read Keras HDF5 name-list attributes only when their encoded size is bounded."""
+        if cls._should_use_hdf5_attribute_worker(attrs):
+            worker_result = cls._read_hdf5_attribute_in_worker(
+                attrs,
+                attr_name,
+                mode="names",
+                max_bytes=cls._MAX_HDF5_NAME_ATTRIBUTE_BYTES,
+                max_items=cls._MAX_HDF5_LINK_VISITS,
+            )
+            worker_status = worker_result.get("status")
+            if worker_status == "missing":
+                return [], False
+            if worker_status == "value":
+                names = cls._decode_hdf5_names(worker_result.get("value"))
+                truncated = bool(worker_result.get("truncated"))
+                if len(names) > cls._MAX_HDF5_LINK_VISITS:
+                    return names[: cls._MAX_HDF5_LINK_VISITS], True
+                return names, truncated
+            return [], True
+
         if attr_name not in attrs:
             return [], False
 

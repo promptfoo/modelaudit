@@ -918,6 +918,55 @@ def test_keras_h5_scanner_flags_keras3_root_vars_virtual_dataset_source(tmp_path
     ]
 
 
+def test_keras_h5_scanner_flags_arbitrary_keras3_saveable_vars_external_link(tmp_path: Path) -> None:
+    external_source = tmp_path / "external.h5"
+    with h5py.File(external_source, "w") as f:
+        f.create_dataset("payload", data=[1.0, 2.0])
+    weights_path = tmp_path / "keras3_custom_child.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        f.create_group("layers").create_group("dense").create_group("vars").create_dataset("0", data=[1.0])
+        f.require_group("custom_parent").require_group("custom_child").require_group("vars")["0"] = h5py.ExternalLink(
+            external_source.name,
+            "/payload",
+        )
+    inflate_h5_file_to_size(weights_path, 536_871_936)
+
+    result = KerasH5Scanner().scan(str(weights_path))
+    audit_result = core_module.scan_model_directory_or_file(str(weights_path), cache_enabled=False)
+
+    assert weights_path.stat().st_size == 536_871_936
+    assert_not_rejected_by_read_cap(result)
+    cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2026-1669"]
+    assert len(cve_issues) == 1
+    assert cve_issues[0].details["external_references"] == [
+        {
+            "kind": "ExternalLink",
+            "hdf5_path": "/custom_parent/custom_child/vars/0",
+            "filename": "external.h5",
+            "path": "/payload",
+        },
+    ]
+    assert core_module.determine_exit_code(audit_result) == 1
+
+
+def test_keras_h5_scanner_allows_internal_arbitrary_keras3_saveable_vars(tmp_path: Path) -> None:
+    weights_path = tmp_path / "keras3_internal_custom_child.weights.h5"
+    with h5py.File(weights_path, "w") as f:
+        f.create_group("layers").create_group("dense").create_group("vars").create_dataset("0", data=[1.0])
+        f.require_group("custom_parent").require_group("custom_child").require_group("vars").create_dataset(
+            "0",
+            data=[2.0],
+        )
+    inflate_h5_file_to_size(weights_path, 536_871_936)
+
+    result = KerasH5Scanner().scan(str(weights_path))
+
+    assert result.success is True
+    assert_not_rejected_by_read_cap(result)
+    assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
 def test_large_hdf5_soft_link_cycle_fails_closed_without_size_limit(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
@@ -1089,18 +1138,96 @@ def test_keras_h5_oversized_weight_name_attribute_fails_closed_before_materializ
     )
 
 
-@pytest.mark.integration
-def test_real_hf_xlm_roberta_large_h5_reaches_keras_scan_without_read_cap(tmp_path: Path) -> None:
+def test_large_dense_hdf5_name_attribute_uses_isolated_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import numpy as np
+
+    model_path = tmp_path / "dense_layer_names.weights.h5"
+    encoded_attribute_bytes = 16 * 1024 * 1024
+    element_size = 32
+    with h5py.File(model_path, "w", track_order=True) as f:
+        f.attrs.create(
+            "layer_names",
+            np.full(encoded_attribute_bytes // element_size, b"dense", dtype=f"S{element_size}"),
+        )
+    inflate_h5_file_to_size(model_path, 536_871_936)
+
+    def fail_parent_attribute_access(_self: Any, name: str) -> Any:
+        raise AssertionError(f"large HDF5 attribute {name!r} was inspected in the parent process")
+
+    monkeypatch.setattr(h5py.AttributeManager, "__contains__", fail_parent_attribute_access)
+    monkeypatch.setattr(h5py.AttributeManager, "get_id", fail_parent_attribute_access)
+    monkeypatch.setattr(h5py.AttributeManager, "__getitem__", fail_parent_attribute_access)
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "keras_h5_external_reference_analysis_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert_not_rejected_by_read_cap(result)
+    assert any(
+        check.name == "HDF5 External Reference Analysis Limit" and check.details["weight_roots_truncated"] is True
+        for check in result.checks
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _assert_pinned_hf_h5_metadata(
+    huggingface_hub: Any,
+    *,
+    repo_id: str,
+    revision: str,
+    expected_size: int,
+    expected_blob_id: str,
+    expected_sha256: str,
+) -> None:
+    info = huggingface_hub.HfApi().model_info(repo_id=repo_id, revision=revision, files_metadata=True)
+    assert info.sha == revision
+    tf_model = next(sibling for sibling in info.siblings if sibling.rfilename == "tf_model.h5")
+    assert tf_model.size == expected_size
+    assert tf_model.blob_id == expected_blob_id
+    assert tf_model.lfs is not None
+    assert tf_model.lfs.sha256 == expected_sha256
+
+
+def _assert_real_hf_h5_reaches_keras_scan(
+    tmp_path: Path,
+    *,
+    repo_id: str,
+    revision: str,
+    expected_size: int,
+    expected_blob_id: str,
+    expected_sha256: str,
+    expected_root_keys: list[str] | None = None,
+    expected_attrs: set[str] | None = None,
+    expected_layer_names: list[str] | None = None,
+) -> None:
     if os.environ.get("MODELAUDIT_RUN_REAL_HF_H5") != "1":
-        pytest.skip("Set MODELAUDIT_RUN_REAL_HF_H5=1 to download and scan the pinned HF H5 model")
+        pytest.skip("Set MODELAUDIT_RUN_REAL_HF_H5=1 to download and scan pinned HF H5 models")
 
     huggingface_hub = pytest.importorskip("huggingface_hub")
+    _assert_pinned_hf_h5_metadata(
+        huggingface_hub,
+        repo_id=repo_id,
+        revision=revision,
+        expected_size=expected_size,
+        expected_blob_id=expected_blob_id,
+        expected_sha256=expected_sha256,
+    )
     cache_dir = os.environ.get("MODELAUDIT_HF_CACHE_DIR", str(tmp_path / "hf-cache"))
     model_path = Path(
         huggingface_hub.hf_hub_download(
-            repo_id="FacebookAI/xlm-roberta-large",
+            repo_id=repo_id,
             filename="tf_model.h5",
-            revision="c23d21b0620b635a76227c604d44e43a9f0ee389",
+            revision=revision,
             cache_dir=cache_dir,
         )
     )
@@ -1109,17 +1236,24 @@ def test_real_hf_xlm_roberta_large_h5_reaches_keras_scan_without_read_cap(tmp_pa
     metadata = audit_result.file_metadata[str(model_path)]
     metadata_extra = getattr(metadata, "model_extra", {}) or {}
 
-    assert model_path.stat().st_size == 2_240_076_248
-    assert metadata.file_size == 2_240_076_248
+    assert model_path.stat().st_size == expected_size
+    assert metadata.file_size == expected_size
+    assert _sha256_file(model_path) == expected_sha256
     with h5py.File(model_path, "r") as h5_file:
-        assert sorted(h5_file.keys()) == ["roberta", "top_level_model_weights"]
-        assert set(h5_file.attrs.keys()) == {"backend", "keras_version", "layer_names"}
+        if expected_root_keys is not None:
+            assert sorted(h5_file.keys()) == expected_root_keys
+        if expected_attrs is not None:
+            assert set(h5_file.attrs.keys()) == expected_attrs
         layer_names, layer_names_truncated = KerasH5Scanner._read_bounded_hdf5_name_attribute(
             h5_file.attrs,
             "layer_names",
         )
         assert layer_names_truncated is False
-        assert layer_names == ["roberta"]
+        assert layer_names
+        if expected_layer_names is not None:
+            assert layer_names == expected_layer_names
+        for layer_name in layer_names:
+            assert layer_name in h5_file
     assert audit_result.files_scanned == 1
     assert "keras_h5" in audit_result.scanner_names
     assert "max_file_read_size_exceeded" not in (metadata_extra.get("scan_outcome_reasons") or [])
@@ -1127,6 +1261,33 @@ def test_real_hf_xlm_roberta_large_h5_reaches_keras_scan_without_read_cap(tmp_pa
         check.name == "Keras Model Format Check" and check.status == CheckStatus.PASSED for check in audit_result.checks
     )
     assert core_module.determine_exit_code(audit_result) == 0
+
+
+@pytest.mark.integration
+def test_real_hf_xlm_roberta_large_h5_reaches_keras_scan_without_read_cap(tmp_path: Path) -> None:
+    _assert_real_hf_h5_reaches_keras_scan(
+        tmp_path,
+        repo_id="FacebookAI/xlm-roberta-large",
+        revision="c23d21b0620b635a76227c604d44e43a9f0ee389",
+        expected_size=2_240_076_248,
+        expected_blob_id="c902fe1cef9561c2e78bd7fccc5f83887e844f8b",
+        expected_sha256="a465c8d459fe83e10db5655221e2e7e7b6df3de2216c524399358d17ac7315ea",
+        expected_root_keys=["roberta", "top_level_model_weights"],
+        expected_attrs={"backend", "keras_version", "layer_names"},
+        expected_layer_names=["roberta"],
+    )
+
+
+@pytest.mark.integration
+def test_real_hf_esm2_large_h5_reaches_keras_scan_without_read_cap(tmp_path: Path) -> None:
+    _assert_real_hf_h5_reaches_keras_scan(
+        tmp_path,
+        repo_id="facebook/esm2_t33_650M_UR50D",
+        revision="08e4846e537177426273712802403f7ba8261b6c",
+        expected_size=2_605_109_760,
+        expected_blob_id="c3271b7e4fc4dbd0f1bd3980c02cc21101c57cbb",
+        expected_sha256="3110b0ee07a47362ff90dc4d780b12287e06f2a09f56c8e117c4aed089fc96b8",
+    )
 
 
 def test_missing_h5py_returns_inconclusive_exit2_without_cache(
