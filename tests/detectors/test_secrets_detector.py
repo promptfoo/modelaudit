@@ -163,6 +163,15 @@ class TestSecretsDetector:
                 _basic_auth_token(b"wrapped-proxy:pass"),
             ),
             (f"Authorization:\n  - Basic {_basic_auth_token(b'listed:pass')}", _basic_auth_token(b"listed:pass")),
+            (
+                f'"Authorization": ["Basic {_basic_auth_token(b"json-list:pass")}"]',
+                _basic_auth_token(b"json-list:pass"),
+            ),
+            (
+                f'"Authorization": [\n  "Basic {_basic_auth_token(b"json-multiline:pass")}"\n]',
+                _basic_auth_token(b"json-multiline:pass"),
+            ),
+            (f"Authorization: >\n  Basic {_basic_auth_token(b'block:pass')}", _basic_auth_token(b"block:pass")),
         ],
     )
     def test_basic_auth_valid_headers_are_detected(self, text: str, token: str) -> None:
@@ -192,6 +201,7 @@ class TestSecretsDetector:
             f"Authorization notes:\n  Basic {_basic_auth_token(b'wrapped:pass')}",
             f"Authorization: documented value\n  Basic {_basic_auth_token(b'wrapped:pass')}",
             f"Authorization notes:\n  - Basic {_basic_auth_token(b'listed:pass')}",
+            f"Authorization:\n\n  Basic {_basic_auth_token(b'gap:pass')}",
             f"Authorization: Basic {'A' * (BASIC_AUTH_TOKEN_MAX_LENGTH + 1)}",
         ],
     )
@@ -211,6 +221,21 @@ class TestSecretsDetector:
 
         assert _basic_auth_findings(findings)
 
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"Authorization": b"Basic c3RydWN0dXJlZC1ieXRlczpzM2NyM3Q="},
+            {"Authorization": ("Basic c3RydWN0dXJlZC10dXBsZTpzM2NyM3Q=",)},
+            {"headers": {"proxy_authorization": ["Basic c3RydWN0dXJlZC1saXN0OnMzY3IzdA=="]}},
+        ],
+    )
+    def test_basic_auth_structured_non_scalar_header_values_are_detected(self, data: dict[str, object]) -> None:
+        detector = SecretsDetector()
+
+        findings = detector.scan_dict(data)
+
+        assert _basic_auth_findings(findings)
+
     def test_basic_auth_full_value_whitelist_still_suppresses_detection(self) -> None:
         token = _basic_auth_token(b"user:pass")
         detector = SecretsDetector(config={"whitelist": [f"Basic {token}"]})
@@ -218,6 +243,31 @@ class TestSecretsDetector:
         findings = detector.scan_text(f"Authorization: Basic {token}", context="headers.txt")
 
         assert _basic_auth_findings(findings) == []
+
+    def test_basic_auth_token_value_whitelist_still_suppresses_detection(self) -> None:
+        token = _basic_auth_token(b"user:pass")
+        detector = SecretsDetector(config={"whitelist": [token]})
+
+        findings = detector.scan_text(f"Authorization: Basic {token}", context="headers.txt")
+
+        assert _basic_auth_findings(findings) == []
+
+    def test_basic_auth_honors_min_secret_length_override(self) -> None:
+        token = _basic_auth_token(b"user:pass")
+        detector = SecretsDetector(config={"min_secret_length": 100})
+
+        findings = detector.scan_text(f"Authorization: Basic {token}", context="headers.txt")
+
+        assert _basic_auth_findings(findings) == []
+
+    def test_basic_auth_custom_pattern_without_capture_group_does_not_crash(self) -> None:
+        detector = SecretsDetector(
+            config={"patterns": [(r"Basic +[A-Za-z]+", "Basic Auth Credentials")], "require_high_confidence": False}
+        )
+
+        findings = detector.scan_text("Authorization: Basic prose", context="auth-config")
+
+        assert isinstance(findings, list)
 
     def test_basic_auth_valid_token_without_header_key_is_ignored_in_structured_data(self) -> None:
         detector = SecretsDetector()

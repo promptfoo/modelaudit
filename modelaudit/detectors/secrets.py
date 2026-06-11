@@ -18,6 +18,8 @@ logger: logging.Logger = logging.getLogger(__name__)
 BASIC_AUTH_SECRET_TYPE = "Basic Auth Credentials"
 BASIC_AUTH_TOKEN_MAX_LENGTH = 8192
 BASIC_AUTH_CONFIDENCE = 0.8
+BASIC_AUTH_PATTERN = rf"\bBasic\s+([A-Za-z0-9+/]{{2,{BASIC_AUTH_TOKEN_MAX_LENGTH}}}={{0,2}})(?![A-Za-z0-9+/=])"
+BASIC_AUTH_HEADER_VALUE_CONTEXT_MAX_BYTES = BASIC_AUTH_TOKEN_MAX_LENGTH + 64
 
 # High-priority secret patterns with descriptions
 SECRET_PATTERNS: list[tuple[str, str]] = [
@@ -55,10 +57,7 @@ SECRET_PATTERNS: list[tuple[str, str]] = [
     # Tokens and Secrets
     (r"eyJ[A-Za-z0-9-_=]+\.eyJ[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*", "JWT Token"),
     (r"Bearer\s+[a-zA-Z0-9\-._~+/]+=*", "Bearer Token"),
-    (
-        rf"\bBasic\s+([A-Za-z0-9+/]{{2,{BASIC_AUTH_TOKEN_MAX_LENGTH}}}={{0,2}})(?![A-Za-z0-9+/=])",
-        BASIC_AUTH_SECRET_TYPE,
-    ),
+    (BASIC_AUTH_PATTERN, BASIC_AUTH_SECRET_TYPE),
     (r"[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}", "UUID (potential secret)"),
     # Passwords and Auth
     (r"password\s*[:=]\s*['\"]?([^'\"\s]{8,})['\"]?", "Hardcoded Password"),
@@ -351,7 +350,8 @@ BINARY_FALSE_POSITIVE_TYPES = frozenset(
 FLOAT_LIKE_PATTERN = re.compile(r"[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?")
 REDACTED_CONTEXT_SECRET = "<redacted-secret>"
 BASIC_AUTH_HEADER_PREFIX_PATTERN = re.compile(
-    r"(?:^|[^\w-])(?:proxy-authorization|authorization)\s*[\"']?\s*[:=]\s*[\"']?\s*$",
+    r"(?:^|[^\w-])(?:proxy-authorization|authorization)\s*[\"']?\s*[:=]\s*"
+    r"(?:[\"']|\[\s*[\"']?|\(\s*[\"']?)?\s*(?:[>|]\s*)?$",
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS = 256
@@ -359,8 +359,9 @@ BASIC_AUTH_HEADER_NAMES = {
     "authorization": "Authorization",
     "proxyauthorization": "Proxy-Authorization",
 }
-BASIC_AUTH_CONTINUATION_PREFIX_PATTERN = re.compile(r"^\s*(?:-\s*)?$")
+BASIC_AUTH_CONTINUATION_PREFIX_PATTERN = re.compile(r"^\s*(?:-\s*)?[\"']?$")
 BASIC_AUTH_VALUE_PREFIX_PATTERN = re.compile(r"^\s*Basic\s+", re.IGNORECASE)
+BASIC_AUTH_VALUE_PREFIX_BYTES_PATTERN = re.compile(rb"^\s*Basic\s+", re.IGNORECASE)
 
 
 def _normalize_basic_auth_header_name(value: str) -> str:
@@ -580,7 +581,15 @@ class SecretsDetector:
 
     @staticmethod
     def _basic_auth_match_has_header_context(text: str, position: int) -> bool:
-        line_start = max(text.rfind("\n", 0, position), text.rfind("\r", 0, position)) + 1
+        search_start = max(0, position - BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS)
+        last_newline = max(text.rfind("\n", search_start, position), text.rfind("\r", search_start, position))
+        if last_newline == -1:
+            if search_start > 0:
+                return False
+            line_start = 0
+        else:
+            line_start = last_newline + 1
+
         line_prefix = text[line_start:position]
         if len(line_prefix) > BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS:
             return False
@@ -589,10 +598,24 @@ class SecretsDetector:
         if BASIC_AUTH_CONTINUATION_PREFIX_PATTERN.fullmatch(line_prefix) is None:
             return False
 
-        previous_end = line_start
-        while previous_end > 0 and text[previous_end - 1] in "\r\n":
+        previous_end = line_start - 1
+        if previous_end < 0:
+            return False
+        if text[previous_end] == "\n" and previous_end > 0 and text[previous_end - 1] == "\r":
             previous_end -= 1
-        previous_start = max(text.rfind("\n", 0, previous_end), text.rfind("\r", 0, previous_end)) + 1
+
+        previous_search_start = max(0, previous_end - BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS)
+        previous_break = max(
+            text.rfind("\n", previous_search_start, previous_end),
+            text.rfind("\r", previous_search_start, previous_end),
+        )
+        if previous_break == -1:
+            if previous_search_start > 0:
+                return False
+            previous_start = 0
+        else:
+            previous_start = previous_break + 1
+
         previous_line = text[previous_start:previous_end]
         if len(previous_line) > BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS:
             return False
@@ -631,6 +654,8 @@ class SecretsDetector:
         context: str,
         safe_context: str,
     ) -> bool:
+        if len(matched_text) < self.min_secret_length:
+            return True
         if self._is_whitelisted(token) or self._is_whitelisted(matched_text):
             return True
 
@@ -656,6 +681,31 @@ class SecretsDetector:
                 "recommendation": f"Remove {BASIC_AUTH_SECRET_TYPE} from model data immediately",
             },
         )
+
+    def _scan_basic_auth_header_text_value(
+        self,
+        value: str,
+        header_name: str | None,
+        context: str,
+    ) -> list[dict[str, Any]]:
+        if header_name is not None and BASIC_AUTH_VALUE_PREFIX_PATTERN.match(value):
+            return self.scan_text(f"{header_name}: {value}", context, is_binary_source=False)
+        return self.scan_text(value, context, is_binary_source=False)
+
+    def _scan_basic_auth_header_bytes_value(
+        self,
+        value: bytes,
+        header_name: str | None,
+        context: str,
+    ) -> list[dict[str, Any]]:
+        if (
+            header_name is not None
+            and len(value) <= BASIC_AUTH_HEADER_VALUE_CONTEXT_MAX_BYTES
+            and BASIC_AUTH_VALUE_PREFIX_BYTES_PATTERN.match(value)
+        ):
+            value_text = value.decode("ascii", errors="ignore")
+            return self.scan_text(f"{header_name}: {value_text}", context, is_binary_source=False)
+        return self.scan_bytes(value, context)
 
     def scan_bytes(self, data: bytes, context: str = "") -> list[dict[str, Any]]:
         """Scan binary data for embedded secrets.
@@ -812,7 +862,7 @@ class SecretsDetector:
         for pattern, description in self._compiled_patterns:
             matches = pattern.finditer(text)
             for match in matches:
-                if description == BASIC_AUTH_SECRET_TYPE:
+                if description == BASIC_AUTH_SECRET_TYPE and pattern.pattern == BASIC_AUTH_PATTERN and match.lastindex:
                     token = match.group(1)
                     if not self._basic_auth_match_is_valid(text, match, token):
                         continue
@@ -916,23 +966,20 @@ class SecretsDetector:
             findings.extend(key_findings)
 
             # Check the value
+            header_name = _canonical_basic_auth_header_name(str(key))
             if isinstance(value, str):
-                header_name = _canonical_basic_auth_header_name(str(key))
-                if header_name is not None and BASIC_AUTH_VALUE_PREFIX_PATTERN.match(value):
-                    findings.extend(self.scan_text(f"{header_name}: {value}", key_context, is_binary_source=False))
-                else:
-                    findings.extend(self.scan_text(value, key_context, is_binary_source=False))
+                findings.extend(self._scan_basic_auth_header_text_value(value, header_name, key_context))
             elif isinstance(value, bytes):
-                findings.extend(self.scan_bytes(value, key_context))
+                findings.extend(self._scan_basic_auth_header_bytes_value(value, header_name, key_context))
             elif isinstance(value, dict):
                 findings.extend(self.scan_dict(value, key_context))
             elif isinstance(value, list | tuple):
                 for i, item in enumerate(value):
                     item_context = f"{key_context}[{i}]"
                     if isinstance(item, str):
-                        findings.extend(self.scan_text(item, item_context))
+                        findings.extend(self._scan_basic_auth_header_text_value(item, header_name, item_context))
                     elif isinstance(item, bytes):
-                        findings.extend(self.scan_bytes(item, item_context))
+                        findings.extend(self._scan_basic_auth_header_bytes_value(item, header_name, item_context))
                     elif isinstance(item, dict):
                         findings.extend(self.scan_dict(item, item_context))
 
