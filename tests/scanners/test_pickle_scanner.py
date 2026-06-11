@@ -8,6 +8,7 @@ import pickletools
 from pathlib import Path
 from typing import Any
 
+import modelaudit_picklescan.api as picklescan_api
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
@@ -2688,9 +2689,24 @@ def test_legitimate_serialization_file_keeps_untrusted_wrapper_origin_review(
 ) -> None:
     safe_path = tmp_path / "safe.joblib"
     safe_path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00.")
+    original_requires_origin_review = picklescan_api.import_only_module_requires_origin_review
+
+    def requires_origin_review(module: str, name: str) -> bool:
+        if (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper"):
+            return True
+        return original_requires_origin_review(module, name)
+
     monkeypatch.setattr(
         "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
         lambda _module, _name: False,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_reference_is_proven_trusted",
+        lambda _module, _name: False,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_module_requires_origin_review",
+        requires_origin_review,
     )
 
     assert _is_legitimate_serialization_file(str(safe_path)) is False
