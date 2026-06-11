@@ -48,6 +48,7 @@ def _make_legacy_pytorch_container(
     storage_payload: bytes,
     *,
     sys_info_padding: int = 0,
+    sys_info_protocol: int = 2,
     object_padding: int = 0,
 ) -> tuple[bytes, dict[str, int]]:
     sys_info: dict[str, object] = {
@@ -62,7 +63,7 @@ def _make_legacy_pytorch_container(
     control_streams = {
         "magic": pickle.dumps(_PYTORCH_LEGACY_MAGIC_NUMBER, protocol=2),
         "protocol": pickle.dumps(_PYTORCH_LEGACY_PROTOCOL_VERSION, protocol=2),
-        "sys_info": pickle.dumps(sys_info, protocol=2),
+        "sys_info": pickle.dumps(sys_info, protocol=sys_info_protocol),
         "object": _legacy_pytorch_object_stream(
             storage_keys,
             len(storage_payload),
@@ -665,18 +666,58 @@ class TestHashGenerationEdgeCases:
 
         assert content_hashes[str(legacy_path)].startswith("unhashable_pytorch_zip_read_limit_")
 
+    @pytest.mark.parametrize("sys_info_protocol", [2, 3, 4, 5])
+    def test_hash_files_by_path_defers_long_legacy_pytorch_sys_info_protocols(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        sys_info_protocol: int,
+    ) -> None:
+        """Incomplete legacy PyTorch sys_info metadata must defer for protocols 2-5."""
+        from modelaudit import core
+
+        payload, offsets = _make_legacy_pytorch_container(
+            b"A" * 256,
+            sys_info_padding=1024,
+            sys_info_protocol=sys_info_protocol,
+        )
+        legacy_path = tmp_path / f"long-sys-info-protocol-{sys_info_protocol}.pt"
+        legacy_path.write_bytes(payload)
+        read_limit = offsets["sys_info_start"] + 8
+        assert read_limit < offsets["sys_info_end"]
+
+        def fail_hash(path: str) -> str:
+            if path == str(legacy_path):
+                pytest.fail("valid long legacy PyTorch sys_info metadata was content-hashed")
+            return "a" * 64
+
+        monkeypatch.setattr(core, "_calculate_file_hash", fail_hash)
+
+        content_hashes = core._hash_files_by_path(
+            [str(legacy_path)],
+            config={"max_file_read_size": read_limit},
+        )
+
+        assert content_hashes[str(legacy_path)].startswith("unhashable_pytorch_zip_read_limit_")
+
+    @pytest.mark.parametrize("sys_info_protocol", [2, 3, 4, 5])
     def test_single_file_scan_bypasses_cache_hash_for_valid_long_legacy_pytorch_control(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sys_info_protocol: int
     ) -> None:
         """Cache lookup must not full-hash a bounded valid legacy PyTorch control."""
         from modelaudit import core
         from modelaudit.cache import reset_cache_manager
         from modelaudit.utils.helpers.secure_hasher import SecureFileHasher
 
-        payload, offsets = _make_legacy_pytorch_container(b"A" * 256, sys_info_padding=1024)
-        legacy_path = tmp_path / "long-control-cache.pt"
+        payload, offsets = _make_legacy_pytorch_container(
+            b"A" * 256,
+            sys_info_padding=1024,
+            sys_info_protocol=sys_info_protocol,
+        )
+        legacy_path = tmp_path / f"long-control-cache-protocol-{sys_info_protocol}.pt"
         legacy_path.write_bytes(payload)
         read_limit = offsets["sys_info_start"] + 8
+        assert read_limit < offsets["sys_info_end"]
 
         def fail_cache_hash(self: SecureFileHasher, path: str) -> str:
             if path == str(legacy_path):
@@ -706,6 +747,10 @@ class TestHashGenerationEdgeCases:
             reset_cache_manager()
 
         assert result.metadata["file_size"] == len(payload)
+        assert result.metadata["legacy_pytorch_bounded_analysis"] is True
+        assert result.metadata["legacy_pytorch_storage_payload_skipped"] is True
+        assert result.metadata["file_hashes"]["sha256_prefix"]
+        assert "sha256" not in result.metadata["file_hashes"]
 
     def test_directory_scan_omits_content_hash_for_valid_long_legacy_pytorch_deferral(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

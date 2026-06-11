@@ -338,6 +338,10 @@ _PYTORCH_LEGACY_SYS_INFO_OPCODES = frozenset(
         *_PICKLE_STRING_OPCODE_NAMES,
     }
 )
+_PYTORCH_LEGACY_SYS_INFO_PROTOCOLS = frozenset({2, 3, 4, 5})
+_PICKLE_PROTO_OPCODE = 0x80
+_PICKLE_FRAME_OPCODE = 0x95
+_PICKLE_EMPTY_DICT_OPCODE = ord("}")
 _PYTORCH_LEGACY_STORAGE_KEY_OPCODES = frozenset(
     {
         "PROTO",
@@ -1038,6 +1042,41 @@ def _legacy_pytorch_control_probe_needs_more_bytes(data: bytes) -> bool:
     return False
 
 
+def _legacy_pytorch_partial_sys_info_has_supported_prefix(data: bytes) -> bool:
+    """Return whether bytes are a valid prefix of a protocol 2-5 sys_info dict."""
+    if len(data) < 3 or data[0] != _PICKLE_PROTO_OPCODE or data[1] not in _PYTORCH_LEGACY_SYS_INFO_PROTOCOLS:
+        return False
+
+    protocol = data[1]
+    dict_offset = 2
+    if protocol >= 4 and data[dict_offset] == _PICKLE_FRAME_OPCODE:
+        frame_arg_end = dict_offset + 1 + 8
+        if len(data) < frame_arg_end:
+            return True
+        dict_offset = frame_arg_end
+        if len(data) == dict_offset:
+            return True
+
+    if data[dict_offset] != _PICKLE_EMPTY_DICT_OPCODE:
+        return False
+
+    try:
+        for opcode_index, (opcode, arg, _position) in enumerate(pickletools.genops(data), start=1):
+            if opcode_index > _PYTORCH_LEGACY_MAX_CONTROL_OPCODES:
+                return False
+            if opcode.name not in _PYTORCH_LEGACY_SYS_INFO_OPCODES:
+                return False
+            if opcode.name == "PROTO" and arg not in _PYTORCH_LEGACY_SYS_INFO_PROTOCOLS:
+                return False
+            if opcode.name == "FRAME" and protocol < 4:
+                return False
+            if opcode.name == "STOP":
+                return _matches_legacy_pytorch_sys_info(data)
+    except Exception:
+        return True
+    return True
+
+
 def _legacy_pytorch_incomplete_sys_info_needs_more_bytes(data: bytes) -> bool:
     if not _matches_legacy_pytorch_preamble(data):
         return False
@@ -1054,7 +1093,7 @@ def _legacy_pytorch_incomplete_sys_info_needs_more_bytes(data: bytes) -> bool:
             if stream_index != 2 or not parsed_opcode or offset + consumed < len(data):
                 return False
             partial_sys_info = data[offset:]
-            return partial_sys_info.startswith(b"\x80\x02}")
+            return _legacy_pytorch_partial_sys_info_has_supported_prefix(partial_sys_info)
 
         end = offset + extent
         if stream_index == 0 and _pickle_scalar_integer(data[:end]) != _PYTORCH_LEGACY_MAGIC_NUMBER:
