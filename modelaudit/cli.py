@@ -2650,11 +2650,12 @@ def _resolve_scan_source_for_path(
         if dry_run:
             try:
                 repo_id, revision, filename = parse_huggingface_file_url(path)
-                click.echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:")
-                click.echo("   Type: HuggingFace file")
-                click.echo(f"   Repository: {_escape_terminal_text(repo_id)}")
-                click.echo(f"   Revision: {_escape_terminal_text(revision)}")
-                click.echo(f"   File: {_escape_terminal_text(filename)}")
+                if runtime.show_styled_output:
+                    click.echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:")
+                    click.echo("   Type: HuggingFace file")
+                    click.echo(f"   Repository: {_escape_terminal_text(repo_id)}")
+                    click.echo(f"   Revision: {_escape_terminal_text(revision)}")
+                    click.echo(f"   File: {_escape_terminal_text(filename)}")
                 return _SourceDispatchResult(actual_path=path, local_scan_required=False)
             except Exception as exc:
                 error_msg = _display_error(exc, path)
@@ -2736,12 +2737,13 @@ def _resolve_scan_source_for_path(
                 else:
                     size_str = f"{size_bytes / 1024:.2f} KB"
 
-                click.echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:")
-                click.echo("   Type: HuggingFace model")
-                click.echo(f"   Model: {_escape_terminal_text(str(model_info['model_id']))}")
-                click.echo(f"   Size: {size_str} ({_escape_terminal_text(str(model_info['file_count']))} files)")
-                if runtime.scan_and_delete:
-                    click.echo(style_text("   Mode: Streaming (scan and delete to save disk)", fg="cyan"))
+                if runtime.show_styled_output:
+                    click.echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:")
+                    click.echo("   Type: HuggingFace model")
+                    click.echo(f"   Model: {_escape_terminal_text(str(model_info['model_id']))}")
+                    click.echo(f"   Size: {size_str} ({_escape_terminal_text(str(model_info['file_count']))} files)")
+                    if runtime.scan_and_delete:
+                        click.echo(style_text("   Mode: Streaming (scan and delete to save disk)", fg="cyan"))
                 return _SourceDispatchResult(actual_path=path, local_scan_required=False)
             except Exception as exc:
                 error_msg = _display_error(exc, path)

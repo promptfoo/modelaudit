@@ -3595,6 +3595,33 @@ def test_scan_huggingface_direct_file_dry_run_does_not_download(
     mock_scan.assert_not_called()
 
 
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.scan_model_directory_or_file")
+def test_scan_huggingface_direct_file_dry_run_json_stdout_is_parseable(
+    mock_scan: MagicMock,
+    mock_download_file: MagicMock,
+) -> None:
+    """Direct HF dry-run JSON output must not be prefixed by preview text."""
+    result = CliRunner().invoke(
+        cli,
+        [
+            "scan",
+            "--dry-run",
+            "--format",
+            "json",
+            "https://huggingface.co/test/model/resolve/main/model-00001-of-00002.safetensors",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Preview for" not in result.output
+    parsed = json.loads(result.output)
+    assert parsed["dry_run"] is True
+    assert parsed["files_scanned"] == 0
+    mock_download_file.assert_not_called()
+    mock_scan.assert_not_called()
+
+
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.cli.download_model")
 @patch("modelaudit.cli.download_file_from_hf")
@@ -3620,6 +3647,39 @@ def test_scan_huggingface_streaming_dry_run_uses_metadata_preview_without_downlo
     assert result.exit_code == 0
     assert "Preview for" in result.output
     assert "test/model" in result.output
+    mock_get_model_info.assert_called_once_with("hf://test/model")
+    mock_download_file.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_download_streaming.assert_not_called()
+
+
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.get_model_info")
+def test_scan_huggingface_streaming_dry_run_json_stdout_is_parseable(
+    mock_get_model_info: MagicMock,
+    mock_download_file: MagicMock,
+    mock_download_model: MagicMock,
+    mock_download_streaming: MagicMock,
+) -> None:
+    """HF model dry-run JSON output must not be prefixed by preview text."""
+    mock_get_model_info.return_value = {
+        "model_id": "test/model",
+        "total_size": 4096,
+        "file_count": 258,
+    }
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--dry-run", "--stream", "--scanners", "xgboost", "--format", "json", "hf://test/model"],
+    )
+
+    assert result.exit_code == 0
+    assert "Preview for" not in result.output
+    parsed = json.loads(result.output)
+    assert parsed["dry_run"] is True
+    assert parsed["files_scanned"] == 0
     mock_get_model_info.assert_called_once_with("hf://test/model")
     mock_download_file.assert_not_called()
     mock_download_model.assert_not_called()
