@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
-from ..scanner_results import VALIDATED_FORMAT_METADATA_KEY
+from ..scanner_results import SUPPRESSED_FAILED_CHECKS_METADATA_KEY, VALIDATED_FORMAT_METADATA_KEY
 from ..utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
 from ._evidence_redaction import redact_untrusted_error_message
 from .base import (
@@ -2565,9 +2565,23 @@ def _finish_scan_result(result: ScanResult) -> None:
 
 def _onnx_format_integrity_validated(result: ScanResult) -> bool:
     """Return True once ONNX ownership is structurally validated."""
+    if result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
+        return False
+    if _suppressed_onnx_format_integrity_failure(result):
+        return False
     return not any(
         check.status == CheckStatus.FAILED and check.name in _ONNX_FORMAT_INTEGRITY_CHECK_NAMES
         for check in result.checks
+    )
+
+
+def _suppressed_onnx_format_integrity_failure(result: ScanResult) -> bool:
+    suppressed_checks = result._private_metadata.get(SUPPRESSED_FAILED_CHECKS_METADATA_KEY)
+    if not isinstance(suppressed_checks, list):
+        return False
+    return any(
+        isinstance(check, dict) and check.get("name") in _ONNX_FORMAT_INTEGRITY_CHECK_NAMES
+        for check in suppressed_checks
     )
 
 

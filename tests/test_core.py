@@ -10040,6 +10040,29 @@ def _create_missing_value_metadata_onnx_candidate(path: Path) -> Path:
     return prefix_mock_onnx_with_unknown_field(path, value_size=0, count=4097, field_number=8)
 
 
+def _create_external_data_onnx_candidate(path: Path) -> Path:
+    onnx = pytest.importorskip("onnx")
+    from onnx import StringStringEntryProto, TensorProto, helper
+
+    weights_path = path.with_name("weights.bin")
+    weights_path.write_bytes(struct.pack("ff", 1.0, 2.0))
+    x_value = helper.make_tensor_value_info("input", TensorProto.FLOAT, [2])
+    y_value = helper.make_tensor_value_info("output", TensorProto.FLOAT, [2])
+    initializer = onnx.TensorProto()
+    initializer.name = "weights"
+    initializer.data_type = TensorProto.FLOAT
+    initializer.dims.extend([2])
+    initializer.data_location = onnx.TensorProto.EXTERNAL
+    location = StringStringEntryProto()
+    location.key = "location"
+    location.value = weights_path.name
+    initializer.external_data.append(location)
+    node = helper.make_node("Add", ["input", "weights"], ["output"], name="add")
+    graph = helper.make_graph([node], "graph", [x_value], [y_value], [initializer])
+    onnx.save(helper.make_model(graph), str(path))
+    return prefix_mock_onnx_with_unknown_field(path, value_size=0, count=4097, field_number=8)
+
+
 def _format_validation_check(result: ScanResult) -> Any:
     return next(check for check in result.checks if check.name == "Format Validation")
 
@@ -10106,6 +10129,28 @@ def test_scan_file_demotes_pt_onnx_mismatch_after_validated_alternate_format(tmp
     }
     assert "Filename and content disagree" in format_check.message
     assert _actionable_s901_issues(result) == []
+
+
+def test_scan_file_keeps_s901_for_external_data_pt_onnx(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    external_data_onnx = _create_external_data_onnx_candidate(tmp_path / "external-data.pt")
+
+    result = scan_file(str(external_data_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert "validated_format" not in result.metadata
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "onnx_schema_validation_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "External Data Reference Check"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("file") == "weights.bin"
+        for check in result.checks
+    )
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
 
 
 def test_scan_file_keeps_s901_for_malicious_valid_pt_onnx(tmp_path: Path) -> None:
@@ -10240,6 +10285,31 @@ def test_scan_file_keeps_s901_for_truncated_pt_onnx(tmp_path: Path) -> None:
     assert _actionable_s901_issues(result)
 
 
+def test_scan_file_keeps_s901_when_truncated_onnx_integrity_check_is_suppressed(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    rule_config = ModelAuditConfig(suppress={"S703"})
+    set_config(rule_config)
+    truncated_onnx = _create_truncated_tensor_onnx(tmp_path / "suppressed-truncated.pt")
+    prefix_mock_onnx_with_unknown_field(truncated_onnx, value_size=0, count=4097, field_number=8)
+
+    result = scan_file(str(truncated_onnx), config={"cache_enabled": False})
+    aggregate = scan_model_directory_or_file(str(truncated_onnx), cache_scan_results=False)
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert "validated_format" not in result.metadata
+    assert not any(check.name == "Tensor Size Validation" for check in result.checks)
+    assert {
+        "name": "Tensor Size Validation",
+        "rule_code": "S703",
+        "severity": "info",
+    } in result._private_metadata[SUPPRESSED_FAILED_CHECKS_METADATA_KEY]
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+    assert determine_exit_code(aggregate) != 0
+
+
 def test_scan_file_keeps_s901_for_malformed_pt_onnx_candidate(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     malformed_payload = tmp_path / "malformed.pt"
@@ -10262,6 +10332,33 @@ def test_scan_file_keeps_s901_for_checker_rejected_pt_onnx_payload(tmp_path: Pat
     invalid_payload.write_bytes((b"\x42\x00" * 4097) + b"\x08\x01\x3a\x00")
 
     _assert_schema_rejected_pt_onnx_keeps_s901(invalid_payload)
+
+
+def test_scan_file_keeps_s901_when_schema_failure_is_suppressed(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    rule_config = ModelAuditConfig(suppress={"S902"})
+    set_config(rule_config)
+    invalid_payload = tmp_path / "suppressed-checker-rejected.pt"
+    invalid_payload.write_bytes((b"\x42\x00" * 4097) + b"\x08\x01\x3a\x00")
+
+    result = scan_file(str(invalid_payload), config={"cache_enabled": False})
+    aggregate = scan_model_directory_or_file(str(invalid_payload), cache_scan_results=False)
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert "validated_format" not in result.metadata
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "onnx_schema_validation_failed" in result.metadata["scan_outcome_reasons"]
+    assert not any(check.name == "ONNX Schema Validation" for check in result.checks)
+    assert {
+        "name": "ONNX Schema Validation",
+        "rule_code": "S902",
+        "severity": "info",
+    } in result._private_metadata[SUPPRESSED_FAILED_CHECKS_METADATA_KEY]
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+    assert determine_exit_code(aggregate) != 0
 
 
 def test_scan_file_keeps_s901_for_unsupported_future_ir_pt_onnx(tmp_path: Path) -> None:
