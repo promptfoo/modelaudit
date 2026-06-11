@@ -418,6 +418,10 @@ def _bounded_custom_operator_value(value: Any) -> str:
     return f"{text[:_ONNX_CUSTOM_OPERATOR_TEXT_LIMIT]}..."
 
 
+def _custom_operator_identity_display(value: str) -> str:
+    return _bounded_custom_operator_value(value) if value else "<default>"
+
+
 @dataclass
 class _CustomOperatorAggregate:
     occurrence_count: int = 0
@@ -2927,19 +2931,34 @@ class OnnxScanner(BaseScanner):
                 details=finding.details(domain=domain, security_note=custom_operator_security_note),
             )
 
-        for (domain, op_type, _overload), finding in sorted(explicit_custom_operator_findings.items()):
+        for (domain, op_type, overload), finding in sorted(explicit_custom_operator_findings.items()):
+            domain_display = _custom_operator_identity_display(domain)
+            op_type_display = _bounded_custom_operator_value(op_type)
+            overload_display = _custom_operator_identity_display(overload)
+            details = finding.details(domain=domain, security_note=custom_operator_security_note)
+            details.update(
+                {
+                    "op_type": op_type,
+                    "overload": overload,
+                    "operator_identity": {
+                        "domain": domain,
+                        "op_type": op_type,
+                        "overload": overload,
+                    },
+                }
+            )
             result.add_check(
                 name="Custom Operator Domain Check",
                 passed=False,
                 message=(
-                    f"Model references custom operator '{op_type}' in the standard ONNX domain in "
-                    f"{finding.occurrence_count} node(s). Ensure its implementation is from a trusted source "
-                    "before installation."
+                    f"Model references custom operator '{op_type_display}' in ONNX domain '{domain_display}' "
+                    f"with overload '{overload_display}' in {finding.occurrence_count} node(s). Ensure its "
+                    "implementation is from a trusted source before installation."
                 ),
                 severity=IssueSeverity.INFO,
                 location=path,
                 rule_code="S1111",
-                details=finding.details(domain=domain, security_note=custom_operator_security_note),
+                details=details,
             )
 
         # Record successful checks for safe operators

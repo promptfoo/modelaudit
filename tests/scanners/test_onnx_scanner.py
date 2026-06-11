@@ -1,3 +1,4 @@
+import json
 import os
 import struct
 import sys
@@ -18,6 +19,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.detectors.jit_script import JITScriptDetector
 from modelaudit.detectors.network_comm import NetworkCommDetector
+from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.onnx_scanner import (
     ONNX_STRUCTURE_INCONCLUSIVE_REASON,
@@ -2156,6 +2158,36 @@ def create_onnx_model_with_custom_nodes(
     return model_path
 
 
+def create_onnx_model_with_explicit_custom_operator_identities(
+    tmp_path: Path,
+    custom_nodes: list[tuple[str, str, str, str]],
+    *,
+    filename: str = "explicit_custom_operator_identities.onnx",
+) -> Path:
+    input_value = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
+    output_value = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
+    previous_output = "input"
+    nodes = []
+    for index, (domain, op_type, overload, node_name) in enumerate(custom_nodes):
+        next_output = "output" if index == len(custom_nodes) - 1 else f"value_{index}"
+        node = helper.make_node(op_type, [previous_output], [next_output], domain=domain, name=node_name)
+        node.overload = overload
+        nodes.append(node)
+        previous_output = next_output
+
+    opset_imports = [helper.make_opsetid("", 13)]
+    opset_imports.extend(
+        helper.make_opsetid(domain, 13)
+        for domain in sorted({domain for domain, _op_type, _overload, _node_name in custom_nodes if domain})
+    )
+    graph = helper.make_graph(nodes, "explicit_custom_operator_identities", [input_value], [output_value])
+    model = helper.make_model(graph, opset_imports=opset_imports)
+    model.ir_version = 8
+    model_path = tmp_path / filename
+    onnx.save(model, str(model_path))
+    return model_path
+
+
 def create_onnx_model_with_repeated_custom_domain_and_missing_external_data(tmp_path: Path) -> Path:
     input_value = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
     output_value = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
@@ -3650,6 +3682,75 @@ def test_onnx_scanner_explicit_custom_op_in_standard_domain_still_flagged(tmp_pa
     assert len(custom_operator_issues) == 1
     assert custom_operator_issues[0].severity == IssueSeverity.INFO
     assert custom_operator_issues[0].details["op_type"] == "custom_op"
+    assert custom_operator_issues[0].details["overload"] == ""
+    assert custom_operator_issues[0].details["operator_identity"] == {
+        "domain": "",
+        "op_type": "custom_op",
+        "overload": "",
+    }
+    assert "ONNX domain '<default>'" in custom_operator_issues[0].message
+    assert "overload '<default>'" in custom_operator_issues[0].message
+
+
+def test_onnx_scanner_explicit_custom_op_identity_survives_json_and_sarif_serialization(
+    tmp_path: Path,
+) -> None:
+    custom_nodes = [
+        ("", "custom_op", "float", "default_float"),
+        ("", "custom_op", "int", "default_int"),
+        ("ai.onnx", "custom_op", "float", "ai_onnx_float"),
+    ]
+    model_path = create_onnx_model_with_explicit_custom_operator_identities(tmp_path, custom_nodes)
+
+    result = scan_model_directory_or_file(
+        str(model_path),
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    expected_identities = {
+        ("", "custom_op", "float"),
+        ("", "custom_op", "int"),
+        ("ai.onnx", "custom_op", "float"),
+    }
+    json_payload = result.model_dump(mode="json")
+    json_custom_issues = [
+        issue
+        for issue in json_payload["issues"]
+        if issue.get("rule_code") == "S1111"
+        and issue.get("details", {}).get("operator_identity", {}).get("op_type") == "custom_op"
+    ]
+
+    assert len(json_custom_issues) == len(expected_identities)
+    assert {
+        (
+            issue["details"]["operator_identity"]["domain"],
+            issue["details"]["operator_identity"]["op_type"],
+            issue["details"]["operator_identity"]["overload"],
+        )
+        for issue in json_custom_issues
+    } == expected_identities
+    assert len({issue["message"] for issue in json_custom_issues}) == len(expected_identities)
+    assert all(issue["location"] == str(model_path) for issue in json_custom_issues)
+
+    sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+    sarif_results = [item for item in sarif_payload["runs"][0]["results"] if item["ruleId"] == "S1111"]
+
+    assert len(sarif_results) == len(expected_identities)
+    assert {item["message"]["text"] for item in sarif_results} == {issue["message"] for issue in json_custom_issues}
+    assert len({item["partialFingerprints"]["primaryLocationLineHash"] for item in sarif_results}) == len(
+        expected_identities
+    )
+    assert {
+        (
+            item["properties"]["operator_identity"]["domain"],
+            item["properties"]["operator_identity"]["op_type"],
+            item["properties"]["operator_identity"]["overload"],
+        )
+        for item in sarif_results
+    } == expected_identities
 
 
 def test_onnx_scanner_real_pyop_node_still_flagged_despite_weight_bytes(tmp_path: Path) -> None:
