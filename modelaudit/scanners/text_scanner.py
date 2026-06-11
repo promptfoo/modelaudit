@@ -68,7 +68,6 @@ BARE_NETWORK_TOKEN_PATTERNS = (
 )
 MAX_TEXT_FINDING_CONTEXT_BYTES = 4096
 MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES = 1024
-MAX_DOCUMENTATION_FENCED_CODE_RANGES = 1024
 DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
     rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
     rb"[\s(\[{\\]{0,4096}[rubfRUBF]*[\"']?$"
@@ -84,7 +83,7 @@ DOCUMENTATION_EXECUTABLE_HTML_URL_ATTRIBUTE_PATTERN = re.compile(
 )
 DOCUMENTATION_HTML_URL_ATTRIBUTE_PATTERN = re.compile(rb"\b(?:href|src)\s*=\s*[\"']?$", re.IGNORECASE)
 DOCUMENTATION_FENCE_LINE_PATTERN = re.compile(
-    rb"^[ \t]{0,3}(?P<marker>`{3,}|~{3,})(?P<suffix>[^\r\n]*)$",
+    rb"^[ \t]{0,3}(?P<marker>`{3,}|~{3,})(?P<suffix>[^\r\n]*)\r?$",
     re.MULTILINE,
 )
 DOCUMENTATION_CODE_CALL_PATTERN = re.compile(rb"\b[A-Za-z_][A-Za-z0-9_.]*\s*\([^()]{0,4096}[rubfRUBF]*[\"']$")
@@ -656,8 +655,8 @@ class TextScanner(BaseScanner):
 
     @staticmethod
     def _documentation_uses_markdown_fences(path: str) -> bool:
-        extension = os.path.splitext(os.path.basename(path).lower())[1]
-        return extension in {".md", ".markdown"}
+        filename = os.path.basename(path).lower()
+        return os.path.splitext(filename)[1] != ".rst"
 
     @staticmethod
     def _is_passive_data_sidecar(path: str) -> bool:
@@ -1209,35 +1208,28 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
-    def _documentation_fenced_code_ranges(payload: bytes) -> tuple[tuple[int, int], ...]:
-        ranges: list[tuple[int, int]] = []
+    def _documentation_position_is_fenced_code(payload: bytes, position: int) -> bool:
+        if position < 0 or position > len(payload):
+            return False
+
         opening_marker: bytes | None = None
-        content_start = 0
         for match in DOCUMENTATION_FENCE_LINE_PATTERN.finditer(payload):
+            if match.start() > position:
+                break
             marker = match.group("marker")
             suffix = match.group("suffix")
-            line_end = payload.find(b"\n", match.end())
-            next_line_start = len(payload) if line_end < 0 else line_end + 1
             if opening_marker is None:
                 opening_marker = marker
-                content_start = next_line_start
                 continue
             if marker[:1] != opening_marker[:1] or len(marker) < len(opening_marker) or suffix.strip():
                 continue
-            ranges.append((content_start, match.start()))
-            if len(ranges) >= MAX_DOCUMENTATION_FENCED_CODE_RANGES:
-                return tuple(ranges)
             opening_marker = None
-        if opening_marker is not None:
-            ranges.append((content_start, len(payload)))
-        return tuple(ranges)
-
-    @staticmethod
-    def _documentation_position_is_fenced_code(
-        position: int,
-        fenced_code_ranges: tuple[tuple[int, int], ...],
-    ) -> bool:
-        return any(start <= position < end for start, end in fenced_code_ranges)
+        if opening_marker is None:
+            return False
+        current_line_end = payload.find(b"\n", position)
+        current_line_end = len(payload) if current_line_end < 0 else current_line_end
+        current_line = payload[max(payload.rfind(b"\n", 0, position) + 1, 0) : current_line_end]
+        return DOCUMENTATION_FENCE_LINE_PATTERN.fullmatch(current_line) is None
 
     @staticmethod
     def _documentation_finding_tokens(finding: dict[str, Any]) -> tuple[bytes, ...]:
@@ -1281,7 +1273,7 @@ class TextScanner(BaseScanner):
         payload: bytes,
         lowered_payload: bytes,
         finding: dict[str, Any],
-        fenced_code_ranges: tuple[tuple[int, int], ...],
+        markdown_fences: bool,
         remaining_occurrences: int,
         allow_exhaustion_probe: bool,
     ) -> tuple[dict[str, Any], bool, int]:
@@ -1319,9 +1311,9 @@ class TextScanner(BaseScanner):
             candidate = {**finding, "position": position}
             if finding_type == "network_library":
                 candidate["pattern"] = token_bytes.decode()
-            if cls._documentation_comment_contains_position(
-                payload, position
-            ) or cls._documentation_position_is_fenced_code(position, fenced_code_ranges):
+            if cls._documentation_comment_contains_position(payload, position) or (
+                markdown_fences and cls._documentation_position_is_fenced_code(payload, position)
+            ):
                 actionable = False
             elif finding_type == "network_function":
                 actionable = not cls._documentation_network_function_is_prose(payload, candidate)
@@ -1555,14 +1547,18 @@ class TextScanner(BaseScanner):
         path: str,
         payload: bytes,
         finding: dict[str, Any],
-        fenced_code_ranges: tuple[tuple[int, int], ...] = (),
+        markdown_fences: bool = False,
     ) -> bool:
         if cls._is_documentation_sidecar(path):
             finding_type = finding.get("type")
             position = finding.get("position")
             if isinstance(position, int) and cls._documentation_comment_contains_position(payload, position):
                 return True
-            if isinstance(position, int) and cls._documentation_position_is_fenced_code(position, fenced_code_ranges):
+            if (
+                isinstance(position, int)
+                and markdown_fences
+                and cls._documentation_position_is_fenced_code(payload, position)
+            ):
                 return True
             return (
                 (
@@ -1602,11 +1598,7 @@ class TextScanner(BaseScanner):
         remaining_occurrences = MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES
         documentation_sidecar = cls._is_documentation_sidecar(path)
         lowered_payload = payload.lower() if documentation_sidecar else b""
-        fenced_code_ranges = (
-            cls._documentation_fenced_code_ranges(payload)
-            if documentation_sidecar and cls._documentation_uses_markdown_fences(path)
-            else ()
-        )
+        markdown_fences = documentation_sidecar and cls._documentation_uses_markdown_fences(path)
         last_retargetable_index = max(
             (index for index, finding in enumerate(findings) if cls._documentation_finding_tokens(finding)),
             default=-1,
@@ -1618,7 +1610,7 @@ class TextScanner(BaseScanner):
                     payload,
                     lowered_payload,
                     finding,
-                    fenced_code_ranges,
+                    markdown_fences,
                     remaining_occurrences,
                     index == last_retargetable_index,
                 )
@@ -1627,7 +1619,7 @@ class TextScanner(BaseScanner):
                 path,
                 payload,
                 finding,
-                fenced_code_ranges,
+                markdown_fences,
             ):
                 finding = {**finding, "severity": "INFO"}
             classified_findings.append(finding)

