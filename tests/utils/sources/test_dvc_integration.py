@@ -35,6 +35,27 @@ def _write_incomplete_png_payload(path: Path) -> None:
     path.write_bytes(png_header + (b"\x00" * (100_000 - len(png_header))))
 
 
+def _patch_metadata_only_incomplete_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    *,
+    reason: str = "synthetic_metadata_only_incomplete",
+) -> None:
+    original_scan_file = core_module.scan_file
+
+    def patched_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        if Path(path).name != filename:
+            return original_scan_file(path, config)
+
+        result = ScanResult(scanner_name="synthetic_incomplete")
+        result.bytes_scanned = Path(path).stat().st_size
+        result.metadata["analysis_incomplete"] = True
+        result.metadata["scan_outcome_reasons"] = [reason]
+        return result
+
+    monkeypatch.setattr(core_module, "scan_file", patched_scan_file)
+
+
 class TestDvcIntegration:
     """Test DVC integration functionality."""
 
@@ -2049,6 +2070,67 @@ class TestDvcSecurity:
         )
         assert any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
 
+    def test_over_limit_dvc_directory_output_records_complete_subdirectory_despite_sibling_gaps(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Directory-output coverage must not depend on aggregate success."""
+        model_dir = tmp_path / "model_dir"
+        covered_subdir = model_dir / "covered"
+        covered_subdir.mkdir(parents=True)
+        covered_payload = covered_subdir / "covered.pkl"
+        covered_payload.write_bytes(pickle.dumps({"covered": True}))
+        malicious = model_dir / "malicious.pkl"
+        malicious.write_bytes(pickle.dumps(_LateMaliciousPayload()))
+        incomplete = model_dir / "incomplete.pkl"
+        incomplete.write_bytes(pickle.dumps({"incomplete": True}))
+        _patch_metadata_only_incomplete_scan(monkeypatch, incomplete.name)
+
+        dvc_lines = ["outs:", f"- path: {model_dir.name}"]
+        for index in range(99):
+            target = tmp_path / f"benign_{index:03}.pkl"
+            target.write_bytes(pickle.dumps({"index": index}))
+            dvc_lines.append(f"- path: {target.name}")
+        dvc_lines.append(f"- path: {model_dir.name}/{covered_subdir.name}")
+        dvc_file = tmp_path / "covered_subdir_tail.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = scan_model_directory_or_file(str(dvc_file), cache_enabled=False)
+
+        assert result.files_scanned == 102
+        assert result.success is False
+        assert determine_exit_code(result) == 1
+        assert any(
+            issue.rule_code == "S201" and issue.location is not None and str(malicious) in issue.location
+            for issue in result.issues
+        )
+        assert not any(issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in result.issues)
+        assert result.file_metadata[str(incomplete)]["analysis_incomplete"] is True
+        assert "synthetic_metadata_only_incomplete" in result.file_metadata[str(incomplete)]["scan_outcome_reasons"]
+
+    def test_directory_dvc_limit_does_not_credit_metadata_only_incomplete_output(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A metadata-only incomplete sibling cannot suppress a capped DVC gap."""
+        benign = tmp_path / "benign.pkl"
+        benign.write_bytes(pickle.dumps({"safe": True}))
+        late = tmp_path / "late.pkl"
+        late.write_bytes(pickle.dumps({"late": True}))
+        _patch_metadata_only_incomplete_scan(monkeypatch, late.name)
+        dvc_file = tmp_path / "capped.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: late.pkl\n")
+
+        result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+        assert result.files_scanned == 2
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert result.file_metadata[str(late)]["analysis_incomplete"] is True
+        assert any(issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in result.issues)
+
     def test_duplicate_only_output_limit_is_complete(self, tmp_path: Path) -> None:
         """A capped tail containing only duplicate declarations adds no coverage gap."""
         target = tmp_path / "model.pkl"
@@ -2545,6 +2627,43 @@ class TestDvcCliIntegration:
         output_data = json.loads(result.output)
         assert any(issue.get("rule_code") == "S201" for issue in output_data["issues"])
         assert not any(issue.get("type") == "dvc_output_limit_exceeded" for issue in output_data["issues"])
+
+    def test_cli_directory_prior_coverage_survives_findings_and_incomplete_siblings(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Prior directory coverage should record complete files even when aggregate success is false."""
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        malicious = models_dir / "malicious.pkl"
+        malicious.write_bytes(pickle.dumps(_LateMaliciousPayload()))
+        incomplete = models_dir / "incomplete.pkl"
+        incomplete.write_bytes(pickle.dumps({"incomplete": True}))
+        _patch_metadata_only_incomplete_scan(monkeypatch, incomplete.name)
+        benign = tmp_path / "benign.pkl"
+        benign.write_bytes(pickle.dumps({"safe": True}))
+        dvc_file = tmp_path / "cli_directory_first.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: models/malicious.pkl\n")
+
+        result = CliRunner().invoke(
+            cli,
+            ["scan", str(models_dir), str(dvc_file), "--format", "json", "--no-cache"],
+        )
+
+        assert result.exit_code == 1, result.output
+        output_data = json.loads(result.output[result.output.index("{") :])
+        assert output_data["success"] is False
+        assert output_data["file_metadata"][str(incomplete)]["analysis_incomplete"] is True
+        assert any(
+            issue.get("rule_code") == "S201" and issue.get("location") and str(malicious) in issue["location"]
+            for issue in output_data["issues"]
+        )
+        assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
 
     def test_cli_dvc_file_expansion(self, tmp_path: Path) -> None:
         """Test that CLI properly expands DVC files."""

@@ -45,6 +45,7 @@ from .core import (
     determine_exit_code,
     scan_model_directory_or_file,
 )
+from .core_results import metadata_has_incomplete_coverage
 from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import format_sarif_output
 from .integrations.source_redaction import redact_source_value
@@ -1437,8 +1438,8 @@ class _ScanPathState:
         *,
         scanner_config: dict[str, Any] | None = None,
     ) -> None:
-        """Record concrete artifacts and successful directory walks for later DVC pointers."""
-        if not self.collect_dvc_coverage or not scan_result.success:
+        """Record concrete artifacts and completed directory walks for later DVC pointers."""
+        if not self.collect_dvc_coverage:
             return
 
         scanner_policy = policy_from_config(scanner_config)
@@ -1462,7 +1463,7 @@ class _ScanPathState:
                 continue
             metadata = scan_result.file_metadata.get(asset.path)
             if metadata is not None and (
-                metadata.get("operational_error") is True or metadata.get("scan_outcome") == "inconclusive"
+                metadata.get("operational_error") is True or metadata_has_incomplete_coverage(metadata)
             ):
                 continue
             record_covered_file(asset.path)

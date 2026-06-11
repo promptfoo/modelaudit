@@ -167,6 +167,7 @@ _add_scan_result_to_model = core_results.add_scan_result_to_model
 _consolidate_checks = core_results.consolidate_checks
 _mark_inconclusive_scan_outcome = core_results.mark_inconclusive_scan_outcome
 _mark_operational_scan_error = core_results.mark_operational_scan_error
+_metadata_has_incomplete_coverage = core_results.metadata_has_incomplete_coverage
 _results_have_operational_error = core_results.results_have_operational_error
 _results_should_be_unsuccessful = core_results.results_should_be_unsuccessful
 _scan_result_has_operational_error = core_results.scan_result_has_operational_error
@@ -2863,7 +2864,7 @@ def scan_model_directory_or_file(
                         continue
                     metadata = results.file_metadata.get(asset.path)
                     if metadata is not None and (
-                        metadata.get("operational_error") is True or metadata.get("scan_outcome") == "inconclusive"
+                        metadata.get("operational_error") is True or _metadata_has_incomplete_coverage(metadata)
                     ):
                         continue
                     if scanner_selection.active and get_scanner_for_file(asset.path, config=config) is None:
@@ -3006,18 +3007,16 @@ def scan_model_directory_or_file(
                         and not (
                             (metadata := nested_result.file_metadata.get(asset.path)) is not None
                             and (
-                                metadata.get("operational_error") is True
-                                or metadata.get("scan_outcome") == "inconclusive"
+                                metadata.get("operational_error") is True or _metadata_has_incomplete_coverage(metadata)
                             )
                         )
                     }
                     scanned_dvc_paths.update(nested_scanned_paths)
                     internally_scanned_dvc_paths.update(nested_scanned_paths)
-                    if nested_result.success and not nested_result.has_errors:
-                        for root, _dirs, _files in os.walk(target, followlinks=False):
-                            resolved_directory = str(Path(root).resolve())
-                            dvc_scanned_directories.add(resolved_directory)
-                            internally_scanned_dvc_directories.add(resolved_directory)
+                    for root, _dirs, _files in os.walk(target, followlinks=False):
+                        resolved_directory = str(Path(root).resolve())
+                        dvc_scanned_directories.add(resolved_directory)
+                        internally_scanned_dvc_directories.add(resolved_directory)
                     if nested_result.has_errors or (
                         nested_result.files_scanned > 0 and nested_result.content_hash is None
                     ):
@@ -3135,7 +3134,7 @@ def scan_model_directory_or_file(
                 if (
                     is_dvc_pointer
                     and not _scan_result_has_operational_error(file_result)
-                    and (file_result.metadata or {}).get("scan_outcome") != "inconclusive"
+                    and not _metadata_has_incomplete_coverage(file_result.metadata or {})
                 ):
                     scanned_dvc_paths.add(resolved_target)
                     internally_scanned_dvc_paths.add(resolved_target)
