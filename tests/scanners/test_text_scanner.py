@@ -341,6 +341,66 @@ return urllib.request.urlopen(req).read()
     assert determine_exit_code(aggregate) == 0
 
 
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "http://user:pass@localhost:8080/v1/embeddings",
+        "http://localhost:8080/v1/embeddings?token=secret",
+    ],
+)
+def test_text_scanner_fenced_documentation_loopback_api_rejects_sensitive_urls(
+    tmp_path: Path,
+    api_url: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        f"""```python
+import requests
+
+requests.get("{api_url}")
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_loopback_api_suspicious_port_remains_actionable(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+curl http://localhost:4444/v1/payload
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "suspicious_port"
+        and check.details.get("port") == 4444
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_fenced_documentation_passive_media_fetch_is_informational(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text(
@@ -415,6 +475,34 @@ import requests
 
 url = "{media_url}"
 image = Image.open(requests.get(url, stream=True).raw)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_passive_media_rejects_arbitrary_hosts(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+from PIL import Image
+import requests
+
+image = Image.open(requests.get("https://attacker.example/track.jpg").raw)
 ```
 """,
         encoding="utf-8",
@@ -744,6 +832,32 @@ curl http://localhost:8080/v1/embeddings | /bin/sh
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_fenced_documentation_loopback_api_shell_substitution_remains_actionable(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+sh -c "$(curl http://localhost:8080/v1/payload)"
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and isinstance(check.details.get("url"), str)
+        and check.details["url"].startswith("http://localhost:8080/v1/payload")
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_fenced_documentation_loopback_api_sudo_shell_execution_remains_actionable(
     tmp_path: Path,
 ) -> None:
@@ -764,6 +878,31 @@ curl http://localhost:8080/v1/payload | sudo sh
         and check.details.get("type") == "url_detected"
         and check.details.get("url") == "http://localhost:8080/v1/payload"
         and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_github_clone_plus_execution_remains_actionable(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+git clone https://github.com/example-org/model.git && ./model/install.sh
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_command"
+        and check.details.get("command_type") == "git_clone"
+        and check.severity == IssueSeverity.CRITICAL
         for check in result.checks
     )
     assert determine_exit_code(aggregate) == 1

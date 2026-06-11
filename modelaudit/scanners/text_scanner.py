@@ -51,7 +51,15 @@ PASSIVE_NETWORK_FINDING_TYPES = frozenset(
     }
 )
 DOCUMENTATION_FENCED_LOOPBACK_API_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+DOCUMENTATION_FENCED_LOOPBACK_API_PORTS = frozenset({80, 443, 8000, 8080})
 DOCUMENTATION_FENCED_PASSIVE_MEDIA_URL_SUFFIXES = (".gif", ".jpeg", ".jpg", ".png", ".webp")
+DOCUMENTATION_FENCED_PASSIVE_MEDIA_URL_HOSTS = frozenset(
+    {
+        "cdn-media.huggingface.co",
+        "images.cocodataset.org",
+        "qianwen-res.oss-cn-beijing.aliyuncs.com",
+    }
+)
 DOCUMENTATION_FENCED_PASSIVE_NETWORK_FINDING_TYPES = PASSIVE_NETWORK_FINDING_TYPES | {
     "network_function",
     "network_library",
@@ -1388,6 +1396,8 @@ class TextScanner(BaseScanner):
             position,
         ):
             return False
+        if DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(line) is not None:
+            return False
         return not any(
             pattern.match(line) is not None
             for pattern in (
@@ -1409,8 +1419,12 @@ class TextScanner(BaseScanner):
         position: int,
         finding: dict[str, Any],
     ) -> bool:
-        clone_match = DOCUMENTATION_FENCED_GIT_CLONE_REFERENCE_PATTERN.match(line)
+        match_line = line.rstrip(b"\r")
+        clone_match = DOCUMENTATION_FENCED_GIT_CLONE_REFERENCE_PATTERN.match(match_line)
         if clone_match is None or not clone_match.start("destination") <= position < clone_match.end("destination"):
+            return False
+        trailing = match_line[clone_match.end() :].strip()
+        if trailing and not trailing.startswith(b"#"):
             return False
         finding_type = finding.get("type")
         if finding_type in {"domain", "domain_name"}:
@@ -1529,6 +1543,14 @@ class TextScanner(BaseScanner):
     def _documentation_loopback_api_url_is_informational(url: str) -> bool:
         try:
             parsed_url = urlsplit(url)
+            if parsed_url.username is not None or parsed_url.password is not None:
+                return False
+            if any(
+                key.casefold().replace("-", "_") in SENSITIVE_REQUIREMENTS_QUERY_KEYS
+                for key, _value in parse_qsl(parsed_url.query, keep_blank_values=True)
+            ):
+                return False
+            raw_port = parsed_url.port
         except ValueError:
             return False
         hostname = parsed_url.hostname
@@ -1537,6 +1559,7 @@ class TextScanner(BaseScanner):
             parsed_url.scheme.casefold() in {"http", "https"}
             and isinstance(hostname, str)
             and hostname.casefold() in DOCUMENTATION_FENCED_LOOPBACK_API_HOSTS
+            and (raw_port is None or raw_port in DOCUMENTATION_FENCED_LOOPBACK_API_PORTS)
             and (path == "/v1" or path.startswith("/v1/"))
         )
 
@@ -1556,6 +1579,7 @@ class TextScanner(BaseScanner):
         return (
             parsed_url.scheme.casefold() in {"http", "https"}
             and parsed_url.hostname is not None
+            and parsed_url.hostname.casefold() in DOCUMENTATION_FENCED_PASSIVE_MEDIA_URL_HOSTS
             and DOCUMENTATION_FENCED_ACTIONABLE_URL_TOKEN_PATTERN.search(url.encode()) is None
             and parsed_url.path.casefold().endswith(DOCUMENTATION_FENCED_PASSIVE_MEDIA_URL_SUFFIXES)
         )
@@ -1578,7 +1602,9 @@ class TextScanner(BaseScanner):
 
     @classmethod
     def _documentation_fenced_passive_network_example_is_informational(cls, fenced_code: bytes) -> bool:
-        if DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN.search(fenced_code):
+        if DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN.search(
+            fenced_code
+        ) or DOCUMENTATION_SHELL_SUBSTITUTION_PATTERN.search(fenced_code):
             return False
         if any(
             match.group("method").lower() not in {b"get", b"head"}
@@ -1693,14 +1719,25 @@ class TextScanner(BaseScanner):
             for match in DOCUMENTATION_FENCED_BARE_URL_TOKEN_PATTERN.finditer(line)
         )
 
-    @staticmethod
-    def _documentation_fenced_network_command_is_informational(finding: dict[str, Any]) -> bool:
+    @classmethod
+    def _documentation_fenced_network_command_is_informational(cls, payload: bytes, finding: dict[str, Any]) -> bool:
         if finding.get("command_type") != "git_clone":
             return False
         destination = finding.get("destination")
-        return isinstance(destination, str) and destination.casefold().startswith(
+        if not isinstance(destination, str) or not destination.casefold().startswith(
             ("git@github.com:", "https://github.com/")
-        )
+        ):
+            return False
+        line_parts = cls._finding_line_parts(payload, finding)
+        if line_parts is None:
+            return False
+        line, _position = line_parts
+        match_line = line.rstrip(b"\r")
+        clone_match = DOCUMENTATION_FENCED_GIT_CLONE_REFERENCE_PATTERN.match(match_line)
+        if clone_match is None:
+            return False
+        trailing = match_line[clone_match.end() :].strip()
+        return not trailing or trailing.startswith(b"#")
 
     @classmethod
     def _documentation_fenced_finding_is_informational(
@@ -1717,7 +1754,7 @@ class TextScanner(BaseScanner):
             return True
         finding_type = finding.get("type")
         if finding_type == "network_command":
-            return cls._documentation_fenced_network_command_is_informational(finding)
+            return cls._documentation_fenced_network_command_is_informational(payload, finding)
         if finding_type in PASSIVE_NETWORK_FINDING_TYPES:
             return cls._documentation_fenced_passive_finding_is_informational(payload, finding)
         return finding_type in {
