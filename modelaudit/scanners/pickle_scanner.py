@@ -271,7 +271,7 @@ _NETWORK_SCAN_SEEDS: tuple[bytes, ...] = (
     b"websocket",
     b"zombie",
 )
-_PICKLE_LITERAL_URL_RE = re.compile(rb"(?i)https?://[A-Za-z0-9\-._~:/?#@!$*+=%-]+")
+_PICKLE_LITERAL_URL_RE = re.compile(rb"(?i)https?://[A-Za-z0-9\-._~:/?#@!$&*+=%-]+")
 _PICKLE_LITERAL_URL_NETWORK_FUNCTION_TOKENS: tuple[bytes, ...] = (
     b"dns.resolver",
     b"ftp.connect",
@@ -1336,10 +1336,27 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
     def mark_literal_result_consumers(*values: _PickleStackValue) -> None:
         mark_executable_consumer(_pickle_literal_record_value(*values))
 
+    def mark_unresolved_records_executable_consumers() -> None:
+        stack_values = tuple(value for value in stack if isinstance(value, _PickleStackValue))
+        mark_literal_result_consumers(*stack_values, *memo.values())
+
+    def build_records() -> tuple[_PickleLiteralRecord, ...]:
+        return tuple(
+            _PickleLiteralRecord(
+                builder.start,
+                builder.end,
+                builder.literal,
+                executable_consumer=builder.executable_consumer,
+            )
+            for builder in builders
+        )
+
     try:
         for opcode_index, (opcode, arg, position) in enumerate(pickletools.genops(data), start=1):
             if opcode_index > _PICKLE_LITERAL_RECORD_MAX_OPCODES:
-                return ()
+                finish_previous_literal(position)
+                mark_unresolved_records_executable_consumers()
+                return build_records()
 
             finish_previous_literal(position)
             opcode_name = opcode.name
@@ -1533,15 +1550,7 @@ def _pickle_literal_records(data: bytes) -> tuple[_PickleLiteralRecord, ...]:
     except Exception:
         return ()
 
-    return tuple(
-        _PickleLiteralRecord(
-            builder.start,
-            builder.end,
-            builder.literal,
-            executable_consumer=builder.executable_consumer,
-        )
-        for builder in builders
-    )
+    return build_records()
 
 
 def _pickle_literal_has_executable_network_context(literal: bytes) -> bool:
@@ -3294,10 +3303,10 @@ class PickleScanner(BaseScanner):
         else:
             result.metadata["pickle_jit_raw_detector_skipped"] = True
 
-        network_scan_data = _pickle_literal_url_stripped_scan_view(expensive_data, network_functions_only=True)
         if _contains_any_seed_lowered(expensive_lower, _NETWORK_SCAN_SEEDS, expensive_present_bytes) or (
             _has_domain_or_ip_shape(expensive_data)
         ):
+            network_scan_data = _pickle_literal_url_stripped_scan_view(expensive_data, network_functions_only=True)
             network_findings = self.collect_network_communication_findings(
                 network_scan_data,
                 context=source,

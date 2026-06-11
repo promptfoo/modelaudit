@@ -1447,6 +1447,7 @@ def test_scan_stream_allows_inert_pickle_url_literals_without_critical_s310() ->
             "license": "https://ultralytics.com/license",
             "docs": "https://docs.ultralytics.com/reference/os.system(command)",
             "api_docs": "https://docs.example.invalid/reference/requests.get(url)",
+            "query_docs": "https://docs.example.invalid/path?x=1&handler=requests.get(url)",
             "socket_docs": "https://docs.example.invalid/reference/socket.connect(host)",
             "repository": "https://github.com/ultralytics/ultralytics",
         },
@@ -1468,6 +1469,18 @@ def test_pickle_literal_records_stops_before_unbounded_opcode_stream() -> None:
     payload += b"Vhttps://docs.example.invalid/reference/requests.get(url)\n."
 
     assert _pickle_literal_records(payload) == ()
+
+
+def test_pickle_literal_records_preserves_completed_literals_at_opcode_cap() -> None:
+    literal = b"https://docs.example.invalid/reference/requests.get(url)"
+    payload = b"V" + literal + b"\n0"
+    payload += b"N" * (_PICKLE_LITERAL_RECORD_MAX_OPCODES + 5)
+
+    records = _pickle_literal_records(payload)
+
+    assert len(records) == 1
+    assert records[0].literal == literal
+    assert records[0].executable_consumer is False
 
 
 def test_scan_stream_keeps_code_after_url_literal_actionable() -> None:

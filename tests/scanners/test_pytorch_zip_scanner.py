@@ -8031,6 +8031,7 @@ def test_pytorch_zip_allows_inert_pickle_url_literals_without_critical_s310(tmp_
             "license": "https://ultralytics.com/license",
             "docs": "https://docs.ultralytics.com/reference/os.system(command)",
             "api_docs": "https://docs.example.invalid/reference/requests.get(url)",
+            "query_docs": "https://docs.example.invalid/path?x=1&handler=requests.get(url)",
             "socket_docs": "https://docs.example.invalid/reference/socket.connect(host)",
             "repository": "https://github.com/ultralytics/ultralytics",
         },
