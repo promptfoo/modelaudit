@@ -467,12 +467,15 @@ class TestDirectoryFileFiltering:
         assert determine_exit_code(results) == 1
         assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
 
+    @pytest.mark.parametrize(("filename", "line"), [("notes.txt", "Ġtoken token\n"), ("settings.conf", "token=olá\n")])
     def test_large_plain_text_document_suffix_within_complete_text_bound_is_skipped(
         self,
         tmp_path: Path,
+        filename: str,
+        line: str,
     ) -> None:
-        document = tmp_path / "notes.txt"
-        document.write_text("#version: 0.2\n" + ("Ġtoken token\n" * 220_000), encoding="utf-8")
+        document = tmp_path / filename
+        document.write_text("#version: 0.2\n" + (line * 220_000), encoding="utf-8")
 
         assert (
             2 * FLAX_MSGPACK_STRUCTURE_READ_BYTES < document.stat().st_size < _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES

@@ -392,7 +392,7 @@ def test_detect_renamed_flax_checkpoint_under_skipped_suffix(tmp_path: Path, suf
     assert detect_file_format(str(checkpoint)) == "flax_msgpack"
 
 
-@pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml"])
+@pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".conf"])
 def test_detect_large_plain_skipped_suffix_within_complete_text_bound_does_not_route_as_flax(
     tmp_path: Path,
     suffix: str,
@@ -406,7 +406,7 @@ def test_detect_large_plain_skipped_suffix_within_complete_text_bound_does_not_r
     assert detect_file_format(str(document)) == "unknown"
 
 
-@pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml"])
+@pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".conf"])
 def test_detect_oversized_ambiguous_skipped_suffix_fails_closed_as_flax(tmp_path: Path, suffix: str) -> None:
     document = tmp_path / f"notes{suffix}"
     document.write_bytes(b"a" * (_CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES + 1))

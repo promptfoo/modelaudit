@@ -55,7 +55,8 @@ _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES = 2 * 1024 * 1024
 _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES = 10 * 1024 * 1024
 _CONTENT_ROUTE_PRINTABLE_TEXT_BYTES = b"\t\n\r" + bytes(range(0x20, 0x7F))
 _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS = frozenset({"\t", "\n", "\r", "\f"})
-_CONTENT_ROUTE_TEXT_OWNER_SUFFIXES = frozenset({".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml"})
+_CONTENT_ROUTE_TEXT_OWNER_SUFFIXES = frozenset({".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".conf"})
+_CONTENT_ROUTE_TEXT_OWNER_STRUCTURE_CHARS = frozenset({" ", "\t", "\n", "\r", "\f", "=", ":", "#", "[", "{"})
 _CONTENT_ROUTE_NON_SOURCE_CONTROL_BYTES = (
     bytes(byte for byte in range(0x20) if byte not in {0x09, 0x0A, 0x0C, 0x0D}) + b"\x7f"
 )
@@ -5362,6 +5363,11 @@ def _is_complete_bounded_printable_text(file_path: Path, file_size: int) -> bool
     return all(char in _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS or char.isprintable() for char in text)
 
 
+def _has_content_route_text_owner_structure(text: str) -> bool:
+    """Return whether printable UTF-8 has ordinary text/config/tokenizer structure."""
+    return any(char in _CONTENT_ROUTE_TEXT_OWNER_STRUCTURE_CHARS for char in text)
+
+
 def _is_complete_bounded_printable_text_content_owner(file_path: Path, file_size: int) -> bool:
     """Return whether printable text can safely own this complete file."""
     suffix = file_path.suffix.lower()
@@ -5384,7 +5390,9 @@ def _is_complete_bounded_printable_text_content_owner(file_path: Path, file_size
         text = payload.decode("utf-8-sig")
     except UnicodeDecodeError:
         return False
-    return all(char in _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS or char.isprintable() for char in text)
+    return _has_content_route_text_owner_structure(text) and all(
+        char in _CONTENT_ROUTE_TEXT_WHITESPACE_CHARS or char.isprintable() for char in text
+    )
 
 
 def _preserve_inconclusive_protobuf_model_routing(file_path: Path, file_size: int) -> bool:
