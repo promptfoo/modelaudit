@@ -509,7 +509,7 @@ DOCUMENTATION_FENCED_URL_ASSIGNMENT_PATTERN = re.compile(
 )
 DOCUMENTATION_FENCED_URL_REQUEST_ASSIGNMENT_PATTERN = re.compile(
     rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:urllib\.request\.)?Request\s*\(\s*"
-    rb"[rubfRUBF]*[\"'](?P<url>https?://[^\"'\s)]+)[\"']",
+    rb"[rubfRUBF]*[\"'](?P<url>https?://[^\"'\s)]+)[\"']\s*\)",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_PASSIVE_REQUEST_ARGUMENT_SUFFIX = rb"(?:\s*,\s*stream\s*=\s*True)?\s*\)"
@@ -552,7 +552,8 @@ DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_VARIABLE_ASSIGNMENT_PATTERN = re.compile(
-    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?://=|<<=|>>=|[+\-*/%@&|^]=|=(?!=))",
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?"
+    rb"\s*(?://=|<<=|>>=|[+\-*/%@&|^]=|=(?!=))",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_REQUESTS_CALL_PATTERN = re.compile(
@@ -589,6 +590,10 @@ DOCUMENTATION_FENCED_EXECUTED_FETCH_PATTERN = re.compile(
     rb"\b"
     + DOCUMENTATION_FENCED_RESPONSE_EXECUTOR
     + rb"\s*\([^\r\n]{0,4096}(?:requests\.(?:get|head)|urllib\.request\.urlopen|urlopen)\s*\(",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_EXECUTED_IMPORTED_FETCH_PATTERN = re.compile(
+    rb"\b" + DOCUMENTATION_FENCED_RESPONSE_EXECUTOR + rb"\s*\([^\r\n]{0,4096}\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_FETCH_RESPONSE_ASSIGNMENT_PATTERN = re.compile(
@@ -2010,12 +2015,12 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
-    def _documentation_fenced_has_imported_network_call(
+    def _documentation_fenced_imported_network_targets(
         cls,
         fenced_code: bytes,
         string_spans: tuple[tuple[int, int, str, bool], ...],
         string_span_starts: tuple[int, ...],
-    ) -> bool:
+    ) -> dict[bytes, list[tuple[int, bytes]]]:
         imported_targets: dict[bytes, list[tuple[int, bytes]]] = {}
         network_names = {b"get", b"head", b"post", b"put", b"patch", b"delete", b"request", b"urlopen", b"urlretrieve"}
         for pattern in (
@@ -2041,6 +2046,20 @@ class TextScanner(BaseScanner):
                     target = (alias_parts[-1] if len(alias_parts) == 2 else imported_name).strip()
                     if re.fullmatch(rb"[A-Za-z_][A-Za-z0-9_]*", target) is not None:
                         imported_targets.setdefault(target, []).append((match.start(), imported_name.lower()))
+        return imported_targets
+
+    @classmethod
+    def _documentation_fenced_has_imported_network_call(
+        cls,
+        fenced_code: bytes,
+        string_spans: tuple[tuple[int, int, str, bool], ...],
+        string_span_starts: tuple[int, ...],
+    ) -> bool:
+        imported_targets = cls._documentation_fenced_imported_network_targets(
+            fenced_code,
+            string_spans,
+            string_span_starts,
+        )
         for call_match in DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN.finditer(fenced_code):
             if cls._documentation_fenced_match_is_line_comment(fenced_code, call_match.start()):
                 continue
@@ -2078,6 +2097,35 @@ class TextScanner(BaseScanner):
         return cls._documentation_fenced_passive_assigned_url_is_informational(
             direct_call_match.group("url").decode("utf-8", errors="ignore")
         )
+
+    @classmethod
+    def _documentation_fenced_has_executed_imported_fetch_response(
+        cls,
+        fenced_code: bytes,
+        string_spans: tuple[tuple[int, int, str, bool], ...],
+        string_span_starts: tuple[int, ...],
+    ) -> bool:
+        imported_targets = cls._documentation_fenced_imported_network_targets(
+            fenced_code,
+            string_spans,
+            string_span_starts,
+        )
+        for match in DOCUMENTATION_FENCED_EXECUTED_IMPORTED_FETCH_PATTERN.finditer(fenced_code):
+            if cls._documentation_fenced_match_is_line_comment(
+                fenced_code,
+                match.start(),
+            ) or cls._documentation_python_string_spans_contain_absolute_position(
+                fenced_code,
+                match.start(),
+                string_spans,
+                string_span_starts,
+            ):
+                continue
+            if any(
+                position < match.start() for position, _imported_name in imported_targets.get(match.group("target"), [])
+            ):
+                return True
+        return False
 
     @classmethod
     def _documentation_fenced_has_module_alias_network_call(
@@ -2192,6 +2240,11 @@ class TextScanner(BaseScanner):
             or DOCUMENTATION_FENCED_PROCESS_SUBSTITUTION_EXECUTION_PATTERN.search(fenced_code)
             or DOCUMENTATION_FENCED_SESSION_HTTP_CALL_PATTERN.search(fenced_code)
             or DOCUMENTATION_FENCED_EXECUTED_FETCH_PATTERN.search(fenced_code)
+            or cls._documentation_fenced_has_executed_imported_fetch_response(
+                fenced_code,
+                string_spans,
+                string_span_starts,
+            )
             or cls._documentation_fenced_has_imported_network_call(fenced_code, string_spans, string_span_starts)
             or cls._documentation_fenced_has_module_alias_network_call(fenced_code, string_spans, string_span_starts)
             or cls._documentation_fenced_has_executed_fetch_response(fenced_code, string_spans, string_span_starts)
