@@ -261,26 +261,30 @@ class TarScanner(BaseScanner):
         tmp_path: str | None = None
         tmp_dir: str | None = None
         try:
-            with contextlib.ExitStack() as stack:
-                tmp_file: BinaryIO
-                if basename is None:
-                    named_tmp = stack.enter_context(tempfile.NamedTemporaryFile(suffix=suffix, delete=False))
-                    tmp_path = named_tmp.name
-                    tmp_file = cast(BinaryIO, named_tmp)
-                else:
-                    tmp_dir = tempfile.mkdtemp(prefix="modelaudit_tar_")
-                    tmp_path = os.path.join(tmp_dir, basename)
-                    tmp_file = stack.enter_context(open(tmp_path, "wb"))
+
+            def copy_member_to(tmp_file: BinaryIO) -> int:
+                copied_size = 0
                 while True:
                     chunk = fileobj.read(ARCHIVE_MEMBER_COPY_CHUNK_BYTES)
                     if not chunk:
                         break
-                    total_size += len(chunk)
-                    if total_size > max_entry_size:
+                    copied_size += len(chunk)
+                    if copied_size > max_entry_size:
                         raise _TarEntryExtractionIncomplete(
                             f"TAR entry {member.name} exceeds maximum size of {max_entry_size} bytes"
                         )
                     tmp_file.write(chunk)
+                return copied_size
+
+            if basename is None:
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as named_tmp:
+                    tmp_path = named_tmp.name
+                    total_size = copy_member_to(cast(BinaryIO, named_tmp))
+            else:
+                tmp_dir = tempfile.mkdtemp(prefix="modelaudit_tar_")
+                tmp_path = os.path.join(tmp_dir, basename)
+                with open(tmp_path, "wb") as tmp_file:
+                    total_size = copy_member_to(tmp_file)
         except Exception:
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)

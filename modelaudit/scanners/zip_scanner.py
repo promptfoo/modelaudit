@@ -1956,45 +1956,58 @@ class ZipScanner(BaseScanner):
                         archive_ext == ".mar" and name.lower().endswith(".py") and not is_security_only_member
                     )
 
-                    try:
-                        with contextlib.ExitStack() as stack:
-                            tmp_file: BinaryIO
-                            if is_content_only_member:
-                                named_tmp = stack.enter_context(tempfile.NamedTemporaryFile(suffix="", delete=False))
-                                tmp_path = named_tmp.name
-                                tmp_file = cast(BinaryIO, named_tmp)
-                            else:
-                                safe_name = (
-                                    re.sub(
-                                        r"[^a-zA-Z0-9_.-]",
-                                        "_",
-                                        os.path.basename(name),
+                    def copy_entry_to(
+                        tmp_file: BinaryIO,
+                        *,
+                        archive: zipfile.ZipFile = z,
+                        entry_info: zipfile.ZipInfo = info,
+                        entry_name: str = name,
+                        entry_size_limit: int = max_entry_size,
+                        total_size_before_entry: int = extracted_uncompressed_size,
+                        total_size_limit: int = max_total_uncompressed_size,
+                    ) -> int:
+                        copied_size = 0
+                        with archive.open(entry_info) as entry:
+                            while True:
+                                chunk = entry.read(ARCHIVE_MEMBER_COPY_CHUNK_BYTES)
+                                if not chunk:
+                                    break
+                                copied_size += len(chunk)
+                                if copied_size > entry_size_limit:
+                                    raise ValueError(
+                                        f"ZIP entry {entry_name} exceeds maximum size of {entry_size_limit} bytes",
                                     )
-                                    or "member"
+                                if total_size_before_entry + copied_size > total_size_limit:
+                                    raise ValueError(
+                                        "ZIP archive exceeds maximum total uncompressed size of "
+                                        f"{total_size_limit} bytes",
+                                    )
+                                tmp_file.write(chunk)
+                        return copied_size
+
+                    try:
+                        total_size = 0
+                        if is_content_only_member:
+                            with tempfile.NamedTemporaryFile(suffix="", delete=False) as named_tmp:
+                                tmp_path = named_tmp.name
+                                total_size = copy_entry_to(cast(BinaryIO, named_tmp))
+                        else:
+                            safe_name = (
+                                re.sub(
+                                    r"[^a-zA-Z0-9_.-]",
+                                    "_",
+                                    os.path.basename(name),
                                 )
-                                if safe_name.lower() not in TEXT_CONTENT_ROUTED_FILENAMES or is_mar_python_fallback:
-                                    safe_name = f"member_{safe_name}"
-                                tmp_dir = tempfile.mkdtemp(prefix="modelaudit_zip_")
-                                tmp_path = os.path.join(tmp_dir, safe_name)
-                                tmp_file = stack.enter_context(open(tmp_path, "wb"))
-                            total_size = 0
-                            with z.open(info) as entry:
-                                while True:
-                                    chunk = entry.read(ARCHIVE_MEMBER_COPY_CHUNK_BYTES)
-                                    if not chunk:
-                                        break
-                                    total_size += len(chunk)
-                                    if total_size > max_entry_size:
-                                        raise ValueError(
-                                            f"ZIP entry {name} exceeds maximum size of {max_entry_size} bytes",
-                                        )
-                                    if extracted_uncompressed_size + total_size > max_total_uncompressed_size:
-                                        raise ValueError(
-                                            "ZIP archive exceeds maximum total uncompressed size of "
-                                            f"{max_total_uncompressed_size} bytes",
-                                        )
-                                    tmp_file.write(chunk)
-                            extracted_uncompressed_size += total_size
+                                or "member"
+                            )
+                            if safe_name.lower() not in TEXT_CONTENT_ROUTED_FILENAMES or is_mar_python_fallback:
+                                safe_name = f"member_{safe_name}"
+                            tmp_dir = tempfile.mkdtemp(prefix="modelaudit_zip_")
+                            tmp_path = os.path.join(tmp_dir, safe_name)
+                            with open(tmp_path, "wb") as tmp_file:
+                                total_size = copy_entry_to(tmp_file)
+
+                        extracted_uncompressed_size += total_size
 
                         if is_mar_python_fallback:
                             mar_python_result = self._scan_mar_python_entry(path, name, tmp_path, total_size)
