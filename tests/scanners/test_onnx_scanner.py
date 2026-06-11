@@ -2424,6 +2424,51 @@ def test_onnx_scanner_custom_domain_aggregate_reports_distinct_operator_identiti
     assert metadata_custom_domains == ["com.vendor"]
 
 
+def test_onnx_scanner_custom_domain_custom_op_overloads_survive_json_and_sarif_serialization(
+    tmp_path: Path,
+) -> None:
+    custom_nodes = [
+        ("com.acme", "custom_op", "float", "acme_float"),
+        ("com.acme", "custom_op", "int", "acme_int"),
+    ]
+    model_path = create_onnx_model_with_explicit_custom_operator_identities(tmp_path, custom_nodes)
+
+    result = scan_model_directory_or_file(
+        str(model_path),
+        cache_scan_results=False,
+        check_jit_script=False,
+        check_network_comm=False,
+        max_array_size=1,
+    )
+
+    expected_identities = [
+        {"domain": "com.acme", "op_type": "custom_op", "overload": "float"},
+        {"domain": "com.acme", "op_type": "custom_op", "overload": "int"},
+    ]
+    json_payload = result.model_dump(mode="json")
+    json_custom_issues = [
+        issue
+        for issue in json_payload["issues"]
+        if issue.get("rule_code") == "S1111" and issue.get("details", {}).get("domain") == "com.acme"
+    ]
+
+    assert len(json_custom_issues) == 1
+    assert json_custom_issues[0]["details"]["operator_identities"] == expected_identities
+    assert json_custom_issues[0]["details"]["distinct_operator_identity_count"] == len(expected_identities)
+    assert json_custom_issues[0]["details"]["operator_identities_truncated"] is False
+
+    sarif_payload = json.loads(format_sarif_output(result, [str(model_path)]))
+    sarif_results = [
+        item
+        for item in sarif_payload["runs"][0]["results"]
+        if item["ruleId"] == "S1111" and item.get("properties", {}).get("domain") == "com.acme"
+    ]
+
+    assert len(sarif_results) == 1
+    assert sarif_results[0]["properties"]["operator_identities"] == expected_identities
+    assert sarif_results[0]["properties"]["distinct_operator_identity_count"] == len(expected_identities)
+
+
 def test_onnx_scanner_repeated_custom_domains_emit_one_check_per_domain(tmp_path: Path) -> None:
     custom_nodes = [
         ("com.microsoft", "Attention", "attention_0"),
