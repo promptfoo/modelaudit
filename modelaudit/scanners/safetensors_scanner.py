@@ -330,6 +330,7 @@ _BASE64_LICENSE_WRAP_SEPARATOR_PATTERN = re.compile(
 _SUSPICIOUS_LICENSE_URL_MARKERS = ("payload", "exfil", "webhook", "callback")
 _URL_PATH_NORMALIZATION_PASSES = 4
 _PERCENT_ENCODED_BYTE_PATTERN = re.compile(r"%[0-9a-fA-F]{2}")
+_ENCODED_URL_SCHEME_PATTERN = re.compile(r"https?%(?:25)*3a(?:%(?:25)*2f){2}", re.IGNORECASE)
 
 
 def _url_path_has_unsafe_decoded_char(path: str) -> bool:
@@ -577,7 +578,7 @@ class SafeTensorsScanner(BaseScanner):
 
         normalized = candidate.replace("-", "+").replace("_", "/")
         if "=" in normalized.rstrip("="):
-            return False
+            return True
         if len(normalized) % 4 == 1:
             return False
         padding = "=" * ((4 - len(normalized) % 4) % 4)
@@ -742,6 +743,8 @@ class SafeTensorsScanner(BaseScanner):
 
     @classmethod
     def _license_document_urls_are_documentary(cls, value: str) -> bool:
+        if _ENCODED_URL_SCHEME_PATTERN.search(value):
+            return False
         urls = _URL_METADATA_PATTERN.findall(value)
         return all(cls._url_looks_like_license_reference(url) for url in urls)
 
