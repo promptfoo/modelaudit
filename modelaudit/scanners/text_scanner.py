@@ -1264,9 +1264,18 @@ class TextScanner(BaseScanner):
         payload: bytes,
         finding: dict[str, Any],
     ) -> bool:
-        line = cls._finding_line(payload, finding)
-        if line is None:
+        line_parts = cls._finding_line_parts(payload, finding)
+        if line_parts is None:
             return True
+        line, position = line_parts
+        if finding.get("type") in {
+            "cloud_storage_url",
+            "url_detected",
+        } and cls._documentation_package_install_is_actionable(
+            line,
+            position,
+        ):
+            return False
         return not any(
             pattern.match(line) is not None
             for pattern in (
@@ -1282,11 +1291,20 @@ class TextScanner(BaseScanner):
             )
         )
 
+    @staticmethod
+    def _documentation_fenced_network_command_is_informational(finding: dict[str, Any]) -> bool:
+        if finding.get("command_type") != "git_clone":
+            return False
+        destination = finding.get("destination")
+        return isinstance(destination, str) and destination.casefold().startswith(
+            ("git@github.com:", "https://github.com/")
+        )
+
     @classmethod
     def _documentation_fenced_finding_is_informational(cls, payload: bytes, finding: dict[str, Any]) -> bool:
         finding_type = finding.get("type")
         if finding_type == "network_command":
-            return finding.get("command_type") in {"docker_pull", "git_clone"}
+            return cls._documentation_fenced_network_command_is_informational(finding)
         if finding_type in PASSIVE_NETWORK_FINDING_TYPES:
             return cls._documentation_fenced_passive_finding_is_informational(payload, finding)
         return finding_type in {

