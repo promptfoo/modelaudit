@@ -374,5 +374,5 @@ class OpenVinoScanner(BaseScanner):
                         rule_code="S902",
                     )
 
-        result.finish(success=not result.has_errors and result.metadata.get("operational_error") is not True)
+        result.finish(success=not result.has_errors and not bool(result.metadata.get("operational_error")))
         return result
