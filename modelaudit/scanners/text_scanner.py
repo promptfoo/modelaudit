@@ -2153,6 +2153,7 @@ class TextScanner(BaseScanner):
                     fenced_code,
                     call_match,
                     imported_name,
+                    string_spans,
                 ):
                     continue
                 return True
@@ -2164,22 +2165,21 @@ class TextScanner(BaseScanner):
         fenced_code: bytes,
         call_match: re.Match[bytes],
         imported_name: bytes,
+        string_spans: tuple[tuple[int, int, str, bool], ...],
     ) -> bool:
         if imported_name not in {b"get", b"head", b"urlopen"}:
             return False
-        direct_call_match = re.match(
-            rb"\b"
-            + re.escape(call_match.group("target"))
-            + rb"\s*\(\s*[rubfRUBF]*[\"'](?P<url>https?://[^\"'\s)]+)[\"']"
-            + DOCUMENTATION_FENCED_PASSIVE_REQUEST_ARGUMENT_SUFFIX,
-            fenced_code[call_match.start() :],
-            flags=re.IGNORECASE,
+        parsed_argument = cls._documentation_fenced_passive_safe_call_argument(
+            fenced_code,
+            call_match.end(),
+            string_spans,
         )
-        if direct_call_match is None:
+        if parsed_argument is None:
             return False
-        return cls._documentation_fenced_passive_assigned_url_is_informational(
-            direct_call_match.group("url").decode("utf-8", errors="ignore")
-        )
+        direct_url, variable_target = parsed_argument
+        if variable_target is not None:
+            return False
+        return direct_url is not None and cls._documentation_fenced_passive_assigned_url_is_informational(direct_url)
 
     @classmethod
     def _documentation_fenced_has_executed_imported_fetch_response(
@@ -2364,6 +2364,32 @@ class TextScanner(BaseScanner):
                     return position
             position += 1
         return limit
+
+    @classmethod
+    def _documentation_fenced_passive_safe_call_argument(
+        cls,
+        fenced_code: bytes,
+        argument_start: int,
+        string_spans: tuple[tuple[int, int, str, bool], ...],
+    ) -> tuple[str | None, bytes | None] | None:
+        argument_end = cls._documentation_fenced_call_argument_end(fenced_code, argument_start, string_spans)
+        arguments = fenced_code[argument_start:argument_end]
+        direct_url_match = re.fullmatch(
+            rb"\s*[rubfRUBF]*[\"'](?P<url>https?://[^\"'\s)]+)[\"']"
+            rb"\s*(?:,\s*stream\s*=\s*True\s*,?\s*)?",
+            arguments,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if direct_url_match is not None:
+            return direct_url_match.group("url").decode("utf-8", errors="ignore"), None
+        variable_match = re.fullmatch(
+            rb"\s*(?P<target>[A-Za-z_][A-Za-z0-9_]*)\b\s*(?:,\s*stream\s*=\s*True\s*,?\s*)?",
+            arguments,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if variable_match is not None:
+            return None, variable_match.group("target")
+        return None
 
     @classmethod
     def _documentation_fenced_has_executed_fetch_response(
@@ -2566,14 +2592,71 @@ class TextScanner(BaseScanner):
             for match in DOCUMENTATION_FENCED_REQUESTS_CALL_PATTERN.finditer(fenced_code)
         ):
             return False
-        direct_url_calls = tuple(DOCUMENTATION_FENCED_DIRECT_URL_CALL_PATTERN.finditer(fenced_code))
-        direct_call_urls = [match.group("url").decode("utf-8", errors="ignore") for match in direct_url_calls]
+        direct_call_urls: list[str] = []
+        variable_call_refs: list[tuple[bytes, int]] = []
+        allowed_call_positions: set[int] = set()
+        for match in DOCUMENTATION_FENCED_ALLOWED_NETWORK_CALL_PATTERN.finditer(fenced_code):
+            if cls._documentation_fenced_match_is_line_comment(
+                fenced_code,
+                match.start(),
+            ) or cls._documentation_python_string_spans_contain_absolute_position(
+                fenced_code,
+                match.start(),
+                string_spans,
+                string_span_starts,
+            ):
+                continue
+            parsed_argument = cls._documentation_fenced_passive_safe_call_argument(
+                fenced_code,
+                match.end(),
+                string_spans,
+            )
+            if parsed_argument is None:
+                continue
+            direct_url, variable_target = parsed_argument
+            allowed_call_positions.add(match.start())
+            if direct_url is not None:
+                direct_call_urls.append(direct_url)
+            elif variable_target is not None:
+                variable_call_refs.append((variable_target, match.start()))
+
+        imported_targets = cls._documentation_fenced_imported_network_targets(
+            fenced_code,
+            string_spans,
+            string_span_starts,
+        )
+        for call_match in DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN.finditer(fenced_code):
+            if cls._documentation_fenced_match_is_line_comment(
+                fenced_code,
+                call_match.start(),
+            ) or cls._documentation_python_string_spans_contain_absolute_position(
+                fenced_code,
+                call_match.start(),
+                string_spans,
+                string_span_starts,
+            ):
+                continue
+            imported_safe_call = any(
+                position < call_match.start() and imported_name in {b"get", b"head", b"urlopen"}
+                for position, imported_name in imported_targets.get(call_match.group("target"), [])
+            )
+            if not imported_safe_call:
+                continue
+            parsed_argument = cls._documentation_fenced_passive_safe_call_argument(
+                fenced_code,
+                call_match.end(),
+                string_spans,
+            )
+            if parsed_argument is None:
+                return False
+            direct_url, variable_target = parsed_argument
+            if direct_url is not None:
+                direct_call_urls.append(direct_url)
+            elif variable_target is not None:
+                variable_call_refs.append((variable_target, call_match.start()))
+
         if any(not cls._documentation_fenced_passive_assigned_url_is_informational(url) for url in direct_call_urls):
             return False
-        variable_call_matches = tuple(DOCUMENTATION_FENCED_URL_VARIABLE_CALL_PATTERN.finditer(fenced_code))
-        allowed_call_positions = {match.start() for match in direct_url_calls} | {
-            match.start() for match in variable_call_matches
-        }
         if any(
             match.start() not in allowed_call_positions
             for match in DOCUMENTATION_FENCED_ALLOWED_NETWORK_CALL_PATTERN.finditer(fenced_code)
@@ -2618,10 +2701,9 @@ class TextScanner(BaseScanner):
                 continue
             assignment_positions.setdefault(match.group("target"), []).append(match.start())
         call_target_urls: list[str] = []
-        for match in variable_call_matches:
-            target = match.group("target")
+        for target, call_position in variable_call_refs:
             preceding_assignments = [
-                position for position in assignment_positions.get(target, []) if position < match.start()
+                position for position in assignment_positions.get(target, []) if position < call_position
             ]
             if not preceding_assignments:
                 return False
@@ -2637,11 +2719,13 @@ class TextScanner(BaseScanner):
         ]
         if any(not cls._documentation_fenced_bare_url_is_informational(url) for url in bare_urls):
             return False
+        vetted_call_urls = (*call_target_urls, *direct_call_urls)
         if any(cls._documentation_loopback_api_url_is_informational(url) for url in bare_urls):
-            return True
-        return bool(call_target_urls or direct_call_urls) and all(
-            cls._documentation_fenced_passive_media_url_is_informational(url)
-            for url in (*call_target_urls, *direct_call_urls)
+            if vetted_call_urls:
+                return all(cls._documentation_loopback_api_url_is_informational(url) for url in vetted_call_urls)
+            return re.search(rb"\b(?:getattr|requests|urllib|urlopen)\b", fenced_code, flags=re.IGNORECASE) is None
+        return bool(vetted_call_urls) and all(
+            cls._documentation_fenced_passive_media_url_is_informational(url) for url in vetted_call_urls
         )
 
     @classmethod
