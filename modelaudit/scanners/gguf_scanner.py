@@ -60,15 +60,18 @@ _GGUF_METADATA_COMMAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("destructive_rm", re.compile(r"(?i)(?:^|[;&|`$()]\s*)rm\s+-[a-z]*[rf][a-z]*\s+(?:/|~|\$|\.\.)")),
     ("backtick_command", re.compile(r"(?i)`\s*(?:rm|curl|wget|bash|sh|python(?:3)?|powershell|pwsh|cmd(?:\.exe)?)\b")),
 )
+_GGUF_METADATA_SHELL_FETCH_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("shell_download", ("curl", "wget")),
+    ("powershell_download", ("invoke-webrequest", "iwr")),
+)
+_GGUF_REMOTE_URL_SCHEMES = ("http://", "https://", "ftp://")
 _GGUF_METADATA_REMOTE_FETCH_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("shell_download", re.compile(r"(?i)\b(?:curl|wget)\b(?:\s+--?[^\s]+)*\s+(?:https?|ftp)://")),
     (
         "network_api",
         re.compile(
             r"(?i)\b(?:requests\.(?:get|post|put|request)|urllib\.request\.urlopen|urlopen|fetch)\s*\(\s*[\"'](?:https?|ftp)://",
         ),
     ),
-    ("powershell_download", re.compile(r"(?i)\b(?:invoke-webrequest|iwr)\b(?:\s+--?[^\s]+)*\s+(?:https?|ftp)://")),
 )
 
 
@@ -912,6 +915,47 @@ class GgufScanner(BaseScanner):
                 return True
         return False
 
+    @staticmethod
+    def _substring_positions(value: str, needle: str) -> list[int]:
+        positions: list[int] = []
+        start = 0
+        while True:
+            position = value.find(needle, start)
+            if position == -1:
+                return positions
+            positions.append(position)
+            start = position + 1
+
+    @classmethod
+    def _has_command_token_before_url(cls, value: str, command: str, url_positions: list[int]) -> bool:
+        for position in cls._substring_positions(value, command):
+            before = value[position - 1] if position else ""
+            after_position = position + len(command)
+            after = value[after_position] if after_position < len(value) else ""
+            if before and (before.isalnum() or before in "._-"):
+                continue
+            if after and (after.isalnum() or after in "._-"):
+                continue
+            if any(position < url_position for url_position in url_positions):
+                return True
+        return False
+
+    @classmethod
+    def _shell_remote_fetch_pattern(cls, value: str) -> str | None:
+        value_lower = value.lower()
+        url_positions = [
+            position
+            for scheme in _GGUF_REMOTE_URL_SCHEMES
+            for position in cls._substring_positions(value_lower, scheme)
+        ]
+        if not url_positions:
+            return None
+
+        for pattern_name, commands in _GGUF_METADATA_SHELL_FETCH_COMMANDS:
+            if any(cls._has_command_token_before_url(value_lower, command, url_positions) for command in commands):
+                return pattern_name
+        return None
+
     @classmethod
     def _metadata_value_security_evidence(cls, key: str, value: str) -> list[dict[str, str]]:
         if cls._is_chat_template_key(key):
@@ -925,6 +969,11 @@ class GgufScanner(BaseScanner):
             if pattern.search(value):
                 evidence.append({"evidence_type": "command_execution", "pattern": pattern_name})
                 break
+
+        shell_remote_fetch_pattern = cls._shell_remote_fetch_pattern(value)
+        if shell_remote_fetch_pattern is not None:
+            evidence.append({"evidence_type": "remote_fetch", "pattern": shell_remote_fetch_pattern})
+            return evidence
 
         for pattern_name, pattern in _GGUF_METADATA_REMOTE_FETCH_PATTERNS:
             if pattern.search(value):
