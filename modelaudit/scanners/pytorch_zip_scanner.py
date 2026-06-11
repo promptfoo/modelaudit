@@ -3073,9 +3073,6 @@ class PyTorchZipScanner(BaseScanner):
                 if any(resolved_search_path == root for root in known_roots):
                     add_root(str(resolved_search_path))
 
-        for root in known_roots:
-            add_root(str(root))
-
         return tuple(roots)
 
     @staticmethod

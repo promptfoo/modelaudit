@@ -8119,6 +8119,36 @@ def test_get_installed_pytorch_version_returns_none_when_metadata_unavailable_wi
     assert not any(name == "torch" or name.startswith("torch.") for name in import_calls)
 
 
+def test_trusted_python_package_roots_ignore_non_importable_site_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    active_root = tmp_path / "active-site"
+    inactive_user_root = tmp_path / "disabled-user-site"
+    active_root.mkdir()
+    inactive_user_root.mkdir()
+    _write_torch_distribution_metadata(inactive_user_root, "2.5.1")
+
+    def fake_sysconfig_path(scheme_key: str, *args: Any, **kwargs: Any) -> str | None:
+        del args, kwargs
+        return str(active_root) if scheme_key in {"purelib", "platlib"} else None
+
+    scanner = PyTorchZipScanner()
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    monkeypatch.setattr(sys, "path", [str(active_root)])
+    monkeypatch.setattr("sysconfig.get_path", fake_sysconfig_path)
+    monkeypatch.setattr("site.getsitepackages", lambda: [str(active_root), str(inactive_user_root)])
+    monkeypatch.setattr("site.getusersitepackages", lambda: str(inactive_user_root))
+    import_calls = _forbid_torch_import(monkeypatch)
+
+    roots = tuple(Path(root) for root in PyTorchZipScanner._trusted_python_package_roots())
+
+    assert active_root.resolve() in roots
+    assert inactive_user_root.resolve() not in roots
+    assert scanner._get_installed_pytorch_version() is None
+    assert not any(name == "torch" or name.startswith("torch.") for name in import_calls)
+
+
 def test_get_installed_pytorch_version_uses_distribution_metadata_without_importing_torch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -8644,6 +8674,35 @@ def test_pytorch_zip_directory_scan_uses_repository_inventory_for_nested_sibling
     assert check.details["safetensors_available"] is True
 
 
+@pytest.mark.usefixtures("requires_symlinks")
+def test_pytorch_zip_hf_snapshot_symlink_uses_snapshot_inventory_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hub_root = tmp_path / "hub"
+    model_cache = hub_root / "models--org--repo"
+    blobs_dir = model_cache / "blobs"
+    snapshot_dir = model_cache / "snapshots" / "abc123"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+    blob_path = create_mock_pytorch_zip(blobs_dir / "deadbeef", prefix="archive")
+    (snapshot_dir / "pytorch_model.bin").symlink_to(Path("../../blobs") / blob_path.name)
+    monkeypatch.setenv("HF_HUB_CACHE", str(hub_root))
+    repository_config: dict[str, Any] = {
+        REPOSITORY_FILE_INVENTORY_CONFIG_KEY: ("pytorch_model.bin", "model.safetensors")
+    }
+
+    result = scan_model_directory_or_file(
+        str(snapshot_dir),
+        cache_enabled=False,
+        **repository_config,
+    )
+
+    check = next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
+    assert result.files_scanned == 1
+    assert check.details["safetensors_available"] is True
+
+
 def test_pytorch_zip_directory_inventory_rejects_malformed_local_safetensors(
     tmp_path: Path,
 ) -> None:
@@ -8718,6 +8777,30 @@ def test_pytorch_zip_streaming_scan_uses_repository_inventory(tmp_path: Path) ->
     repository_config: dict[str, Any] = {
         REPOSITORY_FILE_INVENTORY_CONFIG_KEY: ["pytorch_model.bin", "model.safetensors"]
     }
+    result = scan_model_streaming(
+        file_generator=file_generator(),
+        scan_root=str(repo_root),
+        delete_after_scan=False,
+        timeout=30,
+        cache_enabled=False,
+        **repository_config,
+    )
+
+    check = next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
+    assert check.details["safetensors_available"] is True
+
+
+def test_pytorch_zip_streaming_scan_indexes_inventory_after_generator_populates(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    model_path = create_mock_pytorch_zip(repo_root / "pytorch_model.bin", prefix="archive")
+    repository_inventory: list[str] = []
+    repository_config: dict[str, Any] = {REPOSITORY_FILE_INVENTORY_CONFIG_KEY: repository_inventory}
+
+    def file_generator() -> Iterator[tuple[Path, bool]]:
+        repository_inventory.extend(["pytorch_model.bin", "model.safetensors"])
+        yield model_path, True
+
     result = scan_model_streaming(
         file_generator=file_generator(),
         scan_root=str(repo_root),
