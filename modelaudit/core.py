@@ -725,6 +725,34 @@ def _snapshot_file_size(snapshot: _FileIdentitySnapshot | None) -> int:
     return stat_fields[3]
 
 
+def _openvino_xml_weights_companion(path: Path) -> Path | None:
+    """Return a local OpenVINO XML model's same-stem weights sidecar."""
+    if not _is_openvino_xml_path(path):
+        return None
+    companion_path = path.with_suffix(".bin")
+    return companion_path if companion_path.exists() or companion_path.is_symlink() else None
+
+
+def _snapshot_openvino_companion_for_hash(xml_path: Path, companion_path: Path) -> _FileIdentitySnapshot | None:
+    """Snapshot an OpenVINO sidecar only when hashing stays in the model directory."""
+    companion_snapshot = _snapshot_file_identity(companion_path)
+    if companion_snapshot is None:
+        return None
+    if not companion_path.is_symlink():
+        return companion_snapshot
+
+    try:
+        model_dir = xml_path.resolve(strict=True).parent
+    except OSError:
+        return None
+    if companion_snapshot.resolved_path is None or not is_within_directory(
+        str(model_dir),
+        companion_snapshot.resolved_path,
+    ):
+        return None
+    return companion_snapshot
+
+
 def _validated_shard_family_scopes(
     source_path: str,
     target: dict[str, int | str],
@@ -2680,6 +2708,46 @@ def scan_model_directory_or_file(
                     seen_complete_hf_shard_families.add(family_dedupe_key)
                 scan_entries.append((representative_file, ordered_family_paths, shard_family_key))
 
+            scheduled_openvino_companion_sizes: dict[str, int] = {}
+            if scanner_selection.allows("openvino"):
+                scheduled_companions_by_key: dict[str, str] = {}
+                for representative_file, _scanned_file_paths, _entry_shard_family_key in scan_entries:
+                    xml_path = Path(representative_file)
+                    companion_path = _openvino_xml_weights_companion(xml_path)
+                    if companion_path is None:
+                        continue
+                    companion_snapshot = _snapshot_openvino_companion_for_hash(xml_path, companion_path)
+                    if companion_snapshot is None:
+                        aggregate_hash_complete = False
+                        continue
+                    xml_key = _openvino_xml_companion_key(xml_path)
+                    companion_path_str = str(companion_path)
+                    scheduled_openvino_companion_sizes[xml_key] = _snapshot_file_size(companion_snapshot)
+                    scheduled_companions_by_key[_openvino_xml_companion_key(companion_path)] = companion_path_str
+
+                if scheduled_companions_by_key:
+                    expanded_scan_entries: list[_ScanEntry] = []
+                    for representative_file, scanned_file_paths, entry_shard_family_key in scan_entries:
+                        representative_key = _openvino_xml_companion_key(Path(representative_file))
+                        if representative_key in scheduled_companions_by_key:
+                            continue
+
+                        expanded_scanned_file_paths = list(scanned_file_paths)
+                        expanded_scanned_path_keys = {
+                            _openvino_xml_companion_key(Path(scanned_file_path))
+                            for scanned_file_path in expanded_scanned_file_paths
+                        }
+                        companion_path = _openvino_xml_weights_companion(Path(representative_file))
+                        if companion_path is not None:
+                            companion_key = _openvino_xml_companion_key(companion_path)
+                            scheduled_companion_path = scheduled_companions_by_key.get(companion_key)
+                            if scheduled_companion_path is not None and companion_key not in expanded_scanned_path_keys:
+                                expanded_scanned_file_paths.append(scheduled_companion_path)
+                        expanded_scan_entries.append(
+                            (representative_file, expanded_scanned_file_paths, entry_shard_family_key)
+                        )
+                    scan_entries = expanded_scan_entries
+
             if isinstance(dvc_parent_file, str) and isinstance(dvc_remaining_total_size, int):
                 remaining_size = dvc_remaining_total_size
                 bounded_scan_entries: list[_ScanEntry] = []
@@ -2822,6 +2890,10 @@ def scan_model_directory_or_file(
                             ):
                                 file_config = _with_openvino_scanned_xml_companion(file_config, openvino_owner)
                             file_result = scan_file(representative_file, file_config)
+                            file_result.bytes_scanned += scheduled_openvino_companion_sizes.get(
+                                _openvino_xml_companion_key(Path(representative_file)),
+                                0,
+                            )
                         finally:
                             _finish_phase_timing(phase_timings, "file_scan_dispatch", file_scan_started_at)
 
@@ -4651,29 +4723,8 @@ def scan_model_streaming(
                         continue
                     scan_path = resolved_path
 
-                if skip_file_types and should_skip_file(
-                    str(source_path),
-                    metadata_scanner_available=metadata_scanner_available,
-                    scanner_selection_extensions=scanner_selection_extensions,
-                ):
-                    filename_lower = source_path.name.lower()
-                    if filename_lower in LICENSE_FILES:
-                        try:
-                            license_metadata = collect_license_metadata(
-                                str(scan_path),
-                                nearby_license_cache=nearby_license_cache,
-                            )
-                            from .models import FileMetadataModel
-
-                            results.file_metadata[report_path] = FileMetadataModel(**license_metadata)
-                            logger.debug(f"Collected license metadata from skipped file: {source_path}")
-                        except Exception as e:
-                            logger.warning(f"Error collecting license metadata for {source_path}: {e}")
-                    else:
-                        logger.debug(f"Skipping non-model file: {source_path}")
-                    continue
-
-                # Build config dict for scan_file
+                # Build config before skip filtering so bin-first OpenVINO
+                # sidecars can wait for their selected XML owner.
                 scan_config = {
                     "timeout": timeout - int(time.time() - start_time),
                     **scan_kwargs,
@@ -4693,6 +4744,37 @@ def scan_model_streaming(
                         if sidecar_snapshot is not None:
                             preserved_openvino_companion_snapshots[Path(os.path.abspath(scan_path))] = sidecar_snapshot
                         continue
+
+                scan_unconsumed_openvino_sidecar = (
+                    openvino_sidecar_owner is not None
+                    and scanner_selection.allows("openvino")
+                    and scanning_deferred_openvino_sidecars
+                )
+                if (
+                    skip_file_types
+                    and not scan_unconsumed_openvino_sidecar
+                    and should_skip_file(
+                        str(source_path),
+                        metadata_scanner_available=metadata_scanner_available,
+                        scanner_selection_extensions=scanner_selection_extensions,
+                    )
+                ):
+                    filename_lower = source_path.name.lower()
+                    if filename_lower in LICENSE_FILES:
+                        try:
+                            license_metadata = collect_license_metadata(
+                                str(scan_path),
+                                nearby_license_cache=nearby_license_cache,
+                            )
+                            from .models import FileMetadataModel
+
+                            results.file_metadata[report_path] = FileMetadataModel(**license_metadata)
+                            logger.debug(f"Collected license metadata from skipped file: {source_path}")
+                        except Exception as e:
+                            logger.warning(f"Error collecting license metadata for {source_path}: {e}")
+                    else:
+                        logger.debug(f"Skipping non-model file: {source_path}")
+                    continue
 
                 if scanner_selection.allows("openvino") and _is_openvino_xml_path(scan_path):
                     candidate_companion = scan_path.with_suffix(".bin")

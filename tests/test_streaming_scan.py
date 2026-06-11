@@ -1595,6 +1595,27 @@ def test_scan_model_streaming_openvino_bin_without_yielded_xml_fails_closed(tmp_
     assert any(issue.location == str(bin_path) and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_scan_model_streaming_selected_openvino_preserves_bin_before_skip_filter(tmp_path: Path) -> None:
+    """OpenVINO-only streaming must defer bin-first sidecars before extension filtering."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+
+    result = scan_model_streaming(
+        file_generator=iter([(bin_path, False), (xml_path, True)]),
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+        skip_file_types=True,
+        scanners=["openvino"],
+    )
+
+    assert determine_exit_code(result) == 0
+    assert result.scanner_names == ["openvino"]
+    assert not xml_path.exists()
+    assert not bin_path.exists()
+    assert result.file_metadata[str(xml_path)]["bin_size"] == 16
+    assert not any(check.rule_code == "S701" for check in result.checks)
+
+
 def test_scan_model_directory_or_file_openvino_bin_sidecar_not_pytorch(tmp_path: Path) -> None:
     """Local directory scans should not route declared OpenVINO weights as PyTorch binaries."""
     xml_path, bin_path = _write_openvino_pair(tmp_path)
@@ -1605,6 +1626,50 @@ def test_scan_model_directory_or_file_openvino_bin_sidecar_not_pytorch(tmp_path:
     assert "pytorch_binary" not in result.scanner_names
     assert result.file_metadata[str(xml_path)]["bin_size"] == bin_path.stat().st_size
     assert not any(check.rule_code == "S901" for check in result.checks)
+
+
+def test_scan_model_directory_or_file_selected_openvino_sidecar_changes_content_hash(tmp_path: Path) -> None:
+    """OpenVINO-only directory scans must hash selected same-stem weights sidecars."""
+    xml_path, bin_path = _write_openvino_pair(tmp_path)
+    first_result = scan_model_directory_or_file(
+        str(tmp_path),
+        cache_enabled=False,
+        skip_file_types=True,
+        scanners=["openvino"],
+    )
+
+    bin_path.write_bytes(b"\x01" * 16)
+    second_result = scan_model_directory_or_file(
+        str(tmp_path),
+        cache_enabled=False,
+        skip_file_types=True,
+        scanners=["openvino"],
+    )
+
+    assert first_result.content_hash is not None
+    assert second_result.content_hash is not None
+    assert first_result.content_hash != second_result.content_hash
+    assert str(bin_path) in first_result.file_metadata
+    assert first_result.file_metadata[str(xml_path)]["bin_size"] == 16
+
+
+def test_scan_model_directory_or_file_selected_openvino_sidecar_counts_toward_max_total_size(tmp_path: Path) -> None:
+    """OpenVINO-only directory scans must count selected same-stem weights against total caps."""
+    _xml_path, bin_path = _write_openvino_pair(tmp_path)
+    bin_path.write_bytes(b"\x00" * 64)
+
+    result = scan_model_directory_or_file(
+        str(tmp_path),
+        cache_enabled=False,
+        skip_file_types=True,
+        scanners=["openvino"],
+        max_total_size=32,
+    )
+
+    assert determine_exit_code(result) == 2
+    assert result.bytes_scanned > 32
+    assert result.content_hash is None
+    assert any("Total scan size limit exceeded" in issue.message for issue in result.issues)
 
 
 def test_openvino_bin_sidecar_respects_selected_pytorch_binary_scanner(tmp_path: Path) -> None:
