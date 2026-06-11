@@ -10188,6 +10188,42 @@ def test_scan_file_keeps_s901_when_malicious_pt_onnx_finding_is_downgraded(tmp_p
     assert _actionable_s901_issues(result)
 
 
+@pytest.mark.parametrize("rule_mode", ["suppressed", "downgraded"])
+def test_scan_file_keeps_s901_for_cached_hidden_onnx_evidence(tmp_path: Path, rule_mode: str) -> None:
+    pytest.importorskip("onnx")
+    if rule_mode == "suppressed":
+        rule_config = ModelAuditConfig(suppress={"S902"})
+    else:
+        rule_config = ModelAuditConfig()
+        rule_config.severity = {"S501": Severity.INFO, "S902": Severity.INFO}
+    set_config(rule_config)
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / f"{rule_mode}-cached-malicious.pt", op_type="PythonOp")
+    cache_dir = tmp_path / f"{rule_mode}-cache"
+    cache_config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+    reset_cache_manager()
+
+    try:
+        first_result = scan_file(str(disguised_onnx), config=cache_config)
+        second_result = scan_file(str(disguised_onnx), config=cache_config)
+        format_checks = [_format_validation_check(first_result), _format_validation_check(second_result)]
+
+        assert [result.scanner_name for result in (first_result, second_result)] == ["onnx", "onnx"]
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        assert all(format_check.severity == IssueSeverity.WARNING for format_check in format_checks)
+        assert all(format_check.rule_code == "S901" for format_check in format_checks)
+        assert all(_actionable_s901_issues(result) for result in (first_result, second_result))
+        assert all(
+            ACTIONABLE_FAILED_CHECKS_METADATA_KEY in result._private_metadata
+            for result in (first_result, second_result)
+        )
+    finally:
+        reset_cache_manager()
+
+
 def test_scan_file_keeps_s901_for_truncated_pt_onnx(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     truncated_onnx = _create_truncated_tensor_onnx(tmp_path / "truncated.pt")

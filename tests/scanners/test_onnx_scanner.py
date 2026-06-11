@@ -3195,6 +3195,33 @@ def test_onnx_scanner_external_data_exists(tmp_path: Path) -> None:
     assert resolved_checks[0].status.value == "passed"
 
 
+def test_onnx_scanner_skips_path_schema_validation_for_external_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_onnx_model(tmp_path, external=True, external_path="weights.bin")
+
+    def fail_if_called(_model_or_path: Any, *args: Any, **kwargs: Any) -> None:
+        raise AssertionError("external_data schema validation must not resolve through check_model")
+
+    monkeypatch.setattr(onnx.checker, "check_model", fail_if_called)
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    schema_checks = [c for c in result.checks if c.name == "ONNX Schema Validation"]
+    assert len(schema_checks) == 1
+    assert schema_checks[0].details["external_data_present"] is True
+    assert any(
+        c.name == "External Data Reference Check"
+        and c.status == CheckStatus.PASSED
+        and c.details.get("file") == "weights.bin"
+        for c in result.checks
+    )
+
+
 def test_onnx_scanner_corrupted(tmp_path: Path) -> None:
     model_path = create_onnx_model(tmp_path)
     data = model_path.read_bytes()
@@ -4041,7 +4068,9 @@ class TestCVE202427318NestedPathTraversal:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         traversal_checks = [
             c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
         ]
@@ -4060,7 +4089,9 @@ class TestCVE202427318NestedPathTraversal:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         traversal_checks = [
             c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
         ]
@@ -4080,7 +4111,9 @@ class TestCVE202427318NestedPathTraversal:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         traversal_checks = [
             c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
         ]
@@ -4100,7 +4133,9 @@ class TestCVE202427318NestedPathTraversal:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         traversal_checks = [
             c for c in result.checks if c.status == CheckStatus.FAILED and "traversal" in c.message.lower()
         ]
@@ -4218,7 +4253,9 @@ class TestExternalDataSizeValidation:
 
         result = OnnxScanner().scan(str(model_path))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
         size_checks = [
             c for c in result.checks if c.name == "External Data Size Validation" and c.status == CheckStatus.PASSED
         ]

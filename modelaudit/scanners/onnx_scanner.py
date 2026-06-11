@@ -532,6 +532,15 @@ def _iter_model_external_data_tensor_groups(model: Any) -> Any:
             yield _iter_attribute_external_data_tensors(attribute)
 
 
+def _model_has_external_data(model: Any) -> bool:
+    """Return True when an ONNX model declares tensors stored in external_data."""
+    for tensors in _iter_model_external_data_tensor_groups(model):
+        for tensor in tensors:
+            if int(getattr(tensor, "data_location", 0)) == 1:
+                return True
+    return False
+
+
 def _model_declares_python_operator(model: Any) -> bool:
     """Return True when the parsed ONNX model actually declares a Python operator.
 
@@ -2755,10 +2764,20 @@ class OnnxScanner(BaseScanner):
                     message="ONNX schema checker is unavailable; analysis incomplete",
                     details={"checker_available": False},
                 )
+            elif _model_has_external_data(model):
+                _mark_onnx_schema_incomplete(
+                    result,
+                    path,
+                    message="ONNX schema validation skipped for external-data model; analysis incomplete",
+                    details={
+                        "checker_available": True,
+                        "external_data_present": True,
+                    },
+                )
             else:
                 try:
                     self.check_interrupted()
-                    check_model(path)
+                    check_model(model)
                     self.check_interrupted()
                 except KeyboardInterrupt:
                     raise
