@@ -136,6 +136,14 @@ DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
     rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
     rb"[\s(\[{\\]{0,4096}[rubfRUBF]*[\"']?$"
 )
+DOCUMENTATION_CODE_LITERAL_VALUE_PREFIX_PATTERN = re.compile(
+    rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
+    rb"(?=[^\r\n]{0,4096}$)[^\r\n]*[rubfRUBF]*[\"']$"
+)
+DOCUMENTATION_CODE_LITERAL_BLOCK_PREFIX_PATTERN = re.compile(
+    rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
+    rb"(?=[^\r\n]{0,4096}$)[^\r\n]*[\[{(][ \t]*(?:#.*)?$"
+)
 DOCUMENTATION_CODE_RETURN_STRING_PATTERN = re.compile(
     rb"(?:^|[\r\n;{[(])[ \t]*(?:return|yield)\s+(?:[\s(\[{]{0,4096})?[rubfRUBF]*[\"']?$"
 )
@@ -941,6 +949,7 @@ class TextScanner(BaseScanner):
         code_prefix = prefix[:link_start]
         return (
             cls._documentation_assignment_is_actionable(code_prefix)
+            or DOCUMENTATION_CODE_LITERAL_VALUE_PREFIX_PATTERN.search(code_prefix) is not None
             or DOCUMENTATION_CODE_RETURN_STRING_PATTERN.search(code_prefix) is not None
             or DOCUMENTATION_CODE_CALL_PATTERN.search(code_prefix) is not None
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(code_prefix) is not None
@@ -1412,6 +1421,32 @@ class TextScanner(BaseScanner):
         return False
 
     @classmethod
+    def _documentation_multiline_literal_contains_position(cls, payload: bytes, position: int) -> bool:
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        current_line_prefix = payload[line_start:position]
+        current_indent = len(current_line_prefix) - len(current_line_prefix.lstrip(b" \t"))
+        if current_indent == 0:
+            return False
+
+        context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        previous_line_end = line_start - 1
+        while previous_line_end >= context_start:
+            previous_line_start = max(
+                payload.rfind(b"\n", context_start, previous_line_end) + 1,
+                context_start,
+            )
+            previous_line = payload[previous_line_start:previous_line_end]
+            stripped = previous_line.strip()
+            if stripped and not stripped.startswith(b"#"):
+                previous_indent = len(previous_line) - len(previous_line.lstrip(b" \t"))
+                if previous_indent < current_indent:
+                    return DOCUMENTATION_CODE_LITERAL_BLOCK_PREFIX_PATTERN.search(previous_line) is not None
+            if previous_line_start == context_start:
+                break
+            previous_line_end = previous_line_start - 1
+        return False
+
+    @classmethod
     def _documentation_nested_config_contains_position(cls, payload: bytes, position: int) -> bool:
         line_start = payload.rfind(b"\n", 0, position) + 1
         context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
@@ -1431,6 +1466,8 @@ class TextScanner(BaseScanner):
         if cls._documentation_multiline_return_contains_position(payload, position):
             return True
         if cls._documentation_open_call_contains_position(payload, position):
+            return True
+        if cls._documentation_multiline_literal_contains_position(payload, position):
             return True
         if cls._documentation_position_is_in_passive_markdown_link(payload, position):
             return False
@@ -1831,6 +1868,7 @@ class TextScanner(BaseScanner):
                         absolute_position,
                     )
                     or cls._documentation_open_call_contains_position(payload, absolute_position)
+                    or cls._documentation_multiline_literal_contains_position(payload, absolute_position)
                     or cls._documentation_nested_config_contains_position(payload, absolute_position)
                 ):
                     return False
@@ -1868,6 +1906,7 @@ class TextScanner(BaseScanner):
                             absolute_position,
                         )
                         or cls._documentation_open_call_contains_position(payload, absolute_position)
+                        or cls._documentation_multiline_literal_contains_position(payload, absolute_position)
                         or cls._documentation_nested_config_contains_position(payload, absolute_position)
                     ):
                         return False
