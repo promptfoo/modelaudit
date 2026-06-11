@@ -1458,6 +1458,7 @@ class _SentencePieceTrainerSpecSignals:
 class _SentencePiecePieceProtoSignals:
     piece_text: str | None = None
     piece_type: int | None = None
+    decoded_text_bytes: int = 0
 
 
 def _decode_proto_int32_varint(value: int) -> int:
@@ -1895,6 +1896,7 @@ def _parse_sentencepiece_piece_proto_stream(
     value_end: int,
     *,
     decode_text: bool,
+    max_decoded_text_bytes: int,
 ) -> _SentencePiecePieceProtoSignals | None:
     """Validate one piece submessage while avoiding unnecessary text reads."""
     if value_end - stream.tell() > _SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES:
@@ -1960,9 +1962,12 @@ def _parse_sentencepiece_piece_proto_stream(
         return _SentencePiecePieceProtoSignals(piece_type=piece_type)
 
     text_start, text_end = text_bounds
+    text_length = text_end - text_start
+    if text_length > max_decoded_text_bytes:
+        return None
     stream.seek(text_start)
-    payload = stream.read(text_end - text_start)
-    if len(payload) != text_end - text_start:
+    payload = stream.read(text_length)
+    if len(payload) != text_length:
         return None
     stream.seek(value_end)
     piece_text = _decode_bounded_proto_string(
@@ -1973,7 +1978,11 @@ def _parse_sentencepiece_piece_proto_stream(
     )
     if piece_text is None:
         return None
-    return _SentencePiecePieceProtoSignals(piece_text=piece_text, piece_type=piece_type)
+    return _SentencePiecePieceProtoSignals(
+        piece_text=piece_text,
+        piece_type=piece_type,
+        decoded_text_bytes=text_length,
+    )
 
 
 def _parse_sentencepiece_trainer_spec_proto_stream(
@@ -1990,7 +1999,12 @@ def _parse_sentencepiece_trainer_spec_proto_stream(
     return _parse_sentencepiece_trainer_spec_proto(payload, 0, len(payload))
 
 
-def _classify_sentencepiece_model_proto_stream(stream: BinaryIO, file_size: int) -> _SentencePieceModelProtoRoute:
+def _classify_sentencepiece_model_proto_stream(
+    stream: BinaryIO,
+    file_size: int,
+    *,
+    max_decoded_piece_text_bytes: int = _SENTENCEPIECE_MODEL_PROTO_READ_BYTES,
+) -> _SentencePieceModelProtoRoute:
     offset = 0
     fields_seen = 0
     piece_count = 0
@@ -2004,6 +2018,7 @@ def _classify_sentencepiece_model_proto_stream(stream: BinaryIO, file_size: int)
     malformed_byte_piece = False
     trainer_spec: _SentencePieceTrainerSpecSignals | None = None
     strong_match = False
+    decoded_piece_text_bytes = 0
 
     def reject_candidate() -> _SentencePieceModelProtoRoute:
         return "malformed_candidate" if piece_count else "unknown"
@@ -2037,9 +2052,11 @@ def _classify_sentencepiece_model_proto_stream(stream: BinaryIO, file_size: int)
                 stream,
                 actual_value_end,
                 decode_text=decode_piece_text,
+                max_decoded_text_bytes=max_decoded_piece_text_bytes - decoded_piece_text_bytes,
             )
             if parsed_piece is None:
                 return reject_candidate()
+            decoded_piece_text_bytes += parsed_piece.decoded_text_bytes
             piece = parsed_piece.piece_text
             piece_type = parsed_piece.piece_type
             piece_index = piece_count
@@ -2141,7 +2158,11 @@ def _classify_sentencepiece_model_proto_file(path: str | Path) -> _SentencePiece
                 if len(payload) != stat.st_size:
                     return "unknown"
                 return _classify_sentencepiece_model_proto_stream(BytesIO(payload), stat.st_size)
-            return _classify_sentencepiece_model_proto_stream(handle, stat.st_size)
+            return _classify_sentencepiece_model_proto_stream(
+                handle,
+                stat.st_size,
+                max_decoded_piece_text_bytes=_SENTENCEPIECE_MODEL_PROTO_READ_BYTES,
+            )
     except OSError:
         return "unknown"
 
