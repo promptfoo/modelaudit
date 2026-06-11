@@ -606,6 +606,11 @@ DOCUMENTATION_FENCED_IMPORTED_FETCH_RESPONSE_ASSIGNMENT_PATTERN = re.compile(
     rb"(?P<fetch>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
     re.IGNORECASE,
 )
+DOCUMENTATION_FENCED_IMPORTED_NETWORK_FUNCTION_ALIAS_ASSIGNMENT_PATTERN = re.compile(
+    rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*=\s*"
+    rb"(?P<source>[A-Za-z_][A-Za-z0-9_]*)\b(?!\s*\()",
+    re.IGNORECASE,
+)
 DOCUMENTATION_FENCED_RESPONSE_CONTENT_ALIAS_ASSIGNMENT_PATTERN = re.compile(
     rb"\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\r\n;]{1,512})?\s*=\s*"
     rb"(?P<source>[A-Za-z_][A-Za-z0-9_]*)"
@@ -615,6 +620,11 @@ DOCUMENTATION_FENCED_RESPONSE_CONTENT_ALIAS_ASSIGNMENT_PATTERN = re.compile(
 DOCUMENTATION_FENCED_EXECUTED_RESPONSE_PATTERN = re.compile(
     rb"\b" + DOCUMENTATION_FENCED_RESPONSE_EXECUTOR + rb"\s*\(\s*(?P<target>[A-Za-z_][A-Za-z0-9_]*)"
     rb"(?:\s*\.\s*(?:text|content)|\s*\.\s*read\s*\(\s*\))?",
+    re.IGNORECASE,
+)
+DOCUMENTATION_FENCED_EXECUTED_RESPONSE_ARGUMENT_PATTERN = re.compile(
+    rb"\b" + DOCUMENTATION_FENCED_RESPONSE_EXECUTOR + rb"\s*\([^\r\n]{0,4096}\b(?P<target>[A-Za-z_][A-Za-z0-9_]*)"
+    rb"(?:\s*\.\s*(?:text|content)|\s*\.\s*read\s*\(\s*\))",
     re.IGNORECASE,
 )
 DOCUMENTATION_FENCED_BIBLIOGRAPHY_URL_FIELD_PATTERN = re.compile(
@@ -1713,6 +1723,16 @@ class TextScanner(BaseScanner):
                 + path_reference
                 + rb"/[A-Za-z0-9_./\-]{1,4096}(?:\s|$)",
                 prefix + rb"make\s+-C\s+" + path_reference + rb"(?:\s|$)",
+                prefix
+                + rb"(?:pip(?:[0-9.]+)?|uv\s+pip|(?:python(?:[0-9.]+)?|py)\s+(?:-[A-Za-z0-9_.=\-]+\s+){0,8}-m\s+pip)"
+                + rb"\s+install\b[^\r\n;&|]{0,4096}\s+"
+                + path_reference
+                + rb"(?:\s|$)",
+                prefix
+                + rb"(?:python(?:[0-9.]+)?|py)\s+(?:-[A-Za-z0-9_.=\-]+\s+){0,8}-m\s+build\b"
+                + rb"[^\r\n;&|]{0,4096}\s+"
+                + path_reference
+                + rb"(?:\s|$)",
             )
         )
 
@@ -2169,6 +2189,41 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
+    def _documentation_fenced_has_imported_network_alias_call(
+        cls,
+        fenced_code: bytes,
+        string_spans: tuple[tuple[int, int, str, bool], ...],
+        string_span_starts: tuple[int, ...],
+    ) -> bool:
+        imported_targets = cls._documentation_fenced_imported_network_targets(
+            fenced_code,
+            string_spans,
+            string_span_starts,
+        )
+        alias_positions: dict[bytes, list[int]] = {}
+        for match in DOCUMENTATION_FENCED_IMPORTED_NETWORK_FUNCTION_ALIAS_ASSIGNMENT_PATTERN.finditer(fenced_code):
+            if cls._documentation_fenced_match_is_line_comment(
+                fenced_code,
+                match.start(),
+            ) or cls._documentation_python_string_spans_contain_absolute_position(
+                fenced_code,
+                match.start(),
+                string_spans,
+                string_span_starts,
+            ):
+                continue
+            if any(
+                position < match.start() for position, _imported_name in imported_targets.get(match.group("source"), [])
+            ):
+                alias_positions.setdefault(match.group("target"), []).append(match.start())
+
+        return any(
+            any(position < call_match.start() for position in alias_positions.get(call_match.group("target"), []))
+            for call_match in DOCUMENTATION_FENCED_VARIABLE_CALL_PATTERN.finditer(fenced_code)
+            if not cls._documentation_fenced_match_is_line_comment(fenced_code, call_match.start())
+        )
+
+    @classmethod
     def _documentation_fenced_has_executed_fetch_response(
         cls,
         fenced_code: bytes,
@@ -2224,11 +2279,19 @@ class TextScanner(BaseScanner):
             if any(position < match.start() for position in response_assignments.get(match.group("source"), [])):
                 response_assignments.setdefault(match.group("target"), []).append(match.start())
 
-        return any(
-            any(position < exec_match.start() for position in response_assignments.get(exec_match.group("target"), []))
-            for exec_match in DOCUMENTATION_FENCED_EXECUTED_RESPONSE_PATTERN.finditer(fenced_code)
-            if not cls._documentation_fenced_match_is_line_comment(fenced_code, exec_match.start())
-        )
+        for exec_pattern in (
+            DOCUMENTATION_FENCED_EXECUTED_RESPONSE_PATTERN,
+            DOCUMENTATION_FENCED_EXECUTED_RESPONSE_ARGUMENT_PATTERN,
+        ):
+            for exec_match in exec_pattern.finditer(fenced_code):
+                if cls._documentation_fenced_match_is_line_comment(fenced_code, exec_match.start()):
+                    continue
+                if any(
+                    position < exec_match.start()
+                    for position in response_assignments.get(exec_match.group("target"), [])
+                ):
+                    return True
+        return False
 
     @classmethod
     def _documentation_fenced_has_bound_session_alias_call(cls, fenced_code: bytes) -> bool:
@@ -2274,6 +2337,7 @@ class TextScanner(BaseScanner):
             )
             or cls._documentation_fenced_has_imported_network_call(fenced_code, string_spans, string_span_starts)
             or cls._documentation_fenced_has_module_alias_network_call(fenced_code, string_spans, string_span_starts)
+            or cls._documentation_fenced_has_imported_network_alias_call(fenced_code, string_spans, string_span_starts)
             or cls._documentation_fenced_has_executed_fetch_response(fenced_code, string_spans, string_span_starts)
             or cls._documentation_fenced_has_bound_session_alias_call(fenced_code)
             or cls._documentation_fenced_has_call_after_assignment(
