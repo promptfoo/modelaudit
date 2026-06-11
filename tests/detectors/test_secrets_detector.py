@@ -230,8 +230,24 @@ class TestSecretsDetector:
                 _basic_auth_token(b"bracket:pass"),
             ),
             (
+                f'headers["Authorization"] = f"Basic {_basic_auth_token(b"prefixed-fstring:pass")}"',
+                _basic_auth_token(b"prefixed-fstring:pass"),
+            ),
+            (
+                f"headers['Proxy-Authorization'] = b'Basic {_basic_auth_token(b'prefixed-bytes:pass')}'",
+                _basic_auth_token(b"prefixed-bytes:pass"),
+            ),
+            (
+                f"headers['Authorization'] = `Basic {_basic_auth_token(b'js-template-value:pass')}`",
+                _basic_auth_token(b"js-template-value:pass"),
+            ),
+            (
                 f"headers['Proxy-Authorization'] = 'Basic {_basic_auth_token(b'proxy-bracket:pass')}'",
                 _basic_auth_token(b"proxy-bracket:pass"),
+            ),
+            (
+                f'"Authorization" => "Basic {_basic_auth_token(b"hash-rocket:pass")}"',
+                _basic_auth_token(b"hash-rocket:pass"),
             ),
             (
                 f'AUTH_HEADER = f"Authorization: Basic {_basic_auth_token(b"py-fstring:pass")}"',
@@ -288,6 +304,15 @@ class TestSecretsDetector:
             (
                 f'headers.append("Proxy-Authorization", "Basic {_basic_auth_token(b"headers-append:pass")}")',
                 _basic_auth_token(b"headers-append:pass"),
+            ),
+            (
+                f'headers.put("Authorization", "Basic {_basic_auth_token(b"headers-put:pass")}")',
+                _basic_auth_token(b"headers-put:pass"),
+            ),
+            (
+                "connection.setRequestProperty("
+                f'"Proxy-Authorization", "Basic {_basic_auth_token(b"request-property:pass")}")',
+                _basic_auth_token(b"request-property:pass"),
             ),
             (
                 f'headers.set(\n  "Authorization",\n  "Basic {_basic_auth_token(b"headers-set-multiline:pass")}"\n)',

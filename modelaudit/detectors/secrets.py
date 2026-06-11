@@ -360,15 +360,17 @@ BASIC_AUTH_HEADER_PREFIX_PATTERN = re.compile(
     r"|proxy[-_]?(?:auth|authorization)[-_]?header"
     r")"
     r")"
-    r"\s*(?:\\?[\"'])?\s*(?:\\?\])?\s*[:=]\s*"
-    r"(?:\\?[\"']|\[\s*(?:\\?[\"'])?|\(\s*(?:\\?[\"'])?)?\s*(?:[>|][+-]?\s*)?$",
+    r"\s*(?:\\?[\"'])?\s*(?:\\?\])?\s*(?:=>|[:=])\s*"
+    r"(?:[rRuUbBfF]{0,3}\\?[\"'`]|\[\s*(?:[rRuUbBfF]{0,3}\\?[\"'`])?"
+    r"|\(\s*(?:[rRuUbBfF]{0,3}\\?[\"'`])?)?\s*(?:[>|][+-]?\s*)?$",
     re.IGNORECASE,
 )
 BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN = re.compile(
     r"(?:^|[^\w$])(?:"
-    r"(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*setRequestHeader"
-    r"|(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)+(?:set|append)"
-    r")\s*\(\s*\\?[\"']\s*(?:proxy-authorization|authorization)\s*\\?[\"']\s*,\s*\\?[\"']?\s*$",
+    r"(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*setRequest(?:Header|Property)"
+    r"|(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)+(?:set|append|put)"
+    r")\s*\(\s*\\?[\"']\s*(?:proxy-authorization|authorization)\s*\\?[\"']\s*,\s*"
+    r"(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADERS_CONSTRUCTOR_START_PATTERN = re.compile(
@@ -377,7 +379,7 @@ BASIC_AUTH_HEADERS_CONSTRUCTOR_START_PATTERN = re.compile(
 )
 BASIC_AUTH_HEADERS_CONSTRUCTOR_TUPLE_PREFIX_PATTERN = re.compile(
     r"[\[(]\s*\\?[\"']\s*"
-    r"(?:proxy-authorization|authorization)\s*\\?[\"']\s*,\s*\\?[\"']?\s*$",
+    r"(?:proxy-authorization|authorization)\s*\\?[\"']\s*,\s*(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADERS_INIT_START_PATTERN = re.compile(
