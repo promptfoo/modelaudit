@@ -1878,6 +1878,41 @@ def test_large_legacy_pytorch_truncated_storage_is_inconclusive_not_file_size(
     assert storage_check.details["max_control_opcodes"] == pickle_scanner._PYTORCH_LEGACY_MAX_CONTROL_OPCODES
 
 
+def test_regular_scan_defers_hash_for_incomplete_legacy_pytorch_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit import core
+
+    payload, _pickle_end = _make_legacy_pytorch_container(
+        b"A" * 128,
+        declared_storage_size=512,
+    )
+    path = tmp_path / "legacy-truncated-storage.pt"
+    path.write_bytes(payload)
+
+    def fail_hash(candidate: str) -> str:
+        if candidate == str(path):
+            pytest.fail("incomplete legacy PyTorch layout was hashed before bounded scan dispatch")
+        return "a" * 64
+
+    monkeypatch.setattr(core, "_calculate_file_hash", fail_hash)
+
+    result = scan_model_directory_or_file(
+        str(path),
+        max_file_size=10_000,
+        max_file_read_size=256,
+        cache_enabled=False,
+    )
+    metadata = result.file_metadata[str(path)].model_dump(mode="python")
+
+    assert result.content_hash is None
+    assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "legacy_pytorch_storage_layout_incomplete" in metadata["scan_outcome_reasons"]
+    assert metadata["file_hashes"]["sha256"] is None
+    assert isinstance(metadata["file_hashes"]["sha256_prefix"], str)
+
+
 def test_large_seekable_legacy_pytorch_stream_defers_file_size_limit() -> None:
     payload, pickle_end = _make_legacy_pytorch_container(b"A" * 512)
     stream = io.BytesIO(payload)
