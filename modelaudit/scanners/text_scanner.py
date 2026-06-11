@@ -68,6 +68,7 @@ BARE_NETWORK_TOKEN_PATTERNS = (
 )
 MAX_TEXT_FINDING_CONTEXT_BYTES = 4096
 MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES = 1024
+MAX_DOCUMENTATION_FENCED_CODE_RANGES = 1024
 DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
     rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
     rb"[\s(\[{\\]{0,4096}[rubfRUBF]*[\"']?$"
@@ -654,6 +655,11 @@ class TextScanner(BaseScanner):
         )
 
     @staticmethod
+    def _documentation_uses_markdown_fences(path: str) -> bool:
+        extension = os.path.splitext(os.path.basename(path).lower())[1]
+        return extension in {".md", ".markdown"}
+
+    @staticmethod
     def _is_passive_data_sidecar(path: str) -> bool:
         filename = os.path.basename(path).lower()
         return filename in PASSIVE_DATA_TEXT_FILENAMES or filename.startswith(PASSIVE_DATA_TEXT_PREFIXES)
@@ -1219,6 +1225,8 @@ class TextScanner(BaseScanner):
             if marker[:1] != opening_marker[:1] or len(marker) < len(opening_marker) or suffix.strip():
                 continue
             ranges.append((content_start, match.start()))
+            if len(ranges) >= MAX_DOCUMENTATION_FENCED_CODE_RANGES:
+                return tuple(ranges)
             opening_marker = None
         if opening_marker is not None:
             ranges.append((content_start, len(payload)))
@@ -1586,12 +1594,19 @@ class TextScanner(BaseScanner):
         payload: bytes,
         findings: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], bool]:
+        if not findings:
+            return findings, False
+
         classified_findings: list[dict[str, Any]] = []
         classification_incomplete = False
         remaining_occurrences = MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES
         documentation_sidecar = cls._is_documentation_sidecar(path)
         lowered_payload = payload.lower() if documentation_sidecar else b""
-        fenced_code_ranges = cls._documentation_fenced_code_ranges(payload) if documentation_sidecar else ()
+        fenced_code_ranges = (
+            cls._documentation_fenced_code_ranges(payload)
+            if documentation_sidecar and cls._documentation_uses_markdown_fences(path)
+            else ()
+        )
         last_retargetable_index = max(
             (index for index, finding in enumerate(findings) if cls._documentation_finding_tokens(finding)),
             default=-1,
