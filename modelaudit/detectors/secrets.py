@@ -20,7 +20,7 @@ BASIC_AUTH_TOKEN_MAX_LENGTH = 8192
 BASIC_AUTH_CONFIDENCE = 0.8
 BASIC_AUTH_TOKEN_TERMINATOR = r"(?=$|[\s\"'`,;<\]\)}]|\\[\"'])"
 BASIC_AUTH_PATTERN = (
-    rf"\bBasic\s+([A-Za-z0-9+/]{{2,{BASIC_AUTH_TOKEN_MAX_LENGTH}}}={{0,2}}){BASIC_AUTH_TOKEN_TERMINATOR}"
+    rf"\bBasic[ \t]+([A-Za-z0-9+/]{{2,{BASIC_AUTH_TOKEN_MAX_LENGTH}}}={{0,2}}){BASIC_AUTH_TOKEN_TERMINATOR}"
 )
 BASIC_AUTH_HEADER_VALUE_CONTEXT_MAX_BYTES = BASIC_AUTH_TOKEN_MAX_LENGTH + 64
 
@@ -378,6 +378,15 @@ def _canonical_basic_auth_header_name(value: str) -> str | None:
 
 def _is_basic_auth_header_name(value: str) -> bool:
     return _canonical_basic_auth_header_name(value) is not None
+
+
+def _canonical_basic_auth_header_key(value: object) -> str | None:
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+    return _canonical_basic_auth_header_name(str(value))
 
 
 class SecretsDetector:
@@ -944,7 +953,12 @@ class SecretsDetector:
 
         return findings
 
-    def scan_dict(self, data: dict[str, Any], context: str = "") -> list[dict[str, Any]]:
+    def scan_dict(
+        self,
+        data: dict[str, Any],
+        context: str = "",
+        basic_auth_header_name: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Recursively scan dictionary structures for secrets.
 
         Args:
@@ -966,13 +980,13 @@ class SecretsDetector:
             findings.extend(key_findings)
 
             # Check the value
-            header_name = _canonical_basic_auth_header_name(str(key))
+            header_name = _canonical_basic_auth_header_key(key) or basic_auth_header_name
             if isinstance(value, str):
                 findings.extend(self._scan_basic_auth_header_text_value(value, header_name, key_context))
             elif isinstance(value, bytes):
                 findings.extend(self._scan_basic_auth_header_bytes_value(value, header_name, key_context))
             elif isinstance(value, dict):
-                findings.extend(self.scan_dict(value, key_context))
+                findings.extend(self.scan_dict(value, key_context, header_name))
             elif isinstance(value, list | tuple):
                 for i, item in enumerate(value):
                     item_context = f"{key_context}[{i}]"
@@ -981,7 +995,7 @@ class SecretsDetector:
                     elif isinstance(item, bytes):
                         findings.extend(self._scan_basic_auth_header_bytes_value(item, header_name, item_context))
                     elif isinstance(item, dict):
-                        findings.extend(self.scan_dict(item, item_context))
+                        findings.extend(self.scan_dict(item, item_context, header_name))
 
         return findings
 

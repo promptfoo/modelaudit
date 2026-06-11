@@ -194,6 +194,30 @@ class TestSecretsDetector:
                 _basic_auth_token(b"proxy-bracket:pass"),
             ),
             (
+                f'AUTH_HEADER = f"Authorization: Basic {_basic_auth_token(b"py-fstring:pass")}"',
+                _basic_auth_token(b"py-fstring:pass"),
+            ),
+            (
+                f'AUTH_HEADER = b"Authorization: Basic {_basic_auth_token(b"py-bytes:pass")}"',
+                _basic_auth_token(b"py-bytes:pass"),
+            ),
+            (
+                f"AUTH_HEADER = r'Authorization: Basic {_basic_auth_token(b'py-raw:pass')}'",
+                _basic_auth_token(b"py-raw:pass"),
+            ),
+            (
+                f"const auth = `Authorization: Basic {_basic_auth_token(b'js-template:pass')}`;",
+                _basic_auth_token(b"js-template:pass"),
+            ),
+            (
+                f'ENV AUTH_HEADER="Authorization: Basic {_basic_auth_token(b"docker-env:pass")}"',
+                _basic_auth_token(b"docker-env:pass"),
+            ),
+            (
+                f'env:\n- name: AUTH_HEADER\n  value: "Authorization: Basic {_basic_auth_token(b"k8s-env:pass")}"',
+                _basic_auth_token(b"k8s-env:pass"),
+            ),
+            (
                 f"proxy_authorization: Basic {_basic_auth_token(b'raw-alias:pass')}",
                 _basic_auth_token(b"raw-alias:pass"),
             ),
@@ -251,6 +275,8 @@ class TestSecretsDetector:
             f"Authorization: documented value\n  Basic {_basic_auth_token(b'wrapped:pass')}",
             f"Authorization notes:\n  - Basic {_basic_auth_token(b'listed:pass')}",
             f"Authorization:\n\n  Basic {_basic_auth_token(b'gap:pass')}",
+            f"Authorization: Basic\n  {_basic_auth_token(b'newline-token:pass')}",
+            "Authorization: Basic\n" + ("padding\n" * 300) + _basic_auth_token(b"far-away:pass"),
             f"Authorization: Basic {'A' * (BASIC_AUTH_TOKEN_MAX_LENGTH + 1)}",
             "https://user:pass@example.test/model.bin",
             f"https://example.test/?header=Authorization%3A%20Basic%20{_basic_auth_token(b'percent:pass')}",
@@ -278,7 +304,9 @@ class TestSecretsDetector:
         "data",
         [
             {"Authorization": b"Basic c3RydWN0dXJlZC1ieXRlczpzM2NyM3Q="},
+            {b"Authorization": b"Basic c3RydWN0dXJlZC1ieXRlLWtleTpzM2NyM3Q="},
             {"Authorization": ("Basic c3RydWN0dXJlZC10dXBsZTpzM2NyM3Q=",)},
+            {"Authorization": {"value": "Basic c3RydWN0dXJlZC13cmFwcGVkOnMzY3IzdA=="}},
             {"headers": {"proxy_authorization": ["Basic c3RydWN0dXJlZC1saXN0OnMzY3IzdA=="]}},
         ],
     )

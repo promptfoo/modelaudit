@@ -179,6 +179,56 @@ def test_text_scanner_executable_basic_auth_header_stays_actionable(tmp_path: Pa
     )
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        '```python\nAUTH_HEADER = f"Authorization: Basic cHktZnN0cmluZzpwYXNz"\n```\n',
+        '```python\nAUTH_HEADER = b"Authorization: Basic cHktYnl0ZXM6cGFzcw=="\n```\n',
+        "```javascript\nconst auth = `Authorization: Basic anMtdGVtcGxhdGU6cGFzcw==`;\n```\n",
+        '```Dockerfile\nENV AUTH_HEADER="Authorization: Basic ZG9ja2VyLWVudjpwYXNz"\n```\n',
+        '```yaml\nenv:\n- name: AUTH_HEADER\n  value: "Authorization: Basic azhzLWVudjpwYXNz"\n```\n',
+    ],
+)
+def test_text_scanner_executable_basic_auth_literals_stay_actionable(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False, check_network_comm=False)
+
+    assert result.success is False
+    assert determine_exit_code(aggregate) == 1
+    assert any(
+        check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S702"
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+        and check.details.get("redacted_value") == "Basic <redacted>"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_basic_auth_does_not_bind_far_away_token(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "Authorization: Basic\n" + ("padding\n" * 300) + "ZmFyLWF3YXk6cGFzcw==\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False, check_network_comm=False)
+
+    assert result.success is True
+    assert determine_exit_code(aggregate) == 0
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+
+
 def test_text_scanner_url_userinfo_is_redacted_without_basic_auth_false_positive(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text('download = "https://user:pass@example.test/model.bin"\n', encoding="utf-8")
