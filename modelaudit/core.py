@@ -3583,10 +3583,11 @@ def scan_model_directory_or_file(
                     is_dvc_pointer
                     and not _scan_result_has_operational_error(file_result)
                     and not _metadata_has_incomplete_coverage(file_result.metadata or {})
-                    and not _records_have_incomplete_coverage_for_path(file_records, target)
                 ):
-                    scanned_dvc_paths.add(resolved_target)
-                    internally_scanned_dvc_paths.add(resolved_target)
+                    target_has_incomplete_record = _records_have_incomplete_coverage_for_path(file_records, target)
+                    if not target_has_incomplete_record:
+                        scanned_dvc_paths.add(resolved_target)
+                        internally_scanned_dvc_paths.add(resolved_target)
                     sharded_detection_families: list[set[str]] = []
                     for check in file_result.checks:
                         shard_paths = check.details.get("shards") if isinstance(check.details, dict) else None
