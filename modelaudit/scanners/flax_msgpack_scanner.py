@@ -396,7 +396,10 @@ def _contains_quoted_dunder_attribute_after_comma(value: str) -> bool:
         if quote_index < len(value) and value[quote_index] in {'"', "'"}:
             quote = value[quote_index]
             end_quote = value.find(quote, quote_index + 1)
-            if end_quote != -1:
+            if end_quote == -1:
+                if value[quote_index + 1 :].startswith("__"):
+                    return True
+            else:
                 attribute = value[quote_index + 1 : end_quote]
                 if attribute.startswith("__") and attribute.endswith("__"):
                     return True
@@ -2517,6 +2520,7 @@ class FlaxMsgpackScanner(BaseScanner):
         matched_patterns: dict[str, tuple[str, str]] = {}
         matched_transforms: dict[str, str] = {}
         unresolved_pattern_candidates: set[str] = set()
+        seen_pattern_anchors: dict[str, set[str]] = {}
         track_split_getattr_pattern = any(
             pattern == _UNBOUNDED_GETATTR_PATTERN for _, pattern, _, _ in self._binary_stream_pattern_matchers
         )
@@ -2533,14 +2537,28 @@ class FlaxMsgpackScanner(BaseScanner):
             pattern_candidates = [
                 (pattern, compiled_pattern, lowered_pattern)
                 for anchor, pattern, compiled_pattern, lowered_pattern in self._binary_stream_pattern_matchers
-                if pattern not in matched_patterns and anchor in raw_window_lower
+                if pattern not in self._stream_unsafe_pattern_anchors
+                and pattern not in matched_patterns
+                and anchor in raw_window_lower
             ]
+            unsafe_pattern_candidates = []
+            for pattern, compiled_pattern, lowered_pattern in self._compiled_suspicious_patterns:
+                if pattern not in self._stream_unsafe_pattern_anchors or pattern in matched_patterns:
+                    continue
+                anchors = self._stream_unsafe_pattern_anchors[pattern]
+                if anchors is None or any(anchor.lower().encode("utf-8") in raw_window_lower for anchor in anchors):
+                    unsafe_pattern_candidates.append((pattern, compiled_pattern, lowered_pattern))
             inspect_split_getattr_candidate = (
                 track_split_getattr_pattern
                 and _UNBOUNDED_GETATTR_PATTERN not in matched_patterns
                 and (b"getattr" in raw_window_lower or (saw_getattr_call_candidate and b"__" in raw_window_lower))
             )
-            if not transform_candidates and not pattern_candidates and not inspect_split_getattr_candidate:
+            if (
+                not transform_candidates
+                and not pattern_candidates
+                and not unsafe_pattern_candidates
+                and not inspect_split_getattr_candidate
+            ):
                 return
 
             raw_window = raw_bytes.decode("utf-8", errors="replace")
@@ -2558,18 +2576,33 @@ class FlaxMsgpackScanner(BaseScanner):
                 if transform not in matched_transforms:
                     matched_transforms[transform] = raw_window
 
-            for pattern, compiled_pattern, lowered_pattern in pattern_candidates:
-                if pattern in self._stream_unsafe_pattern_anchors:
-                    if pattern == _UNBOUNDED_GETATTR_PATTERN:
-                        match_sample: str | None = None
-                        if _contains_suspicious_getattr(raw_window):
-                            match_sample = raw_window
-                        elif _contains_suspicious_getattr(normalized_window):
-                            match_sample = normalized_window
-                        if match_sample is not None:
-                            matched_patterns[pattern] = (lowered_pattern, match_sample)
+            for pattern, _compiled_pattern, lowered_pattern in unsafe_pattern_candidates:
+                if pattern == _UNBOUNDED_GETATTR_PATTERN:
+                    match_sample: str | None = None
+                    if _contains_suspicious_getattr(raw_window):
+                        match_sample = raw_window
+                    elif _contains_suspicious_getattr(normalized_window):
+                        match_sample = normalized_window
+                    if match_sample is not None:
+                        matched_patterns[pattern] = (lowered_pattern, match_sample)
                     continue
 
+                anchors = self._stream_unsafe_pattern_anchors[pattern]
+                if anchors is None:
+                    unresolved_pattern_candidates.add(pattern)
+                    continue
+
+                anchor_matchers = self._stream_unsafe_anchor_matchers[pattern]
+                assert anchor_matchers is not None
+                seen_anchors = seen_pattern_anchors.setdefault(pattern, set())
+                window_anchors = {
+                    anchor for anchor, matcher in anchor_matchers if matcher.search(normalized_window) is not None
+                }
+                seen_anchors.update(window_anchors)
+                if len(seen_anchors) == len(anchors):
+                    unresolved_pattern_candidates.add(pattern)
+
+            for pattern, compiled_pattern, lowered_pattern in pattern_candidates:
                 match_sample = None
                 if compiled_pattern.search(raw_window):
                     match_sample = raw_window

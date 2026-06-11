@@ -1315,6 +1315,42 @@ def test_flax_msgpack_binary_anchor_scanner_fails_closed_for_split_getattr_dunde
     assert coverage_check.details["stream_overlap_chars"] == 4096
 
 
+def test_flax_msgpack_binary_anchor_scanner_fails_closed_for_unclosed_split_getattr_dunder() -> None:
+    first_chunk = (b"\x00" * 128) + b"getattr(object"
+    remaining = (b"x" * (64 * 1024)) + b", '__" + (b"a" * (64 * 1024)) + b"__')"
+    cursor = _MsgpackStreamCursor(io.BytesIO(remaining), len(remaining))
+    scanner = FlaxMsgpackScanner()
+    result = ScanResult("flax_msgpack")
+
+    scanner._analyze_streamed_binary_anchor_chunks(
+        first_chunk,
+        cursor,
+        len(remaining),
+        len(first_chunk) + len(remaining),
+        "root.params.blob",
+        result,
+    )
+
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    coverage_check = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
+    assert coverage_check.details["pattern"] == _UNBOUNDED_GETATTR_PATTERN
+
+
+def test_flax_msgpack_large_binary_fails_closed_for_split_stream_unsafe_custom_pattern(tmp_path: Path) -> None:
+    path = tmp_path / "large_binary_custom_stream_unsafe_pattern.msgpack"
+    payload = (b"\x00" * 128) + b"foo" + (b"x" * (64 * 1024 + 4096 + 100)) + b"bar"
+    create_msgpack_file(path, {"params": {"blob": payload}})
+
+    result = FlaxMsgpackScanner(config={"suspicious_patterns": [r"foo.*bar"]}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    coverage_check = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
+    assert coverage_check.details["pattern"] == r"foo.*bar"
+
+
 @pytest.mark.parametrize(
     ("pattern", "payload"),
     [
