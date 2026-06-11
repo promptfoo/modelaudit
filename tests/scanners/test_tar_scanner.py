@@ -990,6 +990,14 @@ class TestTarScanner:
         assert symlink_checks[0].rule_code == "S406"
         assert symlink_checks[0].severity == IssueSeverity.CRITICAL
         assert symlink_checks[0].details == {"target": "../../../etc/passwd", "entry": "link.txt"}
+        assert result.metadata["contents"] == [
+            {
+                "path": f"{archive_path}:link.txt",
+                "type": "tar_symlink",
+                "size": 0,
+                "scan_status": "rejected",
+            }
+        ]
 
     def test_parent_relative_symlink_within_archive_is_safe(self, tmp_path: Path) -> None:
         """A symlink may traverse its parent while remaining inside the archive root."""
@@ -1009,6 +1017,10 @@ class TestTarScanner:
         symlink_checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
         assert result.success is True
         assert symlink_checks == []
+        assert any(
+            entry["path"] == f"{archive_path}:nested/link.bin" and entry["scan_status"] == "link_validated"
+            for entry in result.metadata["contents"]
+        )
 
     def test_archive_root_relative_hardlink_within_archive_is_safe(self, tmp_path: Path) -> None:
         """TAR hardlink targets are resolved from the archive root, not the member parent."""
@@ -1093,6 +1105,14 @@ class TestTarScanner:
         assert link_checks[0].rule_code == "S406"
         assert link_checks[0].message == f"{expected_kind} nested/link.txt has an empty target"
         assert link_checks[0].details == {"target": "", "entry": "nested/link.txt"}
+        assert result.metadata["contents"] == [
+            {
+                "path": f"{archive_path}:nested/link.txt",
+                "type": "tar_symlink" if link_type == tarfile.SYMTYPE else "tar_hardlink",
+                "size": 0,
+                "scan_status": "rejected",
+            }
+        ]
 
     def test_symlink_outside_extraction_root_respects_s406_suppression(self, tmp_path: Path) -> None:
         """The dedicated link escape rule remains directly suppressible."""

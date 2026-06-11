@@ -223,6 +223,8 @@ class TarScanner(BaseScanner):
             if member.issparse():
                 return True
         except AttributeError:
+            # Older TarInfo-compatible objects may not expose issparse();
+            # continue with PAX sparse header detection below.
             pass
         return any(field in member.pax_headers for field in TAR_SPARSE_PAX_SIZE_FIELDS)
 
@@ -663,7 +665,6 @@ class TarScanner(BaseScanner):
                     continue
 
                 if member.issym() or member.islnk():
-                    contents.append(self._member_inventory_entry(path, member, scan_status="link_validated"))
                     target = member.linkname
                     link_kind = "Symlink" if member.issym() else "Hard link"
                     if target:
@@ -675,7 +676,9 @@ class TarScanner(BaseScanner):
                         )
                     else:
                         target_safe = False
+                    link_rejected = False
                     if not target_safe:
+                        link_rejected = True
                         # Check if it's specifically a critical system path
                         if is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
                             message = f"{link_kind} {name} points to critical system path: {target}"
@@ -693,6 +696,7 @@ class TarScanner(BaseScanner):
                             rule_code="S406",
                         )
                     elif is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
+                        link_rejected = True
                         result.add_check(
                             name="Symlink Safety Validation",
                             passed=False,
@@ -702,6 +706,13 @@ class TarScanner(BaseScanner):
                             details={"target": target, "entry": name},
                             rule_code="S406",
                         )
+                    contents.append(
+                        self._member_inventory_entry(
+                            path,
+                            member,
+                            scan_status="rejected" if link_rejected else "link_validated",
+                        )
+                    )
                     continue
 
                 if member.isdir():
