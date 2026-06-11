@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import re
@@ -308,8 +310,16 @@ _SUSPICIOUS_LICENSE_URL_PATH_SUFFIXES = (
     ".tsx",
     ".whl",
 )
-_OPAQUE_LICENSE_TOKEN_PATTERN = re.compile(r"\b[A-Za-z0-9+/=_-]{128,}\b")
+_OPAQUE_LICENSE_TOKEN_MIN_CHARS = 128
+_OPAQUE_LICENSE_TOKEN_PATTERN = re.compile(rf"\b[A-Za-z0-9+/=_-]{{{_OPAQUE_LICENSE_TOKEN_MIN_CHARS},}}\b")
+_BASE64_LICENSE_WRAP_LINE_MIN_CHARS = 32
+_BASE64_LICENSE_WRAP_MAX_LINES = 128
+_BASE64_LICENSE_WRAP_MAX_CHARS = 8192
+_BASE64_LICENSE_WRAP_MAX_DECODED_BYTES = 6144
+_BASE64_LICENSE_WRAP_LINE_PATTERN = re.compile(r"^[A-Za-z0-9+/_-]+={0,2}$")
 _SUSPICIOUS_LICENSE_URL_MARKERS = ("payload", "exfil", "webhook", "callback")
+_URL_PATH_NORMALIZATION_PASSES = 4
+_PERCENT_ENCODED_BYTE_PATTERN = re.compile(r"%[0-9a-fA-F]{2}")
 
 
 class SafeTensorsScanner(BaseScanner):
@@ -484,18 +494,77 @@ class SafeTensorsScanner(BaseScanner):
     def _license_document_line_looks_opaque(line: str) -> bool:
         return _OPAQUE_LICENSE_TOKEN_PATTERN.search(line) is not None
 
+    @staticmethod
+    def _license_document_line_is_wrapped_base64_fragment(line: str) -> bool:
+        return (
+            len(line) >= _BASE64_LICENSE_WRAP_LINE_MIN_CHARS
+            and not any(char.isspace() for char in line)
+            and _BASE64_LICENSE_WRAP_LINE_PATTERN.fullmatch(line) is not None
+        )
+
+    @staticmethod
+    def _base64_candidate_decodes(candidate: str) -> bool:
+        if len(candidate) < _OPAQUE_LICENSE_TOKEN_MIN_CHARS:
+            return False
+        if len(candidate) > _BASE64_LICENSE_WRAP_MAX_CHARS:
+            return True
+
+        normalized = candidate.replace("-", "+").replace("_", "/")
+        if "=" in normalized.rstrip("="):
+            return False
+        if len(normalized) % 4 == 1:
+            return False
+        padding = "=" * ((4 - len(normalized) % 4) % 4)
+        padded = f"{normalized}{padding}"
+        estimated_decoded_bytes = (len(padded) // 4) * 3
+        if estimated_decoded_bytes > _BASE64_LICENSE_WRAP_MAX_DECODED_BYTES:
+            return True
+        try:
+            decoded = base64.b64decode(padded, validate=True)
+        except binascii.Error:
+            return False
+        return len(decoded) >= (_OPAQUE_LICENSE_TOKEN_MIN_CHARS * 3) // 4
+
+    @classmethod
+    def _license_document_has_wrapped_opaque_token(cls, lines: list[str]) -> bool:
+        chunks: list[str] = []
+        total_chars = 0
+        total_lines = 0
+
+        def flush() -> bool:
+            return total_chars >= _OPAQUE_LICENSE_TOKEN_MIN_CHARS and cls._base64_candidate_decodes("".join(chunks))
+
+        for line in [*lines, ""]:
+            if cls._license_document_line_is_wrapped_base64_fragment(line):
+                total_lines += 1
+                total_chars += len(line)
+                if total_lines > _BASE64_LICENSE_WRAP_MAX_LINES or total_chars > _BASE64_LICENSE_WRAP_MAX_CHARS:
+                    return True
+                chunks.append(line)
+                continue
+
+            if flush():
+                return True
+            chunks = []
+            total_chars = 0
+            total_lines = 0
+
+        return False
+
     @classmethod
     def _license_document_body_is_bounded_and_coherent(cls, value: str) -> bool:
         if len(value) > _LICENSE_DOCUMENT_MAX_CHARS:
             return False
 
-        lines = [line.strip().lower() for line in value.splitlines() if line.strip()]
+        lines = [line.strip() for line in value.splitlines() if line.strip()]
         if not lines or any(len(line) > _LICENSE_DOCUMENT_MAX_LINE_CHARS for line in lines):
             return False
         if any(cls._license_document_line_looks_opaque(line) for line in lines):
             return False
+        if cls._license_document_has_wrapped_opaque_token(lines):
+            return False
 
-        documentary_lines = sum(cls._license_document_line_looks_documentary(line) for line in lines)
+        documentary_lines = sum(cls._license_document_line_looks_documentary(line.lower()) for line in lines)
         return documentary_lines / len(lines) > 0.5
 
     @staticmethod
@@ -503,29 +572,34 @@ class SafeTensorsScanner(BaseScanner):
         return hostname == suffix or hostname.endswith(f".{suffix}")
 
     @staticmethod
-    def _normalize_url_path(path: str) -> str:
+    def _normalize_url_path(path: str) -> tuple[str, bool]:
         normalized = path
-        for _ in range(4):
+        for _ in range(_URL_PATH_NORMALIZATION_PASSES):
             decoded = unquote(normalized)
             if decoded == normalized:
-                break
+                return normalized.lower(), False
             normalized = decoded
-        return normalized.lower()
+        return normalized.lower(), _PERCENT_ENCODED_BYTE_PATTERN.search(normalized) is not None
 
     @classmethod
-    def _url_path_segments(cls, path: str) -> list[str]:
-        return [segment for segment in cls._normalize_url_path(path).strip("/").split("/") if segment]
+    def _url_path_segments(cls, path: str) -> tuple[list[str], bool]:
+        normalized_path, has_residual_encoding = cls._normalize_url_path(path)
+        return [segment for segment in normalized_path.strip("/").split("/") if segment], has_residual_encoding
 
     @classmethod
     def _url_path_has_suspicious_target(cls, path: str) -> bool:
-        segments = cls._url_path_segments(path)
+        segments, has_residual_encoding = cls._url_path_segments(path)
+        if has_residual_encoding:
+            return True
         return any(segment in _SUSPICIOUS_LICENSE_URL_PATH_COMPONENTS for segment in segments) or any(
             segment.endswith(suffix) for segment in segments for suffix in _SUSPICIOUS_LICENSE_URL_PATH_SUFFIXES
         )
 
     @classmethod
     def _url_path_looks_like_license_reference(cls, hostname: str, path: str) -> bool:
-        segments = cls._url_path_segments(path)
+        segments, has_residual_encoding = cls._url_path_segments(path)
+        if has_residual_encoding:
+            return False
 
         if cls._url_host_matches_suffix(hostname, "github.com") and len(segments) == 2:
             return True

