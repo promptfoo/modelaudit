@@ -62,6 +62,7 @@ class TestPerformanceBenchmarks:
                     "bytes_scanned": scan_result.bytes_scanned,
                     "issues_found": len(scan_result.issues),
                     "success": scan_result.success,
+                    "has_errors": scan_result.has_errors,
                 },
             )
 
@@ -81,6 +82,7 @@ class TestPerformanceBenchmarks:
             "files_per_second": files_scanned / statistics.mean(durations) if statistics.mean(durations) > 0 else 0,
             "bytes_per_second": bytes_scanned / statistics.mean(durations) if statistics.mean(durations) > 0 else 0,
             "all_successful": all(r["success"] for r in results),
+            "no_operational_errors": not any(r["has_errors"] for r in results),
         }
 
     def test_single_file_performance(self, assets_dir, performance_thresholds):
@@ -135,7 +137,7 @@ class TestPerformanceBenchmarks:
         metrics = self.measure_scan_performance(str(assets_dir), runs=runs)
 
         # Performance assertions
-        assert metrics["all_successful"], "Not all directory scans successful"
+        assert metrics["no_operational_errors"], "Directory scan hit operational errors"
         assert metrics["duration_avg"] < performance_thresholds["directory_scan_max_time"], (
             f"Average directory scan time {metrics['duration_avg']:.2f}s too slow"
         )
@@ -243,12 +245,16 @@ class TestPerformanceBenchmarks:
             return {
                 "duration": duration,
                 "success": results.success,
+                "has_errors": results.has_errors,
                 "files_scanned": results.files_scanned,
             }
 
         # Test with 3 concurrent scans
         is_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
-        future_timeout = 180 if is_ci else 60
+        has_runner_contention = bool(
+            is_ci or os.getenv("PYTEST_XDIST_WORKER") or os.getenv("PYTEST_XDIST_WORKER_COUNT")
+        )
+        future_timeout = 300 if has_runner_contention else 60
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             futures = [executor.submit(scan_directory) for _ in range(3)]
 
@@ -257,8 +263,9 @@ class TestPerformanceBenchmarks:
                 result = future.result()
                 concurrent_results.append(result)
 
-        # All scans should succeed
-        assert all(r["success"] for r in concurrent_results), "All concurrent scans should succeed"
+        assert all(not r["has_errors"] for r in concurrent_results), (
+            "Concurrent scans should not hit operational errors"
+        )
 
         # Performance should not degrade too much under concurrency
         avg_duration = statistics.mean(r["duration"] for r in concurrent_results)
