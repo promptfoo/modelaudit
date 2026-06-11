@@ -1,5 +1,6 @@
 """Tests for modelaudit.models module."""
 
+import json
 import time
 from typing import Any
 
@@ -790,6 +791,27 @@ def test_merge_member_result_bounds_retained_member_hashes_without_quadratic_cop
     records = _member_records_for_segments(parent, ["payload.pkl"])
     assert records[0]["occurrence"] == 1
     assert records[-1]["occurrence"] == MAX_MEMBER_FILE_HASH_RECORDS
+
+
+def test_merge_member_result_bounds_private_occurrence_state_for_unique_truncated_members() -> None:
+    parent = ScanResult(scanner_name="zip")
+    parent.metadata["file_hashes"] = {"sha256": "a" * 64}
+
+    for index in range(MAX_MEMBER_FILE_HASH_RECORDS + 2):
+        parent.merge_member_result(_scan_result_with_sha256(f"{index:064x}"[-64:]), f"payload-{index}.pkl")
+
+    member_hashes = parent.metadata["member_file_hashes"]
+    assert len(member_hashes) == MAX_MEMBER_FILE_HASH_RECORDS
+    assert parent.metadata["member_file_hashes_total"] == MAX_MEMBER_FILE_HASH_RECORDS + 2
+    assert parent.metadata["member_file_hashes_truncated"] is True
+    assert parent.metadata["member_file_hashes_omitted"] == 2
+
+    private_occurrences = parent._private_metadata["member_file_hash_occurrences"]
+    assert isinstance(private_occurrences, dict)
+    assert len(private_occurrences) == MAX_MEMBER_FILE_HASH_RECORDS
+    first_omitted_key = json.dumps([f"payload-{MAX_MEMBER_FILE_HASH_RECORDS}.pkl"], separators=(",", ":"))
+    assert first_omitted_key not in private_occurrences
+    assert _member_records_for_segments(parent, [f"payload-{MAX_MEMBER_FILE_HASH_RECORDS}.pkl"]) == []
 
 
 class TestScanConfigModel:

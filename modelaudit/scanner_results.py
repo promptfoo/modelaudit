@@ -655,10 +655,6 @@ class ScanResult:
             self.metadata[MEMBER_FILE_HASHES_METADATA_KEY] = member_hashes
 
         occurrences, stored_count = self._ensure_member_file_hash_state()
-        normalized_segments = [str(segment) for segment in path_segments]
-        path_key = _member_path_segments_key(normalized_segments)
-        occurrence = occurrences.get(path_key, 0) + 1
-        occurrences[path_key] = occurrence
 
         existing_total = self.metadata.get(MEMBER_FILE_HASHES_TOTAL_METADATA_KEY)
         self.metadata[MEMBER_FILE_HASHES_TOTAL_METADATA_KEY] = (
@@ -668,6 +664,11 @@ class ScanResult:
         if stored_count >= MAX_MEMBER_FILE_HASH_RECORDS:
             self._record_member_file_hash_omission()
             return
+
+        normalized_segments = [str(segment) for segment in path_segments]
+        path_key = _member_path_segments_key(normalized_segments)
+        occurrence = occurrences.get(path_key, 0) + 1
+        occurrences[path_key] = occurrence
 
         stored_record = _deep_mutable_copy(record)
         stored_record["path_segments"] = normalized_segments
