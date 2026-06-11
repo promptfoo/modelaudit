@@ -452,6 +452,10 @@ DOCUMENTATION_FENCED_DIRECT_URL_CALL_PATTERN = re.compile(
     rb"(?P<url>https?://[^\"'\s)]+)",
     re.IGNORECASE,
 )
+DOCUMENTATION_FENCED_REQUESTS_CALL_PATTERN = re.compile(
+    rb"\brequests\.(?P<method>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
+    re.IGNORECASE,
+)
 DOCUMENTATION_PIP_OPTION_WITH_ARGUMENT = (
     rb"--(?:cache-dir|cert|client-cert|exists-action|keyring-provider|log|proxy|python|retries|"
     rb"resume-retries|root-user-action|timeout|trusted-host|use-deprecated|use-feature)"
@@ -1421,6 +1425,11 @@ class TextScanner(BaseScanner):
     @classmethod
     def _documentation_fenced_passive_network_example_is_informational(cls, fenced_code: bytes) -> bool:
         if DOCUMENTATION_FENCED_SHELL_EXECUTION_PATTERN.search(fenced_code):
+            return False
+        if any(
+            match.group("method").lower() not in {b"get", b"head"}
+            for match in DOCUMENTATION_FENCED_REQUESTS_CALL_PATTERN.finditer(fenced_code)
+        ):
             return False
         if any(
             not cls._documentation_loopback_api_url_is_informational(
