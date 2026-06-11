@@ -5802,20 +5802,46 @@ class TestLargeOnnxFileBackedInspection:
         assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
 
     @pytest.mark.integration
-    def test_pinned_huggingface_large_onnx_reaches_file_backed_terminal_scan(self) -> None:
+    @pytest.mark.parametrize(
+        ("repo_id", "revision", "expected_size"),
+        [
+            (
+                "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+                "4328cf26390c98c5e3c738b4460a05b95f4911f5",
+                1_110_068_629,
+            ),
+            (
+                "BAAI/bge-reranker-base",
+                "2cfc18c9415c912f9d8155881c133215df768a70",
+                1_112_459_588,
+            ),
+        ],
+    )
+    def test_pinned_huggingface_large_onnx_reaches_file_backed_terminal_scan(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        repo_id: str,
+        revision: str,
+        expected_size: int,
+    ) -> None:
         from huggingface_hub import hf_hub_download
+
+        def _fail_string_parse(_data: bytes) -> Any:
+            raise AssertionError("pinned large ONNX scan should not parse from a full bytes buffer")
+
+        monkeypatch.setattr(onnx, "load_model_from_string", _fail_string_parse)
 
         path = Path(
             hf_hub_download(
-                repo_id="sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
-                revision="4328cf26390c98c5e3c738b4460a05b95f4911f5",
+                repo_id=repo_id,
+                revision=revision,
                 filename="onnx/model.onnx",
             ),
         )
 
         result = OnnxScanner().scan(str(path))
 
-        assert path.stat().st_size == 1_110_068_629
+        assert path.stat().st_size == expected_size
         assert result.bytes_scanned == path.stat().st_size
         assert result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
         assert result.metadata["onnx_structure_parse"]["omitted_raw_data_bytes"] > 1_000_000_000
