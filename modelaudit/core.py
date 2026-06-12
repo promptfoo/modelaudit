@@ -69,7 +69,7 @@ from modelaudit.scanners.archive_dispatch import (
     merge_inconclusive_flax_msgpack_outcome,
     merge_safetensors_overlap_analysis,
 )
-from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
+from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
 from modelaudit.scanners.mxnet_scanner import MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY
 from modelaudit.scanners.safetensors_scanner import MAX_HEADER_BYTES as SAFETENSORS_MAX_HEADER_BYTES
 from modelaudit.scanners.xgboost_scanner import (
@@ -2603,6 +2603,16 @@ def _should_defer_hash_for_safetensors_header_limit(file_path: str, config: dict
     return should_defer_safetensors_header_limit_hash(file_path, max_header_bytes)
 
 
+def _should_defer_hash_for_file_backed_hdf5(file_path: str) -> bool:
+    """Avoid pre-dispatch whole-file hashing for HDF5 scans handled through h5py metadata traversal."""
+    try:
+        file_size = os.path.getsize(file_path)
+    except OSError:
+        return False
+
+    return file_size > DEFAULT_MAX_FILE_READ_SIZE and find_hdf5_signature_offset(file_path) is not None
+
+
 def _should_defer_hash_for_max_file_size(file_path: str, config: dict[str, Any]) -> bool:
     """Avoid hashing files that regular scanning will reject on max_file_size."""
     try:
@@ -2636,9 +2646,44 @@ def _should_defer_hash_for_max_total_size(
     return hashed_bytes > max_total_size
 
 
+_FILE_BACKED_HDF5_UNHASHABLE_PREFIX = "unhashable_file_backed_hdf5_"
+
+
+def _is_file_backed_hdf5_hash_placeholder(content_hash: str) -> bool:
+    return content_hash.startswith(_FILE_BACKED_HDF5_UNHASHABLE_PREFIX)
+
+
+def _directory_owner_hash_is_unverifiable(
+    content_hash: str,
+    *,
+    allow_file_backed_hdf5: bool,
+) -> bool:
+    if not content_hash.startswith("unhashable_"):
+        return False
+    return not (allow_file_backed_hdf5 and _is_file_backed_hdf5_hash_placeholder(content_hash))
+
+
+def _directory_owner_hash_changed(
+    before_hash: str | None,
+    after_hash: str | None,
+    *,
+    allow_file_backed_hdf5: bool,
+) -> bool:
+    if before_hash == after_hash:
+        return False
+    return not (
+        allow_file_backed_hdf5
+        and isinstance(before_hash, str)
+        and isinstance(after_hash, str)
+        and _is_file_backed_hdf5_hash_placeholder(before_hash)
+        and _is_file_backed_hdf5_hash_placeholder(after_hash)
+    )
+
+
 def _is_incomplete_aggregate_hash_placeholder(content_hash: str) -> bool:
     return content_hash.startswith(
         (
+            _FILE_BACKED_HDF5_UNHASHABLE_PREFIX,
             "unhashable_max_file_size_",
             "unhashable_max_total_size_",
             "unhashable_timeout_",
@@ -2679,6 +2724,9 @@ def _hash_files_by_path(
         routing_path = routing_paths.get(file_path, file_path) if routing_paths is not None else file_path
         if _should_defer_hash_for_safetensors_header_limit(routing_path, hash_config):
             content_hashes[file_path] = f"unhashable_bounded_safetensors_{id(file_path)}"
+            continue
+        if _should_defer_hash_for_file_backed_hdf5(routing_path):
+            content_hashes[file_path] = f"unhashable_file_backed_hdf5_{id(file_path)}"
             continue
         if should_defer_hash_for_pytorch_read_limit(routing_path, hash_config):
             content_hashes[file_path] = f"unhashable_pytorch_zip_read_limit_{id(file_path)}"
@@ -2799,6 +2847,7 @@ def _directory_owner_scan_path(
     config: dict[str, Any],
     deadline: float,
     force_staged: bool = False,
+    require_bound: bool = False,
     source_paths_by_owner_path: dict[str, str] | None = None,
 ) -> Iterator[str]:
     """Yield a bound or hash-verified copied path for logical directory-owner scanning."""
@@ -2807,6 +2856,8 @@ def _directory_owner_scan_path(
             try:
                 owner_scan_path = scan_path_stack.enter_context(_bound_directory_owner_scan_path(root_path))
             except OSError:
+                if require_bound:
+                    raise
                 owner_scan_path = scan_path_stack.enter_context(
                     _staged_directory_owner_scan_path(
                         root_path,
@@ -2818,6 +2869,8 @@ def _directory_owner_scan_path(
                     ),
                 )
         else:
+            if require_bound:
+                raise OSError("Descriptor-backed directory owner path required for deferred source hashes")
             owner_scan_path = scan_path_stack.enter_context(
                 _staged_directory_owner_scan_path(
                     root_path,
@@ -4239,11 +4292,41 @@ def scan_model_directory_or_file(
                         source: owner_hash_for_source(hashes_by_source, source) or f"unhashable_{id(source)}"
                         for source in owner_sources
                     }
-                    if owner_block_reason is None and any(
-                        hash_value.startswith("unhashable_") for hash_value in owner_hashes_before.values()
-                    ):
-                        owner_block_reason = "directory_owner_snapshot_incomplete"
-                        owner_block_details = {"unhashable_source_count": 1}
+                    file_backed_hdf5_owner_source_count = sum(
+                        _is_file_backed_hdf5_hash_placeholder(hash_value) for hash_value in owner_hashes_before.values()
+                    )
+                    allow_file_backed_hdf5_owner_hashes = False
+                    if owner_block_reason is None:
+                        unverifiable_owner_hash_count = sum(
+                            _directory_owner_hash_is_unverifiable(
+                                hash_value,
+                                allow_file_backed_hdf5=True,
+                            )
+                            for hash_value in owner_hashes_before.values()
+                        )
+                        if unverifiable_owner_hash_count:
+                            owner_block_reason = "directory_owner_snapshot_incomplete"
+                            owner_block_details = {"unhashable_source_count": unverifiable_owner_hash_count}
+                        elif file_backed_hdf5_owner_source_count:
+                            if directory_owner_content_source_paths:
+                                owner_block_reason = "directory_owner_snapshot_incomplete"
+                                owner_block_details = {
+                                    "requires_descriptor_bound_owner": True,
+                                    "unhashable_source_count": file_backed_hdf5_owner_source_count,
+                                }
+                            else:
+                                try:
+                                    with _bound_directory_owner_scan_path(owner_root_path):
+                                        pass
+                                except OSError as error:
+                                    owner_block_reason = "directory_owner_snapshot_incomplete"
+                                    owner_block_details = {
+                                        "error_type": type(error).__name__,
+                                        "requires_descriptor_bound_owner": True,
+                                        "unhashable_source_count": file_backed_hdf5_owner_source_count,
+                                    }
+                                else:
+                                    allow_file_backed_hdf5_owner_hashes = True
 
                     owner_snapshot_before_dispatch = directory_owner_initial_snapshot
                     if owner_block_reason is None:
@@ -4312,6 +4395,7 @@ def scan_model_directory_or_file(
                                 config=owner_hash_config,
                                 deadline=start_time + timeout,
                                 force_staged=bool(directory_owner_content_source_paths),
+                                require_bound=allow_file_backed_hdf5_owner_hashes,
                                 source_paths_by_owner_path=directory_owner_content_source_paths,
                             ) as directory_owner_scan_path:
                                 owner_scan_started = True
@@ -4401,16 +4485,26 @@ def scan_model_directory_or_file(
                         changed_owner_sources = [
                             source
                             for source in owner_sources
-                            if owner_hashes_before.get(source) != owner_hashes_after.get(source)
+                            if _directory_owner_hash_changed(
+                                owner_hashes_before.get(source),
+                                owner_hashes_after.get(source),
+                                allow_file_backed_hdf5=allow_file_backed_hdf5_owner_hashes,
+                            )
                         ]
                         if post_snapshot_reason is None and changed_owner_sources:
                             post_snapshot_reason = "directory_owner_source_changed"
                             post_snapshot_details = {"changed_source_count": len(changed_owner_sources)}
-                        if post_snapshot_reason is None and any(
-                            hash_value.startswith("unhashable_") for hash_value in owner_hashes_after.values()
-                        ):
-                            post_snapshot_reason = "directory_owner_snapshot_incomplete"
-                            post_snapshot_details = {"unhashable_source_count": 1}
+                        if post_snapshot_reason is None:
+                            unverifiable_owner_hash_count = sum(
+                                _directory_owner_hash_is_unverifiable(
+                                    hash_value,
+                                    allow_file_backed_hdf5=allow_file_backed_hdf5_owner_hashes,
+                                )
+                                for hash_value in owner_hashes_after.values()
+                            )
+                            if unverifiable_owner_hash_count:
+                                post_snapshot_reason = "directory_owner_snapshot_incomplete"
+                                post_snapshot_details = {"unhashable_source_count": unverifiable_owner_hash_count}
 
                         assert directory_owner_result is not None
                         if post_snapshot_reason is not None:
@@ -4938,11 +5032,17 @@ def scan_model_directory_or_file(
                     hashed_bytes=top_level_hashed_bytes,
                 )
                 defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(target, config)
+                defer_hash_for_file_backed_hdf5 = _should_defer_hash_for_file_backed_hdf5(target)
                 defer_hash_for_pytorch_read_limit = should_defer_hash_for_pytorch_read_limit(
                     target,
                     config,
                 )
-                if defer_hash_for_max_total_size or defer_hash_for_max_file_size or defer_hash_for_pytorch_read_limit:
+                if (
+                    defer_hash_for_max_total_size
+                    or defer_hash_for_max_file_size
+                    or defer_hash_for_file_backed_hdf5
+                    or defer_hash_for_pytorch_read_limit
+                ):
                     aggregate_hash_complete = False
                 if defer_hash_for_pytorch_read_limit:
                     target_config = dict(target_config)
@@ -4951,6 +5051,7 @@ def scan_model_directory_or_file(
                     not _should_defer_hash_for_safetensors_header_limit(target, config)
                     and not defer_hash_for_max_file_size
                     and not defer_hash_for_max_total_size
+                    and not defer_hash_for_file_backed_hdf5
                     and not defer_hash_for_pytorch_read_limit
                 ):
                     try:
@@ -6643,8 +6744,14 @@ def scan_model_streaming(
             hashed_bytes=top_level_hashed_bytes,
         )
         defer_hash_for_max_file_size = _should_defer_hash_for_max_file_size(str(scan_path), scan_config)
+        defer_hash_for_file_backed_hdf5 = _should_defer_hash_for_file_backed_hdf5(str(scan_path))
         defer_hash_for_pytorch_read_limit = should_defer_hash_for_pytorch_read_limit(str(scan_path), scan_config)
-        if defer_hash_for_max_total_size or defer_hash_for_max_file_size or defer_hash_for_pytorch_read_limit:
+        if (
+            defer_hash_for_max_total_size
+            or defer_hash_for_max_file_size
+            or defer_hash_for_file_backed_hdf5
+            or defer_hash_for_pytorch_read_limit
+        ):
             aggregate_hash_complete = False
             return None
         if _should_defer_hash_for_safetensors_header_limit(str(scan_path), scan_config):
