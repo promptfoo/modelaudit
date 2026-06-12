@@ -690,9 +690,9 @@ class ZipScanner(BaseScanner):
 
         descriptor_widths = {entry.uses_zip64_sizes or local_uses_zip64_sizes}
         local_zip64_data = cls._zip64_extra_field(extra)
-        if local_zip64_data is not None and len(local_zip64_data) >= 16:
-            # Python 3.10 can write zero local sizes with a ZIP64 extra field and
-            # still emit the 64-bit descriptor selected by force_zip64=True.
+        if local_zip64_data is not None:
+            # Python/PyTorch can write streamed members with zero local sizes and
+            # a partial ZIP64 extra field, then still emit the 64-bit descriptor.
             descriptor_widths.add(True)
         descriptor_size = 24 if True in descriptor_widths else 16
         try:

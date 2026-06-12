@@ -18,12 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - keep strongly identified SentencePiece tokenizer `.model` artifacts, including custom-unknown models with disabled special tokens, out of XGBoost routing while preserving fail-closed `.model` ambiguity for malformed tails.
 - tolerate picklescan reports that omit private metadata
 - stream bounded Llamafile runtime coverage across preview gaps and report incomplete runtime reads or bounds
+- stream bounded PyTorch ZIP and legacy pickle metadata analysis for oversized legacy `.pt` and `.bin` shards instead of stopping at the generic read-size cap
 - distinguish PyTorch checkpoint producer-version metadata from active runtime CVE applicability, resolve runtime torch metadata only from trusted install roots, report unknown runtime applicability explicitly, carry same-revision repository SafeTensors inventory into PyTorch pickle applicability details, and preserve artifact-level pickle and tensor-structure findings
 - omit isolated C&C vocabulary tokens from strongly identified tokenizer vocabularies while preserving active network and command findings
 - downgrade filename/content mismatch findings only after an alternate ONNX scanner validates the protobuf format while keeping malformed, spoofed, polyglot, and incomplete routes actionable
 - restrict Jinja SSTI indicators to executable template spans so prose mentions of request handling do not produce critical findings
 - treat canonical storage persistent IDs as informational only after legacy PyTorch framing, storage tuples, and storage payloads validate completely
 - prefer validated SafeTensors framing over invalid pickle and weak-magic collisions while retaining security-bearing pickle overlaps
+- make Hugging Face streaming dry runs emit metadata-only previews without artifact downloads, scanner execution, or full scan-result JSON
 - report gated or unauthorized Hugging Face acquisitions as failed, inconclusive source outcomes without claiming artifact coverage, and preserve partial findings from interrupted Hugging Face streaming scans
 - show Hugging Face preview access notices when selected gated files have unknown sizes
 - treat known ONNX Runtime `com.microsoft` optimized-export operators as low-noise vendor metadata while preserving S1111 for unknown custom domains and ambiguous vendor claims

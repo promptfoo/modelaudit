@@ -179,6 +179,313 @@ def _display_error(error: object, path: str) -> str:
     return _escape_terminal_text(display_error)
 
 
+def _preview_size_text(size_bytes: object) -> str:
+    """Return a stable human-readable byte size for dry-run previews."""
+    if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes <= 0:
+        return "Unknown size"
+    if size_bytes >= 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+    if size_bytes >= 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.2f} MB"
+    if size_bytes >= 1024:
+        return f"{size_bytes / 1024:.2f} KB"
+    return f"{size_bytes} bytes"
+
+
+def _preview_inventory_size_text(size_bytes: object, unknown_size_count: object) -> str:
+    """Return a dry-run size string that marks incomplete selected-size inventory."""
+    if (
+        isinstance(size_bytes, int)
+        and not isinstance(size_bytes, bool)
+        and size_bytes > 0
+        and isinstance(unknown_size_count, int)
+        and not isinstance(unknown_size_count, bool)
+        and unknown_size_count > 0
+    ):
+        return f"At least {_preview_size_text(size_bytes)}"
+    return _preview_size_text(size_bytes)
+
+
+def _build_huggingface_dry_run_preview(
+    path: str,
+    runtime: "_ScanRuntimeConfig",
+    *,
+    source_kind: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a compact dry-run preview that is not a scan result payload."""
+    preview: dict[str, Any] = {
+        "dry_run": True,
+        "source": "huggingface",
+        "source_kind": source_kind,
+        "target": _display_scan_path(path),
+        "mode": "streaming" if runtime.scan_and_delete else "standard",
+        "artifact_downloads": 0,
+        "scanner_execution": False,
+    }
+    preview.update(metadata)
+    if runtime.scanner_selection_metadata is not None:
+        preview["scanner_selection"] = dict(runtime.scanner_selection_metadata)
+    return preview
+
+
+def _format_huggingface_dry_run_preview_text(preview: dict[str, Any]) -> str:
+    """Render one Hugging Face dry-run preview for human-readable output."""
+    target = _escape_terminal_text(preview.get("target", ""))
+    source_kind = _escape_terminal_text(str(preview.get("source_kind", "source")).replace("_", " "))
+    lines = [
+        f"📊 Preview for {style_text(target, fg='cyan')}:",
+        f"   Source: Hugging Face {source_kind}",
+    ]
+    if model_id := preview.get("model_id"):
+        lines.append(f"   Model: {_escape_terminal_text(model_id)}")
+    if filename := preview.get("filename"):
+        lines.append(f"   File: {_escape_terminal_text(filename)}")
+    if revision := preview.get("revision"):
+        lines.append(f"   Revision: {_escape_terminal_text(revision)}")
+    if resolved_revision := preview.get("resolved_revision"):
+        lines.append(f"   Resolved revision: {_escape_terminal_text(resolved_revision)}")
+    if "file_count" in preview:
+        lines.append(f"   Files: {_escape_terminal_text(preview['file_count'])}")
+    if "total_size_bytes" in preview or "size_bytes" in preview:
+        lines.append(f"   Size: {_escape_terminal_text(preview.get('human_size', 'Unknown size'))}")
+    inaccessible_gated_file_count = preview.get("inaccessible_gated_file_count")
+    if (
+        isinstance(inaccessible_gated_file_count, int)
+        and not isinstance(inaccessible_gated_file_count, bool)
+        and inaccessible_gated_file_count > 0
+    ):
+        gated_file_count = _escape_terminal_text(str(inaccessible_gated_file_count))
+        lines.append(f"   Access: {gated_file_count} selected file(s) are gated/inaccessible")
+    unknown_size_count = preview.get("unknown_size_count")
+    if isinstance(unknown_size_count, int) and not isinstance(unknown_size_count, bool) and unknown_size_count > 0:
+        lines.append(f"   Access: {_escape_terminal_text(str(unknown_size_count))} selected file size(s) unavailable")
+    lines.append(f"   Mode: {'Streaming dry run' if preview.get('mode') == 'streaming' else 'Dry run'}")
+    lines.append("   Artifact downloads: 0")
+    lines.append("   Scanner execution: none")
+    return "\n".join(lines)
+
+
+def _format_huggingface_dry_run_previews(previews: list[dict[str, Any]], output_format: str) -> str:
+    """Render collected Hugging Face dry-run previews."""
+    if output_format == "json":
+        payload: Any
+        payload = previews[0] if len(previews) == 1 else {"dry_run": True, "previews": previews}
+        return json.dumps(_JSON_VALUE_ADAPTER.dump_python(payload, mode="json"), indent=2)
+    return "\n\n".join(_format_huggingface_dry_run_preview_text(preview) for preview in previews)
+
+
+def _is_huggingface_dry_run_preview_path(path: str) -> bool:
+    """Return whether a path is handled by the Hugging Face dry-run preview planner."""
+    return is_huggingface_file_url(path) or is_huggingface_url(path)
+
+
+def _remaining_huggingface_plan_timeout_seconds(plan: Any) -> float | None:
+    """Return the remaining plan deadline for follow-up metadata requests."""
+    raw_deadline = getattr(plan, "deadline", None)
+    deadline = raw_deadline if isinstance(raw_deadline, (int, float)) and not isinstance(raw_deadline, bool) else None
+    if deadline is None:
+        return None
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        repo_id = getattr(plan, "repo_id", "repository")
+        raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+    return remaining
+
+
+def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeConfig") -> dict[str, Any]:
+    """Preview a Hugging Face repository scan without artifact downloads or scanners."""
+    from .utils.sources.huggingface import (
+        get_model_info,
+        plan_huggingface_model_download,
+        plan_huggingface_streaming_download,
+    )
+
+    if runtime.scan_and_delete:
+        plan = plan_huggingface_streaming_download(
+            path,
+            runtime.max_download_bytes,
+            timeout_seconds=runtime.timeout,
+            scannable_extensions=runtime.scannable_extensions,
+            scannable_filenames=runtime.scannable_filenames,
+            scannable_scanner_ids=runtime.scannable_scanner_ids,
+            allow_content_probes=False,
+            include_all_files=runtime.hf_stream_include_all_files,
+        )
+    else:
+        plan = plan_huggingface_model_download(
+            path,
+            runtime.max_download_bytes,
+            timeout_seconds=runtime.timeout,
+            allow_content_probes=False,
+        )
+
+    preview_timeout = _remaining_huggingface_plan_timeout_seconds(plan)
+    model_info_kwargs: dict[str, Any] = {"allow_content_probes": False}
+    if preview_timeout is not None:
+        model_info_kwargs["timeout_seconds"] = preview_timeout
+    if runtime.scan_and_delete:
+        model_info_kwargs["streaming_selection"] = True
+        model_info_kwargs["scannable_extensions"] = runtime.scannable_extensions
+        model_info_kwargs["scannable_filenames"] = runtime.scannable_filenames
+        model_info_kwargs["scannable_scanner_ids"] = runtime.scannable_scanner_ids
+        model_info_kwargs["include_all_files"] = runtime.hf_stream_include_all_files
+    model_info = get_model_info(path, **model_info_kwargs)
+    total_size = model_info.get("total_size")
+    preserved_metadata = {
+        key: model_info[key]
+        for key in (
+            "inaccessible_gated_file_count",
+            "inaccessible_gated_bytes",
+            "inaccessible_gated_files",
+            "unknown_size_count",
+            "unknown_size_files",
+            "inventory_status",
+            "inventory_error",
+            "gated",
+            "repo_file_count",
+        )
+        if key in model_info
+    }
+    return _build_huggingface_dry_run_preview(
+        path,
+        runtime,
+        source_kind="model",
+        metadata={
+            "model_id": model_info.get("model_id") or model_info.get("repo_id") or _display_scan_path(path),
+            "file_count": model_info.get("file_count", 0),
+            "total_size_bytes": total_size
+            if isinstance(total_size, int) and not isinstance(total_size, bool)
+            else None,
+            "human_size": _preview_inventory_size_text(total_size, model_info.get("unknown_size_count")),
+            "selected_file_count": len(plan.selected_files),
+            "metadata_only": True,
+            **preserved_metadata,
+        },
+    )
+
+
+def _get_huggingface_file_metadata(
+    repo_id: str,
+    revision: str,
+    filename: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Fetch direct Hugging Face file metadata without downloading file content."""
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as exc:
+        raise ImportError(
+            "huggingface-hub package is required for HuggingFace URL support. "
+            "Install with 'pip install modelaudit[huggingface]'"
+        ) from exc
+
+    def remaining_request_timeout() -> float | None:
+        if deadline is None:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+        return min(30.0, remaining)
+
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+    if deadline is not None:
+        from .utils.sources.huggingface import _run_huggingface_worker_with_deadline
+
+        worker_result = _run_huggingface_worker_with_deadline(
+            "get_path_sizes",
+            {
+                "repo_id": repo_id,
+                "filenames": [filename],
+                "requested_revision": revision,
+                "resolved_revision": None,
+                "request_timeout": remaining_request_timeout(),
+            },
+            deadline,
+            repo_id,
+        )
+        value = worker_result.get("value")
+        if not isinstance(value, dict):
+            raise RuntimeError(f"Hugging Face file metadata unavailable for {repo_id}/{filename} at {revision}")
+        resolved_revision = value.get("revision")
+        raw_sizes = value.get("sizes")
+        if not isinstance(raw_sizes, list):
+            raise RuntimeError(f"Hugging Face file metadata unavailable for {repo_id}/{filename} at {revision}")
+        file_size: int | None = None
+        found_file = False
+        for item in raw_sizes:
+            if not isinstance(item, dict) or item.get("path") != filename:
+                continue
+            found_file = True
+            raw_size = item.get("size")
+            file_size = (
+                raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
+            )
+            break
+        if not found_file:
+            raise FileNotFoundError(f"Hugging Face file metadata unavailable for {repo_id}/{filename} at {revision}")
+        bounded_metadata: dict[str, Any] = {"size_bytes": file_size}
+        if isinstance(resolved_revision, str) and resolved_revision and resolved_revision != revision:
+            bounded_metadata["resolved_revision"] = resolved_revision
+        return bounded_metadata
+
+    api = HfApi()
+    repo_info_kwargs: dict[str, Any] = {"revision": revision, "files_metadata": False}
+    repo_info = api.repo_info(repo_id, **repo_info_kwargs)
+    resolved_revision = getattr(repo_info, "sha", None)
+    metadata_revision = resolved_revision if isinstance(resolved_revision, str) and resolved_revision else revision
+    paths_info_kwargs: dict[str, Any] = {"revision": metadata_revision}
+    paths_info = api.get_paths_info(repo_id, [filename], **paths_info_kwargs)
+    file_info = next((item for item in paths_info if getattr(item, "path", None) == filename), None)
+    if file_info is None:
+        raise FileNotFoundError(f"Hugging Face file metadata unavailable for {repo_id}/{filename} at {revision}")
+
+    raw_size = getattr(file_info, "size", None)
+    size_bytes = raw_size if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0 else None
+    metadata: dict[str, Any] = {"size_bytes": size_bytes}
+    if isinstance(resolved_revision, str) and resolved_revision and resolved_revision != revision:
+        metadata["resolved_revision"] = resolved_revision
+    return metadata
+
+
+def _build_huggingface_file_dry_run_preview(path: str, runtime: "_ScanRuntimeConfig") -> dict[str, Any]:
+    """Preview a direct Hugging Face file scan without downloading it."""
+    from .utils.sources.huggingface import _format_size, _is_huggingface_commit_sha, parse_huggingface_file_url
+
+    repo_id, revision, filename = parse_huggingface_file_url(path)
+    file_metadata = _get_huggingface_file_metadata(repo_id, revision, filename, timeout_seconds=runtime.timeout)
+    size_bytes = file_metadata.get("size_bytes")
+    size_limit = runtime.max_download_bytes
+    if isinstance(size_limit, int) and not isinstance(size_limit, bool) and size_limit > 0:
+        resolved_revision = file_metadata.get("resolved_revision")
+        checked_revision = resolved_revision if isinstance(resolved_revision, str) else revision
+        if not _is_huggingface_commit_sha(checked_revision):
+            raise ValueError(
+                f"Unable to determine immutable revision for {_display_scan_path(path)}; refusing capped download"
+            )
+        if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes < 0:
+            raise ValueError(f"Unable to determine file size for {_display_scan_path(path)}; refusing capped download")
+        if size_bytes > size_limit:
+            raise ValueError(
+                f"File size ({_format_size(size_bytes)}) exceeds maximum allowed size ({_format_size(size_limit)})"
+            )
+    return _build_huggingface_dry_run_preview(
+        path,
+        runtime,
+        source_kind="file",
+        metadata={
+            "model_id": repo_id,
+            "revision": revision,
+            "filename": filename,
+            "total_size_bytes": size_bytes,
+            "human_size": _preview_size_text(size_bytes),
+            "metadata_only": True,
+            **file_metadata,
+        },
+    )
+
+
 class _OutputWriteError(click.ClickException):
     """Report output failures using the scan command's documented error code."""
 
@@ -1371,6 +1678,7 @@ class _ScanPathState:
     """Bookkeeping for scanned artifacts and deferred cleanup."""
 
     collect_dvc_coverage: bool = False
+    dry_run_previews: list[dict[str, Any]] = field(default_factory=list)
     scanned_paths: list[str] = field(default_factory=list)
     temp_cleanup_entries: list[tuple[str, bool]] = field(default_factory=list)
     sbom_paths_resolved: bool = False
@@ -1384,6 +1692,21 @@ class _ScanPathState:
         """Record an aggregate error that shard reconciliation does not own."""
         self.has_errors_outside_reconciled_shards = True
         audit_result.has_errors = True
+
+    def record_dry_run_preview(self, preview: dict[str, Any]) -> None:
+        """Record a source that was previewed without scanning."""
+        self.dry_run_previews.append(preview)
+
+    def has_no_scan_content(self, audit_result: ModelAuditResultModel) -> bool:
+        """Return whether no scanner populated the aggregate result."""
+        return (
+            audit_result.files_scanned == 0
+            and audit_result.bytes_scanned == 0
+            and not audit_result.issues
+            and not audit_result.checks
+            and not audit_result.assets
+            and not audit_result.scanner_names
+        )
 
     def record_non_shard_result_errors(self, scan_result: ModelAuditResultModel) -> None:
         """Preserve errors from results that cannot join final CLI shard reconciliation."""
@@ -2277,6 +2600,9 @@ def _configure_scan_logging(verbose: bool) -> None:
     logging.getLogger("modelaudit.core").setLevel(logging.WARNING)
     logging.getLogger("modelaudit.utils.helpers.secure_hasher").setLevel(logging.WARNING)
     logging.getLogger("modelaudit.cache.cache_manager").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("huggingface_hub.utils._http").setLevel(logging.WARNING)
 
 
 def _initialize_progress_tracking(
@@ -2443,6 +2769,23 @@ def _emit_scan_output(
                     click.echo(f"Found {len(visible_issues)} informational issue(s)")
             else:
                 click.echo("No security issues found")
+        return
+
+    if output_format == "text":
+        click.echo("\n" + "─" * 80)
+    click.echo(output_text)
+
+
+def _emit_huggingface_dry_run_output(
+    output_text: str,
+    *,
+    output: str | None,
+    output_format: str,
+) -> None:
+    """Write dry-run preview output without scan-result summaries."""
+    if output:
+        _write_output_text_file(output, output_text)
+        click.echo(f"Preview written to {_display_path(output)}")
         return
 
     if output_format == "text":
@@ -2764,10 +3107,13 @@ def _scan_local_or_downloaded_path(
         ]
         issue_count = len(visible_issues)
         has_critical = any(issue.severity == IssueSeverity.CRITICAL for issue in visible_issues)
+        is_inconclusive = not scan_results.success
 
         if spinner:
             spinner.text = f"Scanned {style_text(display_path, fg='cyan')}"
-            if issue_count == 0:
+            if issue_count == 0 and is_inconclusive:
+                spinner.fail(style_text("❔ Inconclusive", fg="yellow", bold=True))
+            elif issue_count == 0:
                 spinner.ok(style_text("✅ Clean", fg="green", bold=True))
             elif has_critical:
                 spinner.fail(
@@ -2786,7 +3132,9 @@ def _scan_local_or_downloaded_path(
                     ),
                 )
         elif runtime.show_styled_output:
-            if issue_count == 0:
+            if issue_count == 0 and is_inconclusive:
+                click.echo(f"Scanned {display_path}: Inconclusive")
+            elif issue_count == 0:
                 click.echo(f"Scanned {display_path}: Clean")
             else:
                 issues_str = "issue" if issue_count == 1 else "issues"
@@ -2836,17 +3184,19 @@ def _resolve_scan_source_for_path(
         display_path = _display_path(path)
         if dry_run:
             try:
-                repo_id, revision, filename = parse_huggingface_file_url(path)
-                if runtime.show_styled_output:
-                    click.echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:")
-                    click.echo("   Type: HuggingFace file")
-                    click.echo(f"   Repository: {_escape_terminal_text(repo_id)}")
-                    click.echo(f"   Revision: {_escape_terminal_text(revision)}")
-                    click.echo(f"   File: {_escape_terminal_text(filename)}")
-                return _SourceDispatchResult(actual_path=path, local_scan_required=False)
+                preview = _build_huggingface_file_dry_run_preview(path, runtime)
+                source_model_id, source_model_source = extract_model_id_from_path(path)
+                path_state.record_dry_run_preview(preview)
+                return _SourceDispatchResult(
+                    actual_path=path,
+                    local_scan_required=False,
+                    source_model_id=source_model_id,
+                    source_model_source=source_model_source,
+                )
             except Exception as exc:
                 error_msg = _display_error(exc, path)
-                click.echo(f"Error analyzing {display_path}: {error_msg}", err=True)
+                logger.error(f"Failed to preview Hugging Face file {display_path}: {error_msg}")
+                click.echo(f"Error previewing file from {display_path}: {error_msg}", err=True)
                 path_state.mark_non_shard_error(audit_result)
                 return None
 
@@ -2922,6 +3272,24 @@ def _resolve_scan_source_for_path(
 
     if is_huggingface_url(path):
         display_path = _display_path(path)
+        if dry_run:
+            try:
+                preview = _build_huggingface_model_dry_run_preview(path, runtime)
+                source_model_id, source_model_source = extract_model_id_from_path(path)
+                path_state.record_dry_run_preview(preview)
+                return _SourceDispatchResult(
+                    actual_path=path,
+                    local_scan_required=False,
+                    source_model_id=source_model_id,
+                    source_model_source=source_model_source,
+                )
+            except Exception as exc:
+                error_msg = _display_error(exc, path)
+                logger.error(f"Failed to preview Hugging Face model {display_path}: {error_msg}")
+                click.echo(f"Error previewing model from {display_path}: {error_msg}", err=True)
+                path_state.mark_non_shard_error(audit_result)
+                return None
+
         hf_stream_kwargs: dict[str, Any] = {}
         if runtime.scan_and_delete:
             if runtime.scannable_extensions is not None:
@@ -2937,44 +3305,6 @@ def _resolve_scan_source_for_path(
             hf_preview_kwargs.update(hf_stream_kwargs)
             hf_preview_kwargs["streaming_selection"] = True
             hf_preview_kwargs.setdefault("include_all_files", False)
-        if dry_run:
-            try:
-                model_info = get_model_info(path, **hf_preview_kwargs)
-                size_bytes = int(model_info.get("total_size") or 0)
-                inaccessible_gated_file_count = int(model_info.get("inaccessible_gated_file_count") or 0)
-                unknown_size_count = int(model_info.get("unknown_size_count") or 0)
-                if size_bytes == 0 and unknown_size_count:
-                    size_str = "Unknown size"
-                elif size_bytes >= 1024 * 1024 * 1024:
-                    size_str = f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
-                elif size_bytes >= 1024 * 1024:
-                    size_str = f"{size_bytes / (1024 * 1024):.2f} MB"
-                else:
-                    size_str = f"{size_bytes / 1024:.2f} KB"
-                if size_bytes > 0 and unknown_size_count:
-                    size_str = f"At least {size_str}"
-
-                if runtime.show_styled_output:
-                    click.echo(f"\n📊 Preview for {style_text(display_path, fg='cyan')}:")
-                    click.echo("   Type: HuggingFace model")
-                    click.echo(f"   Model: {_escape_terminal_text(str(model_info['model_id']))}")
-                    click.echo(f"   Size: {size_str} ({_escape_terminal_text(str(model_info['file_count']))} files)")
-                    if inaccessible_gated_file_count:
-                        gated_file_count = _escape_terminal_text(str(inaccessible_gated_file_count))
-                        click.echo(f"   Access: {gated_file_count} selected file(s) are gated/inaccessible")
-                    if unknown_size_count:
-                        click.echo(
-                            f"   Access: {_escape_terminal_text(str(unknown_size_count))} "
-                            "selected file size(s) unavailable"
-                        )
-                    if runtime.scan_and_delete:
-                        click.echo(style_text("   Mode: Streaming (scan and delete to save disk)", fg="cyan"))
-                return _SourceDispatchResult(actual_path=path, local_scan_required=False)
-            except Exception as exc:
-                error_msg = _display_error(exc, path)
-                click.echo(f"Error analyzing {display_path}: {error_msg}", err=True)
-                path_state.mark_non_shard_error(audit_result)
-                return None
 
         if runtime.show_styled_output:
             click.echo(f"\n📥 Preparing to download from {style_text(display_path, fg='cyan')}")
@@ -4232,6 +4562,22 @@ def scan_command(
     record_scan_started(list(paths), telemetry_options)
 
     expanded_paths = _resolve_scan_paths(paths, scan_start_time)
+    huggingface_preview_paths: list[str] = []
+    if dry_run:
+        huggingface_preview_paths = [path for path in expanded_paths if _is_huggingface_dry_run_preview_path(path)]
+        if huggingface_preview_paths and len(huggingface_preview_paths) != len(expanded_paths):
+            non_preview_paths = [
+                _display_path(path) for path in expanded_paths if not _is_huggingface_dry_run_preview_path(path)
+            ]
+            click.echo(
+                "Error: Hugging Face dry-run previews cannot be combined with paths that require scanning: "
+                f"{', '.join(non_preview_paths)}",
+                err=True,
+            )
+            record_scan_failed(time.time() - scan_start_time, "Mixed Hugging Face dry-run preview inputs")
+            flush_telemetry()
+            sys.exit(2)
+
     runtime = _resolve_scan_runtime_config(
         expanded_paths,
         format=format,
@@ -4252,6 +4598,14 @@ def scan_command(
         severity=severity,
         scan_start_time=scan_start_time,
     )
+    if dry_run and huggingface_preview_paths and runtime.output_format == "sarif":
+        click.echo(
+            "Error: Hugging Face dry-run previews support text or json output, not sarif",
+            err=True,
+        )
+        record_scan_failed(time.time() - scan_start_time, "Unsupported Hugging Face dry-run preview output")
+        flush_telemetry()
+        sys.exit(2)
     _show_scan_runtime_defaults(
         runtime,
         expanded_paths,
@@ -4359,6 +4713,32 @@ def scan_command(
     )
     audit_result.finalize_statistics()
     audit_result.deduplicate_issues()
+
+    if dry_run and huggingface_preview_paths and path_state.has_no_scan_content(audit_result):
+        try:
+            try:
+                if audit_result.has_errors:
+                    record_scan_failed(time.time() - scan_start_time, "Dry-run preview completed with errors")
+                    flush_telemetry()
+                    sys.exit(2)
+                if path_state.dry_run_previews:
+                    output_text = _format_huggingface_dry_run_previews(
+                        path_state.dry_run_previews, runtime.output_format
+                    )
+                    _emit_huggingface_dry_run_output(
+                        output_text,
+                        output=output,
+                        output_format=runtime.output_format,
+                    )
+            finally:
+                _cleanup_temp_artifacts(path_state.temp_cleanup_entries, verbose=verbose)
+        except _OutputWriteError:
+            record_scan_failed(time.time() - scan_start_time, "Unable to write scan output")
+            flush_telemetry()
+            raise
+        record_scan_completed(time.time() - scan_start_time, {"dry_run": True, "previews": path_state.dry_run_previews})
+        flush_telemetry()
+        sys.exit(0)
 
     try:
         try:
