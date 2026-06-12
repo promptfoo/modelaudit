@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import struct
@@ -21,9 +22,12 @@ from modelaudit.integrations.sarif_formatter import _create_results
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.flax_msgpack_scanner import (
+    _STREAM_TEXT_CHUNK_BYTES,
+    _STREAM_TEXT_OVERLAP_CHARS,
     _UNBOUNDED_GETATTR_PATTERN,
     FlaxMsgpackScanner,
     _matching_jax_transforms,
+    _MsgpackStreamCursor,
     _pattern_has_stream_unsafe_repeat,
 )
 from modelaudit.utils.file.detection import FLAX_MSGPACK_STRUCTURE_READ_BYTES
@@ -33,6 +37,128 @@ def create_msgpack_file(path: Path, data: Any) -> None:
     """Helper to create msgpack files with specific data."""
     with open(path, "wb") as f:
         f.write(msgpack.packb(data, use_bin_type=True))
+
+
+def _flax_ndarray_ext_value(
+    shape_values: list[int],
+    dtype: str,
+    payload: bytes,
+    *,
+    code: int = 1,
+) -> Any:
+    return msgpack.ExtType(code, msgpack.packb((shape_values, dtype, payload), use_bin_type=True))
+
+
+def _write_msgpack_str(output: Any, value: str) -> None:
+    encoded = value.encode()
+    if len(encoded) <= 31:
+        output.write(bytes([0xA0 | len(encoded)]))
+    elif len(encoded) <= 0xFF:
+        output.write(b"\xd9" + struct.pack(">B", len(encoded)))
+    elif len(encoded) <= 0xFFFF:
+        output.write(b"\xda" + struct.pack(">H", len(encoded)))
+    else:
+        output.write(b"\xdb" + struct.pack(">I", len(encoded)))
+    output.write(encoded)
+
+
+def _write_msgpack_uint(output: Any, value: int) -> None:
+    if value <= 0x7F:
+        output.write(bytes([value]))
+    elif value <= 0xFF:
+        output.write(b"\xcc" + struct.pack(">B", value))
+    elif value <= 0xFFFF:
+        output.write(b"\xcd" + struct.pack(">H", value))
+    elif value <= 0xFFFFFFFF:
+        output.write(b"\xce" + struct.pack(">I", value))
+    else:
+        output.write(b"\xcf" + struct.pack(">Q", value))
+
+
+def _msgpack_str_size(value: str) -> int:
+    length = len(value.encode())
+    if length <= 31:
+        return 1 + length
+    if length <= 0xFF:
+        return 2 + length
+    if length <= 0xFFFF:
+        return 3 + length
+    return 5 + length
+
+
+def _msgpack_uint_size(value: int) -> int:
+    if value <= 0x7F:
+        return 1
+    if value <= 0xFF:
+        return 2
+    if value <= 0xFFFF:
+        return 3
+    if value <= 0xFFFFFFFF:
+        return 5
+    return 9
+
+
+def _write_sparse_large_flax_tensor(
+    path: Path,
+    tensor_size: int,
+    *,
+    trailing_reduce: bool = False,
+    body_bytes: bytes | None = None,
+) -> None:
+    with path.open("wb") as output:
+        output.write(b"\x82" if trailing_reduce else b"\x81")
+        _write_msgpack_str(output, "params")
+        output.write(b"\x81")
+        _write_msgpack_str(output, "embedding")
+        output.write(b"\xc6" + struct.pack(">I", tensor_size))
+        if body_bytes is None:
+            output.seek(tensor_size - 1, os.SEEK_CUR)
+            output.write(b"\0")
+        else:
+            output.write(body_bytes)
+        if trailing_reduce:
+            _write_msgpack_str(output, "__reduce__")
+            _write_msgpack_str(output, "os.system")
+
+
+def _write_sparse_large_flax_ndarray_ext(
+    path: Path,
+    tensor_size: int,
+    *,
+    code: int = 1,
+    dtype: str = "float32",
+    shape_values: list[int] | None = None,
+    body_prefix: bytes = b"",
+    trailing_body: bytes = b"",
+    wrap_in_params: bool = True,
+) -> None:
+    shape_values = [tensor_size // 4] if shape_values is None else shape_values
+    metadata_size = 1 + 1 + sum(_msgpack_uint_size(dimension) for dimension in shape_values)
+    metadata_size += _msgpack_str_size(dtype) + 5
+    ext_size = metadata_size + tensor_size + len(trailing_body)
+    with path.open("wb") as output:
+        if wrap_in_params:
+            output.write(b"\x81")
+            _write_msgpack_str(output, "params")
+            output.write(b"\x81")
+            _write_msgpack_str(output, "embedding")
+        output.write(b"\xc9" + struct.pack(">I", ext_size) + bytes([code]))
+        output.write(b"\x93")
+        if len(shape_values) > 15:
+            raise ValueError("test helper only supports fixarray shape metadata")
+        output.write(bytes([0x90 | len(shape_values)]))
+        for dimension in shape_values:
+            _write_msgpack_uint(output, dimension)
+        _write_msgpack_str(output, dtype)
+        output.write(b"\xc6" + struct.pack(">I", tensor_size))
+        if len(body_prefix) > tensor_size:
+            raise ValueError("body_prefix cannot exceed tensor_size")
+        output.write(body_prefix)
+        remaining = tensor_size - len(body_prefix)
+        if remaining:
+            output.seek(remaining - 1, os.SEEK_CUR)
+            output.write(b"\0")
+        output.write(trailing_body)
 
 
 def _assert_inconclusive_aggregate_not_cached(
@@ -352,6 +478,39 @@ def test_flax_msgpack_restore_fn_dangerous_value_still_critical(tmp_path: Path) 
         and issue.message == "Suspicious object attribute value detected: restore_fn"
         for issue in result.issues
     )
+
+
+def test_flax_msgpack_over_budget_padded_restore_fn_dangerous_value_is_critical(tmp_path: Path) -> None:
+    path = tmp_path / "over_budget_padded_restore_fn.msgpack"
+    padded_callable = (" " * (_STREAM_TEXT_CHUNK_BYTES + 7)) + "eval" + ("\n" * (_STREAM_TEXT_CHUNK_BYTES + 11))
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, "restore_fn": padded_callable})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is False
+    restore_fn_issue = next(
+        issue
+        for issue in result.issues
+        if issue.severity == IssueSeverity.CRITICAL
+        and issue.message == "Suspicious object attribute value detected: restore_fn"
+    )
+    assert restore_fn_issue.location == "root/restore_fn"
+    assert restore_fn_issue.details["value_sample"] == "eval"
+
+
+def test_flax_msgpack_over_budget_padded_restore_fn_benign_value_is_not_critical(tmp_path: Path) -> None:
+    path = tmp_path / "over_budget_padded_benign_restore_fn.msgpack"
+    padded_callable = (
+        (" " * (_STREAM_TEXT_CHUNK_BYTES + 7)) + "custom_deserialize" + ("\n" * (_STREAM_TEXT_CHUNK_BYTES + 11))
+    )
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, "restore_fn": padded_callable})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert not [
+        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL and "restore_fn" in issue.message
+    ]
 
 
 def test_flax_msgpack_binary_function_metadata_value_still_critical(tmp_path: Path) -> None:
@@ -1159,6 +1318,169 @@ def test_flax_msgpack_large_binary_benign_getattr_prose_is_not_inconclusive(tmp_
     assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON not in result.metadata.get("scan_outcome_reasons", [])
 
 
+def test_flax_msgpack_binary_anchor_scanner_ignores_benign_getattr_prose() -> None:
+    first_chunk = b"\x00" * 128
+    remaining = b" documentation mentions getattr helper only"
+    cursor = _MsgpackStreamCursor(io.BytesIO(remaining), len(remaining))
+    scanner = FlaxMsgpackScanner()
+    result = ScanResult("flax_msgpack")
+
+    scanner._analyze_streamed_binary_anchor_chunks(
+        first_chunk,
+        cursor,
+        len(remaining),
+        len(first_chunk) + len(remaining),
+        "root.params.blob",
+        result,
+    )
+
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON not in result.metadata.get("scan_outcome_reasons", [])
+    assert all(check.name != "Flax MessagePack Binary Pattern Coverage" for check in result.checks)
+
+
+def test_flax_msgpack_binary_anchor_scanner_fails_closed_for_split_getattr_dunder() -> None:
+    first_chunk = (b"\x00" * 128) + b"getattr(object"
+    remaining = (b"x" * (64 * 1024 + 4096 + 100)) + b", '__custom_hook__')"
+    cursor = _MsgpackStreamCursor(io.BytesIO(remaining), len(remaining))
+    scanner = FlaxMsgpackScanner()
+    result = ScanResult("flax_msgpack")
+
+    scanner._analyze_streamed_binary_anchor_chunks(
+        first_chunk,
+        cursor,
+        len(remaining),
+        len(first_chunk) + len(remaining),
+        "root.params.blob",
+        result,
+    )
+
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    coverage_check = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
+    assert coverage_check.details["pattern"] == _UNBOUNDED_GETATTR_PATTERN
+    assert coverage_check.details["stream_overlap_chars"] == 4096
+
+
+def test_flax_msgpack_binary_anchor_scanner_fails_closed_for_unclosed_split_getattr_dunder() -> None:
+    first_chunk = (b"\x00" * 128) + b"getattr(object"
+    remaining = (b"x" * (64 * 1024)) + b", '__" + (b"a" * (64 * 1024)) + b"__')"
+    cursor = _MsgpackStreamCursor(io.BytesIO(remaining), len(remaining))
+    scanner = FlaxMsgpackScanner()
+    result = ScanResult("flax_msgpack")
+
+    scanner._analyze_streamed_binary_anchor_chunks(
+        first_chunk,
+        cursor,
+        len(remaining),
+        len(first_chunk) + len(remaining),
+        "root.params.blob",
+        result,
+    )
+
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    coverage_check = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
+    assert coverage_check.details["pattern"] == _UNBOUNDED_GETATTR_PATTERN
+
+
+def test_flax_msgpack_binary_anchor_scanner_fails_closed_for_same_window_unclosed_getattr_dunder() -> None:
+    first_chunk = (b"\x00" * 128) + b"getattr(object, '__" + (b"a" * 5000)
+    remaining = (b"a" * (64 * 1024)) + b"__')"
+    cursor = _MsgpackStreamCursor(io.BytesIO(remaining), len(remaining))
+    scanner = FlaxMsgpackScanner()
+    result = ScanResult("flax_msgpack")
+
+    scanner._analyze_streamed_binary_anchor_chunks(
+        first_chunk,
+        cursor,
+        len(remaining),
+        len(first_chunk) + len(remaining),
+        "root.params.blob",
+        result,
+    )
+
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    coverage_check = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
+    assert coverage_check.details["pattern"] == _UNBOUNDED_GETATTR_PATTERN
+
+
+def test_flax_msgpack_text_stream_fails_closed_for_ordered_anchor_split_across_overlap() -> None:
+    scanner = FlaxMsgpackScanner()
+    result = ScanResult("flax_msgpack")
+    first_chunk = "getattr(object" + ("a" * _STREAM_TEXT_OVERLAP_CHARS) + ", '_"
+    second_chunk = "_custom_hook__')"
+
+    scanner._analyze_streamed_text_chunks(
+        [first_chunk, second_chunk],
+        "root.params.expression",
+        result,
+        full_length=len(first_chunk) + len(second_chunk),
+        finding_location="root.params.expression",
+        coverage_details={"string_size": len(first_chunk) + len(second_chunk)},
+        check_jax_transform=True,
+    )
+
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    coverage_check = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
+    assert coverage_check.details["pattern"] == _UNBOUNDED_GETATTR_PATTERN
+
+
+def test_flax_msgpack_large_binary_fails_closed_for_split_stream_unsafe_custom_pattern(tmp_path: Path) -> None:
+    path = tmp_path / "large_binary_custom_stream_unsafe_pattern.msgpack"
+    payload = (b"\x00" * 128) + b"foo" + (b"x" * (64 * 1024 + 4096 + 100)) + b"bar"
+    create_msgpack_file(path, {"params": {"blob": payload}})
+
+    result = FlaxMsgpackScanner(config={"suspicious_patterns": [r"foo.*bar"]}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    coverage_check = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
+    assert coverage_check.details["pattern"] == r"foo.*bar"
+
+
+def test_flax_msgpack_large_binary_does_not_fail_closed_for_reversed_custom_pattern_anchors(tmp_path: Path) -> None:
+    path = tmp_path / "large_binary_reversed_custom_pattern.msgpack"
+    payload = (b"\x00" * 128) + b"bar" + (b"x" * (64 * 1024 + 4096 + 100)) + b"foo"
+    create_msgpack_file(path, {"params": {"blob": payload}})
+
+    result = FlaxMsgpackScanner(config={"suspicious_patterns": [r"foo.*bar"]}).scan(str(path))
+
+    assert result.success is True
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON not in result.metadata.get("scan_outcome_reasons", [])
+    assert all(check.name != "Flax MessagePack Binary Pattern Coverage" for check in result.checks)
+
+
+def test_flax_msgpack_large_binary_preserves_custom_pattern_anchor_order_across_overlap(tmp_path: Path) -> None:
+    path = tmp_path / "large_binary_reversed_overlap_custom_pattern.msgpack"
+    reversed_overlap = b"bar" + (b"x" * (_STREAM_TEXT_OVERLAP_CHARS - len(b"bar") - len(b"foo"))) + b"foo"
+    first_chunk = (b"\x00" * (_STREAM_TEXT_CHUNK_BYTES - len(reversed_overlap))) + reversed_overlap
+    payload = first_chunk + (b"x" * 1024)
+    create_msgpack_file(path, {"params": {"blob": payload}})
+
+    result = FlaxMsgpackScanner(config={"suspicious_patterns": [r"foo.*bar"]}).scan(str(path))
+
+    assert result.success is True
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON not in result.metadata.get("scan_outcome_reasons", [])
+    assert all(check.name != "Flax MessagePack Binary Pattern Coverage" for check in result.checks)
+
+
+def test_flax_msgpack_large_binary_preserves_normalized_history_for_whitespace_pattern(tmp_path: Path) -> None:
+    path = tmp_path / "large_binary_normalized_history.msgpack"
+    payload = (b"\x00" * 128) + b"eval" + (b" " * (_STREAM_TEXT_OVERLAP_CHARS + 1024)) + b"("
+    create_msgpack_file(path, {"params": {"blob": payload}})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Code Pattern Security Check" and check.details["pattern"] == r"eval\s*\("
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize(
     ("pattern", "payload"),
     [
@@ -1323,9 +1645,9 @@ def test_flax_msgpack_small_decode_buffer_accepts_stream_of_small_objects(tmp_pa
 
 
 def test_flax_msgpack_decode_limit_is_inconclusive(tmp_path: Path) -> None:
-    """Oversized MessagePack members should fail closed before materializing content."""
+    """Oversized non-tensor MessagePack members should fail closed before materializing content."""
     path = tmp_path / "oversized_blob.msgpack"
-    create_msgpack_file(path, {"params": {"blob": b"x" * 512}})
+    create_msgpack_file(path, {"params": {"blob": b"x" * 513}})
 
     result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
 
@@ -1338,6 +1660,382 @@ def test_flax_msgpack_decode_limit_is_inconclusive(tmp_path: Path) -> None:
         and check.details["analysis_incomplete"] is True
         for check in result.checks
     )
+
+
+def test_flax_msgpack_large_tensor_above_decode_budget_scans_without_bufferfull(tmp_path: Path) -> None:
+    path = tmp_path / "sparse_large_tensor.msgpack"
+    tensor_size = (512 * 1024 * 1024) + 4
+    _write_sparse_large_flax_tensor(path, tensor_size)
+
+    result = FlaxMsgpackScanner(
+        config={
+            "max_msgpack_decode_bytes": 128,
+            "max_blob_bytes": 64,
+        }
+    ).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON]
+    assert result.metadata["top_level_keys"] == ["params"]
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
+    blob_check = next(check for check in result.checks if check.name == "Binary Blob Size Check")
+    assert blob_check.details["size"] == tensor_size
+
+
+def test_flax_msgpack_large_flax_ndarray_ext_above_decode_budget_streams_tensor_body(tmp_path: Path) -> None:
+    path = tmp_path / "sparse_large_ndarray_ext.msgpack"
+    tensor_size = (1024 * 1024) + 4
+    _write_sparse_large_flax_ndarray_ext(path, tensor_size)
+
+    result = FlaxMsgpackScanner(
+        config={
+            "max_msgpack_decode_bytes": 128,
+            "max_blob_bytes": 64,
+        }
+    ).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["estimated_parameters"] == tensor_size // 4
+    assert result.metadata["jax_metadata"]["tensor_count"] == 1
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
+    assert all(check.name != "Binary Blob Size Check" for check in result.checks)
+
+
+def test_flax_msgpack_flax_ndarray_ext_above_reduced_decode_budget_uses_ndarray_parser(tmp_path: Path) -> None:
+    path = tmp_path / "small_ndarray_ext_above_reduced_budget.msgpack"
+    _write_sparse_large_flax_ndarray_ext(path, 32)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["jax_metadata"]["tensor_count"] == 1
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
+
+
+def test_flax_msgpack_flax_scalar_ext_above_reduced_decode_budget_uses_ndarray_parser(tmp_path: Path) -> None:
+    path = tmp_path / "scalar_ext_above_reduced_budget.msgpack"
+    create_msgpack_file(
+        path,
+        {
+            "params": {
+                "embedding": _flax_ndarray_ext_value([1024], "float32", b"\0" * 4096),
+                "scale": _flax_ndarray_ext_value([], "float64", b"\0" * 8, code=3),
+            }
+        },
+    )
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["estimated_parameters"] == 1025
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
+    assert all(check.name != "Msgpack Parse Check" for check in result.checks)
+
+
+def test_flax_msgpack_flax_native_complex_ext_above_reduced_decode_budget_is_structural(tmp_path: Path) -> None:
+    path = tmp_path / "native_complex_ext_above_reduced_budget.msgpack"
+    complex_body = msgpack.packb((1.0, -2.0), use_bin_type=True)
+    create_msgpack_file(
+        path,
+        {
+            "params": {
+                "embedding": _flax_ndarray_ext_value([1024], "float32", b"\0" * 4096),
+                "complex": msgpack.ExtType(2, complex_body),
+            }
+        },
+    )
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
+    assert all(check.name != "Msgpack Parse Check" for check in result.checks)
+
+
+def test_flax_msgpack_malformed_native_complex_ext_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "malformed_native_complex_ext.msgpack"
+    malformed_body = msgpack.packb(("eval('x')", -2.0), use_bin_type=True)
+    create_msgpack_file(path, {"params": {"complex": msgpack.ExtType(2, malformed_body)}})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is False
+    parse_check = next(check for check in result.checks if check.name == "Msgpack Parse Check")
+    assert "expected Flax complex numeric component" in parse_check.details["parse_error"]
+
+
+@pytest.mark.parametrize(
+    ("dtype", "shape_values", "tensor_size", "expected_parameters"),
+    [
+        ("int8", [64], 64, 64),
+        ("float16", [32], 64, 32),
+        ("float64", [8], 64, 8),
+    ],
+)
+def test_flax_msgpack_streamed_ndarray_parameter_count_uses_dtype_item_size(
+    tmp_path: Path,
+    dtype: str,
+    shape_values: list[int],
+    tensor_size: int,
+    expected_parameters: int,
+) -> None:
+    path = tmp_path / f"{dtype}_ndarray_parameter_count.msgpack"
+    _write_sparse_large_flax_ndarray_ext(path, tensor_size, dtype=dtype, shape_values=shape_values)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["estimated_parameters"] == expected_parameters
+    assert result.metadata["jax_metadata"]["parameter_count"] == expected_parameters
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "shape_values", "tensor_size", "expected_parameters"),
+    [
+        pytest.param("int8", [17], 17, 17, id="int8-prime-byte-count"),
+        pytest.param("float16", [17], 34, 17, id="float16-odd-element-count"),
+    ],
+)
+def test_flax_msgpack_streamed_ndarray_counts_valid_non_generic_tensor_sizes(
+    tmp_path: Path,
+    dtype: str,
+    shape_values: list[int],
+    tensor_size: int,
+    expected_parameters: int,
+) -> None:
+    path = tmp_path / f"{dtype}_non_generic_tensor_size_ndarray.msgpack"
+    _write_sparse_large_flax_ndarray_ext(path, tensor_size, dtype=dtype, shape_values=shape_values)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["estimated_parameters"] == expected_parameters
+    assert result.metadata["jax_metadata"]["parameter_count"] == expected_parameters
+    assert result.metadata["jax_metadata"]["tensor_count"] == 1
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
+
+
+@pytest.mark.parametrize("dtype", ["float8_e4m3fn", "float4_e2m1fn", "float6_e3m2fn", "int4", "uint4"])
+def test_flax_msgpack_flax_ndarray_ext_accepts_one_byte_ml_dtypes_metadata(
+    tmp_path: Path,
+    dtype: str,
+) -> None:
+    path = tmp_path / f"{dtype}_ndarray_ext.msgpack"
+    _write_sparse_large_flax_ndarray_ext(path, 64, dtype=dtype, shape_values=[64])
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["jax_metadata"]["tensor_count"] == 1
+    assert all(check.name != "Msgpack Parse Check" for check in result.checks)
+
+
+def test_flax_msgpack_flax_ndarray_ext_accepts_zero_dimension_after_nonzero(tmp_path: Path) -> None:
+    path = tmp_path / "zero_dimension_ndarray_ext.msgpack"
+    _write_sparse_large_flax_ndarray_ext(path, 0, shape_values=[5, 0])
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert all(check.name != "Msgpack Parse Check" for check in result.checks)
+
+
+def test_flax_msgpack_large_flax_ndarray_ext_treats_valid_tensor_bytes_as_data(tmp_path: Path) -> None:
+    path = tmp_path / "text_like_tensor_bytes_ndarray_ext.msgpack"
+    body_prefix = (b"\0" * (64 * 1024)) + b"eval('x')"
+    body_prefix += b"\0" * (-len(body_prefix) % 4)
+    _write_sparse_large_flax_ndarray_ext(path, len(body_prefix), body_prefix=body_prefix)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["jax_metadata"]["tensor_count"] == 1
+    assert all(issue.message != r"Suspicious code pattern detected: eval\s*\(" for issue in result.issues)
+    assert all(check.name != "Msgpack Parse Check" for check in result.checks)
+
+
+def test_flax_msgpack_direct_ndarray_ext_treats_valid_tensor_bytes_as_data(tmp_path: Path) -> None:
+    path = tmp_path / "direct_text_like_tensor_bytes_ndarray_ext.msgpack"
+    body_prefix = b"eval('x')" + (b"\0" * 24)
+    body_prefix += b"\0" * (-len(body_prefix) % 4)
+    _write_sparse_large_flax_ndarray_ext(path, len(body_prefix), body_prefix=body_prefix, wrap_in_params=False)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["jax_metadata"]["tensor_count"] == 1
+    assert all(issue.message != r"Suspicious code pattern detected: eval\s*\(" for issue in result.issues)
+    assert all(check.name != "Msgpack Parse Check" for check in result.checks)
+
+
+def test_flax_msgpack_ndarray_ext_under_decode_budget_treats_valid_tensor_bytes_as_data(tmp_path: Path) -> None:
+    path = tmp_path / "small_text_like_tensor_bytes_ndarray_ext.msgpack"
+    body_prefix = b"eval('x')" + (b"\0" * 24)
+    body_prefix += b"\0" * (-len(body_prefix) % 4)
+    _write_sparse_large_flax_ndarray_ext(path, len(body_prefix), body_prefix=body_prefix)
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["jax_metadata"]["tensor_count"] == 1
+    assert all(issue.message != r"Suspicious code pattern detected: eval\s*\(" for issue in result.issues)
+    assert all(check.name != "Msgpack Parse Check" for check in result.checks)
+
+
+def test_flax_msgpack_large_flax_ndarray_ext_scans_dtype_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "malicious_dtype_ndarray_ext.msgpack"
+    tensor_size = (64 * 1024) + 4
+    _write_sparse_large_flax_ndarray_ext(path, tensor_size, dtype="eval('x')")
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.message == r"Suspicious code pattern detected: eval\s*\("
+        for issue in result.issues
+    )
+
+
+def test_flax_msgpack_flax_ndarray_ext_rejects_trailing_body_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "trailing_body_ndarray_ext.msgpack"
+    tensor_size = (64 * 1024) + 4
+    _write_sparse_large_flax_ndarray_ext(path, tensor_size, trailing_body=msgpack.packb("eval('x')", use_bin_type=True))
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    parse_check = next(check for check in result.checks if check.name == "Msgpack Parse Check")
+    assert "Flax ndarray extension contains trailing bytes" in parse_check.details["parse_error"]
+
+
+def test_flax_msgpack_flax_ndarray_ext_rejects_unsupported_dtype(tmp_path: Path) -> None:
+    path = tmp_path / "unsupported_dtype_ndarray_ext.msgpack"
+    _write_sparse_large_flax_ndarray_ext(path, (64 * 1024) + 4, dtype="object")
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    parse_check = next(check for check in result.checks if check.name == "Msgpack Parse Check")
+    assert "unsupported Flax ndarray dtype metadata" in parse_check.details["parse_error"]
+
+
+def test_flax_msgpack_flax_ndarray_ext_rejects_shape_dtype_length_mismatch(tmp_path: Path) -> None:
+    path = tmp_path / "shape_dtype_mismatch_ndarray_ext.msgpack"
+    _write_sparse_large_flax_ndarray_ext(path, 64 * 1024, dtype="float64")
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    parse_check = next(check for check in result.checks if check.name == "Msgpack Parse Check")
+    assert "Flax ndarray shape and dtype" in parse_check.details["parse_error"]
+
+
+def test_flax_msgpack_non_text_tensor_like_raw_bin_with_hidden_text_tail_is_incomplete(tmp_path: Path) -> None:
+    path = tmp_path / "hidden_tail_tensor_like_bin.msgpack"
+    payload = (b"\0" * (64 * 1024)) + b"eval('x')" + (b"\0" * 3)
+    create_msgpack_file(path, {"params": {"blob": payload}})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON]
+    assert all(
+        issue.message != r"Suspicious code pattern detected: eval\s*\("
+        for issue in result.issues
+        if issue.severity == IssueSeverity.CRITICAL
+    )
+
+
+@pytest.mark.parametrize("payload_size", [64 * 1024 - 4, 64 * 1024])
+def test_flax_msgpack_over_budget_tensor_like_raw_bin_probe_is_incomplete(
+    tmp_path: Path,
+    payload_size: int,
+) -> None:
+    path = tmp_path / "over_budget_probe_tensor_like_bin.msgpack"
+    create_msgpack_file(path, {"params": {"blob": b"\0" * payload_size}})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON]
+    coverage = next(check for check in result.checks if check.name == "Flax MessagePack Binary Pattern Coverage")
+    assert coverage.details["binary_size"] == payload_size
+    assert coverage.details["sampled_bytes"] == payload_size
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
+
+
+def test_flax_msgpack_large_tensor_skip_continues_to_later_security_finding(tmp_path: Path) -> None:
+    path = tmp_path / "sparse_large_tensor_then_reduce.msgpack"
+    tensor_size = (512 * 1024 * 1024) + 4
+    _write_sparse_large_flax_tensor(path, tensor_size, trailing_reduce=True)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    assert FlaxMsgpackScanner.BINARY_PATTERN_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == "Suspicious object attribute detected: __reduce__"
+        and issue.location == "root/__reduce__"
+        for issue in result.issues
+    )
+
+
+def test_flax_msgpack_truncated_declared_large_tensor_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "truncated_sparse_tensor.msgpack"
+    tensor_size = (512 * 1024 * 1024) + 4
+    _write_sparse_large_flax_tensor(path, tensor_size, body_bytes=b"\0" * 8)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 128}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.TRUNCATED_STREAM_INCONCLUSIVE_REASON]
+    parse_check = next(check for check in result.checks if check.name == "Msgpack Parse Check")
+    assert parse_check.details["parse_error"] == "incomplete trailing msgpack object"
+
+
+def test_flax_msgpack_duplicate_keys_are_reported_and_values_scanned(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate_params.msgpack"
+    path.write_bytes(b"\x82\xa6params\x80\xa6params\x81\xaa__reduce__\xa9os.system")
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    duplicate_check = next(check for check in result.checks if check.name == "MessagePack Duplicate Key Check")
+    assert duplicate_check.details["key"] == "params"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == "Suspicious object attribute detected: __reduce__"
+        and issue.location == "root/params/__reduce__"
+        for issue in result.issues
+    )
+
+
+def test_flax_msgpack_duplicate_key_tracking_budget_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate_key_tracking_budget.msgpack"
+    create_msgpack_file(path, {"aaaa": 1, "bbbb": 2, "cccc": 3})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_duplicate_key_tracking_bytes": 8}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.DUPLICATE_KEY_TRACKING_INCONCLUSIVE_REASON]
+    budget_check = next(check for check in result.checks if check.name == "MessagePack Duplicate Key Tracking Budget")
+    assert budget_check.details["tracked_key_bytes"] == 8
+    assert budget_check.details["next_key_bytes"] == 4
+    assert budget_check.details["seen_key_count"] == 2
 
 
 @pytest.mark.parametrize(
@@ -2092,6 +2790,38 @@ def test_flax_msgpack_detects_short_suspicious_binary_value(tmp_path: Path) -> N
 
     assert any(
         check.name == "Code Pattern Security Check" and check.details.get("sample") == "eval('x')"
+        for check in result.checks
+    )
+
+
+def test_flax_msgpack_detects_over_budget_binary_restore_fn_identity(tmp_path: Path) -> None:
+    path = tmp_path / "over_budget_binary_restore_fn.msgpack"
+    restore_fn = b" \n\t eval \r" + b" " * 54
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, "restore_fn": restore_fn})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+    restore_check = next(
+        check
+        for check in result.checks
+        if check.name == "Object Attribute Security Check"
+        and check.message == "Suspicious object attribute value detected: restore_fn"
+    )
+
+    assert result.success is False
+    assert restore_check.details["value_sample"] == "eval"
+
+
+def test_flax_msgpack_preserves_benign_over_budget_binary_restore_fn(tmp_path: Path) -> None:
+    path = tmp_path / "benign_over_budget_binary_restore_fn.msgpack"
+    restore_fn = b" custom_deserialize " + b" " * 44
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, "restore_fn": restore_fn})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert not any(
+        check.name == "Object Attribute Security Check"
+        and check.message == "Suspicious object attribute value detected: restore_fn"
         for check in result.checks
     )
 
