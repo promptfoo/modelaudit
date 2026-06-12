@@ -254,6 +254,7 @@ _LICENSE_DOCUMENT_LINE_MARKERS = (
 _LICENSE_DOCUMENT_BASE64_WORD_TOKENS = frozenset(
     {
         *_LICENSE_DOCUMENT_LINE_MARKERS,
+        "a",
         "additional",
         "apache",
         "applicable",
@@ -282,6 +283,7 @@ _LICENSE_DOCUMENT_BASE64_WORD_TOKENS = frozenset(
         "hereby",
         "http",
         "https",
+        "i",
         "irrevocable",
         "january",
         "legal",
@@ -427,7 +429,7 @@ _BASE64_LICENSE_WRAP_TOKEN_PATTERN = re.compile(
     r"|[A-Za-z0-9+/_-]{2}=="
     r")(?![A-Za-z0-9+/_-])"
 )
-_BASE64_LICENSE_WRAP_SHORT_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{2,3}(?![A-Za-z0-9+/_-])")
+_BASE64_LICENSE_WRAP_SHORT_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{1,3}(?![A-Za-z0-9+/_-])")
 _BASE64_LICENSE_WRAP_SEPARATOR_PATTERN = re.compile(
     r"^(?:[#>;]|//|--|\*)\s*(?:continued|continuation|wrapped|base64|license(?:\s+terms?)?)?\s*$",
     re.IGNORECASE,
@@ -761,7 +763,12 @@ class SafeTensorsScanner(BaseScanner):
         )
 
     @staticmethod
-    def _base64_candidate_decodes(candidate: str, *, require_active_pattern: bool = False) -> bool:
+    def _base64_candidate_decodes(
+        candidate: str,
+        *,
+        require_active_pattern: bool = False,
+        fail_on_invalid_padding: bool = True,
+    ) -> bool:
         if len(candidate) < _BASE64_LICENSE_WRAP_MIN_DECODE_CHARS:
             return False
         if len(candidate) > _BASE64_LICENSE_WRAP_MAX_CHARS:
@@ -771,7 +778,7 @@ class SafeTensorsScanner(BaseScanner):
         if "=" in normalized.rstrip("="):
             return True
         if len(normalized) % 4 == 1:
-            return not require_active_pattern
+            return fail_on_invalid_padding
         padding = "=" * ((4 - len(normalized) % 4) % 4)
         padded = f"{normalized}{padding}"
         estimated_decoded_bytes = (len(padded) // 4) * 3
@@ -793,20 +800,24 @@ class SafeTensorsScanner(BaseScanner):
         total_lines = 0
         separator_lines = 0
         has_short_fragments = False
+        has_non_documentary_short_fragment = False
 
         def flush() -> bool:
             return total_chars >= _BASE64_LICENSE_WRAP_MIN_DECODE_CHARS and cls._base64_candidate_decodes(
                 "".join(chunks),
                 require_active_pattern=has_short_fragments,
+                fail_on_invalid_padding=not has_short_fragments or has_non_documentary_short_fragment,
             )
 
         def reset() -> None:
             nonlocal chunks, total_chars, total_lines, separator_lines, has_short_fragments
+            nonlocal has_non_documentary_short_fragment
             chunks = []
             total_chars = 0
             total_lines = 0
             separator_lines = 0
             has_short_fragments = False
+            has_non_documentary_short_fragment = False
 
         for line in [*lines, ""]:
             fragments = cls._license_document_line_base64_fragments(line)
@@ -818,6 +829,10 @@ class SafeTensorsScanner(BaseScanner):
                 total_lines += 1
                 separator_lines = 0
                 has_short_fragments = has_short_fragments or short_fragments
+                if short_fragments:
+                    has_non_documentary_short_fragment = has_non_documentary_short_fragment or any(
+                        not cls._license_document_token_looks_documentary(fragment) for fragment in fragments
+                    )
                 total_chars += sum(len(fragment) for fragment in fragments)
                 if total_lines > _BASE64_LICENSE_WRAP_MAX_LINES or total_chars > _BASE64_LICENSE_WRAP_MAX_CHARS:
                     if flush():
@@ -836,10 +851,12 @@ class SafeTensorsScanner(BaseScanner):
                     reset()
                     continue
                 if separator_lines > _BASE64_LICENSE_WRAP_MAX_SEPARATOR_LINES:
-                    if flush() or total_chars >= _BASE64_LICENSE_WRAP_SEPARATOR_OVERFLOW_MIN_CHARS:
+                    if flush():
                         return True
                     if has_short_fragments:
                         continue
+                    if total_chars >= _BASE64_LICENSE_WRAP_SEPARATOR_OVERFLOW_MIN_CHARS:
+                        return True
                     reset()
                     continue
                 continue
