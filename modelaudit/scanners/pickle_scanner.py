@@ -273,7 +273,8 @@ _NETWORK_SCAN_SEEDS: tuple[bytes, ...] = (
     b"zombie",
 )
 _PICKLE_LITERAL_URL_RE = re.compile(
-    rb"(?i)https?://(?:[A-Za-z0-9\-._~:/?#[\]@!$&()*+,;=%-]|"
+    rb"(?i)(?:https?|ftp|ftps|ssh|telnet|ws|wss|s3|gs|az|wasbs?|abfss?)://"
+    rb"(?:[A-Za-z0-9\-._~:/?#[\]@!$&()*+,;=%-]|"
     rb"'(?=[A-Za-z0-9\-._~:/?#[\]@!$&*+,=%-]))+"
 )
 _PICKLE_LITERAL_URL_NETWORK_FUNCTION_TOKENS: tuple[bytes, ...] = (
@@ -1293,6 +1294,8 @@ def _pickle_stack_value_is_executable_network_consumer(value: _PickleStackValue)
     lowered_name = name.lower()
     lowered_full_name = f"{lowered_module}.{lowered_name}"
 
+    if module == "__main__":
+        return True
     if is_suspicious_global(module, name):
         return True
     if lowered_full_name in _EXECUTABLE_PICKLE_GLOBAL_FULL_NAMES:
