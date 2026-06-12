@@ -2741,7 +2741,12 @@ def _format_scan_output(
         return format_sarif_output(audit_result, expanded_paths, verbose)
 
     redacted_result = redact_source_value(audit_result.model_dump(mode="python"))
-    return format_text_output(redacted_result if isinstance(redacted_result, dict) else {}, verbose)
+    output_text = format_text_output(redacted_result if isinstance(redacted_result, dict) else {}, verbose)
+    previews = getattr(audit_result, "previews", None)
+    if isinstance(previews, list) and previews:
+        preview_text = _format_huggingface_dry_run_previews(previews, "text")
+        return f"{preview_text}\n\n{output_text}" if output_text else preview_text
+    return output_text
 
 
 def _emit_scan_output(

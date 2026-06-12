@@ -5262,6 +5262,57 @@ def test_scan_huggingface_streaming_dry_run_metadata_failure_preserves_successfu
     mock_scan_local.assert_not_called()
 
 
+def test_scan_huggingface_streaming_dry_run_metadata_failure_preserves_successful_text_preview() -> None:
+    """Text output should also keep earlier successful previews when a later preview fails."""
+    with (
+        patch(
+            "modelaudit.utils.sources.huggingface.get_model_info",
+            side_effect=[
+                {
+                    "repo_id": "test/model-a",
+                    "model_id": "test/model-a",
+                    "total_size": 1234,
+                    "file_count": 2,
+                },
+                RuntimeError("metadata unavailable for https://huggingface.co/test/model-b\nFORGED"),
+            ],
+        ),
+        patch(
+            "modelaudit.utils.sources.huggingface.plan_huggingface_streaming_download",
+            side_effect=[
+                _hf_streaming_plan("test/model-a", selected_files=["model-a.bin"]),
+                _hf_streaming_plan("test/model-b", selected_files=["model-b.bin"]),
+            ],
+        ),
+        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
+        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--stream",
+                "--format",
+                "text",
+                "hf://test/model-a",
+                "hf://test/model-b",
+            ],
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 2
+    assert "Preview for hf://test/model-a" in result.output
+    assert "Error previewing model" in result.output
+    assert "Hugging Face acquisition failed" in result.output
+    mock_download_streaming.assert_not_called()
+    mock_scan_streaming.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_scan_local.assert_not_called()
+
+
 def test_scan_huggingface_streaming_dry_run_text_escapes_metadata() -> None:
     """Human-readable dry-run previews should escape model-controlled metadata."""
     with (
