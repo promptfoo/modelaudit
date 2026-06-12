@@ -214,6 +214,16 @@ def _source_backed_invocation_requires_loaded_identity(
     return reference in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES
 
 
+def _source_backed_import_requires_initialization_proof(
+    reference: tuple[str, str],
+    *,
+    suppress_safe_numpy_reconstruct: bool = False,
+) -> bool:
+    if suppress_safe_numpy_reconstruct and reference in _NUMPY_SAFE_OBJECT_RECONSTRUCTION_REFERENCES:
+        return False
+    return reference in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES
+
+
 class _StreamShortReadError(ValueError):
     def __init__(self, *, expected_size: int, bytes_read: int, partial_payload: bytes) -> None:
         super().__init__("Stream ended before the declared size was read")
@@ -1910,6 +1920,11 @@ def _with_untrusted_allowlisted_import_findings(
         raw_position = reference.get("position")
         position = raw_position if type(raw_position) is int else None
         key = (import_reference, position)
+        source_backed_import_initialization_untrusted = (
+            _source_backed_import_requires_initialization_proof((module, name))
+            and not module_is_loaded_without_import_hooks(module)
+            and not module_initialization_is_proven_inert(module)
+        )
         if (
             not module
             or not name
@@ -1917,12 +1932,30 @@ def _with_untrusted_allowlisted_import_findings(
             or bool(reference.get("is_dangerous"))
             or not bool(reference.get("requires_origin_verification"))
             or key in existing_references
-            or not import_only_module_requires_origin_review(module, name)
+            or (
+                not import_only_module_requires_origin_review(module, name)
+                and not source_backed_import_initialization_untrusted
+            )
         ):
             continue
+        if source_backed_import_initialization_untrusted:
+            message = (
+                f"Found source-backed allowlisted global without inert import initialization proof: {import_reference}"
+            )
+            why = (
+                "Source-backed framework metadata can execute module-level code when pickle resolves an unloaded "
+                "GLOBAL; suppress it only when the module is already loaded or import-time initialization is "
+                "proven inert."
+            )
+        else:
+            message = f"Found allowlisted global reference from an untrusted module origin: {import_reference}"
+            why = (
+                "Allowlisted modules are safe only when they resolve from the standard library or installed "
+                "site-packages; a project-local shadow module can execute arbitrary import-time code."
+            )
         additional_findings.append(
             Finding(
-                message=f"Found allowlisted global reference from an untrusted module origin: {import_reference}",
+                message=message,
                 severity=Severity.WARNING,
                 location=f"{report.source} (pos {position})" if position is not None else report.source,
                 rule_code="NON_ALLOWLISTED_GLOBAL",
@@ -1932,11 +1965,9 @@ def _with_untrusted_allowlisted_import_findings(
                     "name": name,
                     "import_reference": import_reference,
                     "position": position,
+                    "source_backed_import_initialization_untrusted": source_backed_import_initialization_untrusted,
                 },
-                why=(
-                    "Allowlisted modules are safe only when they resolve from the standard library or installed "
-                    "site-packages; a project-local shadow module can execute arbitrary import-time code."
-                ),
+                why=why,
             )
         )
         existing_references.add(key)
@@ -2216,9 +2247,23 @@ def _non_allowlisted_import_finding_is_proven_safe(
         reference,
         suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
     )
-    inert_reference_is_proven_safe = position is not None and not finding_is_invoked
-    trusted_reference_is_proven_safe = position is not None and (
+    requires_import_initialization_proof = (
         not finding_is_invoked
+        and _source_backed_import_requires_initialization_proof(
+            reference,
+            suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
+        )
+    )
+    import_initialization_is_proven_safe = (
+        not requires_import_initialization_proof
+        or module in inert_initialization_modules
+        or module_is_loaded_without_import_hooks(module)
+    )
+    inert_reference_is_proven_safe = (
+        position is not None and not finding_is_invoked and import_initialization_is_proven_safe
+    )
+    trusted_reference_is_proven_safe = position is not None and (
+        (not finding_is_invoked and import_initialization_is_proven_safe)
         or invocation_is_trusted_reconstruction
         or invocation_identity_is_trusted
         or (

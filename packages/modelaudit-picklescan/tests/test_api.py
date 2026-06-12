@@ -366,6 +366,25 @@ def _write_init_inert_setstate_transformers_package(site_packages: Path, marker:
     )
 
 
+def _write_import_side_effect_transformers_package(site_packages: Path, marker: Path) -> None:
+    package_dir = site_packages / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        "\n".join(
+            [
+                f"MARKER = {str(marker)!r}",
+                "with open(MARKER, 'w', encoding='utf-8') as handle:",
+                "    handle.write('import')",
+                "class OptimizerNames:",
+                "    pass",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def _write_rebindable_trusted_transformers_package(site_packages: Path) -> None:
     package_dir = site_packages / "transformers"
     package_dir.mkdir(parents=True, exist_ok=True)
@@ -6392,13 +6411,18 @@ def test_scan_bytes_warns_on_unresolved_import_only_hf_training_args_metadata(
     )
 
 
-def test_scan_bytes_suppresses_import_only_hf_training_args_metadata_with_trusted_origin(
+def test_scan_bytes_suppresses_import_only_hf_training_args_metadata_with_trusted_origin_and_inert_import(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _force_framework_metadata_unresolved(monkeypatch)
     monkeypatch.setattr(
         "modelaudit_picklescan.api.import_only_reference_is_proven_trusted",
         lambda module, name: (module, name) in _HF_TRAINING_ARGS_METADATA_REFERENCES,
+    )
+    trusted_modules = {module for module, _name in _HF_TRAINING_ARGS_METADATA_REFERENCES}
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.module_initialization_is_proven_inert",
+        lambda module: module in trusted_modules,
     )
     _clear_source_sensitive_caches()
     try:
@@ -6504,6 +6528,59 @@ def test_scan_file_warns_when_trusted_framework_reference_is_rebound_before_scan
     assert any(
         finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
         and finding["import_reference"] == "transformers.training_args.TrainingArguments"
+        for finding in output["findings"]
+    )
+
+
+def test_scan_file_warns_when_unloaded_source_backed_metadata_import_is_not_inert(tmp_path: Path) -> None:
+    payload_path = tmp_path / "unloaded-training-args-import-only.pkl"
+    payload_path.write_bytes(_reference_global("transformers.training_args", "OptimizerNames") + b".")
+    marker = tmp_path / "unloaded-training-args-import.marker"
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_import_side_effect_transformers_package(site_packages, marker)
+
+    script = (
+        "import json, pickle, sys\n"
+        "from pathlib import Path\n"
+        "from modelaudit_picklescan import scan_file\n"
+        "payload_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "report = scan_file(payload_path)\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "pickle.loads(payload_path.read_bytes())\n"
+        "print(json.dumps({\n"
+        "    'status': report.status.value,\n"
+        "    'verdict': report.verdict.value,\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'findings': [\n"
+        "        {\n"
+        "            'rule_code': finding.rule_code,\n"
+        "            'severity': finding.severity.value,\n"
+        "            'import_reference': finding.details.get('import_reference'),\n"
+        "        }\n"
+        "        for finding in report.findings\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(payload_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert not (output["status"] == ScanStatus.COMPLETE.value and output["verdict"] == SafetyVerdict.CLEAN.value)
+    assert output["verdict"] in {SafetyVerdict.SUSPICIOUS.value, SafetyVerdict.MALICIOUS.value}
+    assert any(
+        finding["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and finding["import_reference"] == "transformers.training_args.OptimizerNames"
         for finding in output["findings"]
     )
 

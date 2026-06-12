@@ -298,6 +298,25 @@ def _write_init_inert_setstate_transformers_package(site_packages: Path, marker:
     )
 
 
+def _write_import_side_effect_transformers_package(site_packages: Path, marker: Path) -> None:
+    package_dir = site_packages / "transformers"
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (package_dir / "training_args.py").write_text(
+        "\n".join(
+            [
+                f"MARKER = {str(marker)!r}",
+                "with open(MARKER, 'w', encoding='utf-8') as handle:",
+                "    handle.write('import')",
+                "class OptimizerNames:",
+                "    pass",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def _write_rebindable_trusted_transformers_package(site_packages: Path) -> None:
     package_dir = site_packages / "transformers"
     package_dir.mkdir(parents=True, exist_ok=True)
@@ -1014,6 +1033,61 @@ def test_pytorch_zip_warns_when_trusted_framework_reference_is_rebound_before_sc
     assert any(
         issue["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
         and issue["import_reference"] == "transformers.training_args.TrainingArguments"
+        for issue in output["issues"]
+    )
+
+
+def test_pytorch_zip_warns_when_unloaded_source_backed_metadata_import_is_not_inert(tmp_path: Path) -> None:
+    payload = _pickle_global("transformers.training_args", "OptimizerNames") + b"."
+    model_path = tmp_path / "unloaded_training_args_import_only.bin"
+    _write_training_args_bin(model_path, payload)
+    marker = tmp_path / "unloaded-training-args-import.marker"
+    site_packages = tmp_path / "trusted-site-packages"
+    _write_import_side_effect_transformers_package(site_packages, marker)
+
+    script = (
+        "import json, pickle, sys, zipfile\n"
+        "from pathlib import Path\n"
+        "from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner\n"
+        "model_path = Path(sys.argv[1])\n"
+        "marker = Path(sys.argv[2])\n"
+        "result = PyTorchZipScanner().scan(str(model_path))\n"
+        "marker_before_unpickle = marker.exists()\n"
+        "with zipfile.ZipFile(model_path) as zip_file:\n"
+        "    pickle.loads(zip_file.read('training_args/data.pkl'))\n"
+        "print(json.dumps({\n"
+        "    'success': result.success,\n"
+        "    'pickle_verdict': result.metadata.get('pickle_verdict'),\n"
+        "    'marker_before_unpickle': marker_before_unpickle,\n"
+        "    'marker_after_unpickle': marker.exists(),\n"
+        "    'issues': [\n"
+        "        {\n"
+        "            'rule_code': issue.rule_code,\n"
+        "            'severity': issue.severity.value,\n"
+        "            'import_reference': (issue.details or {}).get('import_reference'),\n"
+        "        }\n"
+        "        for issue in result.issues\n"
+        "    ],\n"
+        "}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(model_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert output["pickle_verdict"] in {"suspicious", "malicious"}
+    assert not (output["success"] is True and output["pickle_verdict"] == "clean" and not output["issues"])
+    assert any(
+        issue["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
+        and issue["import_reference"] == "transformers.training_args.OptimizerNames"
         for issue in output["issues"]
     )
 
