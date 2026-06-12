@@ -177,6 +177,166 @@ def _binunicode(data: bytes) -> bytes:
     return b"X" + len(data).to_bytes(4, "little") + data
 
 
+def _static_getattr_reduce_payload(
+    *,
+    builtin_module: bytes = b"__builtin__",
+    target_module: bytes = b"ultralytics.nn.modules.head",
+    target_name: bytes = b"Detect",
+    attribute: bytes = b"forward",
+    invoke_result: bool = False,
+    stop: bool = True,
+) -> bytes:
+    payload = (
+        b"\x80\x04"
+        + _global(builtin_module, b"getattr")
+        + _global(target_module, target_name)
+        + _binunicode(attribute)
+        + b"\x86R"
+    )
+    if invoke_result:
+        payload += b")R"
+    return payload + (b"." if stop else b"")
+
+
+def _static_getattr_protocol0_unicode_payload() -> bytes:
+    return b"c__builtin__\ngetattr\ncultralytics.nn.modules.head\nDetect\nVforward\n\x86R."
+
+
+_TUPLE_MEMO_WRITES: tuple[tuple[str, bytes], ...] = (
+    ("PUT", b"p0\n"),
+    ("BINPUT", b"q\x00"),
+    ("LONG_BINPUT", b"r\x00\x00\x00\x00"),
+    ("MEMOIZE", b"\x94"),
+)
+_TUPLE_MEMO_READS: tuple[tuple[str, bytes], ...] = (
+    ("GET", b"g0\n"),
+    ("BINGET", b"h\x00"),
+    ("LONG_BINGET", b"j\x00\x00\x00\x00"),
+)
+
+
+def _static_getattr_with_memo_read_args_tuple_payload(
+    *,
+    tuple_opcode: bytes,
+    memo_write: bytes,
+    memo_read: bytes,
+) -> bytes:
+    if tuple_opcode == b"\x86":
+        args_tuple = _global(b"ultralytics.nn.modules.head", b"Detect") + _binunicode(b"forward") + tuple_opcode
+    elif tuple_opcode == b"t":
+        args_tuple = b"(" + _global(b"ultralytics.nn.modules.head", b"Detect") + _binunicode(b"forward") + tuple_opcode
+    else:
+        raise ValueError(f"unsupported tuple opcode: {tuple_opcode!r}")
+    return b"\x80\x04" + _global(b"__builtin__", b"getattr") + args_tuple + memo_write + b"0" + memo_read + b"R."
+
+
+def _static_getattr_with_opaque_target_payload() -> bytes:
+    return b"\x80\x04" + _global(b"__builtin__", b"getattr") + b"}" + _binunicode(b"forward") + b"\x86R."
+
+
+def _static_getattr_with_non_literal_attribute_payload() -> bytes:
+    return (
+        b"\x80\x04"
+        + _global(b"__builtin__", b"getattr")
+        + _global(b"ultralytics.nn.modules.head", b"Detect")
+        + b"K\x01\x86R."
+    )
+
+
+def _static_getattr_with_memo_alias_payload(
+    *,
+    alias_callable: bool = False,
+    alias_target: bool = False,
+    alias_attribute: bool = False,
+) -> bytes:
+    payload = b"\x80\x04"
+    if alias_callable:
+        payload += _global(b"__builtin__", b"getattr") + b"q\x000h\x00"
+    else:
+        payload += _global(b"__builtin__", b"getattr")
+    if alias_target:
+        payload += _global(b"ultralytics.nn.modules.head", b"Detect") + b"q\x010h\x01"
+    else:
+        payload += _global(b"ultralytics.nn.modules.head", b"Detect")
+    if alias_attribute:
+        payload += _binunicode(b"forward") + b"q\x020h\x02"
+    else:
+        payload += _binunicode(b"forward")
+    return payload + b"\x86R."
+
+
+def _memoized_stack_global_operand(module: bytes, name: bytes, module_index: int, name_index: int) -> bytes:
+    return (
+        _short_binunicode(module)
+        + b"q"
+        + bytes([module_index])
+        + b"0"
+        + _short_binunicode(name)
+        + b"q"
+        + bytes([name_index])
+        + b"0"
+        + b"h"
+        + bytes([module_index])
+        + b"h"
+        + bytes([name_index])
+        + b"\x93"
+    )
+
+
+def _static_getattr_with_stack_global_memo_operand_payload(
+    *,
+    alias_callable: bool = False,
+    alias_target: bool = False,
+) -> bytes:
+    payload = b"\x80\x04"
+    if alias_callable:
+        payload += _memoized_stack_global_operand(b"__builtin__", b"getattr", 0, 1)
+    else:
+        payload += _global(b"__builtin__", b"getattr")
+    if alias_target:
+        payload += _memoized_stack_global_operand(b"ultralytics.nn.modules.head", b"Detect", 2, 3)
+    else:
+        payload += _global(b"ultralytics.nn.modules.head", b"Detect")
+    return payload + _binunicode(b"forward") + b"\x86R."
+
+
+def _clear_ultralytics_modules() -> None:
+    for module_name in tuple(sys.modules):
+        if module_name == "ultralytics" or module_name.startswith("ultralytics."):
+            sys.modules.pop(module_name, None)
+
+
+def _write_ultralytics_head_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> Path:
+    _clear_ultralytics_modules()
+    source_root = tmp_path / "ultralytics_source"
+    modules_dir = source_root / "ultralytics" / "nn" / "modules"
+    modules_dir.mkdir(parents=True)
+    for package_dir in (
+        source_root / "ultralytics",
+        source_root / "ultralytics" / "nn",
+        modules_dir,
+    ):
+        (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    head_path = modules_dir / "head.py"
+    head_path.write_text(source, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(source_root))
+    _isolate_reusable_meta_path_finders(monkeypatch)
+    return head_path
+
+
+def _dangerous_getattr_findings(report: PickleReport) -> tuple[Finding, ...]:
+    return tuple(
+        finding
+        for finding in report.findings
+        if finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("import_reference") in {"builtins.getattr", "__builtin__.getattr"}
+    )
+
+
 def _binunicode8(data: bytes) -> bytes:
     return b"\x8d" + len(data).to_bytes(8, "little") + data
 
@@ -630,6 +790,616 @@ def _pathlib_method_reduce_payload(target: Path, method: str) -> bytes:
         + f"cpathlib\n{class_name}.{method}\n".encode("ascii")
         + b"h\x00\x85R."
     )
+
+
+def test_scan_bytes_suppresses_static_ultralytics_getattr_forward_reconstruction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
+
+    report = scan_bytes(
+        _static_getattr_reduce_payload(),
+        source="ultralytics-detect-forward-getattr.pkl",
+    )
+
+    assert not _dangerous_getattr_findings(report)
+    getattr_invocations = [
+        invocation
+        for invocation in report.metadata["callable_invocations"]
+        if invocation.get("import_reference") == "__builtin__.getattr"
+    ]
+    assert len(getattr_invocations) == 1
+    invocation = getattr_invocations[0]
+    assert invocation["getattr_reconstruction"] is True
+    assert invocation["getattr_target_import_reference"] == "ultralytics.nn.modules.head.Detect"
+    assert invocation["getattr_attribute_name"] == "forward"
+    assert invocation["getattr_callable_is_direct"] is True
+    assert invocation["getattr_target_is_direct"] is True
+    assert invocation["getattr_resolved_import_reference"] == "ultralytics.nn.modules.head.Detect.forward"
+
+
+@pytest.mark.parametrize("method_name", ["__getattr__", "__getattribute__"])
+def test_scan_bytes_static_getattr_ignores_instance_attribute_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+) -> None:
+    marker = tmp_path / f"{method_name}.txt"
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n"
+        f"    def {method_name}(self, name):\n"
+        f"        open({str(marker)!r}, 'w').write(name)\n"
+        "        return super().__getattribute__(name)\n\n"
+        "    def forward(self):\n"
+        "        return None\n",
+    )
+
+    report = scan_bytes(
+        _static_getattr_reduce_payload(),
+        source=f"instance-{method_name}-static-getattr.pkl",
+    )
+
+    assert not _dangerous_getattr_findings(report)
+
+
+def test_scan_bytes_tracks_static_getattr_reconstructed_result_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
+
+    report = scan_bytes(
+        _static_getattr_reduce_payload(invoke_result=True),
+        source="ultralytics-detect-forward-getattr-invoked.pkl",
+    )
+
+    assert not _dangerous_getattr_findings(report)
+    assert any(
+        invocation.get("import_reference") == "ultralytics.nn.modules.head.Detect.forward"
+        and invocation.get("opcode") == "REDUCE"
+        for invocation in report.metadata["callable_invocations"]
+    )
+
+
+def test_scan_bytes_suppresses_protocol0_unicode_static_getattr_reconstruction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
+
+    report = scan_bytes(
+        _static_getattr_protocol0_unicode_payload(),
+        source="protocol0-ultralytics-detect-forward-getattr.pkl",
+    )
+
+    assert not _dangerous_getattr_findings(report)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _static_getattr_reduce_payload(),
+        _static_getattr_reduce_payload(attribute=b"__dict__"),
+        _static_getattr_with_opaque_target_payload(),
+        _static_getattr_with_non_literal_attribute_payload(),
+        _static_getattr_with_memo_alias_payload(alias_callable=True),
+        _static_getattr_with_memo_alias_payload(alias_target=True),
+        _static_getattr_with_memo_alias_payload(alias_attribute=True),
+    ],
+)
+def test_scan_bytes_static_getattr_unsafe_context_stays_critical(payload: bytes) -> None:
+    _clear_ultralytics_modules()
+    report = scan_bytes(payload, source="unsafe-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_oversized_attribute_stays_critical_without_metadata_bloat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
+    payload = _static_getattr_reduce_payload(attribute=b"forward" + (b"a" * 1024))
+
+    report = scan_bytes(
+        payload,
+        source="oversized-static-getattr.pkl",
+        options=ScanOptions(max_string_literal_scan_chars=8),
+    )
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all("getattr_attribute_name" not in invocation for invocation in report.metadata["callable_invocations"])
+
+
+@pytest.mark.parametrize(
+    ("payload", "direct_field"),
+    [
+        (_static_getattr_with_stack_global_memo_operand_payload(alias_callable=True), "getattr_callable_is_direct"),
+        (_static_getattr_with_stack_global_memo_operand_payload(alias_target=True), "getattr_target_is_direct"),
+    ],
+)
+def test_scan_bytes_static_getattr_stack_global_memo_operands_stay_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: bytes,
+    direct_field: str,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
+
+    report = scan_bytes(payload, source="stack-global-memo-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+    getattr_invocation = next(
+        invocation
+        for invocation in report.metadata["callable_invocations"]
+        if invocation.get("import_reference") == "__builtin__.getattr"
+    )
+    assert getattr_invocation[direct_field] is False
+
+
+@pytest.mark.parametrize(("tuple_name", "tuple_opcode"), [("TUPLE2", b"\x86"), ("TUPLE", b"t")])
+@pytest.mark.parametrize(("memo_write_name", "memo_write"), _TUPLE_MEMO_WRITES)
+@pytest.mark.parametrize(("memo_read_name", "memo_read"), _TUPLE_MEMO_READS)
+def test_scan_bytes_static_getattr_memo_read_args_tuple_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tuple_name: str,
+    tuple_opcode: bytes,
+    memo_write_name: str,
+    memo_write: bytes,
+    memo_read_name: str,
+    memo_read: bytes,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
+    payload = _static_getattr_with_memo_read_args_tuple_payload(
+        tuple_opcode=tuple_opcode,
+        memo_write=memo_write,
+        memo_read=memo_read,
+    )
+
+    report = scan_bytes(payload, source=f"memo-read-{tuple_name}-{memo_write_name}-{memo_read_name}.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_repeated_static_getattr_reconstructions_suppress_each_position(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
+    payload = _static_getattr_reduce_payload(stop=False) + b"0" + _static_getattr_reduce_payload()[2:]
+
+    report = scan_bytes(payload, source="repeated-static-getattr.pkl")
+
+    assert not _dangerous_getattr_findings(report)
+    getattr_invocations = [
+        invocation
+        for invocation in report.metadata["callable_invocations"]
+        if invocation.get("import_reference") == "__builtin__.getattr"
+    ]
+    assert len(getattr_invocations) == 2
+    assert len({invocation["opcode_position"] for invocation in getattr_invocations}) == 2
+
+
+def test_scan_bytes_mixed_repeated_static_getattr_keeps_unsafe_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n",
+    )
+    payload = (
+        _static_getattr_reduce_payload(stop=False) + b"0" + _static_getattr_reduce_payload(attribute=b"__dict__")[2:]
+    )
+
+    report = scan_bytes(payload, source="mixed-repeated-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert len(findings) == 1
+
+
+def test_scan_bytes_static_getattr_source_backed_method_sink_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "import os\n\nclass Detect:\n    def forward(self):\n        os.system('id')\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="sink-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_decorated_method_descriptor_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    @property\n    def forward(self):\n        return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="decorated-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_module_initialization_side_effect_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "import-side-effect.txt"
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        f"open({str(marker)!r}, 'w').write('loaded')\n\nclass Detect:\n    def forward(self):\n        return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="module-init-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_executable_class_body_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "class-body-side-effect.txt"
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n"
+        f"    open({str(marker)!r}, 'w').write('loaded')\n\n"
+        "    def forward(self):\n"
+        "        return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="class-body-side-effect-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_class_namespace_write_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "def evil(self):\n"
+        "    return None\n\n"
+        "class Detect:\n"
+        "    def forward(self):\n"
+        "        return None\n"
+        "    locals()['forward'] = evil\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="class-namespace-write-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_decorated_class_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "import os\n\n"
+        "def replace(_cls):\n"
+        "    class Replacement:\n"
+        "        def forward(self):\n"
+        "            os.system('id')\n"
+        "    return Replacement\n\n"
+        "@replace\n"
+        "class Detect:\n"
+        "    def forward(self):\n"
+        "        return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="decorated-class-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "def evil(self):\n"
+            "    return None\n\n"
+            "Detect.forward = evil\n"
+        ),
+        (
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "def evil(self):\n"
+            "    return None\n\n"
+            "Alias = Detect\n"
+            "Alias.forward = evil\n"
+        ),
+        (
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "def evil(self):\n"
+            "    return None\n\n"
+            "setattr(Detect, 'forward', evil)\n"
+        ),
+        (
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "def evil(self):\n"
+            "    return None\n\n"
+            "(Alias,) = (Detect,)\n"
+            "Alias.forward = evil\n"
+        ),
+        (
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "def evil(self):\n"
+            "    return None\n\n"
+            "def patch(cls):\n"
+            "    cls.forward = evil\n\n"
+            "patch(Detect)\n"
+        ),
+        (
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "def evil(self):\n"
+            "    return None\n\n"
+            "if True:\n"
+            "    Detect.forward = evil\n"
+        ),
+        (
+            "class Evil:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "for Detect in [Evil]:\n"
+            "    pass\n"
+        ),
+        ("class Detect:\n    def forward(self):\n        return None\n    from os import system as forward\n"),
+        ("class Detect:\n    def forward(self):\n        return None\n    from os import popen as forward\n"),
+        ("class Detect:\n    def forward(self):\n        return None\n    import os as forward\n"),
+        (
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n"
+            "    if True:\n"
+            "        from os import system as forward\n"
+        ),
+    ],
+)
+def test_scan_bytes_static_getattr_post_class_method_rewrite_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    _write_ultralytics_head_source(tmp_path, monkeypatch, source)
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="rewritten-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_class_body_rewrite_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect:\n    def forward(self):\n        return None\n    forward = staticmethod(lambda self: None)\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="class-body-rewritten-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_conditional_class_body_method_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "import os\n\n"
+        "class Base:\n"
+        "    def forward(self):\n"
+        "        os.system('id')\n\n"
+        "class Detect(Base):\n"
+        "    if False:\n"
+        "        def forward(self):\n"
+        "            return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="conditional-class-body-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_explicit_metaclass_lookup_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class DetectMeta(type):\n"
+        "    def __getattribute__(cls, name):\n"
+        "        return super().__getattribute__(name)\n\n"
+        "class Detect(metaclass=DetectMeta):\n"
+        "    def forward(self):\n"
+        "        return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="metaclass-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_dynamic_metaclass_keyword_lookup_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "import os\n\n"
+        "class DetectMeta(type):\n"
+        "    def __getattribute__(cls, name):\n"
+        "        os.system('id')\n"
+        "        return super().__getattribute__(name)\n\n"
+        "class Detect(**{'metaclass': DetectMeta}):\n"
+        "    def forward(self):\n"
+        "        return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="dynamic-metaclass-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_dynamic_base_lookup_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "def make_base():\n"
+        "    class Base:\n"
+        "        pass\n"
+        "    return Base\n\n"
+        "class Detect(make_base()):\n"
+        "    def forward(self):\n"
+        "        return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="dynamic-base-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_unresolved_base_lookup_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class Detect(ExternalBase):\n    def forward(self):\n        return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="unresolved-base-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
+
+
+def test_scan_bytes_static_getattr_inherited_metaclass_lookup_stays_critical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        "class DetectMeta(type):\n"
+        "    def __getattribute__(cls, name):\n"
+        "        return super().__getattribute__(name)\n\n"
+        "class Base(metaclass=DetectMeta):\n"
+        "    pass\n\n"
+        "class Detect(Base):\n"
+        "    def forward(self):\n"
+        "        return None\n",
+    )
+
+    report = scan_bytes(_static_getattr_reduce_payload(), source="inherited-metaclass-static-getattr.pkl")
+
+    findings = _dangerous_getattr_findings(report)
+    assert findings
+    assert all(finding.severity == Severity.CRITICAL for finding in findings)
 
 
 def _file_mode_reduce_payload(module: bytes, name: bytes, target: Path, mode: bytes) -> bytes:
