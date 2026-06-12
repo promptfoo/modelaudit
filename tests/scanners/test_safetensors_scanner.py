@@ -1194,6 +1194,38 @@ def test_license_metadata_wrapped_opaque_tail_before_long_prose_reports_wrapped_
     )
 
 
+def test_license_metadata_wrapped_opaque_tail_before_large_prose_reports_wrapped_opaque_token(
+    tmp_path: Path,
+) -> None:
+    file_path = tmp_path / "license_metadata_opaque_wrapped_base64_tail_before_large_prose.safetensors"
+    prefix = "License grant terms permission reproduce distribute applicable law " * 3
+    suffix = " under license terms permission reproduce distribute applicable law" * 3
+    wrapped_tail = "\n".join(f"{prefix}{line}{suffix}" for line in opaque_wrapped_base64_lines())
+    documentary_tail = "\n".join("License terms grant permission reproduce distribute work." for _ in range(3000))
+    payload = f"{ordinary_license_text_without_url()}\n{wrapped_tail}\n{documentary_tail}"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert len(payload) > 128 * 1024
+    assert not SafeTensorsScanner._is_ordinary_license_metadata_value("license", payload, metadata_is_valid=True)
+    assert set(result.metadata["custom_metadata_security_flags"]) >= {"suspicious_pattern", "unusually_long_value"}
+    assert any(issue.rule_code == "S905" and "license" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Metadata Pattern Check"
+        and check.status == CheckStatus.FAILED
+        and check.details == {"key": "license", "pattern": "wrapped-opaque-token"}
+        for check in result.checks
+    )
+
+
 def test_license_metadata_url_bearing_wrapped_opaque_tail_reports_wrapped_opaque_token(
     tmp_path: Path,
 ) -> None:

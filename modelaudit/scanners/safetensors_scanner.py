@@ -1025,8 +1025,7 @@ class SafeTensorsScanner(BaseScanner):
 
     @classmethod
     def _metadata_value_has_wrapped_opaque_token(cls, value: str) -> bool:
-        scan_value = value[-_LICENSE_DOCUMENT_MAX_CHARS:]
-        lines = [line.strip() for line in scan_value.splitlines() if line.strip()]
+        lines = [line.strip() for line in value.splitlines() if line.strip()]
         return len(lines) > 1 and cls._license_document_has_wrapped_opaque_token(lines)
 
     @classmethod
