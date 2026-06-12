@@ -51,6 +51,7 @@ from .core_results import (
     details_match_shard_family_paths,
     metadata_has_incomplete_coverage,
     records_have_incomplete_coverage_for_path,
+    results_have_incomplete_coverage_under_directory,
     results_have_inconclusive_outcome,
 )
 from .integrations.jfrog import scan_jfrog_artifact
@@ -1489,7 +1490,6 @@ class _ScanPathState:
             if not resolved_path.is_file():
                 return
             self.dvc_covered_paths.add(str(resolved_path))
-            self.dvc_covered_directories.update(str(parent) for parent in resolved_path.parents)
 
         def path_matches_shard_family(candidate_path: str | None, shard_paths: set[Path]) -> bool:
             resolved_candidate = resolve_coverage_path(candidate_path)
@@ -1585,6 +1585,11 @@ class _ScanPathState:
             try:
                 resolved_root = directory_root.resolve()
             except OSError:
+                continue
+            if results_have_inconclusive_outcome(scan_result) or results_have_incomplete_coverage_under_directory(
+                scan_result,
+                str(resolved_root),
+            ):
                 continue
             walk_errors: list[OSError] = []
             walked_directories: set[str] = set()

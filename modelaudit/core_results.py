@@ -269,6 +269,68 @@ def records_have_incomplete_coverage_for_path(records: Iterable[Any] | None, fil
         return False
 
 
+def _location_is_within_directory(location: str, directory_path: str) -> bool:
+    if _location_matches_file_path(location, directory_path):
+        return True
+
+    try:
+        resolved_directory = Path(directory_path).resolve(strict=False)
+        resolved_location = Path(location).resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+    try:
+        return resolved_location == resolved_directory or resolved_location.is_relative_to(resolved_directory)
+    except ValueError:
+        return False
+
+
+def record_has_incomplete_coverage_under_directory(record: Any, directory_path: str) -> bool:
+    """Return True when a retained issue/check makes a directory unsafe to blanket-cover."""
+    if not record_details_have_incomplete_coverage(record):
+        return False
+
+    location = _metadata_value(record, "location")
+    if not isinstance(location, str) or not location:
+        return True
+
+    return _location_is_within_directory(location, str(directory_path))
+
+
+def records_have_incomplete_coverage_under_directory(records: Iterable[Any] | None, directory_path: str) -> bool:
+    """Return True when retained issue/check details make a directory unsafe to blanket-cover."""
+    if records is None:
+        return False
+    try:
+        return any(record_has_incomplete_coverage_under_directory(record, directory_path) for record in records)
+    except TypeError:
+        return False
+
+
+def results_have_incomplete_coverage_under_directory(
+    results: ModelAuditResultModel,
+    directory_path: str,
+) -> bool:
+    """Return True when a directory subtree has incomplete or failed scan coverage."""
+    for asset in results.assets or []:
+        asset_path = getattr(asset, "path", None)
+        if not isinstance(asset_path, str) or not _location_is_within_directory(asset_path, directory_path):
+            continue
+        if getattr(asset, "type", None) == "error":
+            return True
+
+    for metadata_path, metadata in (results.file_metadata or {}).items():
+        if not _location_is_within_directory(metadata_path, directory_path):
+            continue
+        if _metadata_value(metadata, OPERATIONAL_ERROR_METADATA_KEY) is True or metadata_has_incomplete_coverage(
+            metadata
+        ):
+            return True
+
+    records = (*(results.issues or []), *(results.checks or []))
+    return records_have_incomplete_coverage_under_directory(records, directory_path)
+
+
 def results_have_inconclusive_outcome(results: ModelAuditResultModel) -> bool:
     """Return True when any scanned file has incomplete coverage."""
     if any(metadata_has_incomplete_coverage(metadata) for metadata in (results.file_metadata or {}).values()):

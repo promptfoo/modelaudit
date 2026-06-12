@@ -2612,12 +2612,12 @@ class TestDvcSecurity:
         )
         assert any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
 
-    def test_over_limit_dvc_directory_output_records_complete_subdirectory_despite_sibling_gaps(
+    def test_over_limit_dvc_directory_output_keeps_tail_directory_incomplete_after_sibling_gap(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Directory-output coverage must not depend on aggregate success."""
+        """An incomplete directory scan must not blanket-cover a tail subdirectory."""
         model_dir = tmp_path / "model_dir"
         covered_subdir = model_dir / "covered"
         covered_subdir.mkdir(parents=True)
@@ -2642,12 +2642,12 @@ class TestDvcSecurity:
 
         assert result.files_scanned == 102
         assert result.success is False
-        assert determine_exit_code(result) == 1
+        assert determine_exit_code(result) == 2
         assert any(
             issue.rule_code == "S201" and issue.location is not None and str(malicious) in issue.location
             for issue in result.issues
         )
-        assert not any(issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in result.issues)
+        assert any(issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in result.issues)
         assert result.file_metadata[str(incomplete)]["analysis_incomplete"] is True
         assert "synthetic_metadata_only_incomplete" in result.file_metadata[str(incomplete)]["scan_outcome_reasons"]
 
@@ -3341,6 +3341,40 @@ class TestDvcCliIntegration:
             for issue in output_data["issues"]
         )
         assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
+
+    def test_cli_incomplete_directory_prior_coverage_does_not_cover_tail_directory(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Prior incomplete directory scans must not blanket-cover capped DVC tail directories."""
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        models_dir = tmp_path / "models"
+        covered_dir = models_dir / "covered"
+        covered_dir.mkdir(parents=True)
+        covered_payload = covered_dir / "covered.pkl"
+        covered_payload.write_bytes(pickle.dumps({"covered": True}))
+        incomplete = models_dir / "incomplete.pkl"
+        incomplete.write_bytes(pickle.dumps({"incomplete": True}))
+        _patch_metadata_only_incomplete_scan(monkeypatch, incomplete.name)
+        benign = tmp_path / "benign.pkl"
+        benign.write_bytes(pickle.dumps({"safe": True}))
+        dvc_file = tmp_path / "cli_directory_tail.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: models/covered\n")
+
+        result = CliRunner().invoke(
+            cli,
+            ["scan", str(models_dir), str(dvc_file), "--format", "json", "--no-cache"],
+        )
+
+        assert result.exit_code == 2, result.output
+        output_data = json.loads(result.output[result.output.index("{") :])
+        assert output_data["success"] is False
+        assert output_data["file_metadata"][str(incomplete)]["analysis_incomplete"] is True
+        assert any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
 
     @pytest.mark.parametrize(
         "shard_failure_details",
