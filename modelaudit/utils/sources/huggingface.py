@@ -2458,6 +2458,7 @@ def download_model(
     max_size: int | None = None,
     *,
     timeout_seconds: float | None = None,
+    repository_file_inventory: list[str] | None = None,
 ) -> Path:
     """Download a model from HuggingFace.
 
@@ -2467,6 +2468,7 @@ def download_model(
         show_progress: Whether to show download progress
         max_size: Optional maximum total selected download size in bytes
         timeout_seconds: Optional end-to-end acquisition deadline in seconds
+        repository_file_inventory: Optional list filled with repository member names from metadata
 
     Returns:
         Path to the downloaded model directory
@@ -2543,6 +2545,8 @@ def download_model(
                 "Hugging Face selective filtering incomplete: "
                 f"failed listing files in repository {repo_id}: {repo_listing_error}"
             )
+        if repository_file_inventory is not None:
+            repository_file_inventory[:] = repo_files
         if repo_revision is None:
             raise ValueError(
                 "Hugging Face selective filtering incomplete: "
@@ -2650,6 +2654,7 @@ def download_model_streaming(
     scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
     include_all_files: bool = False,
+    repository_file_inventory: list[str] | None = None,
 ) -> Iterator[tuple[Path, bool]]:
     """Download a model from HuggingFace one file at a time (streaming mode).
 
@@ -2666,6 +2671,7 @@ def download_model_streaming(
         scannable_filenames: Optional exact remote prefilter basenames from scanner selection policy
         scannable_scanner_ids: Optional exact scanner IDs from scanner selection policy
         include_all_files: Include otherwise-unrecognized files under a bounded fail-closed limit
+        repository_file_inventory: Optional list filled with repository member names from metadata
 
     Yields:
         Tuple of (Path, bool) - (downloaded file path, is_last_file flag)
@@ -2718,6 +2724,8 @@ def download_model_streaming(
             if repo_listing_error and repo_listing_error.startswith("timed out after"):
                 raise Exception(f"Timeout listing files in repository {repo_id}")
             raise Exception(f"Failed listing files in repository {repo_id}: {repo_listing_error}")
+        if repository_file_inventory is not None:
+            repository_file_inventory[:] = repo_files
         if repo_revision is None:
             raise Exception(
                 f"Failed listing files in repository {repo_id}: "
@@ -2885,13 +2893,22 @@ def download_model_streaming(
         ) from e
 
 
-def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int | None = None) -> Path:
+def download_file_from_hf(
+    url: str,
+    cache_dir: Path | None = None,
+    max_size: int | None = None,
+    *,
+    repository_file_inventory: list[str] | None = None,
+    timeout_seconds: float | None = None,
+) -> Path:
     """Download a single file from HuggingFace using direct file URL.
 
     Args:
         url: Direct HuggingFace file URL (e.g., https://huggingface.co/user/repo/resolve/main/file.bin)
         cache_dir: Optional cache directory for downloads
         max_size: Optional maximum file size to download; 0 disables the limit
+        repository_file_inventory: Optional list filled with repository member names from metadata
+        timeout_seconds: Optional end-to-end acquisition deadline in seconds
 
     Returns:
         Path to the downloaded file
@@ -2905,7 +2922,7 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
     display_url = redact_huggingface_url_for_display(url)
 
     try:
-        from huggingface_hub import HfApi, hf_hub_download
+        from huggingface_hub import hf_hub_download
     except ImportError as e:
         raise ImportError(
             "huggingface-hub package is required for HuggingFace URL support. "
@@ -2918,17 +2935,49 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
 
         size_limit = max_size or None
         download_revision = branch
+        deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+        repo_files: list[str] | None = None
+        repo_revision: str | None = None
+        repo_listing_error: str | None = None
+        if size_limit is not None or repository_file_inventory is not None:
+            listing_timeout = 30.0
+            if deadline is not None:
+                listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
+                if listing_timeout <= 0:
+                    raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+            repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
+                repo_id,
+                listing_timeout,
+                revision=branch,
+                deadline=deadline,
+            )
+            inventory_revision: str | None = None
+            if _is_huggingface_commit_sha(repo_revision):
+                assert isinstance(repo_revision, str)
+                inventory_revision = repo_revision
+            elif _is_huggingface_commit_sha(branch):
+                inventory_revision = branch
+            if repository_file_inventory is not None and repo_files is not None and inventory_revision is not None:
+                repository_file_inventory[:] = repo_files
+                download_revision = inventory_revision
+
         if size_limit is not None:
-            api = HfApi()
-            repo_info = api.repo_info(repo_id, revision=branch)
-            pinned_revision = getattr(repo_info, "sha", None)
+            pinned_revision = repo_revision
             if not _is_huggingface_commit_sha(pinned_revision):
-                raise ValueError(f"Unable to determine immutable revision for {display_url}; refusing capped download")
+                error_suffix = f": {repo_listing_error}" if repo_listing_error else ""
+                raise ValueError(
+                    f"Unable to determine immutable revision for {display_url}; refusing capped download{error_suffix}"
+                )
             assert isinstance(pinned_revision, str)
 
-            path_info = api.get_paths_info(repo_id, filename, revision=pinned_revision)
-            file_metadata = path_info[0] if path_info else None
-            file_size = getattr(file_metadata, "size", None)
+            path_sizes, _resolved_revision = _get_huggingface_path_sizes(
+                repo_id,
+                [filename],
+                requested_revision=branch,
+                resolved_revision=pinned_revision,
+                deadline=deadline,
+            )
+            file_size = path_sizes.get(filename)
             if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
                 raise ValueError(f"Unable to determine file size for {display_url}; refusing capped download")
             if file_size > size_limit:
@@ -2937,12 +2986,18 @@ def download_file_from_hf(url: str, cache_dir: Path | None = None, max_size: int
                 )
             download_revision = pinned_revision
 
-        # Use hf_hub_download for single file downloads
-        local_path = hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            revision=download_revision,
-            cache_dir=str(cache_dir) if cache_dir else None,
+        download_kwargs: dict[str, Any] = {
+            "repo_id": repo_id,
+            "filename": filename,
+            "revision": download_revision,
+            "cache_dir": str(cache_dir) if cache_dir else None,
+        }
+        local_path = _run_huggingface_download_with_deadline(
+            "hf_hub_download",
+            download_kwargs,
+            deadline,
+            repo_id,
+            direct_download=hf_hub_download,
         )
         downloaded_path = Path(local_path)
         if size_limit is not None:
