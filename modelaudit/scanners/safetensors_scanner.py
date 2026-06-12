@@ -952,6 +952,13 @@ class SafeTensorsScanner(BaseScanner):
                 fragments = cls._license_document_line_short_base64_fragments(line)
                 short_fragments = bool(fragments)
             if fragments:
+                current_line_has_annotated_opaque_fragment = line_has_documentary_annotation and any(
+                    len(fragment) >= _BASE64_LICENSE_WRAP_ANNOTATED_OPAQUE_MIN_CHARS for fragment in fragments
+                )
+                if chunks and current_line_has_annotated_opaque_fragment and requires_active_pattern():
+                    if flush():
+                        return True
+                    reset()
                 current_line_decodes_active = not short_fragments and cls._base64_candidate_decodes(
                     "".join(fragments),
                     require_active_pattern=True,
