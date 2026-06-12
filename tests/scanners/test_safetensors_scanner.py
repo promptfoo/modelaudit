@@ -1843,7 +1843,11 @@ def test_license_metadata_encoded_backslash_url_delimiters_fail_closed(
         r"Additional terms: https:\\evil.example\payload",
         r"Additional terms: https:/\evil.example/payload",
         r"Additional terms: https:\/evil.example/payload",
+        r"Additional terms: https:\evil.example/payload",
+        "Additional terms: https:/evil.example/payload",
         r"Additional terms: http:\\evil.example\payload",
+        r"Additional terms: http:\evil.example/payload",
+        "Additional terms: http:/evil.example/payload",
     ],
 )
 def test_license_metadata_raw_backslash_url_delimiters_fail_closed(
@@ -1921,7 +1925,11 @@ def test_license_metadata_short_encoded_backslash_url_delimiters_report_s905_wit
         r"https:\\evil.example\payload",
         r"https:/\evil.example/payload",
         r"https:\/evil.example/payload",
+        r"https:\evil.example/payload",
+        "https:/evil.example/payload",
         r"http:\\evil.example\payload",
+        r"http:\evil.example/payload",
+        "http:/evil.example/payload",
     ],
 )
 def test_license_metadata_short_raw_backslash_url_delimiters_report_s905_without_raw_url(

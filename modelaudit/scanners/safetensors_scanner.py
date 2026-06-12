@@ -493,7 +493,7 @@ _ENCODED_URL_DELIMITER_PATTERN = re.compile(
     r"(?P<slash1>%(?:25)*(?:2f|5c)|/|\\)(?P<slash2>%(?:25)*(?:2f|5c)|/|\\)",
     re.IGNORECASE,
 )
-_RAW_BACKSLASH_URL_DELIMITER_PATTERN = re.compile(r"https?:(?:\\\\|/\\|\\/)", re.IGNORECASE)
+_RAW_BACKSLASH_URL_DELIMITER_PATTERN = re.compile(r"https?:(?:\\\\|/\\|\\/|\\(?![\\/])|/(?!/))", re.IGNORECASE)
 
 
 def _url_path_has_unsafe_decoded_char(path: str) -> bool:
