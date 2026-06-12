@@ -294,6 +294,36 @@ def test_hf_repo_dry_run_preview_does_not_download_or_scan() -> None:
     mock_scan.assert_not_called()
 
 
+def test_hf_repo_dry_run_preview_rejects_gated_selected_file() -> None:
+    runner = CliRunner()
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": "a" * 40,
+        "total_size": 20,
+        "file_count": 1,
+        "inventory_status": "gated_inaccessible",
+        "inaccessible_gated_file_count": 1,
+        "inaccessible_gated_files": ["model.safetensors"],
+        "files": [{"name": "model.safetensors", "size": 20, "access": "gated"}],
+    }
+
+    with (
+        _mock_hf_model_info(return_value=metadata),
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+    ):
+        result = runner.invoke(
+            cli,
+            ["scan", "--dry-run", "--format", "json", "--scanners", "safetensors", "hf://test/model"],
+        )
+
+    assert result.exit_code == 2
+    assert "Selected Hugging Face files are gated/inaccessible (model.safetensors); refusing dry-run" in result.output
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
 def test_hf_repo_dry_run_preview_enforces_max_size() -> None:
     runner = CliRunner()
     metadata = {

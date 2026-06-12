@@ -438,6 +438,16 @@ def _huggingface_stream_preview_content_route_candidate_files(
     return candidates
 
 
+def _huggingface_preview_content_probe_bytes(item: dict[str, Any]) -> int:
+    """Return the bounded byte charge for a metadata-only content-route probe."""
+    from .utils.sources import huggingface as huggingface_source
+
+    size = _huggingface_preview_file_size(item)
+    if size is None:
+        return huggingface_source._HF_CONTENT_SNIFF_BYTES
+    return min(size, huggingface_source._HF_CONTENT_SNIFF_BYTES)
+
+
 def _huggingface_stream_preview_enforce_content_route_candidate_limit(
     metadata: dict[str, Any],
     selected_files: list[dict[str, Any]],
@@ -453,13 +463,58 @@ def _huggingface_stream_preview_enforce_content_route_candidate_limit(
             "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "
             f"for {repo_id} ({huggingface_source._HF_CONTENT_SNIFF_MAX_FILES} files)"
         )
-    candidate_size = sum(size for item in candidates if (size := _huggingface_preview_file_size(item)) is not None)
+    candidate_size = sum(_huggingface_preview_content_probe_bytes(item) for item in candidates)
     if candidate_size > huggingface_source._HF_CONTENT_SNIFF_MAX_TOTAL_BYTES:
         repo_id = str(metadata.get("repo_id") or metadata.get("model_id") or "unknown")
         raise ValueError(
             "Hugging Face selective filtering incomplete: skipped file inspection byte limit exceeded "
             f"for {repo_id} ({huggingface_source._HF_CONTENT_SNIFF_MAX_TOTAL_BYTES} bytes)"
         )
+
+
+def _huggingface_preview_item_is_gated(item: dict[str, Any]) -> bool:
+    """Return whether Hugging Face metadata says this file is inaccessible."""
+    access = str(item.get("access") or "").lower()
+    inventory_status = str(item.get("inventory_status") or "").lower()
+    return (
+        bool(item.get("gated"))
+        or access in {"gated", "inaccessible", "gated_inaccessible"}
+        or "gated" in inventory_status
+    )
+
+
+def _huggingface_preview_reject_gated_files(
+    metadata: dict[str, Any],
+    selected_files: list[dict[str, Any]],
+) -> None:
+    """Fail closed when a dry-run-selected file would be blocked by Hub access."""
+    selected_names = _huggingface_preview_file_names(selected_files)
+    if not selected_names:
+        return
+
+    gated_names = {str(name) for name in metadata.get("inaccessible_gated_files", []) if isinstance(name, str) and name}
+    blocked_names: list[str] = []
+    for item in selected_files:
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        if name in gated_names or _huggingface_preview_item_is_gated(item):
+            blocked_names.append(name)
+
+    raw_gated_count = metadata.get("inaccessible_gated_file_count")
+    gated_count = raw_gated_count if isinstance(raw_gated_count, int) and not isinstance(raw_gated_count, bool) else 0
+    if (
+        not blocked_names
+        and str(metadata.get("inventory_status") or "").lower() == "gated_inaccessible"
+        and gated_count > 0
+    ):
+        blocked_names = selected_names
+
+    if blocked_names:
+        preview = ", ".join(blocked_names[:3])
+        if len(blocked_names) > 3:
+            preview = f"{preview}, ..."
+        raise ValueError(f"Selected Hugging Face files are gated/inaccessible ({preview}); refusing dry-run")
 
 
 def _huggingface_preview_download_files(metadata: dict[str, Any]) -> list[dict[str, Any]]:
@@ -740,6 +795,7 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
         if runtime.scan_and_delete
         else (download_files or selected_files)
     )
+    _huggingface_preview_reject_gated_files(metadata, budget_files)
     total_size = metadata.get("total_size")
     budget_sizes = [_huggingface_preview_file_size(item) for item in budget_files]
     budget_size = sum(size for size in budget_sizes if size is not None)

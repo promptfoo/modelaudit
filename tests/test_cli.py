@@ -5122,16 +5122,16 @@ def test_scan_huggingface_streaming_dry_run_max_size_enforces_content_probe_cand
 @patch("modelaudit.utils.sources.huggingface.get_model_info")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
-def test_scan_huggingface_streaming_dry_run_max_size_enforces_content_probe_byte_budget(
+def test_scan_huggingface_streaming_dry_run_max_size_budgets_content_candidates_by_probe_bytes(
     mock_scan_streaming: MagicMock,
     mock_download_streaming: MagicMock,
     mock_get_model_info: MagicMock,
     mock_is_hf_url: MagicMock,
 ) -> None:
-    """Max-size dry-run must mirror the real selector's content-probe byte bound."""
+    """Max-size dry-run should not charge full file sizes against the content-probe budget."""
     mock_is_hf_url.return_value = True
     payload_size = 1024 * 1024
-    payload_files = [{"name": f"payload-{index}.blob", "size": payload_size} for index in range(65)]
+    payload_files = [{"name": f"payload-{index}.blob", "size": payload_size} for index in range(6)]
     total_size = 1024 + (len(payload_files) * payload_size)
     mock_get_model_info.return_value = {
         "repo_id": "test/model",
@@ -5162,8 +5162,61 @@ def test_scan_huggingface_streaming_dry_run_max_size_enforces_content_probe_byte
     )
 
     output = strip_ansi(result.output)
+    assert result.exit_code == 0, output
+    assert "Scannable files: 7 of 7" in output
+    assert mock_get_model_info.call_args.kwargs["include_metadata_files"] is True
+    assert mock_get_model_info.call_args.kwargs["sniff_content"] is False
+    mock_download_streaming.assert_not_called()
+    mock_scan_streaming.assert_not_called()
+
+
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.get_model_info")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_dry_run_max_size_enforces_content_probe_byte_budget(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_get_model_info: MagicMock,
+    mock_is_hf_url: MagicMock,
+) -> None:
+    """Max-size dry-run must mirror the real selector's bounded probe-byte cap."""
+    mock_is_hf_url.return_value = True
+    payload_size = 1024 * 1024
+    payload_files = [{"name": f"payload-{index}.blob", "size": payload_size} for index in range(3)]
+    total_size = 1024 + (len(payload_files) * payload_size)
+    mock_get_model_info.return_value = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": _HF_TEST_REVISION,
+        "total_size": total_size,
+        "file_count": 1 + len(payload_files),
+        "files": [
+            {"name": "model.pt", "size": 1024},
+            *payload_files,
+        ],
+    }
+
+    with patch("modelaudit.utils.sources.huggingface._HF_CONTENT_SNIFF_MAX_TOTAL_BYTES", 16 * 1024):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--stream",
+                "--scanners",
+                "pytorch_zip",
+                "--max-size",
+                "100MB",
+                "--format",
+                "text",
+                "hf://test/model",
+            ],
+        )
+
+    output = strip_ansi(result.output)
     assert result.exit_code == 2, output
-    assert "skipped file inspection byte limit exceeded for test/model (67108864 bytes)" in output
+    assert "skipped file inspection byte limit exceeded for test/model (16384 bytes)" in output
     assert mock_get_model_info.call_args.kwargs["include_metadata_files"] is True
     assert mock_get_model_info.call_args.kwargs["sniff_content"] is False
     mock_download_streaming.assert_not_called()
