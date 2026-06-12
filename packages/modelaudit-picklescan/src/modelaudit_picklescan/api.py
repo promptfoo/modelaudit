@@ -2618,7 +2618,7 @@ def _with_untrusted_allowlisted_import_findings(
             or bool(reference.get("is_dangerous"))
             or not bool(reference.get("requires_origin_verification"))
             or key in existing_references
-            or not import_only_module_requires_origin_review(module, name)
+            or not _allowlisted_import_requires_origin_finding(module, name)
         ):
             continue
         additional_findings.append(
@@ -2653,6 +2653,21 @@ def _with_untrusted_allowlisted_import_findings(
         coverage=report.coverage,
         metadata=report.to_dict()["metadata"],
         duration_s=report.duration_s,
+    )
+
+
+def _allowlisted_import_requires_origin_finding(module: str, name: str) -> bool:
+    return import_only_module_requires_origin_review(
+        module,
+        name,
+    ) or _noncanonical_pytorch_storage_like_reference(module, name)
+
+
+def _noncanonical_pytorch_storage_like_reference(module: str, name: str) -> bool:
+    return (
+        module in {"torch", "torch.storage"}
+        and name.endswith("Storage")
+        and (module, name) not in _PYTORCH_STORAGE_GLOBALS
     )
 
 

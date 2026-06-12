@@ -7730,6 +7730,56 @@ def test_pytorch_zip_scanner_trusts_protocol0_storage_persid_in_data_pkl(tmp_pat
     )
 
 
+def test_pytorch_zip_scanner_trusts_redacted_untyped_storage_binpersid_preview() -> None:
+    details: dict[str, Any] = {
+        "pickle_rule_code": "PERSISTENT_ID",
+        "opcode": "BINPERSID",
+        "persistent_id_preview": (
+            "tuple(str_span(len=7), global:torch.storage.UntypedStorage, str_span(len=1), str_span(len=3), int:1)"
+        ),
+    }
+
+    assert PyTorchZipScanner._is_pytorch_storage_persistent_id_record(details, {"0"}) is True
+    assert details["pytorch_storage_persistent_id"] is True
+    assert details["pytorch_storage_key"] == "0"
+
+
+@pytest.mark.parametrize(
+    ("preview", "trusted_storage_keys"),
+    [
+        (
+            ("tuple(str_span(len=7), global:torch.storage.UntypedStorage, str_span(len=1), str_span(len=3), int:1)"),
+            {"0", "1"},
+        ),
+        (
+            ("tuple(str_span(len=7), global:torch.storage.FakeStorage, str_span(len=1), str_span(len=3), int:1)"),
+            {"0"},
+        ),
+        (
+            ("tuple(str_span(len=7), global:torch.storage.UntypedStorage, str_span(len=1), str_span(len=3), int:1)"),
+            {"x"},
+        ),
+        (
+            ("tuple(str_span(len=6), global:torch.storage.UntypedStorage, str_span(len=1), str_span(len=3), int:1)"),
+            {"0"},
+        ),
+    ],
+)
+def test_pytorch_zip_scanner_rejects_untrusted_redacted_binpersid_previews(
+    preview: str,
+    trusted_storage_keys: set[str],
+) -> None:
+    details: dict[str, Any] = {
+        "pickle_rule_code": "PERSISTENT_ID",
+        "opcode": "BINPERSID",
+        "persistent_id_preview": preview,
+    }
+
+    assert PyTorchZipScanner._is_pytorch_storage_persistent_id_record(details, trusted_storage_keys) is False
+    assert "pytorch_storage_persistent_id" not in details
+    assert "pytorch_storage_key" not in details
+
+
 def test_pytorch_zip_scanner_does_not_downgrade_arbitrary_protocol0_persid(
     tmp_path: Path,
 ) -> None:

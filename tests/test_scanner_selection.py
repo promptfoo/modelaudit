@@ -853,11 +853,13 @@ def test_remote_prefilters_preserve_text_scanner_content_routed_filenames() -> N
 
     assert extensions is not None
     assert "" not in extensions
+    assert ".env" in extensions
     assert filenames == frozenset(
         {
             "readme",
             "model_card",
             "requirements.txt",
+            ".env",
             "vocab.txt",
             "vocabulary.txt",
             "tokens.txt",
@@ -868,6 +870,29 @@ def test_remote_prefilters_preserve_text_scanner_content_routed_filenames() -> N
             "labels.txt",
             "classes.txt",
         }
+    )
+    files = [
+        {"path": "s3://bucket/.env"},
+        {"path": "s3://bucket/prod.env"},
+        {"path": "s3://bucket/README"},
+        {"path": "s3://bucket/model.bin"},
+    ]
+
+    assert (
+        filter_cloud_scannable_files(
+            files,
+            scannable_extensions=extensions,
+            scannable_filenames=filenames,
+        )
+        == files[:3]
+    )
+    assert (
+        filter_jfrog_scannable_files(
+            files,
+            scannable_extensions=extensions,
+            scannable_filenames=filenames,
+        )
+        == files[:3]
     )
 
 
