@@ -251,6 +251,59 @@ _LICENSE_DOCUMENT_LINE_MARKERS = (
     "trademark",
     "use",
 )
+_LICENSE_DOCUMENT_BASE64_WORD_TOKENS = frozenset(
+    {
+        *_LICENSE_DOCUMENT_LINE_MARKERS,
+        "additional",
+        "apache",
+        "applicable",
+        "charge",
+        "com",
+        "conditions",
+        "contributor",
+        "defined",
+        "definitions",
+        "display",
+        "document",
+        "exclusive",
+        "free",
+        "github",
+        "grants",
+        "hereby",
+        "http",
+        "https",
+        "irrevocable",
+        "january",
+        "legal",
+        "licence",
+        "licenses",
+        "licensing",
+        "lightricks",
+        "mean",
+        "model",
+        "notice",
+        "ordinary",
+        "perform",
+        "policies",
+        "policy",
+        "prepare",
+        "publicly",
+        "reference",
+        "royalty",
+        "sections",
+        "source",
+        "subject",
+        "sublicense",
+        "through",
+        "under",
+        "version",
+        "video",
+        "whereas",
+        "work",
+        "works",
+        "worldwide",
+    }
+)
 _DUPLICATE_JSON_KEY_DETAIL_LIMIT = 20
 _URL_METADATA_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 _LICENSE_REFERENCE_HOST_SUFFIXES = (
@@ -347,7 +400,11 @@ _BASE64_LICENSE_WRAP_MAX_SEPARATOR_LINES = 4
 _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO = 0.15
 _BASE64_LICENSE_WRAP_LINE_PATTERN = re.compile(r"^[A-Za-z0-9+/_-]+={0,2}$")
 _BASE64_LICENSE_WRAP_TOKEN_PATTERN = re.compile(
-    rf"\b[A-Za-z0-9+/_-]{{{_BASE64_LICENSE_WRAP_TOKEN_MIN_CHARS},}}={{0,2}}\b"
+    r"(?<![A-Za-z0-9+/_-])(?:"
+    rf"[A-Za-z0-9+/_-]{{{_BASE64_LICENSE_WRAP_TOKEN_MIN_CHARS},}}"
+    r"|[A-Za-z0-9+/_-]{3}="
+    r"|[A-Za-z0-9+/_-]{2}=="
+    r")(?![A-Za-z0-9+/_-])"
 )
 _BASE64_LICENSE_WRAP_SEPARATOR_PATTERN = re.compile(
     r"^(?:[#>;]|//|--|\*)\s*(?:continued|continuation|wrapped|base64|license(?:\s+terms?)?)?\s*$",
@@ -597,23 +654,43 @@ class SafeTensorsScanner(BaseScanner):
             return []
 
         fragments: list[str] = []
-        for match in _BASE64_LICENSE_WRAP_TOKEN_PATTERN.finditer(stripped):
+        token_matches = list(_BASE64_LICENSE_WRAP_TOKEN_PATTERN.finditer(stripped))
+        low_ratio_opaque_tokens = [
+            match.group(0)
+            for match in token_matches
+            if len(match.group(0)) / nonspace_len < _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO
+            and not SafeTensorsScanner._base64_candidate_decodes(match.group(0))
+            and not SafeTensorsScanner._license_document_token_looks_documentary(match.group(0))
+        ]
+        for match in token_matches:
             token = match.group(0)
             before = stripped[: match.start()]
             after = stripped[match.end() :]
-            if (
-                len(token) / nonspace_len < _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO
-                and not SafeTensorsScanner._base64_candidate_decodes(token)
-            ):
-                continue
+            token_decodes = SafeTensorsScanner._base64_candidate_decodes(token)
+            if len(token) / nonspace_len < _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO and not token_decodes:
+                if SafeTensorsScanner._license_document_token_looks_documentary(token):
+                    continue
+                if low_ratio_opaque_tokens != [token]:
+                    continue
             annotations = [annotation for annotation in (before, after) if annotation.strip()]
             if not all(
                 SafeTensorsScanner._license_document_annotation_looks_documentary(annotation)
                 for annotation in annotations
             ):
                 continue
+            if not token_decodes and SafeTensorsScanner._license_document_token_looks_documentary(token):
+                continue
             fragments.append(token)
         return fragments
+
+    @staticmethod
+    def _license_document_token_looks_documentary(token: str) -> bool:
+        normalized = token.strip("=").lower()
+        if not normalized:
+            return True
+        if normalized.isdecimal():
+            return True
+        return normalized in _LICENSE_DOCUMENT_BASE64_WORD_TOKENS
 
     @staticmethod
     def _license_document_line_is_bounded_documentary_separator(line: str) -> bool:

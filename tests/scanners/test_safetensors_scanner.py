@@ -932,6 +932,52 @@ def test_license_metadata_padded_short_import_gadget_base64_keeps_length_and_s90
     )
 
 
+def test_license_metadata_annotated_tiny_base64_chunks_keep_length_pattern_and_s905(tmp_path: Path) -> None:
+    file_path = tmp_path / "annotated_tiny_short_import_gadget_license_metadata.safetensors"
+    encoded_gadget = short_import_gadget_base64_tail()
+    chunks = [encoded_gadget[index : index + 4] for index in range(0, len(encoded_gadget), 4)]
+    wrapped_lines = [
+        (
+            "License grant terms permission reproduce distribute applicable law "
+            f"{chunk} "
+            "license terms permission reproduce distribute applicable law"
+        )
+        for chunk in chunks
+    ]
+    wrapped_tail = "\n".join(wrapped_lines)
+    payload = f"{ordinary_license_text_with_url()}\n{wrapped_tail}"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert all(
+        len(chunk) / sum(1 for char in line if not char.isspace()) < _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO
+        for chunk, line in zip(chunks, wrapped_lines, strict=True)
+    )
+    assert not SafeTensorsScanner._is_ordinary_license_metadata_value("license", payload, metadata_is_valid=True)
+    assert set(result.metadata["custom_metadata_security_flags"]) >= {"suspicious_pattern", "unusually_long_value"}
+    assert any(issue.rule_code == "S905" and "license" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Metadata Length Check"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("key") == "license"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Metadata Pattern Check"
+        and check.status == CheckStatus.FAILED
+        and check.details == {"key": "license", "pattern": "https?://"}
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize(
     ("payload_tail", "file_stem"),
     [
