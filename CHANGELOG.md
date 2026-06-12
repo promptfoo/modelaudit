@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - propagate file-level inconclusive and incomplete-coverage metadata into aggregate success, strict JSON, exit-code, and cache semantics
+- paginate and bound large Hugging Face repository inventories before streaming so unfiltered scans preserve complete coverage
 - dispatch logical model directories through their owning scanners, preserving bounded complete SavedModel asset probes before supplemental child-file coverage
 - stream large Flax MessagePack tensor bodies by declared length without tripping the 512 MiB decode budget
 - avoid critical pickle `getattr` findings for proven Ultralytics `Detect.forward` reconstruction while preserving unsafe traversal controls
