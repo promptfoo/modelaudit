@@ -947,6 +947,68 @@ def _is_printable_non_ascii_huggingface_text_prefix(probe: bytes) -> bool:
     )
 
 
+def _detect_huggingface_text_owner_embedded_binary_route(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> str | None:
+    """Return a bounded route for binary/model bytes embedded after a text-owned prefix."""
+    known_size = budget.file_sizes.get(filename)
+    if known_size is None or known_size <= len(prefix):
+        return None
+
+    from modelaudit.utils.file.detection import (
+        FLAX_MSGPACK_STRUCTURE_READ_BYTES,
+        PROTOBUF_MODEL_CANDIDATE_FORMAT,
+        _has_bounded_protobuf_model_text_candidate_signal_bytes,
+        _looks_like_proto0_or_1_pickle,
+        _probe_flax_msgpack_checkpoint_stream,
+        detect_format_from_magic_bytes,
+    )
+
+    def detect_sample_route(sample: bytes) -> str | None:
+        if not sample:
+            return None
+        flax_state = _probe_flax_msgpack_checkpoint_stream(
+            BytesIO(sample),
+            len(sample),
+            sample_is_prefix=True,
+            incomplete_prefix_is_inconclusive=True,
+        )
+        if flax_state is True:
+            return "flax_msgpack"
+        if _starts_with_non_ascii_length_delimited_proto_prefix(
+            sample
+        ) or _has_bounded_protobuf_model_text_candidate_signal_bytes(sample):
+            return PROTOBUF_MODEL_CANDIDATE_FORMAT
+        if _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=True):
+            return "pickle"
+        detected_format = detect_format_from_magic_bytes(
+            sample[:4],
+            sample[:8],
+            sample[:16],
+            max(len(sample), 1),
+            None,
+            pickle_probe_sample=sample,
+            pickle_probe_is_prefix=True,
+        )
+        return None if detected_format == "unknown" else detected_format
+
+    sample_size = FLAX_MSGPACK_STRUCTURE_READ_BYTES
+    post_prefix = _read_huggingface_range(repo_id, filename, revision, budget, prefix, len(prefix), sample_size)
+    post_prefix_route = detect_sample_route(post_prefix)
+    if post_prefix_route is not None:
+        return post_prefix_route
+
+    tail_start = max(0, known_size - min(known_size, sample_size))
+    if tail_start <= len(prefix) + len(post_prefix):
+        return None
+    tail = _read_huggingface_tail(repo_id, filename, revision, budget, prefix, sample_size)
+    return detect_sample_route(tail)
+
+
 def _is_complete_huggingface_text_owner_or_json_probe(
     repo_id: str,
     filename: str,
@@ -977,8 +1039,10 @@ def _is_complete_huggingface_text_owner_or_json_probe(
     known_size = budget.file_sizes.get(filename)
     if known_size is not None and known_size > _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES:
         return False
+    if known_size is None or known_size > len(probe):
+        return False
 
-    return known_size is not None and _is_huggingface_text_owner_prefix(
+    return _is_huggingface_text_owner_prefix(
         filename,
         probe,
         preserve_protobuf_model_candidates=preserve_protobuf_model_candidates,
@@ -1086,6 +1150,8 @@ def _detect_huggingface_flax_msgpack_route(
         return None
     if initial_probe_state is False and Path(filename).suffix.lower() not in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES:
         return None
+    if initial_probe_state is False and _is_huggingface_text_owner_prefix(filename, prefix):
+        return _detect_huggingface_text_owner_embedded_binary_route(repo_id, filename, revision, budget, prefix)
     if _is_complete_huggingface_text_owner_or_json_probe(
         repo_id,
         filename,
@@ -1302,6 +1368,12 @@ def _detect_huggingface_content_route_format(
         preserve_protobuf_model_candidates=True,
     ):
         return None
+    if _is_huggingface_text_owner_prefix(
+        filename,
+        prefix,
+        preserve_protobuf_model_candidates=True,
+    ):
+        return _detect_huggingface_text_owner_embedded_binary_route(repo_id, filename, revision, budget, prefix)
 
     if (
         remote_path.suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES

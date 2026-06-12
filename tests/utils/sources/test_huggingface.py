@@ -4876,7 +4876,7 @@ class TestModelDownloadStreaming:
     ) -> None:
         """A complete large tokenizer text file must not be promoted to Flax."""
         payload = ("#version: 0.2\n" + "e n\n" * 600_000).encode("utf-8")
-        mock_requests_get.return_value = _FakeRangeResponse(payload)
+        mock_requests_get.side_effect = _fake_range_responder(payload)
 
         selected_files = _select_streamable_hf_files(
             "test/model",
@@ -4888,7 +4888,70 @@ class TestModelDownloadStreaming:
 
         assert selected_files == ["known.msgpack"]
 
-    @patch("modelaudit.utils.sources.huggingface._HF_CONTENT_SNIFF_MAX_TOTAL_BYTES", 64 * 1024)
+    @patch("requests.get")
+    def test_select_streamable_text_owner_prefix_preserves_embedded_flax_route(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """A text-looking remote prefix must not skip later bounded binary model bytes."""
+        text_prefix = ("#version: 0.2\n" + "e n\n" * 3_000).encode("utf-8")[:_HF_CONTENT_SNIFF_BYTES]
+        payload = text_prefix + b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03"
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "weights.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
+        )
+
+        assert selected_files == ["known.msgpack", "weights.txt"]
+
+    @patch("requests.get")
+    def test_select_streamable_text_owner_prefix_preserves_mid_window_flax_route(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """The post-prefix guard must cover the Flax structure window, not only one sniff chunk."""
+        text_prefix = ("#version: 0.2\n" + "e n\n" * 3_000).encode("utf-8")[:_HF_CONTENT_SNIFF_BYTES]
+        payload = (
+            text_prefix + (b" " * ((_HF_CONTENT_SNIFF_BYTES * 2) + 100)) + b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03"
+        )
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "weights.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
+        )
+
+        assert selected_files == ["known.msgpack", "weights.txt"]
+
+    @patch("requests.get")
+    def test_select_streamable_text_owner_prefix_preserves_embedded_protobuf_route(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Ordinary text prefixes must not hide later protobuf model-candidate bytes."""
+        text_prefix = ("#version: 0.2\n" + "e n\n" * 3_000).encode("utf-8")[:_HF_CONTENT_SNIFF_BYTES]
+        proto_value = ("é" * 60).encode("utf-8") + b" x:12"
+        payload = text_prefix + b"B" + bytes([len(proto_value)]) + proto_value
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["model.onnx", "candidate.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".onnx"},
+            scannable_scanner_ids={"onnx"},
+        )
+
+        assert selected_files == ["model.onnx", "candidate.txt"]
+
+    @patch("modelaudit.utils.sources.huggingface._HF_CONTENT_SNIFF_MAX_TOTAL_BYTES", 4 * 1024 * 1024)
     @patch("requests.get")
     def test_select_streamable_text_owner_uses_known_size_for_complete_probe_budget(
         self,
@@ -4896,15 +4959,16 @@ class TestModelDownloadStreaming:
     ) -> None:
         """Known-small tokenizer text should not reserve the full text-owner ceiling."""
         payload = ("#version: 0.2\n" + "e n\n" * 3_000).encode("utf-8")
-        requested_range_ends: list[int] = []
+        requested_ranges: list[tuple[int, int]] = []
 
         def get_side_effect(_url: str, *, headers: dict[str, str], **_kwargs: object) -> _FakeRangeResponse:
             range_header = headers["Range"]
             start_text, end_text = range_header.removeprefix("bytes=").split("-", 1)
+            requested_start = int(start_text)
             requested_end = int(end_text)
-            requested_range_ends.append(requested_end)
+            requested_ranges.append((requested_start, requested_end))
             response_end = min(requested_end, len(payload) - 1)
-            return _fake_content_range_response(payload, int(start_text), response_end)
+            return _fake_content_range_response(payload, requested_start, response_end)
 
         mock_requests_get.side_effect = get_side_effect
 
@@ -4917,8 +4981,9 @@ class TestModelDownloadStreaming:
         )
 
         assert selected_files == ["known.msgpack"]
-        assert requested_range_ends
-        assert max(requested_range_ends) < len(payload) - 1
+        assert requested_ranges
+        assert all((end - start + 1) <= FLAX_MSGPACK_STRUCTURE_READ_BYTES for start, end in requested_ranges)
+        assert (0, len(payload) - 1) not in requested_ranges
 
     @patch("requests.get")
     def test_select_streamable_protobuf_excludes_non_ascii_bpe_text_owner(
@@ -4927,7 +4992,7 @@ class TestModelDownloadStreaming:
     ) -> None:
         """BPE merge text with non-ASCII tokens must not become a protobuf candidate."""
         payload = ("#version: 0.2\n" + "Ġ hello\n" * 300_000).encode("utf-8")
-        mock_requests_get.return_value = _FakeRangeResponse(payload)
+        mock_requests_get.side_effect = _fake_range_responder(payload)
 
         selected_files = _select_streamable_hf_files(
             "test/model",
@@ -4940,13 +5005,32 @@ class TestModelDownloadStreaming:
         assert selected_files == ["model.onnx"]
 
     @patch("requests.get")
+    def test_select_streamable_flax_excludes_non_ascii_bpe_text_owner(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """Printable non-ASCII tokenizer text must not be selected as inconclusive Flax."""
+        payload = ("#version: 0.2\n" + "Ġ hello\n" * 300_000).encode("utf-8")
+        mock_requests_get.side_effect = _fake_range_responder(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["known.msgpack", "merges.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".msgpack", ".flax", ".orbax", ".jax"},
+            scannable_scanner_ids={"flax_msgpack"},
+        )
+
+        assert selected_files == ["known.msgpack"]
+
+    @patch("requests.get")
     def test_select_streamable_protobuf_excludes_ascii_varint_text_near_match(
         self,
         mock_requests_get: MagicMock,
     ) -> None:
         """ASCII text starting with a weak ONNX varint tag must remain text-owned."""
         payload = (b"(h benign ascii text\n") * 4097
-        mock_requests_get.return_value = _FakeRangeResponse(payload)
+        mock_requests_get.side_effect = _fake_range_responder(payload)
 
         selected_files = _select_streamable_hf_files(
             "test/model",
