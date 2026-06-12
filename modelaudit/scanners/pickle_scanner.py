@@ -8,10 +8,9 @@ import hashlib
 import io
 import pickletools
 import re
-from collections import Counter
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, BinaryIO, ClassVar, TextIO, cast
 
@@ -457,6 +456,7 @@ class _LegacyPyTorchStorageRecord:
     element_size: int
     storage_type_module: str
     storage_type_name: str
+    storage_type_position: int | None = None
 
 
 @dataclass(frozen=True)
@@ -469,6 +469,7 @@ class _LegacyPyTorchStoragePersistentIdRecord:
 class _LegacyPickleGlobalRef:
     module: str
     name: str
+    position: int | None
 
 
 @dataclass(frozen=True)
@@ -831,6 +832,7 @@ def _legacy_pytorch_storage_record_from_pid(
             element_size=_PYTORCH_LEGACY_STORAGE_ELEMENT_SIZES[storage_type.name],
             storage_type_module=storage_type.module,
             storage_type_name=storage_type.name,
+            storage_type_position=storage_type.position,
         ),
     )
 
@@ -870,7 +872,7 @@ def _legacy_pytorch_storage_records(
         return key if key >= 0 else None
 
     try:
-        for opcode_index, (opcode, arg, _position) in enumerate(pickletools.genops(data), start=1):
+        for opcode_index, (opcode, arg, position) in enumerate(pickletools.genops(data), start=1):
             if opcode_index > _PYTORCH_LEGACY_MAX_CONTROL_OPCODES:
                 return None
             opcode_name = opcode.name
@@ -885,7 +887,7 @@ def _legacy_pytorch_storage_records(
                     stack.append(unknown)
                 else:
                     parts = arg.split()
-                    stack.append(_LegacyPickleGlobalRef(parts[0], parts[1]) if len(parts) == 2 else unknown)
+                    stack.append(_LegacyPickleGlobalRef(parts[0], parts[1], position) if len(parts) == 2 else unknown)
             elif opcode_name == "STACK_GLOBAL":
                 if len(stack) < 2:
                     stack.clear()
@@ -893,7 +895,7 @@ def _legacy_pytorch_storage_records(
                 name = stack.pop()
                 module = stack.pop()
                 stack.append(
-                    _LegacyPickleGlobalRef(module, name)
+                    _LegacyPickleGlobalRef(module, name, position)
                     if isinstance(module, str) and isinstance(name, str)
                     else unknown
                 )
@@ -1017,7 +1019,7 @@ def _legacy_pytorch_storage_persistent_id_records(
                     stack.append(unknown)
                 else:
                     parts = arg.split()
-                    stack.append(_LegacyPickleGlobalRef(parts[0], parts[1]) if len(parts) == 2 else unknown)
+                    stack.append(_LegacyPickleGlobalRef(parts[0], parts[1], position) if len(parts) == 2 else unknown)
             elif opcode_name == "STACK_GLOBAL":
                 if len(stack) < 2:
                     stack.clear()
@@ -1025,7 +1027,7 @@ def _legacy_pytorch_storage_persistent_id_records(
                 name = stack.pop()
                 module = stack.pop()
                 stack.append(
-                    _LegacyPickleGlobalRef(module, name)
+                    _LegacyPickleGlobalRef(module, name, position)
                     if isinstance(module, str) and isinstance(name, str)
                     else unknown
                 )
@@ -1086,6 +1088,15 @@ def _legacy_pytorch_storage_persistent_id_records(
         return tuple(records)
 
     return tuple(records)
+
+
+def _offset_legacy_pytorch_storage_record(
+    record: _LegacyPyTorchStorageRecord,
+    position_offset: int,
+) -> _LegacyPyTorchStorageRecord:
+    if record.storage_type_position is None:
+        return record
+    return replace(record, storage_type_position=position_offset + record.storage_type_position)
 
 
 def _might_be_legacy_pytorch(data: bytes) -> bool:
@@ -1155,11 +1166,16 @@ def _legacy_pytorch_stream_layout(data: bytes) -> _LegacyPyTorchStreamLayout | N
     storage_persistent_ids = tuple(
         _LegacyPyTorchStoragePersistentIdRecord(
             position=object_start + persistent_id.position,
-            record=persistent_id.record,
+            record=_offset_legacy_pytorch_storage_record(persistent_id.record, object_start),
         )
         for persistent_id in _legacy_pytorch_storage_persistent_id_records(object_stream)
     )
-    storage_records = _legacy_pytorch_storage_records(object_stream, storage_keys)
+    relative_storage_records = _legacy_pytorch_storage_records(object_stream, storage_keys)
+    storage_records = (
+        None
+        if relative_storage_records is None
+        else tuple(_offset_legacy_pytorch_storage_record(record, object_start) for record in relative_storage_records)
+    )
     return _LegacyPyTorchStreamLayout(
         tuple(boundaries),
         storage_keys,
@@ -2616,32 +2632,46 @@ class PickleScanner(BaseScanner):
         cls,
         result: ScanResult,
         layout: _LegacyPyTorchStreamLayout,
+        *,
+        position_offset: int = 0,
     ) -> set[str]:
         if result.metadata.get("import_references_truncated") is True:
             return set()
         storage_records = layout.storage_records or ()
-        trusted_import_counts = Counter(
-            cls._legacy_pytorch_storage_import_reference(record) for record in storage_records
-        )
-        if not trusted_import_counts:
+        trusted_import_positions: dict[str, set[int]] = {}
+        for record in storage_records:
+            if record.storage_type_position is None:
+                continue
+            trusted_import_positions.setdefault(cls._legacy_pytorch_storage_import_reference(record), set()).add(
+                position_offset + record.storage_type_position
+            )
+        if not trusted_import_positions:
             return set()
 
         import_references = result.metadata.get("import_references")
         if not isinstance(import_references, list):
             return set()
 
-        observed_import_counts: Counter[str] = Counter()
+        observed_import_positions: dict[str, set[int]] = {}
+        observed_imports_without_position: set[str] = set()
         for raw_reference in import_references:
             if not isinstance(raw_reference, dict):
                 continue
             import_reference = raw_reference.get("import_reference")
-            if isinstance(import_reference, str) and import_reference in trusted_import_counts:
-                observed_import_counts[import_reference] += 1
+            if not isinstance(import_reference, str) or import_reference not in trusted_import_positions:
+                continue
+            position = raw_reference.get("position")
+            if type(position) is int:
+                observed_import_positions.setdefault(import_reference, set()).add(position)
+            else:
+                observed_imports_without_position.add(import_reference)
 
         return {
             import_reference
-            for import_reference, expected_count in trusted_import_counts.items()
-            if 0 < observed_import_counts.get(import_reference, 0) <= expected_count
+            for import_reference, trusted_positions in trusted_import_positions.items()
+            if import_reference not in observed_imports_without_position
+            and (observed_positions := observed_import_positions.get(import_reference, set()))
+            and observed_positions <= trusted_positions
         }
 
     @staticmethod
@@ -2739,6 +2769,8 @@ class PickleScanner(BaseScanner):
         cls,
         result: ScanResult,
         layout: _LegacyPyTorchStreamLayout,
+        *,
+        position_offset: int = 0,
     ) -> None:
         """Treat canonical storage BINPERSID records as informational in validated legacy PyTorch streams."""
         trusted_storage_keys = set(layout.storage_keys)
@@ -2781,7 +2813,11 @@ class PickleScanner(BaseScanner):
             for issue in result.issues
             if not cls._is_legacy_pytorch_storage_persistent_id_record(issue.details, trusted_storage_keys)
         ]
-        trusted_storage_import_references = cls._trusted_legacy_pytorch_storage_import_references(result, layout)
+        trusted_storage_import_references = cls._trusted_legacy_pytorch_storage_import_references(
+            result,
+            layout,
+            position_offset=position_offset,
+        )
         downgraded_import_count = 0
         for check in result.checks:
             if not cls._is_legacy_pytorch_storage_import_call_graph_finding(
@@ -4539,7 +4575,11 @@ class PickleScanner(BaseScanner):
                 if legacy_storage_valid:
                     assert legacy_layout.storage_end is not None
                     self._annotate_legacy_pytorch_layout(result, legacy_layout, position_offset=start_position)
-                    self._downgrade_legacy_pytorch_storage_persistent_ids(result, legacy_layout)
+                    self._downgrade_legacy_pytorch_storage_persistent_ids(
+                        result,
+                        legacy_layout,
+                        position_offset=start_position,
+                    )
                     self._add_legacy_pytorch_bounded_analysis_check(
                         result,
                         source,
