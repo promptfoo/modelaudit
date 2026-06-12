@@ -718,6 +718,7 @@ class SafeTensorsScanner(BaseScanner):
 
         token_matches = list(_BASE64_LICENSE_WRAP_SHORT_TOKEN_PATTERN.finditer(stripped))
         fragments: list[str] = []
+        documentary_fragments: list[str] = []
         for match in token_matches:
             token = match.group(0)
             if SafeTensorsScanner._license_document_span_is_inside_url(stripped, match.start(), match.end()):
@@ -732,9 +733,14 @@ class SafeTensorsScanner(BaseScanner):
                 for annotation in annotations
             ):
                 continue
-            if len(token_matches) > 1 and SafeTensorsScanner._license_document_token_looks_documentary(token):
+            if SafeTensorsScanner._license_document_token_looks_documentary(token):
+                documentary_fragments.append(token)
                 continue
             fragments.append(token)
+        if fragments:
+            return fragments
+        if documentary_fragments:
+            return [documentary_fragments[-1]]
         return fragments
 
     @staticmethod
