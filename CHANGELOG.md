@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - validate Basic Auth credentials only in bounded authorization-header context with decodable username/password tokens
+- stream large Flax MessagePack tensor bodies by declared length without tripping the 512 MiB decode budget
 - avoid critical pickle `getattr` findings for proven Ultralytics `Detect.forward` reconstruction while preserving unsafe traversal controls
 - detect GGUF curl short-option remote fetches, ignore spaced Python attribute calls, and truncate large tokenizer metadata arrays with explicit counts
 - require concrete GGUF metadata evidence for S902 findings instead of flagging benign URLs, chat-template syntax, slashes, or pipes
@@ -26,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - restrict Jinja SSTI indicators to executable template spans so prose mentions of request handling do not produce critical findings
 - treat canonical storage persistent IDs as informational only after legacy PyTorch framing, storage tuples, and storage payloads validate completely
 - prefer validated SafeTensors framing over invalid pickle and weak-magic collisions while retaining security-bearing pickle overlaps
+- make Hugging Face streaming dry runs emit metadata-only previews without artifact downloads, scanner execution, or full scan-result JSON
 - report gated or unauthorized Hugging Face acquisitions as failed, inconclusive source outcomes without claiming artifact coverage, and preserve partial findings from interrupted Hugging Face streaming scans
 - show Hugging Face preview access notices when selected gated files have unknown sizes
 - treat known ONNX Runtime `com.microsoft` optimized-export operators as low-noise vendor metadata while preserving S1111 for unknown custom domains and ambiguous vendor claims
