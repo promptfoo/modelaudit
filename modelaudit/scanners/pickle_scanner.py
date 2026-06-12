@@ -2749,11 +2749,22 @@ class PickleScanner(BaseScanner):
             return
         if result.metadata.get("scan_outcome_reasons") != ["pickle_analysis_incomplete"]:
             return
-        if not _is_legitimate_serialization_file(path):
+        for key in ("trusted_incomplete_tail", "trusted_incomplete_tail_reason", "joblib_numpy_array_payload_count"):
+            result.metadata.pop(key, None)
+        try:
+            from .joblib_scanner import JoblibScanner, _pickle_without_joblib_numpy_array_data
+
+            sanitized = _pickle_without_joblib_numpy_array_data(self._read_file_safely(path))
+        except Exception:
+            return
+        if sanitized is None or sanitized.raw_array_count < 1:
             return
 
         if _joblib_numpy_array_wrapper_origin_is_trusted():
-            self._remove_trusted_joblib_numpy_array_wrapper_findings(result)
+            JoblibScanner._remove_validated_numpy_array_wrapper_findings(
+                result,
+                sanitized.validated_control_occurrences,
+            )
         self._downgrade_pickle_parse_error_findings(result)
         if self._has_warning_or_critical_findings(result):
             result.finish(success=False)
