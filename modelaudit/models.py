@@ -206,23 +206,32 @@ def _record_has_incomplete_coverage(
     return _details_have_incomplete_coverage(_metadata_value(record, "details"))
 
 
-def _issues_have_security_findings(issues: list[Any]) -> bool:
-    """Return True when incoming issue records contain WARNING/CRITICAL findings."""
-    for issue in issues:
-        severity = issue.get("severity") if isinstance(issue, dict) else getattr(issue, "severity", None)
-        if isinstance(severity, IssueSeverity):
-            if severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL):
-                return True
-            continue
-        if isinstance(severity, str):
-            severity_name = severity.lower()
-            if severity_name.startswith("issueseverity."):
-                severity_name = severity_name.split(".", 1)[1]
-            if severity_name in {
-                IssueSeverity.WARNING.value,
-                IssueSeverity.CRITICAL.value,
-            }:
-                return True
+def _normalized_enum_value(value: Any) -> str | None:
+    raw_value = getattr(value, "value", value)
+    if not isinstance(raw_value, str):
+        return None
+    return raw_value.lower().split(".", 1)[-1]
+
+
+def _record_has_security_severity(record: Any) -> bool:
+    severity = _metadata_value(record, "severity")
+    return _normalized_enum_value(severity) in {
+        IssueSeverity.WARNING.value,
+        IssueSeverity.CRITICAL.value,
+    }
+
+
+def _records_have_security_findings(records: list[Any]) -> bool:
+    """Return True when incoming issue/check records contain WARNING/CRITICAL findings."""
+    return any(_record_has_security_severity(record) for record in records)
+
+
+def _checks_have_security_findings(checks: list[Any]) -> bool:
+    for check in checks:
+        if _normalized_enum_value(_metadata_value(check, "status")) == CheckStatus.FAILED.value and (
+            _record_has_security_severity(check)
+        ):
+            return True
     return False
 
 
@@ -629,8 +638,11 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
 
         incoming_issues = results_dict.get("issues", [])
         incoming_checks = results_dict.get("checks", [])
-        incoming_has_security_findings = (
-            _issues_have_security_findings(incoming_issues) if isinstance(incoming_issues, list) else False
+        incoming_has_security_findings = any(
+            (
+                _records_have_security_findings(incoming_issues) if isinstance(incoming_issues, list) else False,
+                _checks_have_security_findings(incoming_checks) if isinstance(incoming_checks, list) else False,
+            )
         )
         incoming_has_incomplete_coverage = _metadata_has_incomplete_coverage(results_dict.get("metadata")) or any(
             (
