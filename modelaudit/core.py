@@ -5288,6 +5288,7 @@ def scan_model_streaming(
     file_hashes: list[str] = []
     hashed_stream_file_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
     hashed_stream_source_hashes_by_path: dict[Path, str] = {}
+    counted_onnx_external_data_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
     aggregate_hash_complete = True
     top_level_hashed_bytes = 0
     files_processed = 0
@@ -5774,8 +5775,13 @@ def scan_model_streaming(
                         )
                         if external_data_identity is not None:
                             onnx_external_data_pre_scan_identities[onnx_external_data_path] = external_data_identity
-                            if not external_data_was_stream_source:
+                            external_data_instance = (external_data_key, external_data_identity)
+                            if (
+                                not external_data_was_stream_source
+                                and external_data_instance not in counted_onnx_external_data_instances
+                            ):
                                 onnx_external_data_bytes_scanned += _snapshot_file_size(external_data_identity)
+                                counted_onnx_external_data_instances.add(external_data_instance)
                         if not external_data_was_stream_source and not external_data_already_hashed:
                             if external_data_identity is None:
                                 aggregate_hash_complete = False

@@ -1,5 +1,6 @@
 """Tests for streaming scan-and-delete functionality."""
 
+import hashlib
 import logging
 import os
 import pickle
@@ -717,6 +718,85 @@ def test_scan_model_streaming_hf_onnx_external_data_sidecar_matches_local_direct
     assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
         "onnx/model.onnx",
         "onnx/model.onnx_data",
+    ]
+
+
+@patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+@patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+@patch(
+    "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+    return_value=(["onnx/model-a.onnx", "onnx/model-b.onnx", "onnx/shared.onnx_data"], "a" * 40, None),
+)
+@patch("modelaudit.utils.sources.huggingface._get_huggingface_path_sizes")
+@patch("huggingface_hub.hf_hub_download")
+def test_scan_model_streaming_hf_shared_onnx_external_data_counts_bytes_once(
+    mock_hf_hub_download: Any,
+    mock_get_path_sizes: Any,
+    _mock_list_repo_files: Any,
+    _mock_get_extensions: Any,
+    _mock_detect_content: Any,
+    tmp_path: Path,
+) -> None:
+    """A shared context-only ONNX sidecar should count once toward streaming totals."""
+    model_a_payload = create_external_onnx_payload(tmp_path, external_path="shared.onnx_data")
+    model_b_payload = create_external_onnx_payload(tmp_path, external_path="shared.onnx_data")
+    sidecar_payload = struct.pack("f", 1.0)
+    remote_payloads = {
+        "onnx/model-a.onnx": model_a_payload,
+        "onnx/model-b.onnx": model_b_payload,
+        "onnx/shared.onnx_data": sidecar_payload,
+    }
+    remote_sizes = {filename: len(payload) for filename, payload in remote_payloads.items()}
+    unique_bytes = sum(remote_sizes.values())
+    expected_hash = compute_aggregate_hash(
+        [
+            hashlib.sha256(model_a_payload).hexdigest(),
+            hashlib.sha256(sidecar_payload).hexdigest(),
+            hashlib.sha256(model_b_payload).hexdigest(),
+        ]
+    )
+
+    def get_path_sizes(
+        _repo_id: str,
+        filenames: list[str],
+        **_kwargs: object,
+    ) -> tuple[dict[str, int | None], str]:
+        return {filename: remote_sizes[filename] for filename in filenames}, "a" * 40
+
+    def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+        assert local_dir is not None
+        path = Path(local_dir) / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(remote_payloads[filename])
+        return str(path)
+
+    mock_get_path_sizes.side_effect = get_path_sizes
+    mock_hf_hub_download.side_effect = download_side_effect
+    generator = download_model_streaming(
+        "https://huggingface.co/test/model",
+        cache_dir=tmp_path / "cache",
+        max_size=unique_bytes,
+        scannable_extensions={".onnx"},
+        scannable_scanner_ids={"onnx"},
+    )
+
+    result = scan_model_streaming(
+        generator,
+        timeout=30,
+        delete_after_scan=True,
+        cache_enabled=False,
+        max_total_size=unique_bytes,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    assert result.bytes_scanned == unique_bytes
+    assert result.content_hash == expected_hash
+    assert not any("Total scan size limit exceeded" in issue.message for issue in result.issues)
+    assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+        "onnx/model-a.onnx",
+        "onnx/shared.onnx_data",
+        "onnx/model-b.onnx",
     ]
 
 
