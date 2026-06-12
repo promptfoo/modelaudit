@@ -5589,7 +5589,7 @@ class TestModelDownloadStreaming:
             scannable_scanner_ids=scannable_scanner_ids,
         )
 
-        assert selected_files == expected_files
+        assert selected_files.filenames == expected_files
 
     @patch("requests.get")
     def test_select_streamable_text_suffix_safetensors_near_match_preserves_flax_route(
@@ -5625,7 +5625,7 @@ class TestModelDownloadStreaming:
             scannable_scanner_ids={"flax_msgpack"},
         )
 
-        assert selected_files == ["known.msgpack", "weights.conf"]
+        assert selected_files.filenames == ["known.msgpack", "weights.conf"]
 
     @patch("requests.get")
     def test_select_streamable_text_suffix_safetensors_inconclusive_flax_preserves_safetensors(
@@ -5649,7 +5649,7 @@ class TestModelDownloadStreaming:
             scannable_scanner_ids={"safetensors"},
         )
 
-        assert selected_files == ["known.safetensors", "weights.conf"]
+        assert selected_files.filenames == ["known.safetensors", "weights.conf"]
 
     @patch("requests.get")
     def test_select_streamable_safetensors_suffix_keeps_flax_like_tensor_bytes_as_safetensors(
@@ -5673,7 +5673,7 @@ class TestModelDownloadStreaming:
             scannable_scanner_ids={"flax_msgpack"},
         )
 
-        assert selected_files == ["known.msgpack"]
+        assert selected_files.filenames == ["known.msgpack"]
 
     @pytest.mark.parametrize(
         ("hidden_payload", "expected_filenames"),
@@ -5749,7 +5749,7 @@ class TestModelDownloadStreaming:
             scannable_scanner_ids={"flax_msgpack"},
         )
 
-        assert selected_files == ["known.msgpack"]
+        assert selected_files.filenames == ["known.msgpack"]
 
     @patch("requests.get")
     def test_select_streamable_text_owner_prefix_preserves_embedded_flax_route(
@@ -5769,7 +5769,7 @@ class TestModelDownloadStreaming:
             scannable_scanner_ids={"flax_msgpack"},
         )
 
-        assert selected_files == ["known.msgpack", "weights.txt"]
+        assert selected_files.filenames == ["known.msgpack", "weights.txt"]
 
     @patch("requests.get")
     def test_select_streamable_text_owner_prefix_preserves_mid_window_flax_route(
@@ -5791,7 +5791,7 @@ class TestModelDownloadStreaming:
             scannable_scanner_ids={"flax_msgpack"},
         )
 
-        assert selected_files == ["known.msgpack", "weights.txt"]
+        assert selected_files.filenames == ["known.msgpack", "weights.txt"]
 
     @patch("requests.get")
     def test_select_streamable_text_owner_prefix_preserves_embedded_protobuf_route(
@@ -5812,7 +5812,7 @@ class TestModelDownloadStreaming:
             scannable_scanner_ids={"onnx"},
         )
 
-        assert selected_files == ["model.onnx", "candidate.txt"]
+        assert selected_files.filenames == ["model.onnx", "candidate.txt"]
 
     @patch("modelaudit.utils.sources.huggingface._HF_CONTENT_SNIFF_MAX_TOTAL_BYTES", 4 * 1024 * 1024)
     @patch("requests.get")
@@ -5843,7 +5843,7 @@ class TestModelDownloadStreaming:
             scannable_scanner_ids={"flax_msgpack"},
         )
 
-        assert selected_files == ["known.msgpack"]
+        assert selected_files.filenames == ["known.msgpack"]
         assert requested_ranges
         assert all((end - start + 1) <= FLAX_MSGPACK_STRUCTURE_READ_BYTES for start, end in requested_ranges)
         assert (0, len(payload) - 1) not in requested_ranges
@@ -5865,7 +5865,7 @@ class TestModelDownloadStreaming:
             scannable_scanner_ids={"onnx"},
         )
 
-        assert selected_files == ["model.onnx"]
+        assert selected_files.filenames == ["model.onnx"]
 
     @patch("requests.get")
     def test_select_streamable_flax_excludes_non_ascii_bpe_text_owner(
@@ -5884,7 +5884,7 @@ class TestModelDownloadStreaming:
             scannable_scanner_ids={"flax_msgpack"},
         )
 
-        assert selected_files == ["known.msgpack"]
+        assert selected_files.filenames == ["known.msgpack"]
 
     @patch("requests.get")
     def test_select_streamable_protobuf_excludes_ascii_varint_text_near_match(
@@ -5903,7 +5903,7 @@ class TestModelDownloadStreaming:
             scannable_scanner_ids={"onnx"},
         )
 
-        assert selected_files == ["model.onnx"]
+        assert selected_files.filenames == ["model.onnx"]
 
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
