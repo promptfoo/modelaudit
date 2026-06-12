@@ -497,7 +497,9 @@ _RAW_BACKSLASH_URL_DELIMITER_PATTERN = re.compile(r"https?:(?:\\\\|/\\|\\/|\\(?!
 
 
 def _url_path_has_unsafe_decoded_char(path: str) -> bool:
-    return any(char == "\\" or ord(char) < 0x20 or ord(char) == 0x7F for char in path)
+    return any(
+        char == "\\" or char == ";" or ord(char) < 0x20 or char.isspace() or ord(char) == 0x7F for char in path
+    ) or any(segment in {".", ".."} for segment in path.split("/"))
 
 
 def _html_unescape_with_entity_mask(value: str, entity_mask: bytearray) -> tuple[str, bytearray, bool]:

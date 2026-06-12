@@ -2262,12 +2262,14 @@ def test_scan_bytes_does_not_mark_synthetic_torch_storage_name_as_storage_persis
     report = scan_bytes(payload, source="synthetic-storage-name.pkl")
 
     assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
     persistent_id_findings = [finding for finding in report.findings if finding.rule_code == "PERSISTENT_ID"]
     assert persistent_id_findings
     assert not any(finding.details.get("pytorch_storage_persistent_id") is True for finding in persistent_id_findings)
     assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
         and finding.details.get("import_reference") == "torch.SyntheticStorage"
+        and finding.details.get("sink") == "importlib.import_module"
         for finding in report.findings
     )
 

@@ -683,9 +683,23 @@ def test_license_url_residual_encoding_fails_closed() -> None:
     assert SafeTensorsScanner._url_looks_like_license_reference(
         "https://github.com:443/Lightricks/LTX-2/blob/main/LICENSE"
     )
+    assert SafeTensorsScanner._url_looks_like_license_reference("https://spdx.org/licenses/MIT-0.json")
     assert not SafeTensorsScanner._url_looks_like_license_reference(
         f"https://github.com/Lightricks/LTX-2/{encoded_prefix}/license"
     )
+    assert not SafeTensorsScanner._url_looks_like_license_reference(
+        "https://opensource.org/licenses/MIT%2F..%2Fnot-license"
+    )
+    assert not SafeTensorsScanner._url_looks_like_license_reference(
+        "https://opensource.org/licenses/MIT%2F.%2Fnot-license"
+    )
+    assert not SafeTensorsScanner._url_looks_like_license_reference(
+        "https://opensource.org/licenses/MIT%2F..%3B%2Fnot-license"
+    )
+    assert not SafeTensorsScanner._url_looks_like_license_reference(
+        "https://opensource.org/licenses/MIT%2F.%3B%2Fnot-license"
+    )
+    assert not SafeTensorsScanner._url_looks_like_license_reference("https://opensource.org/licenses/MIT%20not-license")
     assert not SafeTensorsScanner._url_looks_like_license_reference(
         "https://user:pass@github.com/Lightricks/LTX-2/blob/main/LICENSE"
     )
@@ -789,6 +803,11 @@ def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -
         "https://github.com/Lightricks/LTX-2/blob/main/license.py%00.txt",
         "https://github.com/Lightricks/LTX-2/%5Creleases%5Cdownload%5Cv1/license",
         "https://opensource.org/licenses/MIT,https://evil.example/x",
+        "https://opensource.org/licenses/MIT%2F..%2Fnot-license",
+        "https://opensource.org/licenses/MIT%2F.%2Fnot-license",
+        "https://opensource.org/licenses/MIT%2F..%3B%2Fnot-license",
+        "https://opensource.org/licenses/MIT%2F.%3B%2Fnot-license",
+        "https://opensource.org/licenses/MIT%20not-license",
         "https%3A%2F%2Fevil.example%2Fx",
         "https%3A//evil.example/x",
         "h%74tps%3A%2F%2Fevil.example/x",
@@ -834,6 +853,7 @@ def test_license_metadata_untrusted_url_is_not_suppressed(tmp_path: Path, url: s
     [
         "https://opensource.org/licenses/MIT",
         "https://spdx.org/licenses/MIT.json",
+        "https://spdx.org/licenses/MIT-0.json",
         "https://github.com/Lightricks/LTX-2/blob/main/LICENSE",
     ],
 )

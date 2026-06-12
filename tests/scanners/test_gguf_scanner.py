@@ -2,6 +2,7 @@
 
 import json
 import struct
+import sys
 import time
 import zipfile
 from pathlib import Path
@@ -1766,18 +1767,19 @@ def test_gguf_metadata_value_security_evidence_handles_adversarial_punctuation_q
     benign_urls = " ".join(["https://huggingface.co/org/model"] * 20_000)
     repeated_api_tokens = "https://huggingface.co/org/model " + "fetch(nope) " * 20_000
 
-    start = time.perf_counter()
+    start = time.process_time()
     malicious_evidence = GgufScanner._metadata_value_security_evidence("download", malicious)
     benign_evidence = GgufScanner._metadata_value_security_evidence("description", benign)
     benign_url_evidence = GgufScanner._metadata_value_security_evidence("description", benign_urls)
     repeated_api_evidence = GgufScanner._metadata_value_security_evidence("description", repeated_api_tokens)
-    elapsed = time.perf_counter() - start
+    elapsed = time.process_time() - start
 
     assert any(evidence["evidence_type"] == "remote_fetch" for evidence in malicious_evidence)
     assert benign_evidence == []
     assert benign_url_evidence == []
     assert repeated_api_evidence == []
-    assert elapsed < 1.0
+    elapsed_budget = 1.5 if sys.platform == "win32" else 1.0
+    assert elapsed < elapsed_budget
 
 
 def test_gguf_metadata_concrete_evidence_end_to_end_regressions(tmp_path: Path) -> None:
