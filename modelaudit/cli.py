@@ -4752,6 +4752,9 @@ def scan_command(
         flush_telemetry()
         sys.exit(0)
 
+    if dry_run and path_state.dry_run_previews:
+        cast(Any, audit_result).previews = path_state.dry_run_previews
+
     try:
         try:
             _write_scan_sbom(

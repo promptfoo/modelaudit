@@ -5202,8 +5202,10 @@ def test_scan_huggingface_streaming_dry_run_rejects_sarif_before_metadata() -> N
     mock_scan_local.assert_not_called()
 
 
-def test_scan_huggingface_streaming_dry_run_metadata_failure_suppresses_partial_output(tmp_path: Path) -> None:
-    """A later metadata failure must not emit or write earlier successful previews."""
+def test_scan_huggingface_streaming_dry_run_metadata_failure_preserves_successful_previews(
+    tmp_path: Path,
+) -> None:
+    """A later metadata failure should keep earlier successful previews in structured output."""
     output_file = tmp_path / "preview.json"
     with (
         patch(
@@ -5251,7 +5253,8 @@ def test_scan_huggingface_streaming_dry_run_metadata_failure_suppresses_partial_
     assert "Results written to" in result.output
     assert output_file.exists()
     output_payload = json.loads(output_file.read_text())
-    assert "test/model-a" not in output_file.read_text()
+    assert output_payload["dry_run"] is True
+    assert [preview["model_id"] for preview in output_payload["previews"]] == ["test/model-a"]
     assert_huggingface_acquisition_error_payload(output_payload, "hf://test/model-b", blocked=False)
     mock_download_streaming.assert_not_called()
     mock_scan_streaming.assert_not_called()
