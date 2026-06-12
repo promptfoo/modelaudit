@@ -315,6 +315,10 @@ class TestSecretsDetector:
                 _basic_auth_token(b"headers-add:pass"),
             ),
             (
+                f'request.headers.add("Authorization", "Basic {_basic_auth_token(b"request-headers-add:pass")}")',
+                _basic_auth_token(b"request-headers-add:pass"),
+            ),
+            (
                 f"request.setRequestHeader('Authorization', 'Basic {_basic_auth_token(b'set-request-header:pass')}')",
                 _basic_auth_token(b"set-request-header:pass"),
             ),
@@ -433,6 +437,11 @@ class TestSecretsDetector:
                 _basic_auth_token(b"json-object-values:pass"),
             ),
             (
+                f'{{"headers":[{{"name":"Authorization","headerValues":["Basic '
+                f'{_basic_auth_token(b"json-object-header-values:pass")}"]}}]}}',
+                _basic_auth_token(b"json-object-header-values:pass"),
+            ),
+            (
                 "headers:\n"
                 "  - name: Authorization\n"
                 "    value:\n"
@@ -446,6 +455,13 @@ class TestSecretsDetector:
                 "    values:\n"
                 f"      - Basic {_basic_auth_token(b'yaml-object-values:pass')}\n",
                 _basic_auth_token(b"yaml-object-values:pass"),
+            ),
+            (
+                "headers:\n"
+                "  - name: Authorization\n"
+                "    headerValues:\n"
+                f"      - Basic {_basic_auth_token(b'yaml-object-header-values:pass')}\n",
+                _basic_auth_token(b"yaml-object-header-values:pass"),
             ),
             (
                 f"headers=[('Authorization', 'Basic {_basic_auth_token(b'assignment-tuple:pass')}')]",
@@ -728,8 +744,51 @@ class TestSecretsDetector:
             ),
             (f'Authorization: ["Bearer placeholder"]\nNotes: ["Basic {_basic_auth_token(b"closed-list:pass")}"]'),
             f'notes.append("Authorization notes", "Basic {_basic_auth_token(b"notes:pass")}")',
+            f'cache.add("Authorization", "Basic {_basic_auth_token(b"cache-add:pass")}")',
             f"\u0391uthorization: Basic {_basic_auth_token(b'confusable-alpha:pass')}",
             f"Authorizati\u043en: Basic {_basic_auth_token(b'confusable-o:pass')}",
+            (
+                f'{{"headers":[{{"values":["Basic {_basic_auth_token(b"json-values-metadata-name:pass")}"],'
+                '"metadata":{"name":"Authorization"}}]}}'
+            ),
+            (
+                f'{{"headers":[{{"headerValues":["Basic {_basic_auth_token(b"json-header-values-meta:pass")}"],'
+                '"metadata":{"name":"Authorization"}}]}}'
+            ),
+            (
+                f'{{"headers":[{{"values":["Basic {_basic_auth_token(b"json-values-next-name:pass")}"]}},'
+                '{"name":"Authorization"}]}'
+            ),
+            (
+                f'{{"headers":[{{"headerValues":["Basic {_basic_auth_token(b"json-header-values-next-name:pass")}"]}},'
+                '{"name":"Authorization"}]}'
+            ),
+            (
+                "headers:\n"
+                "  - values:\n"
+                f"      - Basic {_basic_auth_token(b'yaml-values-metadata-name:pass')}\n"
+                "    metadata:\n"
+                "      name: Authorization\n"
+            ),
+            (
+                "headers:\n"
+                "  - headerValues:\n"
+                f"      - Basic {_basic_auth_token(b'yaml-header-values-metadata-name:pass')}\n"
+                "    metadata:\n"
+                "      name: Authorization\n"
+            ),
+            (
+                "headers:\n"
+                "  - values:\n"
+                f"      - Basic {_basic_auth_token(b'yaml-values-next-name:pass')}\n"
+                "  - name: Authorization\n"
+            ),
+            (
+                "headers:\n"
+                "  - headerValues:\n"
+                f"      - Basic {_basic_auth_token(b'yaml-header-values-next-name:pass')}\n"
+                "  - name: Authorization\n"
+            ),
         ],
     )
     def test_basic_auth_malformed_or_unbounded_values_are_ignored(self, text: str) -> None:
@@ -818,6 +877,34 @@ class TestSecretsDetector:
                         "metadata": {"description": f"Basic {_basic_auth_token(b'nested-description-leak:pass')}"}
                     }
                 }
+            },
+            {
+                "headers": [
+                    {
+                        "values": [f"Basic {_basic_auth_token(b'plural-values-metadata-name:pass')}"],
+                        "metadata": {"name": "Authorization"},
+                    }
+                ]
+            },
+            {
+                "headers": [
+                    {
+                        "headerValues": [f"Basic {_basic_auth_token(b'plural-header-values-metadata-name:pass')}"],
+                        "metadata": {"name": "Authorization"},
+                    }
+                ]
+            },
+            {
+                "headers": [
+                    {"values": [f"Basic {_basic_auth_token(b'plural-values-next-name:pass')}"]},
+                    {"name": "Authorization"},
+                ]
+            },
+            {
+                "headers": [
+                    {"headerValues": [f"Basic {_basic_auth_token(b'plural-header-values-next-name:pass')}"]},
+                    {"name": "Authorization"},
+                ]
             },
         ],
     )

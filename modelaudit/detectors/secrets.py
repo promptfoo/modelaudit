@@ -368,7 +368,8 @@ BASIC_AUTH_HEADER_PREFIX_PATTERN = re.compile(
 BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN = re.compile(
     r"(?:^|[^\w$])(?:"
     r"(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*(?:setRequest(?:Header|Property)|setHeader)"
-    r"|(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)+(?:set|append|put|add)"
+    r"|(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)+(?:set|append|put)"
+    r"|(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*(?:headers?|[A-Za-z_$][A-Za-z0-9_$]*Headers?)\s*\.\s*add"
     r")\s*\(\s*\\?[\"']\s*(?:proxy-authorization|authorization)\s*\\?[\"']\s*,\s*"
     r"(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
     re.IGNORECASE,
