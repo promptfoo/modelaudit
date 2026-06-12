@@ -145,6 +145,14 @@ from modelaudit.utils.helpers.types import (
     ProgressCallback,
 )
 from modelaudit.utils.lfs import check_lfs_pointer, get_lfs_issue_details, get_lfs_remediation_steps
+from modelaudit.utils.repository_context import (
+    REPOSITORY_CURRENT_FILE_CONFIG_KEY,
+    REPOSITORY_FILE_INVENTORY_CONFIG_KEY,
+    REPOSITORY_SCAN_ROOT_CONFIG_KEY,
+    RepositoryFileInventory,
+    normalize_repository_member_path,
+    repository_file_inventory_context_from_config,
+)
 from modelaudit.utils.sources._huggingface_cache import (
     _find_hf_cache_root,
     _get_hf_cache_roots,
@@ -173,6 +181,19 @@ _add_error_asset_to_results = core_results.add_error_asset_to_results
 _DIRECTORY_PRECOUNT_CHILD_LIMIT = 1000
 _COMPRESSED_TAR_STREAM_INCOMPLETE_REASON = "tar_compressed_stream_incomplete"
 _STREAMING_SOURCE_INTERRUPTED_REASON = "streaming_source_interrupted"
+
+
+def _repository_member_path_for_scan(scan_path: str, scan_root: Path | None) -> str | None:
+    if scan_root is not None:
+        try:
+            relative_path = Path(scan_path).resolve().relative_to(scan_root).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            pass
+        else:
+            normalized_relative = normalize_repository_member_path(relative_path)
+            if normalized_relative is not None:
+                return normalized_relative
+    return normalize_repository_member_path(Path(scan_path).name)
 
 
 def _count_immediate_children_up_to(path: Path, limit: int) -> int:
@@ -474,7 +495,7 @@ _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON = "xgboost_ubjson_routing_incomplete"
 _ONNX_ROUTING_INCOMPLETE_REASON = "onnx_routing_incomplete"
 _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_incomplete"
 _ShardFamilyKey = tuple[str, str, int | None]
-_ScanEntry = tuple[str, list[str], _ShardFamilyKey | None]
+_ScanEntry = tuple[str, list[str], _ShardFamilyKey | None, str | None]
 _SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY = "shard_family_cache_fingerprint"
 _TRUSTED_STREAM_SHARD_PARENT_PREFIXES = (
     "modelaudit_hf_",
@@ -2372,6 +2393,12 @@ def validate_scan_config(config: dict[str, Any]) -> ScanConfigModel:
         raise ValueError(f"Invalid scan configuration: {e}") from e
 
 
+def _normalize_repository_inventory_config(config: dict[str, Any]) -> dict[str, Any]:
+    if REPOSITORY_FILE_INVENTORY_CONFIG_KEY in config:
+        config[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = repository_file_inventory_context_from_config(config)
+    return config
+
+
 def create_scan_config(**kwargs: Any) -> ScanConfigModel:
     """Create a validated scan configuration from keyword arguments."""
     return ScanConfigModel(**kwargs)
@@ -2472,6 +2499,7 @@ def scan_model_directory_or_file(
         **kwargs,
     }
     config = normalize_scanner_selection_config(config)
+    config = _normalize_repository_inventory_config(config)
     scanner_selection = policy_from_config(config)
     scanner_selection_extensions = selected_scanner_extensions(scanner_selection) if scanner_selection.active else None
     if scanner_selection.active:
@@ -2595,6 +2623,8 @@ def scan_model_directory_or_file(
 
             # First pass: collect all file paths that need scanning
             files_to_scan: list[str] = []
+            repository_inventory_files: list[str] = []
+            repository_member_by_scan_path: dict[str, str] = {}
             shard_family_representatives: dict[_ShardFamilyKey, str] = {}
             shard_family_paths: dict[_ShardFamilyKey, set[str]] = {}
             shard_family_targets: dict[_ShardFamilyKey, ValidatedShardTargets] = {}
@@ -2675,6 +2705,14 @@ def scan_model_directory_or_file(
                     recorded = True
                 return recorded
 
+            def repository_member_path_for_discovered_path(scan_path: str | Path) -> str | None:
+                with suppress(OSError, RuntimeError, ValueError):
+                    relative_path = Path(scan_path).absolute().relative_to(base_dir).as_posix()
+                    normalized_relative = normalize_repository_member_path(relative_path)
+                    if normalized_relative is not None:
+                        return normalized_relative
+                return _repository_member_path_for_scan(str(scan_path), base_dir)
+
             directory_discovery_started_at = _start_phase_timing(phase_timings)
             for root, dirs, files in os.walk(
                 path,
@@ -2728,6 +2766,9 @@ def scan_model_directory_or_file(
                         aggregate_hash_complete = False
                         _record_directory_special_file_unscanned(results, scan_metadata, file_path)
                         continue
+                    repository_member = repository_member_path_for_discovered_path(file_path_obj)
+                    if repository_member is not None:
+                        repository_inventory_files.append(repository_member)
                     snapshot_path = Path(file_path).absolute()
                     snapshot_shard_family_key = _shard_family_key_for_path(str(snapshot_path))
                     route_hf_shard_alias = (
@@ -2792,6 +2833,13 @@ def scan_model_directory_or_file(
                             continue
 
                         target_str = str(target_path)
+                        target_repository_member = (
+                            repository_member
+                            if target_path == scan_source
+                            else _repository_member_path_for_scan(target_str, base_dir)
+                        )
+                        if target_repository_member is not None:
+                            repository_member_by_scan_path[target_str] = target_repository_member
                         shard_family_key = _shard_family_key_for_path(target_str)
                         is_hf_shard_alias = route_hf_shard_alias and target_path == scan_source
                         exclusion_path = (
@@ -2868,6 +2916,13 @@ def scan_model_directory_or_file(
                                         if shard_in_base_dir or shard_in_hf_blobs:
                                             lexical_shard_path = str(Path(shard_path).absolute())
                                             family_paths.add(lexical_shard_path)
+                                            shard_repository_member = repository_member_path_for_discovered_path(
+                                                lexical_shard_path
+                                            )
+                                            if shard_repository_member is not None:
+                                                repository_member_by_scan_path[lexical_shard_path] = (
+                                                    shard_repository_member
+                                                )
                                             validated_targets[lexical_shard_path] = {
                                                 key: value
                                                 for key, value in detected_target.items()
@@ -2958,7 +3013,10 @@ def scan_model_directory_or_file(
                     for file_path in files_to_scan
                     if _resolve_or_absolute_path(file_path) not in hf_shard_blob_paths
                 ]
-            scan_entries: list[_ScanEntry] = [(file_path, [file_path], None) for file_path in files_to_scan]
+            scan_entries: list[_ScanEntry] = [
+                (file_path, [file_path], None, repository_member_by_scan_path.get(file_path))
+                for file_path in files_to_scan
+            ]
             seen_complete_hf_shard_families: set[tuple[str, tuple[str, ...]]] = set()
             for shard_family_key, representative_file in shard_family_representatives.items():
                 ordered_family_paths = sorted(shard_family_paths.get(shard_family_key, {representative_file}))
@@ -2980,12 +3038,24 @@ def scan_model_directory_or_file(
                     if family_dedupe_key in seen_complete_hf_shard_families:
                         continue
                     seen_complete_hf_shard_families.add(family_dedupe_key)
-                scan_entries.append((representative_file, ordered_family_paths, shard_family_key))
+                scan_entries.append(
+                    (
+                        representative_file,
+                        ordered_family_paths,
+                        shard_family_key,
+                        repository_member_by_scan_path.get(representative_file),
+                    )
+                )
 
             scheduled_openvino_companion_sizes: dict[str, int] = {}
             if scanner_selection.allows("openvino"):
                 scheduled_companions_by_key: dict[str, str] = {}
-                for representative_file, _scanned_file_paths, _entry_shard_family_key in scan_entries:
+                for (
+                    representative_file,
+                    _scanned_file_paths,
+                    _entry_shard_family_key,
+                    _repository_member,
+                ) in scan_entries:
                     xml_path = Path(representative_file)
                     companion_path = _openvino_xml_weights_companion(xml_path)
                     if companion_path is None:
@@ -3001,7 +3071,12 @@ def scan_model_directory_or_file(
 
                 if scheduled_companions_by_key:
                     expanded_scan_entries: list[_ScanEntry] = []
-                    for representative_file, scanned_file_paths, entry_shard_family_key in scan_entries:
+                    for (
+                        representative_file,
+                        scanned_file_paths,
+                        entry_shard_family_key,
+                        repository_member,
+                    ) in scan_entries:
                         representative_key = _openvino_xml_companion_key(Path(representative_file))
                         if representative_key in scheduled_companions_by_key:
                             continue
@@ -3018,7 +3093,12 @@ def scan_model_directory_or_file(
                             if scheduled_companion_path is not None and companion_key not in expanded_scanned_path_keys:
                                 expanded_scanned_file_paths.append(scheduled_companion_path)
                         expanded_scan_entries.append(
-                            (representative_file, expanded_scanned_file_paths, entry_shard_family_key)
+                            (
+                                representative_file,
+                                expanded_scanned_file_paths,
+                                entry_shard_family_key,
+                                repository_member,
+                            )
                         )
                     scan_entries = expanded_scan_entries
 
@@ -3052,19 +3132,35 @@ def scan_model_directory_or_file(
                         limit=dvc_total_size_limit if isinstance(dvc_total_size_limit, int) else max_total_size,
                     )
 
+            if not isinstance(config.get(REPOSITORY_FILE_INVENTORY_CONFIG_KEY), RepositoryFileInventory):
+                if REPOSITORY_FILE_INVENTORY_CONFIG_KEY not in config:
+                    config[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = tuple(repository_inventory_files)
+                config[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = repository_file_inventory_context_from_config(config)
+            repository_inventory_context = config[REPOSITORY_FILE_INVENTORY_CONFIG_KEY]
+
             # Second pass: scan every non-shard path independently and every shard
             # family once. Shard scans already expand to sibling shards in the
             # advanced handler, so scanning each shard path would duplicate work.
             if scan_entries:
                 scheduled_openvino_xml_companions = {
                     _openvino_xml_companion_key(Path(representative_file))
-                    for representative_file, _scanned_file_paths, _entry_shard_family_key in scan_entries
+                    for (
+                        representative_file,
+                        _scanned_file_paths,
+                        _entry_shard_family_key,
+                        _repository_member,
+                    ) in scan_entries
                     if scanner_selection.allows("openvino") and _is_openvino_xml_path(Path(representative_file))
                 }
                 hash_sources: list[str] = []
                 seen_hash_sources: set[str] = set()
                 hash_source_by_path: dict[str, str] = {}
-                for _representative_file, scanned_file_paths, entry_shard_family_key in scan_entries:
+                for (
+                    _representative_file,
+                    scanned_file_paths,
+                    entry_shard_family_key,
+                    _repository_member,
+                ) in scan_entries:
                     family_targets = (
                         shard_family_targets.get(entry_shard_family_key, {})
                         if entry_shard_family_key is not None
@@ -3116,7 +3212,7 @@ def scan_model_directory_or_file(
                 if len(scan_entries) > 1:
                     pickle_source_snapshot_stack.enter_context(shared_source_sensitive_caches())
 
-                for representative_file, scanned_file_paths, shard_family_key in scan_entries:
+                for representative_file, scanned_file_paths, shard_family_key, repository_member in scan_entries:
                     # Check for interrupts
                     check_interrupted()
 
@@ -3146,9 +3242,16 @@ def scan_model_directory_or_file(
 
                         file_scan_started_at = _start_phase_timing(phase_timings)
                         try:
-                            file_config = config
+                            file_config = dict(config)
+                            file_config[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = repository_inventory_context
+                            file_config.setdefault(REPOSITORY_SCAN_ROOT_CONFIG_KEY, str(base_dir))
+                            repository_current_file = repository_member or _repository_member_path_for_scan(
+                                representative_file,
+                                base_dir,
+                            )
+                            if repository_current_file is not None:
+                                file_config[REPOSITORY_CURRENT_FILE_CONFIG_KEY] = repository_current_file
                             if shard_family_key is not None:
-                                file_config = dict(config)
                                 file_config[_SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY] = (
                                     _build_shard_family_cache_fingerprint(
                                         shard_family_key,
@@ -5152,6 +5255,7 @@ def scan_model_streaming(
     scanner_selection_extensions = selected_scanner_extensions(scanner_selection) if scanner_selection.active else None
     if scanner_selection.active:
         results.scanner_selection = scanner_selection.to_metadata()
+    repository_inventory_context: RepositoryFileInventory | None = None
     metadata_scanner_available: bool = scanner_selection.allows("metadata") and _registry.has_scanner_class(
         "MetadataScanner"
     )
@@ -5162,6 +5266,21 @@ def scan_model_streaming(
     deferred_openvino_sidecars: dict[Path, Path] = {}
     consumed_openvino_companions: set[Path] = set()
     preserve_shard_reconciliation_errors = False
+
+    def streaming_repository_inventory_context() -> RepositoryFileInventory:
+        nonlocal repository_inventory_context
+
+        configured_inventory = scan_kwargs.get(REPOSITORY_FILE_INVENTORY_CONFIG_KEY)
+        if isinstance(configured_inventory, RepositoryFileInventory):
+            repository_inventory_context = configured_inventory
+            return configured_inventory
+
+        if repository_inventory_context is None or not repository_inventory_context.files:
+            repository_inventory_context = repository_file_inventory_context_from_config(scan_kwargs)
+            if repository_inventory_context.files:
+                scan_kwargs[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = repository_inventory_context
+
+        return repository_inventory_context
 
     def delete_streamed_source(source_path: Path, context: str) -> None:
         if not delete_after_scan or not (source_path.exists() or source_path.is_symlink()):
@@ -5320,6 +5439,9 @@ def scan_model_streaming(
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
     is_hf_cache = base_dir is not None and hf_cache_root is not None
+    scanner_selection_skip_extensions = (
+        None if is_hf_cache and scanner_selection.active else scanner_selection_extensions
+    )
     stream_started = False
 
     try:
@@ -5437,6 +5559,9 @@ def scan_model_streaming(
                     "timeout": timeout - int(time.time() - start_time),
                     **scan_kwargs,
                 }
+                scan_repository_inventory_context = streaming_repository_inventory_context()
+                if scan_repository_inventory_context.files:
+                    scan_config[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = scan_repository_inventory_context
 
                 openvino_sidecar_owner = _openvino_weights_companion_owner(scan_path)
                 if (
@@ -5464,9 +5589,9 @@ def scan_model_streaming(
                     and should_skip_file(
                         str(source_path),
                         metadata_scanner_available=metadata_scanner_available,
-                        scanner_selection_extensions=scanner_selection_extensions,
+                        scanner_selection_extensions=scanner_selection_skip_extensions,
                     )
-                    and not _preserve_hf_download_sidecar_asset(str(source_path), scanner_selection_extensions)
+                    and not _preserve_hf_download_sidecar_asset(str(source_path), scanner_selection_skip_extensions)
                 ):
                     filename_lower = source_path.name.lower()
                     if filename_lower in LICENSE_FILES:
@@ -5506,6 +5631,27 @@ def scan_model_streaming(
                             preserve_shard_reconciliation_errors = True
                             aggregate_hash_complete = False
 
+                # Build config dict for scan_file
+                scan_config = {
+                    "timeout": timeout - int(time.time() - start_time),
+                    **scan_kwargs,
+                }
+                scan_repository_inventory_context = streaming_repository_inventory_context()
+                if scan_repository_inventory_context.files:
+                    scan_config[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = scan_repository_inventory_context
+                if base_dir is not None:
+                    scan_config.setdefault(REPOSITORY_SCAN_ROOT_CONFIG_KEY, str(base_dir))
+                    repository_member_base_dir = base_dir
+                    configured_repository_root = scan_config.get(REPOSITORY_SCAN_ROOT_CONFIG_KEY)
+                    if isinstance(configured_repository_root, str) and configured_repository_root.strip():
+                        with suppress(OSError, RuntimeError, ValueError):
+                            repository_member_base_dir = Path(configured_repository_root).resolve()
+                    repository_current_file = _repository_member_path_for_scan(
+                        str(source_path),
+                        repository_member_base_dir,
+                    )
+                    if repository_current_file is not None:
+                        scan_config[REPOSITORY_CURRENT_FILE_CONFIG_KEY] = repository_current_file
                 initial_shard_target = _snapshot_validated_shard_target(
                     str(source_path),
                     resolved_path=str(scan_path),
