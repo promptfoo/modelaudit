@@ -9545,14 +9545,17 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
             return True
 
         # PyTorch binary files are flexible in format
-        if ext_format == "pytorch_binary" and header_format in {
-            "pytorch_binary",
-            "pickle",
-            "r_serialized",
-            "zip",
-            "unknown",  # .bin files can contain arbitrary binary data
-        }:
-            return True
+        if ext_format == "pytorch_binary":
+            if header_format in {
+                "pytorch_binary",
+                "pickle",
+                "r_serialized",
+                "zip",
+                "unknown",  # .bin files can contain arbitrary binary data
+            }:
+                return True
+            if header_format == "onnx" and file_path.suffix.lower() == ".bin":
+                return True
 
         # TensorFlow protobuf files (.pb extension)
         if ext_format == "protobuf" and header_format in {

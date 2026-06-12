@@ -6457,7 +6457,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         and header_format != "unknown"
         and ext_format != "unknown"
         and not (
-            (ext_format == "pytorch_binary" and header_format in ["zip", "pickle"] and ext == ".bin")
+            (ext_format == "pytorch_binary" and header_format in ["onnx", "zip", "pickle"] and ext == ".bin")
             or (ext_format == "pytorch_binary" and header_format == "pickle" and ext in [".pt", ".pth"])
             or (ext_format == "pickle" and header_format == "jax_checkpoint" and ext in [".ckpt", ".pickle"])
             or (ext_format == "keras" and header_format in ["zip", "hdf5"])

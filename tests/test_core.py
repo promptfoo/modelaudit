@@ -14383,6 +14383,23 @@ def test_scan_file_keeps_s901_for_malicious_valid_pt_onnx(tmp_path: Path) -> Non
     )
 
 
+def test_scan_file_keeps_s901_for_malicious_valid_pth_onnx(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "malicious.pth", op_type="PythonOp")
+
+    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
+
+
 def test_scan_file_keeps_s901_when_malicious_pt_onnx_finding_is_suppressed(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     rule_config = ModelAuditConfig(suppress={"S902"})
