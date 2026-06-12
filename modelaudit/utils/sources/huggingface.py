@@ -66,6 +66,8 @@ __all__ = [
     "parse_huggingface_file_url",
     "parse_huggingface_url",
     "parse_huggingface_url_with_revision",
+    "plan_huggingface_model_download",
+    "plan_huggingface_streaming_download",
     "redact_huggingface_url_for_display",
     "redact_huggingface_urls_in_text",
 ]
@@ -113,6 +115,20 @@ class _HuggingFaceProbeBudget:
                 f"Hugging Face selective filtering incomplete: inconsistent skipped file size for {repo_id}/{filename}"
             )
         self.file_sizes[filename] = file_size
+
+
+@dataclass(frozen=True)
+class HuggingFaceDownloadPlan:
+    namespace: str
+    repo_name: str
+    repo_id: str
+    deadline: float | None
+    size_limit: int | None
+    repo_files: list[str]
+    repo_revision: str
+    selected_files: list[str]
+    selected_sizes: dict[str, int]
+    download_revision: str
 
 
 def _parse_huggingface_response_file_size(response: Any, bytes_read: int, max_bytes: int) -> int | None:
@@ -1121,6 +1137,7 @@ def _select_huggingface_model_files(
     revision: str,
     model_extensions: Collection[str],
     *,
+    allow_content_probes: bool = True,
     allow_inaccessible_probe_errors: bool = False,
     inaccessible_probe_files: list[str] | None = None,
     deadline: float | None = None,
@@ -1129,6 +1146,12 @@ def _select_huggingface_model_files(
     model_files = list(
         dict.fromkeys(filename for filename in repo_files if _is_scannable_hf_file(filename, model_extensions))
     )
+    if not allow_content_probes:
+        candidate_files = _metadata_only_hf_content_probe_candidates(repo_files, model_files)
+        if candidate_files:
+            _raise_metadata_only_hf_selection_incomplete(repo_id, candidate_files)
+        return model_files
+
     selected_files = set(model_files)
     inspected_files = 0
     probe_budget = _HuggingFaceProbeBudget(
@@ -1169,6 +1192,33 @@ def _select_huggingface_model_files(
     return model_files
 
 
+def _metadata_only_hf_content_probe_candidates(repo_files: list[str], selected_files: Collection[str]) -> list[str]:
+    """Return unselected repo files whose inclusion cannot be proven without content probes."""
+    selected_file_set = set(selected_files)
+    return list(
+        dict.fromkeys(
+            filename
+            for filename in repo_files
+            if filename not in selected_file_set and not _is_huggingface_repo_bookkeeping_file(filename)
+        )
+    )
+
+
+def _raise_metadata_only_hf_selection_incomplete(repo_id: str, candidate_files: Collection[str]) -> None:
+    """Fail closed when metadata-only dry-runs cannot prove content-routed selection."""
+    candidates = list(candidate_files)
+    preview = ", ".join(candidates[:3])
+    if len(candidates) > 3:
+        preview = f"{preview}, ..."
+    candidate_label = "file" if len(candidates) == 1 else "files"
+    raise ValueError(
+        "Hugging Face metadata-only dry-run selection incomplete: "
+        f"dry-run refuses for {repo_id} because it cannot prove selection without content probes; "
+        f"{len(candidates)} unselected non-bookkeeping repository {candidate_label} would require "
+        f"artifact content probing: {preview}"
+    )
+
+
 def _build_literal_allow_patterns(filenames: list[str]) -> list[str]:
     """Escape repository filenames before passing them to the Hub glob filter."""
     return [escape_glob(filename) for filename in filenames]
@@ -1200,6 +1250,7 @@ def _include_huggingface_openvino_companions(
     revision: str,
     model_files: list[str],
     *,
+    allow_content_probes: bool = True,
     include_openvino_companions: bool = True,
     deadline: float | None = None,
 ) -> list[str]:
@@ -1221,6 +1272,9 @@ def _include_huggingface_openvino_companions(
         companion = _openvino_bin_companion_name(filename, repo_files)
         if companion is None or companion not in repo_file_set or companion in selected_files:
             continue
+
+        if not allow_content_probes:
+            _raise_metadata_only_hf_selection_incomplete(repo_id, [companion])
 
         detected_format = _detect_huggingface_content_route_format(repo_id, filename, revision, probe_budget)
         if detected_format not in {"openvino", XML_MODEL_INCONCLUSIVE_FORMAT}:
@@ -1520,6 +1574,37 @@ def _get_selected_hf_content_route_formats(
     return selected_formats
 
 
+def _streamable_hf_content_probe_candidates(
+    repo_files: list[str],
+    selected_files: Collection[str],
+    selected_route_scanner_ids: set[str] | None,
+    selected_route_formats: set[str] | None,
+    exact_openvino_companion_candidates: Collection[str],
+) -> list[str]:
+    """Return streaming files that the renamed-file sniff loop would inspect."""
+    processed_files = set(selected_files)
+    exact_openvino_companion_candidate_set = set(exact_openvino_companion_candidates)
+    complete_safetensors_shard_files = _complete_hf_safetensors_shard_files(repo_files)
+    candidates: list[str] = []
+    for file_name in repo_files:
+        if file_name in processed_files:
+            continue
+        processed_files.add(file_name)
+        if _is_huggingface_repo_bookkeeping_file(file_name):
+            continue
+        if file_name in exact_openvino_companion_candidate_set:
+            continue
+        if _hf_safetensors_shard_excluded_by_selection(
+            file_name,
+            selected_route_scanner_ids,
+            selected_route_formats,
+            complete_safetensors_shard_files=complete_safetensors_shard_files,
+        ):
+            continue
+        candidates.append(file_name)
+    return candidates
+
+
 def _select_streamable_hf_files(
     repo_id: str,
     repo_files: list[str],
@@ -1528,6 +1613,7 @@ def _select_streamable_hf_files(
     scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
     *,
+    allow_content_probes: bool = True,
     include_all_files: bool = False,
     deadline: float | None = None,
 ) -> list[str]:
@@ -1540,11 +1626,12 @@ def _select_streamable_hf_files(
         )
     else:
         selected_route_formats = _get_selected_hf_content_route_formats(scannable_extensions, scannable_filenames)
-    sniff_renamed_files = not include_all_files and (
+    sniff_renamed_files_would_be_active = not include_all_files and (
         bool(selected_route_scanner_ids)
         if selected_route_scanner_ids is not None
         else selected_route_formats is None or bool(selected_route_formats)
     )
+    sniff_renamed_files = allow_content_probes and sniff_renamed_files_would_be_active
     if scannable_extensions is None:
         extensions = _get_default_hf_streaming_extensions()
         filenames = (
@@ -1611,30 +1698,31 @@ def _select_streamable_hf_files(
         else set()
     )
 
+    if not allow_content_probes and sniff_renamed_files_would_be_active:
+        candidate_files = _streamable_hf_content_probe_candidates(
+            repo_files,
+            model_files,
+            selected_route_scanner_ids,
+            selected_route_formats,
+            exact_openvino_companion_candidates,
+        )
+        if candidate_files:
+            _raise_metadata_only_hf_selection_incomplete(repo_id, candidate_files)
+
     if sniff_renamed_files:
         inspected_files = 0
         probe_budget = _HuggingFaceProbeBudget(
             remaining_bytes=_HF_CONTENT_SNIFF_MAX_TOTAL_BYTES,
             deadline=deadline,
         )
-        processed_files = set(model_files)
-        complete_safetensors_shard_files = _complete_hf_safetensors_shard_files(repo_files)
         unskippable_detected_safetensors_shards: list[str] = []
-        for file_name in repo_files:
-            if file_name in processed_files:
-                continue
-            processed_files.add(file_name)
-            if _is_huggingface_repo_bookkeeping_file(file_name):
-                continue
-            if file_name in exact_openvino_companion_candidates:
-                continue
-            if _hf_safetensors_shard_excluded_by_selection(
-                file_name,
-                selected_route_scanner_ids,
-                selected_route_formats,
-                complete_safetensors_shard_files=complete_safetensors_shard_files,
-            ):
-                continue
+        for file_name in _streamable_hf_content_probe_candidates(
+            repo_files,
+            model_files,
+            selected_route_scanner_ids,
+            selected_route_formats,
+            exact_openvino_companion_candidates,
+        ):
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
                     "Hugging Face selective filtering incomplete: skipped file inspection limit exceeded "
@@ -2142,6 +2230,7 @@ def _build_huggingface_model_info(
     scannable_extensions: Collection[str] | None = None,
     scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
+    allow_content_probes: bool = True,
     include_all_files: bool = False,
 ) -> dict[str, Any]:
     """Build selected recursive inventory metadata using the downloader's selection policy."""
@@ -2155,6 +2244,7 @@ def _build_huggingface_model_info(
             scannable_extensions,
             scannable_filenames,
             scannable_scanner_ids,
+            allow_content_probes=allow_content_probes,
             include_all_files=include_all_files,
             deadline=deadline,
         )
@@ -2166,6 +2256,7 @@ def _build_huggingface_model_info(
             repo_files,
             repo_revision,
             model_files,
+            allow_content_probes=allow_content_probes,
             include_openvino_companions=include_openvino_companions,
             deadline=deadline,
         )
@@ -2176,6 +2267,7 @@ def _build_huggingface_model_info(
             repo_files,
             repo_revision,
             model_extensions,
+            allow_content_probes=allow_content_probes,
             allow_inaccessible_probe_errors=allow_inaccessible_probe_errors,
             inaccessible_probe_files=inaccessible_probe_files if allow_inaccessible_probe_errors else None,
             deadline=deadline,
@@ -2273,6 +2365,7 @@ def get_model_info(
     scannable_extensions: Collection[str] | None = None,
     scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
+    allow_content_probes: bool = True,
     include_all_files: bool = False,
 ) -> dict[str, Any]:
     """Get information about a HuggingFace model without downloading it.
@@ -2284,6 +2377,7 @@ def get_model_info(
         scannable_extensions: Optional remote prefilter extensions from scanner selection policy
         scannable_filenames: Optional exact remote prefilter basenames from scanner selection policy
         scannable_scanner_ids: Optional exact scanner IDs from scanner selection policy
+        allow_content_probes: Allow bounded artifact range reads for renamed-format routing
         include_all_files: Include otherwise-unrecognized files under streaming selection bounds
 
     Returns:
@@ -2331,6 +2425,7 @@ def get_model_info(
             scannable_extensions=scannable_extensions,
             scannable_filenames=scannable_filenames,
             scannable_scanner_ids=scannable_scanner_ids,
+            allow_content_probes=allow_content_probes,
             include_all_files=include_all_files,
         )
     except Exception as e:
@@ -2472,8 +2567,6 @@ def download_model(
 
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
 
-        size_limit = _normalize_download_size_limit(max_size)
-
         # Enable/disable progress bars based on parameter
         if not show_progress:
             disable_progress_bars()
@@ -2482,49 +2575,12 @@ def download_model(
             # Force progress bar to show even in non-TTY environments
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
-        # List files in the repository to identify model files
-        listing_timeout = 30.0
-        if deadline is not None:
-            listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
-            if listing_timeout <= 0:
-                raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
-        repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
-            repo_id,
-            listing_timeout,
-            deadline=deadline,
-            revision=requested_revision,
-        )
-        if repo_files is None:
-            raise ValueError(
-                "Hugging Face selective filtering incomplete: "
-                f"failed listing files in repository {repo_id}: {repo_listing_error}"
-            )
+        plan = plan_huggingface_model_download(url, max_size, deadline=deadline)
+        deadline = plan.deadline
+        size_limit = plan.size_limit
+        model_files = plan.selected_files
         if repository_file_inventory is not None:
-            repository_file_inventory[:] = repo_files
-        if repo_revision is None:
-            raise ValueError(
-                "Hugging Face selective filtering incomplete: "
-                f"{repo_listing_error or 'repository listing did not include an immutable commit SHA'}"
-            )
-
-        # Find model files in the repository (using centralized model extensions)
-        model_extensions = _get_model_extensions()
-        model_files = _select_huggingface_model_files(
-            repo_id,
-            repo_files,
-            repo_revision,
-            model_extensions,
-            deadline=deadline,
-        )
-        model_files = _include_huggingface_openvino_companions(
-            repo_id,
-            repo_files,
-            repo_revision,
-            model_files,
-            deadline=deadline,
-        )
-        if deadline is not None and time.monotonic() >= deadline:
-            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+            repository_file_inventory[:] = plan.repo_files
 
         # Download strategy:
         # - When cache_dir is provided: Use local_dir to place files directly there (safer)
@@ -2534,7 +2590,7 @@ def download_model(
             "repo_id": repo_id,
             "tqdm_class": None,  # Use default tqdm
         }
-        download_kwargs["revision"] = repo_revision
+        download_kwargs["revision"] = plan.download_revision
 
         if cache_dir is not None:
             # User provided cache directory - use local_dir for direct placement
@@ -2544,18 +2600,7 @@ def download_model(
             # This is safer as it doesn't risk deleting user's global cache
             pass
 
-        # If we found specific model files, download them
-        if model_files:
-            _revision, _ = _ensure_huggingface_selection_within_max_size(
-                repo_id,
-                model_files,
-                size_limit,
-                resolved_revision=repo_revision,
-                deadline=deadline,
-            )
-            download_kwargs["allow_patterns"] = _build_literal_allow_patterns(model_files)
-        else:
-            _raise_no_scannable_hf_files(repo_id)
+        download_kwargs["allow_patterns"] = _build_literal_allow_patterns(model_files)
 
         local_path = _run_huggingface_download_with_deadline(
             "snapshot_download",
@@ -2595,6 +2640,166 @@ def download_model(
         raise Exception(
             f"Failed to download model from {display_url}: {redact_huggingface_urls_in_text(str(e))}"
         ) from e
+
+
+def plan_huggingface_model_download(
+    url: str,
+    max_size: int | None = None,
+    *,
+    timeout_seconds: float | None = None,
+    deadline: float | None = None,
+    allow_content_probes: bool = True,
+) -> HuggingFaceDownloadPlan:
+    """Plan the bounded Hugging Face files a standard acquisition would download."""
+    namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
+    repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
+    size_limit = _normalize_download_size_limit(max_size)
+    if deadline is None and timeout_seconds is not None:
+        deadline = time.monotonic() + timeout_seconds
+
+    listing_timeout = 30.0
+    if deadline is not None:
+        listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
+        if listing_timeout <= 0:
+            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+    repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
+        repo_id,
+        listing_timeout,
+        deadline=deadline,
+        revision=requested_revision,
+    )
+    if repo_files is None:
+        raise ValueError(
+            "Hugging Face selective filtering incomplete: "
+            f"failed listing files in repository {repo_id}: {repo_listing_error}"
+        )
+    if repo_revision is None:
+        raise ValueError(
+            "Hugging Face selective filtering incomplete: "
+            f"{repo_listing_error or 'repository listing did not include an immutable commit SHA'}"
+        )
+
+    model_files = _select_huggingface_model_files(
+        repo_id,
+        repo_files,
+        repo_revision,
+        _get_model_extensions(),
+        allow_content_probes=allow_content_probes,
+        deadline=deadline,
+    )
+    model_files = _include_huggingface_openvino_companions(
+        repo_id,
+        repo_files,
+        repo_revision,
+        model_files,
+        allow_content_probes=allow_content_probes,
+        deadline=deadline,
+    )
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+    if not model_files:
+        _raise_no_scannable_hf_files(repo_id)
+    revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
+        repo_id,
+        model_files,
+        size_limit,
+        resolved_revision=repo_revision,
+        deadline=deadline,
+    )
+    return HuggingFaceDownloadPlan(
+        namespace=namespace,
+        repo_name=repo_name,
+        repo_id=repo_id,
+        deadline=deadline,
+        size_limit=size_limit,
+        repo_files=repo_files,
+        repo_revision=repo_revision,
+        selected_files=model_files,
+        selected_sizes=selected_sizes,
+        download_revision=revision or repo_revision,
+    )
+
+
+def plan_huggingface_streaming_download(
+    url: str,
+    max_size: int | None = None,
+    *,
+    timeout_seconds: float | None = None,
+    scannable_extensions: Collection[str] | None = None,
+    scannable_filenames: Collection[str] | None = None,
+    scannable_scanner_ids: Collection[str] | None = None,
+    allow_content_probes: bool = True,
+    include_all_files: bool = False,
+) -> HuggingFaceDownloadPlan:
+    """Plan the bounded Hugging Face files a streaming acquisition would download."""
+    namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
+    repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
+    size_limit = _normalize_download_size_limit(max_size)
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+
+    listing_timeout = 30.0
+    if deadline is not None:
+        listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
+        if listing_timeout <= 0:
+            raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
+    repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
+        repo_id,
+        listing_timeout,
+        deadline=deadline,
+        revision=requested_revision,
+    )
+    if repo_files is None:
+        if repo_listing_error and repo_listing_error.startswith("timed out after"):
+            raise Exception(f"Timeout listing files in repository {repo_id}")
+        raise Exception(f"Failed listing files in repository {repo_id}: {repo_listing_error}")
+    if repo_revision is None:
+        raise Exception(
+            f"Failed listing files in repository {repo_id}: "
+            f"{repo_listing_error or 'repository listing did not include an immutable commit SHA'}"
+        )
+
+    model_files = _select_streamable_hf_files(
+        repo_id,
+        repo_files,
+        repo_revision,
+        scannable_extensions,
+        scannable_filenames,
+        scannable_scanner_ids,
+        allow_content_probes=allow_content_probes,
+        include_all_files=include_all_files,
+        deadline=deadline,
+    )
+    openvino_companion_suppression_enabled = scannable_scanner_ids is None or "openvino" in {
+        str(scanner_id).lower() for scanner_id in scannable_scanner_ids
+    }
+    model_files = _include_huggingface_openvino_companions(
+        repo_id,
+        repo_files,
+        repo_revision,
+        model_files,
+        allow_content_probes=allow_content_probes,
+        include_openvino_companions=openvino_companion_suppression_enabled,
+        deadline=deadline,
+    )
+    revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
+        repo_id,
+        model_files,
+        size_limit,
+        resolved_revision=repo_revision,
+        deadline=deadline,
+    )
+    return HuggingFaceDownloadPlan(
+        namespace=namespace,
+        repo_name=repo_name,
+        repo_id=repo_id,
+        deadline=deadline,
+        size_limit=size_limit,
+        repo_files=repo_files,
+        repo_revision=repo_revision,
+        selected_files=model_files,
+        selected_sizes=selected_sizes,
+        download_revision=revision or repo_revision,
+    )
 
 
 def download_model_streaming(
@@ -2642,8 +2847,6 @@ def download_model_streaming(
             "Install with 'pip install modelaudit[huggingface]'"
         ) from e
 
-    namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
-    repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
     display_url = redact_huggingface_url_for_display(url)
 
     try:
@@ -2652,9 +2855,6 @@ def download_model_streaming(
 
         from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
 
-        size_limit = _normalize_download_size_limit(max_size)
-        deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
-
         # Configure progress display
         if not show_progress:
             disable_progress_bars()
@@ -2662,59 +2862,28 @@ def download_model_streaming(
             enable_progress_bars()
             os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
-        # List files with timeout without leaking a blocking worker thread.
-        listing_timeout = 30.0
-        if deadline is not None:
-            listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
-            if listing_timeout <= 0:
-                raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
-        repo_files, repo_revision, repo_listing_error = _list_repo_files_with_timeout(
-            repo_id,
-            listing_timeout,
-            deadline=deadline,
-            revision=requested_revision,
-        )
-        if repo_files is None:
-            if repo_listing_error and repo_listing_error.startswith("timed out after"):
-                raise Exception(f"Timeout listing files in repository {repo_id}")
-            raise Exception(f"Failed listing files in repository {repo_id}: {repo_listing_error}")
-        if repository_file_inventory is not None:
-            repository_file_inventory[:] = repo_files
-        if repo_revision is None:
-            raise Exception(
-                f"Failed listing files in repository {repo_id}: "
-                f"{repo_listing_error or 'repository listing did not include an immutable commit SHA'}"
-            )
-
-        model_files = _select_streamable_hf_files(
-            repo_id,
-            repo_files,
-            repo_revision,
-            scannable_extensions,
-            scannable_filenames,
-            scannable_scanner_ids,
+        plan = plan_huggingface_streaming_download(
+            url,
+            max_size,
+            timeout_seconds=timeout_seconds,
+            scannable_extensions=scannable_extensions,
+            scannable_filenames=scannable_filenames,
+            scannable_scanner_ids=scannable_scanner_ids,
             include_all_files=include_all_files,
-            deadline=deadline,
         )
+        namespace = plan.namespace
+        repo_name = plan.repo_name
+        repo_id = plan.repo_id
+        deadline = plan.deadline
+        size_limit = plan.size_limit
+        model_files = plan.selected_files
+        selected_sizes = plan.selected_sizes
+        download_revision = plan.download_revision
+        if repository_file_inventory is not None:
+            repository_file_inventory[:] = plan.repo_files
         openvino_companion_suppression_enabled = scannable_scanner_ids is None or "openvino" in {
             str(scanner_id).lower() for scanner_id in scannable_scanner_ids
         }
-        model_files = _include_huggingface_openvino_companions(
-            repo_id,
-            repo_files,
-            repo_revision,
-            model_files,
-            include_openvino_companions=openvino_companion_suppression_enabled,
-            deadline=deadline,
-        )
-        revision, selected_sizes = _ensure_huggingface_selection_within_max_size(
-            repo_id,
-            model_files,
-            size_limit,
-            resolved_revision=repo_revision,
-            deadline=deadline,
-        )
-        download_revision = revision or repo_revision
 
         # Setup cache directory
         download_path = None
