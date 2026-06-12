@@ -2006,6 +2006,37 @@ def _canonical_huggingface_tree_page_url(url: str) -> str:
     return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, query, ""))
 
 
+def _validate_huggingface_tree_next_url(repo_id: str, current_url: str, next_url: str) -> str:
+    """Return a safe same-origin tree pagination URL or fail closed."""
+    if next_url.strip() != next_url or any(ord(char) < 32 or ord(char) == 127 for char in next_url):
+        raise ValueError(f"Hugging Face repository inventory incomplete: invalid pagination link for {repo_id}")
+
+    try:
+        current_parts = urlsplit(current_url)
+        next_parts = urlsplit(next_url)
+        _ = (current_parts.port, next_parts.port)
+    except ValueError as exc:
+        raise ValueError(
+            f"Hugging Face repository inventory incomplete: invalid pagination link for {repo_id}"
+        ) from exc
+
+    if (
+        not next_parts.scheme
+        or not next_parts.netloc
+        or next_parts.username is not None
+        or next_parts.password is not None
+    ):
+        raise ValueError(f"Hugging Face repository inventory incomplete: invalid pagination link for {repo_id}")
+
+    if (
+        next_parts.scheme.lower() != current_parts.scheme.lower()
+        or next_parts.netloc.lower() != current_parts.netloc.lower()
+    ):
+        raise ValueError(f"Hugging Face repository inventory incomplete: pagination link changed origin for {repo_id}")
+
+    return next_url
+
+
 def _list_huggingface_repo_files_paginated(
     repo_id: str,
     revision: str,
@@ -2064,7 +2095,11 @@ def _list_huggingface_repo_files_paginated(
         links = getattr(response, "links", {})
         next_link = links.get("next") if isinstance(links, dict) else None
         next_candidate = next_link.get("url") if isinstance(next_link, dict) else None
-        next_url = next_candidate if isinstance(next_candidate, str) and next_candidate else None
+        next_url = (
+            _validate_huggingface_tree_next_url(repo_id, next_url, next_candidate)
+            if isinstance(next_candidate, str) and next_candidate
+            else None
+        )
         params = None
 
     return sorted(files)

@@ -799,7 +799,51 @@ class TestModelDownload:
         assert mock_session.stream.call_count == 2
         assert mock_session.stream.call_args_list[0].args[:2] == ("GET", ANY)
         assert mock_session.stream.call_args_list[0].kwargs["params"] == {"recursive": True, "expand": False}
+        assert mock_session.stream.call_args_list[1].args[:2] == (
+            "GET",
+            "https://huggingface.co/api/models/test/model/tree/page-2",
+        )
         assert mock_session.stream.call_args_list[1].kwargs["params"] is None
+
+    @pytest.mark.parametrize(
+        ("next_url", "expected_error"),
+        [
+            ("https://attacker.example/api/models/test/model/tree/page-2", "pagination link changed origin"),
+            ("http://huggingface.co/api/models/test/model/tree/page-2", "pagination link changed origin"),
+            ("https://user:pass@huggingface.co/api/models/test/model/tree/page-2", "invalid pagination link"),
+            ("https://huggingface.co:bad/api/models/test/model/tree/page-2", "invalid pagination link"),
+            ("/api/models/test/model/tree/page-2", "invalid pagination link"),
+        ],
+    )
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_unsafe_pagination_links_before_following(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        next_url: str,
+        expected_error: str,
+    ) -> None:
+        """Unsafe next links must fail closed before auth headers can reach another origin."""
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_session = mock_get_session.return_value
+        mock_session.stream.side_effect = [
+            _FakeTreeResponse(
+                [{"type": "file", "path": "first.bin"}],
+                links={"next": {"url": next_url}},
+            ),
+            AssertionError("unsafe pagination link should not be followed"),
+        ]
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert expected_error in error
+        assert mock_session.stream.call_count == 1
+        requested_urls = [stream_call.args[1] for stream_call in mock_session.stream.call_args_list]
+        assert next_url not in requested_urls
 
     @pytest.mark.parametrize(
         "filename",
