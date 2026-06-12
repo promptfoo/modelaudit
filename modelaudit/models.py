@@ -57,6 +57,11 @@ def _metadata_value(metadata: Any, key: str) -> Any:
 
 _COVERAGE_ONLY_OPERATIONAL_ERROR_REASONS = frozenset({"recognized_format_scanner_unavailable"})
 _COVERAGE_ONLY_OPERATIONAL_ERROR_SUFFIXES = ("_routing_incomplete",)
+_RUNTIME_VERSION_SKIP_DETAILS = {
+    "runtime_version_known": False,
+    "runtime_cve_applicability": "unknown",
+    "runtime_cve_version_gate": "local_environment_only",
+}
 
 
 def _metadata_has_coverage_only_operational_error(metadata: Any) -> bool:
@@ -88,8 +93,7 @@ def _metadata_has_incomplete_coverage(metadata: Any, *, allow_bare_analysis_inco
     return False
 
 
-def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
-    """Return True when record details explicitly identify incomplete coverage."""
+def _metadata_has_scan_outcome_or_reason_marker(metadata: Any) -> bool:
     if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
         return True
     reason = _metadata_value(metadata, "scan_outcome_reason")
@@ -105,6 +109,13 @@ def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
     return False
 
 
+def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
+    """Return True when record details explicitly identify incomplete coverage."""
+    if _metadata_has_scan_outcome_or_reason_marker(metadata):
+        return True
+    return _metadata_value(metadata, "analysis_incomplete") is True
+
+
 def _details_have_incomplete_coverage(
     details: Any,
     *,
@@ -113,9 +124,9 @@ def _details_have_incomplete_coverage(
 ) -> bool:
     """Return True when details or consolidated detail findings identify incomplete coverage."""
     if allow_bare_analysis_incomplete:
-        if _metadata_has_incomplete_coverage(details, allow_bare_analysis_incomplete=True):
+        if _metadata_has_explicit_incomplete_coverage_marker(details):
             return True
-    elif _metadata_has_explicit_incomplete_coverage_marker(details):
+    elif _metadata_has_scan_outcome_or_reason_marker(details):
         return True
     if _depth >= 4:
         return False
@@ -146,6 +157,21 @@ def _details_have_incomplete_coverage(
     return False
 
 
+def _record_is_clean_runtime_version_skip(record: Any) -> bool:
+    details = _metadata_value(record, "details")
+    status = _metadata_value(record, "status")
+    status_value = getattr(status, "value", status)
+    if not (
+        isinstance(status_value, str)
+        and status_value.lower().split(".", 1)[-1] == "skipped"
+        and _metadata_value(details, "analysis_incomplete") is True
+        and not _metadata_has_scan_outcome_or_reason_marker(details)
+    ):
+        return False
+
+    return all(_metadata_value(details, key) == expected for key, expected in _RUNTIME_VERSION_SKIP_DETAILS.items())
+
+
 def _file_metadata_has_incomplete_coverage(file_metadata: Any) -> bool:
     """Return True when any file metadata entry reports incomplete scan coverage."""
     if not isinstance(file_metadata, dict):
@@ -161,13 +187,13 @@ def _records_have_incomplete_coverage(
     """Return True when any issue/check details identify incomplete scan coverage."""
     if not isinstance(records, list):
         return False
-    return any(
-        _record_has_incomplete_coverage(
+    for record in records:
+        if _record_has_incomplete_coverage(
             record,
             allow_skipped_check_exemption=allow_skipped_check_exemption,
-        )
-        for record in records
-    )
+        ):
+            return True
+    return False
 
 
 def _record_has_incomplete_coverage(
@@ -175,22 +201,9 @@ def _record_has_incomplete_coverage(
     *,
     allow_skipped_check_exemption: bool = False,
 ) -> bool:
-    return _details_have_incomplete_coverage(
-        _metadata_value(record, "details"),
-        allow_bare_analysis_incomplete=not (allow_skipped_check_exemption and _record_status_is_skipped(record)),
-    )
-
-
-def _record_status_is_skipped(record: Any) -> bool:
-    status = _metadata_value(record, "status")
-    if isinstance(status, CheckStatus):
-        return status == CheckStatus.SKIPPED
-    if isinstance(status, str):
-        status_name = status.lower()
-        if status_name.startswith("checkstatus."):
-            status_name = status_name.split(".", 1)[1]
-        return status_name == CheckStatus.SKIPPED.value
-    return False
+    if allow_skipped_check_exemption and _record_is_clean_runtime_version_skip(record):
+        return False
+    return _details_have_incomplete_coverage(_metadata_value(record, "details"))
 
 
 def _issues_have_security_findings(issues: list[Any]) -> bool:

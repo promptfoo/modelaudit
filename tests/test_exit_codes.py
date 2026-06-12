@@ -354,24 +354,24 @@ def test_exit_code_check_details_incomplete_without_security_findings() -> None:
     assert determine_exit_code(results) == 2
 
 
-def test_exit_code_skipped_check_bare_analysis_incomplete_is_not_coverage_failure() -> None:
-    """Informational skipped checks are not file coverage failures without an outcome marker."""
+def test_exit_code_check_details_bare_analysis_incomplete_fails_closed() -> None:
+    """Bare analysis_incomplete in record details is incomplete coverage evidence."""
     results = _create_result_model(
         checks=[
             Check(
-                name="PyTorch Runtime CVE Applicability",
-                status=CheckStatus.SKIPPED,
-                message="PyTorch runtime version is unknown",
+                name="Embedded Secret Scan",
+                status=CheckStatus.FAILED,
+                message="Embedded secret scan truncated",
                 severity=IssueSeverity.INFO,
-                location="model.pt",
-                details={"analysis_incomplete": True, "runtime_cve_applicability": "unknown"},
+                location="model.bin",
+                details={"analysis_incomplete": True},
                 timestamp=0.0,
             ),
         ],
     )
 
-    assert results_have_inconclusive_outcome(results) is False
-    assert determine_exit_code(results) == 0
+    assert results_have_inconclusive_outcome(results) is True
+    assert determine_exit_code(results) == 2
 
 
 def test_exit_code_issue_with_skipped_status_still_treats_bare_analysis_incomplete_as_coverage_failure() -> None:
@@ -416,6 +416,54 @@ def test_exit_code_skipped_check_explicit_incomplete_reason_fails_closed() -> No
 
     assert results_have_inconclusive_outcome(results) is True
     assert determine_exit_code(results) == 2
+
+
+def test_exit_code_skipped_bare_analysis_incomplete_fails_closed() -> None:
+    """Skipped checks are clean only for explicit runtime-version applicability skips."""
+    results = _create_result_model(
+        checks=[
+            Check(
+                name="Embedded Secret Scan",
+                status=CheckStatus.SKIPPED,
+                message="Embedded secret scan skipped after bounded read",
+                severity=IssueSeverity.INFO,
+                location="model.bin",
+                details={"analysis_incomplete": True},
+                timestamp=0.0,
+            ),
+        ],
+    )
+
+    assert results_have_inconclusive_outcome(results) is True
+    assert determine_exit_code(results) == 2
+
+
+def test_exit_code_bare_analysis_incomplete_preserves_security_exit() -> None:
+    """Security findings still exit 1 when bare incomplete coverage evidence coexists."""
+    results = _create_result_model(
+        issues=[
+            Issue(
+                message="Embedded secret scan truncated",
+                severity=IssueSeverity.INFO,
+                location="model.bin",
+                details={"analysis_incomplete": True},
+                timestamp=0.0,
+                why=None,
+                type=None,
+            ),
+            Issue(
+                message="Dangerous pickle global",
+                severity=IssueSeverity.CRITICAL,
+                location="payload.pkl",
+                timestamp=0.0,
+                why=None,
+                type=None,
+            ),
+        ],
+    )
+
+    assert results_have_inconclusive_outcome(results) is True
+    assert determine_exit_code(results) == 1
 
 
 def test_exit_code_consolidated_check_findings_preserve_incomplete_coverage() -> None:

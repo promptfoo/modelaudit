@@ -656,6 +656,33 @@ class TestModelAuditResultModel:
         assert result.success is True
         assert determine_exit_code(result) == 0
 
+    def test_aggregate_scan_result_skipped_bare_analysis_incomplete_fails_closed(self) -> None:
+        """Skipped incomplete checks need runtime-version metadata to remain clean."""
+        result = create_initial_audit_result()
+        result.aggregate_scan_result(
+            {
+                "success": True,
+                "files_scanned": 1,
+                "issues": [],
+                "checks": [
+                    {
+                        "name": "Embedded Secret Scan",
+                        "status": "skipped",
+                        "message": "Embedded secret scan skipped after bounded read",
+                        "severity": "info",
+                        "location": "model.bin",
+                        "details": {"analysis_incomplete": True},
+                        "timestamp": 0.0,
+                    }
+                ],
+                "assets": [],
+            }
+        )
+
+        assert result.has_errors is False
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+
     def test_aggregate_scanner_names_wraps_scalar_strings(self) -> None:
         """Scalar scanner fields should not be split into characters."""
         result = create_initial_audit_result()

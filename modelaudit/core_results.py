@@ -14,7 +14,6 @@ from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import (
     INCONCLUSIVE_SCAN_OUTCOME,
     Check,
-    CheckStatus,
     Issue,
     IssueSeverity,
     ScanResult,
@@ -34,6 +33,11 @@ SCAN_OUTCOME_REASON_METADATA_KEY = "scan_outcome_reason"
 SCAN_OUTCOME_REASONS_METADATA_KEY = "scan_outcome_reasons"
 _COVERAGE_ONLY_OPERATIONAL_ERROR_REASONS = frozenset({"recognized_format_scanner_unavailable"})
 _COVERAGE_ONLY_OPERATIONAL_ERROR_SUFFIXES = ("_routing_incomplete",)
+_RUNTIME_VERSION_SKIP_DETAILS = {
+    "runtime_version_known": False,
+    "runtime_cve_applicability": "unknown",
+    "runtime_cve_version_gate": "local_environment_only",
+}
 _SHARD_FAMILY_PATH_DETAIL_KEYS = frozenset(
     {
         "duplicate_shards",
@@ -155,8 +159,7 @@ def metadata_has_incomplete_coverage(metadata: Any, *, allow_bare_analysis_incom
     return False
 
 
-def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
-    """Return True when record details explicitly identify incomplete coverage."""
+def _metadata_has_scan_outcome_or_reason_marker(metadata: Any) -> bool:
     if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
         return True
     reason = _metadata_value(metadata, SCAN_OUTCOME_REASON_METADATA_KEY)
@@ -172,6 +175,28 @@ def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
     return False
 
 
+def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
+    """Return True when record details explicitly identify incomplete coverage."""
+    if _metadata_has_scan_outcome_or_reason_marker(metadata):
+        return True
+    return _metadata_value(metadata, ANALYSIS_INCOMPLETE_METADATA_KEY) is True
+
+
+def _record_is_clean_runtime_version_skip(record: Any) -> bool:
+    details = _metadata_value(record, "details")
+    status = _metadata_value(record, "status")
+    status_value = getattr(status, "value", status)
+    if not (
+        isinstance(status_value, str)
+        and status_value.lower().split(".", 1)[-1] == "skipped"
+        and _metadata_value(details, ANALYSIS_INCOMPLETE_METADATA_KEY) is True
+        and not _metadata_has_scan_outcome_or_reason_marker(details)
+    ):
+        return False
+
+    return all(_metadata_value(details, key) == expected for key, expected in _RUNTIME_VERSION_SKIP_DETAILS.items())
+
+
 def details_have_incomplete_coverage(
     details: Any,
     *,
@@ -180,9 +205,9 @@ def details_have_incomplete_coverage(
 ) -> bool:
     """Return True when details or consolidated detail findings identify incomplete coverage."""
     if allow_bare_analysis_incomplete:
-        if metadata_has_incomplete_coverage(details, allow_bare_analysis_incomplete=True):
+        if _metadata_has_explicit_incomplete_coverage_marker(details):
             return True
-    elif _metadata_has_explicit_incomplete_coverage_marker(details):
+    elif _metadata_has_scan_outcome_or_reason_marker(details):
         return True
     if _depth >= 4:
         return False
@@ -243,22 +268,10 @@ def record_details_have_incomplete_coverage(
     allow_skipped_check_exemption: bool = False,
 ) -> bool:
     """Return True when a retained issue/check detail object identifies incomplete coverage."""
-    return details_have_incomplete_coverage(
-        _metadata_value(record, "details"),
-        allow_bare_analysis_incomplete=not (allow_skipped_check_exemption and _record_status_is_skipped(record)),
-    )
-
-
-def _record_status_is_skipped(record: Any) -> bool:
-    status = _metadata_value(record, "status")
-    if isinstance(status, CheckStatus):
-        return status == CheckStatus.SKIPPED
-    if isinstance(status, str):
-        status_name = status.lower()
-        if status_name.startswith("checkstatus."):
-            status_name = status_name.split(".", 1)[1]
-        return status_name == CheckStatus.SKIPPED.value
-    return False
+    if allow_skipped_check_exemption and _record_is_clean_runtime_version_skip(record):
+        return False
+    details = _metadata_value(record, "details")
+    return details_have_incomplete_coverage(details)
 
 
 def _location_matches_file_path(location: str, file_path: str) -> bool:

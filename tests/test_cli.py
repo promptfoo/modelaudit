@@ -3551,6 +3551,7 @@ def test_format_text_output_skipped_check_bare_analysis_incomplete_remains_clean
                     "analysis_incomplete": True,
                     "runtime_version_known": False,
                     "runtime_cve_applicability": "unknown",
+                    "runtime_cve_version_gate": "local_environment_only",
                 },
             },
         ],
@@ -3625,6 +3626,68 @@ def test_format_text_output_issue_only_incomplete_coverage_with_security_finding
     assert "Dangerous pickle global" in clean_output
     assert "Incomplete security coverage" in clean_output
     assert "WARNINGS DETECTED; COVERAGE INCOMPLETE" in clean_output
+    assert "NO ISSUES FOUND" not in clean_output
+
+
+def test_format_text_output_runtime_version_skip_does_not_report_incomplete_coverage() -> None:
+    """Expected runtime-version applicability skips should not print incomplete coverage."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [],
+        "checks": [
+            {
+                "name": "CVE PyTorch Version Check",
+                "status": "skipped",
+                "message": "PyTorch runtime version unavailable",
+                "severity": "info",
+                "location": "weights.pt",
+                "details": {
+                    "analysis_incomplete": True,
+                    "runtime_version_known": False,
+                    "runtime_cve_applicability": "unknown",
+                    "runtime_cve_version_gate": "local_environment_only",
+                },
+            }
+        ],
+        "file_metadata": {},
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "Incomplete security coverage" not in clean_output
+    assert "SCAN COVERAGE INCOMPLETE" not in clean_output
+    assert "NO ISSUES FOUND" in clean_output
+
+
+def test_format_text_output_skipped_bare_analysis_incomplete_reports_coverage() -> None:
+    """Skipped incomplete checks without runtime-version metadata still fail closed."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [],
+        "checks": [
+            {
+                "name": "Embedded Secret Scan",
+                "status": "skipped",
+                "message": "Embedded secret scan skipped after bounded read",
+                "severity": "info",
+                "location": "model.bin",
+                "details": {"analysis_incomplete": True},
+            }
+        ],
+        "file_metadata": {},
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "Incomplete security coverage" in clean_output
+    assert "model.bin: analysis_incomplete" in clean_output
+    assert "SCAN COVERAGE INCOMPLETE" in clean_output
     assert "NO ISSUES FOUND" not in clean_output
 
 
