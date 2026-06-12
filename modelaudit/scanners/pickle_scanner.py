@@ -2792,7 +2792,6 @@ class PickleScanner(BaseScanner):
     def _is_legacy_pytorch_storage_import_origin_finding(
         cls,
         details: dict[str, Any],
-        trusted_import_references: set[str],
         trusted_import_positions: Mapping[str, set[int]],
         location: str | None,
     ) -> bool:
@@ -2806,8 +2805,6 @@ class PickleScanner(BaseScanner):
             and isinstance(import_reference, str)
         ):
             return False
-        if import_reference in trusted_import_references:
-            return True
         return cls._legacy_pytorch_storage_import_position_matches(
             import_reference,
             details,
@@ -2972,7 +2969,6 @@ class PickleScanner(BaseScanner):
                 check_or_issue.location,
             ) or cls._is_legacy_pytorch_storage_import_origin_finding(
                 check_or_issue.details,
-                trusted_storage_import_references,
                 trusted_storage_import_positions,
                 check_or_issue.location,
             )
