@@ -461,7 +461,7 @@ _ENCODED_URL_SCHEME_LETTERS = (
 )
 _ENCODED_URL_DELIMITER_PATTERN = re.compile(
     rf"(?P<scheme>{''.join(_ENCODED_URL_SCHEME_LETTERS)})(?P<colon>%(?:25)*3a|:)"
-    r"(?P<slash1>%(?:25)*2f|/)(?P<slash2>%(?:25)*2f|/)",
+    r"(?P<slash1>%(?:25)*(?:2f|5c)|/|\\)(?P<slash2>%(?:25)*(?:2f|5c)|/|\\)",
     re.IGNORECASE,
 )
 
@@ -727,8 +727,6 @@ class SafeTensorsScanner(BaseScanner):
             before = stripped[: match.start()]
             after = stripped[match.end() :]
             annotations = [annotation for annotation in (before, after) if annotation.strip()]
-            if not annotations:
-                continue
             if not all(
                 SafeTensorsScanner._license_document_annotation_looks_documentary(annotation)
                 for annotation in annotations
