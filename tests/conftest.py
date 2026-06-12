@@ -121,6 +121,7 @@ def pytest_runtest_setup(item):
             "test_secure_hasher.py",  # Aggregate hash computation tests
             "test_advanced_file_handler.py",  # Large-file fail-closed handler regressions
             "test_huggingface_extensions.py",  # HuggingFace MODEL_EXTENSIONS tests
+            "test_huggingface_symlinks.py",  # HuggingFace cache symlink routing tests
             "test_regular_scan_hash.py",  # Regular scan mode hash generation tests
             "test_core_asset_extraction.py",  # Check consolidation and location parsing regressions
             "test_manifest_scanner.py",  # Manifest scanner tests
