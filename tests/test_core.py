@@ -31,6 +31,7 @@ from modelaudit.config import ModelAuditConfig, set_config
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.rules import Severity
+from modelaudit.scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY, SUPPRESSED_FAILED_CHECKS_METADATA_KEY
 from modelaudit.scanners import (
     archive_dispatch,
     flax_msgpack_scanner,
@@ -74,6 +75,7 @@ from tests.helpers import (
     prefix_mock_onnx_with_unknown_field,
     prefix_mock_onnx_with_unknown_group,
 )
+from tests.helpers.file_creators import valid_jpeg_bytes, valid_png_bytes
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
 
@@ -102,6 +104,50 @@ def _valid_elf64_header() -> bytes:
     header[18:20] = (62).to_bytes(2, "little")
     header[20:24] = (1).to_bytes(4, "little")
     return bytes(header)
+
+
+def _write_hf_tokenizer_json(path: Path, extra_fields: dict[str, Any] | None = None) -> Path:
+    payload: dict[str, Any] = {
+        "version": "1.0",
+        "added_tokens": [],
+        "model": {
+            "type": "BPE",
+            "vocab": {"hello": 0},
+            "merges": [],
+        },
+    }
+    if extra_fields:
+        payload.update(extra_fields)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _write_ordered_hf_tokenizer_json(
+    path: Path,
+    *,
+    late_fields: str = "",
+    padding_size: int = 0,
+    model_fields: str = '"type":"BPE","vocab":{"hello":0},"merges":[]',
+    version_json: str = '"1.0"',
+) -> Path:
+    padding = f',"padding":"{"x" * padding_size}"' if padding_size else ""
+    path.write_text(
+        (f'{{"version":{version_json},"added_tokens":[],"model":{{{model_fields}}}{padding}{late_fields}}}'),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_truncated_ordered_hf_tokenizer_json(path: Path, *, padding_size: int) -> Path:
+    path.write_text(
+        (
+            '{"version":"1.0","added_tokens":[],'
+            '"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},'
+            f'"padding":"{"x" * padding_size}'
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 def test_multi_file_directory_scan_shares_one_pickle_source_snapshot(
@@ -212,6 +258,25 @@ def _build_malicious_pickle(*, protocol: int | None = None) -> bytes:
             return (os_module.system, ("echo core-dispatch-test",))
 
     return pickle.dumps(DangerousPayload(), protocol=protocol)
+
+
+def test_scan_file_padded_media_pickle_polyglot_fails_closed(tmp_path: Path) -> None:
+    media_path = tmp_path / "padded-polyglot.png"
+    media_path.write_bytes(
+        valid_png_bytes() + (b"\0" * (file_detection.MEDIA_ROUTE_READ_BYTES + 2)) + _build_malicious_pickle()
+    )
+
+    result = scan_file(str(media_path), config={"cache_scan_results": False})
+
+    assert result.success is False
+    assert result.scanner_name == "unknown"
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(
+        check.name == "Pickle Routing"
+        and check.status == CheckStatus.FAILED
+        and check.details["format"] == file_detection.PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        for check in result.checks
+    )
 
 
 def _build_protocolless_binary_malicious_pickle() -> bytes:
@@ -336,6 +401,43 @@ def _write_gzip_safetensors_polyglot(
     assert json.loads(payload[8:header_end].decode("utf-8"))
     assert gzip.decompress(gzip_member) == uncompressed
     path.write_bytes(payload)
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [("preview.png", valid_png_bytes()), ("preview.jpg", valid_jpeg_bytes())],
+    ids=["png", "jpg"],
+)
+def test_scan_file_valid_media_is_unknown_not_serialized(tmp_path: Path, filename: str, payload: bytes) -> None:
+    media_path = tmp_path / filename
+    media_path.write_bytes(payload)
+
+    result = scan_file(str(media_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.issues == []
+
+
+def test_directory_scan_skips_valid_media_assets(tmp_path: Path) -> None:
+    (tmp_path / "preview.png").write_bytes(valid_png_bytes())
+    (tmp_path / "teaser.jpg").write_bytes(valid_jpeg_bytes())
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    assert result.files_scanned == 0
+    assert "pickle" not in result.scanner_names
+    assert "flax_msgpack" not in result.scanner_names
+    assert "jax_checkpoint" not in result.scanner_names
+
+
+def test_scan_file_media_pickle_polyglot_detects_system_global(tmp_path: Path) -> None:
+    media_path = tmp_path / "polyglot.png"
+    media_path.write_bytes(valid_png_bytes() + _build_malicious_pickle())
+
+    result = scan_file(str(media_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
 
 
 def _require_tf_protos() -> None:
@@ -2544,7 +2646,9 @@ def test_scan_file_hf_bookkeeping_skip_precedes_zip_preflight(
     monkeypatch.setenv("HF_HOME", str(hf_home))
     metadata_path = hf_home / "download" / "model.metadata"
     metadata_path.parent.mkdir(parents=True)
-    metadata_path.write_text("{}")
+    metadata_path.write_text(
+        "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n"
+    )
 
     def fail_zip_preflight(*_args: Any, **_kwargs: Any) -> bool:
         raise AssertionError("Hugging Face bookkeeping must be skipped before ZIP preflight")
@@ -7599,7 +7703,7 @@ def test_scan_file_large_confirmed_jax_foreign_overlap_is_inconclusive_not_cache
 
 
 @pytest.mark.parametrize("suffix", [".ckpt", ".pickle"])
-def test_scan_file_routes_jax_json_on_pickle_owned_suffixes_through_json_analysis(tmp_path: Path, suffix: str) -> None:
+def test_scan_file_routes_jax_json_on_pickle_owned_suffixes_through_jax_analysis(tmp_path: Path, suffix: str) -> None:
     model_path = tmp_path / f"state{suffix}"
     model_path.write_text(
         json.dumps({"framework": "jax", "payload": "jax.experimental.host_callback.call(os.system, 'id')"}),
@@ -7609,6 +7713,7 @@ def test_scan_file_routes_jax_json_on_pickle_owned_suffixes_through_json_analysi
     result = scan_file(str(model_path), config={"cache_scan_results": False})
 
     assert result.scanner_name == "jax_checkpoint"
+    assert result.metadata["scanner_dependency_ids"] == ["jax_checkpoint"]
     assert any(
         check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
     )
@@ -9784,6 +9889,1370 @@ def test_scan_file_inconclusive_mxnet_tokenizer_config_preserves_direct_jinja_an
     )
 
 
+def test_scan_file_large_hf_tokenizer_json_does_not_run_binary_json_scanners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    monkeypatch.setattr(core_module, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {"padding": "x" * 256},
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is True
+    assert result.scanner_name not in {"manifest", "jinja2_template", "mxnet", "xgboost"}
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+    assert not any(check.name == "JSON Content Analysis" for check in result.checks)
+
+
+def test_scan_file_oversized_hf_tokenizer_json_does_not_fail_closed_as_mxnet(tmp_path: Path) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {"padding": "x" * (file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES + 1024)},
+    )
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is True
+    assert result.scanner_name not in {"manifest", "jinja2_template", "mxnet", "xgboost"}
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
+
+
+@pytest.mark.parametrize("scanners", [None, ["jinja2_template"], ["mxnet"], ["jax_checkpoint"]])
+def test_scan_file_large_hf_tokenizer_json_with_vocab_jinja_tokens_is_benign_for_selected_scanners(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scanners: list[str] | None,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_dir = tmp_path / "onnx"
+    tokenizer_dir.mkdir()
+    tokenizer_path = _write_hf_tokenizer_json(
+        tokenizer_dir / "tokenizer.json",
+        {
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "{{": 0,
+                    "template": 1,
+                    "framework": 2,
+                    "nodes": 3,
+                    **{f"piece_{index}": index + 4 for index in range(80)},
+                },
+                "merges": [],
+            },
+        },
+    )
+    config: dict[str, Any] = {"cache_scan_results": False}
+    if scanners is not None:
+        config["scanners"] = scanners
+
+    result = scan_file(str(tokenizer_path), config=config)
+
+    assert result.success is True
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert "jax_json_checkpoint_analysis_size_limit" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+
+
+def test_scan_file_oversized_tokenizer_json_late_chat_template_preserves_jinja_detection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "model": {
+                "type": "Unigram",
+                "vocab": [[f"piece_{index}", -float(index)] for index in range(80)],
+            },
+            "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_model_template_after_vocab_probe_boundary_preserves_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    vocab_entries = ",".join(f'"piece_{index}":{index}' for index in range(80))
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        model_fields=(
+            f'"type":"BPE","vocab":{{{vocab_entries}}},'
+            '"template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}","merges":[]'
+        ),
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_model_template_after_merges_probe_boundary_preserves_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 256)
+    merges = ",".join(json.dumps(f"piece_{index} piece_{index + 1}") for index in range(80))
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        model_fields=(
+            f'"type":"BPE","vocab":{{"hello":0}},"merges":[{merges}],'
+            '"template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"'
+        ),
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_root_template_between_probe_and_suffix_preserves_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}","tail":"' + ("y" * 256) + '"',
+        padding_size=256,
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert tokenizer_path.stat().st_size > file_detection.TOKENIZER_JSON_ROUTING_READ_BYTES
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_escaped_jinja_string_between_probe_and_suffix_preserves_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"metadata":"\\u007b\\u007b \'\'.__class__.__mro__[1].__subclasses__() \\u007d\\u007d",'
+            '"tail":"' + ("y" * 256) + '"'
+        ),
+        padding_size=256,
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_escaped_chat_template_preserves_jinja_detection(tmp_path: Path) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    malicious_template = "{{ ''.__class__.__mro__[1].__subclasses__() }}"
+    tokenizer_path.write_text(
+        (
+            '{"version":"1.0","added_tokens":[],'
+            '"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},'
+            f'"chat\\u005ftemplate":{json.dumps(malicious_template)}}}'
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("filename", ["tokenizer", "tokenizer.txt", "tokenizer.bin"])
+def test_scan_file_tokenizer_named_json_template_evidence_without_json_suffix_preserves_jinja(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / filename,
+        {"chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}"},
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_extensionless_tokenizer_template_preempts_selected_jax(tmp_path: Path) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer",
+        {
+            "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+            "framework": "jax",
+            "checkpoint_type": "orbax",
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected_scanner"),
+    [
+        ("tokenizer", "unknown"),
+        ("tokenizer.txt", "text"),
+        ("tokenizer.bin", "pytorch_binary"),
+    ],
+)
+def test_scan_file_tokenizer_named_vocab_template_tokens_without_json_suffix_stays_benign(
+    tmp_path: Path,
+    filename: str,
+    expected_scanner: str,
+) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / filename,
+        {
+            "model": {
+                "type": "BPE",
+                "vocab": {"{{": 0, "{%": 1, "template": 2, "hello": 3},
+                "merges": [],
+            }
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is True
+    assert result.scanner_name == expected_scanner
+    assert not any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_mxnet_root_preempts_template_evidence(tmp_path: Path) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "template": "{{ harmless_user_name }}",
+                "special_tokens": [{"id": "[SEP]", "ids": [102], "tokens": ["[SEP]"]}],
+            },
+            "nodes": [{"op": "Custom", "name": "load", "attrs": {"library": "../../tmp/libevil.so"}}],
+            "arg_nodes": [0],
+            "heads": [[0, 0, 0]],
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
+def test_scan_file_oversized_tokenizer_template_preempts_selected_jax(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "model": {
+                "type": "Unigram",
+                "vocab": [[f"piece_{index}", -float(index)] for index in range(80)],
+            },
+            "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+            "framework": "jax",
+        },
+    )
+
+    result = scan_file(
+        str(tokenizer_path),
+        config={"cache_scan_results": False, "scanners": ["jax_checkpoint", "jinja2_template"]},
+    )
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_oversized_tokenizer_model_template_after_vocab_preserves_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "model": {
+                "type": "Unigram",
+                "vocab": [[f"piece_{index}", -float(index)] for index in range(80)],
+                "template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+            },
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_model_vocab_after_structure_probe_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 256)
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    monkeypatch.setattr(core_module, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "model": {
+                "type": "Unigram",
+                "vocab": [[f"piece_{index}", -float(index)] for index in range(80)],
+            },
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert file_detection.is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata.get("scan_outcome_reasons", [])
+    assert "jax_json_checkpoint_analysis_size_limit" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+    assert any(check.name == "MXNet Symbol Routing" for check in result.checks)
+
+
+def test_scan_file_malformed_tokenizer_model_vocab_container_fails_closed(tmp_path: Path) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0 "world":1},"merges":[]}}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert file_detection.is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "MXNet Symbol Routing" for check in result.checks)
+
+
+def test_scan_file_tokenizer_route_key_after_value_ending_at_probe_boundary_preserves_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe_limit = 256
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", probe_limit)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", probe_limit)
+    tokenizer_path = tmp_path / "tokenizer.json"
+    prefix = '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},"padding":"'
+    padding_size = probe_limit - len(prefix.encode("utf-8")) - 1
+    assert padding_size > 0
+    tokenizer_path.write_text(
+        prefix + ("x" * padding_size) + '","chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_hf_tokenizer_route_probe_fails_closed_after_stream_budget_without_eof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe_limit = 128
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", probe_limit)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", probe_limit)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES", probe_limit)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 32)
+    tokenizer_path = _write_truncated_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        padding_size=512,
+    )
+
+    assert tokenizer_path.stat().st_size > probe_limit
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+
+
+def test_hf_tokenizer_route_probe_stream_budget_inside_merges_token_data_does_not_route_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe_limit = 256
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", probe_limit)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", probe_limit)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STREAM_READ_BYTES", probe_limit)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 32)
+    merges = ",".join(json.dumps(f"piece_{index} {{") for index in range(120))
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        model_fields=f'"type":"BPE","vocab":{{"hello":0}},"merges":[{merges}]',
+    )
+
+    assert tokenizer_path.stat().st_size > probe_limit
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is False
+
+
+def test_scan_file_tokenizer_template_preserves_explicit_jax_selection(tmp_path: Path) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "chat_template": "{{ harmless_user_name }}",
+            "framework": "jax",
+            "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+        },
+    )
+
+    result = scan_file(
+        str(tokenizer_path),
+        config={"cache_scan_results": False, "scanners": ["jax_checkpoint"]},
+    )
+
+    assert result.scanner_name == "jax_checkpoint"
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_file_default_json_routing_requires_positive_jax_evidence(tmp_path: Path) -> None:
+    generic_path = tmp_path / "generic.json"
+    generic_path.write_text(
+        json.dumps({"padding": "x" * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 16)}),
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(generic_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name != "jax_checkpoint"
+    assert "jax_json_checkpoint_analysis_size_limit" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_scan_file_selected_jax_preserves_ambiguous_json_fail_closed(tmp_path: Path) -> None:
+    generic_path = tmp_path / "generic.json"
+    generic_path.write_text(
+        json.dumps({"padding": "x" * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 16)}),
+        encoding="utf-8",
+    )
+
+    result = scan_file(
+        str(generic_path),
+        config={"cache_scan_results": False, "scanners": ["jax_checkpoint"]},
+    )
+
+    assert result.scanner_name == "jax_checkpoint"
+    assert result.success is False
+    assert "jax_json_checkpoint_analysis_size_limit" in result.metadata.get("scan_outcome_reasons", [])
+    assert any(check.name == "JSON Checkpoint Analysis Limit" for check in result.checks)
+
+
+def test_scan_file_oversized_tokenizer_json_late_mxnet_root_preserves_mxnet_detection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "model": {
+                "type": "Unigram",
+                "vocab": [[f"piece_{index}", -float(index)] for index in range(80)],
+            },
+            "nodes": [{"op": "Custom", "name": "load", "attrs": {"library": "../../tmp/libevil.so"}}],
+            "arg_nodes": [0],
+            "heads": [[0, 0, 0]],
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
+def test_scan_file_oversized_tokenizer_json_late_jax_root_preserves_selected_jax_detection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 256)
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "model": {
+                "type": "Unigram",
+                "vocab": [[f"piece_{index}", -float(index)] for index in range(80)],
+            },
+            "framework": "jax",
+            "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False, "scanners": ["jax_checkpoint"]})
+
+    assert result.scanner_name == "jax_checkpoint"
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_vocab_template_token_does_not_route_unrelated_scanners(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        model_fields='"type":"BPE","vocab":{"{{":0,"{%":1,"hello":2},"merges":[]',
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is True
+    assert result.scanner_name not in {"jinja2_template", "mxnet", "xgboost", "jax_checkpoint"}
+    assert result.metadata["scanner_dependency_ids"] == ["unknown"]
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+    assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
+    assert not any(check.name == "JSON Checkpoint Analysis Limit" for check in result.checks)
+
+
+def test_scan_file_tokenizer_json_merges_template_tokens_do_not_route_jinja(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        model_fields=(
+            '"type":"BPE","vocab":{"hello":0},"merges":["hello {{","{% benign_token %} world","template token"]'
+        ),
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is True
+    assert result.scanner_name not in {"jinja2_template", "mxnet", "xgboost", "jax_checkpoint"}
+    assert result.metadata["scanner_dependency_ids"] == ["unknown"]
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+
+
+def test_scan_file_tokenizer_json_added_tokens_template_token_does_not_route_jinja(tmp_path: Path) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "added_tokens": [
+                {
+                    "id": 50256,
+                    "content": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+                    "special": True,
+                }
+            ]
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is False
+    assert result.success is True
+    assert result.scanner_name not in {"jinja2_template", "mxnet", "xgboost", "jax_checkpoint"}
+    assert result.metadata["scanner_dependency_ids"] == ["unknown"]
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+
+
+def test_scan_file_tokenizer_json_nested_template_preserves_jinja_detection(tmp_path: Path) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+                "single": "$A:0 [SEP]:0",
+                "pair": "$A:0 [SEP]:0 $B:1 [SEP]:1",
+                "special_tokens": [{"id": "[SEP]", "ids": [102], "tokens": ["[SEP]"]}],
+            }
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_benign_nested_template_has_no_ssti_finding(tmp_path: Path) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "template": "$A:0 [SEP]:0",
+                "single": "$A:0 [SEP]:0",
+                "pair": "$A:0 [SEP]:0 $B:1 [SEP]:1",
+                "special_tokens": [{"id": "[SEP]", "ids": [102], "tokens": ["[SEP]"]}],
+            }
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is True
+    assert result.scanner_name == "jinja2_template"
+    assert not any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_late_chat_template_preserves_jinja_detection(tmp_path: Path) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {"chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}"},
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_late_xgboost_markers_preserve_xgboost_detection(tmp_path: Path) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "version": [1, 7, 4],
+            "learner": {"gradient_booster": {}, "malicious_code": "os.system()"},
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert any(check.name == "JSON Content Analysis" and check.status == CheckStatus.FAILED for check in result.checks)
+
+
+def test_scan_file_tokenizer_json_late_mxnet_markers_preserve_mxnet_detection(tmp_path: Path) -> None:
+    tokenizer_path = _write_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        {
+            "nodes": [{"op": "Custom", "name": "load", "attrs": {"library": "../../tmp/libevil.so"}}],
+            "arg_nodes": [0],
+            "heads": [[0, 0, 0]],
+        },
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
+def test_scan_file_tokenizer_json_late_chat_template_after_structure_budget_preserves_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 192)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"',
+        padding_size=256,
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_directory_tokenizer_json_late_chat_template_after_structure_budget_preserves_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 192)
+    _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"',
+        padding_size=256,
+    )
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    assert result.files_scanned == 1
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_late_xgboost_after_structure_budget_preserves_xgboost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 192)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"learner":{"gradient_booster":{},"malicious_code":"os.system()"}',
+        padding_size=256,
+        version_json="[1,7,4]",
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert any(check.name == "JSON Content Analysis" and check.status == CheckStatus.FAILED for check in result.checks)
+
+
+def test_scan_file_tokenizer_json_late_mxnet_after_structure_budget_preserves_mxnet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 192)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+            '"arg_nodes":[0],"heads":[[0,0,0]]'
+        ),
+        padding_size=256,
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
+def test_scan_file_tokenizer_json_late_mxnet_after_mxnet_budget_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 192)
+    monkeypatch.setattr(core_module, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 192)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+            '"arg_nodes":[0],"heads":[[0,0,0]]'
+        ),
+        padding_size=256,
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "MXNet Symbol Routing" and "bounded JSON probe reached its limit" in check.message
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_late_xgboost_jax_overlap_after_structure_budget_merges_xgboost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 192)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+            '"framework":"jax",'
+            '"payload":"jax.experimental.host_callback.call(os.system, \'id\')"'
+        ),
+        padding_size=256,
+        version_json="[1,7,4]",
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert set(result.metadata["scanner_dependency_ids"]) >= {"jax_checkpoint", "xgboost"}
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert (
+        sum(check.name == "JSON Content Analysis" and check.status == CheckStatus.FAILED for check in result.checks)
+        == 1
+    )
+
+
+def test_scan_file_tokenizer_json_jax_identity_preserves_jax_checkpoint_analysis(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(',"framework":"jax","payload":"jax.experimental.host_callback.call(os.system, \'id\')"'),
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jax_checkpoint"
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert not any(check.name == "Template Extraction" for check in result.checks)
+
+
+def test_scan_file_tokenizer_json_non_jax_identity_does_not_merge_jax(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"framework":"transformers",'
+            '"chat_template":"{{ harmless_user }}",'
+            f'"padding":"{"x" * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 16)}"'
+        ),
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert "jax_json_checkpoint_analysis_size_limit" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "JSON Checkpoint Analysis Limit" for check in result.checks)
+
+
+def test_scan_file_tokenizer_json_library_jax_identity_composes_jinja_template_analysis(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"library":"jax",'
+            '"payload":"jax.experimental.host_callback.call(os.system, \'id\')",'
+            '"chat_template":"{{ harmless_user }}"'
+        ),
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert set(result.metadata["scanner_dependency_ids"]) >= {"jinja2_template", "jax_checkpoint"}
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_jax_identity_composes_jinja_template_analysis(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"framework":"jax",'
+            '"payload":"jax.experimental.host_callback.call(os.system, \'id\')",'
+            '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"'
+        ),
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert set(result.metadata["scanner_dependency_ids"]) >= {"jinja2_template", "jax_checkpoint"}
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_escaped_long_jax_identity_value_composes_jinja_template_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "_STRUCTURED_JSON_TRAILING_READ_BYTES", 64)
+    jax_identity_json = (
+        f'"{"x" * (file_detection._HF_TOKENIZER_STREAM_MAX_KEY_BYTES + 16)}'
+        r"\n\u006a\u0061\u0078"
+        '"'
+    )
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+            f'"framework":{jax_identity_json},'
+            '"payload":"jax.experimental.host_callback.call(os.system, \'id\')"'
+        ),
+        padding_size=256,
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert set(result.metadata["scanner_dependency_ids"]) >= {"jinja2_template", "jax_checkpoint"}
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_extensionless_tokenizer_jax_identity_composes_jinja_template_analysis(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer",
+        late_fields=(
+            ',"framework":"jax",'
+            '"payload":"jax.experimental.host_callback.call(os.system, \'id\')",'
+            '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"'
+        ),
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert set(result.metadata["scanner_dependency_ids"]) >= {"jinja2_template", "jax_checkpoint"}
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_jax_library_identity_composes_jinja_template_analysis(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"library":"jax",'
+            '"payload":"jax.experimental.host_callback.call(os.system, \'id\')",'
+            '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"'
+        ),
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert set(result.metadata["scanner_dependency_ids"]) >= {"jinja2_template", "jax_checkpoint"}
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_config_template_jax_identity_composes_jax_analysis(tmp_path: Path) -> None:
+    tokenizer_path = tmp_path / "tokenizer_config.json"
+    tokenizer_path.write_text(
+        json.dumps(
+            {
+                "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+                "framework": "jax",
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert set(result.metadata["scanner_dependency_ids"]) >= {"jinja2_template", "jax_checkpoint"}
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_non_jax_identity_value_does_not_merge_jax(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"chat_template":"{{ user_name }}","framework":"tensorflow"',
+        padding_size=JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 1,
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is True
+    assert result.scanner_name == "jinja2_template"
+    assert "jax_checkpoint" not in result.metadata.get("scanner_dependency_ids", [])
+    assert "jax_json_checkpoint_analysis_size_limit" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "JSON Checkpoint Analysis Limit" for check in result.checks)
+
+
+def test_scan_file_tokenizer_json_jax_without_template_does_not_self_merge_jinja(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(',"library":"jax","payload":"jax.experimental.host_callback.call(os.system, \'id\')"'),
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jax_checkpoint"
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+    assert (
+        sum(
+            check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize("framework_json", ['"jax"', r'"\u006a\u0061\u0078"'])
+def test_scan_file_oversized_tokenizer_json_late_jax_without_template_routes_jax(
+    tmp_path: Path,
+    framework_json: str,
+) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            f',"framework":{framework_json},"payload":"jax.experimental.host_callback.call(os.system, \'id\')"'
+        ),
+        padding_size=JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 16,
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+    registry_scanner = core_module._registry.get_scanner_for_path(str(tokenizer_path))
+
+    assert tokenizer_path.stat().st_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES
+    assert file_detection.huggingface_tokenizer_json_has_jax_route_evidence(tokenizer_path) is True
+    assert registry_scanner is not None
+    assert registry_scanner.name == "jax_checkpoint"
+    assert result.success is False
+    assert result.scanner_name == "jax_checkpoint"
+    assert "jax_json_checkpoint_analysis_size_limit" in result.metadata.get("scan_outcome_reasons", [])
+    assert any(check.name == "JSON Checkpoint Analysis Limit" for check in result.checks)
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+
+
+def test_scan_file_tokenizer_json_xgboost_jax_jinja_overlap_does_not_recurse(tmp_path: Path) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+            '"framework":"jax",'
+            '"payload":"jax.experimental.host_callback.call(os.system, \'id\')",'
+            '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"'
+        ),
+        version_json="[1,7,4]",
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is False
+    assert set(result.metadata["scanner_dependency_ids"]) >= {
+        "jinja2_template",
+        "jax_checkpoint",
+        "xgboost",
+    }
+    assert (
+        sum(
+            check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+        == 1
+    )
+    assert (
+        sum(
+            check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+        >= 1
+    )
+    assert (
+        sum(
+            check.name == "Jinja2 SSTI Analysis Summary" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+        == 1
+    )
+    assert (
+        sum(check.name == "JSON Content Analysis" and check.status == CheckStatus.FAILED for check in result.checks)
+        == 1
+    )
+
+
+def test_scan_file_malformed_tokenizer_xgboost_jax_jinja_overlap_preserves_jax(
+    tmp_path: Path,
+) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(
+        (
+            '{"version":[1,7,4],"added_tokens":[],'
+            '"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},'
+            '"learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+            '"framework":"jax",'
+            '"payload":"jax.experimental.host_callback.call(os.system, \'id\')",'
+            '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+            '"malformed":'
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is False
+    assert {"jinja2_template", "jax_checkpoint", "xgboost"} <= set(result.metadata["scanner_dependency_ids"])
+    assert "xgboost_json_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert "jax_json_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert any(
+        check.name == "JSON Checkpoint Validation" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_file_malformed_tokenizer_xgboost_jax_selection_preserves_jax_without_jinja(
+    tmp_path: Path,
+) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(
+        (
+            '{"version":[1,7,4],"added_tokens":[],'
+            '"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},'
+            '"learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+            '"framework":"jax",'
+            '"payload":"jax.experimental.host_callback.call(os.system, \'id\')",'
+            '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+            '"malformed":'
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_file(
+        str(tokenizer_path),
+        config={"cache_scan_results": False, "scanners": ["xgboost", "jax_checkpoint"]},
+    )
+
+    assert result.success is False
+    assert {"jax_checkpoint", "xgboost"} <= set(result.metadata["scanner_dependency_ids"])
+    assert "jinja2_template" not in result.metadata["scanner_dependency_ids"]
+    assert "xgboost_json_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert "jax_json_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "JSON Checkpoint Validation" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+    assert "jinja2_template" in result.metadata["skipped_scanner_ids"]
+    assert any(
+        check.name == "Scanner Selection"
+        and check.details.get("skipped_scanner_id") == "jinja2_template"
+        and check.details.get("context") == "overlapping Jinja JSON analysis"
+        for check in result.checks
+    )
+
+
+def test_scan_file_malformed_tokenizer_jax_only_selection_runs_jax_and_skips_xgboost(
+    tmp_path: Path,
+) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(
+        (
+            '{"version":[1,7,4],"added_tokens":[],'
+            '"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},'
+            '"learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+            '"framework":"jax",'
+            '"payload":"jax.experimental.host_callback.call(os.system, \'id\')",'
+            '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+            '"malformed":'
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_file(
+        str(tokenizer_path),
+        config={"cache_scan_results": False, "scanners": ["jax_checkpoint"]},
+    )
+
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+    assert file_detection.huggingface_tokenizer_json_has_jax_route_evidence(tokenizer_path) is True
+    assert result.scanner_name == "jax_checkpoint"
+    assert result.success is False
+    assert result.metadata["scanner_dependency_ids"] == ["jax_checkpoint"]
+    assert "jax_json_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert "xgboost" in result.metadata["skipped_scanner_ids"]
+    assert any(
+        check.name == "Scanner Selection"
+        and check.details.get("skipped_scanner_id") == "xgboost"
+        and check.details.get("kind") == "preferred"
+        for check in result.checks
+    )
+    assert "jinja2_template" in result.metadata["skipped_scanner_ids"]
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+    assert not any(check.name == "Jinja2 SSTI Analysis Summary" for check in result.checks)
+
+
+def test_scan_file_tokenizer_json_malformed_after_structure_budget_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 128)
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 192)
+    monkeypatch.setattr(core_module, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 192)
+    tokenizer_path = _write_truncated_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        padding_size=256,
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "MXNet Symbol Routing" for check in result.checks)
+
+
+def test_scan_file_malformed_exact_tokenizer_json_with_schema_evidence_fails_closed(tmp_path: Path) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    tokenizer_path.write_text(
+        '{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"hello":0}},"padding":1e+}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "MXNet Symbol Routing" for check in result.checks)
+
+
+def test_scan_file_tokenizer_json_duplicate_mxnet_root_after_structure_budget_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 192)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"nodes":[],'
+            '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+            '"arg_nodes":[0],"heads":[[0,0,0]]'
+        ),
+        padding_size=256,
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_enabled": False})
+
+    assert result.metadata["analysis_incomplete"] is True
+    assert "mxnet_symbol_duplicate_root_keys" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "MXNet Symbol JSON Analysis" and check.details.get("duplicate_root_keys") == ["nodes"]
+        for check in result.checks
+    )
+
+
+def test_scan_file_tokenizer_json_excessive_items_late_chat_template_preserves_jinja(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 192)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(
+            ',"padding_items":['
+            + ",".join("0" for _ in range(5000))
+            + '],"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"'
+        ),
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_config_json_with_tokenizer_schema_still_runs_manifest_controls(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_name": "blocked-tokenizer-model",
+                "download_url": "https://evil.example/model.bin",
+                "sha1": "a" * 40,
+                "tokenizer": {
+                    "version": "1.0",
+                    "added_tokens": [],
+                    "model": {"type": "BPE", "vocab": {"hello": 0}},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(config_path), config={"blacklist_patterns": ["blocked"], "cache_scan_results": False})
+
+    assert result.scanner_name == "manifest"
+    assert any(
+        check.name == "Blacklist Pattern Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(check.name == "Untrusted URL Check" and check.status == CheckStatus.FAILED for check in result.checks)
+    assert any(check.name == "Weak Hash Detection" and check.status == CheckStatus.FAILED for check in result.checks)
+
+
 def test_scan_file_inconclusive_mxnet_generation_config_runs_selected_jinja_when_manifest_excluded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -10099,6 +11568,114 @@ def test_scan_file_routes_tail_marker_llamafile_exe(tmp_path: Path) -> None:
     assert result.scanner_name == "llamafile"
 
 
+def _create_budgeted_onnx_candidate(path: Path, *, op_type: str = "Relu") -> Path:
+    create_mock_onnx(path, op_type=op_type)
+    return prefix_mock_onnx_with_unknown_field(path, value_size=0, count=4097, field_number=8)
+
+
+def _create_truncated_tensor_onnx(path: Path) -> Path:
+    onnx = pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+
+    x_value = helper.make_tensor_value_info("input", TensorProto.FLOAT, [2])
+    y_value = helper.make_tensor_value_info("output", TensorProto.FLOAT, [2])
+    initializer = onnx.TensorProto()
+    initializer.name = "weights"
+    initializer.data_type = TensorProto.FLOAT
+    initializer.dims.extend([2])
+    initializer.raw_data = b"\x00" * 4
+    node = helper.make_node("Add", ["input", "weights"], ["output"], name="add")
+    graph = helper.make_graph([node], "graph", [x_value], [y_value], [initializer])
+    onnx.save(helper.make_model(graph), str(path))
+    return path
+
+
+def _create_future_ir_onnx_candidate(path: Path) -> Path:
+    pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+
+    x_value = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])
+    y_value = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])
+    node = helper.make_node("Relu", ["input"], ["output"], name="relu")
+    graph = helper.make_graph([node], "graph", [x_value], [y_value])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 999999
+    path.write_bytes(model.SerializeToString())
+    return prefix_mock_onnx_with_unknown_field(path, value_size=0, count=4097, field_number=8)
+
+
+def _create_missing_value_metadata_onnx_candidate(path: Path) -> Path:
+    onnx = pytest.importorskip("onnx")
+
+    model = onnx.ModelProto()
+    model.ir_version = 7
+    model.opset_import.add().version = 13
+    model.graph.name = "graph"
+    node = model.graph.node.add()
+    node.op_type = "Relu"
+    node.input.append("input")
+    node.output.append("output")
+    path.write_bytes(model.SerializeToString())
+    return prefix_mock_onnx_with_unknown_field(path, value_size=0, count=4097, field_number=8)
+
+
+def _create_external_data_onnx_candidate(path: Path) -> Path:
+    onnx = pytest.importorskip("onnx")
+    from onnx import StringStringEntryProto, TensorProto, helper
+
+    weights_path = path.with_name("weights.bin")
+    weights_path.write_bytes(struct.pack("ff", 1.0, 2.0))
+    x_value = helper.make_tensor_value_info("input", TensorProto.FLOAT, [2])
+    y_value = helper.make_tensor_value_info("output", TensorProto.FLOAT, [2])
+    initializer = onnx.TensorProto()
+    initializer.name = "weights"
+    initializer.data_type = TensorProto.FLOAT
+    initializer.dims.extend([2])
+    initializer.data_location = onnx.TensorProto.EXTERNAL
+    location = StringStringEntryProto()
+    location.key = "location"
+    location.value = weights_path.name
+    initializer.external_data.append(location)
+    node = helper.make_node("Add", ["input", "weights"], ["output"], name="add")
+    graph = helper.make_graph([node], "graph", [x_value], [y_value], [initializer])
+    onnx.save(helper.make_model(graph), str(path))
+    return prefix_mock_onnx_with_unknown_field(path, value_size=0, count=4097, field_number=8)
+
+
+def _format_validation_check(result: ScanResult) -> Any:
+    return next(check for check in result.checks if check.name == "Format Validation")
+
+
+def _actionable_s901_issues(result: ScanResult) -> list[Any]:
+    return [
+        issue
+        for issue in result.issues
+        if issue.rule_code == "S901" and issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+
+
+def _assert_schema_rejected_pt_onnx_keeps_s901(path: Path) -> ScanResult:
+    result = scan_file(str(path), config={"cache_enabled": False})
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert "validated_format" not in result.metadata
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "onnx_schema_validation_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "ONNX Schema Validation"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("schema_validation_reason") == "onnx_schema_validation_failed"
+        for check in result.checks
+    )
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+    assert determine_exit_code(aggregate) != 0
+    return result
+
+
 def test_scan_file_routes_misnamed_onnx_by_header(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     disguised_onnx = tmp_path / "model.payload"
@@ -10107,6 +11684,352 @@ def test_scan_file_routes_misnamed_onnx_by_header(tmp_path: Path) -> None:
     result = scan_file(str(disguised_onnx))
 
     assert result.scanner_name == "onnx"
+
+
+def test_scan_file_demotes_pt_onnx_mismatch_after_validated_alternate_format(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "model.pt")
+
+    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert result.metadata["validated_format"] == "onnx"
+    assert format_check.status == CheckStatus.FAILED
+    assert format_check.severity == IssueSeverity.INFO
+    assert format_check.rule_code is None
+    assert format_check.details == {
+        "extension_format": "pickle",
+        "header_format": PROTOBUF_MODEL_CANDIDATE_FORMAT,
+        "file_type_validation_failed": False,
+        "alternate_format_validated": True,
+        "original_file_type_validation_failed": True,
+        "validated_format": "onnx",
+    }
+    assert "Filename and content disagree" in format_check.message
+    assert _actionable_s901_issues(result) == []
+
+
+def test_scan_file_keeps_s901_for_external_data_pt_onnx(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    external_data_onnx = _create_external_data_onnx_candidate(tmp_path / "external-data.pt")
+
+    result = scan_file(str(external_data_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert "validated_format" not in result.metadata
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "onnx_schema_validation_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "External Data Reference Check"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("file") == "weights.bin"
+        for check in result.checks
+    )
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+
+
+def test_scan_file_keeps_s901_for_malicious_valid_pt_onnx(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "malicious.pt", op_type="PythonOp")
+
+    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
+
+
+def test_scan_file_keeps_s901_when_malicious_pt_onnx_finding_is_suppressed(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    rule_config = ModelAuditConfig(suppress={"S902"})
+    set_config(rule_config)
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "suppressed-malicious.pt", op_type="PythonOp")
+
+    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert not any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
+    assert ACTIONABLE_FAILED_CHECKS_METADATA_KEY not in result.metadata
+    assert SUPPRESSED_FAILED_CHECKS_METADATA_KEY not in result.metadata
+    assert {
+        "name": "Python Operator Detection",
+        "rule_code": "S902",
+        "severity": "critical",
+    } in result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY]
+    assert {
+        "name": "Python Operator Detection",
+        "rule_code": "S902",
+        "severity": "critical",
+    } in result._private_metadata[SUPPRESSED_FAILED_CHECKS_METADATA_KEY]
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+
+
+def test_scan_file_keeps_s901_when_malicious_pt_onnx_finding_is_downgraded(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    rule_config = ModelAuditConfig()
+    rule_config.severity = {"S501": Severity.INFO, "S902": Severity.INFO}
+    set_config(rule_config)
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "downgraded-malicious.pt", op_type="PythonOp")
+
+    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert ACTIONABLE_FAILED_CHECKS_METADATA_KEY not in result.metadata
+    assert {
+        "name": "JIT/Script Code Execution Detection",
+        "rule_code": "S501",
+        "severity": "critical",
+    } in result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY]
+    assert {
+        "name": "Python Operator Detection",
+        "rule_code": "S902",
+        "severity": "critical",
+    } in result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY]
+    assert all(issue.severity == IssueSeverity.INFO for issue in result.issues if issue.rule_code in {"S501", "S902"})
+    assert any(
+        issue.severity == IssueSeverity.INFO and issue.details.get("op_type") == "PythonOp" for issue in result.issues
+    )
+    assert not any(
+        issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+
+
+@pytest.mark.parametrize("rule_mode", ["suppressed", "downgraded"])
+def test_scan_file_keeps_s901_for_cached_hidden_onnx_evidence(tmp_path: Path, rule_mode: str) -> None:
+    pytest.importorskip("onnx")
+    if rule_mode == "suppressed":
+        rule_config = ModelAuditConfig(suppress={"S902"})
+    else:
+        rule_config = ModelAuditConfig()
+        rule_config.severity = {"S501": Severity.INFO, "S902": Severity.INFO}
+    set_config(rule_config)
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / f"{rule_mode}-cached-malicious.pt", op_type="PythonOp")
+    cache_dir = tmp_path / f"{rule_mode}-cache"
+    cache_config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+    reset_cache_manager()
+
+    try:
+        first_result = scan_file(str(disguised_onnx), config=cache_config)
+        second_result = scan_file(str(disguised_onnx), config=cache_config)
+        format_checks = [_format_validation_check(first_result), _format_validation_check(second_result)]
+
+        assert [result.scanner_name for result in (first_result, second_result)] == ["onnx", "onnx"]
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        assert all(format_check.severity == IssueSeverity.WARNING for format_check in format_checks)
+        assert all(format_check.rule_code == "S901" for format_check in format_checks)
+        assert all(_actionable_s901_issues(result) for result in (first_result, second_result))
+        assert all(
+            ACTIONABLE_FAILED_CHECKS_METADATA_KEY in result._private_metadata
+            for result in (first_result, second_result)
+        )
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_keeps_s901_for_truncated_pt_onnx(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    truncated_onnx = _create_truncated_tensor_onnx(tmp_path / "truncated.pt")
+    prefix_mock_onnx_with_unknown_field(truncated_onnx, value_size=0, count=4097, field_number=8)
+
+    result = scan_file(str(truncated_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert "validated_format" not in result.metadata
+    assert any(check.name == "Tensor Size Validation" and check.status == CheckStatus.FAILED for check in result.checks)
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+
+
+def test_scan_file_keeps_s901_when_truncated_onnx_integrity_check_is_suppressed(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    rule_config = ModelAuditConfig(suppress={"S703"})
+    set_config(rule_config)
+    truncated_onnx = _create_truncated_tensor_onnx(tmp_path / "suppressed-truncated.pt")
+    prefix_mock_onnx_with_unknown_field(truncated_onnx, value_size=0, count=4097, field_number=8)
+
+    result = scan_file(str(truncated_onnx), config={"cache_enabled": False})
+    aggregate = scan_model_directory_or_file(str(truncated_onnx), cache_scan_results=False)
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert "validated_format" not in result.metadata
+    assert not any(check.name == "Tensor Size Validation" for check in result.checks)
+    assert {
+        "name": "Tensor Size Validation",
+        "rule_code": "S703",
+        "severity": "info",
+    } in result._private_metadata[SUPPRESSED_FAILED_CHECKS_METADATA_KEY]
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+    assert determine_exit_code(aggregate) != 0
+
+
+def test_scan_file_keeps_s901_for_malformed_pt_onnx_candidate(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    malformed_payload = tmp_path / "malformed.pt"
+    malformed_payload.write_bytes((b"\x42\x00" * 4097) + b"\x08")
+
+    result = scan_file(str(malformed_payload), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "unknown"
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "onnx_tentative_candidate_parse_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+
+
+def test_scan_file_keeps_s901_for_checker_rejected_pt_onnx_payload(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    invalid_payload = tmp_path / "checker-rejected.pt"
+    invalid_payload.write_bytes((b"\x42\x00" * 4097) + b"\x08\x01\x3a\x00")
+
+    _assert_schema_rejected_pt_onnx_keeps_s901(invalid_payload)
+
+
+def test_scan_file_keeps_s901_when_schema_failure_is_suppressed(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    rule_config = ModelAuditConfig(suppress={"S902"})
+    set_config(rule_config)
+    invalid_payload = tmp_path / "suppressed-checker-rejected.pt"
+    invalid_payload.write_bytes((b"\x42\x00" * 4097) + b"\x08\x01\x3a\x00")
+
+    result = scan_file(str(invalid_payload), config={"cache_enabled": False})
+    aggregate = scan_model_directory_or_file(str(invalid_payload), cache_scan_results=False)
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert "validated_format" not in result.metadata
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "onnx_schema_validation_failed" in result.metadata["scan_outcome_reasons"]
+    assert not any(check.name == "ONNX Schema Validation" for check in result.checks)
+    assert {
+        "name": "ONNX Schema Validation",
+        "rule_code": "S902",
+        "severity": "info",
+    } in result._private_metadata[SUPPRESSED_FAILED_CHECKS_METADATA_KEY]
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+    assert determine_exit_code(aggregate) != 0
+
+
+def test_scan_file_keeps_s901_for_unsupported_future_ir_pt_onnx(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    future_ir = _create_future_ir_onnx_candidate(tmp_path / "future-ir.pt")
+
+    _assert_schema_rejected_pt_onnx_keeps_s901(future_ir)
+
+
+def test_scan_file_keeps_s901_for_missing_required_graph_metadata_pt_onnx(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    missing_metadata = _create_missing_value_metadata_onnx_candidate(tmp_path / "missing-metadata.pt")
+
+    _assert_schema_rejected_pt_onnx_keeps_s901(missing_metadata)
+
+
+def test_scan_file_keeps_s901_for_spoofed_pt_protobuf_prefix(tmp_path: Path) -> None:
+    spoofed_payload = tmp_path / "spoofed.pt"
+    spoofed_payload.write_bytes(b"\x08\x01" + b"onnx" + (b"\x00" * 32))
+
+    result = scan_file(str(spoofed_payload), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name != "onnx"
+    assert "validated_format" not in result.metadata
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+
+
+def test_scan_file_keeps_s901_for_onnx_pickle_polyglot_candidate(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    polyglot = _create_budgeted_onnx_candidate(tmp_path / "polyglot.pt")
+    polyglot.write_bytes(polyglot.read_bytes() + b"\x80\x04cbuiltins\neval\n(S'1+1'\ntR.")
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "unknown"
+    assert "onnx_tentative_candidate_parse_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+
+
+def test_scan_file_keeps_s901_when_onnx_dependency_unavailable_for_pt_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("onnx")
+    from modelaudit.scanners import onnx_scanner as onnx_scanner_module
+
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "dependency-unavailable.pt")
+    monkeypatch.setattr(onnx_scanner_module, "_check_onnx", lambda: False)
+
+    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "unknown"
+    assert "onnx_tentative_candidate_analysis_unavailable" in result.metadata["scan_outcome_reasons"]
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+
+
+def test_scan_file_keeps_s901_when_alternate_scan_result_is_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("onnx")
+    from modelaudit.scanners.onnx_scanner import OnnxScanner
+
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "incomplete-owner.pt")
+
+    def incomplete_scan(self: OnnxScanner, _path: str) -> ScanResult:
+        result = ScanResult(scanner_name="onnx", scanner=self)
+        result.metadata["validated_format"] = "onnx"
+        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        result.metadata["scan_outcome_reasons"] = ["onnx_structure_validation_failed"]
+        result.finish(success=False)
+        return result
+
+    monkeypatch.setattr(OnnxScanner, "scan", incomplete_scan)
+
+    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert result.success is False
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
 
 
 def test_scan_file_routes_onnx_pb_by_content(tmp_path: Path) -> None:
@@ -10698,6 +12621,28 @@ def test_scan_file_does_not_route_incidental_onnx_pb_string(tmp_path: Path) -> N
 
     assert result.scanner_name != "onnx"
     assert not any(check.name == "Python Operator Detection" for check in result.checks)
+
+
+def test_scan_directory_missing_onnx_dependency_is_operational_without_security_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "model.onnx"
+    model_path.write_bytes(b"not-a-real-onnx-model")
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+    assert result.success is False
+    assert result.has_errors is True
+    assert determine_exit_code(result) == 2
+    assert result.files_scanned == 1
+    assert result.bytes_scanned == model_path.stat().st_size
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    metadata = result.file_metadata[str(model_path)]
+    assert metadata["scan_outcome"] == "inconclusive"
+    assert metadata["operational_error"] is True
+    assert metadata["operational_error_reason"] == "onnx_dependency_unavailable"
 
 
 def test_scan_file_fails_closed_when_recognized_format_scanner_is_unavailable(

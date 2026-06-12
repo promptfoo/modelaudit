@@ -18,7 +18,9 @@ from modelaudit.utils.file.detection import (
     JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    MEDIA_ROUTE_READ_BYTES,
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+    PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
     PROTOBUF_MODEL_CANDIDATE_FORMAT,
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
     TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
@@ -34,7 +36,10 @@ from tests.helpers.file_creators import (
     create_mock_mxnet_symbol,
     create_mock_onnx,
     create_v7_tar_archive,
+    malicious_pickle_bytes,
     prefix_mock_onnx_with_unknown_field,
+    valid_jpeg_bytes,
+    valid_png_bytes,
 )
 
 
@@ -186,6 +191,82 @@ class TestFileFilter:
         for file in skip_files:
             assert should_skip_file(file), f"Should skip {file}"
 
+    @pytest.mark.parametrize(
+        ("filename", "payload"),
+        [
+            ("preview.png", valid_png_bytes()),
+            ("preview.jpg", valid_jpeg_bytes()),
+            ("preview.jpeg", valid_jpeg_bytes()),
+        ],
+        ids=["png", "jpg", "jpeg"],
+    )
+    def test_valid_media_stays_skipped_by_default_prefilter(
+        self,
+        tmp_path: Path,
+        filename: str,
+        payload: bytes,
+    ) -> None:
+        media_path = tmp_path / filename
+        media_path.write_bytes(payload)
+
+        assert detect_file_format_for_skip_filter(str(media_path)) == "unknown"
+        assert should_skip_file(str(media_path)) is True
+
+    @pytest.mark.parametrize(
+        ("filename", "payload"),
+        [("polyglot.png", valid_png_bytes()), ("polyglot.jpg", valid_jpeg_bytes())],
+        ids=["png", "jpg"],
+    )
+    def test_media_pickle_polyglot_bypasses_default_prefilter(
+        self,
+        tmp_path: Path,
+        filename: str,
+        payload: bytes,
+    ) -> None:
+        media_path = tmp_path / filename
+        media_path.write_bytes(payload + malicious_pickle_bytes())
+
+        assert detect_file_format_for_skip_filter(str(media_path)) == "pickle"
+        assert should_skip_file(str(media_path)) is False
+
+    def test_jpeg_fill_byte_media_pickle_polyglot_bypasses_default_prefilter(self, tmp_path: Path) -> None:
+        media_path = tmp_path / "fill-polyglot.jpg"
+        jpeg_with_fill = valid_jpeg_bytes()[:3] + b"\xff" + valid_jpeg_bytes()[3:]
+        media_path.write_bytes(jpeg_with_fill + malicious_pickle_bytes())
+
+        assert detect_file_format_for_skip_filter(str(media_path)) == "pickle"
+        assert should_skip_file(str(media_path)) is False
+
+    def test_padded_media_pickle_polyglot_bypasses_default_prefilter(self, tmp_path: Path) -> None:
+        media_path = tmp_path / "padded-polyglot.png"
+        media_path.write_bytes(valid_png_bytes() + (b"\0" * (MEDIA_ROUTE_READ_BYTES + 2)) + malicious_pickle_bytes())
+
+        assert detect_file_format_for_skip_filter(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        assert should_skip_file(str(media_path)) is False
+
+    @pytest.mark.parametrize(
+        ("filename", "payload"),
+        [
+            ("bad-crc.png", bytes(bytearray(valid_png_bytes())[:-1] + bytes([valid_png_bytes()[-1] ^ 0x01]))),
+            (
+                "forged-tail.jpg",
+                b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00" + b"\0" * 32 + b"\xff\xd9",
+            ),
+        ],
+        ids=["png-crc", "jpeg-tail"],
+    )
+    def test_malformed_media_headers_bypass_default_prefilter(
+        self,
+        tmp_path: Path,
+        filename: str,
+        payload: bytes,
+    ) -> None:
+        media_path = tmp_path / filename
+        media_path.write_bytes(payload)
+
+        assert detect_file_format_for_skip_filter(str(media_path)) == PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+        assert should_skip_file(str(media_path)) is False
+
     def test_allow_model_extensions(self):
         """Test that model extensions are not skipped."""
         model_files = [
@@ -308,7 +389,7 @@ class TestFileFilter:
         disguised_legacy_tar = create_v7_tar_archive(tmp_path / "legacy-tar.jpg")
 
         real_image = tmp_path / "cover.jpg"
-        real_image.write_bytes(b"\xff\xd8\xff\xe0" + b"jpeg")
+        real_image.write_bytes(valid_jpeg_bytes())
 
         assert not should_skip_file(str(disguised_pickle))
         assert not should_skip_file(str(disguised_protocol0_pickle))
