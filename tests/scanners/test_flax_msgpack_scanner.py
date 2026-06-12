@@ -480,6 +480,39 @@ def test_flax_msgpack_restore_fn_dangerous_value_still_critical(tmp_path: Path) 
     )
 
 
+def test_flax_msgpack_over_budget_padded_restore_fn_dangerous_value_is_critical(tmp_path: Path) -> None:
+    path = tmp_path / "over_budget_padded_restore_fn.msgpack"
+    padded_callable = (" " * (_STREAM_TEXT_CHUNK_BYTES + 7)) + "eval" + ("\n" * (_STREAM_TEXT_CHUNK_BYTES + 11))
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, "restore_fn": padded_callable})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is False
+    restore_fn_issue = next(
+        issue
+        for issue in result.issues
+        if issue.severity == IssueSeverity.CRITICAL
+        and issue.message == "Suspicious object attribute value detected: restore_fn"
+    )
+    assert restore_fn_issue.location == "root/restore_fn"
+    assert restore_fn_issue.details["value_sample"] == "eval"
+
+
+def test_flax_msgpack_over_budget_padded_restore_fn_benign_value_is_not_critical(tmp_path: Path) -> None:
+    path = tmp_path / "over_budget_padded_benign_restore_fn.msgpack"
+    padded_callable = (
+        (" " * (_STREAM_TEXT_CHUNK_BYTES + 7)) + "custom_deserialize" + ("\n" * (_STREAM_TEXT_CHUNK_BYTES + 11))
+    )
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, "restore_fn": padded_callable})
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert not [
+        issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL and "restore_fn" in issue.message
+    ]
+
+
 def test_flax_msgpack_binary_function_metadata_value_still_critical(tmp_path: Path) -> None:
     path = tmp_path / "binary_callable.msgpack"
     create_msgpack_file(path, {"params": {"eval_fn": b"eval", "compiled_fn": b"exec"}})
@@ -1759,6 +1792,33 @@ def test_flax_msgpack_streamed_ndarray_parameter_count_uses_dtype_item_size(
     assert "scan_outcome" not in result.metadata
     assert result.metadata["estimated_parameters"] == expected_parameters
     assert result.metadata["jax_metadata"]["parameter_count"] == expected_parameters
+    assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "shape_values", "tensor_size", "expected_parameters"),
+    [
+        pytest.param("int8", [17], 17, 17, id="int8-prime-byte-count"),
+        pytest.param("float16", [17], 34, 17, id="float16-odd-element-count"),
+    ],
+)
+def test_flax_msgpack_streamed_ndarray_counts_valid_non_generic_tensor_sizes(
+    tmp_path: Path,
+    dtype: str,
+    shape_values: list[int],
+    tensor_size: int,
+    expected_parameters: int,
+) -> None:
+    path = tmp_path / f"{dtype}_non_generic_tensor_size_ndarray.msgpack"
+    _write_sparse_large_flax_ndarray_ext(path, tensor_size, dtype=dtype, shape_values=shape_values)
+
+    result = FlaxMsgpackScanner(config={"max_msgpack_decode_bytes": 16}).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["estimated_parameters"] == expected_parameters
+    assert result.metadata["jax_metadata"]["parameter_count"] == expected_parameters
+    assert result.metadata["jax_metadata"]["tensor_count"] == 1
     assert all(check.name != "Msgpack Decode Budget" for check in result.checks)
 
 

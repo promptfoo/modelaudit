@@ -29,6 +29,7 @@ _DANGEROUS_JAX_TRANSFORMS = ("jit_compile", "eval_jit", "exec_transform", "dynam
 _EVIDENCE_SAMPLE_CHARS = 200
 _EVIDENCE_LOCATION_CHARS = 300
 _EVIDENCE_REDACTION_INPUT_CHARS = 4096
+_MAX_STREAMED_VALUE_IDENTITY_CHARS = _EVIDENCE_REDACTION_INPUT_CHARS
 _MIN_SHORT_BINARY_TEXT_PERCENT = 85
 _MAX_STREAM_TENSOR_SAMPLES = 64
 _MAX_STREAM_SEQUENCE_EVIDENCE = 64
@@ -106,6 +107,7 @@ class _MsgpackStreamFormatError(ValueError):
 class _StreamValue:
     type_name: str
     value: Any = None
+    normalized_value_identity: str | None = None
     direct_string_keys: set[str] = field(default_factory=set)
     sequence_summary: _StreamSequenceSummary | None = None
 
@@ -253,6 +255,60 @@ class _StreamSequenceSummary:
     evidence_complete: bool = True
     negative_dimension: tuple[int, int] | None = None
     oversized_dimension: tuple[int, int] | None = None
+
+
+@dataclass
+class _BoundedNormalizedTextIdentity:
+    max_chars: int
+    parts: list[str] = field(default_factory=list)
+    length: int = 0
+    started: bool = False
+    overflow: bool = False
+    pending_whitespace: list[str] = field(default_factory=list)
+    pending_whitespace_overflow: bool = False
+
+    def observe(self, chunk: str) -> None:
+        if self.overflow:
+            return
+        for char in chunk:
+            if not self.started:
+                if char.isspace():
+                    continue
+                self.started = True
+                self._append(char.lower())
+                continue
+
+            if char.isspace():
+                self._queue_whitespace(char)
+                continue
+
+            if self.pending_whitespace_overflow:
+                self.overflow = True
+                return
+            if self.pending_whitespace:
+                self._append("".join(self.pending_whitespace))
+                self.pending_whitespace.clear()
+            self._append(char.lower())
+
+    def _queue_whitespace(self, char: str) -> None:
+        if self.pending_whitespace_overflow:
+            return
+        if self.length + len(self.pending_whitespace) + 1 > self.max_chars:
+            self.pending_whitespace_overflow = True
+            return
+        self.pending_whitespace.append(char)
+
+    def _append(self, value: str) -> None:
+        if self.length + len(value) > self.max_chars:
+            self.overflow = True
+            return
+        self.parts.append(value)
+        self.length += len(value)
+
+    def value(self) -> str | None:
+        if self.overflow or not self.started:
+            return None
+        return "".join(self.parts)
 
 
 @dataclass
@@ -1308,6 +1364,8 @@ class FlaxMsgpackScanner(BaseScanner):
         value: Any,
         location: str,
         result: ScanResult,
+        *,
+        normalized_value_identity: str | None = None,
     ) -> None:
         """Check dictionary keys for suspicious names that might indicate serialization attacks."""
         if key in self.suspicious_keys:
@@ -1326,7 +1384,11 @@ class FlaxMsgpackScanner(BaseScanner):
             )
             return
 
-        if key in self.function_metadata_keys and self._value_names_dangerous_callable(value):
+        if key in self.function_metadata_keys and self._value_names_dangerous_callable(
+            value,
+            normalized_value_identity=normalized_value_identity,
+        ):
+            sample_value = normalized_value_identity if normalized_value_identity is not None else value
             result.add_check(
                 name="Object Attribute Security Check",
                 passed=False,
@@ -1335,17 +1397,25 @@ class FlaxMsgpackScanner(BaseScanner):
                 location=_redact_evidence_location(location),
                 details={
                     "suspicious_key": key,
-                    "value_sample": _redact_evidence_sample(value),
+                    "value_sample": _redact_evidence_sample(sample_value),
                 },
                 rule_code="S999",
             )
 
-    def _value_names_dangerous_callable(self, value: Any) -> bool:
+    def _value_names_dangerous_callable(
+        self,
+        value: Any,
+        *,
+        normalized_value_identity: str | None = None,
+    ) -> bool:
         """Return whether a metadata value directly names a dangerous callable."""
-        value_text = _text_for_security_matching(value)
-        if value_text is None:
-            return False
-        normalized = value_text.strip().lower()
+        if normalized_value_identity is None:
+            value_text = _text_for_security_matching(value)
+            if value_text is None:
+                return False
+            normalized = value_text.strip().lower()
+        else:
+            normalized = normalized_value_identity
         return normalized in self.dangerous_callable_names
 
     def _add_incomplete_check(
@@ -2154,10 +2224,11 @@ class FlaxMsgpackScanner(BaseScanner):
         summary: _FlaxStreamSummary,
         *,
         item_size: int = 4,
+        validated_tensor: bool = False,
     ) -> None:
         if size >= item_size and size % item_size == 0:
             summary.parameter_count += size // item_size
-        if not self._is_tensor_like_binary_size(size):
+        if not validated_tensor and not self._is_tensor_like_binary_size(size):
             return
 
         summary.tensor_count += 1
@@ -2449,10 +2520,13 @@ class FlaxMsgpackScanner(BaseScanner):
         summary: _FlaxStreamSummary,
         *,
         check_string_jax_transform: bool = True,
-    ) -> None:
+    ) -> str | None:
+        normalized_identity = _BoundedNormalizedTextIdentity(_MAX_STREAMED_VALUE_IDENTITY_CHARS)
+
         def recorded_chunks() -> Iterable[str]:
             for chunk in chunks:
                 self._check_timeout()
+                normalized_identity.observe(chunk)
                 self._record_stream_text(chunk, summary)
                 yield chunk
 
@@ -2475,6 +2549,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 location=_redact_evidence_location(location),
                 details={"length": length, "threshold": 100000},
             )
+        return normalized_identity.value()
 
     def _analyze_streamed_binary_sample(
         self,
@@ -2937,7 +3012,13 @@ class FlaxMsgpackScanner(BaseScanner):
         item_size = self._validate_flax_ndarray_payload_length(shape_values, dtype, data_length)
 
         value_location = f"{location}[2]"
-        self._record_stream_tensor_size(data_length, value_location, summary, item_size=item_size)
+        self._record_stream_tensor_size(
+            data_length,
+            value_location,
+            summary,
+            item_size=item_size,
+            validated_tensor=True,
+        )
         self._check_timeout()
         cursor.skip(data_length)
         self._check_timeout()
@@ -2981,14 +3062,14 @@ class FlaxMsgpackScanner(BaseScanner):
             return _StreamValue("str", value=raw_value.decode("utf-8"))
 
         if length > self.max_msgpack_decode_bytes:
-            self._analyze_streamed_string_scalar(
+            normalized_value_identity = self._analyze_streamed_string_scalar(
                 cursor.iter_utf8_chunks(length),
                 length,
                 location,
                 result,
                 summary,
             )
-            return _StreamValue("str", value=None)
+            return _StreamValue("str", value=None, normalized_value_identity=normalized_value_identity)
 
         raw_value = cursor._read_exact(length)
         value = raw_value.decode("utf-8")
@@ -3610,7 +3691,13 @@ class FlaxMsgpackScanner(BaseScanner):
                     count_node=True,
                     capture_sequence=key_text == "shape",
                 )
-                self._check_suspicious_keys(key_str, value.value, key_location, result)
+                self._check_suspicious_keys(
+                    key_str,
+                    value.value,
+                    key_location,
+                    result,
+                    normalized_value_identity=value.normalized_value_identity,
+                )
 
                 if key_text == "__jax_array__":
                     has_jax_array = True
