@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - suppress installed source-trusted inert Hugging Face training metadata and safe NumPy RNG-state reconstruction noise while keeping default-install, unresolved, rebound, or shadowed PyTorch ZIP framework metadata suspicious unless trusted source can be inspected
+- inspect large Keras HDF5 models through file-backed metadata traversal instead of rejecting them at the generic whole-file read cap; aggregate `content_hash` is omitted for these large file-backed HDF5 scans
 - paginate and bound large Hugging Face repository inventories before streaming so unfiltered scans preserve complete coverage
 - dispatch logical model directories through their owning scanners, preserving bounded complete SavedModel asset probes before supplemental child-file coverage
 - stream large Flax MessagePack tensor bodies by declared length without tripping the 512 MiB decode budget
