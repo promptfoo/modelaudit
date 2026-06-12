@@ -2409,7 +2409,7 @@ def test_directory_scan_hashes_external_data_for_content_routed_onnx_bin(tmp_pat
 
     result = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
 
-    assert result.success is True
+    assert_only_onnx_external_schema_validation_skipped(result)
     assert result.bytes_scanned == routed_model_path.stat().st_size + sidecar_path.stat().st_size
     assert result.content_hash == compute_aggregate_hash(
         [
@@ -2417,6 +2417,19 @@ def test_directory_scan_hashes_external_data_for_content_routed_onnx_bin(tmp_pat
             compute_sha256_hash(sidecar_path),
         ]
     )
+    assert not any(check.name == "Format Validation" for check in result.checks)
+
+
+def test_directory_scan_accepts_content_routed_onnx_bin_without_format_validation(tmp_path: Path) -> None:
+    model_path = create_onnx_model(tmp_path)
+    routed_model_path = tmp_path / "model.bin"
+    model_path.rename(routed_model_path)
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    assert result.success is True
+    assert "onnx" in result.scanner_names
+    assert not any(check.name == "Format Validation" for check in result.checks)
 
 
 def test_directory_scan_does_not_parse_oversized_streamed_onnx_for_sidecar_hash(
@@ -4807,8 +4820,8 @@ class TestCVE202634447SymlinkTraversal:
             and c.status == CheckStatus.PASSED
             and c.details.get("file") == "model.onnx_data"
         ]
-        assert result.success is True
         assert len(resolved_checks) == 1
+        assert_only_onnx_external_schema_validation_skipped(result)
         assert result.bytes_scanned == model_path.stat().st_size + sidecar_path.stat().st_size
         assert result.content_hash == compute_aggregate_hash(
             [
@@ -4816,6 +4829,7 @@ class TestCVE202634447SymlinkTraversal:
                 compute_sha256_hash(sidecar_path),
             ]
         )
+        assert not any(check.name == "Format Validation" for check in result.checks)
         assert not [c for c in result.checks if c.details.get("cve_id") == "CVE-2026-34447"]
 
     def test_huggingface_cache_snapshot_regular_model_with_sidecar_symlink_to_blob_still_flagged(

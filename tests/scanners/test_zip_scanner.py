@@ -10520,7 +10520,7 @@ class TestZipScanner:
 
         for audit_result in (first_result, second_result):
             metadata = audit_result.file_metadata[str(archive_path)]
-            assert audit_result.success is True
+            assert audit_result.success is False
             assert audit_result.has_errors is False
             assert core.determine_exit_code(audit_result) == 1
             assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
