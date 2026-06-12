@@ -779,7 +779,7 @@ class SecretsDetector:
                 if len(match.group("indent")) == direct_item_indent:
                     item_start = max(item_start, match.end())
         item_prefix = headers_prefix[item_start if item_start >= 0 else 0 :]
-        item_suffix = SecretsDetector._basic_auth_header_object_item_suffix(suffix)
+        item_suffix = SecretsDetector._basic_auth_header_object_item_suffix(item_prefix, suffix)
         item_text = item_prefix + item_suffix
         direct_item_prefix = SecretsDetector._basic_auth_header_object_direct_field_text(item_prefix)
         direct_item_text = SecretsDetector._basic_auth_header_object_direct_field_text(item_text)
@@ -862,19 +862,60 @@ class SecretsDetector:
         return "".join(direct_chars)
 
     @staticmethod
-    def _basic_auth_header_object_item_suffix(suffix: str) -> str:
+    def _basic_auth_header_object_item_suffix(item_prefix: str, suffix: str) -> str:
         if not suffix:
             return ""
 
+        brace_depth, quote, escaped = SecretsDetector._basic_auth_brace_state(item_prefix)
+        if brace_depth > 0:
+            for index, character in enumerate(suffix):
+                if escaped:
+                    escaped = False
+                    continue
+                if quote is not None:
+                    if character == "\\":
+                        escaped = True
+                    elif character == quote:
+                        quote = None
+                    continue
+                if character in {"'", '"', "`"}:
+                    quote = character
+                elif character == "{":
+                    brace_depth += 1
+                elif character == "}":
+                    brace_depth -= 1
+                    if brace_depth <= 0:
+                        return suffix[:index]
+            return suffix
+
         end = len(suffix)
-        for delimiter in ("}", "]"):
-            delimiter_index = suffix.find(delimiter)
-            if delimiter_index != -1:
-                end = min(end, delimiter_index)
         item_match = BASIC_AUTH_HEADER_OBJECT_ITEM_START_PATTERN.search(suffix)
         if item_match is not None:
             end = min(end, item_match.start())
         return suffix[:end]
+
+    @staticmethod
+    def _basic_auth_brace_state(value: str) -> tuple[int, str | None, bool]:
+        brace_depth = 0
+        quote: str | None = None
+        escaped = False
+        for character in value:
+            if escaped:
+                escaped = False
+                continue
+            if quote is not None:
+                if character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                continue
+            if character in {"'", '"', "`"}:
+                quote = character
+            elif character == "{":
+                brace_depth += 1
+            elif character == "}":
+                brace_depth = max(0, brace_depth - 1)
+        return brace_depth, quote, escaped
 
     @staticmethod
     def _basic_auth_prefix_has_headers_constructor_context(prefix: str) -> bool:

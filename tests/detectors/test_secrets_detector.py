@@ -396,6 +396,16 @@ class TestSecretsDetector:
                 _basic_auth_token(b"json-header-object-reordered:pass"),
             ),
             (
+                f'{{"headers":[{{"value":["Basic {_basic_auth_token(b"json-object-array-first:pass")}"],'
+                '"name":"Authorization"}]}}',
+                _basic_auth_token(b"json-object-array-first:pass"),
+            ),
+            (
+                'headers: [{ value: ["Bearer placeholder", "Basic '
+                f'{_basic_auth_token(b"js-object-array-second:pass")}"], name: "Proxy-Authorization" }}]',
+                _basic_auth_token(b"js-object-array-second:pass"),
+            ),
+            (
                 f'{{"headers":[{{"name":"Authorization","value":["Bearer placeholder","Basic '
                 f'{_basic_auth_token(b"json-object-list-second:pass")}"]}}]}}',
                 _basic_auth_token(b"json-object-list-second:pass"),
@@ -527,6 +537,14 @@ class TestSecretsDetector:
             (
                 f'headers: [{{ value: "Basic {_basic_auth_token(b"nested-metadata-name:pass")}", '
                 'metadata: { name: "Authorization" } }]'
+            ),
+            (
+                f'headers: [{{ value: ["Basic {_basic_auth_token(b"nested-metadata-array-name:pass")}"], '
+                'metadata: { name: "Authorization" } }]'
+            ),
+            (
+                f'headers: [{{ value: ["Basic {_basic_auth_token(b"next-object-array-name:pass")}"] }}, '
+                '{ name: "Authorization" }]'
             ),
             (
                 "headers:\n"
