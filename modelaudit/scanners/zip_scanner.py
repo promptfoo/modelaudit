@@ -12,8 +12,8 @@ from itertools import pairwise
 from typing import Any, BinaryIO, ClassVar, cast
 
 from ..core_results import mark_operational_scan_error
-from ..scanner_registry_metadata import TEXT_CONTENT_ROUTED_FILENAMES
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
+from ..utils.file.detection import is_declared_text_content_filename
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
@@ -1992,15 +1992,16 @@ class ZipScanner(BaseScanner):
                                 tmp_path = named_tmp.name
                                 total_size = copy_entry_to(cast(BinaryIO, named_tmp))
                         else:
+                            member_basename = os.path.basename(name.replace("\\", "/"))
                             safe_name = (
                                 re.sub(
                                     r"[^a-zA-Z0-9_.-]",
                                     "_",
-                                    os.path.basename(name),
+                                    member_basename,
                                 )
                                 or "member"
                             )
-                            if safe_name.lower() not in TEXT_CONTENT_ROUTED_FILENAMES or is_mar_python_fallback:
+                            if not is_declared_text_content_filename(member_basename) or is_mar_python_fallback:
                                 safe_name = f"member_{safe_name}"
                             tmp_dir = tempfile.mkdtemp(prefix="modelaudit_zip_")
                             tmp_path = os.path.join(tmp_dir, safe_name)

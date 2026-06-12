@@ -7647,13 +7647,18 @@ def _is_complete_declared_text_payload(payload: bytes) -> bool:
     )
 
 
+def is_declared_text_content_filename(filename: str) -> bool:
+    """Return whether a basename is declared as tokenizer or documentation text."""
+    normalized = PurePosixPath(filename.replace("\\", "/")).name.lower()
+    return normalized in _CONTENT_ROUTE_DECLARED_TEXT_ASSET_FILENAMES or (
+        normalized.startswith(_CONTENT_ROUTE_DECLARED_DOCUMENTATION_PREFIXES)
+        and PurePosixPath(normalized).suffix in _CONTENT_ROUTE_DECLARED_DOCUMENTATION_EXTENSIONS
+    )
+
+
 def _is_complete_declared_text_asset(file_path: Path, file_size: int) -> bool:
     """Return whether a declared tokenizer/documentation text asset owns the file."""
-    filename = file_path.name.lower()
-    if filename not in _CONTENT_ROUTE_DECLARED_TEXT_ASSET_FILENAMES and not (
-        filename.startswith(_CONTENT_ROUTE_DECLARED_DOCUMENTATION_PREFIXES)
-        and file_path.suffix.lower() in _CONTENT_ROUTE_DECLARED_DOCUMENTATION_EXTENSIONS
-    ):
+    if not is_declared_text_content_filename(file_path.name):
         return False
     if file_size > _CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES:
         return False

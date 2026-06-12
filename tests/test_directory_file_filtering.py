@@ -697,6 +697,50 @@ class TestDirectoryFileFiltering:
         assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
         assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
 
+    def test_large_nested_readme_stays_on_text_route_inside_zip_member(self, tmp_path: Path) -> None:
+        payload = _large_model_card_text().encode("utf-8")
+        archive = tmp_path / "docs.zip"
+        with zipfile.ZipFile(archive, "w") as zip_archive:
+            zip_archive.writestr("nested/README.md", payload)
+
+        assert len(payload) > file_detection._CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+        assert len(payload) < file_detection._CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES
+
+        results = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["zip"]
+        assert determine_exit_code(results) == 0
+        metadata = results.file_metadata[str(archive)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["zip", "text"]
+        assert metadata["contents"] == [{"path": f"{archive}:nested/README.md", "type": "text", "size": len(payload)}]
+        assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
+        assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    def test_large_nested_model_card_stays_on_text_route_inside_tar_member(self, tmp_path: Path) -> None:
+        payload = _large_model_card_text().encode("utf-8")
+        archive = tmp_path / "docs.tar"
+        member = tarfile.TarInfo("nested/model_card.txt")
+        member.size = len(payload)
+        with tarfile.open(archive, "w") as tar_archive:
+            tar_archive.addfile(member, io.BytesIO(payload))
+
+        assert len(payload) > file_detection._CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+        assert len(payload) < file_detection._CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES
+
+        results = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["tar"]
+        assert determine_exit_code(results) == 0
+        metadata = results.file_metadata[str(archive)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["tar", "text"]
+        assert metadata["contents"] == [
+            {"path": f"{archive}:nested/model_card.txt", "type": "text", "size": len(payload)}
+        ]
+        assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
+        assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
     def test_binary_merges_still_fails_closed_as_flax_in_directory_scan(self, tmp_path: Path) -> None:
         merges = tmp_path / "merges.txt"
         merges.write_bytes(b"\x00" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 2))

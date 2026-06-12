@@ -10,8 +10,8 @@ import tarfile
 import tempfile
 from typing import Any, BinaryIO, ClassVar, cast
 
-from ..scanner_registry_metadata import TEXT_CONTENT_ROUTED_FILENAMES
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
+from ..utils.file.detection import is_declared_text_content_filename
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
@@ -642,7 +642,8 @@ class TarScanner(BaseScanner):
                 try:
                     # Check for compound extensions like .tar.gz
                     name_lower = name.lower()
-                    safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.basename(name)) or "member"
+                    member_basename = os.path.basename(name.replace("\\", "/"))
+                    safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", member_basename) or "member"
                     is_tar_extension = any(name_lower.endswith(ext) for ext in self.supported_extensions)
                     if is_tar_extension:
                         # Extract the full extension for the temp file
@@ -655,7 +656,7 @@ class TarScanner(BaseScanner):
                     else:
                         suffix = f"_{safe_name}"
 
-                    basename = safe_name if safe_name.lower() in TEXT_CONTENT_ROUTED_FILENAMES else None
+                    basename = safe_name if is_declared_text_content_filename(member_basename) else None
                     tmp_path, total_size = self._extract_member_to_tempfile(
                         tar,
                         member,
