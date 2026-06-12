@@ -91,6 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - require explicit boolean opt-in before weight-distribution scans call torch.load and bound primitive PyTorch ZIP fallback extraction
 - fail closed when OCI layer TAR metadata, member counts, or cumulative extracted bytes exceed inspection budgets
 - fail closed on JFrog folder downloads whose selected artifacts use unsafe, colliding, or overlapping local paths
+- keep complete bounded UTF-8 text assets out of Flax MessagePack routing while preserving fail-closed scalar-stream coverage
 - detect dangerous textual byte keys in Flax MessagePack checkpoints
 - bound Joblib decompression output to the configured scanner read budget
 - redact credential-bearing source identifiers in exported SARIF and SBOM reports
