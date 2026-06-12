@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- inspect large Keras HDF5 models through file-backed metadata traversal instead of rejecting them at the generic whole-file read cap; aggregate `content_hash` is omitted for these large file-backed HDF5 scans
 - paginate and bound large Hugging Face repository inventories before streaming so unfiltered scans preserve complete coverage
 - dispatch logical model directories through their owning scanners, preserving bounded complete SavedModel asset probes before supplemental child-file coverage
 - stream large Flax MessagePack tensor bodies by declared length without tripping the 512 MiB decode budget
@@ -28,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - restrict Jinja SSTI indicators to executable template spans so prose mentions of request handling do not produce critical findings
 - treat canonical storage persistent IDs as informational only after legacy PyTorch framing, storage tuples, and storage payloads validate completely
 - prefer validated SafeTensors framing over invalid pickle and weak-magic collisions while retaining security-bearing pickle overlaps
+- preview Hugging Face repository and direct-file scans under `--dry-run` without downloading or scanning, backed by an opt-in pinned false-positive regression harness
 - make Hugging Face streaming dry runs emit metadata-only previews without artifact downloads, scanner execution, or full scan-result JSON
 - report gated or unauthorized Hugging Face acquisitions as failed, inconclusive source outcomes without claiming artifact coverage, and preserve partial findings from interrupted Hugging Face streaming scans
 - show Hugging Face preview access notices when selected gated files have unknown sizes
