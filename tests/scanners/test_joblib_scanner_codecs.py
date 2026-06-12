@@ -19,7 +19,7 @@ import pytest
 from modelaudit_picklescan.call_graph import _clear_source_sensitive_caches
 
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
-from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Issue
+from modelaudit.scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY, INCONCLUSIVE_SCAN_OUTCOME, Issue
 from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.joblib_scanner import (
     JoblibScanner,
@@ -896,6 +896,48 @@ def test_validated_joblib_wrapper_cleanup_preserves_untrusted_dtype_origin(
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata["pickle_report_status"] == "inconclusive"
     assert result.metadata["pickle_verdict"] == "suspicious"
+
+
+def test_validated_joblib_wrapper_cleanup_clears_private_actionable_failed_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted",
+        lambda _module, _name: True,
+    )
+    result = ScanResult("joblib")
+    result.metadata["analysis_incomplete"] = True
+    result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    result.metadata["scan_outcome_message"] = "Scan analysis incomplete."
+    result.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
+    result.metadata["pickle_report_status"] = "inconclusive"
+    result.metadata["pickle_verdict"] = "suspicious"
+    result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="validated wrapper",
+        severity=IssueSeverity.WARNING,
+        details={
+            "import_reference": "joblib.numpy_pickle.NumpyArrayWrapper",
+            "module": "joblib.numpy_pickle",
+            "name": "NumpyArrayWrapper",
+            "position": 10,
+        },
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+    )
+    assert ACTIONABLE_FAILED_CHECKS_METADATA_KEY in result._private_metadata
+
+    JoblibScanner._remove_validated_numpy_array_wrapper_findings(
+        result,
+        {"joblib.numpy_pickle.NumpyArrayWrapper": frozenset({1})},
+    )
+
+    assert result.issues == []
+    assert result.checks == []
+    assert ACTIONABLE_FAILED_CHECKS_METADATA_KEY not in result._private_metadata
+    assert "scan_outcome" not in result.metadata
+    assert result.metadata["pickle_report_status"] == "complete"
+    assert result.metadata["pickle_verdict"] == "clean"
 
 
 def test_scan_preserves_unrelated_codec_global_before_validated_dtype_use(tmp_path: Path) -> None:

@@ -25,7 +25,7 @@ from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_w
 from ..scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY, mark_inconclusive_scan_result
 from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils.file.detection import read_magic_bytes
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, CheckStatus, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 
 _MAX_JOBLIB_DTYPE_SPEC_CHARS = 256
@@ -849,6 +849,53 @@ class JoblibScanner(BaseScanner):
             return False
 
     @staticmethod
+    def _private_actionable_failed_check_entry(check: Check) -> dict[str, str] | None:
+        if (
+            check.status != CheckStatus.FAILED
+            or check.severity not in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            or check.rule_code is None
+        ):
+            return None
+        return {
+            "name": check.name,
+            "rule_code": check.rule_code,
+            "severity": check.severity.value,
+        }
+
+    @staticmethod
+    def _remove_private_actionable_failed_check_entries(
+        result: ScanResult,
+        entries_to_remove: list[dict[str, str]],
+    ) -> None:
+        private_failed_checks = result._private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
+        if not entries_to_remove or not isinstance(private_failed_checks, list):
+            return
+
+        unmatched_entries = list(entries_to_remove)
+        filtered_entries: list[Any] = []
+        for entry in private_failed_checks:
+            if isinstance(entry, dict):
+                matched_index = next(
+                    (
+                        index
+                        for index, candidate in enumerate(unmatched_entries)
+                        if entry.get("name") == candidate["name"]
+                        and entry.get("rule_code") == candidate["rule_code"]
+                        and entry.get("severity") == candidate["severity"]
+                    ),
+                    None,
+                )
+                if matched_index is not None:
+                    del unmatched_entries[matched_index]
+                    continue
+            filtered_entries.append(entry)
+
+        if filtered_entries:
+            result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] = filtered_entries
+        else:
+            result._private_metadata.pop(ACTIONABLE_FAILED_CHECKS_METADATA_KEY, None)
+
+    @staticmethod
     def _remove_validated_numpy_array_wrapper_findings(
         result: ScanResult,
         validated_control_occurrences: dict[str, frozenset[int]],
@@ -962,10 +1009,16 @@ class JoblibScanner(BaseScanner):
         if not removed:
             return
 
-        removed_checks = [check for check in result.checks if builtins.id(check) in validated_finding_ids]
+        removed_private_entries = [
+            entry
+            for check in result.checks
+            if builtins.id(check) in validated_finding_ids
+            for entry in [JoblibScanner._private_actionable_failed_check_entry(check)]
+            if entry is not None
+        ]
         result.issues = [issue for issue in result.issues if builtins.id(issue) not in validated_finding_ids]
         result.checks = [check for check in result.checks if builtins.id(check) not in validated_finding_ids]
-        JoblibScanner._remove_private_actionable_failed_checks(result, removed_checks)
+        JoblibScanner._remove_private_actionable_failed_check_entries(result, removed_private_entries)
         has_security_findings = any(
             issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues
         ) or any(
@@ -981,42 +1034,6 @@ class JoblibScanner(BaseScanner):
             result.metadata["pickle_report_status"] = "complete"
         if result.metadata.get("pickle_verdict") in {"suspicious", "unknown"}:
             result.metadata["pickle_verdict"] = "clean"
-
-    @staticmethod
-    def _remove_private_actionable_failed_checks(result: ScanResult, removed_checks: list[Any]) -> None:
-        entries_to_remove = [
-            {"name": check.name, "rule_code": check.rule_code}
-            for check in removed_checks
-            if getattr(check, "rule_code", None) is not None
-        ]
-        private_failed_checks = result._private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
-        if not entries_to_remove or not isinstance(private_failed_checks, list):
-            return
-
-        unmatched_entries = list(entries_to_remove)
-        retained_entries: list[Any] = []
-        for entry in private_failed_checks:
-            if not isinstance(entry, dict):
-                retained_entries.append(entry)
-                continue
-            match_index = next(
-                (
-                    index
-                    for index, removed_entry in enumerate(unmatched_entries)
-                    if entry.get("name") == removed_entry["name"]
-                    and entry.get("rule_code") == removed_entry["rule_code"]
-                ),
-                None,
-            )
-            if match_index is None:
-                retained_entries.append(entry)
-                continue
-            unmatched_entries.pop(match_index)
-
-        if retained_entries:
-            result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] = retained_entries
-        else:
-            result._private_metadata.pop(ACTIONABLE_FAILED_CHECKS_METADATA_KEY, None)
 
     @staticmethod
     def _downgrade_embedded_pickle_parse_errors(result: ScanResult) -> None:
