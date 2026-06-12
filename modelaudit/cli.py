@@ -783,6 +783,8 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
         if runtime.scan_and_delete
         else _selected_huggingface_preview_files(files, runtime)
     )
+    if runtime.scan_and_delete and runtime.hf_stream_include_all_files:
+        _huggingface_preview_stream_selection_files(metadata, runtime)
     if runtime.scanner_selection_metadata is not None and not selected_files:
         raise ValueError("No metadata-routed Hugging Face files match the active scanner selection; refusing dry-run")
     download_files: list[dict[str, Any]] | None = None
@@ -2203,6 +2205,8 @@ class _ScanPathState:
 _HF_ACQUISITION_ERROR_REASON = "huggingface_acquisition_error"
 _HF_ACQUISITION_BLOCKED_REASON = "huggingface_acquisition_blocked"
 _HF_AUTH_BLOCKED_MARKERS = (
+    "gated/inaccessible",
+    "gated_inaccessible",
     "gatedrepoerror",
     "gated repo",
     "gated repository",
@@ -3544,7 +3548,12 @@ def _resolve_scan_source_for_path(
             except Exception as exc:
                 error_msg = _display_error(exc, path)
                 click.echo(f"Error analyzing {display_path}: {error_msg}", err=True)
-                path_state.mark_non_shard_error(audit_result)
+                _record_huggingface_acquisition_error(
+                    audit_result,
+                    path_state,
+                    path=path,
+                    error_msg=error_msg,
+                )
                 return None
             return _SourceDispatchResult(actual_path=path, local_scan_required=False)
 
@@ -3627,7 +3636,12 @@ def _resolve_scan_source_for_path(
             except Exception as exc:
                 error_msg = _display_error(exc, path)
                 click.echo(f"Error analyzing {display_path}: {error_msg}", err=True)
-                path_state.mark_non_shard_error(audit_result)
+                _record_huggingface_acquisition_error(
+                    audit_result,
+                    path_state,
+                    path=path,
+                    error_msg=error_msg,
+                )
             return _SourceDispatchResult(actual_path=path, local_scan_required=False)
 
         hf_stream_kwargs: dict[str, Any] = {}

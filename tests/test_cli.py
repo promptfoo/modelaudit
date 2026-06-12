@@ -4283,6 +4283,80 @@ def test_scan_huggingface_streaming_dry_run_json_stdout_is_parseable(
     mock_download_streaming.assert_not_called()
 
 
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.get_model_info")
+def test_scan_huggingface_streaming_dry_run_gated_json_reports_acquisition_error(
+    mock_get_model_info: MagicMock,
+    mock_download_file: MagicMock,
+    mock_download_model: MagicMock,
+    mock_download_streaming: MagicMock,
+) -> None:
+    """Gated selected dry-run metadata must not leave JSON looking successful."""
+    url = f"hf://test/gated?revision={_HF_TEST_REVISION}"
+    mock_get_model_info.return_value = {
+        "repo_id": "test/gated",
+        "model_id": "test/gated",
+        "revision": _HF_TEST_REVISION,
+        "total_size": 4096,
+        "file_count": 1,
+        "inaccessible_gated_files": ["model.safetensors"],
+        "inaccessible_gated_file_count": 1,
+        "files": [{"name": "model.safetensors", "size": 4096, "gated": True}],
+    }
+
+    result = CliRunner().invoke(cli, ["scan", "--dry-run", "--stream", "--format", "json", url])
+
+    parsed = parse_click_json_output(result.output)
+    assert result.exit_code == 2
+    assert "Selected Hugging Face files are gated/inaccessible" in result.output
+    assert_huggingface_acquisition_error_payload(
+        parsed,
+        f"hf://test/gated@{_HF_TEST_REVISION}",
+        blocked=True,
+        expected_revision=_HF_TEST_REVISION,
+    )
+    mock_download_file.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_download_streaming.assert_not_called()
+
+
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.cli.get_model_info")
+def test_scan_huggingface_streaming_dry_run_exact_zip_include_all_overflow_reports_live_bound(
+    mock_get_model_info: MagicMock,
+    mock_download_file: MagicMock,
+    mock_download_model: MagicMock,
+    mock_download_streaming: MagicMock,
+) -> None:
+    """Exact generic stream dry-run should hit the live include-all overflow before route fallback."""
+    mock_get_model_info.return_value = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": _HF_TEST_REVISION,
+        "total_size": 129,
+        "file_count": 129,
+        "files": [{"name": f"payloads/chunk-{index:04d}.blob", "size": 1} for index in range(129)],
+    }
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--dry-run", "--stream", "--scanners", "zip", "--format", "json", "hf://test/model"],
+    )
+
+    parsed = parse_click_json_output(result.output)
+    assert result.exit_code == 2
+    assert "repository listing exceeds the bounded unfiltered candidate limit (128)" in result.output
+    assert "No metadata-routed Hugging Face files match" not in result.output
+    assert_huggingface_acquisition_error_payload(parsed, "hf://test/model", blocked=False)
+    mock_download_file.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_download_streaming.assert_not_called()
+
+
 @patch("modelaudit.cli.download_file_from_hf")
 def test_scan_huggingface_file_download_failure_redacts_url(
     mock_download_file: MagicMock,
