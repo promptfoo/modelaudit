@@ -3220,6 +3220,56 @@ def test_scan_model_streaming_hf_cache_onnx_external_data_uses_snapshot_alias(
     assert_only_onnx_external_schema_validation_skipped(result)
 
 
+def test_scan_model_streaming_hf_cache_onnx_external_data_dedupes_yielded_alias_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requires_symlinks: None,
+) -> None:
+    """A yielded HF sidecar alias should count once when also used as ONNX context."""
+    cache_hub = tmp_path / "hf-hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache_hub))
+    cache_root = cache_hub / "models--test--model"
+    blobs_dir = cache_root / "blobs"
+    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    model_link = snapshot_dir / "model.onnx"
+    sidecar_link = snapshot_dir / "model.onnx_data"
+    model_link.symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    sidecar_link.symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+
+    yielded_paths = {path for path, _is_last in iterate_files_streaming(snapshot_dir)}
+    assert yielded_paths == {model_link, sidecar_link}
+
+    unique_bytes = model_blob.stat().st_size + sidecar_blob.stat().st_size
+    expected_hash = compute_aggregate_hash([compute_sha256_hash(model_link), compute_sha256_hash(sidecar_link)])
+
+    def scan_file_side_effect(path: str, config: dict[str, Any]) -> ScanResult:
+        return create_mock_scan_result(bytes_scanned=Path(path).stat().st_size)
+
+    with patch("modelaudit.core.scan_file", side_effect=scan_file_side_effect):
+        result = scan_model_streaming(
+            file_generator=iterate_files_streaming(snapshot_dir),
+            timeout=30,
+            delete_after_scan=False,
+            scan_root=str(snapshot_dir),
+            cache_enabled=False,
+            max_total_size=unique_bytes,
+            scanners=["onnx"],
+            skip_file_types=False,
+        )
+
+    assert result.bytes_scanned == unique_bytes
+    assert result.content_hash == expected_hash
+    assert not any("Total scan size limit exceeded" in issue.message for issue in result.issues)
+    assert determine_exit_code(result) == 0
+
+
 def test_scan_model_streaming_hf_cache_context_only_onnx_external_data_contributes_hash_and_size(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

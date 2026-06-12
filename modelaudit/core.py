@@ -446,6 +446,7 @@ _ONNX_ROUTING_INCOMPLETE_REASON = "onnx_routing_incomplete"
 _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_incomplete"
 _ShardFamilyKey = tuple[str, str, int | None]
 _ScanEntry = tuple[str, list[str], _ShardFamilyKey | None, str | None]
+_FileTargetIdentityKey = tuple[Any, ...]
 _SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY = "shard_family_cache_fingerprint"
 _TRUSTED_STREAM_SHARD_PARENT_PREFIXES = (
     "modelaudit_hf_",
@@ -887,6 +888,22 @@ def _snapshot_file_identity(path: Path) -> _FileIdentitySnapshot | None:
         ),
         stat=stat_fields,
         resolved_path=resolved_path,
+    )
+
+
+def _file_target_identity_key(
+    path: Path,
+    snapshot: _FileIdentitySnapshot | None,
+) -> _FileTargetIdentityKey | None:
+    """Return a target-oriented key that is stable across symlink aliases."""
+    if snapshot is None:
+        return None
+    if snapshot.stat is not None:
+        return ("stat", *snapshot.stat)
+    return (
+        "path",
+        os.path.normcase(os.path.normpath(str(Path(os.path.abspath(path))))),
+        *snapshot.lstat,
     )
 
 
@@ -5287,8 +5304,12 @@ def scan_model_streaming(
     results = create_initial_audit_result()
     file_hashes: list[str] = []
     hashed_stream_file_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
+    hashed_stream_file_hashes_by_target: dict[_FileTargetIdentityKey, str] = {}
     hashed_stream_source_hashes_by_path: dict[Path, str] = {}
+    hashed_stream_source_hashes_by_target: dict[_FileTargetIdentityKey, str] = {}
     counted_onnx_external_data_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
+    counted_onnx_external_data_targets: set[_FileTargetIdentityKey] = set()
+    consumed_onnx_external_data_aliases: dict[Path, _FileTargetIdentityKey] = {}
     aggregate_hash_complete = True
     top_level_hashed_bytes = 0
     files_processed = 0
@@ -5428,6 +5449,7 @@ def scan_model_streaming(
         progress_label: str,
         track_stream_source: bool = False,
         skip_if_stream_source_seen: bool = False,
+        skip_if_stream_target_seen: bool = False,
     ) -> str | None:
         """Hash one streamed source once before it can be deleted or consumed."""
         nonlocal aggregate_hash_complete, top_level_hashed_bytes
@@ -5437,6 +5459,13 @@ def scan_model_streaming(
             return hashed_stream_source_hashes_by_path[scan_path_key]
 
         scan_path_identity = _snapshot_file_identity(scan_path)
+        scan_target_key = _file_target_identity_key(scan_path, scan_path_identity)
+        if (
+            skip_if_stream_target_seen
+            and scan_target_key is not None
+            and scan_target_key in hashed_stream_file_hashes_by_target
+        ):
+            return hashed_stream_file_hashes_by_target[scan_target_key]
         if scan_path_identity is not None and (scan_path_key, scan_path_identity) in hashed_stream_file_instances:
             return None
 
@@ -5462,8 +5491,12 @@ def scan_model_streaming(
         file_hashes.append(file_hash)
         if scan_path_identity is not None:
             hashed_stream_file_instances.add((scan_path_key, scan_path_identity))
+        if scan_target_key is not None:
+            hashed_stream_file_hashes_by_target.setdefault(scan_target_key, file_hash)
         if track_stream_source:
             hashed_stream_source_hashes_by_path[scan_path_key] = file_hash
+            if scan_target_key is not None:
+                hashed_stream_source_hashes_by_target.setdefault(scan_target_key, file_hash)
         return file_hash
 
     def append_streamed_openvino_companion_hash(
@@ -5615,6 +5648,13 @@ def scan_model_streaming(
                     )
                     if route_hf_onnx_alias:
                         scan_path = snapshot_path
+                consumed_onnx_external_data_target = consumed_onnx_external_data_aliases.get(source_key)
+                if consumed_onnx_external_data_target is not None:
+                    source_identity = _snapshot_file_identity(scan_path)
+                    source_target_key = _file_target_identity_key(scan_path, source_identity)
+                    if source_target_key == consumed_onnx_external_data_target:
+                        continue
+                    consumed_onnx_external_data_aliases.pop(source_key, None)
 
                 # Build config before skip filtering so bin-first OpenVINO
                 # sidecars can wait for their selected XML owner.
@@ -5767,11 +5807,21 @@ def scan_model_streaming(
                 ):
                     for onnx_external_data_path in _streamed_onnx_external_data_hash_paths(scan_path):
                         external_data_key = Path(os.path.abspath(onnx_external_data_path))
-                        external_data_was_stream_source = external_data_key in hashed_stream_source_hashes_by_path
                         external_data_identity = _snapshot_file_identity(onnx_external_data_path)
+                        external_data_target_key = _file_target_identity_key(
+                            onnx_external_data_path,
+                            external_data_identity,
+                        )
+                        external_data_was_stream_source = external_data_key in hashed_stream_source_hashes_by_path or (
+                            external_data_target_key is not None
+                            and external_data_target_key in hashed_stream_source_hashes_by_target
+                        )
                         external_data_already_hashed = (
                             external_data_identity is not None
                             and (external_data_key, external_data_identity) in hashed_stream_file_instances
+                        ) or (
+                            external_data_target_key is not None
+                            and external_data_target_key in hashed_stream_file_hashes_by_target
                         )
                         if external_data_identity is not None:
                             onnx_external_data_pre_scan_identities[onnx_external_data_path] = external_data_identity
@@ -5779,9 +5829,15 @@ def scan_model_streaming(
                             if (
                                 not external_data_was_stream_source
                                 and external_data_instance not in counted_onnx_external_data_instances
+                                and (
+                                    external_data_target_key is None
+                                    or external_data_target_key not in counted_onnx_external_data_targets
+                                )
                             ):
                                 onnx_external_data_bytes_scanned += _snapshot_file_size(external_data_identity)
                                 counted_onnx_external_data_instances.add(external_data_instance)
+                                if external_data_target_key is not None:
+                                    counted_onnx_external_data_targets.add(external_data_target_key)
                         if not external_data_was_stream_source and not external_data_already_hashed:
                             if external_data_identity is None:
                                 aggregate_hash_complete = False
@@ -5790,12 +5846,15 @@ def scan_model_streaming(
                             if max_total_size > 0 and top_level_hashed_bytes + external_data_size > max_total_size:
                                 aggregate_hash_complete = False
                                 continue
-                        append_streamed_file_hash(
+                        external_data_hash = append_streamed_file_hash(
                             onnx_external_data_path,
                             scan_config,
                             progress_label=onnx_external_data_path.name,
                             skip_if_stream_source_seen=True,
+                            skip_if_stream_target_seen=True,
                         )
+                        if external_data_hash is not None and external_data_target_key is not None:
+                            consumed_onnx_external_data_aliases[external_data_key] = external_data_target_key
 
                 # Scan the file
                 if progress_callback:
