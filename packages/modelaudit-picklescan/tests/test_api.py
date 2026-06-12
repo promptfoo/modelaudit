@@ -2825,8 +2825,11 @@ def test_scan_bytes_does_not_mark_synthetic_torch_storage_name_as_storage_persis
     assert persistent_id_findings
     assert not any(finding.details.get("pytorch_storage_persistent_id") is True for finding in persistent_id_findings)
     assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "torch.SyntheticStorage"
+        finding.rule_code in {"DANGEROUS_CALL_GRAPH", "NON_ALLOWLISTED_GLOBAL"}
+        and (
+            finding.details.get("import_reference") == "torch.SyntheticStorage"
+            or (finding.details.get("module"), finding.details.get("name")) == ("torch", "SyntheticStorage")
+        )
         for finding in report.findings
     )
 

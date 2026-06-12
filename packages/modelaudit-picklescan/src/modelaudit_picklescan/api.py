@@ -2288,7 +2288,10 @@ def _scan_pickle_payload_native(
         )
         if not isinstance(raw_report, Mapping):
             raise TypeError(f"Rust scanner returned {type(raw_report).__name__}, expected mapping")
-        report = _report_from_native_dict(raw_report)
+        report = _with_canonical_pytorch_storage_persistent_id_metadata(
+            _report_from_native_dict(raw_report),
+            payload,
+        )
         if enrich_call_graph:
             if _call_graph_enrichment_is_redundant(report):
                 if _call_graph_has_no_source_inputs(report):
@@ -2339,6 +2342,121 @@ def _report_from_native_dict(raw_report: Mapping[str, Any]) -> PickleReport:
         metadata=dict(_mapping(raw_report.get("metadata", {}))),
         private_metadata=dict(_mapping(raw_report.get("private_metadata", {}))),
         duration_s=float(raw_report.get("duration_s", 0.0)),
+    )
+
+
+def _with_canonical_pytorch_storage_persistent_id_metadata(report: PickleReport, payload: bytes) -> PickleReport:
+    if not any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings):
+        return report
+    try:
+        storage_reference_parse = _pytorch_storage_keys_from_pickle_bytes(payload)
+    except Exception:
+        storage_reference_parse = _PytorchStorageReferenceParse(set(), False, False)
+    trusted_storage_keys = storage_reference_parse.referenced_keys
+    proven_canonical_storage_ids = (
+        storage_reference_parse.parse_complete
+        and storage_reference_parse.all_persistent_ids_are_pytorch_storage
+        and bool(trusted_storage_keys)
+    )
+    rust_canonical_storage_ids = _rust_pytorch_storage_persistent_id_flags_are_canonical(report)
+    single_storage_key = next(iter(trusted_storage_keys)) if len(trusted_storage_keys) == 1 else None
+
+    findings = tuple(
+        _finding_with_details(
+            finding,
+            _canonical_pytorch_storage_persistent_id_details(
+                finding.details,
+                proven_canonical_storage_ids=proven_canonical_storage_ids,
+                rust_canonical_storage_ids=rust_canonical_storage_ids,
+                single_storage_key=single_storage_key,
+            ),
+        )
+        for finding in report.findings
+    )
+    metadata = report.to_dict()["metadata"]
+    import_references = metadata.get("import_references")
+    if isinstance(import_references, list):
+        metadata["import_references"] = [
+            _canonical_pytorch_storage_import_reference(
+                _mapping(reference),
+                proven_canonical_storage_ids=proven_canonical_storage_ids,
+            )
+            for reference in import_references
+        ]
+    return PickleReport(
+        source=report.source,
+        status=report.status,
+        verdict=report.verdict,
+        findings=findings,
+        notices=report.notices,
+        errors=report.errors,
+        coverage=report.coverage,
+        metadata=metadata,
+        private_metadata=report.private_metadata,
+        duration_s=report.duration_s,
+    )
+
+
+def _rust_pytorch_storage_persistent_id_flags_are_canonical(report: PickleReport) -> bool:
+    flagged_reference_found = False
+    for raw_reference in _sequence(report.metadata.get("import_references")):
+        reference = _mapping(raw_reference)
+        if reference.get("pytorch_storage_persistent_id") is not True:
+            continue
+        flagged_reference_found = True
+        module = reference.get("module")
+        name = reference.get("name")
+        if type(module) is not str or type(name) is not str or (module, name) not in _PYTORCH_STORAGE_GLOBALS:
+            return False
+    return flagged_reference_found
+
+
+def _canonical_pytorch_storage_import_reference(
+    reference: Mapping[str, Any],
+    *,
+    proven_canonical_storage_ids: bool,
+) -> dict[str, Any]:
+    normalized = dict(reference)
+    module = normalized.get("module")
+    name = normalized.get("name")
+    if type(module) is str and type(name) is str and (module, name) in _PYTORCH_STORAGE_GLOBALS:
+        if proven_canonical_storage_ids:
+            normalized["pytorch_storage_persistent_id"] = True
+        return normalized
+    normalized.pop("pytorch_storage_persistent_id", None)
+    return normalized
+
+
+def _canonical_pytorch_storage_persistent_id_details(
+    details: Mapping[str, Any],
+    *,
+    proven_canonical_storage_ids: bool,
+    rust_canonical_storage_ids: bool,
+    single_storage_key: str | None,
+) -> dict[str, Any]:
+    normalized = dict(details)
+    if normalized.get("opcode") not in {"BINPERSID", "PERSID"}:
+        return normalized
+    if proven_canonical_storage_ids:
+        normalized["pytorch_storage_persistent_id"] = True
+        if single_storage_key is not None:
+            normalized["pytorch_storage_key"] = single_storage_key
+        return normalized
+    if rust_canonical_storage_ids and normalized.get("pytorch_storage_persistent_id") is True:
+        return normalized
+    normalized.pop("pytorch_storage_persistent_id", None)
+    normalized.pop("pytorch_storage_key", None)
+    return normalized
+
+
+def _finding_with_details(finding: Finding, details: Mapping[str, Any]) -> Finding:
+    return Finding(
+        message=finding.message,
+        severity=finding.severity,
+        location=finding.location,
+        rule_code=finding.rule_code,
+        details=details,
+        why=finding.why,
     )
 
 

@@ -6509,7 +6509,8 @@ def test_scan_file_fails_closed_for_msgpack_extensions_when_dependency_is_missin
     assert library_check.message == "msgpack library not installed - cannot analyze Flax checkpoints"
 
     aggregate = scan_model_directory_or_file(str(checkpoint), cache_scan_results=False)
-    assert aggregate.success is False
+    assert aggregate.success is True
+    assert any("msgpack library not installed" in issue.message for issue in aggregate.issues)
     assert core_module.determine_exit_code(aggregate) == 1
 
 

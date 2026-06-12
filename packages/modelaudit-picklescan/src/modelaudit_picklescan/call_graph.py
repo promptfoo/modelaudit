@@ -1660,6 +1660,31 @@ _SHORT_SINK_SECONDARY_PRIORITY_TOKENS = ("exec", "system", "run")
 _CALLABLE_SINGLETON_ALIASES = {
     ("builtins", "help"): (("_sitebuiltins", "_Helper.__call__"),),
 }
+_PYTORCH_STORAGE_GLOBAL_NAMES = frozenset(
+    {
+        "BFloat16Storage",
+        "BoolStorage",
+        "ByteStorage",
+        "CharStorage",
+        "ComplexDoubleStorage",
+        "ComplexFloatStorage",
+        "DoubleStorage",
+        "FloatStorage",
+        "HalfStorage",
+        "IntStorage",
+        "LongStorage",
+        "QInt32Storage",
+        "QInt8Storage",
+        "QUInt8Storage",
+        "QUInt4x2Storage",
+        "QUInt2x4Storage",
+        "ShortStorage",
+        "UntypedStorage",
+    }
+)
+_PYTORCH_STORAGE_GLOBALS = frozenset(
+    (module, name) for module in ("torch", "torch.storage") for name in _PYTORCH_STORAGE_GLOBAL_NAMES
+)
 _TORCH_EXTENSION_GLOBALS = frozenset(
     {
         "Size",
@@ -3291,10 +3316,13 @@ def _callable_singleton_aliases(module: str, name: str) -> tuple[tuple[str, str]
 
 
 def _is_pytorch_storage_persistent_id_reference(item: Mapping[str, object]) -> bool:
+    module = item.get("module")
+    name = item.get("name")
     return (
         item.get("pytorch_storage_persistent_id") is True
-        and item.get("module") == "torch"
-        and str(item.get("name", "")).endswith("Storage")
+        and type(module) is str
+        and type(name) is str
+        and (module, name) in _PYTORCH_STORAGE_GLOBALS
     )
 
 
