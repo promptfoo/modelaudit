@@ -20,6 +20,7 @@ from .call_graph import (
     _begin_shared_source_report,
     _CallGraphAnalysisLimitError,
     _ensure_shared_source_snapshot_stable,
+    _is_skippable_pytorch_storage_persistent_id_reference,
     class_static_attribute_lookup_is_proven_source_backed,
     find_analyzed_callable_call_graph_global_positions,
     find_dangerous_call_graphs,
@@ -2122,6 +2123,7 @@ def _with_untrusted_allowlisted_import_findings(
             or bool(reference.get("is_dangerous"))
             or not bool(reference.get("requires_origin_verification"))
             or key in existing_references
+            or _is_skippable_pytorch_storage_persistent_id_reference(reference)
             or (
                 not import_only_module_requires_origin_review(module, name)
                 and not source_backed_import_initialization_untrusted

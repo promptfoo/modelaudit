@@ -2570,6 +2570,94 @@ def test_scan_bytes_marks_global_pytorch_storage_persistent_id_import_reference(
     assert report.notices == ()
 
 
+def test_scan_bytes_does_not_warn_for_library_pytorch_storage_persistent_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = (
+        b"\x80\x02("
+        + _binunicode(b"storage")
+        + _global(b"torch", b"FloatStorage")
+        + _binunicode(b"k")
+        + _binunicode(b"cpu")
+        + b"K\x01tQ."
+    )
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_bytes(payload, source="library-pytorch-storage.pkl")
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+    assert not any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "torch.FloatStorage"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_warns_for_shadowed_pytorch_storage_persistent_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "shadowed-torch-storage-marker"
+    torch_dir = tmp_path / "torch"
+    torch_dir.mkdir()
+    (torch_dir / "__init__.py").write_text(
+        f"open({str(marker)!r}, 'w').write('imported')\nclass FloatStorage:\n    pass\n",
+        encoding="utf-8",
+    )
+    payload = (
+        b"\x80\x02("
+        + _binunicode(b"storage")
+        + _global(b"torch", b"FloatStorage")
+        + _binunicode(b"k")
+        + _binunicode(b"cpu")
+        + b"K\x01tQ."
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_bytes(payload, source="shadowed-pytorch-storage.pkl")
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert marker.exists() is False
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "torch.FloatStorage"
+        for finding in report.findings
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "\n".join(
+                [
+                    "import pickle",
+                    "try:",
+                    f"    pickle.loads({payload!r})",
+                    "except Exception:",
+                    "    pass",
+                    "",
+                ]
+            ),
+        ],
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert marker.read_text(encoding="utf-8") == "imported"
+
+
 def test_scan_bytes_marks_each_pytorch_storage_persistent_id_import_reference() -> None:
     def storage_persistent_id(name: str, key: str, terminator: bytes) -> bytes:
         return (
