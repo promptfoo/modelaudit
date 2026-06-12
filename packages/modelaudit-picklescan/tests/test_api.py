@@ -9182,6 +9182,47 @@ def test_safe_import_suppression_does_not_cross_invocation_positions() -> None:
     assert proven_safe is False
 
 
+def test_source_backed_framework_suppression_requires_contextual_invocation_trust() -> None:
+    reference = ("transformers.training_args", "TrainingArguments")
+    finding = Finding(
+        message="framework metadata invocation",
+        severity=Severity.WARNING,
+        location="mixed-framework-invocations.pkl (pos 42)",
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+        details={
+            "module": reference[0],
+            "name": reference[1],
+            "import_reference": ".".join(reference),
+            "position": 42,
+            "invoked": True,
+        },
+    )
+
+    assert not package_api._non_allowlisted_import_finding_is_proven_safe(
+        finding,
+        inert_initialization_modules=frozenset(),
+        trusted_import_references=frozenset({reference}),
+        invoked_global_positions=frozenset({42}),
+        analyzed_invocation_global_positions=frozenset({42}),
+        analyzed_invocation_references=frozenset({reference}),
+        invocation_load_safe_modules=frozenset({reference[0]}),
+        trusted_reconstruction_global_positions=frozenset(),
+        trusted_reconstruction_references=frozenset(),
+    )
+    assert package_api._non_allowlisted_import_finding_is_proven_safe(
+        finding,
+        inert_initialization_modules=frozenset(),
+        trusted_import_references=frozenset(),
+        invoked_global_positions=frozenset({42}),
+        analyzed_invocation_global_positions=frozenset({42}),
+        analyzed_invocation_references=frozenset({reference}),
+        invocation_load_safe_modules=frozenset({reference[0]}),
+        trusted_reconstruction_global_positions=frozenset(),
+        trusted_reconstruction_references=frozenset(),
+        trusted_invocation_global_positions=frozenset({42}),
+    )
+
+
 def test_with_call_graph_findings_detects_startup_hook_when_only_import_findings_truncated() -> None:
     pytest.importorskip("click")
 
