@@ -87,6 +87,11 @@ from .utils.helpers.auto_defaults import (
     parse_size_string,
 )
 from .utils.helpers.interrupt_handler import interruptible_scan
+from .utils.repository_context import (
+    REPOSITORY_CURRENT_FILE_CONFIG_KEY,
+    REPOSITORY_FILE_INVENTORY_CONFIG_KEY,
+    REPOSITORY_SCAN_ROOT_CONFIG_KEY,
+)
 from .utils.sources.cloud_storage import (
     download_from_cloud,
     is_cleartext_cloud_url,
@@ -1621,6 +1626,8 @@ class _SourceDispatchResult:
     temp_path: str | None = None
     source_model_id: str | None = None
     source_model_source: str | None = None
+    repository_file_inventory: tuple[str, ...] = ()
+    repository_current_file: str | None = None
 
 
 @dataclass
@@ -3013,6 +3020,10 @@ def _scan_local_or_downloaded_path(
                 source_result.source_model_id,
                 source_result.source_model_source,
             )
+        if source_result.repository_file_inventory:
+            config_overrides[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = source_result.repository_file_inventory
+        if source_result.repository_current_file:
+            config_overrides[REPOSITORY_CURRENT_FILE_CONFIG_KEY] = source_result.repository_current_file
 
         if runtime.max_file_size > 0 or runtime.max_total_size > 0:
             record_feature_used(
@@ -3162,10 +3173,14 @@ def _resolve_scan_source_for_path(
                 hf_cache_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_"))
                 temp_dir = str(hf_cache_dir)
 
+            _repo_id, _revision, repository_current_file = parse_huggingface_file_url(path)
+            direct_repository_file_inventory: list[str] = []
             download_path = download_file_from_hf(
                 path,
                 cache_dir=hf_cache_dir,
                 max_size=runtime.max_download_bytes,
+                repository_file_inventory=direct_repository_file_inventory,
+                timeout_seconds=runtime.timeout,
             )
             source_model_id, source_model_source = extract_model_id_from_path(path)
 
@@ -3182,6 +3197,8 @@ def _resolve_scan_source_for_path(
                 temp_path=temp_dir,
                 source_model_id=source_model_id,
                 source_model_source=source_model_source,
+                repository_file_inventory=tuple(direct_repository_file_inventory),
+                repository_current_file=repository_current_file,
             )
         except Exception as exc:
             if download_spinner:
@@ -3311,6 +3328,14 @@ def _resolve_scan_source_for_path(
                 if runtime.show_styled_output:
                     click.echo(style_text("🔄 Starting streaming scan...", fg="cyan"))
 
+                stream_repository_file_inventory: list[str] = []
+                stream_namespace, stream_repo_name, _stream_requested_revision = parse_huggingface_url_with_revision(
+                    path
+                )
+                stream_hf_cache_root = hf_cache_dir / "huggingface"
+                stream_repository_scan_root = stream_hf_cache_root / stream_namespace
+                if stream_repo_name:
+                    stream_repository_scan_root = stream_repository_scan_root / stream_repo_name
                 file_generator = _track_huggingface_stream_acquisition(
                     download_model_streaming(
                         path,
@@ -3318,6 +3343,7 @@ def _resolve_scan_source_for_path(
                         show_progress=runtime.show_progress,
                         max_size=runtime.max_download_bytes,
                         timeout_seconds=runtime.timeout,
+                        repository_file_inventory=stream_repository_file_inventory,
                         **hf_stream_kwargs,
                     )
                 )
@@ -3325,6 +3351,8 @@ def _resolve_scan_source_for_path(
                 streaming_kwargs: dict[str, Any] = {}
                 if trusted_source_provenance is not None:
                     streaming_kwargs["_trusted_source_provenance"] = trusted_source_provenance
+                streaming_kwargs[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = stream_repository_file_inventory
+                streaming_kwargs[REPOSITORY_SCAN_ROOT_CONFIG_KEY] = str(stream_repository_scan_root)
                 streaming_kwargs.update(_scanner_selection_overrides(runtime))
 
                 try:
@@ -3338,6 +3366,7 @@ def _resolve_scan_source_for_path(
                         ),
                         timeout=runtime.timeout,
                         delete_after_scan=True,
+                        scan_root=str(stream_hf_cache_root),
                         blacklist_patterns=list(blacklist) if blacklist else None,
                         max_file_size=runtime.max_file_size,
                         max_total_size=runtime.max_total_size,
@@ -3380,12 +3409,14 @@ def _resolve_scan_source_for_path(
                 download_spinner.start()
 
             show_progress = runtime.show_styled_output and should_show_spinner()
+            download_repository_file_inventory: list[str] = []
             download_path = download_model(
                 path,
                 cache_dir=hf_cache_dir,
                 show_progress=show_progress,
                 max_size=runtime.max_download_bytes,
                 timeout_seconds=runtime.timeout,
+                repository_file_inventory=download_repository_file_inventory,
             )
             download_duration = time.time() - download_start
             try:
@@ -3406,6 +3437,7 @@ def _resolve_scan_source_for_path(
                 temp_path=temp_dir,
                 source_model_id=source_model_id,
                 source_model_source=source_model_source,
+                repository_file_inventory=tuple(download_repository_file_inventory),
             )
         except _HuggingFaceStreamInterruptedError as exc:
             if runtime.show_styled_output:
