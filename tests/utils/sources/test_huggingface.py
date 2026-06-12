@@ -3642,14 +3642,40 @@ class TestModelDownloadStreaming:
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_include_all_large_unknown_suffix_inventory_streams_all_candidates(
+    def test_download_model_streaming_include_all_unbounded_large_unknown_suffix_inventory_fails_closed(
         self,
         mock_hf_hub_download: MagicMock,
         _mock_get_extensions: MagicMock,
+    ) -> None:
+        """Unbounded include-all streaming should not download arbitrary large non-model inventories."""
+        repo_files = ["model.bin", *(f"payloads/chunk-{idx:04d}.blob" for idx in range(129))]
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+            pytest.raises(Exception, match="include_all_files=True without max_size selected more than"),
+        ):
+            list(download_model_streaming("https://huggingface.co/test/model", include_all_files=True))
+
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_include_all_large_unknown_suffix_inventory_with_max_size_streams_all_candidates(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_get_extensions: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """Unfiltered streaming should preserve large accepted inventories instead of failing at 128 candidates."""
+        """A max_size cap should bound aggregate include-all transfer without truncating large inventories."""
         repo_files = ["model.bin", *(f"payloads/chunk-{idx:04d}.blob" for idx in range(129))]
+        mock_get_paths_info.return_value = [
+            SimpleNamespace(path=filename, size=len(b"payload")) for filename in repo_files
+        ]
 
         def download_side_effect(*, filename: str, **_kwargs: object) -> str:
             path = tmp_path / filename
@@ -3664,11 +3690,18 @@ class TestModelDownloadStreaming:
                 return_value=(repo_files, _HF_TEST_REVISION, None),
             ),
         ):
-            results = list(download_model_streaming("https://huggingface.co/test/model", include_all_files=True))
+            results = list(
+                download_model_streaming(
+                    "https://huggingface.co/test/model",
+                    include_all_files=True,
+                    max_size=10 * 1024,
+                )
+            )
 
         assert len(results) == len(repo_files)
         assert results[0] == (tmp_path / "model.bin", False)
         assert results[-1] == (tmp_path / "payloads" / "chunk-0128.blob", True)
+        mock_get_paths_info.assert_called_once_with("test/model", repo_files, revision=_HF_TEST_REVISION)
         assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == repo_files
 
     @pytest.mark.integration
@@ -6611,7 +6644,10 @@ class TestHuggingFaceFileURLs:
             cache_dir=str(cache_dir),
         )
 
-    @patch("modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated", return_value=["model.bin"])
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        side_effect=AssertionError("direct capped file download should not list the repository tree"),
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_with_max_size_preflights_before_download(
@@ -6639,7 +6675,6 @@ class TestHuggingFaceFileURLs:
         mock_hf_api.return_value.repo_info.assert_called_once_with(
             "test/model",
             revision="main",
-            timeout=30.0,
             files_metadata=False,
         )
         mock_hf_api.return_value.get_paths_info.assert_called_once_with(
@@ -6647,7 +6682,7 @@ class TestHuggingFaceFileURLs:
             ["model.bin"],
             revision=TEST_COMMIT_SHA,
         )
-        mock_paginated_listing.assert_called_once_with("test/model", TEST_COMMIT_SHA, timeout_seconds=30.0)
+        mock_paginated_listing.assert_not_called()
         mock_hf_hub_download.assert_called_once_with(
             repo_id="test/model",
             filename="model.bin",
@@ -6769,14 +6804,17 @@ class TestHuggingFaceFileURLs:
             cache_dir=None,
         )
 
-    @patch("modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated", return_value=["model.bin"])
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        side_effect=AssertionError("direct capped file download should not list the repository tree"),
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_with_max_size_rejects_oversized_before_download(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
-        _mock_paginated_listing: MagicMock,
+        mock_paginated_listing: MagicMock,
     ) -> None:
         """Oversized direct files should not reach hf_hub_download."""
         mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(
@@ -6795,9 +6833,13 @@ class TestHuggingFaceFileURLs:
 
         assert "11.0 MB" in str(exc_info.value)
         assert "10.0 MB" in str(exc_info.value)
+        mock_paginated_listing.assert_not_called()
         mock_hf_hub_download.assert_not_called()
 
-    @patch("modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated", return_value=["model.bin"])
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        side_effect=AssertionError("direct capped file download should not list the repository tree"),
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     @pytest.mark.parametrize("file_size", [None, -1, "1024", True])
@@ -6805,7 +6847,7 @@ class TestHuggingFaceFileURLs:
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
-        _mock_paginated_listing: MagicMock,
+        mock_paginated_listing: MagicMock,
         file_size: object,
     ) -> None:
         """Capped direct files fail closed when HuggingFace metadata has no valid size."""
@@ -6821,16 +6863,20 @@ class TestHuggingFaceFileURLs:
                 max_size=10 * 1024 * 1024,
             )
 
+        mock_paginated_listing.assert_not_called()
         mock_hf_hub_download.assert_not_called()
 
-    @patch("modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated", return_value=["model.bin"])
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        side_effect=AssertionError("direct capped file download should not list the repository tree"),
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_with_max_size_rejects_underreported_download(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
-        _mock_paginated_listing: MagicMock,
+        mock_paginated_listing: MagicMock,
         tmp_path: Path,
     ) -> None:
         """Capped direct files should verify the returned cache file before scanning."""
@@ -6849,14 +6895,19 @@ class TestHuggingFaceFileURLs:
                 max_size=4,
             )
 
-    @patch("modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated", return_value=["model.bin"])
+        mock_paginated_listing.assert_not_called()
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        side_effect=AssertionError("direct capped file download should not list the repository tree"),
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_with_max_size_rejects_unverifiable_download(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
-        _mock_paginated_listing: MagicMock,
+        mock_paginated_listing: MagicMock,
         tmp_path: Path,
     ) -> None:
         """Capped direct files fail closed if the downloaded cache path cannot be verified."""
@@ -6873,14 +6924,19 @@ class TestHuggingFaceFileURLs:
                 max_size=4,
             )
 
-    @patch("modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated", return_value=["model.bin"])
+        mock_paginated_listing.assert_not_called()
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        side_effect=AssertionError("direct capped file download should not list the repository tree"),
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_with_max_size_redacts_metadata_errors(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
-        _mock_paginated_listing: MagicMock,
+        mock_paginated_listing: MagicMock,
     ) -> None:
         """Metadata preflight errors should not expose direct URL credentials."""
         mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(
@@ -6901,6 +6957,7 @@ class TestHuggingFaceFileURLs:
         assert "hf_secret" not in error
         assert "token=" not in error
         assert "https://huggingface.co/test/model/resolve/main/model.bin" in error
+        mock_paginated_listing.assert_not_called()
         mock_hf_hub_download.assert_not_called()
 
     @patch("huggingface_hub.HfApi")

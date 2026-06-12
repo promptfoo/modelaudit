@@ -41,6 +41,7 @@ _HF_CONTENT_SNIFF_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
 _MAX_HF_STREAMING_EXTENSIONLESS_FILES = 128
+_MAX_HF_STREAMING_UNBOUNDED_INCLUDE_ALL_EXTRA_FILES = 128
 _MAX_HF_REPOSITORY_INVENTORY_FILES = 8192
 _MAX_HF_REPOSITORY_INVENTORY_PAGES = 128
 _MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES = 10 * 1024 * 1024
@@ -1567,6 +1568,7 @@ def _select_streamable_hf_files(
     scannable_scanner_ids: Collection[str] | None = None,
     *,
     include_all_files: bool = False,
+    include_all_files_unbounded_extra_limit: int | None = None,
     deadline: float | None = None,
 ) -> list[str]:
     """Select bounded remotely scannable files without treating ``""`` as a wildcard."""
@@ -1597,6 +1599,7 @@ def _select_streamable_hf_files(
         )
     model_files: list[str] = []
     extensionless_count = 0
+    include_all_extra_count = 0
     seen_files: set[str] = set()
 
     for file_name in repo_files:
@@ -1618,6 +1621,15 @@ def _select_streamable_hf_files(
             continue
 
         if include_all_files:
+            if include_all_files_unbounded_extra_limit is not None:
+                include_all_extra_count += 1
+                if include_all_extra_count > include_all_files_unbounded_extra_limit:
+                    raise ValueError(
+                        "Refusing to stream-download all files from "
+                        f"{repo_id}: include_all_files=True without max_size selected more than "
+                        f"{include_all_files_unbounded_extra_limit} otherwise-unrecognized file(s); "
+                        "set max_size to bound aggregate transfer size"
+                    )
             model_files.append(file_name)
             continue
 
@@ -2940,6 +2952,11 @@ def download_model_streaming(
             scannable_filenames,
             scannable_scanner_ids,
             include_all_files=include_all_files,
+            include_all_files_unbounded_extra_limit=(
+                _MAX_HF_STREAMING_UNBOUNDED_INCLUDE_ALL_EXTRA_FILES
+                if include_all_files and size_limit is None
+                else None
+            ),
             deadline=deadline,
         )
         openvino_companion_suppression_enabled = scannable_scanner_ids is None or "openvino" in {
@@ -3139,7 +3156,7 @@ def download_file_from_hf(
         repo_files: list[str] | None = None
         repo_revision: str | None = None
         repo_listing_error: str | None = None
-        if size_limit is not None or repository_file_inventory is not None:
+        if repository_file_inventory is not None:
             listing_timeout = 30.0
             if deadline is not None:
                 listing_timeout = min(listing_timeout, max(deadline - time.monotonic(), 0.0))
@@ -3162,21 +3179,29 @@ def download_file_from_hf(
                 download_revision = inventory_revision
 
         if size_limit is not None:
-            pinned_revision = repo_revision
-            if not _is_huggingface_commit_sha(pinned_revision):
+            if repository_file_inventory is not None and not _is_huggingface_commit_sha(repo_revision):
                 error_suffix = f": {repo_listing_error}" if repo_listing_error else ""
                 raise ValueError(
                     f"Unable to determine immutable revision for {display_url}; refusing capped download{error_suffix}"
                 )
-            assert isinstance(pinned_revision, str)
+            pinned_revision = repo_revision if repository_file_inventory is not None else None
 
-            path_sizes, _resolved_revision = _get_huggingface_path_sizes(
-                repo_id,
-                [filename],
-                requested_revision=branch,
-                resolved_revision=pinned_revision,
-                deadline=deadline,
-            )
+            try:
+                path_sizes, resolved_revision = _get_huggingface_path_sizes(
+                    repo_id,
+                    [filename],
+                    requested_revision=branch,
+                    resolved_revision=pinned_revision,
+                    deadline=deadline,
+                )
+            except Exception as exc:
+                if "repository revision unavailable" in str(exc):
+                    raise ValueError(
+                        f"Unable to determine immutable revision for {display_url}; refusing capped download"
+                    ) from exc
+                raise
+            if not _is_huggingface_commit_sha(resolved_revision):
+                raise ValueError(f"Unable to determine immutable revision for {display_url}; refusing capped download")
             file_size = path_sizes.get(filename)
             if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
                 raise ValueError(f"Unable to determine file size for {display_url}; refusing capped download")
@@ -3184,7 +3209,7 @@ def download_file_from_hf(
                 raise ValueError(
                     f"File size ({_format_size(file_size)}) exceeds maximum allowed size ({_format_size(size_limit)})"
                 )
-            download_revision = pinned_revision
+            download_revision = resolved_revision
 
         download_kwargs: dict[str, Any] = {
             "repo_id": repo_id,
