@@ -1,6 +1,7 @@
 """Tests for streaming scan-and-delete functionality."""
 
 import hashlib
+import json
 import logging
 import os
 import pickle
@@ -31,9 +32,10 @@ from modelaudit.core import (
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.models import FileMetadataModel, LicenseInfoModel, create_initial_audit_result
 from modelaudit.scanners import safetensors_scanner
-from modelaudit.scanners.base import CheckStatus, Issue, IssueSeverity, ScanResult
+from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, CheckStatus, Issue, IssueSeverity, ScanResult
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
+from modelaudit.utils.file.hdf5 import HDF5_SIGNATURE_SCAN_MAX_BYTES, find_hdf5_signature_offset
 from modelaudit.utils.helpers.file_hash import compute_sha256_hash
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
@@ -119,6 +121,20 @@ def write_hf_cachedir_tag(path: Path) -> None:
         "#\thttps://bford.info/cachedir/\n",
         encoding="utf-8",
     )
+
+
+def write_large_valid_userblock_keras_hdf5(path: Path) -> int:
+    h5py = pytest.importorskip("h5py")
+    userblock_size = 16 * 1024 * 1024
+    assert userblock_size > HDF5_SIGNATURE_SCAN_MAX_BYTES
+    with h5py.File(path, "w", userblock_size=userblock_size) as h5_file:
+        h5_file.attrs["model_config"] = json.dumps(
+            {"class_name": "Sequential", "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]}},
+        )
+        h5_file.attrs["keras_version"] = "3.13.2"
+    with path.open("ab") as handle:
+        handle.truncate(DEFAULT_MAX_FILE_READ_SIZE + 4096)
+    return userblock_size
 
 
 def create_mock_location_scan_result(
@@ -3735,6 +3751,36 @@ def test_scan_model_streaming_oversized_renamed_safetensors_fails_before_hashing
     assert determine_exit_code(result) == 2
     assert "safetensors" in result.scanner_names
     assert any(check.name == "Header Size Limit" for check in result.checks)
+
+
+def test_scan_model_streaming_defers_hash_for_large_valid_hdf5_userblock_beyond_signature_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = tmp_path / "large-userblock-model.h5"
+    userblock_size = write_large_valid_userblock_keras_hdf5(payload)
+    assert find_hdf5_signature_offset(str(payload)) == userblock_size
+
+    monkeypatch.setattr(
+        "modelaudit.utils.helpers.file_hash.compute_sha256_hash",
+        lambda _path: pytest.fail("streaming large file-backed HDF5 artifact must not be whole-file hashed"),
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(payload, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+    )
+
+    metadata = result.file_metadata[str(payload)]
+    assert result.files_scanned == 1
+    assert result.content_hash is None
+    assert "keras_h5" in result.scanner_names
+    assert metadata["file_backed_scan"] is True
+    assert metadata["file_hashes"] is None
+    assert "hdf5_userblock_zip_probe_incomplete" in metadata["scan_outcome_reasons"]
+    assert determine_exit_code(result) == 2
 
 
 def test_scan_model_streaming_does_not_hash_files_over_max_file_size(
