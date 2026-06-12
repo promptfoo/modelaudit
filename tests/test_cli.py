@@ -4630,6 +4630,80 @@ def test_scan_huggingface_streaming_dry_run_json_stdout_is_parseable(
     mock_download_streaming.assert_not_called()
 
 
+@patch("modelaudit.utils.sources.huggingface.plan_huggingface_streaming_download")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.utils.sources.huggingface.get_model_info")
+def test_scan_huggingface_streaming_dry_run_gated_json_reports_acquisition_error(
+    mock_get_model_info: MagicMock,
+    mock_download_file: MagicMock,
+    mock_download_model: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_plan_streaming: MagicMock,
+) -> None:
+    """Gated selected dry-run planning must not leave JSON looking successful."""
+    url = f"hf://test/gated?revision={_HF_TEST_REVISION}"
+    mock_plan_streaming.side_effect = RuntimeError(
+        "Selected Hugging Face files are gated/inaccessible (model.safetensors); refusing dry-run preview"
+    )
+
+    result = CliRunner().invoke(cli, ["scan", "--dry-run", "--stream", "--format", "json", url])
+
+    parsed = parse_click_json_output(result.output)
+    assert result.exit_code == 2
+    assert "Selected Hugging Face files are gated/inaccessible" in result.output
+    assert_huggingface_acquisition_error_payload(
+        parsed,
+        f"hf://test/gated@{_HF_TEST_REVISION}",
+        blocked=True,
+        expected_revision=_HF_TEST_REVISION,
+    )
+    mock_plan_streaming.assert_called_once()
+    assert mock_plan_streaming.call_args.kwargs["allow_content_probes"] is False
+    mock_get_model_info.assert_not_called()
+    mock_download_file.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_download_streaming.assert_not_called()
+
+
+@patch("modelaudit.utils.sources.huggingface.plan_huggingface_streaming_download")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.cli.download_model")
+@patch("modelaudit.cli.download_file_from_hf")
+@patch("modelaudit.utils.sources.huggingface.get_model_info")
+def test_scan_huggingface_streaming_dry_run_exact_zip_include_all_overflow_reports_live_bound(
+    mock_get_model_info: MagicMock,
+    mock_download_file: MagicMock,
+    mock_download_model: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_plan_streaming: MagicMock,
+) -> None:
+    """Exact generic stream dry-run should report the live include-all overflow."""
+    mock_plan_streaming.side_effect = RuntimeError(
+        "Refusing to stream-download unfiltered files from test/model: repository listing exceeds the bounded "
+        "unfiltered candidate limit (128); streaming coverage is incomplete"
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", "--dry-run", "--stream", "--scanners", "zip", "--format", "json", "hf://test/model"],
+    )
+
+    parsed = parse_click_json_output(result.output)
+    assert result.exit_code == 2
+    assert "repository listing exceeds the bounded unfiltered candidate limit (128)" in result.output
+    assert "No metadata-routed Hugging Face files match" not in result.output
+    assert_huggingface_acquisition_error_payload(parsed, "hf://test/model", blocked=False)
+    mock_plan_streaming.assert_called_once()
+    assert mock_plan_streaming.call_args.kwargs["allow_content_probes"] is False
+    assert mock_plan_streaming.call_args.kwargs["include_all_files"] is True
+    mock_get_model_info.assert_not_called()
+    mock_download_file.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_download_streaming.assert_not_called()
+
+
 @patch("modelaudit.cli.download_file_from_hf")
 def test_scan_huggingface_file_download_failure_redacts_url(
     mock_download_file: MagicMock,
@@ -5185,7 +5259,6 @@ def test_scan_huggingface_streaming_dry_run_does_not_download_or_scan() -> None:
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
         patch("modelaudit.cli.record_download_started") as mock_download_started,
         patch("modelaudit.cli.record_download_completed") as mock_download_completed,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5222,7 +5295,6 @@ def test_scan_huggingface_streaming_dry_run_does_not_download_or_scan() -> None:
     mock_scan_streaming.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
     mock_download_started.assert_not_called()
     mock_download_completed.assert_not_called()
 
@@ -5258,7 +5330,6 @@ def test_scan_huggingface_streaming_dry_run_multiple_paths_emits_single_json_pay
         patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5285,8 +5356,6 @@ def test_scan_huggingface_streaming_dry_run_multiple_paths_emits_single_json_pay
     mock_scan_streaming.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 def test_scan_huggingface_streaming_dry_run_honors_output_file(tmp_path: Path) -> None:
@@ -5310,7 +5379,6 @@ def test_scan_huggingface_streaming_dry_run_honors_output_file(tmp_path: Path) -
         patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5341,7 +5409,6 @@ def test_scan_huggingface_streaming_dry_run_honors_output_file(tmp_path: Path) -
     mock_scan_streaming.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 def test_scan_huggingface_streaming_dry_run_rejects_mixed_scan_inputs(tmp_path: Path) -> None:
@@ -5355,7 +5422,6 @@ def test_scan_huggingface_streaming_dry_run_rejects_mixed_scan_inputs(tmp_path: 
         patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5393,7 +5459,6 @@ def test_scan_huggingface_streaming_dry_run_rejects_sarif_before_metadata() -> N
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.download_file_from_hf") as mock_download_file,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5413,11 +5478,12 @@ def test_scan_huggingface_streaming_dry_run_rejects_sarif_before_metadata() -> N
     mock_download_model.assert_not_called()
     mock_download_file.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
-def test_scan_huggingface_streaming_dry_run_metadata_failure_suppresses_partial_output(tmp_path: Path) -> None:
-    """A later metadata failure must not emit or write earlier successful previews."""
+def test_scan_huggingface_streaming_dry_run_metadata_failure_preserves_successful_previews(
+    tmp_path: Path,
+) -> None:
+    """A later metadata failure should keep earlier successful previews in structured output."""
     output_file = tmp_path / "preview.json"
     with (
         patch(
@@ -5443,7 +5509,6 @@ def test_scan_huggingface_streaming_dry_run_metadata_failure_suppresses_partial_
         patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5463,13 +5528,67 @@ def test_scan_huggingface_streaming_dry_run_metadata_failure_suppresses_partial_
 
     assert result.exit_code == 2
     assert "Error previewing model" in result.output
-    assert "Preview written to" not in result.output
-    assert not output_file.exists()
+    assert "Results written to" in result.output
+    assert output_file.exists()
+    output_payload = json.loads(output_file.read_text())
+    assert output_payload["dry_run"] is True
+    assert [preview["model_id"] for preview in output_payload["previews"]] == ["test/model-a"]
+    assert_huggingface_acquisition_error_payload(output_payload, "hf://test/model-b", blocked=False)
     mock_download_streaming.assert_not_called()
     mock_scan_streaming.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
+
+
+def test_scan_huggingface_streaming_dry_run_metadata_failure_preserves_successful_text_preview() -> None:
+    """Text output should also keep earlier successful previews when a later preview fails."""
+    with (
+        patch(
+            "modelaudit.utils.sources.huggingface.get_model_info",
+            side_effect=[
+                {
+                    "repo_id": "test/model-a",
+                    "model_id": "test/model-a",
+                    "total_size": 1234,
+                    "file_count": 2,
+                },
+                RuntimeError("metadata unavailable for https://huggingface.co/test/model-b\nFORGED"),
+            ],
+        ),
+        patch(
+            "modelaudit.utils.sources.huggingface.plan_huggingface_streaming_download",
+            side_effect=[
+                _hf_streaming_plan("test/model-a", selected_files=["model-a.bin"]),
+                _hf_streaming_plan("test/model-b", selected_files=["model-b.bin"]),
+            ],
+        ),
+        patch("modelaudit.utils.sources.huggingface.download_model_streaming") as mock_download_streaming,
+        patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--stream",
+                "--format",
+                "text",
+                "hf://test/model-a",
+                "hf://test/model-b",
+            ],
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 2
+    assert "Preview for hf://test/model-a" in result.output
+    assert "Error previewing model" in result.output
+    assert "Hugging Face acquisition failed" in result.output
+    mock_download_streaming.assert_not_called()
+    mock_scan_streaming.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_scan_local.assert_not_called()
 
 
 def test_scan_huggingface_streaming_dry_run_text_escapes_metadata() -> None:
@@ -5526,7 +5645,6 @@ def test_scan_huggingface_streaming_dry_run_metadata_failure_fails_closed() -> N
         patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5539,13 +5657,11 @@ def test_scan_huggingface_streaming_dry_run_metadata_failure_fails_closed() -> N
     assert "hf_secret" not in result.output
     assert "\\nFORGED" in result.output
     assert "\nFORGED" not in result.output
-    assert "files_scanned" not in result.output
-    assert "has_errors" not in result.output
+    assert "Hugging Face acquisition failed" in result.output
     mock_download_streaming.assert_not_called()
     mock_scan_streaming.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 @patch(
@@ -5564,7 +5680,6 @@ def test_scan_huggingface_streaming_dry_run_refuses_without_selected_scannable_f
         patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5585,14 +5700,14 @@ def test_scan_huggingface_streaming_dry_run_refuses_without_selected_scannable_f
     assert "metadata-only dry-run selection incomplete" in result.output
     assert "cannot prove selection without content probes" in result.output
     assert "notes.txt" in result.output
-    assert "dry_run" not in result.output
+    parsed = parse_click_json_output(result.output)
+    assert_huggingface_acquisition_error_payload(parsed, "hf://test/model", blocked=False)
     mock_detect_content.assert_not_called()
     mock_get_model_info.assert_not_called()
     mock_download_streaming.assert_not_called()
     mock_scan_streaming.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 def test_scan_huggingface_streaming_dry_run_refuses_unprobed_renamed_candidate_before_max_size() -> None:
@@ -5610,7 +5725,6 @@ def test_scan_huggingface_streaming_dry_run_refuses_unprobed_renamed_candidate_b
         patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5633,7 +5747,8 @@ def test_scan_huggingface_streaming_dry_run_refuses_unprobed_renamed_candidate_b
     assert "metadata-only dry-run selection incomplete" in result.output
     assert "cannot prove selection without content probes" in result.output
     assert "renamed" in result.output
-    assert "dry_run" not in result.output
+    parsed = parse_click_json_output(result.output)
+    assert_huggingface_acquisition_error_payload(parsed, "hf://test/model", blocked=False)
     mock_list_repo_files.assert_called_once()
     mock_detect_content.assert_not_called()
     mock_path_sizes.assert_not_called()
@@ -5642,7 +5757,6 @@ def test_scan_huggingface_streaming_dry_run_refuses_unprobed_renamed_candidate_b
     mock_scan_streaming.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 def test_scan_huggingface_streaming_dry_run_refuses_unprobed_openvino_companion_before_preview() -> None:
@@ -5672,7 +5786,6 @@ def test_scan_huggingface_streaming_dry_run_refuses_unprobed_openvino_companion_
         patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5695,7 +5808,8 @@ def test_scan_huggingface_streaming_dry_run_refuses_unprobed_openvino_companion_
     assert "metadata-only dry-run selection incomplete" in result.output
     assert "cannot prove selection without content probes" in result.output
     assert "document.bin" in result.output
-    assert "dry_run" not in result.output
+    parsed = parse_click_json_output(result.output)
+    assert_huggingface_acquisition_error_payload(parsed, "hf://test/model", blocked=False)
     mock_list_repo_files.assert_called_once()
     mock_detect_content.assert_not_called()
     mock_path_sizes.assert_not_called()
@@ -5704,7 +5818,6 @@ def test_scan_huggingface_streaming_dry_run_refuses_unprobed_openvino_companion_
     mock_scan_streaming.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 @patch(
@@ -5731,7 +5844,6 @@ def test_scan_huggingface_streaming_dry_run_allows_selected_scannable_files(
         patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5759,7 +5871,6 @@ def test_scan_huggingface_streaming_dry_run_allows_selected_scannable_files(
     mock_scan_streaming.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 def test_scan_huggingface_streaming_dry_run_metadata_selection_ignores_unselected_sidecars() -> None:
@@ -5805,7 +5916,6 @@ def test_scan_huggingface_streaming_dry_run_metadata_selection_ignores_unselecte
         patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5841,7 +5951,6 @@ def test_scan_huggingface_streaming_dry_run_metadata_selection_ignores_unselecte
     mock_scan_streaming.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 @patch(
@@ -5860,7 +5969,6 @@ def test_scan_huggingface_standard_dry_run_refuses_without_selected_scannable_fi
         patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5878,14 +5986,14 @@ def test_scan_huggingface_standard_dry_run_refuses_without_selected_scannable_fi
     assert "metadata-only dry-run selection incomplete" in result.output
     assert "cannot prove selection without content probes" in result.output
     assert "sidecar.notmodel" in result.output
-    assert "dry_run" not in result.output
+    parsed = parse_click_json_output(result.output)
+    assert_huggingface_acquisition_error_payload(parsed, "hf://test/model", blocked=False)
     mock_detect_content.assert_not_called()
     mock_get_model_info.assert_not_called()
     mock_download_streaming.assert_not_called()
     mock_scan_streaming.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 @patch(
@@ -5917,7 +6025,6 @@ def test_scan_huggingface_standard_dry_run_uses_standard_selection_not_streaming
         patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5944,7 +6051,6 @@ def test_scan_huggingface_standard_dry_run_uses_standard_selection_not_streaming
     mock_scan_streaming.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 def test_scan_huggingface_standard_dry_run_refuses_unprobed_renamed_candidate_before_max_size() -> None:
@@ -5963,7 +6069,6 @@ def test_scan_huggingface_standard_dry_run_refuses_unprobed_renamed_candidate_be
         patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -5983,7 +6088,8 @@ def test_scan_huggingface_standard_dry_run_refuses_unprobed_renamed_candidate_be
     assert "metadata-only dry-run selection incomplete" in result.output
     assert "cannot prove selection without content probes" in result.output
     assert "renamed" in result.output
-    assert "dry_run" not in result.output
+    parsed = parse_click_json_output(result.output)
+    assert_huggingface_acquisition_error_payload(parsed, "hf://test/model", blocked=False)
     mock_list_repo_files.assert_called_once()
     mock_detect_content.assert_not_called()
     mock_path_sizes.assert_not_called()
@@ -5993,7 +6099,6 @@ def test_scan_huggingface_standard_dry_run_refuses_unprobed_renamed_candidate_be
     mock_scan_streaming.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 def test_scan_huggingface_standard_dry_run_bounds_metadata_to_plan_deadline() -> None:
@@ -6018,7 +6123,6 @@ def test_scan_huggingface_standard_dry_run_bounds_metadata_to_plan_deadline() ->
         patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -6049,7 +6153,6 @@ def test_scan_huggingface_standard_dry_run_bounds_metadata_to_plan_deadline() ->
     mock_scan_streaming.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 def test_scan_huggingface_standard_dry_run_fails_closed_when_plan_deadline_expires() -> None:
@@ -6066,7 +6169,6 @@ def test_scan_huggingface_standard_dry_run_fails_closed_when_plan_deadline_expir
         patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -6085,7 +6187,8 @@ def test_scan_huggingface_standard_dry_run_fails_closed_when_plan_deadline_expir
     assert result.exit_code == 2
     assert "Error previewing model" in result.output
     assert "Hugging Face acquisition timed out for test/model" in result.output
-    assert "dry_run" not in result.output
+    parsed = parse_click_json_output(result.output)
+    assert_huggingface_acquisition_error_payload(parsed, "hf://test/model", blocked=False)
     mock_plan_download.assert_called_once()
     assert mock_plan_download.call_args.kwargs["timeout_seconds"] == 1
     assert mock_plan_download.call_args.kwargs["allow_content_probes"] is False
@@ -6095,7 +6198,6 @@ def test_scan_huggingface_standard_dry_run_fails_closed_when_plan_deadline_expir
     mock_scan_streaming.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 def test_scan_huggingface_file_streaming_dry_run_does_not_download_or_scan() -> None:
@@ -6104,7 +6206,6 @@ def test_scan_huggingface_file_streaming_dry_run_does_not_download_or_scan() -> 
         patch("modelaudit.cli._get_huggingface_file_metadata", return_value={"size_bytes": 2048}),
         patch("modelaudit.cli.download_file_from_hf") as mock_download_file,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -6138,7 +6239,6 @@ def test_scan_huggingface_file_streaming_dry_run_does_not_download_or_scan() -> 
     assert "file_metadata" not in preview
     mock_download_file.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 def test_scan_huggingface_file_streaming_dry_run_passes_timeout_to_metadata() -> None:
@@ -6147,7 +6247,6 @@ def test_scan_huggingface_file_streaming_dry_run_passes_timeout_to_metadata() ->
         patch("modelaudit.cli._get_huggingface_file_metadata", return_value={"size_bytes": 2048}) as mock_metadata,
         patch("modelaudit.cli.download_file_from_hf") as mock_download_file,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -6171,7 +6270,6 @@ def test_scan_huggingface_file_streaming_dry_run_passes_timeout_to_metadata() ->
     assert mock_metadata.call_args.kwargs["timeout_seconds"] == 7
     mock_download_file.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 def test_get_huggingface_file_metadata_fails_closed_when_deadline_expires() -> None:
@@ -6274,7 +6372,6 @@ def test_scan_huggingface_file_streaming_dry_run_allows_known_file_within_max_si
         ),
         patch("modelaudit.cli.download_file_from_hf") as mock_download_file,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -6299,7 +6396,6 @@ def test_scan_huggingface_file_streaming_dry_run_allows_known_file_within_max_si
     assert preview["scanner_execution"] is False
     mock_download_file.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -6318,7 +6414,6 @@ def test_scan_huggingface_file_streaming_dry_run_enforces_max_size_refusals(
         patch("modelaudit.cli._get_huggingface_file_metadata", return_value=file_metadata),
         patch("modelaudit.cli.download_file_from_hf") as mock_download_file,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -6338,10 +6433,14 @@ def test_scan_huggingface_file_streaming_dry_run_enforces_max_size_refusals(
     assert result.exit_code == 2
     assert "Error previewing file" in result.output
     assert expected_error in result.output
-    assert "dry_run" not in result.output
+    parsed = parse_click_json_output(result.output)
+    assert_huggingface_acquisition_error_payload(
+        parsed,
+        "https://huggingface.co/test/model/resolve/main/model.bin",
+        blocked=False,
+    )
     mock_download_file.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 def test_scan_huggingface_file_streaming_dry_run_metadata_failure_fails_closed() -> None:
@@ -6357,7 +6456,6 @@ def test_scan_huggingface_file_streaming_dry_run_metadata_failure_fails_closed()
         patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -6370,14 +6468,12 @@ def test_scan_huggingface_file_streaming_dry_run_metadata_failure_fails_closed()
     assert "hf_secret" not in result.output
     assert "\\nFORGED" in result.output
     assert "\nFORGED" not in result.output
-    assert "files_scanned" not in result.output
-    assert "has_errors" not in result.output
+    assert "Hugging Face acquisition failed" in result.output
     mock_download_file.assert_not_called()
     mock_download_streaming.assert_not_called()
     mock_scan_streaming.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 def test_scan_huggingface_file_streaming_dry_run_parse_failure_fails_closed() -> None:
@@ -6394,7 +6490,6 @@ def test_scan_huggingface_file_streaming_dry_run_parse_failure_fails_closed() ->
         patch("modelaudit.core.scan_model_streaming") as mock_scan_streaming,
         patch("modelaudit.cli.download_model") as mock_download_model,
         patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan_local,
-        patch("modelaudit.cli._format_scan_output") as mock_format_scan_output,
     ):
         result = CliRunner().invoke(
             cli,
@@ -6407,14 +6502,12 @@ def test_scan_huggingface_file_streaming_dry_run_parse_failure_fails_closed() ->
     assert "hf_secret" not in result.output
     assert "\\nFORGED" in result.output
     assert "\nFORGED" not in result.output
-    assert "files_scanned" not in result.output
-    assert "has_errors" not in result.output
+    assert "Hugging Face acquisition failed" in result.output
     mock_download_file.assert_not_called()
     mock_download_streaming.assert_not_called()
     mock_scan_streaming.assert_not_called()
     mock_download_model.assert_not_called()
     mock_scan_local.assert_not_called()
-    mock_format_scan_output.assert_not_called()
 
 
 @patch("modelaudit.cli.is_huggingface_url")
