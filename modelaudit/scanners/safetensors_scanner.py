@@ -211,6 +211,8 @@ _CREDENTIAL_METADATA_PATTERNS = (
     r"ghp_[a-zA-Z0-9]{36}",
 )
 _GENERIC_URL_METADATA_PATTERN = r"https?://"
+_ENCODED_URL_DELIMITER_METADATA_PATTERN = "encoded-url-delimiter"
+_WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN = "wrapped-opaque-token"
 _LICENSE_METADATA_KEYS = frozenset({"license"})
 _LICENSE_DOCUMENT_MARKERS = (
     "license agreement",
@@ -881,6 +883,13 @@ class SafeTensorsScanner(BaseScanner):
         return False
 
     @classmethod
+    def _metadata_value_has_wrapped_opaque_token(cls, value: str) -> bool:
+        if len(value) > 1000:
+            return False
+        lines = [line.strip() for line in value.splitlines() if line.strip()]
+        return len(lines) > 1 and cls._license_document_has_wrapped_opaque_token(lines)
+
+    @classmethod
     def _license_document_body_is_bounded_and_coherent(cls, value: str) -> bool:
         if len(value) > _LICENSE_DOCUMENT_MAX_CHARS:
             return False
@@ -1034,6 +1043,18 @@ class SafeTensorsScanner(BaseScanner):
             for pattern in SUSPICIOUS_METADATA_PATTERNS
         )
 
+    @staticmethod
+    def _add_metadata_pattern_check(result: ScanResult, path: str, key: str, pattern: str) -> None:
+        result.add_check(
+            name="Metadata Pattern Check",
+            passed=False,
+            message=f"Suspicious metadata value for {key}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={"key": key, "pattern": pattern},
+            why="Metadata matched known suspicious pattern",
+        )
+
     @classmethod
     def _is_ordinary_license_metadata_value(
         cls,
@@ -1084,9 +1105,13 @@ class SafeTensorsScanner(BaseScanner):
                 flags.add("unusually_long_value")
             if any(marker in value.lower() for marker in ("import ", "#!/")):
                 flags.add("code_like_value")
-            if any(
-                (pattern != _GENERIC_URL_METADATA_PATTERN or not is_ordinary_license) and re.search(pattern, value)
-                for pattern in SUSPICIOUS_METADATA_PATTERNS
+            if (
+                any(
+                    (pattern != _GENERIC_URL_METADATA_PATTERN or not is_ordinary_license) and re.search(pattern, value)
+                    for pattern in SUSPICIOUS_METADATA_PATTERNS
+                )
+                or _value_has_encoded_url_delimiter(value)
+                or cls._metadata_value_has_wrapped_opaque_token(value)
             ):
                 flags.add("suspicious_pattern")
 
@@ -1572,21 +1597,20 @@ class SafeTensorsScanner(BaseScanner):
                         )
 
                     # Check for regex-based suspicious patterns (independent of above check)
+                    suspicious_pattern: str | None = None
                     for pattern in SUSPICIOUS_METADATA_PATTERNS:
                         if pattern == _GENERIC_URL_METADATA_PATTERN and is_ordinary_license:
                             continue
                         if re.search(pattern, value):
-                            custom_metadata_security_flags.add("suspicious_pattern")
-                            result.add_check(
-                                name="Metadata Pattern Check",
-                                passed=False,
-                                message=f"Suspicious metadata value for {key}",
-                                severity=IssueSeverity.INFO,
-                                location=path,
-                                details={"key": key, "pattern": pattern},
-                                why="Metadata matched known suspicious pattern",
-                            )
+                            suspicious_pattern = pattern
                             break
+                    if suspicious_pattern is None and _value_has_encoded_url_delimiter(value):
+                        suspicious_pattern = _ENCODED_URL_DELIMITER_METADATA_PATTERN
+                    if suspicious_pattern is None and self._metadata_value_has_wrapped_opaque_token(value):
+                        suspicious_pattern = _WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN
+                    if suspicious_pattern is not None:
+                        custom_metadata_security_flags.add("suspicious_pattern")
+                        self._add_metadata_pattern_check(result, path, key, suspicious_pattern)
 
                 if "__metadata__" in header:
                     result.metadata["custom_metadata_security_flags"] = sorted(custom_metadata_security_flags)

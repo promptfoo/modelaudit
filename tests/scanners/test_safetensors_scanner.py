@@ -88,6 +88,22 @@ Additional licensing: https://ltx.io/model/licensing
     return body + ("\nThis paragraph is ordinary license text and contains no executable metadata." * 10)
 
 
+def ordinary_license_text_without_url() -> str:
+    return "\n".join(
+        [
+            "MIT License",
+            "Permission is hereby granted to use, reproduce, distribute, sublicense, and modify the work.",
+            "The copyright notice and permission notice shall be included with copies of the work.",
+            "License terms grant permission to reproduce and distribute derivative works under applicable law.",
+            "Patent license terms grant use of the work and related output under these conditions.",
+            "Liability restriction terms apply to every entity that receives the licensed work.",
+            "Trademark restrictions and copyright notices must remain with the distributed work.",
+            "This license agreement grants permission to use the work under ordinary terms.",
+            "The licensor may grant additional permission to reproduce and distribute the work.",
+        ]
+    )
+
+
 def encode_url_path(path: str, passes: int) -> str:
     encoded = path
     for _ in range(passes):
@@ -442,6 +458,31 @@ def test_license_metadata_document_url_and_length_are_not_suspicious(tmp_path: P
         for check in result.checks
         if check.name in {"Metadata Length Check", "Metadata Pattern Check"} and check.status == CheckStatus.FAILED
     ]
+    assert not [issue for issue in result.issues if issue.rule_code == "S905"]
+
+
+def test_license_metadata_ordinary_prose_without_url_stays_clean(tmp_path: Path) -> None:
+    file_path = tmp_path / "license_metadata_without_url.safetensors"
+    license_text = ordinary_license_text_without_url()
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": license_text},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+    summary = SafeTensorsScanner._summarize_custom_metadata({"license": license_text})
+
+    assert 500 <= len(license_text) < 1000
+    assert "http://" not in license_text
+    assert "https://" not in license_text
+    assert SafeTensorsScanner._is_ordinary_license_metadata_value("license", license_text, metadata_is_valid=True)
+    assert result.success is True
+    assert result.metadata["custom_metadata_security_flags"] == []
+    assert summary["custom_metadata_security_flags"] == []
     assert not [issue for issue in result.issues if issue.rule_code == "S905"]
 
 
@@ -1640,6 +1681,106 @@ def test_license_metadata_encoded_backslash_url_delimiters_fail_closed(
         and check.details == {"key": "license", "pattern": "https?://"}
         for check in result.checks
     )
+
+
+@pytest.mark.parametrize(
+    "encoded_url",
+    [
+        "https%3A%5C%5Cevil.example%5Cx",
+        "https:%5C%5Cevil.example%5Cx",
+        "h%74tps%3A%5C%5Cevil.example%5Cx",
+    ],
+)
+def test_license_metadata_short_encoded_backslash_url_delimiters_report_s905_without_raw_url(
+    tmp_path: Path,
+    encoded_url: str,
+) -> None:
+    file_path = tmp_path / "short_encoded_backslash_url_license_metadata.safetensors"
+    payload = f"{ordinary_license_text_without_url()}\nEncoded reference: {encoded_url}"
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert len(payload) < 1000
+    assert "http://" not in payload
+    assert "https://" not in payload
+    assert result.metadata["custom_metadata_security_flags"] == ["suspicious_pattern"]
+    assert any(issue.rule_code == "S905" and "license" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Metadata Pattern Check"
+        and check.status == CheckStatus.FAILED
+        and check.details == {"key": "license", "pattern": "encoded-url-delimiter"}
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 3])
+def test_license_metadata_short_bare_tiny_base64_chunks_report_s905_without_length_or_raw_url(
+    tmp_path: Path,
+    chunk_size: int,
+) -> None:
+    file_path = tmp_path / f"short_bare_{chunk_size}_char_base64_license_metadata.safetensors"
+    encoded_payload = base64.b64encode(b"import os\n#payload").decode("ascii")
+    chunks = [encoded_payload[index : index + chunk_size] for index in range(0, len(encoded_payload), chunk_size)]
+    separator = "License grant terms."
+    chunk_separator = f"\n{separator}\n"
+    payload = "License agreement terms.\n" + chunk_separator.join(chunks)
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert all(1 <= len(chunk) <= 3 and "=" not in chunk for chunk in chunks)
+    assert len(payload) < 1000
+    assert "import " not in payload
+    assert "http://" not in payload
+    assert "https://" not in payload
+    assert result.metadata["custom_metadata_security_flags"] == ["suspicious_pattern"]
+    assert any(issue.rule_code == "S905" and "license" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Metadata Pattern Check"
+        and check.status == CheckStatus.FAILED
+        and check.details == {"key": "license", "pattern": "wrapped-opaque-token"}
+        for check in result.checks
+    )
+
+
+def test_license_metadata_percent_encoded_backslash_text_without_url_stays_clean(tmp_path: Path) -> None:
+    file_path = tmp_path / "short_encoded_backslash_text_license_metadata.safetensors"
+    payload = (
+        f"{ordinary_license_text_without_url()}\n"
+        "Documentation note: %5C is a percent-encoded backslash in Windows path prose."
+    )
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert len(payload) < 1000
+    assert "http://" not in payload
+    assert "https://" not in payload
+    assert result.success is True
+    assert result.metadata["custom_metadata_security_flags"] == []
+    assert not [issue for issue in result.issues if issue.rule_code == "S905"]
 
 
 def test_license_metadata_percent_encoded_backslash_text_stays_clean(tmp_path: Path) -> None:
