@@ -55,6 +55,8 @@ PASSIVE_NETWORK_FINDING_TYPES = frozenset(
 CORRELATABLE_DOCUMENTATION_NETWORK_FINDING_TYPES = PASSIVE_NETWORK_FINDING_TYPES | frozenset({"network_command"})
 DOCUMENTATION_NETWORK_EVIDENCE_TRAILING_DELIMITERS = ".,;:)]}'\"`>"
 DOCUMENTATION_NETWORK_EVIDENCE_LEADING_DELIMITERS = "<([{'\"`"
+DOCUMENTATION_NETWORK_URL_BOUNDARY_BYTES = b" \t\r\n\"'<>`"
+DOCUMENTATION_NETWORK_URL_MAX_SCHEME_BYTES = 32
 DOCUMENTATION_NETWORK_DESTINATION_TOKEN_PATTERN = re.compile(rb"[^\s;&|#]+")
 DOCUMENTATION_NETWORK_FINDING_SEVERITY_RANK = {
     "DEBUG": 0,
@@ -153,6 +155,7 @@ DOCUMENTATION_BARE_DOMAIN_TLDS = frozenset(
     }
 )
 MAX_TEXT_FINDING_CONTEXT_BYTES = 4096
+MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES = MAX_TEXT_FINDING_CONTEXT_BYTES * 64
 MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES = 1024
 DOCUMENTATION_CODE_ASSIGNMENT_PATTERN = re.compile(
     rb"(?:^|[\r\n{[(,;])[ \t]*(?:(?:const|let|var)[ \t]+)?[A-Za-z_][A-Za-z0-9_.-]*[ \t]*="
@@ -233,6 +236,13 @@ DOCUMENTATION_CONFIG_MAPPING_PATTERN = re.compile(
     + rb")\s*:\s*(?:\[\s*)?(?:(?:\r?\n|\r)[ \t]*(?:[-*+]\s+)?)?[\"']?$",
     re.IGNORECASE,
 )
+DOCUMENTATION_CONFIG_MARKDOWN_MAPPING_PATTERN = re.compile(
+    rb"(?:^|[\s{[(,;])(?:[\"']"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb"[\"']|"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb")\s*:\s*(?:\[\s*)?(?:(?:\r?\n|\r)[ \t]*(?:[-*+]\s+)?)?[\"']?$"
+)
 DOCUMENTATION_CONFIG_MAPPING_PREFIX_PATTERN = re.compile(
     rb"(?:^|[\s{[(,;])(?:[\"']"
     + DOCUMENTATION_CONFIG_NETWORK_KEY
@@ -240,6 +250,12 @@ DOCUMENTATION_CONFIG_MAPPING_PREFIX_PATTERN = re.compile(
     + DOCUMENTATION_CONFIG_NETWORK_KEY
     + rb")\s*:\s*(?:\[\s*)?[\"']?$",
     re.IGNORECASE,
+)
+DOCUMENTATION_CONFIG_LIST_MAPPING_PATTERN = re.compile(
+    rb"(?:^|(?:\r?\n|\r))[ \t]*[-*+]\s+" + DOCUMENTATION_CONFIG_NETWORK_KEY + rb"\s*:\s*(?:\[\s*)?$"
+)
+DOCUMENTATION_CONFIG_MARKDOWN_UNQUOTED_MAPPING_PATTERN = re.compile(
+    rb"(?:^|[\s{[(,;])" + DOCUMENTATION_CONFIG_NETWORK_KEY + rb"\s*:\s*(?:\[\s*)?$"
 )
 DOCUMENTATION_NESTED_CONFIG_OBJECT_PATTERN = re.compile(
     rb"(?:^|[\s{[(,;])[\"']?" + DOCUMENTATION_CONFIG_NETWORK_KEY + rb"[\"']?\s*(?:=|:)\s*"
@@ -251,15 +267,42 @@ DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DOCUMENTATION_NESTED_CONFIG_VALUE_LINE_PATTERN = re.compile(
-    rb"[ \t]+(?:[-*+]\s+)?[\"']?(?:url|uri)[\"']?\s*:\s*[\"']?",
+    rb"[ \t]*(?:[-*+]\s+)?[\"']?(?:url|uri)[\"']?\s*:\s*[\"']?",
     re.IGNORECASE,
 )
 DOCUMENTATION_NESTED_CONFIG_LIST_ITEM_PATTERN = re.compile(
-    rb"[ \t]+[-*+]\s+\S.*",
+    rb"[ \t]*[-*+]\s+\S.*",
     re.IGNORECASE,
 )
+DOCUMENTATION_LIST_ITEM_PREFIX_PATTERN = re.compile(rb"[ \t]*[-*+]\s+")
+DOCUMENTATION_CONFIG_XML_TAG_NAME = (
+    rb"(?:[A-Za-z_][A-Za-z0-9_.-]*:)?(?:endpoint|callback|webhook)"
+    rb"(?:[-_:][A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*)?"
+)
 DOCUMENTATION_CONFIG_TAG_PATTERN = re.compile(
-    rb"<(?:endpoint|callback|webhook)(?:[-_:][A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)*)?>\s*$",
+    rb"<" + DOCUMENTATION_CONFIG_XML_TAG_NAME + rb">\s*$",
+    re.IGNORECASE,
+)
+DOCUMENTATION_CONFIG_TAG_START_PATTERN = re.compile(
+    rb"<(?P<closing>/)?\s*(?P<tag>" + DOCUMENTATION_CONFIG_XML_TAG_NAME + rb")(?=[\s>/])",
+    re.IGNORECASE,
+)
+DOCUMENTATION_CONFIG_QUOTED_VALUE_OPEN_PATTERN = re.compile(
+    rb"(?:^|[\s{[(,;])(?:[\"']"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb"[\"']|"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb")\s*:\s*(?:\[\s*)?(?P<quote>[\"'])",
+    re.IGNORECASE,
+)
+DOCUMENTATION_NESTED_CONFIG_OBJECT_QUOTED_VALUE_OPEN_PATTERN = re.compile(
+    rb"(?:^|[\s{[(,;])[\"']?"
+    + DOCUMENTATION_CONFIG_NETWORK_KEY
+    + rb"[\"']?\s*(?:=|:)\s*\{[^{}\r\n]{0,4096}[\"']?(?:url|uri)[\"']?\s*:\s*(?P<quote>[\"'])",
+    re.IGNORECASE,
+)
+DOCUMENTATION_NESTED_CONFIG_QUOTED_VALUE_LINE_PATTERN = re.compile(
+    rb"[ \t]*(?:[-*+]\s+)?[\"']?(?:url|uri)[\"']?\s*:\s*(?P<quote>[\"'])",
     re.IGNORECASE,
 )
 DOCUMENTATION_PRIVILEGE_OPTION_WITH_ARGUMENT = (
@@ -1090,13 +1133,26 @@ class TextScanner(BaseScanner):
             or DOCUMENTATION_CODE_LITERAL_VALUE_PREFIX_PATTERN.search(code_prefix) is not None
             or DOCUMENTATION_CODE_RETURN_STRING_PATTERN.search(code_prefix) is not None
             or DOCUMENTATION_CODE_CALL_PATTERN.search(code_prefix) is not None
-            or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(code_prefix) is not None
+            or cls._documentation_markdown_link_config_is_actionable(code_prefix)
+        )
+
+    @classmethod
+    def _documentation_markdown_link_config_is_actionable(cls, code_prefix: bytes) -> bool:
+        stripped = code_prefix.rstrip()
+        return (
+            cls._documentation_structured_config_value_prefix_is_actionable(code_prefix)
+            or DOCUMENTATION_CONFIG_LIST_MAPPING_PATTERN.search(code_prefix) is not None
+            or DOCUMENTATION_CONFIG_MARKDOWN_UNQUOTED_MAPPING_PATTERN.search(code_prefix) is not None
+            or DOCUMENTATION_CONFIG_MARKDOWN_MAPPING_PATTERN.search(code_prefix) is not None
+            or (
+                stripped.endswith((b'"', b"'")) and DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(code_prefix) is not None
+            )
             or cls._documentation_nested_config_is_actionable(code_prefix)
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(code_prefix) is not None
         )
 
     @classmethod
-    def _documentation_position_is_in_passive_markdown_link(cls, payload: bytes, position: int) -> bool:
+    def _documentation_markdown_link_context(cls, payload: bytes, position: int) -> tuple[bytes, int] | None:
         line_start = max(payload.rfind(b"\n", 0, position) + 1, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
         line_end = payload.find(b"\n", position)
         if line_end < 0:
@@ -1108,11 +1164,68 @@ class TextScanner(BaseScanner):
             if match.start() <= line_position < match.end():
                 prefix = line[: match.start()]
                 markdown_match = cls._documentation_passive_markdown_link_match(prefix)
-                return markdown_match is not None and not cls._documentation_markdown_link_is_in_code_context(
-                    prefix,
-                    markdown_match.start(),
-                )
-        return False
+                if markdown_match is None:
+                    return None
+                link_start = line_start + markdown_match.start()
+                context_start = max(0, link_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+                if context_start > 0:
+                    next_newline = payload.find(b"\n", context_start, link_start)
+                    if next_newline >= 0:
+                        context_start = next_newline + 1
+                return payload[context_start:link_start], link_start
+        return None
+
+    @classmethod
+    def _documentation_markdown_link_context_prefix(cls, payload: bytes, position: int) -> bytes | None:
+        context = cls._documentation_markdown_link_context(payload, position)
+        return context[0] if context is not None else None
+
+    @classmethod
+    def _documentation_markdown_link_xml_config_context_status(cls, payload: bytes, link_start: int) -> bool | None:
+        line_start = payload.rfind(b"\n", 0, link_start) + 1
+        context_start = max(line_start, link_start - MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES)
+        context_prefix = payload[context_start:link_start]
+        tag_match = None
+        for match in DOCUMENTATION_CONFIG_TAG_START_PATTERN.finditer(context_prefix):
+            tag_match = match
+            break
+        if tag_match is None:
+            return None if context_start > line_start else False
+        return cls._documentation_config_xml_tag_value_is_open(context_prefix[tag_match.start() :])
+
+    @classmethod
+    def _documentation_markdown_link_has_open_xml_config_context(cls, payload: bytes, link_start: int) -> bool:
+        return cls._documentation_markdown_link_xml_config_context_status(payload, link_start) is True
+
+    @classmethod
+    def _documentation_position_is_in_actionable_markdown_link_context(cls, payload: bytes, position: int) -> bool:
+        context = cls._documentation_markdown_link_context(payload, position)
+        if context is None:
+            return False
+        context_prefix, link_start = context
+        line_prefix = context_prefix[context_prefix.rfind(b"\n") + 1 :]
+        if cls._documentation_shell_comment_before_position(line_prefix, len(line_prefix)):
+            return False
+        return cls._documentation_markdown_link_is_in_code_context(
+            context_prefix,
+            len(context_prefix),
+        ) or cls._documentation_markdown_link_has_open_xml_config_context(
+            payload,
+            link_start,
+        )
+
+    @classmethod
+    def _documentation_position_is_in_passive_markdown_link(cls, payload: bytes, position: int) -> bool:
+        context = cls._documentation_markdown_link_context(payload, position)
+        if context is None:
+            return False
+        context_prefix, link_start = context
+        return cls._documentation_markdown_link_xml_config_context_status(
+            payload, link_start
+        ) is False and not cls._documentation_markdown_link_is_in_code_context(
+            context_prefix,
+            len(context_prefix),
+        )
 
     @staticmethod
     def _documentation_comment_contains_position(payload: bytes, position: int) -> bool:
@@ -1181,6 +1294,183 @@ class TextScanner(BaseScanner):
         return False
 
     @staticmethod
+    def _documentation_quoted_value_is_open(source: bytes, quote: int, value_start: int) -> bool:
+        escaped = False
+        cursor = value_start
+        while cursor < len(source):
+            value = source[cursor]
+            if escaped:
+                escaped = False
+                cursor += 1
+                continue
+            if value == ord("\\") and quote != ord("'"):
+                escaped = True
+                cursor += 1
+                continue
+            if value in {ord("\r"), ord("\n")}:
+                return False
+            if value == quote:
+                if quote == ord("'") and cursor + 1 < len(source) and source[cursor + 1] == quote:
+                    cursor += 2
+                    continue
+                return False
+            cursor += 1
+        return True
+
+    @staticmethod
+    def _documentation_xml_start_tag_end(prefix: bytes, search_start: int) -> int | None:
+        quote: int | None = None
+        cursor = search_start
+        while cursor < len(prefix):
+            value = prefix[cursor]
+            if quote is not None:
+                if value == quote:
+                    quote = None
+                cursor += 1
+                continue
+            if value in {ord("'"), ord('"')}:
+                quote = value
+            elif value == ord(">"):
+                return cursor
+            elif value == ord("<"):
+                return None
+            cursor += 1
+        return None
+
+    @classmethod
+    def _documentation_config_xml_tag_value_is_open(cls, prefix: bytes) -> bool:
+        open_tags: list[bytes] = []
+        for match in DOCUMENTATION_CONFIG_TAG_START_PATTERN.finditer(prefix):
+            tag = match.group("tag").lower()
+            tag_end = cls._documentation_xml_start_tag_end(prefix, match.end())
+            if tag_end is None:
+                return True
+            if match.group("closing"):
+                if not open_tags or open_tags[-1] != tag:
+                    return True
+                open_tags.pop()
+                continue
+            tag_body = prefix[match.end() : tag_end].rstrip()
+            if tag_body.endswith(b"/"):
+                continue
+            open_tags.append(tag)
+        return bool(open_tags)
+
+    @classmethod
+    def _documentation_closed_config_xml_suffix_start(cls, prefix: bytes) -> int | None:
+        open_tags: list[bytes] = []
+        last_tag_end: int | None = None
+        for match in DOCUMENTATION_CONFIG_TAG_START_PATTERN.finditer(prefix):
+            tag = match.group("tag").lower()
+            tag_end = cls._documentation_xml_start_tag_end(prefix, match.end())
+            if tag_end is None:
+                return None
+            last_tag_end = tag_end + 1
+            if match.group("closing"):
+                if not open_tags or open_tags[-1] != tag:
+                    return None
+                open_tags.pop()
+                continue
+            tag_body = prefix[match.end() : tag_end].rstrip()
+            if tag_body.endswith(b"/"):
+                continue
+            open_tags.append(tag)
+        if last_tag_end is None or open_tags:
+            return None
+        return last_tag_end
+
+    @classmethod
+    def _documentation_truncated_prefix_after_closed_xml_config_is_passive(cls, payload: bytes, position: int) -> bool:
+        line_start = payload.rfind(b"\n", 0, position) + 1
+        context_start = max(line_start, position - MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES)
+        context_prefix = payload[context_start:position]
+        tag_match = None
+        for match in DOCUMENTATION_CONFIG_TAG_START_PATTERN.finditer(context_prefix):
+            tag_match = match
+            break
+        if tag_match is None:
+            return False
+        line_end = payload.find(b"\n", position)
+        if line_end < 0:
+            line_end = len(payload)
+        line_end = min(line_end, position + MAX_TEXT_FINDING_CONTEXT_BYTES)
+        tag_context = context_prefix[tag_match.start() :] + payload[position:line_end]
+        tag_context_position = position - (context_start + tag_match.start())
+        suffix_start = cls._documentation_closed_config_xml_suffix_start(tag_context[:tag_context_position])
+        if suffix_start is None:
+            return False
+        suffix_line = tag_context[suffix_start:]
+        suffix_position = tag_context_position - suffix_start
+        return not cls._documentation_line_is_code_shaped(suffix_line, suffix_position)
+
+    @classmethod
+    def _documentation_config_quoted_value_line_is_actionable(cls, line_prefix: bytes) -> bool:
+        for match in DOCUMENTATION_CONFIG_QUOTED_VALUE_OPEN_PATTERN.finditer(line_prefix):
+            quote = match.group("quote")[0]
+            if cls._documentation_quoted_value_is_open(line_prefix, quote, match.end()):
+                return True
+        return False
+
+    @classmethod
+    def _documentation_nested_config_quoted_value_is_actionable(cls, prefix: bytes) -> bool:
+        for object_match in DOCUMENTATION_NESTED_CONFIG_OBJECT_QUOTED_VALUE_OPEN_PATTERN.finditer(prefix):
+            quote = object_match.group("quote")[0]
+            if cls._documentation_quoted_value_is_open(prefix, quote, object_match.end()):
+                return True
+
+        lines = prefix.splitlines()
+        if len(lines) < 2:
+            return False
+        value_line = lines[-1]
+        value_match = DOCUMENTATION_NESTED_CONFIG_QUOTED_VALUE_LINE_PATTERN.match(value_line)
+        if value_match is None:
+            return False
+        quote = value_match.group("quote")[0]
+        if not cls._documentation_quoted_value_is_open(value_line, quote, value_match.end()):
+            return False
+
+        value_indent = cls._documentation_line_indent(value_line)
+        value_is_list_item = DOCUMENTATION_NESTED_CONFIG_LIST_ITEM_PATTERN.fullmatch(value_line) is not None
+        for line_index in range(len(lines) - 2, -1, -1):
+            line = lines[line_index]
+            if not line.strip():
+                return False
+            line_indent = cls._documentation_line_indent(line)
+            if line_indent > value_indent or (line_indent == value_indent and not value_is_list_item):
+                continue
+            if DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(line) is not None:
+                return True
+            list_item_prefix = DOCUMENTATION_LIST_ITEM_PREFIX_PATTERN.match(line)
+            if list_item_prefix is not None:
+                if value_indent <= line_indent:
+                    return False
+                if (
+                    DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(line[list_item_prefix.end() :])
+                    is not None
+                ):
+                    return True
+                for parent_index in range(line_index - 1, -1, -1):
+                    parent_line = lines[parent_index]
+                    if not parent_line.strip():
+                        return False
+                    parent_indent = cls._documentation_line_indent(parent_line)
+                    if parent_indent > line_indent:
+                        continue
+                    return DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(parent_line) is not None
+                return False
+            return False
+        return False
+
+    @classmethod
+    def _documentation_structured_config_value_prefix_is_actionable(cls, prefix: bytes) -> bool:
+        line_prefix = prefix[prefix.rfind(b"\n") + 1 :]
+        return (
+            cls._documentation_config_quoted_value_line_is_actionable(line_prefix)
+            or cls._documentation_nested_config_quoted_value_is_actionable(prefix)
+            or cls._documentation_config_xml_tag_value_is_open(prefix)
+        )
+
+    @staticmethod
     def _documentation_line_indent(line: bytes) -> int:
         return len(line) - len(line.lstrip(b" \t"))
 
@@ -1195,22 +1485,31 @@ class TextScanner(BaseScanner):
         if DOCUMENTATION_NESTED_CONFIG_VALUE_LINE_PATTERN.fullmatch(value_line) is None:
             return False
         value_indent = cls._documentation_line_indent(value_line)
+        value_is_list_item = DOCUMENTATION_NESTED_CONFIG_LIST_ITEM_PATTERN.fullmatch(value_line) is not None
         for line_index in range(len(lines) - 2, -1, -1):
             line = lines[line_index]
             if not line.strip():
                 return False
             line_indent = cls._documentation_line_indent(line)
-            if line_indent >= value_indent:
+            if line_indent > value_indent or (line_indent == value_indent and not value_is_list_item):
                 continue
             if DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(line) is not None:
                 return True
-            if DOCUMENTATION_NESTED_CONFIG_LIST_ITEM_PATTERN.fullmatch(line) is not None:
+            list_item_prefix = DOCUMENTATION_LIST_ITEM_PREFIX_PATTERN.match(line)
+            if list_item_prefix is not None:
+                if value_indent <= line_indent:
+                    return False
+                if (
+                    DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(line[list_item_prefix.end() :])
+                    is not None
+                ):
+                    return True
                 for parent_index in range(line_index - 1, -1, -1):
                     parent_line = lines[parent_index]
                     if not parent_line.strip():
                         return False
                     parent_indent = cls._documentation_line_indent(parent_line)
-                    if parent_indent >= line_indent:
+                    if parent_indent > line_indent:
                         continue
                     return DOCUMENTATION_NESTED_CONFIG_PARENT_LINE_PATTERN.fullmatch(parent_line) is not None
                 return False
@@ -1432,6 +1731,7 @@ class TextScanner(BaseScanner):
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
             or cls._documentation_nested_config_is_actionable(prefix)
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
+            or cls._documentation_structured_config_value_prefix_is_actionable(prefix)
         ):
             return True
 
@@ -1623,10 +1923,12 @@ class TextScanner(BaseScanner):
             return True
         if cls._documentation_multiline_literal_contains_position(payload, position):
             return True
+        if cls._documentation_position_is_in_actionable_markdown_link_context(payload, position):
+            return True
         if cls._documentation_position_is_in_passive_markdown_link(payload, position):
             return False
         if cls._finding_line_prefix_is_truncated(payload, finding):
-            return True
+            return not cls._documentation_truncated_prefix_after_closed_xml_config_is_passive(payload, position)
         line_parts = cls._finding_line_parts(payload, finding)
         markdown_table_context = False
         if line_parts is not None:
@@ -1657,6 +1959,7 @@ class TextScanner(BaseScanner):
             or DOCUMENTATION_CONFIG_MAPPING_PATTERN.search(prefix) is not None
             or cls._documentation_nested_config_is_actionable(prefix)
             or DOCUMENTATION_CONFIG_TAG_PATTERN.search(prefix) is not None
+            or cls._documentation_structured_config_value_prefix_is_actionable(prefix)
         )
 
     @staticmethod
@@ -2302,6 +2605,85 @@ class TextScanner(BaseScanner):
             "span_end": span_end,
         }
 
+    @staticmethod
+    def _documentation_url_scheme_byte_is_valid(value: int, *, first: bool = False) -> bool:
+        return (
+            (65 <= value <= 90)
+            or (97 <= value <= 122)
+            or (not first and ((48 <= value <= 57) or value in {ord("+"), ord("."), ord("-")}))
+        )
+
+    @classmethod
+    def _documentation_url_scheme_is_valid(cls, scheme: bytes) -> bool:
+        return (
+            bool(scheme)
+            and cls._documentation_url_scheme_byte_is_valid(scheme[0], first=True)
+            and all(cls._documentation_url_scheme_byte_is_valid(value) for value in scheme[1:])
+        )
+
+    @staticmethod
+    def _documentation_url_candidate_end(payload: bytes, span_start: int, line_end: int) -> int | None:
+        scan_end = min(line_end, span_start + MAX_TEXT_FINDING_CONTEXT_BYTES)
+        span_end = span_start
+        while span_end < scan_end and payload[span_end] not in DOCUMENTATION_NETWORK_URL_BOUNDARY_BYTES:
+            span_end += 1
+        if (
+            span_end == scan_end
+            and span_end < line_end
+            and payload[span_end] not in DOCUMENTATION_NETWORK_URL_BOUNDARY_BYTES
+        ):
+            return None
+        return span_end
+
+    @classmethod
+    def _documentation_bare_url_span_at_position(
+        cls,
+        payload: bytes,
+        position: int,
+        line_start: int,
+        line_end: int,
+    ) -> tuple[int, int] | None:
+        if line_start >= line_end:
+            return None
+        position = min(max(position, line_start), line_end - 1)
+        separator_start = max(line_start, position - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        separator_end = min(
+            line_end,
+            position + DOCUMENTATION_NETWORK_URL_MAX_SCHEME_BYTES + len(b"://"),
+        )
+        matching_spans: list[tuple[int, int]] = []
+        seen_starts: set[int] = set()
+        separator = payload.find(b"://", separator_start, separator_end)
+        while separator >= 0:
+            candidate_starts: list[int] = []
+            if position <= separator and cls._documentation_url_scheme_is_valid(payload[position:separator]):
+                candidate_starts.append(position)
+
+            scheme_start = separator - 1
+            minimum_scheme_start = max(line_start, separator - DOCUMENTATION_NETWORK_URL_MAX_SCHEME_BYTES)
+            while scheme_start > minimum_scheme_start and cls._documentation_url_scheme_byte_is_valid(
+                payload[scheme_start - 1]
+            ):
+                scheme_start -= 1
+            if cls._documentation_url_scheme_is_valid(payload[scheme_start:separator]):
+                candidate_starts.append(scheme_start)
+
+            for candidate_start in candidate_starts:
+                if candidate_start in seen_starts:
+                    continue
+                seen_starts.add(candidate_start)
+                candidate_end = cls._documentation_url_candidate_end(payload, candidate_start, line_end)
+                if (
+                    candidate_end is not None
+                    and candidate_start <= position < candidate_end
+                    and BARE_NETWORK_URL_TOKEN_PATTERN.fullmatch(payload[candidate_start:candidate_end]) is not None
+                ):
+                    matching_spans.append((candidate_start, candidate_end))
+            separator = payload.find(b"://", separator + len(b"://"), separator_end)
+        if not matching_spans:
+            return None
+        return min(matching_spans, key=lambda span: (span[1] - span[0], -span[0]))
+
     @classmethod
     def _documentation_url_evidence_at_position(
         cls,
@@ -2310,16 +2692,14 @@ class TextScanner(BaseScanner):
         line_lookup: dict[int, tuple[int, int, int]] | None = None,
     ) -> dict[str, Any] | None:
         line_start, line_end, _line_number = cls._documentation_line_bounds(payload, position, line_lookup)
-        line = payload[line_start:line_end]
-        line_position = position - line_start
-        for match in BARE_NETWORK_URL_TOKEN_PATTERN.finditer(line):
-            if not (match.start() <= line_position < match.end()):
-                continue
-            raw_value = match.group().decode("utf-8", errors="ignore")
+        span = cls._documentation_bare_url_span_at_position(payload, position, line_start, line_end)
+        if span is not None:
+            span_start, span_end = span
+            raw_value = payload[span_start:span_end].decode("utf-8", errors="ignore")
             return cls._documentation_network_evidence_from_span(
                 payload,
-                line_start + match.start(),
-                line_start + match.end(),
+                span_start,
+                span_end,
                 kind="url",
                 value=redact_url_for_finding(raw_value),
                 line_lookup=line_lookup,

