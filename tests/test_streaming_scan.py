@@ -30,7 +30,8 @@ from modelaudit.core import (
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.models import FileMetadataModel, LicenseInfoModel, create_initial_audit_result
 from modelaudit.scanners import safetensors_scanner
-from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
+from modelaudit.scanners.base import CheckStatus, Issue, IssueSeverity, ScanResult
+from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import SAFETENSORS_ROUTING_HEADER_PARSE_BYTES
 from modelaudit.utils.helpers.file_hash import compute_sha256_hash
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
@@ -106,6 +107,23 @@ def create_mock_location_scan_result(
     )
     result.finish(success=True)
     return result
+
+
+def _write_ordered_hf_tokenizer_json(
+    path: Path,
+    *,
+    late_fields: str = "",
+    padding_size: int = 0,
+) -> Path:
+    padding = f',"padding":"{"x" * padding_size}"' if padding_size else ""
+    path.write_text(
+        (
+            '{"version":"1.0","added_tokens":[],'
+            f'"model":{{"type":"BPE","vocab":{{"hello":0}},"merges":[]}}{padding}{late_fields}}}'
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 def test_scan_model_directory_or_file_streaming_path() -> None:
@@ -1955,6 +1973,33 @@ def test_scan_model_streaming_skips_non_model_files(tmp_path: Path) -> None:
     assert mock_scan.call_args.args[0] == str(model_file)
     assert mock_scan.call_args.kwargs["config"]["skip_file_types"] is True
     assert result.files_scanned == 1
+
+
+def test_scan_model_streaming_tokenizer_json_late_chat_template_after_structure_budget_reports_issue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "TOKENIZER_JSON_ROUTING_STRUCTURE_READ_BYTES", 192)
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=',"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"',
+        padding_size=256,
+    )
+
+    result = scan_model_streaming(
+        file_generator=iter([(tokenizer_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_scan_results=False,
+        skip_file_types=False,
+    )
+
+    assert result.files_scanned == 1
+    assert determine_exit_code(result) == 1
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
 
 
 def test_scan_model_streaming_preserves_license_metadata_when_skipped(tmp_path: Path) -> None:

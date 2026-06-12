@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
+from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from ..utils.file.detection import (
     _JAX_JSON_CHECKPOINT_PREFIX_UNAVAILABLE,
     _JAX_JSON_CHECKPOINT_PROBE_AMBIGUOUS,
@@ -23,11 +24,17 @@ from ..utils.file.detection import (
     _probe_jax_json_checkpoint_file_state,
     _read_jax_json_checkpoint_prefix,
     has_jax_json_checkpoint_structure,
+    huggingface_tokenizer_json_has_jax_route_evidence,
+    huggingface_tokenizer_json_has_template_route_evidence,
     is_confirmed_jax_json_checkpoint_file,
+    is_huggingface_tokenizer_json_file,
     is_jax_json_checkpoint_file,
 )
 from ._evidence_redaction import redact_evidence_string
 from .base import BaseScanner, IssueSeverity, ScanResult
+
+JAX_SKIP_XGBOOST_JSON_OVERLAP_CONFIG_KEY = "_jax_skip_xgboost_json_overlap"
+JAX_SKIP_JINJA_JSON_OVERLAP_CONFIG_KEY = "_jax_skip_jinja_json_overlap"
 
 try:
     import numpy as np
@@ -796,6 +803,12 @@ class JaxCheckpointScanner(BaseScanner):
             filename = path_obj.name.lower()
             if filename == "_checkpoint":
                 return True
+            tokenizer_jax_evidence = huggingface_tokenizer_json_has_jax_route_evidence(path)
+            if is_huggingface_tokenizer_json_file(path) and not tokenizer_jax_evidence:
+                return False
+            tokenizer_template_evidence = huggingface_tokenizer_json_has_template_route_evidence(path)
+            if tokenizer_template_evidence and not tokenizer_jax_evidence:
+                return False
             ext = os.path.splitext(path)[1].lower()
             if ext == ".json":
                 if filename == "orbax_checkpoint_metadata.json":
@@ -803,8 +816,8 @@ class JaxCheckpointScanner(BaseScanner):
                 if filename == "metadata.json":
                     if cls._has_regular_orbax_sibling_marker(path_obj):
                         return True
-                    return is_confirmed_jax_json_checkpoint_file(path)
-                return is_confirmed_jax_json_checkpoint_file(path)
+                    return tokenizer_jax_evidence or is_confirmed_jax_json_checkpoint_file(path)
+                return tokenizer_jax_evidence or is_confirmed_jax_json_checkpoint_file(path)
             if ext in cls.supported_extensions:
                 return cls._is_likely_jax_file(path) or is_jax_json_checkpoint_file(path)
             return is_jax_json_checkpoint_file(path)
@@ -2035,6 +2048,8 @@ class JaxCheckpointScanner(BaseScanner):
                     },
                     rule_code="S902",
                 )
+            self._scan_jinja_json_overlap(path, result)
+            self._scan_xgboost_json_overlap(path, result)
             return
 
         try:
@@ -2109,6 +2124,81 @@ class JaxCheckpointScanner(BaseScanner):
                     "scan_outcome_reason": "jax_json_scan_failed",
                 },
                 rule_code="S902",
+            )
+        self._scan_jinja_json_overlap(path, result)
+        self._scan_xgboost_json_overlap(path, result)
+
+    def _merge_filename_owned_result(self, result: ScanResult, owner_result: ScanResult) -> None:
+        """Merge an owner scan without dropping existing incomplete-coverage reasons."""
+        existing_reasons = list(result.metadata.get("scan_outcome_reasons", []))
+        result.merge(owner_result)
+        for reason in existing_reasons:
+            mark_inconclusive_scan_result(result, reason)
+
+    def _scan_jinja_json_overlap(self, path: str, result: ScanResult) -> None:
+        """Preserve template analysis for JAX-owned tokenizer/config JSON files."""
+        if self.config.get(JAX_SKIP_JINJA_JSON_OVERLAP_CONFIG_KEY) is True:
+            return
+        if Path(path).name.lower() not in {
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.json",
+            "generation_config.json",
+        }:
+            return
+        if Path(path).name.lower() == "tokenizer.json" and not huggingface_tokenizer_json_has_template_route_evidence(
+            path
+        ):
+            return
+
+        from .jinja2_template_scanner import JINJA_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY, Jinja2TemplateScanner
+
+        if not Jinja2TemplateScanner.can_handle(path):
+            return
+
+        scanner_selection = policy_from_config(self.config)
+        if scanner_selection.allows("jinja2_template"):
+            jinja_config = dict(self.config)
+            jinja_config[JINJA_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY] = True
+            self._merge_filename_owned_result(result, Jinja2TemplateScanner(config=jinja_config).scan(path))
+        elif scanner_selection.active:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "jinja2_template",
+                scanner_selection,
+                context="overlapping Jinja JSON analysis",
+            )
+
+    def _scan_xgboost_json_overlap(self, path: str, result: ScanResult) -> None:
+        """Preserve XGBoost JSON analysis when JAX evidence overlaps."""
+        if self.config.get(JAX_SKIP_XGBOOST_JSON_OVERLAP_CONFIG_KEY) is True:
+            return
+        if Path(path).suffix.lower() != ".json":
+            return
+
+        from .xgboost_scanner import (
+            XGBOOST_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY,
+            XGBOOST_SKIP_JINJA_JSON_OVERLAP_CONFIG_KEY,
+            XGBoostScanner,
+        )
+
+        if not XGBoostScanner.can_handle(path):
+            return
+
+        scanner_selection = policy_from_config(self.config)
+        if scanner_selection.allows("xgboost"):
+            xgboost_config = dict(self.config)
+            xgboost_config[XGBOOST_SKIP_JAX_JSON_OVERLAP_CONFIG_KEY] = True
+            xgboost_config[XGBOOST_SKIP_JINJA_JSON_OVERLAP_CONFIG_KEY] = True
+            self._merge_filename_owned_result(result, XGBoostScanner(config=xgboost_config).scan(path))
+        elif scanner_selection.active:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "xgboost",
+                scanner_selection,
+                context="overlapping XGBoost JSON analysis",
             )
 
     def scan(self, path: str) -> ScanResult:
