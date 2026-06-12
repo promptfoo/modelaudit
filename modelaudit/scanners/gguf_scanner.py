@@ -5,9 +5,10 @@ from __future__ import annotations
 import os
 import re
 import struct
+from bisect import bisect_left
 from collections.abc import Iterable
 from typing import Any, BinaryIO, ClassVar, NamedTuple
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote
 
 from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
 
@@ -82,6 +83,16 @@ _GGUF_METADATA_COMMAND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("backtick_command", re.compile(r"(?i)`\s*(?:rm|curl|wget|bash|sh|python(?:3)?|powershell|pwsh|cmd(?:\.exe)?)\b")),
 )
 _GGUF_DESTRUCTIVE_COMMAND_PREFIXES = ("sudo", "doas", "command", "env", "nohup", "nice", "setsid", "timeout")
+_GGUF_METADATA_COMMAND_API_PREFILTERS = (
+    "`",
+    "__import__",
+    "cmd",
+    "eval",
+    "exec",
+    "os.popen",
+    "os.system",
+    "subprocess.",
+)
 _GGUF_PREFIX_OPTIONS_WITH_VALUE = frozenset(
     {"-c", "--close-from", "-g", "--group", "-h", "--host", "-p", "--prompt", "-t", "--command-timeout", "-u", "--user"}
 )
@@ -174,6 +185,7 @@ _GGUF_METADATA_NETWORK_APIS = (
     "urlretrieve",
     "fetch",
 )
+_GGUF_NETWORK_API_PREFILTERS = ("requests", "httpx", "urllib", "urlopen", "urlretrieve", "fetch")
 _GGUF_NETWORK_CLIENT_ALIAS_METHODS = {
     "httpx": ("get", "post", "put", "patch", "delete", "head", "options", "request", "stream"),
     "requests": ("get", "post", "put", "patch", "delete", "head", "options", "request"),
@@ -192,6 +204,7 @@ _GGUF_NETWORK_URL_ASSIGNMENT_PATTERN = re.compile(
     r"""(?is)\b(?P<name>[a-z_][a-z0-9_]*)\s*=\s*(?:[rubf]{0,2})?(?P<quote>['"])(?:https?|ftp)://[^'"\s<>]+(?P=quote)""",
 )
 _GGUF_REMOTE_URL_PATTERN = re.compile(r"(?i)\b(?:https?|ftp)://[^\s'\"<>)\]}]+")
+_GGUF_REMOTE_URL_POSITION_LIMIT = 512
 _GGUF_EXECUTION_SINK_COMMANDS = frozenset(
     {"bash", "sh", "zsh", "fish", "cmd", "powershell", "pwsh", "python", "python3", "perl", "ruby", "node"}
 )
@@ -1278,8 +1291,7 @@ class GgufScanner(BaseScanner):
             return False
         if cls._shell_remote_fetch_pattern(text) is None and cls._network_api_remote_fetch_pattern(text) is None:
             return False
-        urls = cls._remote_urls_in_text(text)
-        return bool(urls) and all(cls._is_documentation_reference_url(url) for url in urls)
+        return cls._text_contains_only_documentation_reference_urls(text)
 
     @staticmethod
     def _remote_urls_in_text(text: str) -> tuple[str, ...]:
@@ -1292,8 +1304,20 @@ class GgufScanner(BaseScanner):
 
     @staticmethod
     def _is_documentation_reference_url(url: str) -> bool:
-        hostname = urlparse(url).hostname
+        _scheme, separator, remainder = url.lower().partition("://")
+        if not separator:
+            return False
+        hostname = remainder.split("/", 1)[0].split(":", 1)[0]
         return hostname in _GGUF_DOCUMENTATION_URL_HOSTS
+
+    @classmethod
+    def _text_contains_only_documentation_reference_urls(cls, text: str) -> bool:
+        saw_url = False
+        for match in _GGUF_REMOTE_URL_PATTERN.finditer(text):
+            saw_url = True
+            if not cls._is_documentation_reference_url(match.group(0).rstrip(".,;:")):
+                return False
+        return saw_url
 
     @staticmethod
     def _line_looks_like_documentation(lowered_line: str) -> bool:
@@ -1316,6 +1340,14 @@ class GgufScanner(BaseScanner):
                 " model card ",
             )
         )
+
+    @classmethod
+    def _text_may_contain_execution_sink(cls, value_lower: str) -> bool:
+        for command in _GGUF_EXECUTION_SINK_COMMANDS:
+            for position in cls._iter_substring_positions(value_lower, command):
+                if cls._has_token_boundary(value_lower, position, command):
+                    return True
+        return False
 
     @classmethod
     def _text_pipes_to_execution_sink(cls, text: str) -> bool:
@@ -1497,6 +1529,11 @@ class GgufScanner(BaseScanner):
 
     @classmethod
     def _metadata_command_pattern(cls, value: str) -> str | None:
+        value_lower = value.lower()
+        if not any(marker in value_lower for marker in _GGUF_METADATA_COMMAND_API_PREFILTERS) and not (
+            cls._text_may_contain_execution_sink(value_lower)
+        ):
+            return None
         for pattern_name, pattern in _GGUF_METADATA_COMMAND_PATTERNS:
             if pattern.search(value):
                 return pattern_name
@@ -1669,6 +1706,9 @@ class GgufScanner(BaseScanner):
                 ):
                     return True
                 if candidate.startswith("-"):
+                    if not any(character.isalnum() for character in candidate):
+                        index += 1
+                        continue
                     value_mode = cls._fetch_option_value_mode(candidate, command)
                     if value_mode == "none" and any(scheme in candidate.lower() for scheme in _GGUF_REMOTE_URL_SCHEMES):
                         return True
@@ -1719,6 +1759,29 @@ class GgufScanner(BaseScanner):
     def _has_remote_url(value: str) -> bool:
         value_lower = value.lower()
         return any(scheme in value_lower for scheme in _GGUF_REMOTE_URL_SCHEMES)
+
+    @staticmethod
+    def _remote_url_positions(value_lower: str) -> tuple[int, ...]:
+        positions: list[int] = []
+        for match in _GGUF_REMOTE_URL_PATTERN.finditer(value_lower):
+            positions.append(match.start())
+            if len(positions) >= _GGUF_REMOTE_URL_POSITION_LIMIT:
+                break
+        return tuple(positions)
+
+    @staticmethod
+    def _remote_url_positions_intersect_window(
+        value_lower: str,
+        positions: tuple[int, ...],
+        start: int,
+        end: int,
+    ) -> bool:
+        index = bisect_left(positions, start)
+        if index < len(positions) and positions[index] < end:
+            return True
+        if len(positions) < _GGUF_REMOTE_URL_POSITION_LIMIT:
+            return False
+        return _GGUF_REMOTE_URL_PATTERN.search(value_lower, start, end) is not None
 
     @staticmethod
     def _has_token_boundary(value: str, position: int, token: str) -> bool:
@@ -1962,14 +2025,27 @@ class GgufScanner(BaseScanner):
         value_lower = value.lower()
         if not cls._has_remote_url(value_lower):
             return None
+        if not any(marker in value_lower for marker in _GGUF_NETWORK_API_PREFILTERS):
+            return None
 
         remote_url_assignments = cls._remote_url_variable_assignments(value_lower)
         api_aliases = cls._network_api_alias_tokens(value_lower)
+        remote_url_positions = cls._remote_url_positions(value_lower)
         for api_name in (*_GGUF_METADATA_NETWORK_APIS, *api_aliases.tokens):
             for api_position in cls._iter_substring_positions(value_lower, api_name):
                 if not cls._has_network_api_boundary(value_lower, api_position, api_name):
                     continue
                 after_position = api_position + len(api_name)
+                has_prior_remote_assignment = bool(
+                    remote_url_assignments.items and remote_url_assignments.items[0][0] < api_position
+                ) or cls._remote_url_assignments_truncated_before(remote_url_assignments, api_position)
+                if not has_prior_remote_assignment and not cls._remote_url_positions_intersect_window(
+                    value_lower,
+                    remote_url_positions,
+                    after_position,
+                    min(len(value_lower), after_position + 2048),
+                ):
+                    continue
                 argument_window = cls._api_argument_window(value_lower, after_position)
                 if argument_window is None:
                     continue
@@ -1994,6 +2070,29 @@ class GgufScanner(BaseScanner):
         return []
 
     @classmethod
+    def _metadata_value_has_only_benign_documentation_urls(cls, key: str, value: str) -> bool:
+        if not cls._is_documentation_metadata_key(key):
+            return False
+        if not cls._text_contains_only_documentation_reference_urls(value):
+            return False
+        if _GGUF_SHELL_FETCH_COMMAND_PATTERN.search(value):
+            return False
+
+        value_lower = value.lower()
+        if any(marker in value_lower for marker in _GGUF_NETWORK_API_PREFILTERS):
+            return False
+        if cls._contains_path_traversal(value) or cls._destructive_rm_pattern(value):
+            return False
+        if cls._metadata_command_pattern(value) is not None:
+            return False
+
+        return not (
+            "|" in value
+            and cls._text_may_contain_execution_sink(value_lower)
+            and cls._text_pipes_to_execution_sink(value)
+        )
+
+    @classmethod
     def _metadata_value_security_evidence(
         cls,
         key: str,
@@ -2002,6 +2101,8 @@ class GgufScanner(BaseScanner):
         max_template_size: int = _GGUF_DEFAULT_MAX_TEMPLATE_SIZE,
     ) -> list[dict[str, str]]:
         if cls._metadata_value_looks_like_documentation(key, value):
+            return []
+        if cls._metadata_value_has_only_benign_documentation_urls(key, value):
             return []
 
         if cls._is_chat_template_key(key):
