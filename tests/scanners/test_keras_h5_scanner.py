@@ -654,6 +654,45 @@ def test_large_keras_h5_directory_scan_defers_core_hashing(
     )
 
 
+def test_large_keras_h5_streaming_scan_defers_core_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {"layers": [{"class_name": "Dense", "config": {"units": 1}}]},
+        },
+        file_name="large_streamed_model.h5",
+    )
+    inflate_h5_file_to_size(model_path)
+
+    monkeypatch.setattr(
+        "modelaudit.utils.helpers.file_hash.compute_sha256_hash",
+        lambda _path: pytest.fail("Streaming scan must not hash large HDF5 before Keras H5 dispatch"),
+    )
+    monkeypatch.setattr(
+        KerasH5Scanner,
+        "calculate_file_hashes",
+        lambda _self, _path: pytest.fail("Keras H5 scanner must not hash large HDF5"),
+    )
+
+    audit_result = core_module.scan_model_streaming(
+        file_generator=iter([(model_path, True)]),
+        timeout=30,
+        delete_after_scan=False,
+        cache_enabled=False,
+    )
+    metadata = audit_result.file_metadata[str(model_path)]
+
+    assert audit_result.success is True
+    assert audit_result.files_scanned == 1
+    assert audit_result.content_hash is None
+    assert "keras_h5" in audit_result.scanner_names
+    assert "max_file_read_size_exceeded" not in metadata.get("scan_outcome_reasons", [])
+
+
 def test_large_malicious_keras_h5_still_detects_lambda_payload(tmp_path: Path) -> None:
     model_path = create_custom_h5_file(
         tmp_path,
