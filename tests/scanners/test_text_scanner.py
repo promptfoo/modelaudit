@@ -3664,11 +3664,22 @@ def test_text_scanner_bare_active_vocabulary_tokens_are_informational(
     assert determine_exit_code(aggregate) == 0
 
 
-def test_text_scanner_bare_merges_basic_token_pair_remains_actionable(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("credential", "secret_type"),
+    [
+        ("Basic configuration", "Basic Auth Credentials"),
+        ("Bearer configuration", "Bearer Token"),
+    ],
+)
+def test_text_scanner_bare_merges_basic_token_pair_remains_actionable(
+    tmp_path: Path,
+    credential: str,
+    secret_type: str,
+) -> None:
     text_dir = tmp_path / "text_tokenizer"
     text_dir.mkdir()
     text_path = text_dir / "merges.txt"
-    text_path.write_text("#version: 0.2\nsafe token\nBasic configuration\n", encoding="utf-8")
+    text_path.write_text(f"#version: 0.2\nsafe token\n{credential}\n", encoding="utf-8")
 
     result = TextScanner().scan(str(text_path))
     aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
@@ -3679,6 +3690,7 @@ def test_text_scanner_bare_merges_basic_token_pair_remains_actionable(tmp_path: 
         if check.name == "Embedded Secrets Detection" and check.status == CheckStatus.FAILED
     ]
     assert secret_checks
+    assert any(check.details.get("secret_type") == secret_type for check in secret_checks)
     assert any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in secret_checks)
     assert determine_exit_code(aggregate) == 1
 

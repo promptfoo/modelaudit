@@ -80,6 +80,10 @@ DOCUMENTATION_NETWORK_FINDING_PRIORITY = {
 PASSIVE_DATA_TEXT_FILENAMES = frozenset({"classes.txt", "merges.txt"})
 PASSIVE_DATA_TEXT_PREFIXES = ("label", "token", "vocab")
 PASSIVE_DATA_SECRET_TYPES = frozenset({"Basic Auth Credentials", "Bearer Token"})
+PASSIVE_DATA_AUTH_LINE_PATTERN = re.compile(
+    rb"^[ \t]*(?P<scheme>basic|bearer)[ \t]+(?P<token>[A-Za-z0-9._~+/\-]{2,8192}={0,2})[ \t]*\r?$",
+    re.IGNORECASE | re.MULTILINE,
+)
 TOKENIZER_VOCABULARY_FILENAMES = frozenset(TOKENIZER_VOCABULARY_CONTENT_FILENAMES)
 TOKENIZER_VOCABULARY_PREFIXES = ("tokenizer_vocab", "tokenizer-vocab", "vocab")
 TOKENIZER_VOCABULARY_OMITTABLE_CC_PATTERNS = frozenset({"trojan", "zombie"})
@@ -2326,6 +2330,72 @@ class TextScanner(BaseScanner):
         return line[position : position + length].strip() == stripped
 
     @classmethod
+    def _passive_data_auth_line_has_existing_finding(
+        cls,
+        payload: bytes,
+        findings: list[dict[str, Any]],
+        *,
+        line_start: int,
+        line_end: int,
+        secret_type: str,
+    ) -> bool:
+        for finding in findings:
+            if finding.get("secret_type") != secret_type:
+                continue
+            position = finding.get("position")
+            if isinstance(position, int) and line_start <= position <= line_end:
+                return True
+            line = cls._finding_line(payload, finding)
+            if line is not None and payload[line_start:line_end].strip() == line:
+                return True
+        return False
+
+    @classmethod
+    def _passive_data_auth_line_secret_findings(
+        cls,
+        path: str,
+        payload: bytes,
+        findings: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not cls._is_passive_data_sidecar(path):
+            return []
+
+        passive_findings: list[dict[str, Any]] = []
+        for match in PASSIVE_DATA_AUTH_LINE_PATTERN.finditer(payload):
+            scheme = match.group("scheme").decode("ascii").casefold()
+            token = match.group("token")
+            secret_type = "Basic Auth Credentials" if scheme == "basic" else "Bearer Token"
+            line_start, line_end, _line_number = cls._documentation_line_bounds(payload, match.start())
+            if cls._passive_data_auth_line_has_existing_finding(
+                payload,
+                findings + passive_findings,
+                line_start=line_start,
+                line_end=line_end,
+                secret_type=secret_type,
+            ):
+                continue
+
+            redacted_scheme = "Basic" if scheme == "basic" else "Bearer"
+            token_position = match.start("token")
+            passive_findings.append(
+                {
+                    "type": "embedded_secret",
+                    "severity": "CRITICAL",
+                    "secret_type": secret_type,
+                    "position": token_position,
+                    "length": len(token),
+                    "confidence": 0.8,
+                    "pattern": "passive_data_auth_line",
+                    "redacted_value": f"{redacted_scheme} <redacted>",
+                    "message": f"{secret_type} detected in passive data sidecar (confidence: 80%)",
+                    "context": f"{path} pos:{token_position}",
+                    "recommendation": f"Remove {secret_type} from model data immediately",
+                    "passive_data_sidecar": True,
+                }
+            )
+        return passive_findings
+
+    @classmethod
     def _is_isolated_tokenizer_vocabulary_cc_finding(cls, payload: bytes, finding: dict[str, Any]) -> bool:
         if finding.get("type") != "cc_pattern":
             return False
@@ -3134,7 +3204,7 @@ class TextScanner(BaseScanner):
         findings: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         # Whole-line Basic/Bearer matches in passive sidecars can be real credentials.
-        return findings
+        return findings + cls._passive_data_auth_line_secret_findings(path, payload, findings)
 
     @staticmethod
     def _is_unreadable_path_result(result: ScanResult) -> bool:
