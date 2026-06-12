@@ -1908,6 +1908,7 @@ def test_license_metadata_short_entity_encoded_url_delimiters_report_s905_withou
         "https&amp;amp;#x3a;&amp;amp;#x2f;&amp;amp;#x2f;evil.example/x",
         "https&amp;amp;amp;amp;amp;#x3a;&amp;amp;amp;amp;amp;#x2f;&amp;amp;amp;amp;amp;#x2f;evil.example/x",
         "https&amp;amp;amp;amp;amp;amp;amp;amp;#x3a;&amp;amp;amp;amp;amp;amp;amp;amp;#x2f;&amp;amp;amp;amp;amp;amp;amp;amp;#x2f;evil.example/x",
+        "h&amp;amp;amp;amp;amp;#x74;tps&amp;amp;amp;amp;amp;#x3a;&amp;amp;amp;amp;amp;#x2f;&amp;amp;amp;amp;amp;#x2f;evil.example/x",
     ],
 )
 def test_license_metadata_nested_entity_encoded_url_delimiter_fails_closed(
