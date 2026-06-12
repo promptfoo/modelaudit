@@ -8,7 +8,7 @@ import hashlib
 import io
 import pickletools
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +43,8 @@ _KNOWN_PICKLE_EXTENSIONS = frozenset({".pkl", ".pickle", ".dill", ".joblib"})
 _JOBLIB_NUMPY_ARRAY_WRAPPER_MODULE = "joblib.numpy_pickle"
 _JOBLIB_NUMPY_ARRAY_WRAPPER_NAME = "NumpyArrayWrapper"
 _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE = f"{_JOBLIB_NUMPY_ARRAY_WRAPPER_MODULE}.{_JOBLIB_NUMPY_ARRAY_WRAPPER_NAME}"
+_JOBLIB_NUMPY_ARRAY_WRAPPER_PICKLE_MARKER = b"joblib.numpy_pickle\nNumpyArrayWrapper"
+_JOBLIB_NUMPY_ARRAY_WRAPPER_SPAN_PROOF_MAX_BYTES = 10 * 1024 * 1024
 _PYTORCH_CONTAINER_EXTENSIONS = frozenset({".bin", ".pt", ".pth", ".ckpt", ".pkl"})
 _BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{10,}={0,2}(?![A-Za-z0-9+/=])")
 _HEX_TOKEN_RE = re.compile(rb"(?<![A-Fa-f0-9])[A-Fa-f0-9]{20,}(?![A-Fa-f0-9])")
@@ -1907,22 +1909,77 @@ def _is_legitimate_serialization_file(path: str) -> bool:
         return False
     try:
         with path_obj.open("rb") as handle:
-            if not _looks_like_pickle(handle.read(_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES)):
+            prefix = handle.read(_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES)
+            if not _looks_like_pickle(prefix):
                 return False
         report = StandalonePickleScanner().scan_file(path_obj, enrich_call_graph=False)
     except Exception:
         return False
-    joblib_wrapper_origin_is_trusted = _joblib_numpy_array_wrapper_origin_is_trusted()
+    joblib_wrapper_reference_requires_span_proof = (
+        path_obj.suffix.lower() == ".joblib" and _JOBLIB_NUMPY_ARRAY_WRAPPER_PICKLE_MARKER in prefix
+    )
+    validated_joblib_control_references = (
+        _joblib_numpy_array_validated_raw_span_control_references(path_obj)
+        if joblib_wrapper_reference_requires_span_proof
+        else frozenset()
+    )
+    if (
+        joblib_wrapper_reference_requires_span_proof
+        and _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE not in validated_joblib_control_references
+    ):
+        return False
+
+    def validated_joblib_control_finding_is_trusted(finding: Any) -> bool:
+        details = getattr(finding, "details", {})
+        if not isinstance(details, Mapping):
+            return False
+        import_reference = str(details.get("import_reference", ""))
+        if import_reference not in validated_joblib_control_references:
+            return False
+        module = details.get("module")
+        name = details.get("name")
+        if not isinstance(module, str) or not isinstance(name, str):
+            return False
+        try:
+            return import_only_reference_is_proven_trusted(module, name)
+        except Exception:
+            return False
+
     security_findings = tuple(
         finding
         for finding in report.findings
-        if not (
-            joblib_wrapper_origin_is_trusted
-            and finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-            and str(finding.details.get("import_reference", "")) == _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE
-        )
+        if not (finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and validated_joblib_control_finding_is_trusted(finding))
     )
-    return not security_findings and report.status.value != "error"
+    if security_findings:
+        return False
+    if report.status.value != "error":
+        return True
+    return joblib_wrapper_reference_requires_span_proof and bool(validated_joblib_control_references)
+
+
+def _joblib_numpy_array_validated_raw_span_control_references(path_obj: Path) -> frozenset[str]:
+    try:
+        if path_obj.suffix.lower() != ".joblib":
+            return frozenset()
+        file_size = path_obj.stat().st_size
+        if file_size <= 0 or file_size > _JOBLIB_NUMPY_ARRAY_WRAPPER_SPAN_PROOF_MAX_BYTES:
+            return frozenset()
+        with path_obj.open("rb") as handle:
+            payload = handle.read(_JOBLIB_NUMPY_ARRAY_WRAPPER_SPAN_PROOF_MAX_BYTES + 1)
+        if len(payload) != file_size:
+            return frozenset()
+        from .joblib_scanner import _pickle_without_joblib_numpy_array_data
+
+        sanitized = _pickle_without_joblib_numpy_array_data(payload)
+    except Exception:
+        return frozenset()
+    if sanitized is None:
+        return frozenset()
+    return frozenset(sanitized.validated_control_occurrences)
+
+
+def _joblib_numpy_array_wrapper_has_validated_raw_span(path_obj: Path) -> bool:
+    return _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE in _joblib_numpy_array_validated_raw_span_control_references(path_obj)
 
 
 def _joblib_numpy_array_wrapper_origin_is_trusted() -> bool:

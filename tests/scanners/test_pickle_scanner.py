@@ -130,6 +130,102 @@ def _binunicode(data: bytes) -> bytes:
     return b"X" + len(data).to_bytes(4, "little") + data
 
 
+def _joblib_test_binunicode(value: str) -> bytes:
+    return _binunicode(value.encode("utf-8"))
+
+
+def _joblib_test_numpy_wrapper_control(*, shape: int = 4, dtype: str = "i8") -> bytes:
+    return (
+        b"cjoblib.numpy_pickle\nNumpyArrayWrapper\n)\x81}("
+        + _joblib_test_binunicode("subclass")
+        + b"cnumpy\nndarray\n"
+        + _joblib_test_binunicode("shape")
+        + b"K"
+        + bytes([shape])
+        + b"\x85"
+        + _joblib_test_binunicode("order")
+        + _joblib_test_binunicode("C")
+        + _joblib_test_binunicode("dtype")
+        + b"cnumpy\ndtype\n"
+        + _joblib_test_binunicode(dtype)
+        + b"\x89\x88\x87R"
+        + _joblib_test_binunicode("allow_mmap")
+        + b"\x88"
+        + _joblib_test_binunicode("numpy_array_alignment_bytes")
+        + b"K\x10ub"
+    )
+
+
+def _joblib_test_numpy_raw_segment(prefix_length: int, raw_data: bytes) -> bytes:
+    padding_length = 16 - ((prefix_length + 1) % 16)
+    return bytes([padding_length]) + (b"\xff" * padding_length) + raw_data
+
+
+def _joblib_test_numpy_array_payload() -> bytes:
+    prefix = b"\x80\x02](" + _joblib_test_numpy_wrapper_control()
+    return prefix + _joblib_test_numpy_raw_segment(len(prefix), b"\x00" * 32) + b"e."
+
+
+_JOBLIB_TEST_TRUSTED_REFERENCES = frozenset(
+    {
+        ("joblib.numpy_pickle", "NumpyArrayWrapper"),
+        ("numpy", "ndarray"),
+        ("numpy", "dtype"),
+    }
+)
+
+
+def _joblib_test_reference_is_trusted(
+    module: str,
+    name: str,
+    *,
+    pickle_entrypoint_methods: tuple[str, ...] | None = None,
+    pickle_invokes_metaclass_call: bool | None = None,
+) -> bool:
+    del pickle_entrypoint_methods, pickle_invokes_metaclass_call
+    return (module, name) in _JOBLIB_TEST_TRUSTED_REFERENCES
+
+
+def _joblib_test_invocation_is_trusted(module: str, name: str, reference: dict[str, object]) -> bool:
+    del reference
+    return _joblib_test_reference_is_trusted(module, name)
+
+
+def _joblib_test_requires_origin_review(module: str, name: str) -> bool:
+    return not _joblib_test_reference_is_trusted(module, name)
+
+
+def _trust_joblib_test_references(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
+        _joblib_test_reference_is_trusted,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_reference_is_proven_trusted",
+        _joblib_test_reference_is_trusted,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph.import_only_reference_is_proven_trusted",
+        _joblib_test_reference_is_trusted,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_reference_is_proven_trusted_for_pickle_invocation",
+        _joblib_test_invocation_is_trusted,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph.import_only_reference_is_proven_trusted_for_pickle_invocation",
+        _joblib_test_invocation_is_trusted,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_module_requires_origin_review",
+        _joblib_test_requires_origin_review,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph.import_only_module_requires_origin_review",
+        _joblib_test_requires_origin_review,
+    )
+
+
 def _binary_opcode_os_system_reduce_payload() -> bytes:
     # The command text is inert here; the scanner only needs a realistic GLOBAL/REDUCE payload shape.
     return _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93" + _short_binunicode(b"echo") + b"\x85R."
@@ -3537,12 +3633,12 @@ def test_policy_compatibility_exports_cover_required_dangerous_symbols() -> None
     assert is_suspicious_global("json", "loads") is False
 
 
-def test_legitimate_serialization_file_uses_rust_scan(
+def test_legitimate_serialization_file_rejects_bare_joblib_wrapper_without_span_proof(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    safe_path = tmp_path / "safe.joblib"
-    safe_path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00.")
+    bare_path = tmp_path / "bare.joblib"
+    bare_path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00not-joblib-raw-tail")
     malicious_path = tmp_path / "evil.joblib"
     malicious_path.write_bytes(pickle.dumps(MaliciousPayload(), protocol=4))
     text_path = tmp_path / "not-pickle.joblib"
@@ -3552,9 +3648,20 @@ def test_legitimate_serialization_file_uses_rust_scan(
         lambda module, name: (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper"),
     )
 
-    assert _is_legitimate_serialization_file(str(safe_path)) is True
+    assert _is_legitimate_serialization_file(str(bare_path)) is False
     assert _is_legitimate_serialization_file(str(malicious_path)) is False
     assert _is_legitimate_serialization_file(str(text_path)) is False
+
+
+def test_legitimate_serialization_file_accepts_validated_joblib_raw_span(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe_path = tmp_path / "safe.joblib"
+    safe_path.write_bytes(_joblib_test_numpy_array_payload())
+    _trust_joblib_test_references(monkeypatch)
+
+    assert _is_legitimate_serialization_file(str(safe_path)) is True
 
 
 def test_legitimate_serialization_file_keeps_untrusted_wrapper_origin_review(
@@ -3562,7 +3669,7 @@ def test_legitimate_serialization_file_keeps_untrusted_wrapper_origin_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     safe_path = tmp_path / "safe.joblib"
-    safe_path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00.")
+    safe_path.write_bytes(_joblib_test_numpy_array_payload())
     original_requires_origin_review = picklescan_api.import_only_module_requires_origin_review
 
     def requires_origin_review(module: str, name: str) -> bool:
@@ -3591,16 +3698,13 @@ def test_legitimate_serialization_file_skips_call_graph_enrichment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     safe_path = tmp_path / "safe.joblib"
-    safe_path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00.")
+    safe_path.write_bytes(_joblib_test_numpy_array_payload())
 
     def fail_call_graph_enrichment(_report: object) -> object:
         raise AssertionError("validation helper should use native Rust findings only")
 
     monkeypatch.setattr("modelaudit_picklescan.api._with_call_graph_findings", fail_call_graph_enrichment)
-    monkeypatch.setattr(
-        "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
-        lambda module, name: (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper"),
-    )
+    _trust_joblib_test_references(monkeypatch)
 
     assert _is_legitimate_serialization_file(str(safe_path)) is True
 
@@ -3610,16 +3714,13 @@ def test_legitimate_serialization_file_keeps_bounded_file_reads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     safe_path = tmp_path / "safe.joblib"
-    safe_path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00.")
+    safe_path.write_bytes(_joblib_test_numpy_array_payload())
 
     def fail_read_bytes(_path: Path) -> bytes:
         raise AssertionError("validation helper should preserve bounded scanner reads")
 
     monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
-    monkeypatch.setattr(
-        "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
-        lambda module, name: (module, name) == ("joblib.numpy_pickle", "NumpyArrayWrapper"),
-    )
+    _trust_joblib_test_references(monkeypatch)
 
     assert _is_legitimate_serialization_file(str(safe_path)) is True
 
