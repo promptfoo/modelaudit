@@ -395,7 +395,7 @@ BASIC_AUTH_HEADERS_CONSTRUCTOR_TUPLE_PREFIX_PATTERN = re.compile(
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADERS_INIT_START_PATTERN = re.compile(
-    r"(?:^|[^\w$])(?:\\?[\"']\s*)?headers\s*(?:\\?[\"'])?\s*[:=]\s*\[",
+    r"(?:^|[^\w$])(?:\\?[\"']\s*)?headers\s*(?:\\?[\"'])?\s*[:=]\s*(?P<opener>[\[(])",
     re.IGNORECASE,
 )
 BASIC_AUTH_HEADERS_OBJECT_CONTEXT_START_PATTERN = re.compile(
@@ -1079,6 +1079,8 @@ class SecretsDetector:
         for line_index in range(len(lines) - 2, -1, -1):
             line = lines[line_index]
             line_indent = SecretsDetector._basic_auth_line_indent(line)
+            if line.strip().startswith("#"):
+                continue
             if line_indent > current_item_indent:
                 continue
             if key_pattern.fullmatch(line) is not None:
@@ -1285,7 +1287,8 @@ class SecretsDetector:
 
         for headers_match in BASIC_AUTH_HEADERS_INIT_START_PATTERN.finditer(prefix[: tuple_match.start()]):
             if SecretsDetector._basic_auth_headers_init_array_remains_open(
-                prefix[headers_match.end() : tuple_match.start()]
+                prefix[headers_match.end() : tuple_match.start()],
+                headers_match.group("opener"),
             ):
                 return True
         return False
@@ -1325,8 +1328,9 @@ class SecretsDetector:
         return paren_depth > 0 and bracket_depth > 0
 
     @staticmethod
-    def _basic_auth_headers_init_array_remains_open(value: str) -> bool:
-        bracket_depth = 1
+    def _basic_auth_headers_init_array_remains_open(value: str, opener: str = "[") -> bool:
+        opening, closing = ("(", ")") if opener == "(" else ("[", "]")
+        depth = 1
         quote: str | None = None
         escaped = False
 
@@ -1342,14 +1346,14 @@ class SecretsDetector:
                 continue
             if character in {"'", '"', "`"}:
                 quote = character
-            elif character == "[":
-                bracket_depth += 1
-            elif character == "]":
-                bracket_depth -= 1
-                if bracket_depth <= 0:
+            elif character == opening:
+                depth += 1
+            elif character == closing:
+                depth -= 1
+                if depth <= 0:
                     return False
 
-        return bracket_depth > 0
+        return depth > 0
 
     @staticmethod
     def _basic_auth_token_decodes_to_credentials(token: str) -> bool:

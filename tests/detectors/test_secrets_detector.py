@@ -550,6 +550,28 @@ class TestSecretsDetector:
         assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
         assert token not in json.dumps(basic_findings, sort_keys=True)
 
+    def test_basic_auth_source_tuple_headers_container_is_detected(self) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"source-tuple-headers:pass")
+        text = f'requests.get(url, headers=(("Authorization", "Basic {token}"),))'
+
+        findings = detector.scan_text(text, context="client.py")
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert token not in json.dumps(basic_findings, sort_keys=True)
+
+    @pytest.mark.parametrize("container_name", ["params", "metadata"])
+    def test_basic_auth_source_tuple_non_headers_container_is_ignored(self, container_name: str) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"source-tuple-non-header:pass")
+        text = f'requests.get(url, {container_name}=(("Authorization", "Basic {token}"),))'
+
+        findings = detector.scan_text(text, context="client.py")
+
+        assert _basic_auth_findings(findings) == []
+
     def test_basic_auth_many_yaml_header_value_list_entries_are_detected(self) -> None:
         detector = SecretsDetector()
         token = _basic_auth_token(b"many-yaml-list:pass")
@@ -602,6 +624,36 @@ class TestSecretsDetector:
         detector = SecretsDetector()
         token = _basic_auth_token(b"next-key-list:pass")
         text = f"Authorization:\n  - Bearer placeholder\nmetadata:\n  - Basic {token}\n"
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        assert _basic_auth_findings(findings) == []
+
+    @pytest.mark.parametrize("header_name", ["Authorization", "Proxy-Authorization"])
+    def test_basic_auth_yaml_header_value_list_detects_after_comment_only_lines(self, header_name: str) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"yaml-comment-gap:pass")
+        text = f"{header_name}:\n  # generated header list\n  # primary credential\n  - Basic {token}\n"
+
+        findings = detector.scan_text(text, context="headers.yaml")
+
+        basic_findings = _basic_auth_findings(findings)
+        assert len(basic_findings) == 1
+        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert token not in json.dumps(basic_findings, sort_keys=True)
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "\n  - Basic {token}\n",
+            "  documented placeholder\n  - Basic {token}\n",
+            "  - metadata:\n      # comment-only nested line\n      - Basic {token}\n",
+        ],
+    )
+    def test_basic_auth_yaml_header_value_list_ignores_non_direct_gaps(self, body: str) -> None:
+        detector = SecretsDetector()
+        token = _basic_auth_token(b"yaml-nondirect-gap:pass")
+        text = "Authorization:\n" + body.format(token=token)
 
         findings = detector.scan_text(text, context="headers.yaml")
 
