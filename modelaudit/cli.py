@@ -726,10 +726,11 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
         else (download_files or selected_files)
     )
     total_size = metadata.get("total_size")
-    selected_display_sizes = [_huggingface_preview_file_size(item) for item in selected_files]
-    selected_display_size = sum(size for size in selected_display_sizes if size is not None)
     budget_sizes = [_huggingface_preview_file_size(item) for item in budget_files]
     budget_size = sum(size for size in budget_sizes if size is not None)
+    display_files = budget_files if runtime.scan_and_delete and max_download_bytes is not None else selected_files
+    display_sizes = [_huggingface_preview_file_size(item) for item in display_files]
+    display_size = sum(size for size in display_sizes if size is not None)
     if runtime.scan_and_delete and max_download_bytes is not None:
         _huggingface_stream_preview_enforce_content_route_candidate_limit(metadata, selected_files, runtime)
     if max_download_bytes is not None and any(size is None for size in budget_sizes):
@@ -765,8 +766,8 @@ def _preview_huggingface_model_source(path: str, runtime: "_ScanRuntimeConfig", 
     _preview_echo(f"   Files: {_escape_terminal_text(str(metadata.get('file_count', 0)))}", err=err)
     _preview_echo(f"   Total size: {_format_preview_size(total_size)}", err=err)
     if runtime.scannable_extensions is not None or runtime.scannable_filenames is not None:
-        _preview_echo(f"   Scannable files: {len(selected_files)} of {metadata.get('file_count', 0)}", err=err)
-        _preview_echo(f"   Scannable size: {_format_preview_size(selected_display_size)}", err=err)
+        _preview_echo(f"   Scannable files: {len(display_files)} of {metadata.get('file_count', 0)}", err=err)
+        _preview_echo(f"   Scannable size: {_format_preview_size(display_size)}", err=err)
     if runtime.scan_and_delete:
         _preview_echo("   Mode: Streaming", err=err)
     if runtime.scanner_selection_metadata is not None:

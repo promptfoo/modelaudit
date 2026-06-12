@@ -1123,6 +1123,52 @@ def test_hf_stream_dry_run_max_size_budgets_unselected_content_route_candidates(
     mock_scan.assert_not_called()
 
 
+def test_hf_stream_dry_run_max_size_displays_budgeted_content_route_candidates() -> None:
+    runner = CliRunner()
+    metadata = {
+        "repo_id": "test/model",
+        "model_id": "test/model",
+        "revision": "a" * 40,
+        "total_size": 60,
+        "file_count": 2,
+        "files": [
+            {"name": "model.pt", "size": 20},
+            {"name": "renamed.payload", "size": 40},
+        ],
+    }
+
+    with (
+        _mock_hf_model_info(return_value=metadata),
+        patch("modelaudit.cli.download_model") as mock_download_model,
+        patch("modelaudit.cli.scan_model_directory_or_file") as mock_scan,
+        patch("modelaudit.utils.sources.huggingface._read_huggingface_prefix") as mock_read_prefix,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "scan",
+                "--dry-run",
+                "--stream",
+                "--format",
+                "json",
+                "--max-size",
+                "100B",
+                "--scanners",
+                "pytorch_zip",
+                "hf://test/model",
+            ],
+        )
+
+    parsed = parse_click_json_output(result.stdout)
+    assert result.exit_code == 0, result.output
+    assert parsed["files_scanned"] == 0
+    assert "Scannable files: 2 of 2" in result.stderr
+    assert "Scannable size: 60 B" in result.stderr
+    mock_read_prefix.assert_not_called()
+    mock_download_model.assert_not_called()
+    mock_scan.assert_not_called()
+
+
 def test_hf_repo_dry_run_preview_rejects_negative_max_size_without_metadata_lookup() -> None:
     runner = CliRunner()
 
