@@ -759,6 +759,7 @@ def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -
         "https://github.com/Lightricks/LTX-2/blob/main/license_update.py",
         "https://github.com/Lightricks/LTX-2/blob/main/license.bat",
         "https://github.com/Lightricks/LTX-2/blob/main/license.com",
+        "https://github.com/Lightricks/LTX-2/blob/main/license.jar",
         "https://github.com/Lightricks/LTX-2/blob/main/license.js",
         "https://github.com/Lightricks/LTX-2/%252Freleases%252Fv1/license",
         "https://user:pass@github.com/Lightricks/LTX-2/blob/main/LICENSE",

@@ -379,6 +379,7 @@ _SUSPICIOUS_LICENSE_URL_PATH_SUFFIXES = (
     ".gguf",
     ".gz",
     ".h5",
+    ".jar",
     ".js",
     ".joblib",
     ".jsx",
