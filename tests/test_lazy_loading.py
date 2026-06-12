@@ -409,8 +409,8 @@ class TestSpecificFileTypes:
                 # This is actually expected behavior - not all JSON files are ML-related
 
                 # Should have loaded minimal scanners (or none if no match).
-                # JSON dispatch can probe metadata/xgboost/mxnet/manifest scanners.
-                expected_json_probe_scanners = {"metadata", "xgboost", "mxnet", "manifest"}
+                # JSON dispatch can probe JAX metadata/xgboost/mxnet/manifest scanners.
+                expected_json_probe_scanners = {"jax_checkpoint", "metadata", "xgboost", "mxnet", "manifest"}
                 assert set(_registry._loaded_scanners).issubset(expected_json_probe_scanners)
             finally:
                 Path(f.name).unlink(missing_ok=True)
