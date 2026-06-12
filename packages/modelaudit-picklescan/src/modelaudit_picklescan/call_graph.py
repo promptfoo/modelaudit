@@ -2452,7 +2452,48 @@ def _loaded_site_package_reference_owner_matches(
         return all(
             _function_owner_matches_trusted_source(function, expected_module=module_name) for function in functions
         ) and _trusted_reference_runtime_dependencies_are_source_independent(value)
-    return not callable(value)
+    if callable(value):
+        return False
+    return _loaded_site_package_instance_owner_matches_trusted_source(
+        value,
+        expected_module=module_name,
+        expected_name=name,
+        pickle_entrypoint_methods=pickle_entrypoint_methods,
+    )
+
+
+def _loaded_site_package_instance_owner_matches_trusted_source(
+    value: object,
+    *,
+    expected_module: str,
+    expected_name: str,
+    pickle_entrypoint_methods: tuple[str, ...] | None,
+) -> bool:
+    if pickle_entrypoint_methods is None or not any(
+        method in _PICKLE_BUILD_ENTRYPOINT_METHODS for method in pickle_entrypoint_methods
+    ):
+        return True
+    class_ = type(value)
+    class_module = type.__getattribute__(class_, "__module__")
+    class_name = type.__getattribute__(class_, "__name__")
+    if (
+        type(class_module) is not str
+        or class_module != expected_module
+        or type(class_name) is not str
+        or class_name != _reference_leaf_name(expected_name)
+        or _trusted_python_module_source_path(class_module) is None
+    ):
+        return False
+    return _class_pickle_owner_matches_trusted_source(
+        class_,
+        expected_module=expected_module,
+        pickle_entrypoint_methods=pickle_entrypoint_methods,
+        pickle_invokes_metaclass_call=False,
+    ) and _class_pickle_runtime_dependencies_are_source_independent(
+        class_,
+        pickle_entrypoint_methods=pickle_entrypoint_methods,
+        pickle_invokes_metaclass_call=False,
+    )
 
 
 def _reference_leaf_name(name: str) -> str:
