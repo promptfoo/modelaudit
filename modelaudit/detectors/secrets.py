@@ -677,7 +677,7 @@ class SecretsDetector:
         return redacted
 
     @staticmethod
-    def _basic_auth_match_has_header_context(text: str, position: int) -> bool:
+    def _basic_auth_match_has_header_context(text: str, position: int, match_end: int | None = None) -> bool:
         search_start = max(0, position - BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS)
         last_newline = max(text.rfind("\n", search_start, position), text.rfind("\r", search_start, position))
         line_start = search_start if last_newline == -1 else last_newline + 1
@@ -706,7 +706,12 @@ class SecretsDetector:
                     return True
         collection_search_start = max(0, position - BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS)
         collection_prefix = text[collection_search_start:position]
-        if SecretsDetector._basic_auth_prefix_has_headers_object_context(collection_prefix):
+        collection_suffix = (
+            text[match_end : min(len(text), match_end + BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS)]
+            if match_end is not None
+            else ""
+        )
+        if SecretsDetector._basic_auth_prefix_has_headers_object_context(collection_prefix, collection_suffix):
             return True
         if BASIC_AUTH_CONTINUATION_PREFIX_PATTERN.fullmatch(line_prefix) is None:
             return False
@@ -733,7 +738,7 @@ class SecretsDetector:
         )
 
     @staticmethod
-    def _basic_auth_prefix_has_headers_object_context(prefix: str) -> bool:
+    def _basic_auth_prefix_has_headers_object_context(prefix: str, suffix: str = "") -> bool:
         if BASIC_AUTH_HEADER_OBJECT_VALUE_PREFIX_PATTERN.search(prefix) is None:
             return False
 
@@ -748,11 +753,28 @@ class SecretsDetector:
         for match in BASIC_AUTH_HEADER_OBJECT_ITEM_START_PATTERN.finditer(headers_prefix):
             item_start = max(item_start, match.end())
         item_prefix = headers_prefix[item_start if item_start >= 0 else 0 :]
+        item_suffix = SecretsDetector._basic_auth_header_object_item_suffix(suffix)
+        item_text = item_prefix + item_suffix
 
-        for match in BASIC_AUTH_HEADER_OBJECT_NAME_FIELD_PATTERN.finditer(item_prefix):
+        for match in BASIC_AUTH_HEADER_OBJECT_NAME_FIELD_PATTERN.finditer(item_text):
             if _canonical_basic_auth_header_key(match.group("name")) is not None:
                 return True
         return False
+
+    @staticmethod
+    def _basic_auth_header_object_item_suffix(suffix: str) -> str:
+        if not suffix:
+            return ""
+
+        end = len(suffix)
+        for delimiter in ("}", "]"):
+            delimiter_index = suffix.find(delimiter)
+            if delimiter_index != -1:
+                end = min(end, delimiter_index)
+        item_match = BASIC_AUTH_HEADER_OBJECT_ITEM_START_PATTERN.search(suffix)
+        if item_match is not None:
+            end = min(end, item_match.start())
+        return suffix[:end]
 
     @staticmethod
     def _basic_auth_prefix_has_headers_constructor_context(prefix: str) -> bool:
@@ -862,6 +884,7 @@ class SecretsDetector:
         return self._basic_auth_match_has_header_context(
             text,
             match.start(),
+            match.end(),
         ) and self._basic_auth_token_decodes_to_credentials(token)
 
     def _record_basic_auth_finding(

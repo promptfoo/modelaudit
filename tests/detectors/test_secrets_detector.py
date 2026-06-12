@@ -361,15 +361,31 @@ class TestSecretsDetector:
                 _basic_auth_token(b"object-list:pass"),
             ),
             (
+                f'fetch("/model", {{ headers: [{{ value: "Basic {_basic_auth_token(b"object-list-reordered:pass")}", '
+                'name: "Authorization" }] })',
+                _basic_auth_token(b"object-list-reordered:pass"),
+            ),
+            (
                 "headers:\n"
                 "  - name: Proxy-Authorization\n"
                 f"    value: Basic {_basic_auth_token(b'yaml-object-list:pass')}\n",
                 _basic_auth_token(b"yaml-object-list:pass"),
             ),
             (
+                "headers:\n"
+                f"  - value: Basic {_basic_auth_token(b'yaml-object-reordered:pass')}\n"
+                "    name: Proxy-Authorization\n",
+                _basic_auth_token(b"yaml-object-reordered:pass"),
+            ),
+            (
                 f'{{"headers":[{{"headerName":"proxy_authorization_header","headerValue":"Basic '
                 f'{_basic_auth_token(b"json-header-object:pass")}"}}]}}',
                 _basic_auth_token(b"json-header-object:pass"),
+            ),
+            (
+                f'{{"headers":[{{"headerValue":"Basic {_basic_auth_token(b"json-header-object-reordered:pass")}",'
+                '"headerName":"proxy_authorization_header"}]}}',
+                _basic_auth_token(b"json-header-object-reordered:pass"),
             ),
             (
                 f"headers=[('Authorization', 'Basic {_basic_auth_token(b'assignment-tuple:pass')}')]",
@@ -477,6 +493,15 @@ class TestSecretsDetector:
             (
                 'headers: [{ name: "Authorization", description: "documented" }, '
                 f'{{ name: "Accept", value: "Basic {_basic_auth_token(b"wrong-object:pass")}" }}]'
+            ),
+            (
+                f'headers: [{{ value: "Basic {_basic_auth_token(b"wrong-object-reordered:pass")}" }}, '
+                '{ name: "Authorization" }]'
+            ),
+            (
+                "headers:\n"
+                f"  - value: Basic {_basic_auth_token(b'wrong-yaml-object-reordered:pass')}\n"
+                "  - name: Authorization\n"
             ),
             f'notes.append("Authorization notes", "Basic {_basic_auth_token(b"notes:pass")}")',
             f"\u0391uthorization: Basic {_basic_auth_token(b'confusable-alpha:pass')}",
