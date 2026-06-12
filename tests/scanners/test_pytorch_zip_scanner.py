@@ -19,7 +19,13 @@ from types import ModuleType
 from typing import IO, Any
 
 import pytest
-from modelaudit_picklescan.call_graph import _clear_source_sensitive_caches, import_only_module_requires_origin_review
+from modelaudit_picklescan.api import _source_backed_import_requires_initialization_proof
+from modelaudit_picklescan.call_graph import (
+    _clear_source_sensitive_caches,
+    import_only_module_requires_origin_review,
+    module_initialization_is_proven_inert,
+    module_is_loaded_without_import_hooks,
+)
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file, scan_model_streaming
@@ -12396,12 +12402,18 @@ def test_pytorch_zip_tensor_metadata_truncation_preserves_origin_warning_precede
         zipf.writestr("archive/data/0", b"\x00" * 24)
 
     requires_origin_review = import_only_module_requires_origin_review("torch._utils", "_rebuild_tensor_v2")
+    requires_source_backed_import_proof = (
+        _source_backed_import_requires_initialization_proof(("torch._utils", "_rebuild_tensor_v2"))
+        and not module_is_loaded_without_import_hooks("torch._utils")
+        and not module_initialization_is_proven_inert("torch._utils")
+    )
+    warning_expected = requires_origin_review or requires_source_backed_import_proof
     _assert_pytorch_zip_inconclusive_not_cached(
         zip_path,
         tmp_path / "truncation-cache",
         "pytorch_zip_tensor_metadata_validation_truncated",
-        expected_success=requires_origin_review,
-        expected_exit_code=1 if requires_origin_review else 2,
+        expected_success=warning_expected,
+        expected_exit_code=1 if warning_expected else 2,
     )
 
 
