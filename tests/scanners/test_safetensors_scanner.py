@@ -790,6 +790,7 @@ def test_license_metadata_executable_content_is_not_suppressed(tmp_path: Path) -
         "https://github.com/Lightricks/LTX-2/blob/main/license.pkl",
         "https://opensource.org/licenses/MIT?u=https://evil.example/x",
         "https://github.com:bad/Lightricks/LTX-2/blob/main/LICENSE",
+        "https://github.com:65536/Lightricks/LTX-2/blob/main/LICENSE",
         "https://opensource.org:bad/licenses/MIT",
         "https://github.com:/Lightricks/LTX-2/blob/main/LICENSE",
         "https://opensource.org:/licenses/MIT",
