@@ -94,6 +94,38 @@ class _FakeRangeResponse:
         yield self.payload[:chunk_size]
 
 
+class _FakeTreeResponse:
+    def __init__(
+        self,
+        payload: object,
+        links: dict[str, dict[str, str]] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.payload = payload
+        self.raw_payload = json.dumps(payload).encode("utf-8")
+        self.links = links or {}
+        self.headers = headers if headers is not None else {"Content-Length": str(len(self.raw_payload))}
+
+    def __enter__(self) -> "_FakeTreeResponse":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> object:
+        return self.payload
+
+    def iter_content(self, chunk_size: int) -> Iterator[bytes]:
+        for start in range(0, len(self.raw_payload), chunk_size):
+            yield self.raw_payload[start : start + chunk_size]
+
+    def iter_bytes(self, chunk_size: int) -> Iterator[bytes]:
+        yield from self.iter_content(chunk_size)
+
+
 def _fake_content_range_response(payload: bytes, start: int, end: int) -> _FakeRangeResponse:
     return _FakeRangeResponse(
         payload[start : end + 1],
@@ -623,13 +655,19 @@ class TestModelDownload:
 
         mock_snapshot_download.assert_not_called()
 
+    @patch("modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated")
     @patch("huggingface_hub.HfApi.repo_info")
-    def test_list_repo_files_timeout_uses_hfapi_timeout(self, mock_repo_info: MagicMock) -> None:
+    def test_list_repo_files_timeout_uses_hfapi_timeout(
+        self,
+        mock_repo_info: MagicMock,
+        mock_paginated_listing: MagicMock,
+    ) -> None:
         """Timeout helper should use the request-layer timeout instead of background threads."""
         mock_repo_info.return_value = SimpleNamespace(
             sha=_HF_TEST_REVISION,
             siblings=[SimpleNamespace(rfilename="config.json")],
         )
+        mock_paginated_listing.return_value = ["config.json"]
 
         repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
 
@@ -637,14 +675,21 @@ class TestModelDownload:
         assert revision == _HF_TEST_REVISION
         assert error is None
         mock_repo_info.assert_called_once_with("test/model", timeout=7, files_metadata=False)
+        mock_paginated_listing.assert_called_once_with("test/model", _HF_TEST_REVISION, timeout_seconds=7)
 
+    @patch("modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated")
     @patch("huggingface_hub.HfApi.repo_info")
-    def test_list_repo_files_timeout_passes_requested_revision(self, mock_repo_info: MagicMock) -> None:
+    def test_list_repo_files_timeout_passes_requested_revision(
+        self,
+        mock_repo_info: MagicMock,
+        mock_paginated_listing: MagicMock,
+    ) -> None:
         """Requested repository revisions should reach direct HfApi listing calls."""
         mock_repo_info.return_value = SimpleNamespace(
             sha=_HF_TEST_REVISION,
             siblings=[SimpleNamespace(rfilename="config.json")],
         )
+        mock_paginated_listing.return_value = ["config.json"]
 
         repo_files, revision, error = _list_repo_files_with_timeout(
             "test/model",
@@ -661,6 +706,7 @@ class TestModelDownload:
             files_metadata=False,
             revision="refs/pr/1",
         )
+        mock_paginated_listing.assert_called_once_with("test/model", _HF_TEST_REVISION, timeout_seconds=7)
 
     @patch("modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline")
     def test_list_repo_files_deadline_uses_terminable_worker(self, mock_run_worker: MagicMock) -> None:
@@ -683,6 +729,25 @@ class TestModelDownload:
             {"repo_id": "test/model", "request_timeout": 7},
             123.0,
             "test/model",
+        )
+
+    @patch("modelaudit.utils.sources.huggingface._list_huggingface_repo_files_at_revision")
+    def test_download_worker_serializes_repository_listing(self, mock_list_at_revision: MagicMock) -> None:
+        """The deadline worker should return only serializable listing evidence."""
+        mock_list_at_revision.return_value = (["config.json", "model.bin"], _HF_TEST_REVISION)
+
+        result = _run_huggingface_worker_operation(
+            "list_repo_files",
+            {"repo_id": "test/model", "request_timeout": 7},
+        )
+
+        assert result == {
+            "value": {"files": ["config.json", "model.bin"], "revision": _HF_TEST_REVISION},
+        }
+        mock_list_at_revision.assert_called_once_with(
+            "test/model",
+            requested_revision=None,
+            timeout_seconds=7,
         )
 
     @patch("modelaudit.utils.sources.huggingface._run_huggingface_worker_with_deadline")
@@ -709,31 +774,377 @@ class TestModelDownload:
             "test/model",
         )
 
+    @patch("huggingface_hub.utils.get_session")
     @patch("huggingface_hub.HfApi.repo_info")
-    def test_download_worker_serializes_repository_listing(self, mock_repo_info: MagicMock) -> None:
-        """The deadline worker should return only serializable listing evidence."""
-        mock_repo_info.return_value = SimpleNamespace(
-            sha=_HF_TEST_REVISION,
-            siblings=[SimpleNamespace(rfilename="model.bin"), {"path": "config.json"}],
+    def test_list_repo_files_uses_paginated_tree_inventory(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+    ) -> None:
+        """Large repository inventory should consume every tree page once and deduplicate names."""
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_session = mock_get_session.return_value
+        mock_session.stream.side_effect = [
+            _FakeTreeResponse(
+                [
+                    {"type": "file", "path": "z-model.bin"},
+                    {"type": "directory", "path": "nested"},
+                ],
+                links={"next": {"url": "https://huggingface.co/api/models/test/model/tree/page-2"}},
+            ),
+            _FakeTreeResponse(
+                [
+                    {"type": "file", "path": "a-config.json"},
+                    {"type": "file", "path": "z-model.bin"},
+                ],
+            ),
+        ]
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files == ["a-config.json", "z-model.bin"]
+        assert revision == _HF_TEST_REVISION
+        assert error is None
+        mock_get_session.assert_called_once_with()
+        assert mock_session.stream.call_count == 2
+        assert mock_session.stream.call_args_list[0].args[:2] == ("GET", ANY)
+        assert mock_session.stream.call_args_list[0].kwargs["params"] == {"recursive": True, "expand": False}
+        assert mock_session.stream.call_args_list[1].args[:2] == (
+            "GET",
+            "https://huggingface.co/api/models/test/model/tree/page-2",
+        )
+        assert mock_session.stream.call_args_list[1].kwargs["params"] is None
+
+    @pytest.mark.parametrize(
+        ("next_url", "expected_error"),
+        [
+            ("https://attacker.example/api/models/test/model/tree/page-2", "pagination link changed origin"),
+            ("http://huggingface.co/api/models/test/model/tree/page-2", "pagination link changed origin"),
+            ("https://user:pass@huggingface.co/api/models/test/model/tree/page-2", "invalid pagination link"),
+            ("https://huggingface.co:bad/api/models/test/model/tree/page-2", "invalid pagination link"),
+            ("/api/models/test/model/tree/page-2", "invalid pagination link"),
+        ],
+    )
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_unsafe_pagination_links_before_following(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        next_url: str,
+        expected_error: str,
+    ) -> None:
+        """Unsafe next links must fail closed before auth headers can reach another origin."""
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_session = mock_get_session.return_value
+        mock_session.stream.side_effect = [
+            _FakeTreeResponse(
+                [{"type": "file", "path": "first.bin"}],
+                links={"next": {"url": next_url}},
+            ),
+            AssertionError("unsafe pagination link should not be followed"),
+        ]
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert expected_error in error
+        assert mock_session.stream.call_count == 1
+        requested_urls = [stream_call.args[1] for stream_call in mock_session.stream.call_args_list]
+        assert next_url not in requested_urls
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "../escape.bin",
+            "/abs.bin",
+            "nested/../../escape.bin",
+            "nested//model.bin",
+            r"nested\escape.bin",
+            "bad\x00name.bin",
+        ],
+    )
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_unsafe_paginated_names(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        filename: str,
+    ) -> None:
+        """Repository tree names must not escape local placement or verification roots."""
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse([{"type": "file", "path": filename}])
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "unsafe repository filename" in error
+
+    @pytest.mark.parametrize(
+        "tree_item",
+        [
+            {"path": "malicious.pkl"},
+            {"type": None, "path": "malicious.pkl"},
+            {"type": "lfs", "path": "malicious.pkl"},
+        ],
+    )
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_unknown_paginated_tree_item_types(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        tree_item: dict[str, object],
+    ) -> None:
+        """Unknown tree item types must not create a partial benign inventory."""
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse(
+            [
+                {"type": "file", "path": "benign.bin"},
+                tree_item,
+            ]
         )
 
-        result = _run_huggingface_worker_operation(
-            "list_repo_files",
-            {"repo_id": "test/model", "request_timeout": 7},
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "unknown tree item type" in error
+
+    @pytest.mark.parametrize(
+        "tree_item",
+        [
+            {"type": "file"},
+            {"type": "file", "path": None},
+            {"type": "file", "path": 123},
+        ],
+    )
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_malformed_paginated_file_entries(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        tree_item: dict[str, object],
+    ) -> None:
+        """Malformed file entries must fail closed before the inventory is accepted."""
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse(
+            [
+                {"type": "file", "path": "benign.bin"},
+                tree_item,
+            ]
         )
 
-        assert result == {
-            "value": {"files": ["model.bin", "config.json"], "revision": _HF_TEST_REVISION},
-        }
-        mock_repo_info.assert_called_once_with("test/model", timeout=7, files_metadata=False)
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
 
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "invalid repository filename" in error
+
+    @patch("huggingface_hub.utils.get_session")
     @patch("huggingface_hub.HfApi.repo_info")
-    def test_download_worker_passes_requested_revision_to_listing(self, mock_repo_info: MagicMock) -> None:
+    def test_list_repo_files_rejects_repeated_pagination_cursor(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+    ) -> None:
+        """A repeated next page URL must fail closed instead of looping or double-counting."""
+        repeated_url = "https://huggingface.co/api/models/test/model/tree/repeated"
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_session = mock_get_session.return_value
+        mock_session.stream.side_effect = [
+            _FakeTreeResponse([{"type": "file", "path": "first.bin"}], links={"next": {"url": repeated_url}}),
+            _FakeTreeResponse([{"type": "file", "path": "second.bin"}], links={"next": {"url": repeated_url}}),
+        ]
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "pagination cursor repeated" in error
+        assert mock_session.stream.call_count == 2
+
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_truncated_paginated_inventory(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+    ) -> None:
+        """A later page failure must not produce a partial successful inventory."""
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_get_session.return_value.stream.side_effect = [
+            _FakeTreeResponse(
+                [{"type": "file", "path": "first.bin"}],
+                links={"next": {"url": "https://huggingface.co/api/models/test/model/tree/page-2"}},
+            ),
+            RuntimeError("page 2 failed"),
+        ]
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "page 2 failed" in error
+
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_excessive_paginated_inventory(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Repository inventory remains explicitly bounded even when pagination succeeds."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface._MAX_HF_REPOSITORY_INVENTORY_FILES", 2)
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse(
+            [
+                {"type": "file", "path": "one.bin"},
+                {"type": "file", "path": "two.bin"},
+                {"type": "file", "path": "three.bin"},
+            ]
+        )
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "bounded inventory limit" in error
+
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_excessive_tree_page_response_bytes(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Tree pages must be byte-bounded before JSON decoding."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface._MAX_HF_REPOSITORY_TREE_PAGE_RESPONSE_BYTES", 16)
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse(
+            [{"type": "file", "path": "model.bin"}],
+            headers={"Content-Length": "17"},
+        )
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "bounded response limit" in error
+
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_overlong_paginated_names(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Accepted tree paths must be length-bounded before local path or glob use."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface._MAX_HF_REPOSITORY_PATH_CHARS", 8)
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse(
+            [{"type": "file", "path": "very-long-model.bin"}]
+        )
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "bounded path length" in error
+
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_rejects_excessive_page_count(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Pagination must fail closed when page count exceeds the explicit cap."""
+        monkeypatch.setattr("modelaudit.utils.sources.huggingface._MAX_HF_REPOSITORY_INVENTORY_PAGES", 1)
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_get_session.return_value.stream.return_value = _FakeTreeResponse(
+            [{"type": "file", "path": "first.bin"}],
+            links={"next": {"url": "https://huggingface.co/api/models/test/model/tree/page-2"}},
+        )
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "bounded pagination limit" in error
+
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_canonicalizes_repeated_pagination_cursor(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+    ) -> None:
+        """Semantically repeated next URLs must not evade loop detection by query ordering."""
+        first_url = "https://huggingface.co/api/models/test/model/tree/page?cursor=abc&expand=false"
+        repeated_url = "https://huggingface.co/api/models/test/model/tree/page?expand=false&cursor=abc"
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_session = mock_get_session.return_value
+        mock_session.stream.side_effect = [
+            _FakeTreeResponse([{"type": "file", "path": "first.bin"}], links={"next": {"url": first_url}}),
+            _FakeTreeResponse([{"type": "file", "path": "second.bin"}], links={"next": {"url": repeated_url}}),
+        ]
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files is None
+        assert revision is None
+        assert error is not None
+        assert "pagination cursor repeated" in error
+        assert mock_session.stream.call_count == 2
+
+    @patch("huggingface_hub.utils.build_hf_headers")
+    @patch("huggingface_hub.utils.get_session")
+    @patch("huggingface_hub.HfApi.repo_info")
+    def test_list_repo_files_uses_configured_session_and_auth_headers(
+        self,
+        mock_repo_info: MagicMock,
+        mock_get_session: MagicMock,
+        mock_build_headers: MagicMock,
+    ) -> None:
+        """Private or gated inventories should use Hub-configured auth headers and transport."""
+        mock_repo_info.return_value = SimpleNamespace(sha=_HF_TEST_REVISION)
+        mock_build_headers.return_value = {"authorization": "Bearer configured-token"}
+        mock_session = mock_get_session.return_value
+        mock_session.stream.return_value = _FakeTreeResponse([{"type": "file", "path": "model.bin"}])
+
+        repo_files, revision, error = _list_repo_files_with_timeout("test/model", timeout_seconds=7)
+
+        assert repo_files == ["model.bin"]
+        assert revision == _HF_TEST_REVISION
+        assert error is None
+        mock_build_headers.assert_called_once_with(token=None)
+        mock_get_session.assert_called_once_with()
+        assert mock_session.stream.call_args.args[0] == "GET"
+        assert mock_session.stream.call_args.kwargs["headers"] == {"authorization": "Bearer configured-token"}
+
+    @patch("modelaudit.utils.sources.huggingface._list_huggingface_repo_files_at_revision")
+    def test_download_worker_passes_requested_revision_to_listing(self, mock_list_at_revision: MagicMock) -> None:
         """Worker listing operations should not silently fall back to default branch."""
-        mock_repo_info.return_value = SimpleNamespace(
-            sha=_HF_TEST_REVISION,
-            siblings=[SimpleNamespace(rfilename="model.bin")],
-        )
+        mock_list_at_revision.return_value = (["model.bin"], _HF_TEST_REVISION)
 
         result = _run_huggingface_worker_operation(
             "list_repo_files",
@@ -743,11 +1154,10 @@ class TestModelDownload:
         assert result == {
             "value": {"files": ["model.bin"], "revision": _HF_TEST_REVISION},
         }
-        mock_repo_info.assert_called_once_with(
+        mock_list_at_revision.assert_called_once_with(
             "test/model",
-            timeout=7,
-            files_metadata=False,
-            revision="refs/pr/1",
+            requested_revision="refs/pr/1",
+            timeout_seconds=7,
         )
 
     @patch("huggingface_hub.HfApi.model_info")
@@ -780,7 +1190,7 @@ class TestModelDownload:
 
         repo_files, pinned_revision, error = _list_repo_files_with_timeout("test/model")
 
-        assert repo_files == ["model.bin"]
+        assert repo_files is None
         assert pinned_revision is None
         assert error == "repository listing did not include an immutable commit SHA"
 
@@ -1929,6 +2339,45 @@ class TestModelDownload:
             "test/model",
         )
 
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    def test_huggingface_path_sizes_reject_conflicting_duplicate_metadata(
+        self,
+        mock_get_paths_info: MagicMock,
+    ) -> None:
+        """Conflicting duplicate size evidence must not weaken aggregate download caps."""
+        mock_get_paths_info.return_value = [
+            SimpleNamespace(path="model.bin", size=1500),
+            SimpleNamespace(path="model.bin", size=1),
+        ]
+
+        with pytest.raises(Exception, match=r"inconsistent size metadata for selected file model\.bin"):
+            _get_huggingface_path_sizes("test/model", ["model.bin"], resolved_revision=_HF_TEST_REVISION)
+
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    def test_huggingface_path_sizes_batches_large_selections(
+        self,
+        mock_get_paths_info: MagicMock,
+    ) -> None:
+        """Selected-file metadata should stay under the Hub path-info batch limit."""
+        filenames = [f"shard-{idx:04d}.bin" for idx in range(513)]
+        mock_get_paths_info.side_effect = [
+            [SimpleNamespace(path=filename, size=1) for filename in filenames[:512]],
+            [SimpleNamespace(path=filenames[512], size=1)],
+        ]
+
+        sizes, revision = _get_huggingface_path_sizes(
+            "test/model",
+            filenames,
+            resolved_revision=_HF_TEST_REVISION,
+        )
+
+        assert sizes == dict.fromkeys(filenames, 1)
+        assert revision == _HF_TEST_REVISION
+        assert mock_get_paths_info.call_args_list == [
+            call("test/model", filenames[:512], revision=_HF_TEST_REVISION),
+            call("test/model", filenames[512:], revision=_HF_TEST_REVISION),
+        ]
+
     @patch("modelaudit.utils.sources.huggingface.time.monotonic", return_value=100.0)
     @patch("requests.get")
     def test_huggingface_prefix_rechecks_deadline_between_chunks(
@@ -2094,19 +2543,35 @@ class TestModelDownload:
         assert deadline > time.monotonic()
         assert repo_id == "test/model"
 
+    @patch("modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated")
     @patch("huggingface_hub.HfApi.repo_info")
-    def test_list_repo_files_at_revision_returns_matching_sha(self, mock_repo_info: MagicMock) -> None:
+    def test_list_repo_files_at_revision_returns_matching_sha(
+        self,
+        mock_repo_info: MagicMock,
+        mock_paginated_listing: MagicMock,
+    ) -> None:
         """Capped downloads should keep the listing and transfer on one immutable revision."""
         mock_repo_info.return_value = SimpleNamespace(
             sha=TEST_COMMIT_SHA,
             siblings=[SimpleNamespace(rfilename="pytorch_model.bin")],
         )
+        mock_paginated_listing.return_value = ["pytorch_model.bin"]
 
-        repo_files, revision = _list_huggingface_repo_files_at_revision("test/model", timeout_seconds=7)
+        repo_files, revision = _list_huggingface_repo_files_at_revision(
+            "test/model",
+            requested_revision=TEST_COMMIT_SHA,
+            timeout_seconds=7,
+        )
 
         assert repo_files == ["pytorch_model.bin"]
         assert revision == TEST_COMMIT_SHA
-        mock_repo_info.assert_called_once_with("test/model", timeout=7, files_metadata=False)
+        mock_repo_info.assert_called_once_with(
+            "test/model",
+            timeout=7,
+            files_metadata=False,
+            revision=TEST_COMMIT_SHA,
+        )
+        mock_paginated_listing.assert_called_once_with("test/model", TEST_COMMIT_SHA, timeout_seconds=7)
 
     @patch("huggingface_hub.HfApi.repo_info")
     def test_list_repo_files_at_revision_rejects_mutable_revision(self, mock_repo_info: MagicMock) -> None:
@@ -2116,7 +2581,7 @@ class TestModelDownload:
             siblings=[SimpleNamespace(rfilename="pytorch_model.bin")],
         )
 
-        with pytest.raises(Exception, match="repository revision unavailable"):
+        with pytest.raises(Exception, match="immutable commit SHA"):
             _list_huggingface_repo_files_at_revision("test/model")
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
@@ -2334,6 +2799,38 @@ class TestModelDownload:
     )
     @patch("huggingface_hub.HfApi.get_paths_info")
     @patch("huggingface_hub.snapshot_download")
+    def test_download_model_max_size_allows_hf_cache_blob_symlink(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Capped default-cache snapshots should allow normal Hub blob symlinks."""
+        repo_cache = tmp_path / "hf-cache" / "hub" / "models--test--model"
+        download_path = repo_cache / "snapshots" / _HF_TEST_REVISION
+        blob_path = repo_cache / "blobs" / "abc123"
+        download_path.mkdir(parents=True)
+        blob_path.parent.mkdir(parents=True)
+        blob_path.write_bytes(b"weights")
+        (download_path / "pytorch_model.bin").symlink_to(Path("..") / ".." / "blobs" / blob_path.name)
+        mock_snapshot_download.return_value = str(download_path)
+        mock_get_paths_info.return_value = [SimpleNamespace(path="pytorch_model.bin", size=7)]
+
+        download_model("https://huggingface.co/test/model", max_size=1000)
+
+        assert mock_snapshot_download.call_args.kwargs["allow_patterns"] == ["pytorch_model.bin"]
+        assert mock_snapshot_download.call_args.kwargs["revision"] == _HF_TEST_REVISION
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.snapshot_download")
     def test_download_model_max_size_rejects_underreported_snapshot(
         self,
         mock_snapshot_download: MagicMock,
@@ -2351,6 +2848,34 @@ class TestModelDownload:
 
         with pytest.raises(Exception, match="downloaded selected Hugging Face files total 9 bytes exceeds max size 4"):
             download_model("https://huggingface.co/test/model", max_size=4)
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["pytorch_model.bin"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_max_size_rejects_symlink_escape_after_transfer(
+        self,
+        mock_snapshot_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Capped downloads should not accept arbitrary selected-file symlink escapes."""
+        download_path = tmp_path / "download"
+        escaped_target = tmp_path / "outside.bin"
+        download_path.mkdir()
+        escaped_target.write_bytes(b"weights")
+        (download_path / "pytorch_model.bin").symlink_to(escaped_target)
+        mock_snapshot_download.return_value = str(download_path)
+        mock_get_paths_info.return_value = [SimpleNamespace(path="pytorch_model.bin", size=7)]
+
+        with pytest.raises(Exception, match="downloaded selected file symlink target escaped: pytorch_model\\.bin"):
+            download_model("https://huggingface.co/test/model", max_size=1000)
 
     @patch("modelaudit.utils.sources.huggingface.get_model_size", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
@@ -3127,12 +3652,12 @@ class TestModelDownloadStreaming:
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_include_all_unknown_suffix_overflow_fails_closed(
+    def test_download_model_streaming_include_all_unbounded_large_unknown_suffix_inventory_fails_closed(
         self,
         mock_hf_hub_download: MagicMock,
         _mock_get_extensions: MagicMock,
     ) -> None:
-        """Incomplete unknown-suffix coverage must fail before downloading recognized files."""
+        """Unbounded include-all streaming should not download arbitrary large non-model inventories."""
         repo_files = ["model.bin", *(f"payloads/chunk-{idx:04d}.blob" for idx in range(129))]
 
         with (
@@ -3140,16 +3665,97 @@ class TestModelDownloadStreaming:
                 "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
                 return_value=(repo_files, _HF_TEST_REVISION, None),
             ),
-            pytest.raises(Exception, match="repository listing exceeds the bounded unfiltered candidate limit"),
+            pytest.raises(Exception, match="include_all_files=True without max_size selected more than"),
         ):
-            list(
+            list(download_model_streaming("https://huggingface.co/test/model", include_all_files=True))
+
+        mock_hf_hub_download.assert_not_called()
+
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_include_all_large_unknown_suffix_inventory_with_max_size_streams_all_candidates(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_get_extensions: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """A max_size cap should bound aggregate include-all transfer without truncating large inventories."""
+        repo_files = ["model.bin", *(f"payloads/chunk-{idx:04d}.blob" for idx in range(129))]
+        mock_get_paths_info.return_value = [
+            SimpleNamespace(path=filename, size=len(b"payload")) for filename in repo_files
+        ]
+
+        def download_side_effect(*, filename: str, **_kwargs: object) -> str:
+            path = tmp_path / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"payload")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+                return_value=(repo_files, _HF_TEST_REVISION, None),
+            ),
+        ):
+            results = list(
                 download_model_streaming(
                     "https://huggingface.co/test/model",
                     include_all_files=True,
+                    max_size=10 * 1024,
                 )
             )
 
-        mock_hf_hub_download.assert_not_called()
+        assert len(results) == len(repo_files)
+        assert results[0] == (tmp_path / "model.bin", False)
+        assert results[-1] == (tmp_path / "payloads" / "chunk-0128.blob", True)
+        mock_get_paths_info.assert_called_once_with("test/model", repo_files, revision=_HF_TEST_REVISION)
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == repo_files
+
+    @pytest.mark.integration
+    def test_pinned_grok_large_inventory_metadata_streaming_reaches_terminal(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The pinned Grok inventory should not fail at the historical 128-candidate cap."""
+        monkeypatch.setenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+        repo_id = "xai-org/grok-1"
+        revision = "5de83eb225f49624b424f1c8aa74f96983b5885c"
+
+        repo_files, resolved_revision = _list_huggingface_repo_files_at_revision(
+            repo_id,
+            requested_revision=revision,
+            timeout_seconds=30,
+        )
+
+        assert resolved_revision == revision
+        assert len(repo_files) == 773
+
+        with patch(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            return_value=(repo_files, resolved_revision, None),
+        ):
+            results = list(
+                download_model_streaming(
+                    "hf://xai-org/grok-1",
+                    cache_dir=tmp_path,
+                    show_progress=False,
+                    max_size=10 * 1024,
+                    timeout_seconds=120,
+                    scannable_extensions={".md"},
+                    scannable_filenames={"readme"},
+                    scannable_scanner_ids={"metadata"},
+                )
+            )
+
+        assert len(results) == 1
+        readme_path, is_last = results[0]
+        assert readme_path.name == "README.md"
+        assert readme_path.stat().st_size <= 10 * 1024
+        assert is_last is True
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
     @patch(
@@ -6401,12 +7007,17 @@ class TestHuggingFaceFileURLs:
             cache_dir=str(cache_dir),
         )
 
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        side_effect=AssertionError("direct capped file download should not list the repository tree"),
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_with_max_size_preflights_before_download(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
+        mock_paginated_listing: MagicMock,
         tmp_path: Path,
     ) -> None:
         """Direct file downloads should allow files exactly at the capped boundary."""
@@ -6427,7 +7038,6 @@ class TestHuggingFaceFileURLs:
         mock_hf_api.return_value.repo_info.assert_called_once_with(
             "test/model",
             revision="main",
-            timeout=30.0,
             files_metadata=False,
         )
         mock_hf_api.return_value.get_paths_info.assert_called_once_with(
@@ -6435,6 +7045,7 @@ class TestHuggingFaceFileURLs:
             ["model.bin"],
             revision=TEST_COMMIT_SHA,
         )
+        mock_paginated_listing.assert_not_called()
         mock_hf_hub_download.assert_called_once_with(
             repo_id="test/model",
             filename="model.bin",
@@ -6443,12 +7054,17 @@ class TestHuggingFaceFileURLs:
         )
         assert result == downloaded_file
 
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        return_value=["pytorch_model.bin", "model.safetensors"],
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_fills_repository_file_inventory(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
+        mock_paginated_listing: MagicMock,
         tmp_path: Path,
     ) -> None:
         downloaded_file = tmp_path / "downloaded_file.bin"
@@ -6474,6 +7090,7 @@ class TestHuggingFaceFileURLs:
 
         assert result == downloaded_file
         assert inventory == ["pytorch_model.bin", "model.safetensors"]
+        mock_paginated_listing.assert_called_once_with("test/model", TEST_COMMIT_SHA, timeout_seconds=30.0)
         mock_hf_hub_download.assert_called_once_with(
             repo_id="test/model",
             filename="pytorch_model.bin",
@@ -6481,12 +7098,17 @@ class TestHuggingFaceFileURLs:
             cache_dir=None,
         )
 
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        return_value=["pytorch_model.bin", "model.safetensors"],
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_inventory_pins_uncapped_download_to_listed_revision(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
+        mock_paginated_listing: MagicMock,
         tmp_path: Path,
     ) -> None:
         downloaded_file = tmp_path / "downloaded_file.bin"
@@ -6508,6 +7130,7 @@ class TestHuggingFaceFileURLs:
 
         assert result == downloaded_file
         assert inventory == ["pytorch_model.bin", "model.safetensors"]
+        mock_paginated_listing.assert_called_once_with("test/model", TEST_COMMIT_SHA, timeout_seconds=30.0)
         mock_hf_api.return_value.get_paths_info.assert_not_called()
         mock_hf_hub_download.assert_called_once_with(
             repo_id="test/model",
@@ -6544,12 +7167,17 @@ class TestHuggingFaceFileURLs:
             cache_dir=None,
         )
 
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        side_effect=AssertionError("direct capped file download should not list the repository tree"),
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_with_max_size_rejects_oversized_before_download(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
+        mock_paginated_listing: MagicMock,
     ) -> None:
         """Oversized direct files should not reach hf_hub_download."""
         mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(
@@ -6568,8 +7196,13 @@ class TestHuggingFaceFileURLs:
 
         assert "11.0 MB" in str(exc_info.value)
         assert "10.0 MB" in str(exc_info.value)
+        mock_paginated_listing.assert_not_called()
         mock_hf_hub_download.assert_not_called()
 
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        side_effect=AssertionError("direct capped file download should not list the repository tree"),
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     @pytest.mark.parametrize("file_size", [None, -1, "1024", True])
@@ -6577,6 +7210,7 @@ class TestHuggingFaceFileURLs:
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
+        mock_paginated_listing: MagicMock,
         file_size: object,
     ) -> None:
         """Capped direct files fail closed when HuggingFace metadata has no valid size."""
@@ -6592,14 +7226,20 @@ class TestHuggingFaceFileURLs:
                 max_size=10 * 1024 * 1024,
             )
 
+        mock_paginated_listing.assert_not_called()
         mock_hf_hub_download.assert_not_called()
 
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        side_effect=AssertionError("direct capped file download should not list the repository tree"),
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_with_max_size_rejects_underreported_download(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
+        mock_paginated_listing: MagicMock,
         tmp_path: Path,
     ) -> None:
         """Capped direct files should verify the returned cache file before scanning."""
@@ -6618,12 +7258,19 @@ class TestHuggingFaceFileURLs:
                 max_size=4,
             )
 
+        mock_paginated_listing.assert_not_called()
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        side_effect=AssertionError("direct capped file download should not list the repository tree"),
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_with_max_size_rejects_unverifiable_download(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
+        mock_paginated_listing: MagicMock,
         tmp_path: Path,
     ) -> None:
         """Capped direct files fail closed if the downloaded cache path cannot be verified."""
@@ -6640,12 +7287,19 @@ class TestHuggingFaceFileURLs:
                 max_size=4,
             )
 
+        mock_paginated_listing.assert_not_called()
+
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_huggingface_repo_files_paginated",
+        side_effect=AssertionError("direct capped file download should not list the repository tree"),
+    )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_with_max_size_redacts_metadata_errors(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
+        mock_paginated_listing: MagicMock,
     ) -> None:
         """Metadata preflight errors should not expose direct URL credentials."""
         mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(
@@ -6666,6 +7320,7 @@ class TestHuggingFaceFileURLs:
         assert "hf_secret" not in error
         assert "token=" not in error
         assert "https://huggingface.co/test/model/resolve/main/model.bin" in error
+        mock_paginated_listing.assert_not_called()
         mock_hf_hub_download.assert_not_called()
 
     @patch("huggingface_hub.HfApi")
