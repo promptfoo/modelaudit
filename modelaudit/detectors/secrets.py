@@ -811,11 +811,14 @@ class SecretsDetector:
         key_line_index = SecretsDetector._basic_auth_yaml_list_context_key_line_index_from_lines(
             lines,
             BASIC_AUTH_HEADER_OBJECT_VALUE_YAML_KEY_PATTERN,
+            allow_list_item_value_key=True,
         )
         if key_line_index is None:
             return False
 
-        key_indent = SecretsDetector._basic_auth_line_indent(lines[key_line_index])
+        key_indent = SecretsDetector._basic_auth_yaml_list_item_value_indent(
+            lines[key_line_index],
+        ) or SecretsDetector._basic_auth_line_indent(lines[key_line_index])
         item_start_index = SecretsDetector._basic_auth_yaml_header_object_item_start_line_index(lines, key_line_index)
         if item_start_index is None:
             return False
@@ -843,6 +846,9 @@ class SecretsDetector:
 
     @staticmethod
     def _basic_auth_yaml_header_object_item_start_line_index(lines: list[str], key_line_index: int) -> int | None:
+        if SecretsDetector._basic_auth_yaml_list_line_starts_item(lines[key_line_index]):
+            return key_line_index
+
         key_indent = SecretsDetector._basic_auth_line_indent(lines[key_line_index])
         for line_index in range(key_line_index, -1, -1):
             line = lines[line_index]
@@ -1046,6 +1052,7 @@ class SecretsDetector:
     def _basic_auth_yaml_list_context_key_line_index_from_lines(
         lines: list[str],
         key_pattern: re.Pattern[str],
+        allow_list_item_value_key: bool = False,
     ) -> int | None:
         if not lines or not SecretsDetector._basic_auth_yaml_list_current_value_prefix(lines[-1]):
             return None
@@ -1057,6 +1064,11 @@ class SecretsDetector:
             if line_indent > current_item_indent:
                 continue
             if key_pattern.fullmatch(line) is not None:
+                return line_index
+            if (
+                allow_list_item_value_key
+                and key_pattern.fullmatch(SecretsDetector._basic_auth_yaml_list_item_value_text(line)) is not None
+            ):
                 return line_index
             if line_indent != current_item_indent or not SecretsDetector._basic_auth_yaml_list_item_has_value(line):
                 return None
