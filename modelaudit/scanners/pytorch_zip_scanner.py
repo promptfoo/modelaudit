@@ -1,7 +1,9 @@
 """Scanner for PyTorch zip-archived model files (.pt, .pth)."""
 
 import ast
+import importlib.machinery
 import io
+import json
 import logging
 import os
 import pickletools
@@ -15,6 +17,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from copy import copy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, ClassVar
 
 from ..detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
@@ -27,6 +30,12 @@ from ..scanner_results import (
 from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTES, _looks_like_proto0_or_1_pickle
+from ..utils.repository_context import (
+    RepositoryFileInventory,
+    repository_file_inventory_context_from_config,
+    repository_has_safetensors_sibling,
+    safetensors_alternative_filenames_for_member,
+)
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
 from ._evidence_redaction import redact_evidence_string, redact_untrusted_error_message
@@ -36,7 +45,7 @@ from .archive_member_security import (
     executable_archive_member_name_rule_code,
     probe_executable_archive_member_signature,
 )
-from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from .base import BaseScanner, Check, CheckStatus, IssueSeverity, ScanResult
 from .pickle_scanner import (
     PickleScanner,
     _pickle_literal_url_stripped_scan_view,
@@ -314,6 +323,7 @@ class PyTorchZipScanner(BaseScanner):
     MAX_SYMLINK_TARGET_COMPRESSED_BYTES: ClassVar[int] = 128 * 1024
     MAX_VERSION_METADATA_BYTES: ClassVar[int] = 4096
     MAX_VERSION_JSON_BYTES: ClassVar[int] = 10 * 1024 * 1024
+    MAX_SAFETENSORS_HEADER_BYTES: ClassVar[int] = 10 * 1024 * 1024
     DEFAULT_VERSION_PICKLE_PROBE_BYTES: ClassVar[int] = 1024 * 1024
     DEFAULT_MAX_NESTED_ZIP_DEPTH: ClassVar[int] = 5
     DEFAULT_MAX_BLACKLIST_SCAN_BYTES: ClassVar[int] = 100 * 1024 * 1024
@@ -323,6 +333,7 @@ class PyTorchZipScanner(BaseScanner):
     LOCAL_ENTRY_LIMIT_METADATA_KEY: ClassVar[str] = "pytorch_zip_local_entry_limit_exceeded"
     VERSION_METADATA_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_version_metadata_size_limit"
     VERSION_METADATA_READ_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_version_metadata_read_failed"
+    RUNTIME_VERSION_UNKNOWN_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_runtime_version_unknown"
     SCAN_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_scan_incomplete"
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -331,6 +342,11 @@ class PyTorchZipScanner(BaseScanner):
         self.pickle_scanner: PickleScanner | None = pickle_scanner
         self.current_file_path = ""  # Will be set when scanning files
         self._relaxed_crc_tracker = RelaxedZipCrcTracker()
+        self._repository_inventory_context: RepositoryFileInventory = repository_file_inventory_context_from_config(
+            self.config
+        )
+        self._installed_pytorch_version_cache: object = _INSTALLED_PYTORCH_VERSION_UNSET
+        self._installed_pytorch_metadata_path: str | None = None
         # Configurable limits (can override class defaults via config)
         self.max_compression_ratio = self.config.get("max_compression_ratio", self.MAX_COMPRESSION_RATIO)
         self.min_compression_bomb_uncompressed_size = self._normalize_positive_int_config(
@@ -1673,6 +1689,7 @@ class PyTorchZipScanner(BaseScanner):
         """Extract PyTorch version info and check for CVE vulnerabilities"""
         pytorch_version_info = self._extract_pytorch_version_info(zip_file, safe_entries, result)
         result.metadata.update(pytorch_version_info)
+        self._add_pytorch_version_provenance_check(pytorch_version_info, result, path)
         self._check_cve_2025_32434_vulnerability(pytorch_version_info, result, path)
         self._check_cve_2026_24747_vulnerability(pytorch_version_info, result, path)
         self._check_cve_2022_45907_vulnerability(pytorch_version_info, result, path)
@@ -2828,8 +2845,6 @@ class PyTorchZipScanner(BaseScanner):
                 meta_entry = self._find_zip_entry(safe_entries, meta_file)
                 if meta_entry is not None:
                     try:
-                        import json
-
                         metadata_bytes = self._read_bounded_version_metadata(
                             zipfile_obj,
                             meta_entry,
@@ -2842,7 +2857,10 @@ class PyTorchZipScanner(BaseScanner):
                         # Look for framework-specific version fields in metadata.
                         # Avoid generic "version" keys, which often describe model/config
                         # schema versions and can cause false CVE attributions.
-                        for key in ["pytorch_version", "torch_version", "framework_version"]:
+                        version_keys = ["pytorch_version", "torch_version"]
+                        if self._metadata_declares_pytorch_framework(meta_data):
+                            version_keys.append("framework_version")
+                        for key in version_keys:
                             if key in meta_data and isinstance(meta_data[key], str):
                                 candidate = meta_data[key].strip()
                                 if self._looks_like_pytorch_version(candidate):
@@ -2870,35 +2888,76 @@ class PyTorchZipScanner(BaseScanner):
                 for opcode, arg, pos in pickletools.genops(f):
                     opcodes.append((opcode, arg, pos))
 
+            string_opcode_names = {"UNICODE", "STRING", "SHORT_BINSTRING", "SHORT_BINUNICODE", "BINUNICODE"}
+
             # Look for GLOBAL opcodes that reference torch.__version__
             for i, (opcode, arg, _pos) in enumerate(opcodes):
-                if opcode.name == "GLOBAL" and arg and "torch" in arg and ("version" in arg or "__version__" in arg):
+                if opcode.name == "GLOBAL" and self._is_torch_version_global_arg(arg):
                     # Found a reference to torch version - try to get the value
                     # Look for subsequent opcodes that might contain the version string
                     for j in range(i + 1, min(i + 10, len(opcodes))):
                         next_opcode, next_arg, _next_pos = opcodes[j]
                         if (
-                            next_opcode.name in ["UNICODE", "STRING", "SHORT_BINSTRING", "BINUNICODE"]
+                            next_opcode.name in string_opcode_names
                             and next_arg
                             and isinstance(next_arg, str)
-                            and self._looks_like_version(next_arg)
+                            and self._looks_like_pytorch_version(next_arg)
                         ):
                             return next_arg
 
-            # Look for any version-like strings in the pickle
-            for opcode, arg, _pos in opcodes:
-                if (
-                    opcode.name in ["UNICODE", "STRING", "SHORT_BINSTRING", "BINUNICODE"]
-                    and arg
-                    and isinstance(arg, str)
-                    and self._looks_like_pytorch_version(arg)
-                ):
-                    return arg
+            # Look for explicit torch/PyTorch version keys followed by a version literal.
+            # Generic keys like "version" are model/config schema metadata, not
+            # PyTorch producer evidence.
+            explicit_version_keys = {
+                "__version__",
+                "producer_pytorch_version",
+                "pytorch_version",
+                "pytorch_framework_version",
+                "torch.__version__",
+                "torch_version",
+            }
+            for i, (opcode, arg, _pos) in enumerate(opcodes):
+                if opcode.name not in string_opcode_names or not isinstance(arg, str):
+                    continue
+                normalized_key = arg.strip().lower()
+                if normalized_key not in explicit_version_keys:
+                    continue
+                for next_opcode, next_arg, _next_pos in opcodes[i + 1 : min(i + 8, len(opcodes))]:
+                    if (
+                        next_opcode.name in string_opcode_names
+                        and isinstance(next_arg, str)
+                        and self._looks_like_pytorch_version(next_arg)
+                    ):
+                        return next_arg
 
         except Exception as exc:
             logger.debug("Unable to infer PyTorch version from pickle metadata: %s", exc)
 
         return None
+
+    @classmethod
+    def _is_torch_version_global_arg(cls, value: object) -> bool:
+        global_name = cls._coerce_pickle_string_arg(value)
+        if global_name is None:
+            return False
+        parts = global_name.split()
+        if len(parts) == 2:
+            module, name = parts
+        elif "." in global_name:
+            module, name = global_name.rsplit(".", 1)
+        else:
+            return False
+        return module == "torch" and name == "__version__"
+
+    @staticmethod
+    def _metadata_declares_pytorch_framework(metadata: dict[str, Any]) -> bool:
+        for key in ("framework", "library", "backend"):
+            value = metadata.get(key)
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                if isinstance(item, str) and item.strip().lower() in {"pytorch", "torch"}:
+                    return True
+        return False
 
     def _looks_like_version(self, text: str) -> bool:
         """Check if a string looks like a version number"""
@@ -2941,40 +3000,235 @@ class PyTorchZipScanner(BaseScanner):
         return None, source if isinstance(source, str) else None
 
     def _get_installed_pytorch_version(self) -> str | None:
-        """Get PyTorch version from an already-imported module without importing torch."""
+        """Get installed PyTorch version without importing torch."""
+        cached = self._installed_pytorch_version_cache
+        if cached is not _INSTALLED_PYTORCH_VERSION_UNSET:
+            return cached if isinstance(cached, str) else None
+
+        version, metadata_path = self._resolve_installed_pytorch_version()
+        self._installed_pytorch_version_cache = version
+        self._installed_pytorch_metadata_path = metadata_path
+        return version
+
+    def _resolve_installed_pytorch_version(self) -> tuple[str | None, str | None]:
+        """Resolve active PyTorch runtime metadata from trusted environment paths."""
+        trusted_roots = self._trusted_python_package_roots()
+        import_origin = self._resolve_torch_import_origin()
+
         try:
-            import sys
+            from importlib import metadata
+        except Exception as exc:
+            logger.debug("Unable to load importlib.metadata for PyTorch version detection: %s", exc)
+            return None, None
 
-            torch_module = sys.modules.get("torch")
-            if torch_module is None:
-                return None
-            version = getattr(torch_module, "__version__", None)
-            if isinstance(version, str) and version.strip():
-                return version.strip()
-        except Exception:
+        distribution, metadata_path = self._trusted_torch_distribution(
+            metadata,
+            trusted_roots=trusted_roots,
+            import_origin=import_origin,
+        )
+        if distribution is None:
+            return self._trusted_imported_torch_module_version(trusted_roots)
+
+        try:
+            package_version: object = distribution.version
+        except Exception as exc:
+            logger.debug("Unable to read trusted torch package metadata: %s", exc)
+            return None, None
+
+        if not isinstance(package_version, str):
+            logger.debug("Ignoring non-string installed torch package version metadata: %r", package_version)
+            return None, None
+
+        package_version = package_version.strip()
+        if not package_version:
+            logger.debug("Ignoring blank installed torch package version metadata")
+            return None, None
+
+        if not self._looks_like_pytorch_version(package_version):
+            logger.debug("Using malformed installed torch package version metadata conservatively: %r", package_version)
+        return package_version, str(metadata_path) if metadata_path is not None else None
+
+    def _get_installed_pytorch_metadata_path(self) -> str | None:
+        self._get_installed_pytorch_version()
+        return self._installed_pytorch_metadata_path
+
+    @staticmethod
+    def _trusted_python_package_roots() -> tuple[os.PathLike[str], ...]:
+        import site
+        import sys
+        import sysconfig
+
+        roots: list[os.PathLike[str]] = []
+
+        def add_root(value: object) -> None:
+            if not isinstance(value, str) or not value.strip():
+                return
+            try:
+                resolved = os.fspath(os.path.realpath(value))
+            except OSError:
+                return
+            if resolved and resolved not in {os.fspath(root) for root in roots}:
+                roots.append(Path(resolved))
+
+        known_roots: list[Path] = []
+
+        def add_known_root(value: object) -> None:
+            if not isinstance(value, str) or not value.strip():
+                return
+            with suppress(OSError, RuntimeError, TypeError, ValueError):
+                known_roots.append(Path(os.path.realpath(value)).resolve())
+
+        for scheme_key in ("purelib", "platlib"):
+            add_known_root(sysconfig.get_path(scheme_key))
+        with suppress(Exception):
+            for package_root in site.getsitepackages():
+                add_known_root(package_root)
+        with suppress(Exception):
+            add_known_root(site.getusersitepackages())
+
+        for search_path in sys.path:
+            with suppress(OSError, RuntimeError, TypeError, ValueError):
+                resolved_search_path = Path(os.path.realpath(search_path)).resolve()
+                if any(resolved_search_path == root for root in known_roots):
+                    add_root(str(resolved_search_path))
+
+        return tuple(roots)
+
+    @staticmethod
+    def _canonical_package_name(name: object) -> str | None:
+        if not isinstance(name, str):
             return None
+        normalized = re.sub(r"[-_.]+", "-", name).strip().lower()
+        return normalized or None
 
+    @staticmethod
+    def _path_is_relative_to(path: Path, root: Path) -> bool:
+        try:
+            path.resolve().relative_to(root.resolve())
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return True
+
+    @staticmethod
+    def _distribution_metadata_path(distribution: Any, root: Path) -> Path:
+        raw_path = getattr(distribution, "_path", None)
+        if raw_path is not None:
+            with suppress(OSError, RuntimeError, TypeError, ValueError):
+                return Path(raw_path).resolve()
+        with suppress(Exception):
+            located = distribution.locate_file("")
+            return Path(located).resolve()
+        return root
+
+    @staticmethod
+    def _resolve_torch_import_origin() -> Path | None:
+        with suppress(Exception):
+            spec = importlib.machinery.PathFinder.find_spec("torch")
+            if spec is None:
+                return None
+            raw_origin = spec.origin
+            if isinstance(raw_origin, str) and raw_origin not in {"built-in", "frozen", "namespace"}:
+                return Path(raw_origin).resolve()
+            locations = getattr(spec, "submodule_search_locations", None)
+            if locations:
+                for location in locations:
+                    if isinstance(location, str) and location.strip():
+                        return Path(location).resolve()
         return None
+
+    def _trusted_imported_torch_module_version(
+        self,
+        trusted_roots: tuple[os.PathLike[str], ...],
+    ) -> tuple[str | None, str | None]:
+        import sys
+
+        torch_module = sys.modules.get("torch")
+        if torch_module is None:
+            return None, None
+
+        module_path = getattr(torch_module, "__file__", None)
+        if not isinstance(module_path, str) or not module_path.strip():
+            return None, None
+
+        with suppress(OSError, RuntimeError, TypeError, ValueError):
+            resolved_module_path = Path(module_path).resolve()
+            if not any(self._path_is_relative_to(resolved_module_path, Path(raw_root)) for raw_root in trusted_roots):
+                logger.debug("Ignoring already-imported torch module outside trusted package roots")
+                return None, None
+
+            try:
+                module_version = getattr(torch_module, "__version__", None)
+            except Exception as exc:
+                logger.debug("Unable to read already-imported torch.__version__: %s", exc)
+                return None, None
+            if isinstance(module_version, str) and module_version.strip():
+                return module_version.strip(), str(resolved_module_path)
+            if module_version is not None:
+                logger.debug("Ignoring non-string already-imported torch.__version__: %r", module_version)
+        return None, None
+
+    def _trusted_torch_distribution(
+        self,
+        metadata: Any,
+        *,
+        trusted_roots: tuple[os.PathLike[str], ...],
+        import_origin: Path | None,
+    ) -> tuple[Any | None, Path | None]:
+        resolved_roots: list[Path] = []
+        for raw_root in trusted_roots:
+            try:
+                trusted_root = Path(raw_root).resolve()
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
+            if trusted_root not in resolved_roots:
+                resolved_roots.append(trusted_root)
+
+        trusted_import_root = None
+        if import_origin is not None:
+            trusted_import_root = next(
+                (root for root in resolved_roots if self._path_is_relative_to(import_origin, root)),
+                None,
+            )
+            if trusted_import_root is None:
+                logger.debug("Ignoring trusted torch metadata because torch resolves outside trusted package roots")
+                return None, None
+
+        search_roots = [trusted_import_root] if trusted_import_root is not None else resolved_roots
+        fallback_distribution: tuple[Any, Path] | None = None
+        for trusted_root in search_roots:
+            try:
+                distributions = metadata.distributions(path=[str(trusted_root)])
+            except Exception:
+                logger.debug("Unable to inspect trusted Python package root during torch metadata lookup")
+                continue
+            for distribution in distributions:
+                try:
+                    package_name = distribution.metadata.get("Name")
+                except Exception:
+                    package_name = getattr(distribution, "name", None)
+                if self._canonical_package_name(package_name) != "torch":
+                    continue
+                metadata_path = self._distribution_metadata_path(distribution, trusted_root)
+                if not self._path_is_relative_to(metadata_path, trusted_root):
+                    logger.debug("Ignoring torch metadata outside trusted root")
+                    continue
+                if fallback_distribution is None:
+                    fallback_distribution = (distribution, metadata_path)
+        if fallback_distribution is not None:
+            return fallback_distribution
+        return None, None
 
     def _select_pytorch_version_for_check(
         self,
         version_info: dict[str, Any],
         is_vulnerable: Callable[[str], bool],
     ) -> tuple[str | None, str | None]:
-        """Select the most conservative PyTorch version source for CVE gating."""
+        """Select active runtime version evidence for package/runtime CVE gating."""
+        del version_info, is_vulnerable
         installed_version = self._get_installed_pytorch_version()
-        metadata_version, metadata_source = self._get_detected_pytorch_version(
-            version_info,
-            installed_version=installed_version,
-        )
-
-        if installed_version and is_vulnerable(installed_version):
-            return installed_version, "local_environment"
-        if metadata_version and is_vulnerable(metadata_version):
-            return metadata_version, metadata_source
         if installed_version:
             return installed_version, "local_environment"
-        return metadata_version, metadata_source
+        return None, None
 
     @staticmethod
     def _format_pytorch_version_source(version_source: str | None) -> str:
@@ -2983,12 +3237,157 @@ class PyTorchZipScanner(BaseScanner):
             return "Local PyTorch"
         return "Artifact metadata indicates PyTorch"
 
+    def _add_unknown_pytorch_runtime_version_check(
+        self,
+        result: ScanResult,
+        path: str,
+        *,
+        check_name: str,
+        cve_id: str,
+        fix_version: str,
+        description: str,
+        remediation: str,
+        fail_closed: bool,
+        producer_version: str | None = None,
+        producer_source: str | None = None,
+        cvss: float | None = None,
+        cwe: str | None = None,
+    ) -> None:
+        """Record explicit unknown applicability for runtime-version-gated CVEs."""
+        if fail_closed:
+            mark_inconclusive_scan_result(result, self.RUNTIME_VERSION_UNKNOWN_INCONCLUSIVE_REASON)
+
+        details: dict[str, Any] = {
+            "cve_id": cve_id,
+            "description": description,
+            "remediation": remediation,
+            "producer_pytorch_version": producer_version,
+            "producer_pytorch_version_source": producer_source,
+            "installed_pytorch_version": None,
+            "installed_pytorch_metadata_path": self._get_installed_pytorch_metadata_path(),
+            "runtime_version_known": False,
+            "runtime_cve_applicability": "unknown",
+            "runtime_cve_version_gate": "local_environment_only",
+            "analysis_incomplete": True,
+            "fixed_in": f"PyTorch {fix_version}",
+        }
+        if fail_closed:
+            details["scan_outcome_reason"] = self.RUNTIME_VERSION_UNKNOWN_INCONCLUSIVE_REASON
+        if cvss is not None:
+            details["cvss"] = cvss
+        if cwe is not None:
+            details["cwe"] = cwe
+
+        result.checks.append(
+            Check(
+                name=check_name,
+                status=CheckStatus.SKIPPED,
+                message=(
+                    f"PyTorch runtime version is unknown; cannot determine {cve_id} applicability "
+                    f"(fixed in PyTorch {fix_version})."
+                ),
+                severity=IssueSeverity.INFO,
+                location=path,
+                details=details,
+            )
+        )
+
+    @staticmethod
+    def _producer_framework_version_evidence(version_info: dict[str, Any]) -> tuple[str | None, str | None]:
+        producer_version = version_info.get("pytorch_framework_version")
+        if not isinstance(producer_version, str) or not producer_version.strip():
+            return None, None
+        producer_source = version_info.get("pytorch_version_source")
+        return producer_version.strip(), producer_source if isinstance(producer_source, str) else None
+
+    def _add_pytorch_version_provenance_check(
+        self,
+        version_info: dict[str, Any],
+        result: ScanResult,
+        path: str,
+    ) -> None:
+        """Record artifact producer version metadata separately from runtime CVE evidence."""
+        producer_version = version_info.get("pytorch_framework_version")
+        producer_source = version_info.get("pytorch_version_source")
+        archive_version = version_info.get("pytorch_archive_version")
+        installed_version = self._get_installed_pytorch_version()
+
+        if not any(isinstance(value, str) and value.strip() for value in (producer_version, archive_version)):
+            return
+
+        if isinstance(producer_version, str) and producer_version.strip():
+            producer_version = producer_version.strip()
+        else:
+            producer_version = None
+        if isinstance(producer_source, str) and producer_source.strip():
+            producer_source = producer_source.strip()
+        else:
+            producer_source = None
+        if isinstance(archive_version, str) and archive_version.strip():
+            archive_version = archive_version.strip()
+        else:
+            archive_version = None
+
+        if installed_version:
+            runtime_summary = f"active scanner/runtime PyTorch is {installed_version}"
+            runtime_scope = "local_environment"
+        else:
+            runtime_summary = "active scanner/runtime PyTorch version is not known"
+            runtime_scope = None
+
+        producer_summary = (
+            f"Artifact producer metadata records PyTorch {producer_version}"
+            if producer_version
+            else "Artifact contains PyTorch archive version metadata"
+        )
+        if producer_source:
+            producer_summary = f"{producer_summary} from {producer_source}"
+
+        result.add_check(
+            name="PyTorch Version Provenance",
+            passed=True,
+            message=(
+                f"{producer_summary}; {runtime_summary}. "
+                "Producer metadata is provenance and is not used by itself for runtime CVE applicability."
+            ),
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "producer_pytorch_version": producer_version,
+                "producer_pytorch_version_source": producer_source,
+                "pytorch_archive_version": archive_version,
+                "installed_pytorch_version": installed_version,
+                "installed_pytorch_metadata_path": self._get_installed_pytorch_metadata_path(),
+                "active_runtime_version": installed_version,
+                "active_runtime_version_source": runtime_scope,
+                "runtime_version_known": installed_version is not None,
+                "runtime_cve_version_gate": "local_environment_only",
+            },
+        )
+
     def _check_cve_2025_32434_vulnerability(self, version_info: dict[str, Any], result: ScanResult, path: str) -> None:
         """Check for CVE-2025-32434 using conservative PyTorch version evidence."""
         detected_version, version_source = self._select_pytorch_version_for_check(
             version_info, self._is_vulnerable_pytorch_version
         )
         if not detected_version:
+            producer_version, producer_source = self._producer_framework_version_evidence(version_info)
+            self._add_unknown_pytorch_runtime_version_check(
+                result,
+                path,
+                check_name="CVE-2025-32434 PyTorch Version Check",
+                cve_id=self.CVE_2025_32434_ID,
+                fix_version=self.CVE_2025_32434_FIX_VERSION,
+                description=self.CVE_2025_32434_DESCRIPTION,
+                remediation=(
+                    "Update to PyTorch 2.6.0 or later, avoid torch.load(weights_only=True) with untrusted models"
+                ),
+                fail_closed=producer_version is not None,
+                producer_version=producer_version,
+                producer_source=producer_source,
+                cvss=9.8,
+                cwe="CWE-502",
+            )
             return
 
         is_vulnerable = self._is_vulnerable_pytorch_version(detected_version)
@@ -3006,9 +3405,18 @@ class PyTorchZipScanner(BaseScanner):
                 location=path,
                 details={
                     "cve_id": self.CVE_2025_32434_ID,
+                    "cvss": 9.8,
+                    "cwe": "CWE-502",
+                    "description": self.CVE_2025_32434_DESCRIPTION,
+                    "remediation": (
+                        "Update to PyTorch 2.6.0 or later, avoid torch.load(weights_only=True) with untrusted models"
+                    ),
                     "detected_pytorch_version": detected_version,
                     "pytorch_version_source": version_source,
                     "installed_pytorch_version": self._get_installed_pytorch_version(),
+                    "installed_pytorch_metadata_path": self._get_installed_pytorch_metadata_path(),
+                    "runtime_version_known": True,
+                    "runtime_cve_applicability": "vulnerable",
                     "vulnerability_description": "RCE when loading models with torch.load(weights_only=True)",
                     "fixed_in": f"PyTorch {self.CVE_2025_32434_FIX_VERSION}",
                     "recommendation": (
@@ -3028,10 +3436,27 @@ class PyTorchZipScanner(BaseScanner):
             version_info, self._is_vulnerable_pytorch_version_2026
         )
         if not detected_version:
+            cve_info = CVE_COMBINED_PATTERNS[self.CVE_2026_24747_ID]
+            producer_version, producer_source = self._producer_framework_version_evidence(version_info)
+            self._add_unknown_pytorch_runtime_version_check(
+                result,
+                path,
+                check_name="CVE-2026-24747 PyTorch Version Check",
+                cve_id=self.CVE_2026_24747_ID,
+                fix_version=self.CVE_2026_24747_FIX_VERSION,
+                description=str(cve_info["description"]),
+                remediation=str(cve_info["remediation"]),
+                fail_closed=producer_version is not None,
+                producer_version=producer_version,
+                producer_source=producer_source,
+                cvss=float(str(cve_info["cvss"])),
+                cwe=str(cve_info["cwe"]),
+            )
             return
 
         is_vulnerable = self._is_vulnerable_pytorch_version_2026(detected_version)
         source_prefix = self._format_pytorch_version_source(version_source)
+        cve_info = CVE_COMBINED_PATTERNS[self.CVE_2026_24747_ID]
         if is_vulnerable:
             result.add_check(
                 name="CVE-2026-24747 PyTorch Version Check",
@@ -3045,9 +3470,16 @@ class PyTorchZipScanner(BaseScanner):
                 location=path,
                 details={
                     "cve_id": self.CVE_2026_24747_ID,
+                    "cvss": cve_info["cvss"],
+                    "cwe": cve_info["cwe"],
+                    "description": cve_info["description"],
+                    "remediation": cve_info["remediation"],
                     "detected_pytorch_version": detected_version,
                     "pytorch_version_source": version_source,
                     "installed_pytorch_version": self._get_installed_pytorch_version(),
+                    "installed_pytorch_metadata_path": self._get_installed_pytorch_metadata_path(),
+                    "runtime_version_known": True,
+                    "runtime_cve_applicability": "vulnerable",
                     "vulnerability_description": self.CVE_2026_24747_DESCRIPTION,
                     "fixed_in": f"PyTorch {self.CVE_2026_24747_FIX_VERSION}",
                     "recommendation": (
@@ -3071,6 +3503,16 @@ class PyTorchZipScanner(BaseScanner):
                 ),
                 severity=IssueSeverity.INFO,
                 location=path,
+                details={
+                    "cve_id": self.CVE_2026_24747_ID,
+                    "detected_pytorch_version": detected_version,
+                    "pytorch_version_source": version_source,
+                    "installed_pytorch_version": self._get_installed_pytorch_version(),
+                    "installed_pytorch_metadata_path": self._get_installed_pytorch_metadata_path(),
+                    "runtime_version_known": True,
+                    "runtime_cve_applicability": "not_vulnerable",
+                    "fixed_in": f"PyTorch {self.CVE_2026_24747_FIX_VERSION}",
+                },
             )
 
     def _is_vulnerable_pytorch_version_2026(self, version: str) -> bool:
@@ -3132,7 +3574,24 @@ class PyTorchZipScanner(BaseScanner):
             version_info,
             is_vulnerable,
         )
-        if not detected_version or not is_vulnerable(detected_version):
+        if not detected_version:
+            producer_version, producer_source = self._producer_framework_version_evidence(version_info)
+            self._add_unknown_pytorch_runtime_version_check(
+                result,
+                path,
+                check_name=cve_metadata.check_name,
+                cve_id=cve_metadata.cve_id,
+                fix_version=cve_metadata.fix_version,
+                description=cve_metadata.description,
+                remediation=cve_metadata.remediation,
+                fail_closed=producer_version is not None,
+                producer_version=producer_version,
+                producer_source=producer_source,
+                cvss=cve_metadata.cvss,
+                cwe=cve_metadata.cwe,
+            )
+            return
+        if not is_vulnerable(detected_version):
             return
 
         source_prefix = self._format_pytorch_version_source(version_source)
@@ -3155,6 +3614,9 @@ class PyTorchZipScanner(BaseScanner):
                 "detected_pytorch_version": detected_version,
                 "pytorch_version_source": version_source,
                 "installed_pytorch_version": self._get_installed_pytorch_version(),
+                "installed_pytorch_metadata_path": self._get_installed_pytorch_metadata_path(),
+                "runtime_version_known": True,
+                "runtime_cve_applicability": "vulnerable",
                 "vulnerability_description": cve_metadata.description,
                 "fixed_in": f"PyTorch {cve_metadata.fix_version}",
                 "recommendation": cve_metadata.remediation,
@@ -3404,21 +3866,47 @@ class PyTorchZipScanner(BaseScanner):
 
     def _check_safetensors_available(self, model_path: str) -> bool:
         """Check if a SafeTensors alternative exists in the same directory"""
+        if repository_has_safetensors_sibling(model_path, self.config, self._repository_inventory_context):
+            return True
+
         try:
-            import glob
-
-            # Get the directory containing the PyTorch model
-            model_dir = os.path.dirname(model_path)
-            if not model_dir:
-                # If no directory (relative path), use current directory
-                model_dir = "."
-
-            # Look for .safetensors files in the same directory
-            safetensors_pattern = os.path.join(model_dir, "*.safetensors")
-            safetensors_files = glob.glob(safetensors_pattern)
-
-            return len(safetensors_files) > 0
+            model_dir = os.path.dirname(model_path) or "."
+            allowed_names = safetensors_alternative_filenames_for_member(os.path.basename(model_path))
+            if not allowed_names:
+                return False
+            with os.scandir(model_dir) as entries:
+                return any(
+                    entry.name in allowed_names
+                    and entry.is_file(follow_symlinks=False)
+                    and self._is_plausible_safetensors_file(entry.path)
+                    for entry in entries
+                )
         except Exception:
+            return False
+
+    def _is_plausible_safetensors_file(self, path: str) -> bool:
+        try:
+            file_size = os.path.getsize(path)
+        except OSError:
+            return False
+        if file_size <= 8:
+            return False
+        try:
+            with open(path, "rb") as handle:
+                header_prefix = handle.read(8)
+                if len(header_prefix) != 8:
+                    return False
+                (header_size,) = struct.unpack("<Q", header_prefix)
+                if header_size <= 0 or header_size > self.MAX_SAFETENSORS_HEADER_BYTES:
+                    return False
+                if 8 + header_size > file_size:
+                    return False
+                header = handle.read(header_size)
+        except Exception:
+            return False
+        try:
+            return isinstance(json.loads(header.decode("utf-8")), dict)
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return False
 
     def _analyze_pickle_imports(self, pickle_result: ScanResult) -> dict[str, Any]:

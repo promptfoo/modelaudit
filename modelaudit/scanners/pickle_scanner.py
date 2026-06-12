@@ -1815,6 +1815,19 @@ def extend_unique_network_findings(findings: list[dict[str, Any]], additions: li
     findings.extend(unique_network_findings(additions, existing_findings=findings))
 
 
+def offset_network_finding_positions(findings: list[dict[str, Any]], position_offset: int) -> list[dict[str, Any]]:
+    if position_offset <= 0:
+        return findings
+    adjusted: list[dict[str, Any]] = []
+    for finding in findings:
+        position = finding.get("position")
+        if not isinstance(position, int):
+            adjusted.append(finding)
+            continue
+        adjusted.append({**finding, "position": position_offset + position})
+    return adjusted
+
+
 def filter_inert_pickle_literal_network_findings(
     findings: list[dict[str, Any]],
     data: bytes,
@@ -3579,6 +3592,7 @@ class PickleScanner(BaseScanner):
                 result=result,
             )
             network_findings = filter_inert_pickle_literal_network_findings(network_findings, expensive_data)
+            network_findings = offset_network_finding_positions(network_findings, position_offset)
             extend_unique_network_findings(
                 network_findings,
                 executable_pickle_literal_network_findings(

