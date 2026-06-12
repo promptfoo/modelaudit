@@ -782,6 +782,7 @@ class SecretsDetector:
             BASIC_AUTH_HEADER_PREFIX_PATTERN.search(previous_line) is not None
             or BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(previous_line) is not None
             or BASIC_AUTH_SERVER_HEADER_DIRECTIVE_PREFIX_PATTERN.search(previous_line) is not None
+            or BASIC_AUTH_XML_HEADER_PREFIX_PATTERN.search(previous_line) is not None
         )
 
     @staticmethod

@@ -248,8 +248,17 @@ class TestSecretsDetector:
                 _basic_auth_token(b"xml-header:pass"),
             ),
             (
+                f"<Authorization>\n  Basic {_basic_auth_token(b'xml-header-multiline:pass')}\n</Authorization>",
+                _basic_auth_token(b"xml-header-multiline:pass"),
+            ),
+            (
                 f"<Proxy-Authorization>Basic {_basic_auth_token(b'xml-proxy:pass')}</Proxy-Authorization>",
                 _basic_auth_token(b"xml-proxy:pass"),
+            ),
+            (
+                f"<Proxy-Authorization>\n  Basic "
+                f"{_basic_auth_token(b'xml-proxy-multiline:pass')}\n</Proxy-Authorization>",
+                _basic_auth_token(b"xml-proxy-multiline:pass"),
             ),
             (
                 f'headers["Authorization"] = "Basic {_basic_auth_token(b"bracket:pass")}"',
@@ -710,6 +719,7 @@ class TestSecretsDetector:
             f"Authorization: Basic\r\nX-Trace: {_basic_auth_token(b'not-continuation:pass')}",
             "Authorization: Basic\n" + ("padding\n" * 300) + _basic_auth_token(b"far-away:pass"),
             f"<X-Trace>Basic {_basic_auth_token(b'xml-non-header:pass')}</X-Trace>",
+            f"<X-Trace>\n  Basic {_basic_auth_token(b'xml-non-header-multiline:pass')}\n</X-Trace>",
             f"Authorization: Basic {'A' * (BASIC_AUTH_TOKEN_MAX_LENGTH + 1)}",
             "https://user:pass@example.test/model.bin",
             f"https://example.test/?header=Authorization%3A%20Basic%20{_basic_auth_token(b'percent:pass')}",
