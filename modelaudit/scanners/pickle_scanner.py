@@ -2852,7 +2852,7 @@ class PickleScanner(BaseScanner):
                 and not result.has_warnings
                 and not result.metadata.get("analysis_incomplete")
                 and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
-                and result.metadata.get("pickle_verdict") == "suspicious"
+                and result.metadata.get("pickle_verdict") in {"malicious", "suspicious"}
             )
             if clean_trusted_storage_downgrade:
                 cls._remove_private_actionable_failed_check_entries(result, downgraded_private_entries)

@@ -1951,7 +1951,7 @@ def test_legacy_pytorch_storage_pid_downgrades_companion_storage_import_call_gra
     result.metadata.update(
         {
             "import_references": [{"import_reference": "torch.ByteStorage", "position": 153}],
-            "pickle_verdict": "suspicious",
+            "pickle_verdict": "malicious",
         }
     )
     result.add_check(
@@ -2026,7 +2026,7 @@ def test_legacy_pytorch_storage_pid_downgrades_parser_layout_storage_import_posi
     result.metadata.update(
         {
             "import_references": [{"import_reference": "torch.ByteStorage", "position": storage_import_position}],
-            "pickle_verdict": "suspicious",
+            "pickle_verdict": "malicious",
         }
     )
     result.add_check(
@@ -2081,7 +2081,7 @@ def test_legacy_pytorch_storage_pid_downgrades_wrapped_parser_layout_storage_imp
             "import_references": [
                 {"import_reference": "torch.ByteStorage", "position": len(prefix) + storage_import_position}
             ],
-            "pickle_verdict": "suspicious",
+            "pickle_verdict": "malicious",
         }
     )
     result.add_check(
@@ -2134,7 +2134,7 @@ def test_legacy_pytorch_storage_pid_downgrades_duplicate_same_position_storage_i
                 {"import_reference": "torch.ByteStorage", "position": 153},
                 {"import_reference": "torch.ByteStorage", "position": 153},
             ],
-            "pickle_verdict": "suspicious",
+            "pickle_verdict": "malicious",
         }
     )
     result.add_check(
@@ -2201,7 +2201,7 @@ def test_legacy_pytorch_storage_pid_downgrades_memoized_multi_storage_import_cal
     result.metadata.update(
         {
             "import_references": [{"import_reference": "torch.ByteStorage", "position": 153}],
-            "pickle_verdict": "suspicious",
+            "pickle_verdict": "malicious",
         }
     )
     for key in ("0", "1"):
