@@ -1235,6 +1235,9 @@ def test_pytorch_zip_storage_reference_validation_checks_timeout_between_data_pk
 @pytest.mark.slow
 def test_pytorch_zip_pinned_pid_storage_member_qa(tmp_path: Path) -> None:
     """Pinned PiD storage bytes must not be scanned as a follow-on pickle stream."""
+    if os.environ.get("MODELAUDIT_RUN_HF_E2E") != "1":
+        pytest.skip("Set MODELAUDIT_RUN_HF_E2E=1 to download and scan the pinned Hugging Face checkpoint")
+
     model_path = _pinned_pid_member_slice(tmp_path)
 
     result = PyTorchZipScanner().scan(str(model_path))
