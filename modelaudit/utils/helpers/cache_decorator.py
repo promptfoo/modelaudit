@@ -168,6 +168,17 @@ def should_bypass_cache_for_unavailable_hdf5_analysis(file_path: str) -> bool:
         return True
 
 
+def should_bypass_cache_for_file_backed_hdf5(file_path: str) -> bool:
+    """Bypass content-hash cache probes for HDF5 files scanned through bounded file-backed inspection."""
+    try:
+        from ...scanners.base import DEFAULT_MAX_FILE_READ_SIZE
+
+        file_size = os.path.getsize(file_path)
+    except OSError:
+        return False
+    return file_size > DEFAULT_MAX_FILE_READ_SIZE and find_hdf5_signature_offset(file_path) is not None
+
+
 def should_bypass_cache_for_zip_entry_preflight(file_path: str, config: dict[str, Any]) -> bool:
     """Avoid cache probes that materialize an over-limit or inconsistent ZIP directory."""
     try:
@@ -424,6 +435,10 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
                 if should_bypass_cache_for_unavailable_hdf5_analysis(file_path):
                     logger.debug(f"Bypassing cache because HDF5 analysis is unavailable: {file_path}")
+                    return func(*args, **kwargs)
+
+                if should_bypass_cache_for_file_backed_hdf5(file_path):
+                    logger.debug(f"Bypassing cache for file-backed HDF5 inspection: {file_path}")
                     return func(*args, **kwargs)
 
                 if not cache_config.should_cache_file(file_stat.st_size, file_ext):
