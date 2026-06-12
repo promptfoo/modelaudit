@@ -921,6 +921,26 @@ class TestSecretsDetector:
 
         assert _basic_auth_findings(findings) == []
 
+    def test_basic_auth_contextless_dense_tokens_skip_broad_context_scans(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        detector = SecretsDetector()
+
+        def fail_broad_context_scan(*_args: object, **_kwargs: object) -> bool:
+            raise AssertionError("contextless Basic tokens should not run broad collection context checks")
+
+        for helper_name in (
+            "_basic_auth_match_has_yaml_list_header_context",
+            "_basic_auth_prefix_has_header_value_array_context",
+            "_basic_auth_prefix_has_headers_object_context",
+        ):
+            monkeypatch.setattr(SecretsDetector, helper_name, staticmethod(fail_broad_context_scan))
+
+        findings = detector.scan_text(" ".join(["Basic dXNlcjpwYXNz"] * 1000), context="README.md")
+
+        assert _basic_auth_findings(findings) == []
+
     @pytest.mark.parametrize(
         "header_name",
         [

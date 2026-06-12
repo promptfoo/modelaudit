@@ -768,11 +768,18 @@ class SecretsDetector:
             if match_end is not None
             else ""
         )
-        if SecretsDetector._basic_auth_match_has_yaml_list_header_context(text, position):
+        collection_prefix_lower = collection_prefix.lower()
+        if SecretsDetector._basic_auth_yaml_list_current_value_prefix(
+            line_prefix
+        ) and SecretsDetector._basic_auth_match_has_yaml_list_header_context(text, position):
             return True
-        if SecretsDetector._basic_auth_prefix_has_header_value_array_context(collection_prefix):
+        if "auth" in collection_prefix_lower and SecretsDetector._basic_auth_prefix_has_header_value_array_context(
+            collection_prefix
+        ):
             return True
-        if SecretsDetector._basic_auth_prefix_has_headers_object_context(collection_prefix, collection_suffix):
+        if "headers" in collection_prefix_lower and SecretsDetector._basic_auth_prefix_has_headers_object_context(
+            collection_prefix, collection_suffix
+        ):
             return True
         if BASIC_AUTH_CONTINUATION_PREFIX_PATTERN.fullmatch(line_prefix) is None:
             return False
@@ -831,7 +838,12 @@ class SecretsDetector:
 
     @staticmethod
     def _basic_auth_next_line_start(text: str, position: int) -> int | None:
-        newline_positions = [index for index in (text.find("\n", position), text.find("\r", position)) if index != -1]
+        search_end = min(len(text), position + BASIC_AUTH_TOKEN_MAX_LENGTH + BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS)
+        newline_positions = [
+            index
+            for index in (text.find("\n", position, search_end), text.find("\r", position, search_end))
+            if index != -1
+        ]
         if not newline_positions:
             return None
         line_end = min(newline_positions)
