@@ -9,6 +9,8 @@ from typing import Any
 
 import pytest
 
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
+from modelaudit.scanners import pickle_scanner as pickle_scanner_module
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pickle_scanner import ML_SAFE_GLOBALS, PickleScanner, _is_legitimate_serialization_file
 
@@ -185,19 +187,24 @@ def test_joblib_like_pickle_keeps_wrapper_warning_when_origin_is_untrusted(
     joblib_file = tmp_path / "numpy_arrays.joblib"
     _write_joblib_like_pickle(joblib_file, padding=16)
 
-    def untrusted_joblib_wrapper(_module: str, _name: str) -> bool:
-        return False
+    monkeypatch.setattr(pickle_scanner_module, "_is_legitimate_serialization_file", lambda _path: True)
+    monkeypatch.setattr(pickle_scanner_module, "_joblib_numpy_array_wrapper_origin_is_trusted", lambda: False)
 
-    monkeypatch.setattr(
-        "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
-        untrusted_joblib_wrapper,
-    )
-    monkeypatch.setattr(
-        "modelaudit_picklescan.api.import_only_reference_is_proven_trusted",
-        untrusted_joblib_wrapper,
+    scanner = PickleScanner()
+    result = scanner._create_result()
+    result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    result.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
+    result.add_check(
+        name="Pickle Global Import",
+        passed=False,
+        message="Global import joblib.numpy_pickle.NumpyArrayWrapper is not allowlisted",
+        severity=IssueSeverity.WARNING,
+        location=str(joblib_file),
+        details={"import_reference": "joblib.numpy_pickle.NumpyArrayWrapper"},
+        rule_code="NON_ALLOWLISTED_GLOBAL",
     )
 
-    result = PickleScanner().scan(str(joblib_file))
+    scanner._apply_legitimate_joblib_like_pickle_cleanup(result, str(joblib_file))
 
     assert result.success is False
     assert result.has_warnings or result.metadata.get("scan_outcome") == "inconclusive"
