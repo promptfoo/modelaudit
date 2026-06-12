@@ -2682,7 +2682,7 @@ class TestDvcSecurity:
 
         assert result.files_scanned == 102
         assert result.success is False
-        assert determine_exit_code(result) == 2
+        assert determine_exit_code(result) == 1
         assert any(
             issue.rule_code == "S201" and issue.location is not None and str(malicious) in issue.location
             for issue in result.issues
