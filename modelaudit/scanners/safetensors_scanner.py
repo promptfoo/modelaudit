@@ -421,6 +421,7 @@ _BASE64_LICENSE_WRAP_MAX_DECODED_BYTES = 6144
 _BASE64_LICENSE_WRAP_MAX_SEPARATOR_LINES = 4
 _BASE64_LICENSE_WRAP_SEPARATOR_OVERFLOW_MIN_CHARS = 4
 _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO = 0.15
+_BASE64_LICENSE_WRAP_TRAILING_DOCUMENTARY_TOKENS = frozenset({"and", "or"})
 _BASE64_LICENSE_WRAP_LINE_PATTERN = re.compile(r"^[A-Za-z0-9+/_-]+={0,2}$")
 _BASE64_LICENSE_WRAP_TOKEN_PATTERN = re.compile(
     r"(?<![A-Za-z0-9+/_-])(?:"
@@ -740,6 +741,11 @@ class SafeTensorsScanner(BaseScanner):
         if fragments:
             return fragments
         if documentary_fragments:
+            if (
+                len(documentary_fragments) > 1
+                and documentary_fragments[-1].strip("=").lower() in _BASE64_LICENSE_WRAP_TRAILING_DOCUMENTARY_TOKENS
+            ):
+                return [documentary_fragments[-2]]
             return [documentary_fragments[-1]]
         return fragments
 

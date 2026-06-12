@@ -1264,14 +1264,16 @@ def test_license_metadata_unpadded_tiny_prefix_suffix_chunks_reconstruct_active_
 
 
 @pytest.mark.parametrize("chunk_size", [1, 2, 3])
+@pytest.mark.parametrize("line_template", ["License to use {chunk} under terms", "License to use {chunk} and terms"])
 def test_license_metadata_unpadded_tiny_chunks_ignore_documentary_short_words(
     tmp_path: Path,
     chunk_size: int,
+    line_template: str,
 ) -> None:
     file_path = tmp_path / f"unpadded_{chunk_size}_char_extra_short_words_license_metadata.safetensors"
     encoded_payload = base64.b64encode(b"import os\nos.system('id')\n#").decode("ascii").rstrip("=")
     chunks = [encoded_payload[index : index + chunk_size] for index in range(0, len(encoded_payload), chunk_size)]
-    wrapped_tail = "\n".join(f"License to use {chunk} under terms" for chunk in chunks)
+    wrapped_tail = "\n".join(line_template.format(chunk=chunk) for chunk in chunks)
     payload = f"{ordinary_license_text_with_url()}\n{wrapped_tail}"
     write_raw_safetensors(
         file_path,
@@ -1289,11 +1291,15 @@ def test_license_metadata_unpadded_tiny_chunks_ignore_documentary_short_words(
     assert any(issue.rule_code == "S905" and "license" in issue.message for issue in result.issues)
 
 
-def test_license_metadata_word_like_chunk_with_extra_short_words_reconstructs_active_payload(tmp_path: Path) -> None:
+@pytest.mark.parametrize("line_template", ["License to use {chunk} under terms", "License to use {chunk} and terms"])
+def test_license_metadata_word_like_chunk_with_extra_short_words_reconstructs_active_payload(
+    tmp_path: Path,
+    line_template: str,
+) -> None:
     file_path = tmp_path / "word_like_chunk_extra_short_words_license_metadata.safetensors"
     encoded_payload = base64.b64encode(b"o import os\nos.system('id')\n").decode("ascii").rstrip("=")
     chunks = [encoded_payload[index : index + 2] for index in range(0, len(encoded_payload), 2)]
-    wrapped_tail = "\n".join(f"License to use {chunk} under terms" for chunk in chunks)
+    wrapped_tail = "\n".join(line_template.format(chunk=chunk) for chunk in chunks)
     payload = f"{ordinary_license_text_with_url()}\n{wrapped_tail}"
     write_raw_safetensors(
         file_path,
