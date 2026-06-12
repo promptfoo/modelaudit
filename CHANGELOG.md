@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - validate Basic Auth credentials only in bounded authorization-header context with decodable username/password tokens
+- detect GGUF curl short-option remote fetches, ignore spaced Python attribute calls, and truncate large tokenizer metadata arrays with explicit counts
+- require concrete GGUF metadata evidence for S902 findings instead of flagging benign URLs, chat-template syntax, slashes, or pipes
 - deduplicate repeated ONNX custom-operator domain findings into bounded per-domain reports while preserving affected-file evidence
 - avoid Hugging Face streaming body probes for declared-suffix artifacts excluded by scanner selection while preserving selected renamed content routes
 - exclude Hugging Face local-dir cache sidecars from scan inventory, routing, issue locations, and SBOM components while preserving hidden artifact scanning
