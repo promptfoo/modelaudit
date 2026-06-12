@@ -2259,16 +2259,17 @@ def test_scan_bytes_marks_each_pytorch_storage_persistent_id_import_reference() 
 def test_scan_bytes_does_not_mark_synthetic_torch_storage_name_as_storage_persistent_id() -> None:
     payload = _pytorch_storage_persistent_id_payload("0", storage_name="SyntheticStorage")
 
-    report = scan_bytes(payload, source="synthetic-storage-name.pkl")
+    report = scan_bytes(payload, source="synthetic-storage-name.pkl", enrich_call_graph=False)
 
     assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
     persistent_id_findings = [finding for finding in report.findings if finding.rule_code == "PERSISTENT_ID"]
     assert persistent_id_findings
     assert not any(finding.details.get("pytorch_storage_persistent_id") is True for finding in persistent_id_findings)
     assert any(
-        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and finding.details.get("import_reference") == "torch.SyntheticStorage"
-        for finding in report.findings
+        reference.get("import_reference") == "torch.SyntheticStorage"
+        and reference.get("pytorch_storage_persistent_id") is not True
+        for reference in report.metadata["import_references"]
     )
 
 
