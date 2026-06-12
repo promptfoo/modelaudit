@@ -13,6 +13,7 @@ from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from modelaudit.core_results import mark_operational_scan_error
 from modelaudit.detectors.network_comm import redact_url_for_finding
+from modelaudit.scanner_registry_metadata import TOKENIZER_VOCABULARY_CONTENT_FILENAMES
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from modelaudit.scanners._evidence_redaction import redact_untrusted_error_message
 from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
@@ -76,18 +77,10 @@ DOCUMENTATION_NETWORK_FINDING_PRIORITY = {
     "domain_name": 0,
     "domain": 0,
 }
-PASSIVE_DATA_TEXT_FILENAMES = frozenset({"classes.txt"})
+PASSIVE_DATA_TEXT_FILENAMES = frozenset({"classes.txt", "merges.txt"})
 PASSIVE_DATA_TEXT_PREFIXES = ("label", "token", "vocab")
-TOKENIZER_VOCABULARY_FILENAMES = frozenset(
-    {
-        "tokenizer.txt",
-        "tokenizer_vocab.txt",
-        "tokenizer-vocab.txt",
-        "tokens.txt",
-        "vocab.txt",
-        "vocabulary.txt",
-    }
-)
+PASSIVE_DATA_SECRET_TYPES = frozenset({"Basic Auth Credentials", "Bearer Token"})
+TOKENIZER_VOCABULARY_FILENAMES = frozenset(TOKENIZER_VOCABULARY_CONTENT_FILENAMES)
 TOKENIZER_VOCABULARY_PREFIXES = ("tokenizer_vocab", "tokenizer-vocab", "vocab")
 TOKENIZER_VOCABULARY_OMITTABLE_CC_PATTERNS = frozenset({"trojan", "zombie"})
 MIN_TOKENIZER_VOCABULARY_LINES = 8
@@ -800,6 +793,7 @@ class TextScanner(BaseScanner):
             "vocabulary.txt",
             "tokens.txt",
             "tokenizer.txt",
+            "merges.txt",
             "labels.txt",
             "classes.txt",
             "model_card.md",
@@ -2316,6 +2310,22 @@ class TextScanner(BaseScanner):
         return any(isinstance(value, str) and line_text == value.casefold() for value in candidates)
 
     @classmethod
+    def _is_bare_data_secret_token(cls, payload: bytes, finding: dict[str, Any]) -> bool:
+        if finding.get("secret_type") not in PASSIVE_DATA_SECRET_TYPES:
+            return False
+        line_parts = cls._finding_line_parts(payload, finding)
+        if line_parts is None:
+            return False
+        line, position = line_parts
+        length = finding.get("length")
+        if not isinstance(length, int) or length <= 0 or position + length > len(line):
+            return False
+        stripped = line.strip()
+        if not stripped or b"@" in stripped or b":" in stripped or b"=" in stripped:
+            return False
+        return line[position : position + length].strip() == stripped
+
+    @classmethod
     def _is_isolated_tokenizer_vocabulary_cc_finding(cls, payload: bytes, finding: dict[str, Any]) -> bool:
         if finding.get("type") != "cc_pattern":
             return False
@@ -3116,6 +3126,16 @@ class TextScanner(BaseScanner):
             classified_findings.append(finding)
         return classified_findings, classification_incomplete, classification_limit_sources
 
+    @classmethod
+    def _downgrade_sidecar_secret_findings(
+        cls,
+        path: str,
+        payload: bytes,
+        findings: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        # Whole-line Basic/Bearer matches in passive sidecars can be real credentials.
+        return findings
+
     @staticmethod
     def _is_unreadable_path_result(result: ScanResult) -> bool:
         return any(check.name == "Path Readable" and check.status == CheckStatus.FAILED for check in result.checks)
@@ -3208,6 +3228,7 @@ class TextScanner(BaseScanner):
                     max_findings=max_findings,
                 )
                 secret_findings, finding_limit = self._split_detector_finding_limit(secret_findings)
+                secret_findings = self._downgrade_sidecar_secret_findings(path, inspected_payload, secret_findings)
                 if secret_findings or not truncated:
                     self.add_embedded_secret_findings(secret_findings, result, context=path)
                 if finding_limit is not None:
@@ -3413,7 +3434,7 @@ class TextScanner(BaseScanner):
                     details={"file_type": "documentation"},
                     rule_code=None,  # Passing check
                 )
-            elif filename in ["vocab.txt", "vocabulary.txt", "tokens.txt", "tokenizer.txt"]:
+            elif filename in ["vocab.txt", "vocabulary.txt", "tokens.txt", "tokenizer.txt", "merges.txt"]:
                 result.add_check(
                     name="File Type Identification",
                     passed=True,

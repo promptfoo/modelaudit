@@ -7228,7 +7228,7 @@ def test_scan_file_routes_malicious_flax_checkpoint_under_skipped_suffix(tmp_pat
 @pytest.mark.parametrize(
     ("filename", "payload", "expected_scanner"),
     [
-        ("merges.txt", "#version: 0.2\nĠ t\n", "unknown"),
+        ("merges.txt", "#version: 0.2\nĠ t\n", "text"),
         (
             "tokenizer.json",
             json.dumps({"version": "1.0", "model": {"type": "BPE", "vocab": {"Ġthe": 0}}}),
@@ -7260,14 +7260,15 @@ def test_scan_file_keeps_bounded_utf8_tokenizer_text_out_of_flax_scanner(
 
 
 @pytest.mark.parametrize(
-    ("filename", "line"),
-    [("merges.txt", "Ġtoken token\n"), ("settings.conf", "token=olá\n")],
+    ("filename", "line", "expected_scanner"),
+    [("merges.txt", "Ġtoken token\n", "text"), ("settings.conf", "token=olá\n", "unknown")],
     ids=["bpe-merges", "conf"],
 )
 def test_scan_file_keeps_large_text_owner_text_out_of_flax_scanner(
     tmp_path: Path,
     filename: str,
     line: str,
+    expected_scanner: str,
 ) -> None:
     text_path = tmp_path / filename
     text_path.write_text(_build_large_text_owner_text(line), encoding="utf-8")
@@ -7279,7 +7280,7 @@ def test_scan_file_keeps_large_text_owner_text_out_of_flax_scanner(
 
     result = scan_file(str(text_path), config={"cache_scan_results": False})
 
-    assert result.scanner_name == "unknown"
+    assert result.scanner_name == expected_scanner
     assert result.success is True
     assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
 
@@ -7294,7 +7295,7 @@ def test_scan_file_keeps_nested_utf8_tokenizer_text_member_out_of_flax_scanner(t
     assert result.success is True
     assert not result.issues
     assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
-    assert result.metadata["contents"] == [{"path": f"{archive}:tokenizer/merges.txt", "type": "unknown", "size": 19}]
+    assert result.metadata["contents"] == [{"path": f"{archive}:tokenizer/merges.txt", "type": "text", "size": 19}]
 
 
 def test_scan_file_keeps_large_nested_tokenizer_text_member_out_of_flax_scanner(tmp_path: Path) -> None:
@@ -7309,7 +7310,7 @@ def test_scan_file_keeps_large_nested_tokenizer_text_member_out_of_flax_scanner(
     assert not result.issues
     assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
     assert result.metadata["contents"] == [
-        {"path": f"{archive}:tokenizer/merges.txt", "type": "unknown", "size": len(payload)}
+        {"path": f"{archive}:tokenizer/merges.txt", "type": "text", "size": len(payload)}
     ]
 
 

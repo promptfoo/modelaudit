@@ -13,6 +13,7 @@ from typing import Any, BinaryIO, ClassVar, cast
 
 from ..core_results import mark_operational_scan_error
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
+from ..utils.file.detection import is_declared_text_content_filename
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
@@ -290,13 +291,7 @@ class ZipScanner(BaseScanner):
         ext = os.path.splitext(basename)[1]
         if ext in {".zip", ".npz", ".mar"}:
             return True
-        return (
-            basename == ".env"
-            or basename == "readme"
-            or (basename.startswith("readme.") and ext in {".txt", ".md", ".markdown", ".rst"})
-            or basename == "model_card"
-            or (basename.startswith(("model_card.", "modelcard.")) and ext in {".txt", ".md", ".markdown", ".rst"})
-        )
+        return basename == ".env" or is_declared_text_content_filename(basename)
 
     def _is_known_unreadable_archive_entry(self, info: zipfile.ZipInfo) -> bool:
         return info.header_offset in self.known_unreadable_archive_entry_offsets
@@ -2004,6 +1999,9 @@ class ZipScanner(BaseScanner):
                     max_entry_size = self._get_max_entry_size()
                     is_security_only_member = self._is_security_only_member_entry(name)
                     is_content_only_member = self._is_content_only_member_entry(name)
+                    is_mar_python_fallback = (
+                        archive_ext == ".mar" and name.lower().endswith(".py") and not is_security_only_member
+                    )
                     preserve_nested_routing_basename = self._preserve_nested_routing_basename(name)
                     safe_name: str | None = None
 
@@ -2018,7 +2016,39 @@ class ZipScanner(BaseScanner):
                         safe_name = raw_safe_name if preserve_nested_routing_basename else raw_safe_name.strip("._")
                         if not safe_name:
                             safe_name = "archive-member"
+                        if is_mar_python_fallback:
+                            safe_name = f"member_{safe_name}"
+                            preserve_nested_routing_basename = False
                         suffix = f"_{safe_name}"
+
+                    def copy_entry_to(
+                        tmp_file: BinaryIO,
+                        *,
+                        archive: zipfile.ZipFile = z,
+                        entry_info: zipfile.ZipInfo = info,
+                        entry_name: str = name,
+                        entry_size_limit: int = max_entry_size,
+                        total_size_before_entry: int = extracted_uncompressed_size,
+                        total_size_limit: int = max_total_uncompressed_size,
+                    ) -> int:
+                        copied_size = 0
+                        with archive.open(entry_info) as entry:
+                            while True:
+                                chunk = entry.read(ARCHIVE_MEMBER_COPY_CHUNK_BYTES)
+                                if not chunk:
+                                    break
+                                copied_size += len(chunk)
+                                if copied_size > entry_size_limit:
+                                    raise ValueError(
+                                        f"ZIP entry {entry_name} exceeds maximum size of {entry_size_limit} bytes",
+                                    )
+                                if total_size_before_entry + copied_size > total_size_limit:
+                                    raise ValueError(
+                                        "ZIP archive exceeds maximum total uncompressed size of "
+                                        f"{total_size_limit} bytes",
+                                    )
+                                tmp_file.write(chunk)
+                        return copied_size
 
                     try:
                         with self._open_member_temp_file(
@@ -2026,26 +2056,11 @@ class ZipScanner(BaseScanner):
                             safe_name,
                             preserve_nested_routing_basename and not is_content_only_member,
                         ) as (tmp_path, tmp, tmp_dir):
-                            total_size = 0
-                            with z.open(info) as entry:
-                                while True:
-                                    chunk = entry.read(ARCHIVE_MEMBER_COPY_CHUNK_BYTES)
-                                    if not chunk:
-                                        break
-                                    total_size += len(chunk)
-                                    if total_size > max_entry_size:
-                                        raise ValueError(
-                                            f"ZIP entry {name} exceeds maximum size of {max_entry_size} bytes",
-                                        )
-                                    if extracted_uncompressed_size + total_size > max_total_uncompressed_size:
-                                        raise ValueError(
-                                            "ZIP archive exceeds maximum total uncompressed size of "
-                                            f"{max_total_uncompressed_size} bytes",
-                                        )
-                                    tmp.write(chunk)
-                            extracted_uncompressed_size += total_size
+                            total_size = copy_entry_to(tmp)
 
-                        if archive_ext == ".mar" and name.lower().endswith(".py") and not is_security_only_member:
+                        extracted_uncompressed_size += total_size
+
+                        if is_mar_python_fallback:
                             mar_python_result = self._scan_mar_python_entry(path, name, tmp_path, total_size)
                             if mar_python_result is not None:
                                 result.merge(mar_python_result)
