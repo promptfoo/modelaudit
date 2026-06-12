@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - contextualize SafeTensors license metadata so ordinary embedded license text does not produce URL or long-value noise while preserving malformed and executable metadata detections
 - reconstruct bounded wrapped SafeTensors license base64 tails and fail closed on residual URL encodings before suppressing metadata URL and length findings
+- avoid critical pickle `getattr` findings for proven Ultralytics `Detect.forward` reconstruction while preserving unsafe traversal controls
 - detect GGUF curl short-option remote fetches, ignore spaced Python attribute calls, and truncate large tokenizer metadata arrays with explicit counts
 - require concrete GGUF metadata evidence for S902 findings instead of flagging benign URLs, chat-template syntax, slashes, or pipes
 - deduplicate repeated ONNX custom-operator domain findings into bounded per-domain reports while preserving affected-file evidence
