@@ -19,8 +19,10 @@ BASIC_AUTH_SECRET_TYPE = "Basic Auth Credentials"
 BASIC_AUTH_TOKEN_MAX_LENGTH = 8192
 BASIC_AUTH_CONFIDENCE = 0.8
 BASIC_AUTH_TOKEN_TERMINATOR = r"(?=$|[\s\"'`,.;<\]\)}]|\\(?:[\"']|r|n))"
+BASIC_AUTH_SCHEME_SEPARATOR = r"(?:[ \t]+|(?:\r\n|\r|\n)[ \t])"
 BASIC_AUTH_PATTERN = (
-    rf"\bBasic[ \t]+([A-Za-z0-9+/]{{2,{BASIC_AUTH_TOKEN_MAX_LENGTH}}}={{0,2}}){BASIC_AUTH_TOKEN_TERMINATOR}"
+    rf"\bBasic{BASIC_AUTH_SCHEME_SEPARATOR}"
+    rf"([A-Za-z0-9+/]{{2,{BASIC_AUTH_TOKEN_MAX_LENGTH}}}={{0,2}}){BASIC_AUTH_TOKEN_TERMINATOR}"
 )
 BASIC_AUTH_HEADER_VALUE_CONTEXT_MAX_BYTES = BASIC_AUTH_TOKEN_MAX_LENGTH + 64
 
@@ -379,6 +381,10 @@ BASIC_AUTH_SERVER_HEADER_DIRECTIVE_PREFIX_PATTERN = re.compile(
     r"(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
     re.IGNORECASE,
 )
+BASIC_AUTH_XML_HEADER_PREFIX_PATTERN = re.compile(
+    r"<\s*(?:authorization|proxy-authorization)(?:\s+[^<>]*)?>\s*$",
+    re.IGNORECASE,
+)
 BASIC_AUTH_HEADERS_CONSTRUCTOR_START_PATTERN = re.compile(
     r"(?:^|[^\w$])(?:new\s+)?Headers\s*\(\s*\[",
     re.IGNORECASE,
@@ -722,6 +728,8 @@ class SecretsDetector:
         if BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(line_prefix) is not None:
             return True
         if BASIC_AUTH_SERVER_HEADER_DIRECTIVE_PREFIX_PATTERN.search(line_prefix) is not None:
+            return True
+        if BASIC_AUTH_XML_HEADER_PREFIX_PATTERN.search(line_prefix) is not None:
             return True
         bounded_prefix = text[search_start:position]
         if BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(bounded_prefix) is not None:
@@ -1360,11 +1368,11 @@ class SecretsDetector:
         return bool(separator and (username or password))
 
     def _basic_auth_match_is_valid(self, text: str, match: re.Match[str], token: str) -> bool:
-        return self._basic_auth_match_has_header_context(
+        return self._basic_auth_token_decodes_to_credentials(token) and self._basic_auth_match_has_header_context(
             text,
             match.start(),
             match.end(),
-        ) and self._basic_auth_token_decodes_to_credentials(token)
+        )
 
     def _record_basic_auth_finding(
         self,

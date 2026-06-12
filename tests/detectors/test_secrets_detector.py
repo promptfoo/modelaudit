@@ -160,6 +160,8 @@ class TestSecretsDetector:
         ("text", "token"),
         [
             ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("Authorization: Basic\n dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+            ("Authorization: Basic\r\n\tdXNlcjpwYXNz", "dXNlcjpwYXNz"),
             (f"Authorization: Basic {_basic_auth_token(b'sentence:pass')}.", _basic_auth_token(b"sentence:pass")),
             (f'BASIC_AUTH="Basic {_basic_auth_token(b"basic-var:pass")}"', _basic_auth_token(b"basic-var:pass")),
             (f'auth_header = "Basic {_basic_auth_token(b"auth-header:pass")}"', _basic_auth_token(b"auth-header:pass")),
@@ -237,6 +239,14 @@ class TestSecretsDetector:
             (
                 f"<code>Authorization: Basic {_basic_auth_token(b'html:pass')}</code>",
                 _basic_auth_token(b"html:pass"),
+            ),
+            (
+                f"<Authorization>Basic {_basic_auth_token(b'xml-header:pass')}</Authorization>",
+                _basic_auth_token(b"xml-header:pass"),
+            ),
+            (
+                f"<Proxy-Authorization>Basic {_basic_auth_token(b'xml-proxy:pass')}</Proxy-Authorization>",
+                _basic_auth_token(b"xml-proxy:pass"),
             ),
             (
                 f'headers["Authorization"] = "Basic {_basic_auth_token(b"bracket:pass")}"',
@@ -695,7 +705,9 @@ class TestSecretsDetector:
             f"Authorization notes:\n  - Basic {_basic_auth_token(b'listed:pass')}",
             f"Authorization:\n\n  Basic {_basic_auth_token(b'gap:pass')}",
             f"Authorization: Basic\n  {_basic_auth_token(b'newline-token:pass')}",
+            f"Authorization: Basic\r\n  {_basic_auth_token(b'crlf-double-space:pass')}",
             "Authorization: Basic\n" + ("padding\n" * 300) + _basic_auth_token(b"far-away:pass"),
+            f"<X-Trace>Basic {_basic_auth_token(b'xml-non-header:pass')}</X-Trace>",
             f"Authorization: Basic {'A' * (BASIC_AUTH_TOKEN_MAX_LENGTH + 1)}",
             "https://user:pass@example.test/model.bin",
             f"https://example.test/?header=Authorization%3A%20Basic%20{_basic_auth_token(b'percent:pass')}",
@@ -795,6 +807,22 @@ class TestSecretsDetector:
         detector = SecretsDetector()
 
         findings = detector.scan_text(text, context="headers.txt")
+
+        assert _basic_auth_findings(findings) == []
+
+    def test_basic_auth_rejects_invalid_tokens_before_context_scan(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        detector = SecretsDetector()
+
+        def fail_context_scan(*_args: object, **_kwargs: object) -> bool:
+            raise AssertionError("invalid Basic token should not run header context checks")
+
+        monkeypatch.setattr(
+            SecretsDetector,
+            "_basic_auth_match_has_header_context",
+            staticmethod(fail_context_scan),
+        )
+
+        findings = detector.scan_text("Notes: Basic AAAAA", context="headers.txt")
 
         assert _basic_auth_findings(findings) == []
 
