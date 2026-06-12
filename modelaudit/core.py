@@ -1212,6 +1212,8 @@ def _streamed_onnx_external_data_hash_paths(path: Path) -> list[Path]:
     seen_external_paths: set[Path] = set()
     for tensors in _iter_model_external_data_tensor_groups(model):
         for tensor in tensors:
+            if getattr(tensor, "data_location", None) != onnx.TensorProto.EXTERNAL:
+                continue
             if not getattr(tensor, "external_data", ()):
                 continue
             info = {entry.key: entry.value for entry in tensor.external_data}
@@ -4267,8 +4269,25 @@ def scan_model_directory_or_file(
                 hash_sources: list[str] = []
                 seen_hash_sources: set[str] = set()
                 hash_source_by_path: dict[str, str] = {}
+                hash_budget_bytes = 0
+                onnx_external_data_sources_by_path: dict[str, list[str]] = {}
+                onnx_external_data_sizes_by_path: dict[str, int] = {}
+                onnx_external_data_routing_paths: dict[str, str] = {}
+                scan_entry_target_keys: set[_FileTargetIdentityKey] = set()
                 for (
                     _representative_file,
+                    scanned_file_paths,
+                    _entry_shard_family_key,
+                    _repository_member,
+                ) in scan_entries:
+                    for scanned_file_path in scanned_file_paths:
+                        scanned_path = Path(scanned_file_path)
+                        scanned_identity = _snapshot_file_identity(scanned_path)
+                        scanned_target_key = _file_target_identity_key(scanned_path, scanned_identity)
+                        if scanned_target_key is not None:
+                            scan_entry_target_keys.add(scanned_target_key)
+                for (
+                    representative_file,
                     scanned_file_paths,
                     entry_shard_family_key,
                     _repository_member,
@@ -4286,6 +4305,55 @@ def scan_model_directory_or_file(
                         if hash_source not in seen_hash_sources:
                             hash_sources.append(hash_source)
                             seen_hash_sources.add(hash_source)
+                            with suppress(OSError):
+                                hash_budget_bytes += os.path.getsize(hash_source)
+                    representative_hash_source = hash_source_by_path.get(representative_file)
+                    if (
+                        scanner_selection.allows("onnx")
+                        and representative_hash_source is not None
+                        and not _should_defer_hash_for_max_file_size(representative_hash_source, config)
+                    ):
+                        representative_external_sources: list[str] = []
+                        representative_external_bytes = 0
+                        for external_data_path in _streamed_onnx_external_data_hash_paths(Path(representative_file)):
+                            external_data_identity = _snapshot_file_identity(external_data_path)
+                            external_data_target_key = _file_target_identity_key(
+                                external_data_path,
+                                external_data_identity,
+                            )
+                            if (
+                                external_data_target_key is not None
+                                and external_data_target_key in scan_entry_target_keys
+                            ):
+                                continue
+                            if _should_defer_hash_for_max_file_size(str(external_data_path), config):
+                                aggregate_hash_complete = False
+                                continue
+                            if external_data_identity is None:
+                                aggregate_hash_complete = False
+                                continue
+                            external_data_size = _snapshot_file_size(external_data_identity)
+                            representative_external_bytes += external_data_size
+                            if max_total_size > 0 and hash_budget_bytes + external_data_size > max_total_size:
+                                aggregate_hash_complete = False
+                                continue
+                            external_data_source = str(
+                                Path(external_data_identity.resolved_path)
+                                if external_data_identity.resolved_path is not None
+                                else external_data_path
+                            )
+                            if external_data_source not in seen_hash_sources:
+                                hash_sources.append(external_data_source)
+                                seen_hash_sources.add(external_data_source)
+                                hash_budget_bytes += external_data_size
+                            representative_external_sources.append(external_data_source)
+                            onnx_external_data_routing_paths[external_data_source] = str(external_data_path)
+                            if external_data_target_key is not None:
+                                scan_entry_target_keys.add(external_data_target_key)
+                        if representative_external_sources:
+                            onnx_external_data_sources_by_path[representative_file] = representative_external_sources
+                        if representative_external_bytes:
+                            onnx_external_data_sizes_by_path[representative_file] = representative_external_bytes
 
                 if (
                     directory_owner_class is not None
@@ -4323,6 +4391,7 @@ def scan_model_directory_or_file(
                 routing_paths_by_source = {
                     hash_source: scanned_file_path for scanned_file_path, hash_source in hash_source_by_path.items()
                 }
+                routing_paths_by_source.update(onnx_external_data_routing_paths)
                 routing_paths_by_source.update(
                     {
                         owner_source: owner_source
@@ -4629,6 +4698,13 @@ def scan_model_directory_or_file(
                     _is_incomplete_aggregate_hash_placeholder(content_hash) for content_hash in content_hashes.values()
                 ):
                     aggregate_hash_complete = False
+                for external_data_sources in onnx_external_data_sources_by_path.values():
+                    if any(
+                        (external_hash := hashes_by_source.get(external_data_source)) is None
+                        or external_hash.startswith("unhashable_")
+                        for external_data_source in external_data_sources
+                    ):
+                        aggregate_hash_complete = False
                 _finish_phase_timing(phase_timings, "top_level_hashing", top_level_hashing_started_at)
                 duplicate_paths_by_hash: dict[str, list[str]] = {}
                 for file_path, content_hash in content_hashes.items():
@@ -4696,6 +4772,7 @@ def scan_model_directory_or_file(
                                 _openvino_xml_companion_key(Path(representative_file)),
                                 0,
                             )
+                            file_result.bytes_scanned += onnx_external_data_sizes_by_path.get(representative_file, 0)
                         finally:
                             _finish_phase_timing(phase_timings, "file_scan_dispatch", file_scan_started_at)
 
@@ -4715,6 +4792,18 @@ def scan_model_directory_or_file(
                             ):
                                 file_hashes.append(path_content_hash)
                                 recorded_content_hashes.add(path_content_hash)
+                        for onnx_external_data_source in onnx_external_data_sources_by_path.get(
+                            representative_file,
+                            (),
+                        ):
+                            external_data_content_hash = hashes_by_source.get(onnx_external_data_source)
+                            if (
+                                external_data_content_hash is not None
+                                and not external_data_content_hash.startswith("unhashable_")
+                                and external_data_content_hash not in recorded_content_hashes
+                            ):
+                                file_hashes.append(external_data_content_hash)
+                                recorded_content_hashes.add(external_data_content_hash)
 
                         # Add scanner to tracking list (different from scanner_names)
                         scanner_name = file_result.scanner_name
