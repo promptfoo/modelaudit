@@ -30,6 +30,7 @@ from modelaudit.models import (
     create_initial_audit_result,
     rebuild_models,
 )
+from modelaudit.scanner_results import Check, CheckStatus
 from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 
 
@@ -783,6 +784,32 @@ class TestModelAuditResultModel:
         assert result.success is False
         assert result.checks[0].details["scan_outcome_reason"] == "dvc_analysis_incomplete"
         assert determine_exit_code(result) == 2
+
+    def test_aggregate_scan_result_direct_runtime_version_skip_does_not_fail_coverage_success(self) -> None:
+        """Direct aggregation should also exempt expected runtime-version skips."""
+        result = create_initial_audit_result()
+        scan_result = ScanResult(scanner_name="pytorch_zip")
+        scan_result.checks.append(
+            Check(
+                name="CVE PyTorch Version Check",
+                status=CheckStatus.SKIPPED,
+                message="PyTorch runtime version unavailable",
+                severity=IssueSeverity.INFO,
+                location="weights.pt",
+                details={
+                    "analysis_incomplete": True,
+                    "runtime_version_known": False,
+                    "runtime_cve_applicability": "unknown",
+                    "runtime_cve_version_gate": "local_environment_only",
+                },
+            )
+        )
+
+        result.aggregate_scan_result_direct(scan_result)
+
+        assert result.has_errors is False
+        assert result.success is True
+        assert determine_exit_code(result) == 0
 
     def test_aggregate_scan_result_direct_operational_flag_sets_error_state(self) -> None:
         """Direct aggregation should honor explicit operational-error metadata."""

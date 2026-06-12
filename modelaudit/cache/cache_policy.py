@@ -42,6 +42,11 @@ _PRIVATE_EVIDENCE_METADATA_KEYS = (
     ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
     SUPPRESSED_FAILED_CHECKS_METADATA_KEY,
 )
+_RUNTIME_VERSION_SKIP_DETAILS = {
+    "runtime_version_known": False,
+    "runtime_cve_applicability": "unknown",
+    "runtime_cve_version_gate": "local_environment_only",
+}
 
 
 def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
@@ -65,7 +70,10 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
             if not isinstance(entry, dict):
                 continue
 
-            if _metadata_disqualifies_cache(entry.get("details"), allow_bare_analysis_incomplete=False):
+            if _metadata_disqualifies_cache(
+                entry.get("details"),
+                allow_bare_analysis_incomplete=not _record_is_clean_runtime_version_skip(entry),
+            ):
                 return False
 
             message = entry.get("message")
@@ -75,6 +83,23 @@ def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
                 return False
 
     return True
+
+
+def _record_is_clean_runtime_version_skip(record: dict[str, Any]) -> bool:
+    details = record.get("details")
+    if not isinstance(details, dict):
+        return False
+    status = record.get("status")
+    status_value = getattr(status, "value", status)
+    if not (
+        isinstance(status_value, str)
+        and status_value.lower().split(".", 1)[-1] == "skipped"
+        and details.get("analysis_incomplete") is True
+        and not _has_incomplete_coverage_outcome_marker(details)
+    ):
+        return False
+
+    return all(details.get(key) == expected for key, expected in _RUNTIME_VERSION_SKIP_DETAILS.items())
 
 
 def _metadata_disqualifies_cache(metadata: Any, *, allow_bare_analysis_incomplete: bool) -> bool:
@@ -111,6 +136,22 @@ def _metadata_disqualifies_cache(metadata: Any, *, allow_bare_analysis_incomplet
             details,
             allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
         )
+
+    return False
+
+
+def _has_incomplete_coverage_outcome_marker(metadata: dict[str, Any]) -> bool:
+    if metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
+        return True
+    reason = metadata.get("scan_outcome_reason")
+    if isinstance(reason, str):
+        return bool(reason)
+
+    reasons = metadata.get(SCAN_OUTCOME_REASONS_METADATA_KEY)
+    if isinstance(reasons, str):
+        return bool(reasons)
+    if isinstance(reasons, (list, tuple, set, frozenset)):
+        return any(bool(item) for item in reasons)
 
     return False
 
