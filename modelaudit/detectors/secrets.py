@@ -957,12 +957,14 @@ class SecretsDetector:
                 findings.extend(self._scan_basic_auth_structured_header_value(item, value_header_name, key_context))
             return findings
         if isinstance(value, list | tuple):
-            findings: list[dict[str, Any]] = []
+            list_findings: list[dict[str, Any]] = []
             for i, item in enumerate(value):
                 if self._findings_truncated:
                     break
-                findings.extend(self._scan_basic_auth_structured_header_value(item, header_name, f"{context}[{i}]"))
-            return findings
+                list_findings.extend(
+                    self._scan_basic_auth_structured_header_value(item, header_name, f"{context}[{i}]")
+                )
+            return list_findings
         return []
 
     def _scan_basic_auth_structured_header_object(
