@@ -343,11 +343,13 @@ _LICENSE_REFERENCE_FILE_MARKERS = (
 )
 _SUSPICIOUS_LICENSE_URL_PATH_COMPONENTS = frozenset({"download", "raw", "releases"})
 _SUSPICIOUS_LICENSE_URL_PATH_SUFFIXES = (
+    ".bat",
     ".bin",
     ".bz2",
     ".cjs",
     ".cmd",
     ".ckpt",
+    ".com",
     ".dll",
     ".dylib",
     ".exe",
@@ -413,6 +415,7 @@ _BASE64_LICENSE_WRAP_SEPARATOR_PATTERN = re.compile(
 _SUSPICIOUS_LICENSE_URL_MARKERS = ("payload", "exfil", "webhook", "callback")
 _BASE64_LICENSE_DECODED_ACTIVE_MARKERS = (
     "#!",
+    "chmod +x",
     "curl ",
     "eval(",
     "exec(",
@@ -420,6 +423,7 @@ _BASE64_LICENSE_DECODED_ACTIVE_MARKERS = (
     "https://",
     "import ",
     "os.system",
+    "rm -rf",
     "subprocess",
     "wget ",
 )
@@ -655,23 +659,17 @@ class SafeTensorsScanner(BaseScanner):
 
         fragments: list[str] = []
         token_matches = list(_BASE64_LICENSE_WRAP_TOKEN_PATTERN.finditer(stripped))
-        low_ratio_opaque_tokens = [
-            match.group(0)
-            for match in token_matches
-            if len(match.group(0)) / nonspace_len < _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO
-            and not SafeTensorsScanner._base64_candidate_decodes(match.group(0))
-            and not SafeTensorsScanner._license_document_token_looks_documentary(match.group(0))
-        ]
         for match in token_matches:
             token = match.group(0)
             before = stripped[: match.start()]
             after = stripped[match.end() :]
             token_decodes = SafeTensorsScanner._base64_candidate_decodes(token)
-            if len(token) / nonspace_len < _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO and not token_decodes:
-                if SafeTensorsScanner._license_document_token_looks_documentary(token):
-                    continue
-                if low_ratio_opaque_tokens != [token]:
-                    continue
+            if (
+                len(token) / nonspace_len < _BASE64_LICENSE_WRAP_MIN_FRAGMENT_RATIO
+                and not token_decodes
+                and SafeTensorsScanner._license_document_token_looks_documentary(token)
+            ):
+                continue
             annotations = [annotation for annotation in (before, after) if annotation.strip()]
             if not all(
                 SafeTensorsScanner._license_document_annotation_looks_documentary(annotation)
