@@ -2119,6 +2119,39 @@ class TestDvcSecurity:
         assert path_state.dvc_covered_paths == set()
         assert path_state.dvc_covered_directories == set()
 
+    def test_cli_directory_coverage_records_complete_subdirectories_after_sibling_gap(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A complete subdirectory remains DVC coverage when a sibling is incomplete."""
+        from modelaudit.cli import _ScanPathState
+        from modelaudit.models import AssetModel, create_initial_audit_result
+
+        models_dir = tmp_path / "models"
+        covered_dir = models_dir / "covered"
+        covered_dir.mkdir(parents=True)
+        covered_payload = covered_dir / "covered.pkl"
+        covered_payload.write_bytes(pickle.dumps({"covered": True}))
+        incomplete = models_dir / "incomplete.pkl"
+        incomplete.write_bytes(pickle.dumps({"incomplete": True}))
+        directory_result = create_initial_audit_result()
+        directory_result.success = False
+        directory_result.assets.append(AssetModel(path=str(covered_payload), type="pickle"))
+        directory_result.assets.append(AssetModel(path=str(incomplete), type="pickle"))
+        directory_result.file_metadata[str(incomplete)] = {
+            "analysis_incomplete": True,
+            "scan_outcome": INCONCLUSIVE_SCAN_OUTCOME,
+            "scan_outcome_reasons": ["synthetic_metadata_only_incomplete"],
+        }
+        path_state = _ScanPathState(collect_dvc_coverage=True)
+
+        path_state.record_dvc_coverage(str(models_dir), directory_result)
+
+        assert str(covered_payload.resolve()) in path_state.dvc_covered_paths
+        assert str(incomplete.resolve()) not in path_state.dvc_covered_paths
+        assert str(models_dir.resolve()) not in path_state.dvc_covered_directories
+        assert str(covered_dir.resolve()) in path_state.dvc_covered_directories
+
     def test_cli_shard_check_paths_count_as_dvc_coverage(self, tmp_path: Path) -> None:
         """Shard siblings scanned by the advanced handler must discharge capped outputs."""
         from modelaudit.cli import _ScanPathState
@@ -2689,12 +2722,12 @@ class TestDvcSecurity:
         )
         assert any(issue.type == "dvc_output_limit_exceeded" for issue in result.issues)
 
-    def test_over_limit_dvc_directory_output_keeps_tail_directory_incomplete_after_sibling_gap(
+    def test_over_limit_dvc_directory_output_covers_complete_tail_after_sibling_gap(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """An incomplete directory scan must not blanket-cover a tail subdirectory."""
+        """Unrelated incomplete siblings must not block complete tail subdirectory coverage."""
         model_dir = tmp_path / "model_dir"
         covered_subdir = model_dir / "covered"
         covered_subdir.mkdir(parents=True)
@@ -2724,7 +2757,7 @@ class TestDvcSecurity:
             issue.rule_code == "S201" and issue.location is not None and str(malicious) in issue.location
             for issue in result.issues
         )
-        assert any(issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in result.issues)
+        assert not any(issue.type == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in result.issues)
         assert result.file_metadata[str(incomplete)]["analysis_incomplete"] is True
         assert "synthetic_metadata_only_incomplete" in result.file_metadata[str(incomplete)]["scan_outcome_reasons"]
 
@@ -3419,12 +3452,12 @@ class TestDvcCliIntegration:
         )
         assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
 
-    def test_cli_incomplete_directory_prior_coverage_does_not_cover_tail_directory(
+    def test_cli_complete_directory_prior_coverage_covers_tail_subdirectory_after_sibling_gap(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Prior incomplete directory scans must not blanket-cover capped DVC tail directories."""
+        """Prior directory scans can cover complete tail directories despite sibling gaps."""
         from click.testing import CliRunner
 
         from modelaudit.cli import cli
@@ -3451,7 +3484,45 @@ class TestDvcCliIntegration:
         output_data = json.loads(result.output[result.output.index("{") :])
         assert output_data["success"] is False
         assert output_data["file_metadata"][str(incomplete)]["analysis_incomplete"] is True
-        assert any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
+        assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
+
+    def test_cli_complete_directory_prior_coverage_reports_malicious_tail_after_sibling_gap(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A covered tail directory still reports malicious descendants when a sibling is incomplete."""
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        models_dir = tmp_path / "models"
+        covered_dir = models_dir / "covered"
+        covered_dir.mkdir(parents=True)
+        malicious = covered_dir / "malicious.pkl"
+        malicious.write_bytes(pickle.dumps(_LateMaliciousPayload()))
+        incomplete = models_dir / "incomplete.pkl"
+        incomplete.write_bytes(pickle.dumps({"incomplete": True}))
+        _patch_metadata_only_incomplete_scan(monkeypatch, incomplete.name)
+        benign = tmp_path / "benign.pkl"
+        benign.write_bytes(pickle.dumps({"safe": True}))
+        dvc_file = tmp_path / "cli_directory_tail_malicious.dvc"
+        dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: models/covered\n")
+
+        result = CliRunner().invoke(
+            cli,
+            ["scan", str(models_dir), str(dvc_file), "--format", "json", "--no-cache"],
+        )
+
+        assert result.exit_code == 1, result.output
+        output_data = json.loads(result.output[result.output.index("{") :])
+        assert output_data["success"] is False
+        assert output_data["file_metadata"][str(incomplete)]["analysis_incomplete"] is True
+        assert any(
+            issue.get("rule_code") == "S201" and issue.get("location") and str(malicious) in issue["location"]
+            for issue in output_data["issues"]
+        )
+        assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
 
     @pytest.mark.parametrize(
         "shard_failure_details",
