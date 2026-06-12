@@ -853,6 +853,7 @@ def _is_complete_huggingface_text_or_json(
     from modelaudit.utils.file.detection import (
         _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES,
         _has_bounded_protobuf_model_text_candidate_signal_bytes,
+        _is_complete_bounded_ascii_printable_text_content_owner_bytes,
         _is_complete_bounded_printable_text_content_owner_bytes,
     )
 
@@ -861,6 +862,7 @@ def _is_complete_huggingface_text_or_json(
         preserve_protobuf_model_candidates
         and remote_path.suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
         and _has_bounded_protobuf_model_text_candidate_signal_bytes(probe)
+        and not _is_complete_bounded_ascii_printable_text_content_owner_bytes(remote_path, len(probe), probe)
     ):
         return False
 

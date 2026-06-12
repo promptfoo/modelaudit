@@ -4644,10 +4644,17 @@ class TestModelDownloadStreaming:
             ),
             (
                 "weights.conf",
-                b":\n" + _make_printable_utf8_messagepack_candidate(),
+                b":" + _make_printable_utf8_messagepack_candidate(),
                 {".msgpack", ".flax", ".orbax", ".jax"},
                 {"flax_msgpack"},
                 ["known.msgpack", "weights.conf"],
+            ),
+            (
+                "weights-colon-newline.conf",
+                b":\n" + _make_printable_utf8_messagepack_candidate(),
+                {".msgpack", ".flax", ".orbax", ".jax"},
+                {"flax_msgpack"},
+                ["known.msgpack", "weights-colon-newline.conf"],
             ),
             (
                 "weights-colon-space.conf",
@@ -4680,6 +4687,7 @@ class TestModelDownloadStreaming:
         ],
         ids=[
             "flax-msgpack-text-suffix",
+            "flax-msgpack-colon-inline-text-suffix",
             "flax-msgpack-structure-prefixed-text-suffix",
             "flax-msgpack-colon-space-text-suffix",
             "flax-msgpack-key-colon-text-suffix",
@@ -4879,6 +4887,25 @@ class TestModelDownloadStreaming:
         selected_files = _select_streamable_hf_files(
             "test/model",
             ["model.onnx", "merges.txt"],
+            _HF_TEST_REVISION,
+            scannable_extensions={".onnx"},
+            scannable_scanner_ids={"onnx"},
+        )
+
+        assert selected_files == ["model.onnx"]
+
+    @patch("requests.get")
+    def test_select_streamable_protobuf_excludes_ascii_varint_text_near_match(
+        self,
+        mock_requests_get: MagicMock,
+    ) -> None:
+        """ASCII text starting with a weak ONNX varint tag must remain text-owned."""
+        payload = (b"(h benign ascii text\n") * 4097
+        mock_requests_get.return_value = _FakeRangeResponse(payload)
+
+        selected_files = _select_streamable_hf_files(
+            "test/model",
+            ["model.onnx", "notes.txt"],
             _HF_TEST_REVISION,
             scannable_extensions={".onnx"},
             scannable_scanner_ids={"onnx"},

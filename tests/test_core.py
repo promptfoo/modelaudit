@@ -5326,8 +5326,8 @@ def test_scan_file_fails_closed_for_printable_utf8_text_suffix_binary_candidate(
 @pytest.mark.parametrize("filename", ["ambiguous.txt", "settings.conf"])
 @pytest.mark.parametrize(
     "prefix",
-    [b" ", b":\n", b": a\n", b"a:\n"],
-    ids=["space", "colon-newline", "colon-space-value", "key-colon"],
+    [b" ", b":", b":\n", b": a\n", b"a:\n"],
+    ids=["space", "colon-inline", "colon-newline", "colon-space-value", "key-colon"],
 )
 def test_scan_file_fails_closed_for_prefixed_text_suffix_messagepack_candidate(
     tmp_path: Path,
@@ -5417,6 +5417,28 @@ def test_scan_file_keeps_printable_ascii_text_suffix_protobuf_tag_near_match_out
     filename: str,
 ) -> None:
     payload = _build_printable_ascii_protobuf_candidate_route()
+    candidate = tmp_path / filename
+    candidate.write_bytes(payload)
+
+    assert file_detection.detect_file_format(str(candidate)) == "unknown"
+    assert file_detection.detect_file_format_from_magic(str(candidate)) == "unknown"
+    assert file_detection.detect_file_format_for_skip_filter(str(candidate)) == "unknown"
+
+    result = scan_file(str(candidate), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(candidate), cache_scan_results=False)
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") is None
+    assert core_module.determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize("filename", ["ascii-varint.txt", "ascii-varint.conf"])
+def test_scan_file_keeps_printable_ascii_text_suffix_protobuf_varint_near_match_out_of_protobuf_candidate(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    payload = (b"(h benign ascii text\n") * 4097
     candidate = tmp_path / filename
     candidate.write_bytes(payload)
 

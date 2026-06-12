@@ -7783,6 +7783,14 @@ def _is_complete_bounded_printable_text_content_owner_bytes(
 
 def _is_complete_bounded_printable_text_content_owner(file_path: Path, file_size: int) -> bool:
     """Return whether printable text can safely own this complete file."""
+    suffix = file_path.suffix.lower()
+    max_complete_text_bytes = (
+        _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
+        if suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        else _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+    )
+    if file_size > max_complete_text_bytes:
+        return False
     try:
         payload = read_magic_bytes(str(file_path), file_size)
     except OSError:
@@ -7810,6 +7818,14 @@ def _is_complete_bounded_ascii_printable_text_content_owner_bytes(
 
 def _is_complete_bounded_ascii_printable_text_content_owner(file_path: Path, file_size: int) -> bool:
     """Return whether complete ASCII text can safely veto a protobuf candidate."""
+    suffix = file_path.suffix.lower()
+    max_complete_text_bytes = (
+        _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES
+        if suffix in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
+        else _CONTENT_ROUTE_PRINTABLE_TEXT_FAST_PATH_BYTES
+    )
+    if file_size > max_complete_text_bytes:
+        return False
     try:
         payload = read_magic_bytes(str(file_path), file_size)
     except OSError:
@@ -7829,7 +7845,7 @@ def _preserve_inconclusive_protobuf_model_routing(file_path: Path, file_size: in
         file_path.suffix.lower() in _CONTENT_ROUTE_TEXT_OWNER_SUFFIXES
         and _has_bounded_protobuf_model_text_candidate_signal(file_path, file_size)
     ):
-        return True
+        return not _is_complete_bounded_ascii_printable_text_content_owner(file_path, file_size)
     return not _is_complete_bounded_ascii_printable_text_content_owner(file_path, file_size)
 
 

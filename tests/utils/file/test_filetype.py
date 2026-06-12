@@ -480,10 +480,23 @@ def test_detect_printable_ascii_text_suffix_protobuf_tag_near_match_stays_unknow
 
 
 @pytest.mark.parametrize("suffix", [".txt", ".conf"])
+def test_detect_printable_ascii_text_suffix_protobuf_varint_near_match_stays_unknown(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    document = tmp_path / f"ascii-varint{suffix}"
+    document.write_bytes((b"(h benign ascii text\n") * 4097)
+
+    assert detect_file_format_from_magic(str(document)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(document)) == "unknown"
+    assert detect_file_format(str(document)) == "unknown"
+
+
+@pytest.mark.parametrize("suffix", [".txt", ".conf"])
 @pytest.mark.parametrize(
     "prefix",
-    [b" ", b":\n", b": a\n", b"a:\n"],
-    ids=["space", "colon-newline", "colon-space-value", "key-colon"],
+    [b" ", b":", b":\n", b": a\n", b"a:\n"],
+    ids=["space", "colon-inline", "colon-newline", "colon-space-value", "key-colon"],
 )
 def test_detect_text_suffix_messagepack_scalar_stream_candidate_fails_closed(
     tmp_path: Path,
@@ -496,6 +509,34 @@ def test_detect_text_suffix_messagepack_scalar_stream_candidate_fails_closed(
     assert detect_file_format_from_magic(str(document)) == "flax_msgpack"
     assert detect_file_format_for_skip_filter(str(document)) == "flax_msgpack"
     assert detect_file_format(str(document)) == "flax_msgpack"
+
+
+def test_complete_text_owner_helpers_do_not_read_oversized_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = tmp_path / "large.txt"
+    document.write_bytes(b"x")
+
+    def fail_read_magic_bytes(_path: str, _size: int) -> bytes:
+        raise AssertionError("oversized text owner should be rejected before reading")
+
+    monkeypatch.setattr(file_detection, "read_magic_bytes", fail_read_magic_bytes)
+
+    assert (
+        file_detection._is_complete_bounded_printable_text_content_owner(
+            document,
+            _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES + 1,
+        )
+        is False
+    )
+    assert (
+        file_detection._is_complete_bounded_ascii_printable_text_content_owner(
+            document,
+            _CONTENT_ROUTE_TEXT_OWNER_COMPLETE_BYTES + 1,
+        )
+        is False
+    )
 
 
 @pytest.mark.parametrize("suffix", [".txt", ".conf"])

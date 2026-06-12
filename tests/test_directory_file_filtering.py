@@ -545,8 +545,8 @@ class TestDirectoryFileFiltering:
     @pytest.mark.parametrize("filename", ["ambiguous.txt", "settings.conf"])
     @pytest.mark.parametrize(
         "prefix",
-        [b": a\n", b"a:\n"],
-        ids=["colon-space-value", "key-colon"],
+        [b":", b": a\n", b"a:\n"],
+        ids=["colon-inline", "colon-space-value", "key-colon"],
     )
     def test_structure_prefixed_text_suffix_messagepack_candidate_is_scanned_in_directory(
         self,
