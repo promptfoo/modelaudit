@@ -795,6 +795,66 @@ def test_numpy_object_dtype_benign_exit0(tmp_path: Path) -> None:
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_numpy_object_dtype_recomputes_success_after_reconstruction_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arr = np.array([{"k": "v"}, [1, 2, 3]], dtype=object)
+    path = tmp_path / "benign_object.npy"
+    np.save(path, arr, allow_pickle=True)
+
+    def fake_embedded_scan(
+        _self: NumPyScanner,
+        _file_obj: Any,
+        payload_size: int,
+        context_path: str,
+    ) -> ScanResult:
+        embedded_result = ScanResult(scanner_name="pickle")
+        embedded_result.add_check(
+            name="Standalone Pickle Finding",
+            passed=False,
+            message="untrusted numpy reconstruction global",
+            severity=IssueSeverity.WARNING,
+            location=context_path,
+            details={
+                "import_reference": "numpy._core.multiarray._reconstruct",
+                "module": "numpy._core.multiarray",
+                "name": "_reconstruct",
+                "position": 16,
+            },
+            rule_code="NON_ALLOWLISTED_GLOBAL",
+        )
+        embedded_result.bytes_scanned = payload_size
+        embedded_result.finish(success=False)
+        return embedded_result
+
+    monkeypatch.setattr(NumPyScanner, "_scan_embedded_pickle_payload", fake_embedded_scan)
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_reconstruction_reference_is_trusted",
+        lambda _module, _name: True,
+    )
+    monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_payload_has_safe_reconstruct_proof",
+        lambda _payload: True,
+    )
+
+    result = NumPyScanner().scan(str(path))
+
+    assert result.metadata["embedded_pickle_scan_success"] is False
+    assert result.success is True
+    assert not any(
+        check.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and check.details.get("import_reference") == "numpy._core.multiarray._reconstruct"
+        for check in result.checks
+    )
+    assert not any(
+        issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and issue.details.get("import_reference") == "numpy._core.multiarray._reconstruct"
+        for issue in result.issues
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
 def test_numpy_object_dtype_cleanup_keeps_untrusted_numpy_reconstruction_warning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
