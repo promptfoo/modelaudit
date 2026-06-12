@@ -23,6 +23,7 @@ from modelaudit.scanner_registry_metadata import (
 from modelaudit.scanners import SCANNER_REGISTRY, ScannerRegistry, _registry, get_scanner_for_file
 from modelaudit.scanners.archive_dispatch import _HEADER_FORMAT_TO_SCANNER_ID, _select_nested_scanner_id
 from modelaudit.scanners.base import BaseScanner, IssueSeverity
+from modelaudit.utils.file.detection import JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES
 from tests.helpers import create_mock_pytorch_zip
 
 TarWriteMode = Literal["w:gz", "w:bz2", "w:xz"]
@@ -944,6 +945,33 @@ def test_get_scanner_for_path_routes_model_manifest_json_to_manifest_scanner(tmp
     manifest_path.write_text(json.dumps({"model_type": "bert", "architectures": ["BertModel"]}))
 
     _assert_scanner_for_path(manifest_path, "manifest")
+
+
+def test_get_scanner_for_path_routes_confirmed_jax_json_before_manifest(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "state.json"
+    checkpoint_path.write_text(json.dumps({"framework": "jax", "weights": [1, 2, 3]}), encoding="utf-8")
+
+    _assert_scanner_for_path(checkpoint_path, "jax_checkpoint")
+
+
+def test_get_scanner_for_path_keeps_oversized_ordinary_json_with_manifest(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "config.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "model_type": "ordinary",
+                "padding": "x" * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _assert_scanner_for_path(manifest_path, "manifest")
+
+    result = scan_file(str(manifest_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "manifest"
+    assert result.success is True
 
 
 def test_manifest_metadata_does_not_claim_tokenizer_exact_filenames() -> None:
