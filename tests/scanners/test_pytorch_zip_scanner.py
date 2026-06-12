@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import os
 import pickle
@@ -198,6 +199,173 @@ def _pytorch_storage_persistent_id_sequence_payload(keys: list[str]) -> bytes:
     for key in keys:
         payload += _pytorch_storage_persistent_id_payload(key)[2:-1]
     return payload + b"e."
+
+
+_ZIP64_LIMIT = 0xFFFFFFFF
+_ZIP64_ENTRY_COUNT_LIMIT = 0xFFFF
+
+
+def _write_sparse_pytorch_zip64_shard(path: Path, *, storage_size: int) -> None:
+    """Write a sparse PyTorch ZIP with a ZIP64 streamed tensor storage member."""
+
+    def write_local_entry(handle: IO[bytes], name: str, data: bytes) -> dict[str, Any]:
+        name_bytes = name.encode("utf-8")
+        offset = handle.tell()
+        crc32 = zlib.crc32(data) & 0xFFFFFFFF
+        handle.write(
+            struct.pack(
+                "<IHHHHHIIIHH",
+                0x04034B50,
+                20,
+                0,
+                0,
+                0,
+                0,
+                crc32,
+                len(data),
+                len(data),
+                len(name_bytes),
+                0,
+            )
+        )
+        handle.write(name_bytes)
+        handle.write(data)
+        return {
+            "name": name,
+            "crc32": crc32,
+            "compressed_size": len(data),
+            "uncompressed_size": len(data),
+            "local_offset": offset,
+            "flags": 0,
+            "version_needed": 20,
+        }
+
+    def write_sparse_streamed_entry(handle: IO[bytes], name: str, size: int) -> dict[str, Any]:
+        name_bytes = name.encode("utf-8")
+        offset = handle.tell()
+        partial_zip64_extra = struct.pack("<HHQ", 0x0001, 8, size)
+        handle.write(
+            struct.pack(
+                "<IHHHHHIIIHH",
+                0x04034B50,
+                45,
+                0x0008,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                len(name_bytes),
+                len(partial_zip64_extra),
+            )
+        )
+        handle.write(name_bytes)
+        handle.write(partial_zip64_extra)
+        data_offset = handle.tell()
+        handle.seek(data_offset + size - 1)
+        handle.write(b"\x00")
+        handle.write(struct.pack("<IIQQ", 0x08074B50, 0, size, size))
+        return {
+            "name": name,
+            "crc32": 0,
+            "compressed_size": size,
+            "uncompressed_size": size,
+            "local_offset": offset,
+            "flags": 0x0008,
+            "version_needed": 45,
+        }
+
+    def write_central_entry(handle: IO[bytes], entry: dict[str, Any]) -> None:
+        name_bytes = str(entry["name"]).encode("utf-8")
+        compressed_size = int(entry["compressed_size"])
+        uncompressed_size = int(entry["uncompressed_size"])
+        local_offset = int(entry["local_offset"])
+        zip64_values: list[int] = []
+        raw_compressed_size = compressed_size
+        raw_uncompressed_size = uncompressed_size
+        raw_local_offset = local_offset
+        if uncompressed_size >= _ZIP64_LIMIT:
+            raw_uncompressed_size = _ZIP64_LIMIT
+            zip64_values.append(uncompressed_size)
+        if compressed_size >= _ZIP64_LIMIT:
+            raw_compressed_size = _ZIP64_LIMIT
+            zip64_values.append(compressed_size)
+        if local_offset >= _ZIP64_LIMIT:
+            raw_local_offset = _ZIP64_LIMIT
+            zip64_values.append(local_offset)
+        zip64_extra = b""
+        if zip64_values:
+            zip64_payload = b"".join(value.to_bytes(8, "little") for value in zip64_values)
+            zip64_extra = struct.pack("<HH", 0x0001, len(zip64_payload)) + zip64_payload
+        version_needed = int(entry["version_needed"])
+        handle.write(
+            struct.pack(
+                "<IHHHHHHIIIHHHHHII",
+                0x02014B50,
+                max(45, version_needed),
+                version_needed,
+                int(entry["flags"]),
+                0,
+                0,
+                0,
+                int(entry["crc32"]),
+                raw_compressed_size,
+                raw_uncompressed_size,
+                len(name_bytes),
+                len(zip64_extra),
+                0,
+                0,
+                0,
+                0,
+                raw_local_offset,
+            )
+        )
+        handle.write(name_bytes)
+        handle.write(zip64_extra)
+
+    entries: list[dict[str, Any]] = []
+    with path.open("wb") as handle:
+        entries.append(write_local_entry(handle, "archive/version", b"3\n"))
+        entries.append(write_local_entry(handle, "archive/byteorder", b"little"))
+        entries.append(write_local_entry(handle, "archive/data.pkl", _pytorch_storage_persistent_id_payload("0")))
+        entries.append(write_sparse_streamed_entry(handle, "archive/data/0", storage_size))
+
+        central_directory_offset = handle.tell()
+        for entry in entries:
+            write_central_entry(handle, entry)
+        central_directory_size = handle.tell() - central_directory_offset
+
+        zip64_eocd_offset = handle.tell()
+        handle.write(
+            struct.pack(
+                "<IQHHIIQQQQ",
+                0x06064B50,
+                44,
+                45,
+                45,
+                0,
+                0,
+                len(entries),
+                len(entries),
+                central_directory_size,
+                central_directory_offset,
+            )
+        )
+        handle.write(struct.pack("<IIQI", 0x07064B50, 0, zip64_eocd_offset, 1))
+        handle.write(
+            struct.pack(
+                "<IHHHHIIH",
+                0x06054B50,
+                0,
+                0,
+                min(len(entries), _ZIP64_ENTRY_COUNT_LIMIT),
+                min(len(entries), _ZIP64_ENTRY_COUNT_LIMIT),
+                min(central_directory_size, _ZIP64_LIMIT),
+                _ZIP64_LIMIT,
+                0,
+            )
+        )
 
 
 def _pytorch_storage_persistent_id_payload_with_popped_key(key: str, popped_key: str) -> bytes:
@@ -584,6 +752,31 @@ def test_pytorch_zip_scanner_safe_model(tmp_path):
     # Check for issues - a safe model might still have some informational issues
     error_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
     assert len(error_issues) == 0
+
+
+def test_oversized_pytorch_zip_uses_bounded_prefix_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "large-model.pt")
+    with model_path.open("ab") as handle:
+        handle.write(b"padding" * 200)
+
+    def reject_full_file_hash(_self: PyTorchZipScanner, _path: str) -> dict[str, str | None]:
+        raise AssertionError("oversized PyTorch ZIP scans must not hash the full file")
+
+    monkeypatch.setattr(PyTorchZipScanner, "calculate_file_hashes", reject_full_file_hash)
+
+    result = PyTorchZipScanner(config={"max_file_read_size": 512}).scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata["file_hashes"] == {
+        "sha256_prefix": hashlib.sha256(model_path.read_bytes()[:512]).hexdigest()
+    }
+    integrity_check = next(check for check in result.checks if check.name == "File Integrity Hash")
+    assert integrity_check.details["hash_complete"] is False
+    assert integrity_check.details["bytes_hashed"] == 512
+    assert "sha256" not in integrity_check.details
 
 
 def test_pytorch_zip_scanner_malicious_model(tmp_path):
@@ -1902,6 +2095,101 @@ def test_pytorch_zip_initialize_scan_does_not_read_archive_members(
     assert result.success is True
     assert archive_reads == []
     assert "pickle_files" not in result.metadata
+
+
+def test_pytorch_zip_initialize_scan_uses_prefix_hash_for_oversized_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zip_path = create_mock_pytorch_zip(tmp_path / "large.pt")
+    prefix_limit = 1024
+    with zip_path.open("ab") as handle:
+        handle.write(b"A" * (prefix_limit * 2))
+
+    def fail_full_hash(self: PyTorchZipScanner, path: str, result: ScanResult) -> None:
+        del self, path, result
+        raise AssertionError("oversized PyTorch ZIP initialization should not hash the full archive")
+
+    monkeypatch.setattr(PyTorchZipScanner, "add_file_integrity_check", fail_full_hash)
+
+    scanner = PyTorchZipScanner(config={"max_file_read_size": prefix_limit})
+    result = scanner._initialize_scan(str(zip_path))
+
+    integrity_check = next(check for check in result.checks if check.name == "File Integrity Hash")
+    expected_prefix_hash = hashlib.sha256(zip_path.read_bytes()[:prefix_limit]).hexdigest()
+    assert result.success is True
+    assert result.metadata["file_hashes"] == {"sha256_prefix": expected_prefix_hash}
+    assert integrity_check.details["sha256_prefix"] == expected_prefix_hash
+    assert integrity_check.details["bytes_hashed"] == prefix_limit
+    assert integrity_check.details["hash_complete"] is False
+    assert "sha256" not in integrity_check.details
+
+
+def test_pytorch_zip_scan_preserves_prefix_hash_for_oversized_archive_after_pickle_merge(
+    tmp_path: Path,
+) -> None:
+    zip_path = create_mock_pytorch_zip(tmp_path / "large.pt")
+    prefix_limit = 1024
+    with zip_path.open("ab") as handle:
+        handle.write(b"A" * (prefix_limit * 2))
+
+    with zip_path.open("rb") as handle:
+        expected_prefix_hash = hashlib.sha256(handle.read(prefix_limit)).hexdigest()
+
+    scanner = PyTorchZipScanner(config={"max_file_read_size": prefix_limit})
+    result = scanner.scan(str(zip_path))
+
+    nested_integrity_check = next(
+        check
+        for check in result.checks
+        if check.name == "File Integrity Check" and (check.location or "").endswith(":data.pkl")
+    )
+    assert result.success is True
+    assert result.metadata["file_hashes"] == {"sha256_prefix": expected_prefix_hash}
+    assert nested_integrity_check.details["hash_complete"] is True
+    assert "sha256" in nested_integrity_check.details
+
+
+def test_pytorch_zip_regular_scan_sparse_zip64_storage_shard_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whisper-like ZIP64 storage shards should be inspected without full-file hashing."""
+    from modelaudit import core
+
+    zip_path = tmp_path / "pytorch_model.bin"
+    storage_size = (4 * 1024 * 1024 * 1024) + 1024
+    _write_sparse_pytorch_zip64_shard(zip_path, storage_size=storage_size)
+
+    hashed_paths: list[str] = []
+
+    def fail_hash(path: str) -> str:
+        hashed_paths.append(path)
+        if path == str(zip_path):
+            pytest.fail("oversized PyTorch ZIP shard was content-hashed before bounded scan dispatch")
+        return "a" * 64
+
+    monkeypatch.setattr(core, "_calculate_file_hash", fail_hash)
+
+    result = scan_model_directory_or_file(
+        str(zip_path),
+        max_file_size=storage_size + (1024 * 1024),
+        max_file_read_size=1024,
+        cache_enabled=False,
+    )
+    metadata = result.file_metadata[str(zip_path)].model_dump(mode="python")
+    file_hashes = metadata["file_hashes"]
+
+    assert result.success is True
+    assert result.content_hash is None
+    assert result.bytes_scanned < 1_000_000
+    assert "pytorch_zip" in result.scanner_names
+    assert hashed_paths == []
+    assert metadata["pickle_files"] == ["archive/data.pkl"]
+    assert metadata["file_size"] == zip_path.stat().st_size
+    assert file_hashes["sha256"] is None
+    assert isinstance(file_hashes["sha256_prefix"], str)
+    assert "max_file_read_size_exceeded" not in metadata.get("scan_outcome_reasons", [])
 
 
 def test_pytorch_zip_scan_does_not_route_numeric_tensor_data_files_as_pickles(tmp_path: Path) -> None:

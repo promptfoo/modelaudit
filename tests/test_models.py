@@ -317,6 +317,9 @@ class TestFileHashesModel:
         hashes = FileHashesModel(sha256="a" * 64)
         assert hashes.has_any_hash() is True
 
+        prefix_hashes = FileHashesModel(sha256_prefix="b" * 64)
+        assert prefix_hashes.has_any_hash() is True
+
         empty_hashes = FileHashesModel()
         assert empty_hashes.has_any_hash() is False
 
@@ -347,6 +350,19 @@ class TestFileHashesModel:
         """Test get_strongest_hash returns None when empty."""
         hashes = FileHashesModel()
         assert hashes.get_strongest_hash() is None
+
+    def test_get_strongest_hash_ignores_partial_prefix(self):
+        """Partial prefix hashes must not be returned as complete identity."""
+        hashes = FileHashesModel(sha256_prefix="b" * 64)
+        assert hashes.get_strongest_hash() is None
+
+    def test_partial_hash_serializes_as_prefix_only(self):
+        """JSON metadata should expose partial hashes only under the prefix key."""
+        metadata = FileMetadataModel(file_hashes=FileHashesModel(sha256_prefix="c" * 64))
+
+        dumped = metadata.model_dump(mode="json", exclude_none=True)
+
+        assert dumped["file_hashes"] == {"sha256_prefix": "c" * 64}
 
 
 class TestFileMetadataModel:
@@ -395,6 +411,14 @@ class TestFileMetadataModel:
         metadata = FileMetadataModel()
         metadata.set_file_hashes({"sha256": "a" * 64})
         assert metadata.file_hashes is not None
+
+    def test_set_file_hashes_preserves_sha256_prefix(self) -> None:
+        """Test setting bounded prefix hashes."""
+        metadata = FileMetadataModel()
+        metadata.set_file_hashes({"sha256_prefix": "a" * 64})
+        assert metadata.file_hashes is not None
+        assert metadata.file_hashes.sha256_prefix == "a" * 64
+        assert metadata.file_hashes.get_strongest_hash() is None
 
     def test_calculate_risk_score(self):
         """Test risk score calculation."""

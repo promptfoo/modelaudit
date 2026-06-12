@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - tolerate picklescan reports that omit private metadata
 - stream bounded Llamafile runtime coverage across preview gaps and report incomplete runtime reads or bounds
 - skip PyTorch ZIP tensor storage members referenced by `data.pkl` during hidden-pickle discovery while preserving fail-closed coverage for ambiguous storage layouts
+- stream bounded PyTorch ZIP and legacy pickle metadata analysis for oversized legacy `.pt` and `.bin` shards instead of stopping at the generic read-size cap
 - distinguish PyTorch checkpoint producer-version metadata from active runtime CVE applicability, resolve runtime torch metadata only from trusted install roots, report unknown runtime applicability explicitly, carry same-revision repository SafeTensors inventory into PyTorch pickle applicability details, and preserve artifact-level pickle and tensor-structure findings
 - omit isolated C&C vocabulary tokens from strongly identified tokenizer vocabularies while preserving active network and command findings
 - downgrade filename/content mismatch findings only after an alternate ONNX scanner validates the protobuf format while keeping malformed, spoofed, polyglot, and incomplete routes actionable
