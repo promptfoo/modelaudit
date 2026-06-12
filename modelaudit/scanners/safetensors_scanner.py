@@ -213,6 +213,7 @@ _CREDENTIAL_METADATA_PATTERNS = (
 )
 _GENERIC_URL_METADATA_PATTERN = r"https?://"
 _ENCODED_URL_DELIMITER_METADATA_PATTERN = "encoded-url-delimiter"
+_BACKSLASH_URL_DELIMITER_METADATA_PATTERN = "backslash-url-delimiter"
 _WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN = "wrapped-opaque-token"
 _LICENSE_METADATA_KEYS = frozenset({"license"})
 _LICENSE_DOCUMENT_MARKERS = (
@@ -492,6 +493,7 @@ _ENCODED_URL_DELIMITER_PATTERN = re.compile(
     r"(?P<slash1>%(?:25)*(?:2f|5c)|/|\\)(?P<slash2>%(?:25)*(?:2f|5c)|/|\\)",
     re.IGNORECASE,
 )
+_RAW_BACKSLASH_URL_DELIMITER_PATTERN = re.compile(r"https?:(?:\\\\|/\\|\\/)", re.IGNORECASE)
 
 
 def _url_path_has_unsafe_decoded_char(path: str) -> bool:
@@ -565,6 +567,10 @@ def _value_has_encoded_url_delimiter(value: str) -> bool:
         _HTML_ENTITY_REFERENCE_PATTERN.search(match.group(0)) is not None
         for match in _RESIDUAL_ENTITY_URL_DELIMITER_PATTERN.finditer(decoded_value)
     )
+
+
+def _value_has_raw_backslash_url_delimiter(value: str) -> bool:
+    return _RAW_BACKSLASH_URL_DELIMITER_PATTERN.search(value) is not None
 
 
 class SafeTensorsScanner(BaseScanner):
@@ -1112,7 +1118,7 @@ class SafeTensorsScanner(BaseScanner):
 
     @classmethod
     def _license_document_urls_are_documentary(cls, value: str) -> bool:
-        if _value_has_encoded_url_delimiter(value):
+        if _value_has_encoded_url_delimiter(value) or _value_has_raw_backslash_url_delimiter(value):
             return False
         urls = _URL_METADATA_PATTERN.findall(value)
         return all(cls._url_looks_like_license_reference(url) for url in urls)
@@ -1224,6 +1230,7 @@ class SafeTensorsScanner(BaseScanner):
                     for pattern in SUSPICIOUS_METADATA_PATTERNS
                 )
                 or _value_has_encoded_url_delimiter(value)
+                or _value_has_raw_backslash_url_delimiter(value)
                 or cls._metadata_value_has_wrapped_opaque_token(value)
             ):
                 flags.add("suspicious_pattern")
@@ -1719,6 +1726,8 @@ class SafeTensorsScanner(BaseScanner):
                             break
                     if suspicious_pattern is None and _value_has_encoded_url_delimiter(value):
                         suspicious_pattern = _ENCODED_URL_DELIMITER_METADATA_PATTERN
+                    if suspicious_pattern is None and _value_has_raw_backslash_url_delimiter(value):
+                        suspicious_pattern = _BACKSLASH_URL_DELIMITER_METADATA_PATTERN
                     if suspicious_pattern is None and self._metadata_value_has_wrapped_opaque_token(value):
                         suspicious_pattern = _WRAPPED_OPAQUE_TOKEN_METADATA_PATTERN
                     if suspicious_pattern is not None:
