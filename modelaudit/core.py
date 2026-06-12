@@ -157,7 +157,9 @@ from modelaudit.utils.repository_context import (
 )
 from modelaudit.utils.sources._huggingface_cache import (
     _find_hf_cache_root,
+    _get_hf_cache_root_spellings,
     _get_hf_cache_roots,
+    _is_hf_cache_snapshot_alias,
     _path_has_part,
     _resolve_hf_cache_path,
     _trusted_hf_blobs_root,
@@ -447,6 +449,7 @@ _ONNX_ROUTING_INCOMPLETE_REASON = "onnx_routing_incomplete"
 _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_incomplete"
 _ShardFamilyKey = tuple[str, str, int | None]
 _ScanEntry = tuple[str, list[str], _ShardFamilyKey | None, str | None]
+_FileTargetIdentityKey = tuple[Any, ...]
 _SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY = "shard_family_cache_fingerprint"
 _TRUSTED_STREAM_SHARD_PARENT_PREFIXES = (
     "modelaudit_hf_",
@@ -1164,6 +1167,91 @@ def _is_openvino_xml_path(path: Path) -> bool:
         return False
 
 
+def _is_streamed_onnx_external_data_hash_candidate(path: Path) -> bool:
+    """Return whether a streamed path may declare ONNX external_data sidecars."""
+    if path.suffix.lower() == ".onnx":
+        return True
+    try:
+        return detect_file_format_for_skip_filter(str(path)) == "onnx"
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _streamed_onnx_external_data_hash_paths(path: Path) -> list[Path]:
+    """Return safe, present ONNX external_data sidecars that should join the stream hash."""
+    if not _is_streamed_onnx_external_data_hash_candidate(path):
+        return []
+
+    try:
+        import onnx
+
+        from modelaudit.scanners.onnx_scanner import (
+            _is_trusted_huggingface_cache_external_alias,
+            _is_windows_absolute_path,
+            _iter_model_external_data_tensor_groups,
+            _resolve_external_location,
+            _resolve_external_location_lexically,
+        )
+    except Exception:
+        return []
+
+    try:
+        model_path = Path(os.path.abspath(path))
+        model = onnx.load(str(model_path), load_external_data=False)
+    except Exception:
+        return []
+
+    model_dir = model_path.parent
+    lexical_model_dir = Path(os.path.abspath(model_dir))
+    try:
+        resolved_model_dir = model_dir.resolve()
+    except OSError:
+        return []
+
+    external_paths: list[Path] = []
+    seen_external_paths: set[Path] = set()
+    for tensors in _iter_model_external_data_tensor_groups(model):
+        for tensor in tensors:
+            if getattr(tensor, "data_location", None) != onnx.TensorProto.EXTERNAL:
+                continue
+            if not getattr(tensor, "external_data", ()):
+                continue
+            info = {entry.key: entry.value for entry in tensor.external_data}
+            location = info.get("location")
+            if (
+                not isinstance(location, str)
+                or not location
+                or "\x00" in location
+                or _is_windows_absolute_path(location)
+            ):
+                continue
+
+            lexical_external_path = _resolve_external_location_lexically(model_dir, location)
+            try:
+                lexical_external_path.relative_to(lexical_model_dir)
+            except ValueError:
+                continue
+
+            external_path = _resolve_external_location(model_dir, location)
+            external_hash_path = external_path
+            if not is_within_directory(str(resolved_model_dir), str(external_path)):
+                if not _is_trusted_huggingface_cache_external_alias(
+                    model_path,
+                    lexical_external_path,
+                    external_path,
+                ):
+                    continue
+                external_hash_path = lexical_external_path
+            if not external_hash_path.is_file():
+                continue
+            if external_path in seen_external_paths:
+                continue
+            seen_external_paths.add(external_path)
+            external_paths.append(external_hash_path)
+
+    return external_paths
+
+
 def _openvino_xml_companion_key(path: Path) -> str:
     """Return a stable lexical key for one scheduled OpenVINO XML scan."""
     return os.path.normcase(os.path.normpath(str(Path(os.path.abspath(path)))))
@@ -1228,6 +1316,22 @@ def _snapshot_file_identity(path: Path) -> _FileIdentitySnapshot | None:
         ),
         stat=stat_fields,
         resolved_path=resolved_path,
+    )
+
+
+def _file_target_identity_key(
+    path: Path,
+    snapshot: _FileIdentitySnapshot | None,
+) -> _FileTargetIdentityKey | None:
+    """Return a target-oriented key that is stable across symlink aliases."""
+    if snapshot is None:
+        return None
+    if snapshot.stat is not None:
+        return ("stat", *snapshot.stat)
+    return (
+        "path",
+        os.path.normcase(os.path.normpath(str(Path(os.path.abspath(path))))),
+        *snapshot.lstat,
     )
 
 
@@ -2969,7 +3073,7 @@ def _resolve_directory_scan_target(
 
     # Check if this is a HuggingFace cache symlink scenario
     is_hf_cache_symlink = False
-    if is_symlink and is_hf_cache and _path_has_part(file_path, "snapshots"):
+    if is_symlink and is_hf_cache and _is_hf_cache_snapshot_alias(file_path, hf_cache_root):
         # Reuse the canonical target resolved above. On Windows, os.readlink()
         # may expose a device-path spelling that cannot safely be rejoined.
         resolved_target = resolved_file
@@ -2991,6 +3095,48 @@ def _resolve_directory_scan_target(
         return None, False, False
 
     return resolved_file, is_hf_cache_symlink, False
+
+
+def _hf_cache_snapshot_alias_has_safe_parent_components(snapshot_path: Path, hf_cache_root: Path | None) -> bool:
+    """Return whether a snapshot alias parent path avoids symlink components."""
+    if hf_cache_root is None:
+        return False
+
+    absolute_path = Path(os.path.abspath(snapshot_path.expanduser()))
+    resolved_cache_root = _resolve_hf_cache_path(hf_cache_root)
+    cache_root_spellings = [Path(os.path.abspath(hf_cache_root.expanduser()))]
+    for hub_root in _get_hf_cache_root_spellings():
+        model_cache_root = hub_root / resolved_cache_root.name
+        if _resolve_hf_cache_path(model_cache_root) == resolved_cache_root:
+            cache_root_spellings.append(model_cache_root)
+
+    for cache_root in dict.fromkeys(cache_root_spellings):
+        try:
+            relative_parts = absolute_path.relative_to(cache_root).parts
+        except ValueError:
+            continue
+        if len(relative_parts) < 3 or relative_parts[0].lower() != "snapshots" or relative_parts[1] in {"", ".", ".."}:
+            return False
+        current = cache_root
+        for part in relative_parts[:-1]:
+            current = current / part
+            if current.is_symlink():
+                return False
+        return True
+    return False
+
+
+def _should_scan_hf_cache_alias_lexically_for_onnx(snapshot_path: Path, hf_cache_root: Path | None) -> bool:
+    """Return whether an HF cache alias should be scanned via its snapshot path for ONNX sidecars."""
+    suffix = snapshot_path.suffix.lower()
+    if suffix == ".onnx":
+        return True
+    if not _hf_cache_snapshot_alias_has_safe_parent_components(snapshot_path, hf_cache_root):
+        return False
+    try:
+        return detect_file_format_for_skip_filter(str(snapshot_path)) == "onnx"
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def _unclassified_symlink_names(root: str, dirs: list[str], files: list[str]) -> list[str]:
@@ -3349,6 +3495,7 @@ def scan_model_directory_or_file(
             scanned_paths: set[str] = set()
             directory_walk_covered_directories: set[str] = set()
             hf_shard_blob_paths: set[str] = set()
+            hf_onnx_alias_hash_sources: dict[str, str] = {}
             reported_traversal_targets: set[str] = set()
 
             # First pass: collect all file paths that need scanning
@@ -3674,7 +3821,11 @@ def scan_model_directory_or_file(
                     route_hf_shard_alias = (
                         is_hf_cache_symlink and resolved_file.exists() and snapshot_shard_family_key is not None
                     )
-                    scan_source = snapshot_path if route_hf_shard_alias else resolved_file
+                    route_hf_onnx_alias = is_hf_cache_symlink and _should_scan_hf_cache_alias_lexically_for_onnx(
+                        snapshot_path,
+                        hf_cache_root,
+                    )
+                    scan_source = snapshot_path if route_hf_shard_alias or route_hf_onnx_alias else resolved_file
 
                     # Skip non-model files early if filtering is enabled
                     # Note: skip_file_types parameter already contains the correct value
@@ -3743,15 +3894,25 @@ def scan_model_directory_or_file(
                         shard_family_key = _shard_family_key_for_path(target_str)
                         is_hf_shard_alias = route_hf_shard_alias and target_path == scan_source
                         exclusion_path = (
-                            str(resolved_file) if is_hf_shard_alias else _resolve_or_absolute_path(target_str)
+                            str(resolved_file)
+                            if is_hf_cache_symlink and target_path == scan_source
+                            else _resolve_or_absolute_path(target_str)
                         )
                         if exclusion_path in dvc_excluded_paths:
                             continue
                         if is_hf_shard_alias:
                             hf_shard_blob_paths.add(str(resolved_file))
+                        is_hf_onnx_alias = route_hf_onnx_alias and target_path == scan_source
+                        if is_hf_onnx_alias:
+                            hf_onnx_alias_hash_sources[target_str] = str(resolved_file)
                         dedupe_target_str = (
                             str(resolved_file)
-                            if is_hf_cache_symlink and target_path == scan_source and shard_family_key is None
+                            if (
+                                is_hf_cache_symlink
+                                and target_path == scan_source
+                                and shard_family_key is None
+                                and not is_hf_onnx_alias
+                            )
                             else target_str
                         )
                         if dedupe_target_str in scanned_paths:
@@ -4161,8 +4322,25 @@ def scan_model_directory_or_file(
                 hash_sources: list[str] = []
                 seen_hash_sources: set[str] = set()
                 hash_source_by_path: dict[str, str] = {}
+                hash_budget_bytes = 0
+                onnx_external_data_sources_by_path: dict[str, list[str]] = {}
+                onnx_external_data_sizes_by_path: dict[str, int] = {}
+                onnx_external_data_routing_paths: dict[str, str] = {}
+                scan_entry_target_keys: set[_FileTargetIdentityKey] = set()
                 for (
                     _representative_file,
+                    scanned_file_paths,
+                    _entry_shard_family_key,
+                    _repository_member,
+                ) in scan_entries:
+                    for scanned_file_path in scanned_file_paths:
+                        scanned_path = Path(scanned_file_path)
+                        scanned_identity = _snapshot_file_identity(scanned_path)
+                        scanned_target_key = _file_target_identity_key(scanned_path, scanned_identity)
+                        if scanned_target_key is not None:
+                            scan_entry_target_keys.add(scanned_target_key)
+                for (
+                    representative_file,
                     scanned_file_paths,
                     entry_shard_family_key,
                     _repository_member,
@@ -4173,13 +4351,62 @@ def scan_model_directory_or_file(
                         else {}
                     )
                     for scanned_file_path in scanned_file_paths:
-                        hash_source = str(
+                        hash_source = hf_onnx_alias_hash_sources.get(scanned_file_path) or str(
                             family_targets.get(scanned_file_path, {}).get("resolved_path", scanned_file_path)
                         )
                         hash_source_by_path[scanned_file_path] = hash_source
                         if hash_source not in seen_hash_sources:
                             hash_sources.append(hash_source)
                             seen_hash_sources.add(hash_source)
+                            with suppress(OSError):
+                                hash_budget_bytes += os.path.getsize(hash_source)
+                    representative_hash_source = hash_source_by_path.get(representative_file)
+                    if (
+                        scanner_selection.allows("onnx")
+                        and representative_hash_source is not None
+                        and not _should_defer_hash_for_max_file_size(representative_hash_source, config)
+                    ):
+                        representative_external_sources: list[str] = []
+                        representative_external_bytes = 0
+                        for external_data_path in _streamed_onnx_external_data_hash_paths(Path(representative_file)):
+                            external_data_identity = _snapshot_file_identity(external_data_path)
+                            external_data_target_key = _file_target_identity_key(
+                                external_data_path,
+                                external_data_identity,
+                            )
+                            if (
+                                external_data_target_key is not None
+                                and external_data_target_key in scan_entry_target_keys
+                            ):
+                                continue
+                            if _should_defer_hash_for_max_file_size(str(external_data_path), config):
+                                aggregate_hash_complete = False
+                                continue
+                            if external_data_identity is None:
+                                aggregate_hash_complete = False
+                                continue
+                            external_data_size = _snapshot_file_size(external_data_identity)
+                            representative_external_bytes += external_data_size
+                            if max_total_size > 0 and hash_budget_bytes + external_data_size > max_total_size:
+                                aggregate_hash_complete = False
+                                continue
+                            external_data_source = str(
+                                Path(external_data_identity.resolved_path)
+                                if external_data_identity.resolved_path is not None
+                                else external_data_path
+                            )
+                            if external_data_source not in seen_hash_sources:
+                                hash_sources.append(external_data_source)
+                                seen_hash_sources.add(external_data_source)
+                                hash_budget_bytes += external_data_size
+                            representative_external_sources.append(external_data_source)
+                            onnx_external_data_routing_paths[external_data_source] = str(external_data_path)
+                            if external_data_target_key is not None:
+                                scan_entry_target_keys.add(external_data_target_key)
+                        if representative_external_sources:
+                            onnx_external_data_sources_by_path[representative_file] = representative_external_sources
+                        if representative_external_bytes:
+                            onnx_external_data_sizes_by_path[representative_file] = representative_external_bytes
 
                 if (
                     directory_owner_class is not None
@@ -4217,6 +4444,7 @@ def scan_model_directory_or_file(
                 routing_paths_by_source = {
                     hash_source: scanned_file_path for scanned_file_path, hash_source in hash_source_by_path.items()
                 }
+                routing_paths_by_source.update(onnx_external_data_routing_paths)
                 routing_paths_by_source.update(
                     {
                         owner_source: owner_source
@@ -4564,6 +4792,13 @@ def scan_model_directory_or_file(
                     _is_incomplete_aggregate_hash_placeholder(content_hash) for content_hash in content_hashes.values()
                 ):
                     aggregate_hash_complete = False
+                for external_data_sources in onnx_external_data_sources_by_path.values():
+                    if any(
+                        (external_hash := hashes_by_source.get(external_data_source)) is None
+                        or external_hash.startswith("unhashable_")
+                        for external_data_source in external_data_sources
+                    ):
+                        aggregate_hash_complete = False
                 _finish_phase_timing(phase_timings, "top_level_hashing", top_level_hashing_started_at)
                 duplicate_paths_by_hash: dict[str, list[str]] = {}
                 for file_path, content_hash in content_hashes.items():
@@ -4631,6 +4866,7 @@ def scan_model_directory_or_file(
                                 _openvino_xml_companion_key(Path(representative_file)),
                                 0,
                             )
+                            file_result.bytes_scanned += onnx_external_data_sizes_by_path.get(representative_file, 0)
                         finally:
                             _finish_phase_timing(phase_timings, "file_scan_dispatch", file_scan_started_at)
 
@@ -4650,6 +4886,18 @@ def scan_model_directory_or_file(
                             ):
                                 file_hashes.append(path_content_hash)
                                 recorded_content_hashes.add(path_content_hash)
+                        for onnx_external_data_source in onnx_external_data_sources_by_path.get(
+                            representative_file,
+                            (),
+                        ):
+                            external_data_content_hash = hashes_by_source.get(onnx_external_data_source)
+                            if (
+                                external_data_content_hash is not None
+                                and not external_data_content_hash.startswith("unhashable_")
+                                and external_data_content_hash not in recorded_content_hashes
+                            ):
+                                file_hashes.append(external_data_content_hash)
+                                recorded_content_hashes.add(external_data_content_hash)
 
                         # Add scanner to tracking list (different from scanner_names)
                         scanner_name = file_result.scanner_name
@@ -6593,6 +6841,12 @@ def scan_model_streaming(
     results = create_initial_audit_result()
     file_hashes: list[str] = []
     hashed_stream_file_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
+    hashed_stream_file_hashes_by_target: dict[_FileTargetIdentityKey, str] = {}
+    hashed_stream_source_hashes_by_path: dict[Path, str] = {}
+    hashed_stream_source_hashes_by_target: dict[_FileTargetIdentityKey, str] = {}
+    counted_onnx_external_data_instances: set[tuple[Path, _FileIdentitySnapshot]] = set()
+    counted_onnx_external_data_targets: set[_FileTargetIdentityKey] = set()
+    consumed_onnx_external_data_aliases: dict[Path, _FileTargetIdentityKey] = {}
     aggregate_hash_complete = True
     top_level_hashed_bytes = 0
     files_processed = 0
@@ -6730,12 +6984,25 @@ def scan_model_streaming(
         scan_config: dict[str, Any],
         *,
         progress_label: str,
+        track_stream_source: bool = False,
+        skip_if_stream_source_seen: bool = False,
+        skip_if_stream_target_seen: bool = False,
     ) -> str | None:
         """Hash one streamed source once before it can be deleted or consumed."""
         nonlocal aggregate_hash_complete, top_level_hashed_bytes
 
         scan_path_key = Path(os.path.abspath(scan_path))
+        if skip_if_stream_source_seen and scan_path_key in hashed_stream_source_hashes_by_path:
+            return hashed_stream_source_hashes_by_path[scan_path_key]
+
         scan_path_identity = _snapshot_file_identity(scan_path)
+        scan_target_key = _file_target_identity_key(scan_path, scan_path_identity)
+        if (
+            skip_if_stream_target_seen
+            and scan_target_key is not None
+            and scan_target_key in hashed_stream_file_hashes_by_target
+        ):
+            return hashed_stream_file_hashes_by_target[scan_target_key]
         if scan_path_identity is not None and (scan_path_key, scan_path_identity) in hashed_stream_file_instances:
             return None
 
@@ -6768,6 +7035,12 @@ def scan_model_streaming(
         file_hashes.append(file_hash)
         if scan_path_identity is not None:
             hashed_stream_file_instances.add((scan_path_key, scan_path_identity))
+        if scan_target_key is not None:
+            hashed_stream_file_hashes_by_target.setdefault(scan_target_key, file_hash)
+        if track_stream_source:
+            hashed_stream_source_hashes_by_path[scan_path_key] = file_hash
+            if scan_target_key is not None:
+                hashed_stream_source_hashes_by_target.setdefault(scan_target_key, file_hash)
         return file_hash
 
     def append_streamed_openvino_companion_hash(
@@ -6856,6 +7129,9 @@ def scan_model_streaming(
             openvino_scan_companion_key: Path | None = None
             openvino_companion_pre_scan_identity: _FileIdentitySnapshot | None = None
             openvino_companion_bytes_scanned = 0
+            onnx_external_data_pre_scan_identities: dict[Path, _FileIdentitySnapshot] = {}
+            onnx_external_data_bytes_scanned = 0
+            suppress_consumed_onnx_external_data_accounting = False
             openvino_sidecar_needs_independent_scan = False
             independent_openvino_sidecar_result: ScanResult | None = None
             independent_openvino_sidecar_path: Path | None = None
@@ -6882,7 +7158,7 @@ def scan_model_streaming(
                     continue
 
                 if base_dir is not None:
-                    resolved_path, _is_hf_cache_symlink, entry_unavailable = _resolve_directory_scan_target(
+                    resolved_path, is_hf_cache_symlink, entry_unavailable = _resolve_directory_scan_target(
                         source_path,
                         base_dir,
                         is_hf_cache=is_hf_cache,
@@ -6913,6 +7189,27 @@ def scan_model_streaming(
                             issue_type=_DIRECTORY_SPECIAL_FILE_UNSCANNED_REASON,
                         )
                         continue
+                    snapshot_path = Path(os.path.abspath(source_path))
+                    route_hf_onnx_alias = is_hf_cache_symlink and _should_scan_hf_cache_alias_lexically_for_onnx(
+                        snapshot_path,
+                        hf_cache_root,
+                    )
+                    if route_hf_onnx_alias:
+                        scan_path = snapshot_path
+                consumed_onnx_external_data_target = consumed_onnx_external_data_aliases.get(source_key)
+                if consumed_onnx_external_data_target is not None:
+                    source_identity = _snapshot_file_identity(scan_path)
+                    source_target_key = _file_target_identity_key(scan_path, source_identity)
+                    if source_target_key == consumed_onnx_external_data_target:
+                        scanner_class = _registry.get_scanner_for_path(
+                            str(scan_path),
+                            scanner_selection=scanner_selection if scanner_selection.active else None,
+                        )
+                        if scanner_class is None:
+                            continue
+                        suppress_consumed_onnx_external_data_accounting = True
+                    else:
+                        consumed_onnx_external_data_aliases.pop(source_key, None)
 
                 # Build config before skip filtering so bin-first OpenVINO
                 # sidecars can wait for their selected XML owner.
@@ -7059,6 +7356,8 @@ def scan_model_streaming(
                     scan_path,
                     scan_config,
                     progress_label=source_path.name,
+                    track_stream_source=True,
+                    skip_if_stream_target_seen=suppress_consumed_onnx_external_data_accounting,
                 )
                 if openvino_scan_companion_path is not None:
                     append_streamed_openvino_companion_hash(
@@ -7066,6 +7365,60 @@ def scan_model_streaming(
                         openvino_scan_companion_path,
                         scan_config,
                     )
+                if scanner_selection.allows("onnx") and not _should_defer_hash_for_max_file_size(
+                    str(scan_path),
+                    scan_config,
+                ):
+                    for onnx_external_data_path in _streamed_onnx_external_data_hash_paths(scan_path):
+                        external_data_key = Path(os.path.abspath(onnx_external_data_path))
+                        external_data_identity = _snapshot_file_identity(onnx_external_data_path)
+                        external_data_target_key = _file_target_identity_key(
+                            onnx_external_data_path,
+                            external_data_identity,
+                        )
+                        external_data_was_stream_source = external_data_key in hashed_stream_source_hashes_by_path or (
+                            external_data_target_key is not None
+                            and external_data_target_key in hashed_stream_source_hashes_by_target
+                        )
+                        external_data_already_hashed = (
+                            external_data_identity is not None
+                            and (external_data_key, external_data_identity) in hashed_stream_file_instances
+                        ) or (
+                            external_data_target_key is not None
+                            and external_data_target_key in hashed_stream_file_hashes_by_target
+                        )
+                        if external_data_identity is not None:
+                            onnx_external_data_pre_scan_identities[onnx_external_data_path] = external_data_identity
+                            external_data_instance = (external_data_key, external_data_identity)
+                            if (
+                                not external_data_was_stream_source
+                                and external_data_instance not in counted_onnx_external_data_instances
+                                and (
+                                    external_data_target_key is None
+                                    or external_data_target_key not in counted_onnx_external_data_targets
+                                )
+                            ):
+                                onnx_external_data_bytes_scanned += _snapshot_file_size(external_data_identity)
+                                counted_onnx_external_data_instances.add(external_data_instance)
+                                if external_data_target_key is not None:
+                                    counted_onnx_external_data_targets.add(external_data_target_key)
+                        if not external_data_was_stream_source and not external_data_already_hashed:
+                            if external_data_identity is None:
+                                aggregate_hash_complete = False
+                                continue
+                            external_data_size = _snapshot_file_size(external_data_identity)
+                            if max_total_size > 0 and top_level_hashed_bytes + external_data_size > max_total_size:
+                                aggregate_hash_complete = False
+                                continue
+                        external_data_hash = append_streamed_file_hash(
+                            onnx_external_data_path,
+                            scan_config,
+                            progress_label=onnx_external_data_path.name,
+                            skip_if_stream_source_seen=True,
+                            skip_if_stream_target_seen=True,
+                        )
+                        if external_data_hash is not None and external_data_target_key is not None:
+                            consumed_onnx_external_data_aliases[external_data_key] = external_data_target_key
 
                 # Scan the file
                 if progress_callback:
@@ -7075,6 +7428,8 @@ def scan_model_streaming(
                     str(scan_path),
                     config=scan_config,
                 )
+                if suppress_consumed_onnx_external_data_accounting:
+                    scan_result.bytes_scanned = 0
                 openvino_sidecar_needs_independent_scan = (
                     openvino_scan_companion_path is not None
                     and _openvino_weights_sidecar_needs_independent_scan(
@@ -7084,6 +7439,7 @@ def scan_model_streaming(
                 )
                 if not openvino_sidecar_needs_independent_scan:
                     scan_result.bytes_scanned += openvino_companion_bytes_scanned
+                scan_result.bytes_scanned += onnx_external_data_bytes_scanned
                 if (
                     openvino_scan_companion_path is not None
                     and openvino_companion_pre_scan_identity is not None
@@ -7095,6 +7451,11 @@ def scan_model_streaming(
                         "openvino_weights_changed_during_xml_scan",
                     )
                     preserve_shard_reconciliation_errors = True
+                    aggregate_hash_complete = False
+                if any(
+                    _snapshot_file_identity(onnx_external_data_path) != pre_scan_identity
+                    for onnx_external_data_path, pre_scan_identity in onnx_external_data_pre_scan_identities.items()
+                ):
                     aggregate_hash_complete = False
                 if openvino_sidecar_needs_independent_scan and openvino_scan_companion_path is not None:
                     independent_openvino_sidecar_path = openvino_scan_companion_path
