@@ -19,7 +19,7 @@ BASIC_AUTH_SECRET_TYPE = "Basic Auth Credentials"
 BASIC_AUTH_TOKEN_MAX_LENGTH = 8192
 BASIC_AUTH_CONFIDENCE = 0.8
 BASIC_AUTH_TOKEN_TERMINATOR = r"(?=$|[\s\"'`,.;<\]\)}]|\\(?:[\"']|r|n))"
-BASIC_AUTH_SCHEME_SEPARATOR = r"(?:[ \t]+|(?:\r\n|\r|\n)[ \t])"
+BASIC_AUTH_SCHEME_SEPARATOR = r"(?:[ \t]*(?:\r\n|\r|\n)[ \t]+|[ \t]+)"
 BASIC_AUTH_PATTERN = (
     rf"\bBasic{BASIC_AUTH_SCHEME_SEPARATOR}"
     rf"([A-Za-z0-9+/]{{2,{BASIC_AUTH_TOKEN_MAX_LENGTH}}}={{0,2}}){BASIC_AUTH_TOKEN_TERMINATOR}"
