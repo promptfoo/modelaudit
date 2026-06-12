@@ -192,6 +192,20 @@ def _preview_size_text(size_bytes: object) -> str:
     return f"{size_bytes} bytes"
 
 
+def _preview_inventory_size_text(size_bytes: object, unknown_size_count: object) -> str:
+    """Return a dry-run size string that marks incomplete selected-size inventory."""
+    if (
+        isinstance(size_bytes, int)
+        and not isinstance(size_bytes, bool)
+        and size_bytes > 0
+        and isinstance(unknown_size_count, int)
+        and not isinstance(unknown_size_count, bool)
+        and unknown_size_count > 0
+    ):
+        return f"At least {_preview_size_text(size_bytes)}"
+    return _preview_size_text(size_bytes)
+
+
 def _build_huggingface_dry_run_preview(
     path: str,
     runtime: "_ScanRuntimeConfig",
@@ -235,6 +249,17 @@ def _format_huggingface_dry_run_preview_text(preview: dict[str, Any]) -> str:
         lines.append(f"   Files: {_escape_terminal_text(preview['file_count'])}")
     if "total_size_bytes" in preview or "size_bytes" in preview:
         lines.append(f"   Size: {_escape_terminal_text(preview.get('human_size', 'Unknown size'))}")
+    inaccessible_gated_file_count = preview.get("inaccessible_gated_file_count")
+    if (
+        isinstance(inaccessible_gated_file_count, int)
+        and not isinstance(inaccessible_gated_file_count, bool)
+        and inaccessible_gated_file_count > 0
+    ):
+        gated_file_count = _escape_terminal_text(str(inaccessible_gated_file_count))
+        lines.append(f"   Access: {gated_file_count} selected file(s) are gated/inaccessible")
+    unknown_size_count = preview.get("unknown_size_count")
+    if isinstance(unknown_size_count, int) and not isinstance(unknown_size_count, bool) and unknown_size_count > 0:
+        lines.append(f"   Access: {_escape_terminal_text(str(unknown_size_count))} selected file size(s) unavailable")
     lines.append(f"   Mode: {'Streaming dry run' if preview.get('mode') == 'streaming' else 'Dry run'}")
     lines.append("   Artifact downloads: 0")
     lines.append("   Scanner execution: none")
@@ -284,6 +309,7 @@ def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeCo
             scannable_extensions=runtime.scannable_extensions,
             scannable_filenames=runtime.scannable_filenames,
             scannable_scanner_ids=runtime.scannable_scanner_ids,
+            allow_content_probes=False,
             include_all_files=runtime.hf_stream_include_all_files,
         )
     else:
@@ -291,10 +317,11 @@ def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeCo
             path,
             runtime.max_download_bytes,
             timeout_seconds=runtime.timeout,
+            allow_content_probes=False,
         )
 
     preview_timeout = _remaining_huggingface_plan_timeout_seconds(plan)
-    model_info_kwargs: dict[str, Any] = {}
+    model_info_kwargs: dict[str, Any] = {"allow_content_probes": False}
     if preview_timeout is not None:
         model_info_kwargs["timeout_seconds"] = preview_timeout
     if runtime.scan_and_delete:
@@ -305,6 +332,21 @@ def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeCo
         model_info_kwargs["include_all_files"] = runtime.hf_stream_include_all_files
     model_info = get_model_info(path, **model_info_kwargs)
     total_size = model_info.get("total_size")
+    preserved_metadata = {
+        key: model_info[key]
+        for key in (
+            "inaccessible_gated_file_count",
+            "inaccessible_gated_bytes",
+            "inaccessible_gated_files",
+            "unknown_size_count",
+            "unknown_size_files",
+            "inventory_status",
+            "inventory_error",
+            "gated",
+            "repo_file_count",
+        )
+        if key in model_info
+    }
     return _build_huggingface_dry_run_preview(
         path,
         runtime,
@@ -315,9 +357,10 @@ def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeCo
             "total_size_bytes": total_size
             if isinstance(total_size, int) and not isinstance(total_size, bool)
             else None,
-            "human_size": _preview_size_text(total_size),
+            "human_size": _preview_inventory_size_text(total_size, model_info.get("unknown_size_count")),
             "selected_file_count": len(plan.selected_files),
             "metadata_only": True,
+            **preserved_metadata,
         },
     )
 

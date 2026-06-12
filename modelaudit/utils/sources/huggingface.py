@@ -1137,6 +1137,7 @@ def _select_huggingface_model_files(
     revision: str,
     model_extensions: Collection[str],
     *,
+    allow_content_probes: bool = True,
     allow_inaccessible_probe_errors: bool = False,
     inaccessible_probe_files: list[str] | None = None,
     deadline: float | None = None,
@@ -1145,6 +1146,9 @@ def _select_huggingface_model_files(
     model_files = list(
         dict.fromkeys(filename for filename in repo_files if _is_scannable_hf_file(filename, model_extensions))
     )
+    if not allow_content_probes:
+        return model_files
+
     selected_files = set(model_files)
     inspected_files = 0
     probe_budget = _HuggingFaceProbeBudget(
@@ -1216,6 +1220,7 @@ def _include_huggingface_openvino_companions(
     revision: str,
     model_files: list[str],
     *,
+    allow_content_probes: bool = True,
     include_openvino_companions: bool = True,
     deadline: float | None = None,
 ) -> list[str]:
@@ -1238,9 +1243,10 @@ def _include_huggingface_openvino_companions(
         if companion is None or companion not in repo_file_set or companion in selected_files:
             continue
 
-        detected_format = _detect_huggingface_content_route_format(repo_id, filename, revision, probe_budget)
-        if detected_format not in {"openvino", XML_MODEL_INCONCLUSIVE_FORMAT}:
-            continue
+        if allow_content_probes:
+            detected_format = _detect_huggingface_content_route_format(repo_id, filename, revision, probe_budget)
+            if detected_format not in {"openvino", XML_MODEL_INCONCLUSIVE_FORMAT}:
+                continue
 
         expanded_files.append(companion)
         selected_files.add(companion)
@@ -1544,6 +1550,7 @@ def _select_streamable_hf_files(
     scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
     *,
+    allow_content_probes: bool = True,
     include_all_files: bool = False,
     deadline: float | None = None,
 ) -> list[str]:
@@ -1556,10 +1563,14 @@ def _select_streamable_hf_files(
         )
     else:
         selected_route_formats = _get_selected_hf_content_route_formats(scannable_extensions, scannable_filenames)
-    sniff_renamed_files = not include_all_files and (
-        bool(selected_route_scanner_ids)
-        if selected_route_scanner_ids is not None
-        else selected_route_formats is None or bool(selected_route_formats)
+    sniff_renamed_files = (
+        allow_content_probes
+        and not include_all_files
+        and (
+            bool(selected_route_scanner_ids)
+            if selected_route_scanner_ids is not None
+            else selected_route_formats is None or bool(selected_route_formats)
+        )
     )
     if scannable_extensions is None:
         extensions = _get_default_hf_streaming_extensions()
@@ -2158,6 +2169,7 @@ def _build_huggingface_model_info(
     scannable_extensions: Collection[str] | None = None,
     scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
+    allow_content_probes: bool = True,
     include_all_files: bool = False,
 ) -> dict[str, Any]:
     """Build selected recursive inventory metadata using the downloader's selection policy."""
@@ -2171,6 +2183,7 @@ def _build_huggingface_model_info(
             scannable_extensions,
             scannable_filenames,
             scannable_scanner_ids,
+            allow_content_probes=allow_content_probes,
             include_all_files=include_all_files,
             deadline=deadline,
         )
@@ -2182,6 +2195,7 @@ def _build_huggingface_model_info(
             repo_files,
             repo_revision,
             model_files,
+            allow_content_probes=allow_content_probes,
             include_openvino_companions=include_openvino_companions,
             deadline=deadline,
         )
@@ -2192,6 +2206,7 @@ def _build_huggingface_model_info(
             repo_files,
             repo_revision,
             model_extensions,
+            allow_content_probes=allow_content_probes,
             allow_inaccessible_probe_errors=allow_inaccessible_probe_errors,
             inaccessible_probe_files=inaccessible_probe_files if allow_inaccessible_probe_errors else None,
             deadline=deadline,
@@ -2289,6 +2304,7 @@ def get_model_info(
     scannable_extensions: Collection[str] | None = None,
     scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
+    allow_content_probes: bool = True,
     include_all_files: bool = False,
 ) -> dict[str, Any]:
     """Get information about a HuggingFace model without downloading it.
@@ -2300,6 +2316,7 @@ def get_model_info(
         scannable_extensions: Optional remote prefilter extensions from scanner selection policy
         scannable_filenames: Optional exact remote prefilter basenames from scanner selection policy
         scannable_scanner_ids: Optional exact scanner IDs from scanner selection policy
+        allow_content_probes: Allow bounded artifact range reads for renamed-format routing
         include_all_files: Include otherwise-unrecognized files under streaming selection bounds
 
     Returns:
@@ -2347,6 +2364,7 @@ def get_model_info(
             scannable_extensions=scannable_extensions,
             scannable_filenames=scannable_filenames,
             scannable_scanner_ids=scannable_scanner_ids,
+            allow_content_probes=allow_content_probes,
             include_all_files=include_all_files,
         )
     except Exception as e:
@@ -2569,6 +2587,7 @@ def plan_huggingface_model_download(
     *,
     timeout_seconds: float | None = None,
     deadline: float | None = None,
+    allow_content_probes: bool = True,
 ) -> HuggingFaceDownloadPlan:
     """Plan the bounded Hugging Face files a standard acquisition would download."""
     namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
@@ -2604,6 +2623,7 @@ def plan_huggingface_model_download(
         repo_files,
         repo_revision,
         _get_model_extensions(),
+        allow_content_probes=allow_content_probes,
         deadline=deadline,
     )
     model_files = _include_huggingface_openvino_companions(
@@ -2611,6 +2631,7 @@ def plan_huggingface_model_download(
         repo_files,
         repo_revision,
         model_files,
+        allow_content_probes=allow_content_probes,
         deadline=deadline,
     )
     if deadline is not None and time.monotonic() >= deadline:
@@ -2646,6 +2667,7 @@ def plan_huggingface_streaming_download(
     scannable_extensions: Collection[str] | None = None,
     scannable_filenames: Collection[str] | None = None,
     scannable_scanner_ids: Collection[str] | None = None,
+    allow_content_probes: bool = True,
     include_all_files: bool = False,
 ) -> HuggingFaceDownloadPlan:
     """Plan the bounded Hugging Face files a streaming acquisition would download."""
@@ -2682,6 +2704,7 @@ def plan_huggingface_streaming_download(
         scannable_extensions,
         scannable_filenames,
         scannable_scanner_ids,
+        allow_content_probes=allow_content_probes,
         include_all_files=include_all_files,
         deadline=deadline,
     )
@@ -2693,6 +2716,7 @@ def plan_huggingface_streaming_download(
         repo_files,
         repo_revision,
         model_files,
+        allow_content_probes=allow_content_probes,
         include_openvino_companions=openvino_companion_suppression_enabled,
         deadline=deadline,
     )

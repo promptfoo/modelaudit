@@ -4233,6 +4233,15 @@ def test_scan_huggingface_streaming_dry_run_uses_metadata_preview_without_downlo
         "model_id": "test/model",
         "total_size": 4096,
         "file_count": 258,
+        "inaccessible_gated_file_count": 2,
+        "inaccessible_gated_bytes": 2048,
+        "inaccessible_gated_files": ["private/model.bin", "private/config.json"],
+        "unknown_size_count": 1,
+        "unknown_size_files": ["unknown/model.bin"],
+        "inventory_status": "gated_inaccessible",
+        "inventory_error": "some selected sizes unavailable",
+        "gated": True,
+        "repo_file_count": 260,
     }
 
     result = CliRunner().invoke(
@@ -4243,12 +4252,17 @@ def test_scan_huggingface_streaming_dry_run_uses_metadata_preview_without_downlo
     assert result.exit_code == 0
     assert "Preview for" in result.output
     assert "test/model" in result.output
+    assert "Size: At least 4.00 KB" in result.output
+    assert "Access: 2 selected file(s) are gated/inaccessible" in result.output
+    assert "Access: 1 selected file size(s) unavailable" in result.output
     mock_plan_streaming.assert_called_once()
+    assert mock_plan_streaming.call_args.kwargs["allow_content_probes"] is False
     mock_get_model_info.assert_called_once()
     assert mock_get_model_info.call_args.args == ("hf://test/model",)
     preview_kwargs = mock_get_model_info.call_args.kwargs
     assert preview_kwargs["streaming_selection"] is True
     assert preview_kwargs["include_all_files"] is False
+    assert preview_kwargs["allow_content_probes"] is False
     assert "xgboost" in preview_kwargs["scannable_scanner_ids"]
     mock_download_file.assert_not_called()
     mock_download_model.assert_not_called()
@@ -4275,6 +4289,15 @@ def test_scan_huggingface_streaming_dry_run_json_stdout_is_parseable(
         "model_id": "test/model",
         "total_size": 4096,
         "file_count": 258,
+        "inaccessible_gated_file_count": 2,
+        "inaccessible_gated_bytes": 2048,
+        "inaccessible_gated_files": ["private/model.bin", "private/config.json"],
+        "unknown_size_count": 1,
+        "unknown_size_files": ["unknown/model.bin"],
+        "inventory_status": "gated_inaccessible",
+        "inventory_error": "some selected sizes unavailable",
+        "gated": True,
+        "repo_file_count": 260,
     }
 
     result = CliRunner().invoke(
@@ -4288,15 +4311,26 @@ def test_scan_huggingface_streaming_dry_run_json_stdout_is_parseable(
     assert parsed["dry_run"] is True
     assert parsed["source_kind"] == "model"
     assert parsed["selected_file_count"] == 1
+    assert parsed["inaccessible_gated_file_count"] == 2
+    assert parsed["inaccessible_gated_bytes"] == 2048
+    assert parsed["inaccessible_gated_files"] == ["private/model.bin", "private/config.json"]
+    assert parsed["unknown_size_count"] == 1
+    assert parsed["unknown_size_files"] == ["unknown/model.bin"]
+    assert parsed["inventory_status"] == "gated_inaccessible"
+    assert parsed["inventory_error"] == "some selected sizes unavailable"
+    assert parsed["gated"] is True
+    assert parsed["repo_file_count"] == 260
     assert parsed["artifact_downloads"] == 0
     assert parsed["scanner_execution"] is False
     assert "files_scanned" not in parsed
     mock_plan_streaming.assert_called_once()
+    assert mock_plan_streaming.call_args.kwargs["allow_content_probes"] is False
     mock_get_model_info.assert_called_once()
     assert mock_get_model_info.call_args.args == ("hf://test/model",)
     preview_kwargs = mock_get_model_info.call_args.kwargs
     assert preview_kwargs["streaming_selection"] is True
     assert preview_kwargs["include_all_files"] is False
+    assert preview_kwargs["allow_content_probes"] is False
     assert "xgboost" in preview_kwargs["scannable_scanner_ids"]
     mock_download_file.assert_not_called()
     mock_download_model.assert_not_called()
@@ -5257,7 +5291,7 @@ def test_scan_huggingface_streaming_dry_run_refuses_without_selected_scannable_f
     assert result.exit_code == 2
     assert "repository listing contains no recognized ModelAudit-scannable files" in result.output
     assert "dry_run" not in result.output
-    mock_detect_content.assert_called_once()
+    mock_detect_content.assert_not_called()
     mock_get_model_info.assert_not_called()
     mock_download_streaming.assert_not_called()
     mock_scan_streaming.assert_not_called()
@@ -5436,7 +5470,7 @@ def test_scan_huggingface_standard_dry_run_refuses_without_selected_scannable_fi
     assert result.exit_code == 2
     assert "repository listing contains no recognized ModelAudit-scannable files" in result.output
     assert "dry_run" not in result.output
-    mock_detect_content.assert_called_once()
+    mock_detect_content.assert_not_called()
     mock_get_model_info.assert_not_called()
     mock_download_streaming.assert_not_called()
     mock_scan_streaming.assert_not_called()
@@ -5495,7 +5529,7 @@ def test_scan_huggingface_standard_dry_run_uses_standard_selection_not_streaming
     assert preview["selected_file_count"] == 1
     assert preview["artifact_downloads"] == 0
     assert preview["scanner_execution"] is False
-    assert mock_detect_content.call_count == 129
+    mock_detect_content.assert_not_called()
     mock_streaming_plan.assert_not_called()
     mock_download_streaming.assert_not_called()
     mock_scan_streaming.assert_not_called()
@@ -5548,8 +5582,10 @@ def test_scan_huggingface_standard_dry_run_bounds_metadata_to_plan_deadline() ->
     assert preview["selected_file_count"] == 1
     mock_plan_download.assert_called_once()
     assert mock_plan_download.call_args.kwargs["timeout_seconds"] == 7
+    assert mock_plan_download.call_args.kwargs["allow_content_probes"] is False
     metadata_timeout = mock_get_model_info.call_args.kwargs["timeout_seconds"]
     assert 0 < metadata_timeout <= 7
+    assert mock_get_model_info.call_args.kwargs["allow_content_probes"] is False
     mock_streaming_plan.assert_not_called()
     mock_download_streaming.assert_not_called()
     mock_scan_streaming.assert_not_called()
@@ -5594,6 +5630,7 @@ def test_scan_huggingface_standard_dry_run_fails_closed_when_plan_deadline_expir
     assert "dry_run" not in result.output
     mock_plan_download.assert_called_once()
     assert mock_plan_download.call_args.kwargs["timeout_seconds"] == 1
+    assert mock_plan_download.call_args.kwargs["allow_content_probes"] is False
     mock_get_model_info.assert_not_called()
     mock_streaming_plan.assert_not_called()
     mock_download_streaming.assert_not_called()
@@ -6215,8 +6252,10 @@ def test_scan_huggingface_streaming_preview_preserves_include_all_files_policy(
     preview_kwargs = mock_get_model_info.call_args.kwargs
     assert preview_kwargs["streaming_selection"] is True
     assert preview_kwargs["include_all_files"] is True
+    assert "allow_content_probes" not in preview_kwargs
     assert "scannable_extensions" not in preview_kwargs
     assert mock_download_streaming.call_args.kwargs["include_all_files"] is True
+    assert "allow_content_probes" not in mock_download_streaming.call_args.kwargs
 
 
 @patch("modelaudit.cli.is_huggingface_url")
