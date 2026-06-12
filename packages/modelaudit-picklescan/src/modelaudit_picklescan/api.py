@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import pickletools
 import tempfile
+import time
 import zipfile
 from collections.abc import Mapping
 from contextlib import suppress
@@ -45,8 +47,14 @@ _PYTORCH_ZIP_METADATA_BASENAMES = frozenset({"version", "byteorder"})
 _PYTORCH_CHECKPOINT_SUFFIXES = frozenset({".pt", ".pth", ".ckpt"})
 _PICKLE_MEMBER_SUFFIXES = (".pkl", ".pickle")
 _PICKLE_BINARY_PROTOCOL_PREFIXES = (b"\x80\x01", b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05")
+_PICKLE_OPCODE_BYTES = frozenset(ord(opcode.code) for opcode in pickletools.opcodes)
+_PICKLE_SECURITY_RELEVANT_OPCODES = frozenset(
+    {"GLOBAL", "STACK_GLOBAL", "REDUCE", "INST", "OBJ", "NEWOBJ", "NEWOBJ_EX", "BUILD"}
+)
 _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
 _PICKLE_DISCOVERY_LONG_PROBE_BYTES = 64 * 1024
+_TRUSTED_STORAGE_PICKLE_PROBE_BYTES = 4 * 1024
+_PICKLE_FRAME_OPCODE = b"\x95"
 _PROTO0_1_START_BYTES = b"()]}cilp0FGIJKLMNSTUVX"
 _PROTO0_1_MAX_PROBE_OPCODES = _PICKLE_DISCOVERY_LONG_PROBE_BYTES
 _PROTO0_1_IGNORABLE_TRAILING_BYTES = b" \t\r\n\x00"
@@ -55,6 +63,7 @@ _PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES = (
     "no newline found when trying to read ",
 )
 _PICKLE_FRAME_OPCODE_BYTES = 9
+_PICKLE_INCOMPLETE_FRAME_MIN_PAYLOAD_OPCODES = 4
 _PROTO0_1_TRIVIAL_LEADING_OPCODES = frozenset(
     {
         "MARK",
@@ -89,11 +98,43 @@ _MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES = 4 * 1024 * 1024
 _MAX_PYTORCH_ZIP_PICKLE_MEMBERS = 256
 _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES = 512 * 1024 * 1024
 _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES = 512 * 1024 * 1024
+_MAX_PYTORCH_ZIP_STORAGE_REFERENCE_DATA_PICKLE_BYTES = 10 * 1024 * 1024
+_MAX_PYTORCH_ZIP_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES = 64 * 1024 * 1024
+_PYTORCH_STORAGE_TRUST_MAX_OPCODES = 100_000
+_PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH = 1024
+_PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES = 100_000
+_PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH = 64
+_PYTORCH_STORAGE_TRUST_MAX_REFERENCED_KEYS = 10_000
 _RUST_EXTENSION_MODULE = "modelaudit_picklescan._rust"
 _MAX_INERT_INITIALIZATION_MODULES = 32
 _SAFE_NUMPY_RECONSTRUCT_MAX_PAYLOAD_BYTES = 10 * 1024 * 1024
 _SAFE_NUMPY_RECONSTRUCT_MAX_OPCODES = 100_000
 _TRUSTED_REFERENCE_RECONSTRUCTION_OPCODES = frozenset({"BUILD", "NEWOBJ", "NEWOBJ_EX"})
+_PYTORCH_STORAGE_GLOBAL_NAMES = frozenset(
+    {
+        "BFloat16Storage",
+        "BoolStorage",
+        "ByteStorage",
+        "CharStorage",
+        "ComplexDoubleStorage",
+        "ComplexFloatStorage",
+        "DoubleStorage",
+        "FloatStorage",
+        "HalfStorage",
+        "IntStorage",
+        "LongStorage",
+        "QInt32Storage",
+        "QInt8Storage",
+        "QUInt8Storage",
+        "QUInt4x2Storage",
+        "QUInt2x4Storage",
+        "ShortStorage",
+        "UntypedStorage",
+    }
+)
+_PYTORCH_STORAGE_GLOBALS = frozenset(
+    (module, name) for module in ("torch", "torch.storage") for name in _PYTORCH_STORAGE_GLOBAL_NAMES
+)
 _TRUSTED_FRAMEWORK_REDUCE_REFERENCES = frozenset(
     {
         ("accelerate.utils.dataclasses", "DistributedType"),
@@ -244,6 +285,16 @@ class _PickleDiscoveryProbeBudgetExceeded(ValueError):
     """Raised when another hidden ZIP-member probe would exceed the byte budget."""
 
 
+class _PytorchZipDeadlineExceeded(TimeoutError):
+    """Raised when Python-side PyTorch ZIP analysis exceeds ScanOptions.timeout_s."""
+
+
+@dataclass(frozen=True)
+class _PickleGlobalRef:
+    module: str
+    name: str
+
+
 @dataclass(frozen=True)
 class _AbstractGlobal:
     module: str
@@ -278,6 +329,13 @@ class _AbstractCallResult:
 
 _ABSTRACT_MARK = object()
 _ABSTRACT_UNKNOWN = object()
+
+
+@dataclass(frozen=True)
+class _PytorchStorageReferenceParse:
+    referenced_keys: set[str]
+    parse_complete: bool
+    all_persistent_ids_are_pytorch_storage: bool
 
 
 class PickleScanner:
@@ -443,126 +501,153 @@ class PickleScanner:
         size: int,
         enrich_call_graph: bool = True,
     ) -> PickleReport | None:
-        preflight_entry_count = _read_zip_entry_count(path_or_stream, size)
-        if preflight_entry_count is not None and preflight_entry_count > _MAX_PYTORCH_ZIP_ENTRIES:
-            return _pytorch_zip_entry_limit_report(
-                source=source,
-                size=size,
-                entry_count=preflight_entry_count,
-            )
-
-        with zipfile.ZipFile(path_or_stream, "r") as archive:
-            entries = _bounded_zip_entries(archive, source=source, size=size)
-            if isinstance(entries, PickleReport):
-                return entries
-            if not _has_pytorch_zip_metadata(entries):
-                return None
-
-            pickle_entries, discovery_notices = _discover_pytorch_zip_pickle_entries(archive, entries, source=source)
-            probe_budget_exhausted = any(
-                notice.code == "pytorch_zip_pickle_discovery_probe_budget" for notice in discovery_notices
-            )
-            if (
-                not _is_pytorch_zip_archive(
-                    entries,
-                    discovered_pickle_entries=pickle_entries,
-                )
-                and not probe_budget_exhausted
-            ):
-                return None
-            if not pickle_entries:
-                if probe_budget_exhausted:
-                    return _combine_pytorch_zip_reports(
-                        source=source,
-                        size=size,
-                        entry_count=len(entries),
-                        pickle_entries=[],
-                        member_reports=[],
-                        extra_notices=discovery_notices,
-                    )
-                return _pytorch_zip_notice_report(
+        deadline = time.monotonic() + self.options.timeout_s
+        try:
+            preflight_entry_count = _read_zip_entry_count(path_or_stream, size)
+            _check_pytorch_zip_deadline(deadline)
+            if preflight_entry_count is not None and preflight_entry_count > _MAX_PYTORCH_ZIP_ENTRIES:
+                return _pytorch_zip_entry_limit_report(
                     source=source,
                     size=size,
-                    message="PyTorch ZIP archive does not contain pickle members to scan",
-                    code="pytorch_zip_no_pickle_members",
-                    details={"analysis_incomplete": True},
+                    entry_count=preflight_entry_count,
                 )
 
-            reports: list[PickleReport] = []
-            skipped_notices: list[Notice] = list(discovery_notices)
-            scanned_pickle_member_count = 0
-            scanned_pickle_member_bytes = 0
-            budget_skipped_entries: list[zipfile.ZipInfo] = []
-            for entry in pickle_entries:
-                member_name = entry.filename
-                member_source = f"{source}:{member_name}"
-                if entry.file_size > _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES:
-                    skipped_notices.append(
-                        Notice(
-                            message=(
-                                "PyTorch ZIP pickle member skipped because it exceeds the standalone member scan limit"
-                            ),
-                            severity=Severity.INFO,
-                            location=member_source,
-                            code="pytorch_zip_member_size_limit",
-                            details={
-                                "member_name": member_name,
-                                "member_size": entry.file_size,
-                                "max_member_size": _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES,
-                                "analysis_incomplete": True,
-                            },
-                        )
+            with zipfile.ZipFile(path_or_stream, "r") as archive:
+                entries = _bounded_zip_entries(archive, source=source, size=size)
+                _check_pytorch_zip_deadline(deadline)
+                if isinstance(entries, PickleReport):
+                    return entries
+                if not _has_pytorch_zip_metadata(entries):
+                    return None
+
+                pickle_entries, discovery_notices, trusted_storage_keys_by_data_pkl = (
+                    _discover_pytorch_zip_pickle_entries(
+                        archive,
+                        entries,
+                        source=source,
+                        options=self.options,
+                        deadline=deadline,
                     )
-                    continue
+                )
+                probe_budget_exhausted = any(
+                    notice.code == "pytorch_zip_pickle_discovery_probe_budget" for notice in discovery_notices
+                )
                 if (
-                    scanned_pickle_member_count >= _MAX_PYTORCH_ZIP_PICKLE_MEMBERS
-                    or scanned_pickle_member_bytes + entry.file_size > _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES
+                    not _is_pytorch_zip_archive(
+                        entries,
+                        discovered_pickle_entries=pickle_entries,
+                    )
+                    and not probe_budget_exhausted
                 ):
-                    budget_skipped_entries.append(entry)
-                    continue
-                scanned_pickle_member_count += 1
-                scanned_pickle_member_bytes += entry.file_size
-                try:
-                    with archive.open(entry, "r") as member_stream:
-                        reports.append(
-                            self.scan_stream(
+                    return None
+                if not pickle_entries:
+                    if probe_budget_exhausted:
+                        return _combine_pytorch_zip_reports(
+                            source=source,
+                            size=size,
+                            entry_count=len(entries),
+                            pickle_entries=[],
+                            member_reports=[],
+                            extra_notices=discovery_notices,
+                        )
+                    return _pytorch_zip_notice_report(
+                        source=source,
+                        size=size,
+                        message="PyTorch ZIP archive does not contain pickle members to scan",
+                        code="pytorch_zip_no_pickle_members",
+                        details={"analysis_incomplete": True},
+                    )
+
+                reports: list[PickleReport] = []
+                skipped_notices: list[Notice] = list(discovery_notices)
+                scanned_pickle_member_count = 0
+                scanned_pickle_member_bytes = 0
+                budget_skipped_entries: list[zipfile.ZipInfo] = []
+                for entry in pickle_entries:
+                    _check_pytorch_zip_deadline(deadline)
+                    member_name = entry.filename
+                    member_source = f"{source}:{member_name}"
+                    if entry.file_size > _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES:
+                        skipped_notices.append(
+                            Notice(
+                                message=(
+                                    "PyTorch ZIP pickle member skipped because it exceeds the standalone member "
+                                    "scan limit"
+                                ),
+                                severity=Severity.INFO,
+                                location=member_source,
+                                code="pytorch_zip_member_size_limit",
+                                details={
+                                    "member_name": member_name,
+                                    "member_size": entry.file_size,
+                                    "max_member_size": _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES,
+                                    "analysis_incomplete": True,
+                                },
+                            )
+                        )
+                        continue
+                    if (
+                        scanned_pickle_member_count >= _MAX_PYTORCH_ZIP_PICKLE_MEMBERS
+                        or scanned_pickle_member_bytes + entry.file_size > _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES
+                    ):
+                        budget_skipped_entries.append(entry)
+                        continue
+                    scanned_pickle_member_count += 1
+                    scanned_pickle_member_bytes += entry.file_size
+                    try:
+                        with archive.open(entry, "r") as member_stream:
+                            member_report = self.scan_stream(
                                 cast(BinaryIO, member_stream),
                                 source=member_source,
                                 size=entry.file_size,
                                 enrich_call_graph=enrich_call_graph,
                             )
+                        trusted_storage_keys = trusted_storage_keys_by_data_pkl.get(member_name)
+                        if trusted_storage_keys:
+                            member_report = _without_trusted_pytorch_storage_persistent_id_findings(
+                                member_report,
+                                trusted_storage_keys,
+                            )
+                        reports.append(member_report)
+                    except Exception as error:
+                        reports.append(
+                            _io_error_report(
+                                source=member_source,
+                                message=f"Could not read PyTorch ZIP pickle member: {error!s}",
+                                category="zip_error",
+                                exception=error,
+                                bytes_scanned=0,
+                                bytes_total=entry.file_size,
+                            )
                         )
-                except Exception as error:
-                    reports.append(
-                        _io_error_report(
-                            source=member_source,
-                            message=f"Could not read PyTorch ZIP pickle member: {error!s}",
-                            category="zip_error",
-                            exception=error,
-                            bytes_scanned=0,
-                            bytes_total=entry.file_size,
+
+                if budget_skipped_entries:
+                    skipped_notices.append(
+                        _pytorch_zip_pickle_member_budget_notice(
+                            source=source,
+                            pickle_member_count=len(pickle_entries),
+                            scanned_pickle_member_count=scanned_pickle_member_count,
+                            total_pickle_member_bytes=sum(entry.file_size for entry in pickle_entries),
+                            scanned_pickle_member_bytes=scanned_pickle_member_bytes,
+                            skipped_entries=budget_skipped_entries,
                         )
                     )
 
-            if budget_skipped_entries:
-                skipped_notices.append(
-                    _pytorch_zip_pickle_member_budget_notice(
-                        source=source,
-                        pickle_member_count=len(pickle_entries),
-                        scanned_pickle_member_count=scanned_pickle_member_count,
-                        total_pickle_member_bytes=sum(entry.file_size for entry in pickle_entries),
-                        scanned_pickle_member_bytes=scanned_pickle_member_bytes,
-                        skipped_entries=budget_skipped_entries,
-                    )
+                return _combine_pytorch_zip_reports(
+                    source=source,
+                    size=size,
+                    entry_count=len(entries),
+                    pickle_entries=pickle_entries,
+                    member_reports=reports,
+                    extra_notices=tuple(skipped_notices),
                 )
-
-            return _combine_pytorch_zip_reports(
+        except _PytorchZipDeadlineExceeded:
+            return _pytorch_zip_notice_report(
                 source=source,
                 size=size,
-                entry_count=len(entries),
-                pickle_entries=pickle_entries,
-                member_reports=reports,
-                extra_notices=tuple(skipped_notices),
+                message="PyTorch ZIP analysis stopped at the configured timeout",
+                code="pytorch_zip_scan_timeout",
+                details={"timeout_s": self.options.timeout_s, "analysis_incomplete": True},
             )
 
 
@@ -694,6 +779,11 @@ def _has_pytorch_zip_metadata(entries: list[zipfile.ZipInfo]) -> bool:
     return any(Path(name).name in _PYTORCH_ZIP_METADATA_BASENAMES for name in names)
 
 
+def _check_pytorch_zip_deadline(deadline: float) -> None:
+    if time.monotonic() > deadline:
+        raise _PytorchZipDeadlineExceeded
+
+
 def _is_pytorch_zip_archive(
     entries: list[zipfile.ZipInfo],
     *,
@@ -714,7 +804,9 @@ def _discover_pytorch_zip_pickle_entries(
     entries: list[zipfile.ZipInfo],
     *,
     source: str,
-) -> tuple[list[zipfile.ZipInfo], tuple[Notice, ...]]:
+    options: ScanOptions,
+    deadline: float,
+) -> tuple[list[zipfile.ZipInfo], tuple[Notice, ...], dict[str, set[str]]]:
     pickle_entries: list[zipfile.ZipInfo] = []
     notices: list[Notice] = []
     seen_entries: set[int] = set()
@@ -735,6 +827,15 @@ def _discover_pytorch_zip_pickle_entries(
         if _is_data_pickle_member(lowered) or lowered.endswith(_PICKLE_MEMBER_SUFFIXES):
             add_entry(entry)
 
+    trusted_storage_entry_ids, trusted_storage_keys_by_data_pkl, storage_notices = _validated_pytorch_storage_entry_ids(
+        archive,
+        entries,
+        source=source,
+        options=options,
+        deadline=deadline,
+    )
+    notices.extend(storage_notices)
+
     for entry in entries:
         if entry.is_dir() or id(entry) in seen_entries:
             continue
@@ -743,8 +844,18 @@ def _discover_pytorch_zip_pickle_entries(
     probe_bytes_remaining = [_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES]
     probed_member_count = 0
     for candidate_index, entry in enumerate(candidates):
+        _check_pytorch_zip_deadline(deadline)
         try:
-            if _zip_entry_looks_like_pickle(archive, entry, probe_bytes_remaining):
+            if id(entry) in trusted_storage_entry_ids:
+                looks_like_pickle = _trusted_storage_zip_entry_looks_like_pickle(
+                    archive,
+                    entry,
+                    probe_bytes_remaining,
+                    deadline,
+                )
+            else:
+                looks_like_pickle = _zip_entry_looks_like_pickle(archive, entry, probe_bytes_remaining, deadline)
+            if looks_like_pickle:
                 add_entry(entry)
             probed_member_count += 1
         except _PickleDiscoveryProbeBudgetExceeded:
@@ -760,7 +871,146 @@ def _discover_pytorch_zip_pickle_entries(
         except Exception as error:
             notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
 
-    return pickle_entries, tuple(notices)
+    return pickle_entries, tuple(notices), trusted_storage_keys_by_data_pkl
+
+
+def _validated_pytorch_storage_entry_ids(
+    archive: zipfile.ZipFile,
+    entries: list[zipfile.ZipInfo],
+    *,
+    source: str,
+    options: ScanOptions,
+    deadline: float,
+) -> tuple[set[int], dict[str, set[str]], tuple[Notice, ...]]:
+    members = [
+        (entry.filename, entry)
+        for entry in entries
+        if not entry.is_dir() and _is_canonical_pytorch_zip_member_name(entry.filename)
+    ]
+    entries_by_name: dict[str, list[zipfile.ZipInfo]] = {}
+    for name, entry in members:
+        entries_by_name.setdefault(name, []).append(entry)
+
+    trusted_entry_ids: set[int] = set()
+    trusted_storage_keys_by_data_pkl: dict[str, set[str]] = {}
+    notices: list[Notice] = []
+    storage_reference_bytes_read = 0
+    storage_reference_opcodes_remaining = [min(_PYTORCH_STORAGE_TRUST_MAX_OPCODES, options.max_opcodes)]
+    for data_pkl_name, data_pkl_entries in entries_by_name.items():
+        _check_pytorch_zip_deadline(deadline)
+        if data_pkl_name.rsplit("/", 1)[-1] != "data.pkl":
+            continue
+        prefix = data_pkl_name[: -len("data.pkl")]
+        if f"{prefix}version" not in entries_by_name or len(data_pkl_entries) != 1:
+            continue
+
+        storage_entries_by_key: dict[str, zipfile.ZipInfo] = {}
+        data_prefix = f"{prefix}data/"
+        for candidate_name, candidate_entries in entries_by_name.items():
+            if not candidate_name.startswith(data_prefix) or len(candidate_entries) != 1:
+                continue
+            storage_key = candidate_name[len(data_prefix) :]
+            if _is_ascii_decimal_digits(storage_key):
+                storage_entries_by_key[storage_key] = candidate_entries[0]
+        if not storage_entries_by_key:
+            continue
+
+        data_pkl_entry = data_pkl_entries[0]
+        if data_pkl_entry.file_size > _MAX_PYTORCH_ZIP_STORAGE_REFERENCE_DATA_PICKLE_BYTES:
+            notices.append(
+                _pytorch_zip_storage_reference_validation_notice(
+                    source=source,
+                    data_pkl_member=data_pkl_name,
+                    message=(
+                        f"PyTorch ZIP storage reference validation skipped oversized data.pkl member {data_pkl_name}"
+                    ),
+                    code="pytorch_zip_storage_reference_validation_size_limit",
+                    details={
+                        "member_size": data_pkl_entry.file_size,
+                        "max_member_size": _MAX_PYTORCH_ZIP_STORAGE_REFERENCE_DATA_PICKLE_BYTES,
+                    },
+                )
+            )
+            continue
+
+        try:
+            if (
+                storage_reference_bytes_read + data_pkl_entry.file_size
+                > _MAX_PYTORCH_ZIP_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES
+            ):
+                notices.append(
+                    _pytorch_zip_storage_reference_validation_notice(
+                        source=source,
+                        data_pkl_member=data_pkl_name,
+                        message=(
+                            "PyTorch ZIP storage reference validation skipped data.pkl members after "
+                            f"{_MAX_PYTORCH_ZIP_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES} bytes"
+                        ),
+                        code="pytorch_zip_storage_reference_validation_failed",
+                        details={
+                            "member_size": data_pkl_entry.file_size,
+                            "bytes_read": storage_reference_bytes_read,
+                            "max_total_bytes": _MAX_PYTORCH_ZIP_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES,
+                        },
+                    )
+                )
+                continue
+            with archive.open(data_pkl_entry, "r") as member:
+                pickle_data = member.read(_MAX_PYTORCH_ZIP_STORAGE_REFERENCE_DATA_PICKLE_BYTES)
+            storage_reference_bytes_read += len(pickle_data)
+        except Exception as error:
+            notices.append(
+                _pytorch_zip_storage_reference_validation_notice(
+                    source=source,
+                    data_pkl_member=data_pkl_name,
+                    message=f"Could not inspect PyTorch ZIP data.pkl storage references: {error!s}",
+                    code="pytorch_zip_storage_reference_validation_failed",
+                    details={"exception_type": type(error).__name__},
+                )
+            )
+            continue
+
+        reference_parse = _pytorch_storage_keys_from_pickle_bytes(
+            pickle_data,
+            opcode_budget_remaining=storage_reference_opcodes_remaining,
+            deadline=deadline,
+        )
+        if not reference_parse.parse_complete:
+            notices.append(
+                _pytorch_zip_storage_reference_validation_notice(
+                    source=source,
+                    data_pkl_member=data_pkl_name,
+                    message=f"Could not parse PyTorch ZIP data.pkl storage references in {data_pkl_name}",
+                    code="pytorch_zip_storage_reference_validation_failed",
+                    details={},
+                )
+            )
+            continue
+
+        referenced_storage_keys = reference_parse.referenced_keys
+        existing_storage_keys = set(storage_entries_by_key)
+        missing_storage_keys = referenced_storage_keys - existing_storage_keys
+        if missing_storage_keys:
+            notices.append(
+                _pytorch_zip_storage_reference_validation_notice(
+                    source=source,
+                    data_pkl_member=data_pkl_name,
+                    message=f"PyTorch ZIP data.pkl references missing tensor storage members in {data_pkl_name}",
+                    code="pytorch_zip_storage_reference_missing_members",
+                    details={
+                        "missing_storage_keys": sorted(missing_storage_keys)[:10],
+                        "missing_storage_key_count": len(missing_storage_keys),
+                    },
+                )
+            )
+
+        trusted_storage_keys = referenced_storage_keys & existing_storage_keys
+        if trusted_storage_keys and not missing_storage_keys and reference_parse.all_persistent_ids_are_pytorch_storage:
+            trusted_storage_keys_by_data_pkl[data_pkl_name] = trusted_storage_keys
+        for storage_key in trusted_storage_keys:
+            trusted_entry_ids.add(id(storage_entries_by_key[storage_key]))
+
+    return trusted_entry_ids, trusted_storage_keys_by_data_pkl, tuple(notices)
 
 
 def _read_zip_entry_probe(
@@ -768,7 +1018,9 @@ def _read_zip_entry_probe(
     entry: zipfile.ZipInfo,
     max_bytes: int,
     probe_bytes_remaining: list[int],
+    deadline: float,
 ) -> bytes:
+    _check_pytorch_zip_deadline(deadline)
     expected_bytes = min(max(entry.file_size, 0), max_bytes)
     if expected_bytes == 0:
         return b""
@@ -777,6 +1029,7 @@ def _read_zip_entry_probe(
 
     with archive.open(entry, "r") as member:
         sample = member.read(min(max_bytes, probe_bytes_remaining[0]))
+    _check_pytorch_zip_deadline(deadline)
     probe_bytes_remaining[0] -= len(sample)
     return sample
 
@@ -785,12 +1038,14 @@ def _zip_entry_looks_like_pickle(
     archive: zipfile.ZipFile,
     entry: zipfile.ZipInfo,
     probe_bytes_remaining: list[int],
+    deadline: float,
 ) -> bool:
     prefix = _read_zip_entry_probe(
         archive,
         entry,
         _PICKLE_DISCOVERY_SHORT_PROBE_BYTES,
         probe_bytes_remaining,
+        deadline,
     )
     if not prefix:
         return False
@@ -801,6 +1056,7 @@ def _zip_entry_looks_like_pickle(
             entry,
             _PICKLE_DISCOVERY_LONG_PROBE_BYTES,
             probe_bytes_remaining,
+            deadline,
         )
         return _looks_like_binary_pickle_prefix(sample, sample_is_prefix=entry.file_size > len(sample))
 
@@ -814,8 +1070,156 @@ def _zip_entry_looks_like_pickle(
             entry,
             _PICKLE_DISCOVERY_LONG_PROBE_BYTES,
             probe_bytes_remaining,
+            deadline,
         )
     return _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=entry.file_size > len(sample))
+
+
+def _trusted_storage_zip_entry_looks_like_pickle(
+    archive: zipfile.ZipFile,
+    entry: zipfile.ZipInfo,
+    probe_bytes_remaining: list[int],
+    deadline: float,
+) -> bool:
+    prefix = _read_zip_entry_probe(
+        archive,
+        entry,
+        _PICKLE_DISCOVERY_SHORT_PROBE_BYTES,
+        probe_bytes_remaining,
+        deadline,
+    )
+    if not prefix:
+        return False
+    is_binary_pickle_candidate = prefix.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES)
+    is_frame_first_candidate = prefix.startswith(_PICKLE_FRAME_OPCODE)
+    if not is_binary_pickle_candidate and not is_frame_first_candidate and prefix[0] not in _PROTO0_1_START_BYTES:
+        return False
+
+    sample = prefix
+    if entry.file_size > len(prefix):
+        sample = _read_zip_entry_probe(
+            archive,
+            entry,
+            _TRUSTED_STORAGE_PICKLE_PROBE_BYTES,
+            probe_bytes_remaining,
+            deadline,
+        )
+    if is_binary_pickle_candidate:
+        return _binary_pickle_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
+    if is_frame_first_candidate:
+        return _frame_first_trusted_storage_probe_should_scan(sample)
+    return _proto0_or_1_trusted_storage_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
+
+
+def _binary_pickle_probe_should_scan(sample: bytes, *, sample_is_prefix: bool) -> bool:
+    opcode_count = 0
+    try:
+        for opcode, _arg, _pos in pickletools.genops(sample):
+            opcode_count += 1
+            if opcode.name == "STOP":
+                return opcode_count >= 2
+    except Exception:
+        return sample_is_prefix and (opcode_count >= 2 or _has_known_binary_pickle_second_opcode(sample))
+    return sample_is_prefix and opcode_count >= 2
+
+
+def _has_known_binary_pickle_second_opcode(sample: bytes) -> bool:
+    return len(sample) >= 3 and sample[2] in _PICKLE_OPCODE_BYTES
+
+
+def _proto0_or_1_trusted_storage_probe_should_scan(sample: bytes, *, sample_is_prefix: bool) -> bool:
+    if _has_complete_pickle_stream_without_frame_stop_overrun(sample):
+        return True
+    if _has_security_relevant_opcode_in_incomplete_frame(sample):
+        return True
+    if not sample_is_prefix:
+        return False
+    if _contains_pickle_frame_opcode(sample):
+        return False
+    return _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=True)
+
+
+def _frame_first_trusted_storage_probe_should_scan(sample: bytes) -> bool:
+    if not sample.startswith(_PICKLE_FRAME_OPCODE):
+        return False
+    return _has_complete_pickle_stream_without_frame_stop_overrun(
+        sample
+    ) or _has_structural_pickle_evidence_in_incomplete_frame(sample)
+
+
+def _has_structural_pickle_evidence_in_incomplete_frame(sample: bytes) -> bool:
+    frame_end: int | None = None
+    payload_opcode_count = 0
+    try:
+        for opcode, arg, pos in pickletools.genops(sample):
+            if pos is None:
+                continue
+            if opcode.name == "FRAME":
+                if frame_end is not None or not isinstance(arg, int):
+                    return False
+                frame_end = pos + _PICKLE_FRAME_OPCODE_BYTES + arg
+                if frame_end <= len(sample):
+                    return False
+                continue
+            if frame_end is None or pos >= frame_end:
+                return False
+            payload_opcode_count += 1
+    except Exception as exc:
+        message = str(exc).lower()
+        return (
+            frame_end is not None
+            and frame_end > len(sample)
+            and payload_opcode_count >= _PICKLE_INCOMPLETE_FRAME_MIN_PAYLOAD_OPCODES
+            and (
+                "exhausted before seeing stop" in message
+                or "no newline found when trying to read" in message
+                or "not enough data" in message
+                or "expected" in message
+            )
+        )
+    return frame_end is not None and payload_opcode_count >= _PICKLE_INCOMPLETE_FRAME_MIN_PAYLOAD_OPCODES
+
+
+def _has_security_relevant_opcode_in_incomplete_frame(sample: bytes) -> bool:
+    incomplete_frame_seen = False
+    security_relevant_opcode_seen = False
+    try:
+        for opcode, arg, pos in pickletools.genops(sample):
+            if opcode.name == "FRAME" and isinstance(arg, int) and pos is not None:
+                incomplete_frame_seen = pos + _PICKLE_FRAME_OPCODE_BYTES + arg > len(sample)
+            elif opcode.name in _PICKLE_SECURITY_RELEVANT_OPCODES:
+                security_relevant_opcode_seen = True
+            if incomplete_frame_seen and security_relevant_opcode_seen:
+                return True
+    except Exception:
+        return incomplete_frame_seen and security_relevant_opcode_seen
+    return False
+
+
+def _contains_pickle_frame_opcode(sample: bytes) -> bool:
+    try:
+        return any(opcode.name == "FRAME" for opcode, _arg, _pos in pickletools.genops(sample))
+    except Exception:
+        return False
+
+
+def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> bool:
+    active_frame_end = 0
+    opcode_count = 0
+    try:
+        for opcode, arg, pos in pickletools.genops(sample):
+            opcode_count += 1
+            if pos is None:
+                continue
+            if opcode.name == "FRAME":
+                if not isinstance(arg, int):
+                    return False
+                active_frame_end = max(active_frame_end, pos + _PICKLE_FRAME_OPCODE_BYTES + arg)
+            elif opcode.name == "STOP":
+                return opcode_count >= 2 and active_frame_end <= len(sample)
+    except Exception:
+        return False
+    return False
 
 
 def _looks_like_binary_pickle_prefix(sample: bytes, *, sample_is_prefix: bool) -> bool:
@@ -903,8 +1307,349 @@ def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool) -> 
 
 
 def _is_data_pickle_member(name: str) -> bool:
-    normalized = name.replace("\\", "/").lower()
+    normalized = _normalize_zip_member_name(name).lower()
     return normalized == "data.pkl" or normalized.endswith("/data.pkl")
+
+
+def _normalize_zip_member_name(name: str) -> str:
+    return name.replace("\\", "/").lstrip("/")
+
+
+def _is_canonical_pytorch_zip_member_name(name: str) -> bool:
+    if not name or "\\" in name or name.startswith("/"):
+        return False
+    parts = name.split("/")
+    return all(part and part not in {".", ".."} for part in parts)
+
+
+def _is_ascii_decimal_digits(value: str) -> bool:
+    return value.isascii() and value.isdecimal()
+
+
+def _coerce_pickle_string_arg(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    return None
+
+
+def _split_protocol0_persid_fields(text: str) -> list[str] | None:
+    if not text.startswith("(") or not text.endswith(")"):
+        return None
+    fields: list[str] = []
+    start = 1
+    in_quote: str | None = None
+    escaped = False
+    for index, char in enumerate(text[1:-1], start=1):
+        if escaped:
+            escaped = False
+            continue
+        if in_quote is not None:
+            if char == "\\":
+                escaped = True
+            elif char == in_quote:
+                in_quote = None
+            continue
+        if char in {"'", '"'}:
+            in_quote = char
+        elif char == ",":
+            fields.append(text[start:index].strip())
+            start = index + 1
+    if in_quote is not None:
+        return None
+    fields.append(text[start:-1].strip())
+    return fields
+
+
+def _quoted_protocol0_field_value(field: str) -> str | None:
+    if len(field) < 2 or field[0] not in {"'", '"'} or field[-1] != field[0]:
+        return None
+    value = field[1:-1]
+    return None if "\\" in value else value
+
+
+def _storage_key_from_protocol0_persid_text(
+    pid_text: Any,
+    trusted_storage_keys: set[str] | None = None,
+) -> str | None:
+    text = _coerce_pickle_string_arg(pid_text)
+    if text is None:
+        return None
+    fields = _split_protocol0_persid_fields(text)
+    if fields is None or len(fields) != 5:
+        return None
+    if _quoted_protocol0_field_value(fields[0]) != "storage":
+        return None
+    storage_type_field = fields[1]
+    if not storage_type_field.startswith("<class '") or not storage_type_field.endswith("'>"):
+        return None
+    module, separator, name = storage_type_field[len("<class '") : -len("'>")].rpartition(".")
+    if not separator or (module, name) not in _PYTORCH_STORAGE_GLOBALS:
+        return None
+    storage_key = _quoted_protocol0_field_value(fields[2])
+    if storage_key is None or not _is_ascii_decimal_digits(storage_key):
+        return None
+    if trusted_storage_keys is not None and storage_key not in trusted_storage_keys:
+        return None
+    if _quoted_protocol0_field_value(fields[3]) is None:
+        return None
+    storage_size = fields[4]
+    if not storage_size.isascii() or not storage_size.isdecimal():
+        return None
+    return storage_key
+
+
+def _protocol0_persid_text_from_preview(preview: Any) -> str | None:
+    if not isinstance(preview, str) or not preview.startswith("str:") or len(preview) > 4096:
+        return None
+    try:
+        value = ast.literal_eval(preview[len("str:") :])
+    except (SyntaxError, TypeError, ValueError):
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _is_trusted_pytorch_storage_persistent_id_finding(
+    finding: Finding,
+    trusted_storage_keys: set[str],
+) -> bool:
+    if finding.rule_code != "PERSISTENT_ID":
+        return False
+    details = finding.details
+    storage_key = details.get("pytorch_storage_key")
+    if (
+        details.get("opcode") == "BINPERSID"
+        and details.get("pytorch_storage_persistent_id") is True
+        and isinstance(storage_key, str)
+    ):
+        return storage_key in trusted_storage_keys
+
+    if details.get("opcode") != "PERSID":
+        return False
+    if details.get("pytorch_storage_persistent_id") is True and isinstance(storage_key, str):
+        return storage_key in trusted_storage_keys
+
+    persid_text = _protocol0_persid_text_from_preview(details.get("persistent_id_preview"))
+    return _storage_key_from_protocol0_persid_text(persid_text, trusted_storage_keys) is not None
+
+
+def _without_trusted_pytorch_storage_persistent_id_findings(
+    report: PickleReport,
+    trusted_storage_keys: set[str],
+) -> PickleReport:
+    findings = tuple(
+        finding
+        for finding in report.findings
+        if not _is_trusted_pytorch_storage_persistent_id_finding(finding, trusted_storage_keys)
+    )
+    if len(findings) == len(report.findings):
+        return report
+    verdict = report.verdict if findings else SafetyVerdict.CLEAN
+    if not findings and report.status != ScanStatus.COMPLETE:
+        verdict = SafetyVerdict.UNKNOWN
+    return PickleReport(
+        source=report.source,
+        status=report.status,
+        verdict=verdict,
+        findings=findings,
+        notices=report.notices,
+        errors=report.errors,
+        coverage=report.coverage,
+        metadata=report.metadata,
+        private_metadata=report.private_metadata,
+        duration_s=report.duration_s,
+    )
+
+
+def _pytorch_storage_keys_from_pickle_bytes(
+    pickle_data: bytes,
+    *,
+    opcode_budget_remaining: list[int] | None = None,
+    deadline: float | None = None,
+) -> _PytorchStorageReferenceParse:
+    marker = object()
+    memo: dict[int, Any] = {}
+    stack: list[Any] = []
+    referenced_keys: set[str] = set()
+    all_persistent_ids_are_pytorch_storage = True
+
+    def pop_marked_tuple() -> tuple[Any, ...] | None:
+        items: list[Any] = []
+        while stack:
+            item = stack.pop()
+            if item is marker:
+                return tuple(reversed(items))
+            items.append(item)
+            if len(items) > _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH:
+                raise ValueError("PyTorch storage persistent ID tuple exceeded trust parser width")
+        return None
+
+    def within_limits() -> bool:
+        return (
+            len(stack) <= _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH
+            and len(memo) <= _PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES
+            and len(referenced_keys) <= _PYTORCH_STORAGE_TRUST_MAX_REFERENCED_KEYS
+        )
+
+    def memo_key(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def storage_key_from_pid(pid: Any) -> str | None:
+        if not isinstance(pid, tuple) or len(pid) != 5:
+            return None
+        if pid[0] != "storage":
+            return None
+        storage_type = pid[1]
+        if not (
+            isinstance(storage_type, _PickleGlobalRef)
+            and (storage_type.module, storage_type.name) in _PYTORCH_STORAGE_GLOBALS
+        ):
+            return None
+        storage_key = _coerce_pickle_string_arg(pid[2])
+        if storage_key is None or not _is_ascii_decimal_digits(storage_key):
+            return None
+        if _coerce_pickle_string_arg(pid[3]) is None:
+            return None
+        storage_size = pid[4]
+        if not isinstance(storage_size, int) or isinstance(storage_size, bool) or storage_size < 0:
+            return None
+        return storage_key
+
+    try:
+        for opcode_count, (opcode, arg, _pos) in enumerate(pickletools.genops(pickle_data), start=1):
+            if deadline is not None and opcode_count % 1024 == 0:
+                _check_pytorch_zip_deadline(deadline)
+            if opcode_budget_remaining is not None:
+                if opcode_budget_remaining[0] <= 0:
+                    return _PytorchStorageReferenceParse(set(), False, False)
+                opcode_budget_remaining[0] -= 1
+            if opcode_count > _PYTORCH_STORAGE_TRUST_MAX_OPCODES:
+                return _PytorchStorageReferenceParse(set(), False, False)
+            opcode_name = opcode.name
+            if opcode_name in {"PROTO", "FRAME", "STOP"}:
+                continue
+            if opcode_name == "MARK":
+                stack.append(marker)
+            elif opcode_name in {
+                "BINSTRING",
+                "SHORT_BINSTRING",
+                "BINUNICODE",
+                "SHORT_BINUNICODE",
+                "UNICODE",
+                "BINBYTES",
+                "SHORT_BINBYTES",
+            }:
+                stack.append(_coerce_pickle_string_arg(arg))
+            elif opcode_name == "GLOBAL":
+                global_name = _coerce_pickle_string_arg(arg)
+                if global_name is None:
+                    stack.append(None)
+                else:
+                    parts = global_name.split()
+                    stack.append(_PickleGlobalRef(parts[0], parts[1]) if len(parts) == 2 else None)
+            elif opcode_name == "STACK_GLOBAL":
+                if len(stack) < 2:
+                    stack.clear()
+                    continue
+                name = _coerce_pickle_string_arg(stack.pop())
+                module = _coerce_pickle_string_arg(stack.pop())
+                stack.append(_PickleGlobalRef(module, name) if module is not None and name is not None else None)
+            elif opcode_name == "EMPTY_TUPLE":
+                stack.append(())
+            elif opcode_name == "TUPLE":
+                tuple_value = pop_marked_tuple()
+                if tuple_value is None:
+                    stack.clear()
+                else:
+                    stack.append(tuple_value)
+            elif opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
+                tuple_size = int(opcode_name[-1])
+                if len(stack) < tuple_size:
+                    stack.clear()
+                    continue
+                items = stack[-tuple_size:]
+                del stack[-tuple_size:]
+                stack.append(tuple(items))
+            elif opcode_name in {"BININT", "BININT1", "BININT2", "LONG", "LONG1", "LONG4", "INT"}:
+                stack.append(arg)
+            elif opcode_name == "NONE":
+                stack.append(None)
+            elif opcode_name == "NEWTRUE":
+                stack.append(True)
+            elif opcode_name == "NEWFALSE":
+                stack.append(False)
+            elif opcode_name in {"BINPUT", "LONG_BINPUT", "PUT"}:
+                key = memo_key(arg)
+                if key is not None and stack:
+                    memo[key] = stack[-1]
+            elif opcode_name == "MEMOIZE":
+                if stack:
+                    memo[len(memo)] = stack[-1]
+            elif opcode_name in {"BINGET", "LONG_BINGET", "GET"}:
+                key = memo_key(arg)
+                stack.append(memo.get(key) if key is not None else None)
+            elif opcode_name == "POP":
+                if stack:
+                    stack.pop()
+            elif opcode_name == "POP_MARK":
+                pop_marked_tuple()
+            elif opcode_name == "DUP":
+                if stack:
+                    stack.append(stack[-1])
+            elif opcode_name == "BINPERSID":
+                pid = stack.pop() if stack else None
+                storage_key = storage_key_from_pid(pid)
+                if storage_key is not None:
+                    referenced_keys.add(storage_key)
+                else:
+                    all_persistent_ids_are_pytorch_storage = False
+                stack.append(None)
+            elif opcode_name == "PERSID":
+                storage_key = _storage_key_from_protocol0_persid_text(arg)
+                if storage_key is not None:
+                    referenced_keys.add(storage_key)
+                else:
+                    all_persistent_ids_are_pytorch_storage = False
+                stack.append(None)
+            else:
+                stack.clear()
+            if not within_limits():
+                return _PytorchStorageReferenceParse(set(), False, False)
+    except Exception:
+        return _PytorchStorageReferenceParse(set(), False, False)
+    return _PytorchStorageReferenceParse(
+        referenced_keys=referenced_keys,
+        parse_complete=True,
+        all_persistent_ids_are_pytorch_storage=all_persistent_ids_are_pytorch_storage,
+    )
+
+
+def _pytorch_zip_storage_reference_validation_notice(
+    *,
+    source: str,
+    data_pkl_member: str,
+    message: str,
+    code: str,
+    details: dict[str, Any],
+) -> Notice:
+    return Notice(
+        message=message,
+        severity=Severity.INFO,
+        location=f"{source}:{data_pkl_member}",
+        code=code,
+        details={
+            "data_pkl_member": data_pkl_member,
+            "analysis_incomplete": True,
+            **details,
+        },
+    )
 
 
 def _pytorch_zip_member_probe_notice(*, source: str, entry: zipfile.ZipInfo, error: Exception) -> Notice:

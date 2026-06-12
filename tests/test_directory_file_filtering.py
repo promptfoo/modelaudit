@@ -242,7 +242,7 @@ class TestDirectoryFileFiltering:
             (Path(tmp_dir) / "README.md").write_text("Documentation")
             (Path(tmp_dir) / "script.py").write_text("print('hello')")
             (Path(tmp_dir) / "style.css").write_text("body { color: red; }")
-            (Path(tmp_dir) / "model.pkl").write_bytes(b"fake pickle data")
+            (Path(tmp_dir) / "model.pkl").write_bytes(pickle.dumps({"weights": [1.0]}))
             (Path(tmp_dir) / "config.json").write_text('{"key": "value"}')
 
             # Scan with file filtering enabled (default)
@@ -259,7 +259,7 @@ class TestDirectoryFileFiltering:
             (Path(tmp_dir) / "README.md").write_text("Documentation")
             (Path(tmp_dir) / "script.py").write_text("print('hello')")
             (Path(tmp_dir) / "style.css").write_text("body { color: red; }")
-            (Path(tmp_dir) / "model.pkl").write_bytes(b"fake pickle data")
+            (Path(tmp_dir) / "model.pkl").write_bytes(pickle.dumps({"weights": [1.0]}))
             (Path(tmp_dir) / "config.json").write_text('{"key": "value"}')
 
             # Scan with file filtering disabled
@@ -275,8 +275,8 @@ class TestDirectoryFileFiltering:
             # Create hidden and non-hidden files
             (Path(tmp_dir) / ".DS_Store").write_text("metadata")
             (Path(tmp_dir) / ".gitignore").write_text("*.pyc")
-            (Path(tmp_dir) / ".model.pkl").write_bytes(b"hidden model")
-            (Path(tmp_dir) / "visible.pkl").write_bytes(b"visible model")
+            (Path(tmp_dir) / ".model.pkl").write_bytes(pickle.dumps({"hidden": True}))
+            (Path(tmp_dir) / "visible.pkl").write_bytes(pickle.dumps({"visible": True}))
 
             # Scan with default settings
             results = scan_model_directory_or_file(tmp_dir)
@@ -294,11 +294,11 @@ class TestDirectoryFileFiltering:
 
             # Root files
             (Path(tmp_dir) / "README.md").write_text("Root readme")
-            (Path(tmp_dir) / "model1.pkl").write_bytes(b"model 1")
+            (Path(tmp_dir) / "model1.pkl").write_bytes(pickle.dumps({"model": 1}))
 
             # Subdirectory files
             (sub_dir / "README.md").write_text("Sub readme")
-            (sub_dir / "model2.pkl").write_bytes(b"model 2")
+            (sub_dir / "model2.pkl").write_bytes(pickle.dumps({"model": 2}))
             (sub_dir / "train.py").write_text("training script")
 
             # Scan with filtering enabled
@@ -2316,8 +2316,8 @@ class TestDirectoryFileFiltering:
                 (Path(tmp_dir) / f"log{i}.log").write_text(f"Log {i}")
 
             # Add a few model files
-            (Path(tmp_dir) / "model1.pkl").write_bytes(b"model 1")
-            (Path(tmp_dir) / "model2.h5").write_bytes(b"model 2")
+            (Path(tmp_dir) / "model1.pkl").write_bytes(pickle.dumps({"model": 1}))
+            (Path(tmp_dir) / "model2.pickle").write_bytes(pickle.dumps({"model": 2}))
 
             # Scan with filtering should be faster
             results = scan_model_directory_or_file(tmp_dir)

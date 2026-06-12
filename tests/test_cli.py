@@ -40,7 +40,7 @@ from modelaudit.cli import (
     format_text_output,
 )
 from modelaudit.core import scan_model_directory_or_file
-from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
+from modelaudit.models import FileMetadataModel, ModelAuditResultModel, create_initial_audit_result
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.repository_context import (
     REPOSITORY_FILE_INVENTORY_CONFIG_KEY,
@@ -1185,6 +1185,32 @@ def test_scan_json_output(tmp_path):
         assert output_json["files_scanned"] == 1
     except json.JSONDecodeError:
         pytest.fail("Output is not valid JSON")
+
+
+def test_strict_json_incomplete_coverage_exits_2(tmp_path: Path) -> None:
+    """Strict JSON should expose incomplete coverage and terminate truthfully."""
+    test_file = tmp_path / "model.bin"
+    test_file.write_bytes(b"bounded coverage")
+    scan_result = create_mock_scan_result(
+        success=False,
+        files_scanned=1,
+        file_metadata={
+            str(test_file): {
+                "analysis_incomplete": True,
+                "scan_outcome_reasons": ["bounded_probe_exhausted"],
+            }
+        },
+    )
+
+    with patch("modelaudit.cli.scan_model_directory_or_file", return_value=scan_result):
+        result = CliRunner().invoke(cli, ["scan", str(test_file), "--strict", "--format", "json"])
+
+    assert result.exit_code == 2, result.output
+    payload = parse_click_json_output(result.output)
+    assert payload["success"] is False
+    assert payload["has_errors"] is False
+    assert payload["file_metadata"][str(test_file)]["analysis_incomplete"] is True
+    assert payload["file_metadata"][str(test_file)]["scan_outcome_reasons"] == ["bounded_probe_exhausted"]
 
 
 def test_scan_output_file(tmp_path: Path) -> None:
@@ -3378,6 +3404,321 @@ def test_format_text_output_operational_errors_status():
     clean_output = strip_ansi(output)
     assert "SCAN COMPLETED WITH OPERATIONAL ERRORS" in clean_output
     assert "NO ISSUES FOUND" not in clean_output
+
+
+def test_format_text_output_complete_benign_scan_remains_clean() -> None:
+    """Fully covered benign scans should keep the clean text status."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [],
+        "file_metadata": {"model.pkl": {"scan_outcome_reasons": []}},
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "No security issues detected" in clean_output
+    assert "NO ISSUES FOUND" in clean_output
+    assert "Incomplete security coverage" not in clean_output
+
+
+def test_format_text_output_incomplete_coverage_without_findings_is_not_clean() -> None:
+    """Incomplete coverage without findings should not be presented as a clean scan."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [],
+        "file_metadata": {
+            "model.bin": {
+                "analysis_incomplete": True,
+                "scan_outcome_reasons": ["bounded_probe_exhausted"],
+            },
+        },
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "Incomplete security coverage" in clean_output
+    assert "bounded_probe_exhausted" in clean_output
+    assert "SCAN COVERAGE INCOMPLETE" in clean_output
+    assert "No security issues detected" not in clean_output
+    assert "NO ISSUES FOUND" not in clean_output
+
+
+def test_format_text_output_incomplete_coverage_with_security_findings_is_explicit() -> None:
+    """Security findings should remain visible when coverage is incomplete."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [
+            {"message": "Dangerous pickle global", "severity": "warning", "location": "model.pkl"},
+        ],
+        "file_metadata": {"model.pkl": {"scan_outcome": "inconclusive"}},
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "Dangerous pickle global" in clean_output
+    assert "Incomplete security coverage" in clean_output
+    assert "WARNINGS DETECTED; COVERAGE INCOMPLETE" in clean_output
+    assert "NO ISSUES FOUND" not in clean_output
+
+
+def test_format_text_output_issue_only_incomplete_coverage_without_findings_is_not_clean() -> None:
+    """Issue details should surface incomplete coverage even without file metadata."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [
+            {
+                "message": "DVC output limit exceeded - not all declared outputs were scanned",
+                "severity": "info",
+                "location": "model.dvc",
+                "type": "dvc_output_limit_exceeded",
+                "details": {
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "reason": "dvc_output_limit_exceeded",
+                },
+            },
+        ],
+        "checks": [],
+        "file_metadata": {},
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "Incomplete security coverage" in clean_output
+    assert "model.dvc: dvc_output_limit_exceeded" in clean_output
+    assert "SCAN COVERAGE INCOMPLETE" in clean_output
+    assert "No security issues detected" not in clean_output
+    assert "NO ISSUES FOUND" not in clean_output
+
+
+def test_format_text_output_check_only_incomplete_coverage_without_findings_is_not_clean() -> None:
+    """Check details should surface incomplete coverage even without file metadata."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [],
+        "checks": [
+            {
+                "name": "DVC Output Resolution",
+                "status": "failed",
+                "message": "DVC output resolution incomplete",
+                "severity": "info",
+                "location": "model.dvc",
+                "details": {"analysis_incomplete": True, "scan_outcome_reason": "dvc_analysis_incomplete"},
+            },
+        ],
+        "file_metadata": {},
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "Incomplete security coverage" in clean_output
+    assert "model.dvc: dvc_analysis_incomplete" in clean_output
+    assert "SCAN COVERAGE INCOMPLETE" in clean_output
+    assert "No security issues detected" not in clean_output
+    assert "NO ISSUES FOUND" not in clean_output
+
+
+def test_format_text_output_skipped_check_bare_analysis_incomplete_remains_clean() -> None:
+    """Skipped applicability checks without outcome markers should not render coverage incomplete."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [],
+        "checks": [
+            {
+                "name": "PyTorch Runtime Version",
+                "status": "skipped",
+                "message": "PyTorch runtime version not available; CVE applicability unknown",
+                "severity": "info",
+                "location": "model.pt",
+                "details": {
+                    "analysis_incomplete": True,
+                    "runtime_version_known": False,
+                    "runtime_cve_applicability": "unknown",
+                    "runtime_cve_version_gate": "local_environment_only",
+                },
+            },
+        ],
+        "file_metadata": {},
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "Incomplete security coverage" not in clean_output
+    assert "SCAN COVERAGE INCOMPLETE" not in clean_output
+    assert "NO ISSUES FOUND" in clean_output
+
+
+def test_format_text_output_consolidated_check_incomplete_coverage_is_not_clean() -> None:
+    """Consolidated check findings should still surface incomplete coverage."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [],
+        "checks": [
+            {
+                "name": "DVC Output Resolution",
+                "status": "failed",
+                "message": "DVC output resolution incomplete",
+                "severity": "info",
+                "location": "model.dvc",
+                "details": {
+                    "component_count": 2,
+                    "findings": [
+                        {"analysis_incomplete": True, "scan_outcome_reason": "dvc_output_limit_exceeded"},
+                        {"component": "covered-sibling"},
+                    ],
+                },
+            },
+        ],
+        "file_metadata": {},
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "Incomplete security coverage" in clean_output
+    assert "model.dvc: dvc_output_limit_exceeded" in clean_output
+    assert "SCAN COVERAGE INCOMPLETE" in clean_output
+    assert "No security issues detected" not in clean_output
+    assert "NO ISSUES FOUND" not in clean_output
+
+
+def test_format_text_output_issue_only_incomplete_coverage_with_security_findings_is_explicit() -> None:
+    """Issue-only coverage gaps should not hide security findings."""
+    results = {
+        "files_scanned": 2,
+        "bytes_scanned": 20,
+        "duration": 0.1,
+        "issues": [
+            {
+                "message": "DVC output resolution incomplete",
+                "severity": "info",
+                "location": "model.dvc",
+                "details": {"analysis_incomplete": True, "scan_outcome_reason": "dvc_analysis_incomplete"},
+            },
+            {"message": "Dangerous pickle global", "severity": "warning", "location": "payload.pkl"},
+        ],
+        "file_metadata": {},
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "Dangerous pickle global" in clean_output
+    assert "Incomplete security coverage" in clean_output
+    assert "WARNINGS DETECTED; COVERAGE INCOMPLETE" in clean_output
+    assert "NO ISSUES FOUND" not in clean_output
+
+
+def test_format_text_output_runtime_version_skip_does_not_report_incomplete_coverage() -> None:
+    """Expected runtime-version applicability skips should not print incomplete coverage."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [],
+        "checks": [
+            {
+                "name": "CVE PyTorch Version Check",
+                "status": "skipped",
+                "message": "PyTorch runtime version unavailable",
+                "severity": "info",
+                "location": "weights.pt",
+                "details": {
+                    "analysis_incomplete": True,
+                    "runtime_version_known": False,
+                    "runtime_cve_applicability": "unknown",
+                    "runtime_cve_version_gate": "local_environment_only",
+                },
+            }
+        ],
+        "file_metadata": {},
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "Incomplete security coverage" not in clean_output
+    assert "SCAN COVERAGE INCOMPLETE" not in clean_output
+    assert "NO ISSUES FOUND" in clean_output
+
+
+def test_format_text_output_skipped_bare_analysis_incomplete_reports_coverage() -> None:
+    """Skipped incomplete checks without runtime-version metadata still fail closed."""
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [],
+        "checks": [
+            {
+                "name": "Embedded Secret Scan",
+                "status": "skipped",
+                "message": "Embedded secret scan skipped after bounded read",
+                "severity": "info",
+                "location": "model.bin",
+                "details": {"analysis_incomplete": True},
+            }
+        ],
+        "file_metadata": {},
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "Incomplete security coverage" in clean_output
+    assert "model.bin: analysis_incomplete" in clean_output
+    assert "SCAN COVERAGE INCOMPLETE" in clean_output
+    assert "NO ISSUES FOUND" not in clean_output
+
+
+def test_text_cli_incomplete_coverage_path_status_is_not_clean(tmp_path: Path) -> None:
+    """Per-path CLI progress should not call an incomplete scan clean."""
+    test_file = tmp_path / "model.bin"
+    test_file.write_bytes(b"weights")
+    mock_result = create_initial_audit_result()
+    mock_result.files_scanned = 1
+    mock_result.bytes_scanned = len(b"weights")
+    mock_result.success = False
+    mock_result.file_metadata[str(test_file)] = FileMetadataModel(
+        analysis_incomplete=True,
+        scan_outcome_reasons=["bounded_probe_exhausted"],
+    )
+
+    runner = CliRunner()
+    with patch("modelaudit.cli.scan_model_directory_or_file", return_value=mock_result):
+        result = runner.invoke(
+            cli,
+            ["scan", str(test_file), "--format", "text", "--no-cache"],
+            catch_exceptions=False,
+        )
+
+    clean_output = strip_ansi(result.output)
+    assert result.exit_code == 2
+    assert f"Scanned {test_file}: Inconclusive" in clean_output
+    assert "coverage incomplete" in clean_output
+    assert f"Scanned {test_file}: Clean" not in clean_output
+    assert "No security issues detected" not in clean_output
+    assert "SCAN COVERAGE INCOMPLETE" in clean_output
 
 
 def test_format_text_output_only_info_issues():

@@ -6509,7 +6509,7 @@ def test_scan_file_fails_closed_for_msgpack_extensions_when_dependency_is_missin
     assert library_check.message == "msgpack library not installed - cannot analyze Flax checkpoints"
 
     aggregate = scan_model_directory_or_file(str(checkpoint), cache_scan_results=False)
-    assert aggregate.success is True
+    assert aggregate.success is False
     assert core_module.determine_exit_code(aggregate) == 1
 
 
@@ -10444,7 +10444,7 @@ def test_scan_file_reports_visible_jax_pattern_after_depth_capped_prefix_value(t
 
     aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
 
-    assert core_module.determine_exit_code(aggregate) == 2
+    assert core_module.determine_exit_code(aggregate) == 1
     assert any("Suspicious pattern in bounded JSON checkpoint prefix" in issue.message for issue in aggregate.issues)
     assert aggregate.file_metadata[str(model_path)]["scan_outcome"] == "inconclusive"
     assert "mxnet_symbol_routing_incomplete" in aggregate.file_metadata[str(model_path)]["scan_outcome_reasons"]
@@ -10469,7 +10469,7 @@ def test_scan_file_reports_visible_renamed_jax_pattern_behind_inconclusive_mxnet
 
     aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
 
-    assert core_module.determine_exit_code(aggregate) == 2
+    assert core_module.determine_exit_code(aggregate) == 1
     assert any("Suspicious pattern in bounded JSON checkpoint prefix" in issue.message for issue in aggregate.issues)
     assert aggregate.file_metadata[str(model_path)]["scan_outcome"] == "inconclusive"
     assert "mxnet_symbol_routing_incomplete" in aggregate.file_metadata[str(model_path)]["scan_outcome_reasons"]
@@ -10494,7 +10494,7 @@ def test_scan_file_reports_escaped_renamed_jax_pattern_behind_inconclusive_mxnet
     aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
 
     assert b"jax" not in model_path.read_bytes()[:JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES]
-    assert core_module.determine_exit_code(aggregate) == 2
+    assert core_module.determine_exit_code(aggregate) == 1
     assert any("Suspicious pattern in bounded JSON checkpoint prefix" in issue.message for issue in aggregate.issues)
     assert "mxnet_symbol_routing_incomplete" in aggregate.file_metadata[str(model_path)]["scan_outcome_reasons"]
 
@@ -11383,7 +11383,7 @@ def test_scan_file_inconclusive_mxnet_route_composes_jax_analysis(
     )
     aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
     assert any("Suspicious pattern in JSON checkpoint" in issue.message for issue in aggregate.issues)
-    assert core_module.determine_exit_code(aggregate) == 2
+    assert core_module.determine_exit_code(aggregate) == 1
 
 
 def test_scan_file_inconclusive_mxnet_route_composes_escaped_suffix_owned_jax_payload_without_root_marker(
@@ -12137,7 +12137,7 @@ def test_scan_file_inconclusive_params_routing_preserves_raw_findings(tmp_path: 
     assert any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
     assert any("Suspicious executable token" in issue.message for issue in result.issues)
     assert any("Potential executable signature found in params blob" in issue.message for issue in aggregate.issues)
-    assert core_module.determine_exit_code(aggregate) == 2
+    assert core_module.determine_exit_code(aggregate) == 1
 
 
 def test_scan_file_inconclusive_params_routing_honors_excluded_mxnet(tmp_path: Path) -> None:
@@ -14370,6 +14370,23 @@ def test_scan_file_keeps_s901_for_external_data_pt_onnx(tmp_path: Path) -> None:
 def test_scan_file_keeps_s901_for_malicious_valid_pt_onnx(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "malicious.pt", op_type="PythonOp")
+
+    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
+
+
+def test_scan_file_keeps_s901_for_malicious_valid_pth_onnx(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "malicious.pth", op_type="PythonOp")
 
     result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
     format_check = _format_validation_check(result)
