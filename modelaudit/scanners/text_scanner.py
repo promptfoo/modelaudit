@@ -2386,9 +2386,11 @@ class TextScanner(BaseScanner):
         path: str,
         payload: bytes,
         findings: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
+        *,
+        max_findings: int,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         if not cls._is_passive_data_sidecar(path):
-            return []
+            return [], None
 
         passive_findings: list[dict[str, Any]] = []
         for match in PASSIVE_DATA_BASIC_AUTH_LINE_PATTERN.finditer(payload):
@@ -2408,6 +2410,16 @@ class TextScanner(BaseScanner):
                 continue
 
             token_position = match.start("token")
+            if len(findings) + len(passive_findings) >= max_findings:
+                return passive_findings, {
+                    "type": DETECTOR_FINDING_LIMIT_TYPE,
+                    "detector": "secrets",
+                    "severity": "INFO",
+                    "message": "Embedded secret findings exceeded the configured reporting limit",
+                    "max_findings": max_findings,
+                    "analysis_incomplete": True,
+                    "context": path,
+                }
             passive_findings.append(
                 {
                     "type": "embedded_secret",
@@ -2424,7 +2436,7 @@ class TextScanner(BaseScanner):
                     "passive_data_sidecar": True,
                 }
             )
-        return passive_findings
+        return passive_findings, None
 
     @classmethod
     def _is_isolated_tokenizer_vocabulary_cc_finding(cls, payload: bytes, finding: dict[str, Any]) -> bool:
@@ -3233,9 +3245,11 @@ class TextScanner(BaseScanner):
         path: str,
         payload: bytes,
         findings: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
+        *,
+        max_findings: int,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         if not cls._is_passive_data_sidecar(path):
-            return findings
+            return findings, None
 
         findings = [
             finding
@@ -3244,7 +3258,13 @@ class TextScanner(BaseScanner):
             or cls._passive_data_bare_secret_finding_is_actionable(payload, finding)
         ]
         # Whole-line Basic/Bearer matches in passive sidecars can be real credentials.
-        return findings + cls._passive_data_auth_line_secret_findings(path, payload, findings)
+        passive_findings, finding_limit = cls._passive_data_auth_line_secret_findings(
+            path,
+            payload,
+            findings,
+            max_findings=max_findings,
+        )
+        return findings + passive_findings, finding_limit
 
     @staticmethod
     def _is_unreadable_path_result(result: ScanResult) -> bool:
@@ -3338,7 +3358,14 @@ class TextScanner(BaseScanner):
                     max_findings=max_findings,
                 )
                 secret_findings, finding_limit = self._split_detector_finding_limit(secret_findings)
-                secret_findings = self._downgrade_sidecar_secret_findings(path, inspected_payload, secret_findings)
+                secret_findings, passive_finding_limit = self._downgrade_sidecar_secret_findings(
+                    path,
+                    inspected_payload,
+                    secret_findings,
+                    max_findings=max_findings,
+                )
+                if finding_limit is None:
+                    finding_limit = passive_finding_limit
                 if secret_findings or not truncated:
                     self.add_embedded_secret_findings(secret_findings, result, context=path)
                 if finding_limit is not None:

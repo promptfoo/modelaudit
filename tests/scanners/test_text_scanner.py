@@ -3732,6 +3732,55 @@ def test_text_scanner_merges_whole_line_basic_bearer_credentials_remain_actionab
     )
 
 
+def test_text_scanner_merges_passive_basic_auth_respects_finding_limit(tmp_path: Path) -> None:
+    text_dir = tmp_path / "text_tokenizer"
+    text_dir.mkdir()
+    text_path = text_dir / "merges.txt"
+    tokens = ["dTA6cA==", "dTE6cA==", "dTI6cA==", "dTM6cA==", "dTQ6cA=="]
+    text_path.write_text("\n".join(f"Basic {token}" for token in tokens) + "\n", encoding="utf-8")
+
+    result = TextScanner(
+        config={
+            "check_network_comm": False,
+            "text_content_max_findings": 1,
+            "cache_enabled": False,
+        }
+    ).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(
+        str(text_path),
+        cache_enabled=False,
+        check_network_comm=False,
+        text_content_max_findings=1,
+    )
+
+    failed_secret_checks = [
+        check
+        for check in result.checks
+        if check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("secret_type") == "Basic Auth Credentials"
+    ]
+    assert len(failed_secret_checks) == 1
+    assert failed_secret_checks[0].details.get("passive_data_sidecar") is True
+    assert failed_secret_checks[0].details.get("redacted_value") == "Basic <redacted>"
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert determine_exit_code(aggregate) == 2
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("detector") == "secrets"
+        and check.details.get("max_findings") == 1
+        and check.details.get("analysis_incomplete") is True
+        and check.details.get("scan_outcome_reason") == "text_content_security_finding_limit"
+        for check in result.checks
+    )
+    serialized = result.to_json()
+    for raw_value in ("u0:p", "u1:p", "u2:p", "u3:p", "u4:p", *tokens):
+        assert raw_value not in serialized
+
+
 def test_text_scanner_merges_basic_assignments_remain_actionable(tmp_path: Path) -> None:
     text_dir = tmp_path / "text_tokenizer"
     text_dir.mkdir()
