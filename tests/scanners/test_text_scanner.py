@@ -1203,6 +1203,7 @@ def test_text_scanner_documentation_enclosing_call_ignores_markdown_table_call_l
         'payloads = {"#doc": "[download](https://evil.example/payload.sh)"}\n',
         'payloads = {"note": "#", "doc": "[download](https://evil.example/payload.sh)"}\n',
         'payloads = {\n    "doc": "[download](https://evil.example/payload.sh)"\n}\n',
+        'payloads = {\n"doc": "[download](https://evil.example/payload.sh)"\n}\n',
         'payloads = {  # endpoint payloads\n    "doc": "[download](https://evil.example/payload.sh)"\n}\n',
     ],
 )
@@ -1227,6 +1228,37 @@ def test_text_scanner_model_card_dict_markdown_link_remains_actionable(
         for check in network_checks
     )
     assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "payloads = {\n[API docs](https://docs.example.com/reference)\n}\n",
+        "payloads = {\n- [API docs](https://docs.example.com/reference)\n}\n",
+        "payloads = {\n1. [API docs](https://docs.example.com/reference)\n}\n",
+        "payloads = {\n+ [API docs](https://docs.example.com/reference)\n}\n",
+        "payloads = {\n### [API docs](https://docs.example.com/reference)\n}\n",
+        "payloads = {\n# [API docs](https://docs.example.com/reference)\n}\n",
+    ],
+)
+def test_text_scanner_model_card_zero_indent_markdown_links_after_literal_opener_stay_informational(
+    tmp_path: Path,
+    content: str,
+) -> None:
+    text_path = tmp_path / "model_card.md"
+    text_path.write_text(
+        content,
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    network_checks = _failed_network_detection_checks(result)
+
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert determine_exit_code(aggregate) == 0
 
 
 def test_text_scanner_model_card_crlf_dict_markdown_link_remains_actionable(tmp_path: Path) -> None:

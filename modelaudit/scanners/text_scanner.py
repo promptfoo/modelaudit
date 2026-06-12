@@ -1206,6 +1206,13 @@ class TextScanner(BaseScanner):
         line_prefix = context_prefix[context_prefix.rfind(b"\n") + 1 :]
         if cls._documentation_shell_comment_before_position(line_prefix, len(line_prefix)):
             return False
+        if cls._documentation_markdown_link_leading_prefix_is_passive(line_prefix):
+            return cls._documentation_markdown_link_config_is_actionable(
+                context_prefix
+            ) or cls._documentation_markdown_link_has_open_xml_config_context(
+                payload,
+                link_start,
+            )
         return cls._documentation_markdown_link_is_in_code_context(
             context_prefix,
             len(context_prefix),
@@ -1220,11 +1227,18 @@ class TextScanner(BaseScanner):
         if context is None:
             return False
         context_prefix, link_start = context
-        return cls._documentation_markdown_link_xml_config_context_status(
-            payload, link_start
-        ) is False and not cls._documentation_markdown_link_is_in_code_context(
-            context_prefix,
-            len(context_prefix),
+        line_prefix = context_prefix[context_prefix.rfind(b"\n") + 1 :]
+        passive_line_markdown_link = cls._documentation_markdown_link_leading_prefix_is_passive(line_prefix)
+        literal_value_prefix = cls._documentation_markdown_link_leading_prefix_is_literal_value(line_prefix)
+        return cls._documentation_markdown_link_xml_config_context_status(payload, link_start) is False and (
+            (passive_line_markdown_link and not cls._documentation_markdown_link_config_is_actionable(context_prefix))
+            or (
+                not literal_value_prefix
+                and not cls._documentation_markdown_link_is_in_code_context(
+                    context_prefix,
+                    len(context_prefix),
+                )
+            )
         )
 
     @staticmethod
@@ -1841,6 +1855,67 @@ class TextScanner(BaseScanner):
             previous_line_end = previous_line_start - 1
         return False
 
+    @staticmethod
+    def _documentation_markdown_link_leading_prefix_is_passive(prefix: bytes) -> bool:
+        prefix = prefix.lstrip()
+        return (
+            not prefix or prefix.startswith(b"#") or DOCUMENTATION_MARKDOWN_PREFIX_PATTERN.fullmatch(prefix) is not None
+        )
+
+    @staticmethod
+    def _documentation_markdown_link_leading_prefix_is_literal_value(prefix: bytes) -> bool:
+        stripped = prefix.strip()
+        return stripped.startswith((b'"', b"'", b"{", b"[", b"(")) or stripped.endswith((b",", b"{", b"["))
+
+    @classmethod
+    def _documentation_literal_continuation_line_is_passive_markdown_prefix(cls, line: bytes) -> bool:
+        markdown_match = cls._documentation_passive_markdown_link_match(line)
+        if markdown_match is None:
+            return False
+        return cls._documentation_markdown_link_leading_prefix_is_passive(line[: markdown_match.start()])
+
+    @classmethod
+    def _documentation_literal_continuation_line_is_code_shaped(cls, line: bytes) -> bool:
+        stripped = line.strip()
+        if cls._documentation_literal_continuation_line_is_passive_markdown_prefix(line):
+            return False
+        return (
+            stripped.startswith((b'"', b"'", b"{", b"[", b"(", b"-", b"+"))
+            or stripped.endswith((b",", b"{", b"[", b"("))
+            or bool(re.match(rb"\d", stripped))
+        )
+
+    @classmethod
+    def _documentation_zero_indent_multiline_literal_contains_position(
+        cls,
+        payload: bytes,
+        line_start: int,
+        current_line_prefix: bytes,
+        context_start: int,
+    ) -> bool:
+        if not cls._documentation_literal_continuation_line_is_code_shaped(current_line_prefix):
+            return False
+
+        previous_line_end = line_start - 1
+        while previous_line_end >= context_start:
+            previous_line_start = max(
+                payload.rfind(b"\n", context_start, previous_line_end) + 1,
+                context_start,
+            )
+            previous_line = payload[previous_line_start:previous_line_end].removesuffix(b"\r")
+            stripped = previous_line.strip()
+            if stripped and not stripped.startswith(b"#"):
+                if DOCUMENTATION_CODE_LITERAL_BLOCK_PREFIX_PATTERN.search(previous_line) is not None:
+                    return True
+                if stripped.startswith((b"}", b"]", b")")):
+                    return False
+                if not cls._documentation_literal_continuation_line_is_code_shaped(previous_line):
+                    return False
+            if previous_line_start == context_start:
+                break
+            previous_line_end = previous_line_start - 1
+        return False
+
     @classmethod
     def _documentation_open_call_contains_position(cls, payload: bytes, position: int) -> bool:
         line_start = payload.rfind(b"\n", 0, position) + 1
@@ -1879,10 +1954,18 @@ class TextScanner(BaseScanner):
         line_start = payload.rfind(b"\n", 0, position) + 1
         current_line_prefix = payload[line_start:position]
         current_indent = len(current_line_prefix) - len(current_line_prefix.lstrip(b" \t"))
-        if current_indent == 0:
-            return False
 
         context_start = max(0, line_start - MAX_TEXT_FINDING_CONTEXT_BYTES)
+        if current_indent == 0:
+            if cls._documentation_position_is_in_passive_markdown_link(payload, position):
+                return False
+            return cls._documentation_zero_indent_multiline_literal_contains_position(
+                payload,
+                line_start,
+                current_line_prefix,
+                context_start,
+            )
+
         previous_line_end = line_start - 1
         while previous_line_end >= context_start:
             previous_line_start = max(
