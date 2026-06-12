@@ -380,9 +380,9 @@ jobs:
     # Always run for fastest feedback
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
-    # The full fast suite can approach 30 minutes on hosted runners when the
+    # The full fast suite can approach 40 minutes on hosted runners when the
     # bounded-replay security regressions land on the long-running worker.
-    timeout-minutes: 40
+    timeout-minutes: 50
     steps:
       - name: Checkout repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -426,7 +426,7 @@ jobs:
     needs: changes
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 50
     steps:
       - name: Checkout repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
