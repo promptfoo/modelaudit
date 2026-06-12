@@ -6,12 +6,25 @@ Detects API keys, passwords, tokens, and other sensitive data embedded in model 
 Part of ModelAudit's critical security validation suite.
 """
 
+import base64
+import binascii
 import logging
 import math
 import re
 from typing import Any
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+BASIC_AUTH_SECRET_TYPE = "Basic Auth Credentials"
+BASIC_AUTH_TOKEN_MAX_LENGTH = 8192
+BASIC_AUTH_CONFIDENCE = 0.8
+BASIC_AUTH_TOKEN_TERMINATOR = r"(?=$|[\s\"'`,.;<\]\)}]|\\(?:[\"']|r|n))"
+BASIC_AUTH_SCHEME_SEPARATOR = r"(?:[ \t]*(?:\r\n|\r|\n)[ \t]+|[ \t]+)"
+BASIC_AUTH_PATTERN = (
+    rf"\bBasic{BASIC_AUTH_SCHEME_SEPARATOR}"
+    rf"([A-Za-z0-9+/]{{2,{BASIC_AUTH_TOKEN_MAX_LENGTH}}}={{0,2}}){BASIC_AUTH_TOKEN_TERMINATOR}"
+)
+BASIC_AUTH_HEADER_VALUE_CONTEXT_MAX_BYTES = BASIC_AUTH_TOKEN_MAX_LENGTH + 64
 
 # High-priority secret patterns with descriptions
 SECRET_PATTERNS: list[tuple[str, str]] = [
@@ -49,7 +62,7 @@ SECRET_PATTERNS: list[tuple[str, str]] = [
     # Tokens and Secrets
     (r"eyJ[A-Za-z0-9-_=]+\.eyJ[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*", "JWT Token"),
     (r"Bearer\s+[a-zA-Z0-9\-._~+/]+=*", "Bearer Token"),
-    (r"Basic\s+[a-zA-Z0-9]+=*", "Basic Auth Credentials"),
+    (BASIC_AUTH_PATTERN, BASIC_AUTH_SECRET_TYPE),
     (r"[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}", "UUID (potential secret)"),
     # Passwords and Auth
     (r"password\s*[:=]\s*['\"]?([^'\"\s]{8,})['\"]?", "Hardcoded Password"),
@@ -341,6 +354,172 @@ BINARY_FALSE_POSITIVE_TYPES = frozenset(
 )
 FLOAT_LIKE_PATTERN = re.compile(r"[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?")
 REDACTED_CONTEXT_SECRET = "<redacted-secret>"
+BASIC_AUTH_ARGUMENT_GAP = r"(?:\s|/\*[^*]*\*+(?:[^/*][^*]*\*+)*/)*"
+BASIC_AUTH_HEADER_PREFIX_PATTERN = re.compile(
+    r"(?:^|[^\w-])(?:"
+    r"(?:http[-_]?)?(?:"
+    r"proxy[-_]?authorization|proxyauthorization|authorization"
+    r"|basic[-_]?auth|auth[-_]?header|authorization[-_]?header"
+    r"|proxy[-_]?(?:auth|authorization)[-_]?header"
+    r")"
+    r")"
+    r"\s*(?:\\?[\"'])?\s*(?:\\?\])?\s*(?:=>|[:=])\s*"
+    r"(?:[rRuUbBfF]{0,3}\\?[\"'`]|\[\s*(?:[rRuUbBfF]{0,3}\\?[\"'`])?"
+    r"|\(\s*(?:[rRuUbBfF]{0,3}\\?[\"'`])?"
+    r"|(?:\[\]\s*)?[A-Za-z_$][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_$][A-Za-z0-9_$]*)*"
+    r"\s*\{\s*(?:[rRuUbBfF]{0,3}\\?[\"'`])?)?\s*(?:[>|][+-]?\s*)?$",
+    re.IGNORECASE,
+)
+BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN = re.compile(
+    r"(?:^|[^\w$])(?:"
+    r"(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*(?:setRequest(?:Header|Property)|setHeader)"
+    r"|(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*"
+    r"(?:headers?|[A-Za-z_$][A-Za-z0-9_$]*Headers?)\s*\.\s*(?:set|append|put|add)"
+    rf")\s*\(\s*\\?[\"']\s*(?:proxy-authorization|authorization)\s*\\?[\"']\s*,{BASIC_AUTH_ARGUMENT_GAP}"
+    r"(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADER_PROPERTY_APPEND_PREFIX_PATTERN = re.compile(
+    r"(?:^|[^\w$])(?:[A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*)*"
+    r"(?:headers?|[A-Za-z_$][A-Za-z0-9_$]*Headers?)"
+    r"\s*\[\s*\\?[\"']\s*(?:proxy-authorization|authorization)\s*\\?[\"']\s*\]\s*"
+    r"\.\s*append\s*\(\s*(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
+    re.IGNORECASE,
+)
+BASIC_AUTH_SERVER_HEADER_DIRECTIVE_PREFIX_PATTERN = re.compile(
+    r"(?:^|[^\w$])proxy[-_]?set[-_]?header\s+(?:proxy-authorization|authorization)\s+"
+    r"(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
+    re.IGNORECASE,
+)
+BASIC_AUTH_XML_HEADER_PREFIX_PATTERN = re.compile(
+    r"<\s*(?:authorization|proxy-authorization)(?:\s+[^<>]*)?>\s*$",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADERS_CONSTRUCTOR_START_PATTERN = re.compile(
+    r"(?:^|[^\w$])(?:new\s+)?Headers\s*\(\s*\[",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADERS_CONSTRUCTOR_TUPLE_PREFIX_PATTERN = re.compile(
+    r"[\[(]\s*\\?[\"']\s*"
+    r"(?:proxy-authorization|authorization)\s*\\?[\"']\s*,\s*(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADERS_INIT_START_PATTERN = re.compile(
+    r"(?:^|[^\w$])(?:\\?[\"']\s*)?headers\s*(?:\\?[\"'])?\s*[:=]\s*(?P<opener>[\[(])",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADERS_OBJECT_CONTEXT_START_PATTERN = re.compile(
+    r"(?:^|[^\w$])(?:\\?[\"']\s*)?headers\s*(?:\\?[\"'])?\s*(?:=>|[:=])",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADER_OBJECT_VALUE_PREFIX_PATTERN = re.compile(
+    r"(?:^|[^\w$])(?:\\?[\"']\s*)?(?:header[-_]?values?|values?)\s*(?:\\?[\"'])?\s*(?:=>|[:=])\s*"
+    r"(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*$",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADER_VALUE_ARRAY_START_PATTERN = re.compile(
+    r"(?:^|[^\w-])(?:\\?[\"']\s*)?"
+    r"(?:http[-_]?)?(?:proxy[-_]?authorization|proxyauthorization|authorization|basic[-_]?auth"
+    r"|auth[-_]?header|authorization[-_]?header|proxy[-_]?(?:auth|authorization)[-_]?header)"
+    r"\s*(?:\\?[\"'])?\s*(?:=>|[:=])\s*\[",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADER_VALUE_YAML_KEY_PATTERN = re.compile(
+    r"\s*"
+    r"(?:\\?[\"']\s*)?"
+    r"(?:proxy[-_]?authorization|proxyauthorization|authorization|basic[-_]?auth"
+    r"|auth[-_]?header|authorization[-_]?header|proxy[-_]?(?:auth|authorization)[-_]?header)"
+    r"\s*(?:\\?[\"'])?\s*:\s*",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADER_OBJECT_VALUE_ARRAY_START_PATTERN = re.compile(
+    r"(?:^|[^\w$])(?:\\?[\"']\s*)?(?:header[-_]?values?|values?)\s*(?:\\?[\"'])?\s*(?:=>|[:=])\s*\[",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADER_OBJECT_VALUE_YAML_KEY_PATTERN = re.compile(
+    r"\s*(?:header[-_]?values?|values?)\s*:\s*",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADER_OBJECT_NAME_FIELD_PATTERN = re.compile(
+    r"(?:^|[^\w$])(?:\\?[\"']\s*)?(?:header[-_]?name|header|key|name)\s*(?:\\?[\"'])?\s*(?:=>|[:=])\s*"
+    r"(?:[rRuUbBfF]{0,3}\\?[\"'`])?\s*(?P<name>[A-Za-z0-9_. -]{1,96})",
+    re.IGNORECASE,
+)
+BASIC_AUTH_HEADER_OBJECT_ITEM_START_PATTERN = re.compile(r"[\r\n](?P<indent>[ \t]*)-\s*")
+BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS = 256
+BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS = 4096
+BASIC_AUTH_YAML_LIST_CONTEXT_MAX_CHARS = 64 * 1024
+BASIC_AUTH_YAML_LIST_CONTEXT_MAX_LINES = 512
+BASIC_AUTH_HEADER_NAMES = {
+    "authorization": "Authorization",
+    "proxyauthorization": "Proxy-Authorization",
+    "basicauth": "Authorization",
+    "authheader": "Authorization",
+    "authorizationheader": "Authorization",
+    "proxyauthheader": "Proxy-Authorization",
+    "proxyauthorizationheader": "Proxy-Authorization",
+}
+BASIC_AUTH_HEADER_OBJECT_NAME_KEYS = frozenset({"header", "headername", "key", "name"})
+BASIC_AUTH_HEADER_OBJECT_VALUE_KEYS = frozenset({"headervalue", "headervalues", "value", "values"})
+BASIC_AUTH_STRING_PREFIX_CHARS = frozenset("rRuUbBfF")
+BASIC_AUTH_QUOTE_CHARS = frozenset({'"', "'", "`"})
+BASIC_AUTH_CONTINUATION_PREFIX_PATTERN = re.compile(r"^\s*(?:-\s*)?[\"']?$")
+BASIC_AUTH_HEADER_VALUE_PATTERN = re.compile(rf"^\s*{BASIC_AUTH_PATTERN}", re.IGNORECASE)
+BASIC_AUTH_VALUE_PREFIX_PATTERN = re.compile(r"^\s*Basic\s+", re.IGNORECASE)
+BASIC_AUTH_VALUE_PREFIX_BYTES_PATTERN = re.compile(rb"^\s*Basic\s+", re.IGNORECASE)
+
+
+def _normalize_basic_auth_header_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.casefold())
+
+
+def _canonical_basic_auth_header_name(value: str) -> str | None:
+    normalized = _normalize_basic_auth_header_name(value)
+    if normalized.startswith("http"):
+        without_http_prefix = normalized[4:]
+        if without_http_prefix in BASIC_AUTH_HEADER_NAMES:
+            normalized = without_http_prefix
+    return BASIC_AUTH_HEADER_NAMES.get(normalized)
+
+
+def _is_basic_auth_header_name(value: str) -> bool:
+    return _canonical_basic_auth_header_name(value) is not None
+
+
+def _normalize_basic_auth_structured_key(value: object) -> str | None:
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+    return _normalize_basic_auth_header_name(str(value))
+
+
+def _canonical_basic_auth_header_key(value: object) -> str | None:
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+    return _canonical_basic_auth_header_name(str(value))
+
+
+def _is_basic_auth_headers_container_key(value: object) -> bool:
+    return _normalize_basic_auth_structured_key(value) == "headers"
+
+
+def _is_basic_auth_header_object_name_key(value: object) -> bool:
+    return _normalize_basic_auth_structured_key(value) in BASIC_AUTH_HEADER_OBJECT_NAME_KEYS
+
+
+def _is_basic_auth_header_object_value_key(value: object) -> bool:
+    return _normalize_basic_auth_structured_key(value) in BASIC_AUTH_HEADER_OBJECT_VALUE_KEYS
+
+
+def _canonical_basic_auth_header_object_name_value(value: object) -> str | None:
+    if not isinstance(value, str | bytes):
+        return None
+    return _canonical_basic_auth_header_key(value)
 
 
 class SecretsDetector:
@@ -546,6 +725,837 @@ class SecretsDetector:
             redacted = pattern.sub(REDACTED_CONTEXT_SECRET, redacted)
         return redacted
 
+    @staticmethod
+    def _basic_auth_match_has_header_context(text: str, position: int, match_end: int | None = None) -> bool:
+        search_start = max(0, position - BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS)
+        last_newline = max(text.rfind("\n", search_start, position), text.rfind("\r", search_start, position))
+        line_start = search_start if last_newline == -1 else last_newline + 1
+
+        line_prefix = text[line_start:position]
+        if len(line_prefix) > BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS:
+            return False
+        if BASIC_AUTH_HEADER_PREFIX_PATTERN.search(line_prefix) is not None:
+            return True
+        if BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(line_prefix) is not None:
+            return True
+        if BASIC_AUTH_HEADER_PROPERTY_APPEND_PREFIX_PATTERN.search(line_prefix) is not None:
+            return True
+        if BASIC_AUTH_SERVER_HEADER_DIRECTIVE_PREFIX_PATTERN.search(line_prefix) is not None:
+            return True
+        if BASIC_AUTH_XML_HEADER_PREFIX_PATTERN.search(line_prefix) is not None:
+            return True
+        bounded_prefix = text[search_start:position]
+        if BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(bounded_prefix) is not None:
+            return True
+        if BASIC_AUTH_HEADER_PROPERTY_APPEND_PREFIX_PATTERN.search(bounded_prefix) is not None:
+            return True
+        if SecretsDetector._basic_auth_prefix_has_headers_constructor_context(bounded_prefix):
+            return True
+        if SecretsDetector._basic_auth_prefix_has_headers_init_context(bounded_prefix):
+            return True
+        if BASIC_AUTH_HEADERS_CONSTRUCTOR_TUPLE_PREFIX_PATTERN.search(bounded_prefix) is not None:
+            collection_search_start = max(0, position - BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS)
+            if collection_search_start < search_start:
+                collection_prefix = text[collection_search_start:position]
+                if SecretsDetector._basic_auth_prefix_has_headers_constructor_context(collection_prefix):
+                    return True
+                if SecretsDetector._basic_auth_prefix_has_headers_init_context(collection_prefix):
+                    return True
+        collection_search_start = max(0, position - BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS)
+        collection_prefix = text[collection_search_start:position]
+        collection_suffix = (
+            text[match_end : min(len(text), match_end + BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS)]
+            if match_end is not None
+            else ""
+        )
+        if SecretsDetector._basic_auth_yaml_list_current_value_prefix(
+            line_prefix
+        ) and SecretsDetector._basic_auth_match_has_yaml_list_header_context(text, position):
+            return True
+        if SecretsDetector._basic_auth_prefix_may_have_header_value_array_context(
+            collection_prefix,
+            line_prefix,
+        ) and SecretsDetector._basic_auth_prefix_has_header_value_array_context(collection_prefix):
+            return True
+        if SecretsDetector._basic_auth_prefix_may_have_headers_object_context(
+            collection_prefix
+        ) and SecretsDetector._basic_auth_prefix_has_headers_object_context(collection_prefix, collection_suffix):
+            return True
+        if BASIC_AUTH_CONTINUATION_PREFIX_PATTERN.fullmatch(line_prefix) is None:
+            return False
+
+        previous_end = line_start - 1
+        if previous_end < 0:
+            return False
+        if text[previous_end] == "\n" and previous_end > 0 and text[previous_end - 1] == "\r":
+            previous_end -= 1
+
+        previous_search_start = max(0, previous_end - BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS)
+        previous_break = max(
+            text.rfind("\n", previous_search_start, previous_end),
+            text.rfind("\r", previous_search_start, previous_end),
+        )
+        previous_start = previous_search_start if previous_break == -1 else previous_break + 1
+
+        previous_line = text[previous_start:previous_end]
+        if len(previous_line) > BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS:
+            return False
+        return (
+            BASIC_AUTH_HEADER_PREFIX_PATTERN.search(previous_line) is not None
+            or BASIC_AUTH_SPLIT_HEADER_PREFIX_PATTERN.search(previous_line) is not None
+            or BASIC_AUTH_SERVER_HEADER_DIRECTIVE_PREFIX_PATTERN.search(previous_line) is not None
+            or BASIC_AUTH_XML_HEADER_PREFIX_PATTERN.search(previous_line) is not None
+        )
+
+    @staticmethod
+    def _basic_auth_match_has_yaml_list_header_context(text: str, position: int) -> bool:
+        lines = SecretsDetector._basic_auth_yaml_list_context_lines(text, position)
+        if not lines:
+            return False
+        if (
+            SecretsDetector._basic_auth_yaml_list_context_key_line_index_from_lines(
+                lines,
+                BASIC_AUTH_HEADER_VALUE_YAML_KEY_PATTERN,
+            )
+            is not None
+        ):
+            return True
+        return SecretsDetector._basic_auth_yaml_list_has_header_object_context(text, position, lines)
+
+    @staticmethod
+    def _basic_auth_yaml_list_context_lines(text: str, position: int) -> list[str]:
+        context_start = max(0, position - BASIC_AUTH_YAML_LIST_CONTEXT_MAX_CHARS)
+        lines = text[context_start:position].splitlines()
+        return lines[-BASIC_AUTH_YAML_LIST_CONTEXT_MAX_LINES:]
+
+    @staticmethod
+    def _basic_auth_yaml_list_suffix_lines(text: str, position: int) -> list[str]:
+        next_line_start = SecretsDetector._basic_auth_next_line_start(text, position)
+        if next_line_start is None:
+            return []
+        context_end = min(len(text), next_line_start + BASIC_AUTH_YAML_LIST_CONTEXT_MAX_CHARS)
+        return text[next_line_start:context_end].splitlines()[:BASIC_AUTH_YAML_LIST_CONTEXT_MAX_LINES]
+
+    @staticmethod
+    def _basic_auth_next_line_start(text: str, position: int) -> int | None:
+        search_end = min(len(text), position + BASIC_AUTH_TOKEN_MAX_LENGTH + BASIC_AUTH_HEADER_CONTEXT_MAX_CHARS)
+        newline_positions = [
+            index
+            for index in (text.find("\n", position, search_end), text.find("\r", position, search_end))
+            if index != -1
+        ]
+        if not newline_positions:
+            return None
+        line_end = min(newline_positions)
+        if text[line_end : line_end + 2] == "\r\n":
+            return line_end + 2
+        return line_end + 1
+
+    @staticmethod
+    def _basic_auth_yaml_list_has_header_object_context(text: str, position: int, lines: list[str]) -> bool:
+        key_line_index = SecretsDetector._basic_auth_yaml_list_context_key_line_index_from_lines(
+            lines,
+            BASIC_AUTH_HEADER_OBJECT_VALUE_YAML_KEY_PATTERN,
+            allow_list_item_value_key=True,
+        )
+        if key_line_index is None:
+            return False
+
+        key_indent = SecretsDetector._basic_auth_yaml_list_item_value_indent(
+            lines[key_line_index],
+        ) or SecretsDetector._basic_auth_line_indent(lines[key_line_index])
+        item_start_index = SecretsDetector._basic_auth_yaml_header_object_item_start_line_index(lines, key_line_index)
+        if item_start_index is None:
+            return False
+
+        direct_field_indent = SecretsDetector._basic_auth_yaml_header_object_direct_field_indent(
+            lines,
+            item_start_index,
+        )
+        if direct_field_indent is None or key_indent > direct_field_indent:
+            return False
+        if not SecretsDetector._basic_auth_yaml_header_object_has_headers_container(lines, item_start_index):
+            return False
+
+        direct_fields = SecretsDetector._basic_auth_yaml_header_object_direct_field_lines(
+            lines,
+            SecretsDetector._basic_auth_yaml_list_suffix_lines(text, position),
+            item_start_index,
+            direct_field_indent,
+        )
+        for field_line in direct_fields:
+            match = BASIC_AUTH_HEADER_OBJECT_NAME_FIELD_PATTERN.match(field_line.strip())
+            if match is not None and _canonical_basic_auth_header_key(match.group("name")) is not None:
+                return True
+        return False
+
+    @staticmethod
+    def _basic_auth_yaml_header_object_item_start_line_index(lines: list[str], key_line_index: int) -> int | None:
+        if SecretsDetector._basic_auth_yaml_list_line_starts_item(lines[key_line_index]):
+            return key_line_index
+
+        key_indent = SecretsDetector._basic_auth_line_indent(lines[key_line_index])
+        for line_index in range(key_line_index, -1, -1):
+            line = lines[line_index]
+            if not line.strip():
+                continue
+            line_indent = SecretsDetector._basic_auth_line_indent(line)
+            if line_indent >= key_indent:
+                continue
+            if SecretsDetector._basic_auth_yaml_list_line_starts_item(line):
+                return line_index
+            return None
+        return None
+
+    @staticmethod
+    def _basic_auth_yaml_header_object_direct_field_indent(lines: list[str], item_start_index: int) -> int | None:
+        item_line = lines[item_start_index]
+        item_indent = SecretsDetector._basic_auth_line_indent(item_line)
+        direct_field_indent = SecretsDetector._basic_auth_yaml_list_item_value_indent(item_line)
+        for line in lines[item_start_index + 1 :]:
+            if not line.strip():
+                continue
+            line_indent = SecretsDetector._basic_auth_line_indent(line)
+            if line_indent <= item_indent:
+                break
+            direct_field_indent = line_indent if direct_field_indent is None else min(direct_field_indent, line_indent)
+        return direct_field_indent
+
+    @staticmethod
+    def _basic_auth_yaml_header_object_has_headers_container(lines: list[str], item_start_index: int) -> bool:
+        item_indent = SecretsDetector._basic_auth_line_indent(lines[item_start_index])
+        for line_index in range(item_start_index - 1, -1, -1):
+            line = lines[line_index]
+            if not line.strip():
+                continue
+            line_indent = SecretsDetector._basic_auth_line_indent(line)
+            if line_indent >= item_indent:
+                continue
+            return SecretsDetector._basic_auth_yaml_line_is_headers_key(line)
+        return False
+
+    @staticmethod
+    def _basic_auth_yaml_header_object_direct_field_lines(
+        lines: list[str],
+        suffix_lines: list[str],
+        item_start_index: int,
+        direct_field_indent: int,
+    ) -> list[str]:
+        item_line = lines[item_start_index]
+        item_indent = SecretsDetector._basic_auth_line_indent(item_line)
+        direct_fields: list[str] = []
+        item_value = SecretsDetector._basic_auth_yaml_list_item_value_text(item_line)
+        if item_value and SecretsDetector._basic_auth_yaml_list_item_value_indent(item_line) == direct_field_indent:
+            direct_fields.append(item_value)
+
+        for line in lines[item_start_index + 1 : -1]:
+            if line.strip() and SecretsDetector._basic_auth_line_indent(line) == direct_field_indent:
+                direct_fields.append(line.strip())
+
+        for line in suffix_lines:
+            if not line.strip():
+                continue
+            line_indent = SecretsDetector._basic_auth_line_indent(line)
+            if line_indent <= item_indent and SecretsDetector._basic_auth_yaml_list_line_starts_item(line):
+                break
+            if line_indent < direct_field_indent:
+                break
+            if line_indent == direct_field_indent:
+                direct_fields.append(line.strip())
+        return direct_fields
+
+    @staticmethod
+    def _basic_auth_yaml_line_is_headers_key(line: str) -> bool:
+        key, separator, value = line.strip().partition(":")
+        if not separator or value.strip():
+            return False
+        key = key.strip().strip("\"'")
+        return _normalize_basic_auth_structured_key(key) == "headers"
+
+    @staticmethod
+    def _basic_auth_yaml_list_line_starts_item(line: str) -> bool:
+        stripped = line.lstrip(" \t")
+        return stripped.startswith("-") and (len(stripped) == 1 or stripped[1].isspace())
+
+    @staticmethod
+    def _basic_auth_yaml_list_item_value_text(line: str) -> str:
+        if not SecretsDetector._basic_auth_yaml_list_line_starts_item(line):
+            return ""
+        return line.lstrip(" \t")[1:].strip()
+
+    @staticmethod
+    def _basic_auth_yaml_list_item_value_indent(line: str) -> int | None:
+        item_value = SecretsDetector._basic_auth_yaml_list_item_value_text(line)
+        if not item_value:
+            return None
+        return line.index(item_value)
+
+    @staticmethod
+    def _basic_auth_prefix_has_headers_object_context(prefix: str, suffix: str = "") -> bool:
+        headers_match: re.Match[str] | None = None
+        for match in BASIC_AUTH_HEADERS_OBJECT_CONTEXT_START_PATTERN.finditer(prefix):
+            headers_match = match
+        if headers_match is None:
+            return False
+
+        headers_prefix = prefix[headers_match.end() :]
+        item_start = headers_prefix.rfind("{")
+        yaml_item_indent: int | None = None
+        yaml_item_direct_field_indent: int | None = None
+        item_matches = list(BASIC_AUTH_HEADER_OBJECT_ITEM_START_PATTERN.finditer(headers_prefix))
+        if item_matches:
+            direct_item_indent = min(len(match.group("indent")) for match in item_matches)
+            yaml_item_start = -1
+            for match in item_matches:
+                if len(match.group("indent")) == direct_item_indent and match.end() > yaml_item_start:
+                    yaml_item_start = match.end()
+                    yaml_item_indent = len(match.group("indent"))
+                    yaml_item_direct_field_indent = SecretsDetector._basic_auth_text_column_at(
+                        headers_prefix,
+                        match.end(),
+                    )
+            item_start = max(item_start, yaml_item_start)
+        item_prefix = headers_prefix[item_start if item_start >= 0 else 0 :]
+        item_suffix = SecretsDetector._basic_auth_header_object_item_suffix(item_prefix, suffix)
+        item_text = item_prefix + item_suffix
+        if yaml_item_indent is not None and yaml_item_direct_field_indent is not None and "{" not in item_prefix:
+            direct_item_prefix = SecretsDetector._basic_auth_yaml_header_object_direct_field_text(
+                item_prefix,
+                yaml_item_indent,
+                yaml_item_direct_field_indent,
+            )
+            direct_item_text = SecretsDetector._basic_auth_yaml_header_object_direct_field_text(
+                item_text,
+                yaml_item_indent,
+                yaml_item_direct_field_indent,
+            )
+        else:
+            direct_item_prefix = SecretsDetector._basic_auth_header_object_direct_field_text(item_prefix)
+            direct_item_text = SecretsDetector._basic_auth_header_object_direct_field_text(item_text)
+
+        if not (
+            BASIC_AUTH_HEADER_OBJECT_VALUE_PREFIX_PATTERN.search(direct_item_prefix) is not None
+            or SecretsDetector._basic_auth_prefix_has_header_object_value_array_context(direct_item_prefix)
+            or SecretsDetector._basic_auth_prefix_has_header_object_value_yaml_list_context(item_prefix, item_text)
+        ):
+            return False
+
+        for match in BASIC_AUTH_HEADER_OBJECT_NAME_FIELD_PATTERN.finditer(direct_item_text):
+            if _canonical_basic_auth_header_key(match.group("name")) is not None:
+                return True
+        return False
+
+    @staticmethod
+    def _basic_auth_prefix_has_header_value_array_context(prefix: str) -> bool:
+        if SecretsDetector._basic_auth_prefix_has_header_value_yaml_list_context(prefix):
+            return True
+        for match in BASIC_AUTH_HEADER_VALUE_ARRAY_START_PATTERN.finditer(prefix):
+            if SecretsDetector._basic_auth_headers_init_array_remains_open(prefix[match.end() :]):
+                return True
+        return False
+
+    @staticmethod
+    def _basic_auth_prefix_has_header_value_yaml_list_context(prefix: str) -> bool:
+        return (
+            SecretsDetector._basic_auth_yaml_list_context_key_line_index(
+                prefix,
+                BASIC_AUTH_HEADER_VALUE_YAML_KEY_PATTERN,
+            )
+            is not None
+        )
+
+    @staticmethod
+    def _basic_auth_prefix_has_header_object_value_array_context(prefix: str) -> bool:
+        for match in BASIC_AUTH_HEADER_OBJECT_VALUE_ARRAY_START_PATTERN.finditer(prefix):
+            if SecretsDetector._basic_auth_headers_init_array_remains_open(prefix[match.end() :]):
+                return True
+        return False
+
+    @staticmethod
+    def _basic_auth_prefix_has_header_object_value_yaml_list_context(item_prefix: str, item_text: str) -> bool:
+        key_line_index = SecretsDetector._basic_auth_yaml_list_context_key_line_index(
+            item_prefix,
+            BASIC_AUTH_HEADER_OBJECT_VALUE_YAML_KEY_PATTERN,
+        )
+        if key_line_index is None:
+            return False
+        if key_line_index == 0:
+            return True
+
+        lines = item_prefix.splitlines()
+        key_indent = SecretsDetector._basic_auth_line_indent(lines[key_line_index])
+        return key_indent <= SecretsDetector._basic_auth_header_object_direct_field_indent(item_text)
+
+    @staticmethod
+    def _basic_auth_yaml_list_context_key_line_index(prefix: str, key_pattern: re.Pattern[str]) -> int | None:
+        return SecretsDetector._basic_auth_yaml_list_context_key_line_index_from_lines(
+            prefix.splitlines(),
+            key_pattern,
+        )
+
+    @staticmethod
+    def _basic_auth_yaml_list_context_key_line_index_from_lines(
+        lines: list[str],
+        key_pattern: re.Pattern[str],
+        allow_list_item_value_key: bool = False,
+    ) -> int | None:
+        if not lines or not SecretsDetector._basic_auth_yaml_list_current_value_prefix(lines[-1]):
+            return None
+
+        current_item_indent = SecretsDetector._basic_auth_line_indent(lines[-1])
+        for line_index in range(len(lines) - 2, -1, -1):
+            line = lines[line_index]
+            line_indent = SecretsDetector._basic_auth_line_indent(line)
+            if line.strip().startswith("#"):
+                continue
+            if line_indent > current_item_indent:
+                continue
+            if key_pattern.fullmatch(line) is not None:
+                return line_index
+            if (
+                allow_list_item_value_key
+                and key_pattern.fullmatch(SecretsDetector._basic_auth_yaml_list_item_value_text(line)) is not None
+            ):
+                return line_index
+            if line_indent != current_item_indent or not SecretsDetector._basic_auth_yaml_list_item_has_value(line):
+                return None
+        return None
+
+    @staticmethod
+    def _basic_auth_yaml_list_current_value_prefix(line: str) -> bool:
+        stripped = line.strip()
+        if not stripped.startswith("-"):
+            return False
+
+        value_prefix = stripped[1:].strip()
+        if not value_prefix:
+            return True
+
+        prefix_length = 0
+        while (
+            prefix_length < len(value_prefix)
+            and prefix_length < 3
+            and value_prefix[prefix_length] in BASIC_AUTH_STRING_PREFIX_CHARS
+        ):
+            prefix_length += 1
+
+        quote_prefix = value_prefix[prefix_length:]
+        if quote_prefix.startswith("\\"):
+            quote_prefix = quote_prefix[1:]
+        return len(quote_prefix) == 1 and quote_prefix in BASIC_AUTH_QUOTE_CHARS
+
+    @staticmethod
+    def _basic_auth_yaml_list_item_has_value(line: str) -> bool:
+        stripped = line.lstrip(" \t")
+        return len(stripped) >= 2 and stripped[0] == "-" and stripped[1].isspace()
+
+    @staticmethod
+    def _basic_auth_line_indent(line: str) -> int:
+        return len(line) - len(line.lstrip(" "))
+
+    @staticmethod
+    def _basic_auth_header_object_direct_field_indent(value: str) -> int:
+        indents = [SecretsDetector._basic_auth_line_indent(line) for line in value.splitlines()[1:] if line.strip()]
+        return min(indents) if indents else 0
+
+    @staticmethod
+    def _basic_auth_text_column_at(value: str, index: int) -> int:
+        line_start = max(value.rfind("\n", 0, index), value.rfind("\r", 0, index)) + 1
+        return index - line_start
+
+    @staticmethod
+    def _basic_auth_yaml_header_object_direct_field_text(
+        value: str,
+        item_indent: int,
+        direct_field_indent: int,
+    ) -> str:
+        lines = value.splitlines(keepends=True)
+        if len(lines) <= 1:
+            return value
+
+        direct_lines = [lines[0]]
+        for line in lines[1:]:
+            if not line.strip():
+                direct_lines.append(line)
+                continue
+
+            line_indent = SecretsDetector._basic_auth_line_indent(line)
+            if line_indent <= item_indent and SecretsDetector._basic_auth_yaml_list_line_starts_item(line):
+                break
+            if line_indent < direct_field_indent:
+                break
+            if line_indent == direct_field_indent:
+                direct_lines.append(line)
+        return "".join(direct_lines)
+
+    @staticmethod
+    def _basic_auth_header_object_direct_field_text(value: str) -> str:
+        if "{" not in value:
+            lines = value.splitlines(keepends=True)
+            if len(lines) <= 1:
+                return value
+            indents = [len(line) - len(line.lstrip(" ")) for line in lines[1:] if line.strip()]
+            direct_indent = min(indents) if indents else 0
+            direct_lines = [lines[0]]
+            for line in lines[1:]:
+                if not line.strip() or len(line) - len(line.lstrip(" ")) <= direct_indent:
+                    direct_lines.append(line)
+            return "".join(direct_lines)
+
+        direct_chars: list[str] = []
+        brace_depth = 0
+        quote: str | None = None
+        escaped = False
+        for character in value:
+            include = brace_depth <= 1
+            if escaped:
+                escaped = False
+                if include:
+                    direct_chars.append(character)
+                continue
+            if quote is not None:
+                if character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                if include:
+                    direct_chars.append(character)
+                continue
+            if character in {"'", '"', "`"}:
+                quote = character
+                if include:
+                    direct_chars.append(character)
+            elif character == "{":
+                brace_depth += 1
+                if brace_depth <= 1:
+                    direct_chars.append(character)
+            elif character == "}":
+                if brace_depth <= 1:
+                    direct_chars.append(character)
+                brace_depth = max(0, brace_depth - 1)
+            elif include or character in {",", "\n", "\r"}:
+                direct_chars.append(character)
+        return "".join(direct_chars)
+
+    @staticmethod
+    def _basic_auth_header_object_item_suffix(item_prefix: str, suffix: str) -> str:
+        if not suffix:
+            return ""
+
+        brace_depth, quote, escaped = SecretsDetector._basic_auth_brace_state(item_prefix)
+        if brace_depth > 0:
+            for index, character in enumerate(suffix):
+                if escaped:
+                    escaped = False
+                    continue
+                if quote is not None:
+                    if character == "\\":
+                        escaped = True
+                    elif character == quote:
+                        quote = None
+                    continue
+                if character in {"'", '"', "`"}:
+                    quote = character
+                elif character == "{":
+                    brace_depth += 1
+                elif character == "}":
+                    brace_depth -= 1
+                    if brace_depth <= 0:
+                        return suffix[:index]
+            return suffix
+
+        end = len(suffix)
+        item_match = BASIC_AUTH_HEADER_OBJECT_ITEM_START_PATTERN.search(suffix)
+        if item_match is not None:
+            end = min(end, item_match.start())
+        return suffix[:end]
+
+    @staticmethod
+    def _basic_auth_prefix_may_have_header_value_array_context(prefix: str, line_prefix: str) -> bool:
+        return "[" in prefix or SecretsDetector._basic_auth_yaml_list_current_value_prefix(line_prefix)
+
+    @staticmethod
+    def _basic_auth_prefix_may_have_headers_object_context(prefix: str) -> bool:
+        prefix_lower = prefix.lower()
+        if "headers" not in prefix_lower or (":" not in prefix and "=" not in prefix):
+            return False
+        return (
+            "{" in prefix
+            or BASIC_AUTH_HEADER_OBJECT_ITEM_START_PATTERN.search(prefix) is not None
+            or BASIC_AUTH_HEADER_OBJECT_VALUE_PREFIX_PATTERN.search(prefix) is not None
+            or BASIC_AUTH_HEADER_OBJECT_VALUE_ARRAY_START_PATTERN.search(prefix) is not None
+            or BASIC_AUTH_HEADER_OBJECT_VALUE_YAML_KEY_PATTERN.search(prefix) is not None
+        )
+
+    @staticmethod
+    def _basic_auth_brace_state(value: str) -> tuple[int, str | None, bool]:
+        brace_depth = 0
+        quote: str | None = None
+        escaped = False
+        for character in value:
+            if escaped:
+                escaped = False
+                continue
+            if quote is not None:
+                if character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                continue
+            if character in {"'", '"', "`"}:
+                quote = character
+            elif character == "{":
+                brace_depth += 1
+            elif character == "}":
+                brace_depth = max(0, brace_depth - 1)
+        return brace_depth, quote, escaped
+
+    @staticmethod
+    def _basic_auth_prefix_has_headers_constructor_context(prefix: str) -> bool:
+        tuple_match = BASIC_AUTH_HEADERS_CONSTRUCTOR_TUPLE_PREFIX_PATTERN.search(prefix)
+        if tuple_match is None:
+            return False
+
+        for constructor_match in BASIC_AUTH_HEADERS_CONSTRUCTOR_START_PATTERN.finditer(prefix[: tuple_match.start()]):
+            if SecretsDetector._basic_auth_headers_constructor_remains_open(
+                prefix[constructor_match.end() : tuple_match.start()]
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _basic_auth_prefix_has_headers_init_context(prefix: str) -> bool:
+        tuple_match = BASIC_AUTH_HEADERS_CONSTRUCTOR_TUPLE_PREFIX_PATTERN.search(prefix)
+        if tuple_match is None:
+            return False
+
+        for headers_match in BASIC_AUTH_HEADERS_INIT_START_PATTERN.finditer(prefix[: tuple_match.start()]):
+            if SecretsDetector._basic_auth_headers_init_array_remains_open(
+                prefix[headers_match.end() : tuple_match.start()],
+                headers_match.group("opener"),
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _basic_auth_headers_constructor_remains_open(value: str) -> bool:
+        paren_depth = 1
+        bracket_depth = 1
+        quote: str | None = None
+        escaped = False
+
+        for character in value:
+            if escaped:
+                escaped = False
+                continue
+            if quote is not None:
+                if character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                continue
+            if character in {"'", '"', "`"}:
+                quote = character
+            elif character == "(":
+                paren_depth += 1
+            elif character == ")":
+                paren_depth -= 1
+                if paren_depth <= 0:
+                    return False
+            elif character == "[":
+                bracket_depth += 1
+            elif character == "]":
+                bracket_depth -= 1
+                if bracket_depth <= 0:
+                    return False
+
+        return paren_depth > 0 and bracket_depth > 0
+
+    @staticmethod
+    def _basic_auth_headers_init_array_remains_open(value: str, opener: str = "[") -> bool:
+        opening, closing = ("(", ")") if opener == "(" else ("[", "]")
+        depth = 1
+        quote: str | None = None
+        escaped = False
+
+        for character in value:
+            if escaped:
+                escaped = False
+                continue
+            if quote is not None:
+                if character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                continue
+            if character in {"'", '"', "`"}:
+                quote = character
+            elif character == opening:
+                depth += 1
+            elif character == closing:
+                depth -= 1
+                if depth <= 0:
+                    return False
+
+        return depth > 0
+
+    @staticmethod
+    def _basic_auth_token_decodes_to_credentials(token: str) -> bool:
+        if not token or len(token) > BASIC_AUTH_TOKEN_MAX_LENGTH or len(token) % 4 == 1:
+            return False
+        padding_start = token.find("=")
+        if padding_start != -1 and any(character != "=" for character in token[padding_start:]):
+            return False
+
+        padded_token = token + ("=" * ((4 - len(token) % 4) % 4))
+        try:
+            decoded = base64.b64decode(padded_token.encode("ascii"), validate=True)
+        except (binascii.Error, UnicodeEncodeError, ValueError):
+            return False
+
+        username, separator, password = decoded.partition(b":")
+        return bool(separator and (username or password))
+
+    def _basic_auth_match_is_valid(self, text: str, match: re.Match[str], token: str) -> bool:
+        return self._basic_auth_token_decodes_to_credentials(token) and self._basic_auth_match_has_header_context(
+            text,
+            match.start(),
+            match.end(),
+        )
+
+    def _record_basic_auth_finding(
+        self,
+        findings: list[dict[str, Any]],
+        token: str,
+        matched_text: str,
+        pattern: re.Pattern[str],
+        position: int,
+        context: str,
+        safe_context: str,
+    ) -> bool:
+        if len(matched_text) < self.min_secret_length:
+            return True
+        if self._is_whitelisted(token) or self._is_whitelisted(matched_text):
+            return True
+
+        confidence = max(
+            self._calculate_confidence(token, BASIC_AUTH_SECRET_TYPE, context),
+            BASIC_AUTH_CONFIDENCE,
+        )
+        severity = "CRITICAL" if confidence >= 0.8 else "WARNING"
+
+        return self._record_finding(
+            findings,
+            {
+                "type": "embedded_secret",
+                "severity": severity,
+                "secret_type": BASIC_AUTH_SECRET_TYPE,
+                "position": position,
+                "length": len(token),
+                "confidence": round(confidence, 2),
+                "pattern": pattern.pattern[:50] + "..." if len(pattern.pattern) > 50 else pattern.pattern,
+                "redacted_value": "Basic <redacted>",
+                "message": f"{BASIC_AUTH_SECRET_TYPE} detected (confidence: {confidence:.0%})",
+                "context": f"{safe_context} pos:{position}" if safe_context else f"pos:{position}",
+                "recommendation": f"Remove {BASIC_AUTH_SECRET_TYPE} from model data immediately",
+            },
+        )
+
+    def _scan_basic_auth_header_text_value(
+        self,
+        value: str,
+        header_name: str | None,
+        context: str,
+    ) -> list[dict[str, Any]]:
+        if header_name is not None and BASIC_AUTH_VALUE_PREFIX_PATTERN.match(value):
+            return self.scan_text(f"{header_name}: {value}", context, is_binary_source=False)
+        return self.scan_text(value, context, is_binary_source=False)
+
+    def _scan_basic_auth_header_bytes_value(
+        self,
+        value: bytes,
+        header_name: str | None,
+        context: str,
+    ) -> list[dict[str, Any]]:
+        if header_name is not None and BASIC_AUTH_VALUE_PREFIX_BYTES_PATTERN.match(value):
+            value_text = value[:BASIC_AUTH_HEADER_VALUE_CONTEXT_MAX_BYTES].decode("ascii", errors="ignore")
+            header_value_match = BASIC_AUTH_HEADER_VALUE_PATTERN.match(value_text)
+            findings: list[dict[str, Any]] = []
+            if header_value_match is not None:
+                findings = self.scan_text(
+                    f"{header_name}: {value_text[: header_value_match.end()]}",
+                    context,
+                    is_binary_source=False,
+                )
+                if self._findings_truncated:
+                    return findings
+            findings.extend(self.scan_bytes(value, context))
+            return findings
+        return self.scan_bytes(value, context)
+
+    def _scan_basic_auth_structured_header_value(
+        self,
+        value: Any,
+        header_name: str | None,
+        context: str,
+    ) -> list[dict[str, Any]]:
+        if isinstance(value, str):
+            return self._scan_basic_auth_header_text_value(value, header_name, context)
+        if isinstance(value, bytes):
+            return self._scan_basic_auth_header_bytes_value(value, header_name, context)
+        if isinstance(value, dict):
+            if header_name is None:
+                return self.scan_dict(value, context)
+            findings: list[dict[str, Any]] = []
+            for key, item in value.items():
+                if self._findings_truncated:
+                    break
+                key_context = f"{context}/{key}" if context else str(key)
+                findings.extend(self.scan_text(str(key), f"{key_context}[key]"))
+                value_header_name = header_name if _is_basic_auth_header_object_value_key(key) else None
+                findings.extend(self._scan_basic_auth_structured_header_value(item, value_header_name, key_context))
+            return findings
+        if isinstance(value, list | tuple):
+            list_findings: list[dict[str, Any]] = []
+            for i, item in enumerate(value):
+                if self._findings_truncated:
+                    break
+                list_findings.extend(
+                    self._scan_basic_auth_structured_header_value(item, header_name, f"{context}[{i}]")
+                )
+            return list_findings
+        return []
+
+    def _scan_basic_auth_structured_header_object(
+        self,
+        data: dict[Any, Any],
+        context: str,
+    ) -> list[dict[str, Any]] | None:
+        header_name = next(
+            (
+                candidate
+                for key, value in data.items()
+                if _is_basic_auth_header_object_name_key(key)
+                for candidate in [_canonical_basic_auth_header_object_name_value(value)]
+                if candidate is not None
+            ),
+            None,
+        )
+        if header_name is None:
+            return None
+
+        findings: list[dict[str, Any]] = []
+        for key, value in data.items():
+            if self._findings_truncated:
+                break
+            key_context = f"{context}/{key}" if context else str(key)
+            findings.extend(self.scan_text(str(key), f"{key_context}[key]"))
+            value_header_name = (
+                header_name if _is_basic_auth_header_object_value_key(key) else _canonical_basic_auth_header_key(key)
+            )
+            findings.extend(self._scan_basic_auth_structured_header_value(value, value_header_name, key_context))
+        return findings
+
     def scan_bytes(self, data: bytes, context: str = "") -> list[dict[str, Any]]:
         """Scan binary data for embedded secrets.
 
@@ -701,6 +1711,22 @@ class SecretsDetector:
         for pattern, description in self._compiled_patterns:
             matches = pattern.finditer(text)
             for match in matches:
+                if description == BASIC_AUTH_SECRET_TYPE and pattern.pattern == BASIC_AUTH_PATTERN and match.lastindex:
+                    token = match.group(1)
+                    if not self._basic_auth_match_is_valid(text, match, token):
+                        continue
+                    if not self._record_basic_auth_finding(
+                        findings,
+                        token,
+                        match.group(0),
+                        pattern,
+                        match.start(1),
+                        context,
+                        safe_context,
+                    ):
+                        return findings
+                    continue
+
                 # Use capture group if available (for patterns like key=VALUE)
                 # This extracts just the secret value, not the key name
                 if match.groups():
@@ -767,7 +1793,12 @@ class SecretsDetector:
 
         return findings
 
-    def scan_dict(self, data: dict[str, Any], context: str = "") -> list[dict[str, Any]]:
+    def scan_dict(
+        self,
+        data: dict[str, Any],
+        context: str = "",
+        basic_auth_header_name: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Recursively scan dictionary structures for secrets.
 
         Args:
@@ -789,21 +1820,30 @@ class SecretsDetector:
             findings.extend(key_findings)
 
             # Check the value
-            if isinstance(value, str):
-                findings.extend(self.scan_text(value, key_context, is_binary_source=False))
-            elif isinstance(value, bytes):
-                findings.extend(self.scan_bytes(value, key_context))
-            elif isinstance(value, dict):
-                findings.extend(self.scan_dict(value, key_context))
-            elif isinstance(value, list | tuple):
+            header_name = _canonical_basic_auth_header_key(key) or basic_auth_header_name
+            if isinstance(value, list | tuple):
+                headers_container = _is_basic_auth_headers_container_key(key)
                 for i, item in enumerate(value):
                     item_context = f"{key_context}[{i}]"
-                    if isinstance(item, str):
-                        findings.extend(self.scan_text(item, item_context))
-                    elif isinstance(item, bytes):
-                        findings.extend(self.scan_bytes(item, item_context))
-                    elif isinstance(item, dict):
-                        findings.extend(self.scan_dict(item, item_context))
+                    if headers_container and isinstance(item, list | tuple) and len(item) == 2:
+                        pair_header_name = _canonical_basic_auth_header_key(item[0])
+                        if pair_header_name is not None:
+                            findings.extend(
+                                self._scan_basic_auth_structured_header_value(
+                                    item[1],
+                                    pair_header_name,
+                                    f"{item_context}[1]",
+                                )
+                            )
+                            continue
+                    if headers_container and isinstance(item, dict):
+                        header_object_findings = self._scan_basic_auth_structured_header_object(item, item_context)
+                        if header_object_findings is not None:
+                            findings.extend(header_object_findings)
+                            continue
+                    findings.extend(self._scan_basic_auth_structured_header_value(item, header_name, item_context))
+            else:
+                findings.extend(self._scan_basic_auth_structured_header_value(value, header_name, key_context))
 
         return findings
 

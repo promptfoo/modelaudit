@@ -2988,7 +2988,7 @@ def _with_untrusted_allowlisted_import_findings(
             or key in existing_references
             or _is_skippable_pytorch_storage_persistent_id_reference(reference)
             or (
-                not import_only_module_requires_origin_review(module, name)
+                not _allowlisted_import_requires_origin_finding(module, name)
                 and not source_backed_import_initialization_untrusted
             )
         ):
@@ -3194,6 +3194,21 @@ def _proven_trusted_invocation_global_positions(callable_invocations: object) ->
             if len(trusted_positions) >= _MAX_INERT_INITIALIZATION_MODULES:
                 break
     return frozenset(trusted_positions)
+
+
+def _allowlisted_import_requires_origin_finding(module: str, name: str) -> bool:
+    return import_only_module_requires_origin_review(
+        module,
+        name,
+    ) or _noncanonical_pytorch_storage_like_reference(module, name)
+
+
+def _noncanonical_pytorch_storage_like_reference(module: str, name: str) -> bool:
+    return (
+        module in {"torch", "torch.storage"}
+        and name.endswith("Storage")
+        and (module, name) not in _PYTORCH_STORAGE_GLOBALS
+    )
 
 
 def _proven_trusted_import_references(report: PickleReport) -> frozenset[tuple[str, str]]:

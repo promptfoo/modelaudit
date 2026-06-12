@@ -36,6 +36,10 @@ def test_embedded_code_rule_maps_dynamic_module_execution_before_executable_text
     assert get_embedded_code_rule_code("TorchScript Dynamic module execution detected") == "S108"
 
 
+def test_secret_rule_maps_basic_auth_credentials_to_password_rule() -> None:
+    assert get_secret_rule_code("Basic Auth Credentials") == "S702"
+
+
 @pytest.mark.parametrize(
     ("message", "expected_rule_code"),
     [
