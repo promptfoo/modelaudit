@@ -287,12 +287,46 @@ def _dvc_omitted_outputs_covered_by_directory_walk(
 ) -> bool:
     """Return whether a directory walk independently covers every bounded omitted DVC target."""
 
+    def directory_files_are_covered(target: Path) -> bool:
+        walk_errors: list[OSError] = []
+        for root, dirs, files in os.walk(target, followlinks=False, onerror=walk_errors.append):
+            for directory_name in dirs:
+                directory_path = Path(root) / directory_name
+                if directory_path.is_symlink():
+                    return False
+            for filename in files:
+                file_path = os.path.join(root, filename)
+                if _is_huggingface_cache_file(file_path):
+                    continue
+                if (
+                    skip_file_types
+                    and should_skip_file(
+                        file_path,
+                        metadata_scanner_available=metadata_scanner_available,
+                        scanner_selection_extensions=scanner_selection_extensions,
+                    )
+                    and not _preserve_hf_download_sidecar_asset(file_path, scanner_selection_extensions)
+                ):
+                    continue
+                try:
+                    file_path_obj = Path(file_path)
+                    if file_path_obj.is_symlink() or not file_path_obj.is_file():
+                        return False
+                    resolved_file = str(file_path_obj.resolve())
+                except OSError:
+                    return False
+                if resolved_file not in directory_walk_covered_paths:
+                    return False
+        return not walk_errors
+
     def is_covered(target: Path) -> bool:
         target_str = str(target)
         if target.is_file():
             return target_str in directory_walk_covered_paths
-        if not target.is_dir() or target_str not in directory_walk_covered_directories:
+        if not target.is_dir():
             return False
+        if target_str not in directory_walk_covered_directories:
+            return directory_files_are_covered(target)
 
         walk_errors: list[OSError] = []
         for root, dirs, files in os.walk(target, followlinks=False, onerror=walk_errors.append):

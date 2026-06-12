@@ -158,6 +158,8 @@ def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
     """Return True when record details explicitly identify incomplete coverage."""
     if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
         return True
+    if _metadata_value(metadata, ANALYSIS_INCOMPLETE_METADATA_KEY) is True:
+        return True
     reason = _metadata_value(metadata, SCAN_OUTCOME_REASON_METADATA_KEY)
     if isinstance(reason, str):
         return bool(reason)

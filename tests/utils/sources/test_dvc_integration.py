@@ -3918,6 +3918,99 @@ class TestDvcCliIntegration:
         assert output_data.get("content_hash") is None
         assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
 
+    def test_cli_capped_pointer_uses_explicit_files_for_omitted_directory_coverage(self, tmp_path: Path) -> None:
+        """Complete explicit file scans should cover a later omitted DVC directory target."""
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        first = models_dir / "first.pkl"
+        second = models_dir / "second.pkl"
+        first.write_bytes(pickle.dumps({"first": True}))
+        second.write_bytes(pickle.dumps({"second": True}))
+        dvc_lines = ["outs:"]
+        for index in range(100):
+            filler = tmp_path / f"benign_{index:03}.pkl"
+            filler.write_bytes(pickle.dumps({"index": index}))
+            dvc_lines.append(f"- path: {filler.name}")
+        dvc_lines.append("- path: models")
+        dvc_file = tmp_path / "capped_directory.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = CliRunner().invoke(
+            cli,
+            ["scan", str(first), str(second), str(dvc_file), "--format", "json", "--no-cache"],
+        )
+
+        assert result.exit_code == 0, result.output
+        output_data = json.loads(result.output)
+        assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
+
+    def test_cli_capped_pointer_reports_malicious_explicit_file_in_omitted_directory(self, tmp_path: Path) -> None:
+        """Explicit-file directory coverage must not hide malicious scanned descendants."""
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        malicious = models_dir / "malicious.pkl"
+        malicious.write_bytes(pickle.dumps(_LateMaliciousPayload()))
+        dvc_lines = ["outs:"]
+        for index in range(100):
+            filler = tmp_path / f"benign_{index:03}.pkl"
+            filler.write_bytes(pickle.dumps({"index": index}))
+            dvc_lines.append(f"- path: {filler.name}")
+        dvc_lines.append("- path: models")
+        dvc_file = tmp_path / "capped_malicious_directory.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = CliRunner().invoke(
+            cli,
+            ["scan", str(malicious), str(dvc_file), "--format", "json", "--no-cache"],
+        )
+
+        assert result.exit_code == 1, result.output
+        output_data = json.loads(result.output)
+        assert any(
+            issue.get("rule_code") == "S201" and issue.get("location") and str(malicious) in issue["location"]
+            for issue in output_data["issues"]
+        )
+        assert not any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
+
+    def test_cli_capped_pointer_rejects_partially_scanned_omitted_directory(self, tmp_path: Path) -> None:
+        """One scanned child file must not blanket-cover a later omitted directory target."""
+        from click.testing import CliRunner
+
+        from modelaudit.cli import cli
+
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        scanned = models_dir / "scanned.pkl"
+        hidden = models_dir / "hidden.pkl"
+        scanned.write_bytes(pickle.dumps({"scanned": True}))
+        hidden.write_bytes(pickle.dumps({"hidden": True}))
+        dvc_lines = ["outs:"]
+        for index in range(100):
+            filler = tmp_path / f"benign_{index:03}.pkl"
+            filler.write_bytes(pickle.dumps({"index": index}))
+            dvc_lines.append(f"- path: {filler.name}")
+        dvc_lines.append("- path: models")
+        dvc_file = tmp_path / "capped_partial_directory.dvc"
+        dvc_file.write_text("\n".join(dvc_lines) + "\n")
+
+        result = CliRunner().invoke(
+            cli,
+            ["scan", str(scanned), str(dvc_file), "--format", "json", "--no-cache"],
+        )
+
+        assert result.exit_code == 2, result.output
+        output_data = json.loads(result.output)
+        assert output_data["success"] is False
+        assert any(issue.get("type") == DVC_OUTPUT_LIMIT_EXCEEDED_REASON for issue in output_data["issues"])
+
     def test_cli_streamed_directory_sibling_covers_omitted_output(self, tmp_path: Path) -> None:
         """Streaming a sibling directory should provide concrete DVC coverage."""
         from click.testing import CliRunner
