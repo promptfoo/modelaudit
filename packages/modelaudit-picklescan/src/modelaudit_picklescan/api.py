@@ -20,6 +20,7 @@ from .call_graph import (
     _begin_shared_source_report,
     _CallGraphAnalysisLimitError,
     _ensure_shared_source_snapshot_stable,
+    _is_skippable_pytorch_storage_persistent_id_reference,
     class_static_attribute_lookup_is_proven_source_backed,
     find_analyzed_callable_call_graph_global_positions,
     find_dangerous_call_graphs,
@@ -31,6 +32,7 @@ from .call_graph import (
     import_only_reference_is_proven_trusted,
     import_only_reference_is_proven_trusted_for_pickle_invocation,
     module_initialization_is_proven_inert,
+    module_is_loaded_without_import_hooks,
     shared_source_fingerprint_metadata,
     shared_source_sensitive_caches,
 )
@@ -190,6 +192,9 @@ _NUMPY_RECONSTRUCT_REFERENCES = frozenset(
 )
 _NUMPY_NDARRAY_REFERENCES = frozenset({("numpy", "ndarray")})
 _NUMPY_DTYPE_REFERENCES = frozenset({("numpy", "dtype")})
+_NUMPY_SAFE_OBJECT_RECONSTRUCTION_REFERENCES = (
+    _NUMPY_RECONSTRUCT_REFERENCES | _NUMPY_NDARRAY_REFERENCES | _NUMPY_DTYPE_REFERENCES
+)
 _CODECS_ENCODE_REFERENCES = frozenset({("_codecs", "encode")})
 _TRUSTED_STATIC_GETATTR_RECONSTRUCTIONS = frozenset(
     {
@@ -205,6 +210,26 @@ _ZIP64_EOCD_LOCATOR_SIZE = 20
 _ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
 _ZIP64_EOCD_MIN_SIZE = 56
 _ZIP64_SENTINEL_ENTRY_COUNT = 0xFFFF
+
+
+def _source_backed_invocation_requires_loaded_identity(
+    reference: tuple[str, str],
+    *,
+    suppress_safe_numpy_reconstruct: bool,
+) -> bool:
+    if suppress_safe_numpy_reconstruct and reference in _NUMPY_SAFE_OBJECT_RECONSTRUCTION_REFERENCES:
+        return False
+    return reference in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES
+
+
+def _source_backed_import_requires_initialization_proof(
+    reference: tuple[str, str],
+    *,
+    suppress_safe_numpy_reconstruct: bool = False,
+) -> bool:
+    if suppress_safe_numpy_reconstruct and reference in _NUMPY_SAFE_OBJECT_RECONSTRUCTION_REFERENCES:
+        return False
+    return reference in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES
 
 
 class _StreamShortReadError(ValueError):
@@ -1789,6 +1814,7 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
             trusted_reconstruction_global_positions,
             trusted_reconstruction_references,
             trusted_invocation_global_positions,
+            suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
         )
     updated_report = _with_call_graph_source_fingerprint_metadata(report, source_fingerprints)
     updated_report = (
@@ -1959,10 +1985,18 @@ def _without_proven_safe_getattr_reconstruction_findings(
     report: PickleReport,
     safe_getattr_reconstruction_keys: frozenset[tuple[int, int]],
 ) -> PickleReport:
+    fallback_global_positions = _safe_getattr_global_position_fallbacks(
+        report.findings,
+        safe_getattr_reconstruction_keys,
+    )
     findings = tuple(
         finding
         for finding in report.findings
-        if _dangerous_getattr_call_key(finding) not in safe_getattr_reconstruction_keys
+        if not _dangerous_getattr_call_is_proven_safe(
+            finding,
+            safe_getattr_reconstruction_keys,
+            fallback_global_positions,
+        )
     )
     if len(findings) == len(report.findings):
         return report
@@ -1980,14 +2014,53 @@ def _without_proven_safe_getattr_reconstruction_findings(
     )
 
 
-def _dangerous_getattr_call_key(finding: Finding) -> tuple[int, int] | None:
+def _safe_getattr_global_position_fallbacks(
+    findings: tuple[Finding, ...],
+    safe_getattr_reconstruction_keys: frozenset[tuple[int, int]],
+) -> frozenset[int]:
+    safe_counts: dict[int, int] = {}
+    missing_opcode_counts: dict[int, int] = {}
+    for global_position, _opcode_position in safe_getattr_reconstruction_keys:
+        safe_counts[global_position] = safe_counts.get(global_position, 0) + 1
+    for finding in findings:
+        if _optional_int(finding.details.get("opcode_position")) is not None:
+            continue
+        missing_opcode_global_position = _dangerous_getattr_call_global_position(finding)
+        if missing_opcode_global_position is not None:
+            missing_opcode_counts[missing_opcode_global_position] = (
+                missing_opcode_counts.get(missing_opcode_global_position, 0) + 1
+            )
+    return frozenset(
+        global_position
+        for global_position, count in missing_opcode_counts.items()
+        if count == 1 and safe_counts.get(global_position) == 1
+    )
+
+
+def _dangerous_getattr_call_is_proven_safe(
+    finding: Finding,
+    safe_getattr_reconstruction_keys: frozenset[tuple[int, int]],
+    fallback_global_positions: frozenset[int],
+) -> bool:
+    key = _dangerous_getattr_call_key(finding)
+    if key is not None:
+        return key in safe_getattr_reconstruction_keys
+    global_position = _dangerous_getattr_call_global_position(finding)
+    return global_position is not None and global_position in fallback_global_positions
+
+
+def _dangerous_getattr_call_global_position(finding: Finding) -> int | None:
     if finding.rule_code != "DANGEROUS_CALL" or str(finding.details.get("opcode", "")) != "REDUCE":
         return None
     module = str(finding.details.get("module", ""))
     name = str(finding.details.get("name", ""))
     if module not in {"builtins", "__builtin__", "__builtins__"} or name != "getattr":
         return None
-    global_position = _optional_int(finding.details.get("global_position"))
+    return _optional_int(finding.details.get("global_position"))
+
+
+def _dangerous_getattr_call_key(finding: Finding) -> tuple[int, int] | None:
+    global_position = _dangerous_getattr_call_global_position(finding)
     opcode_position = _optional_int(finding.details.get("opcode_position"))
     if global_position is None or opcode_position is None:
         return None
@@ -2038,6 +2111,11 @@ def _with_untrusted_allowlisted_import_findings(
         raw_position = reference.get("position")
         position = raw_position if type(raw_position) is int else None
         key = (import_reference, position)
+        source_backed_import_initialization_untrusted = (
+            _source_backed_import_requires_initialization_proof((module, name))
+            and not module_is_loaded_without_import_hooks(module)
+            and not module_initialization_is_proven_inert(module)
+        )
         if (
             not module
             or not name
@@ -2045,12 +2123,31 @@ def _with_untrusted_allowlisted_import_findings(
             or bool(reference.get("is_dangerous"))
             or not bool(reference.get("requires_origin_verification"))
             or key in existing_references
-            or not import_only_module_requires_origin_review(module, name)
+            or _is_skippable_pytorch_storage_persistent_id_reference(reference)
+            or (
+                not import_only_module_requires_origin_review(module, name)
+                and not source_backed_import_initialization_untrusted
+            )
         ):
             continue
+        if source_backed_import_initialization_untrusted:
+            message = (
+                f"Found source-backed allowlisted global without inert import initialization proof: {import_reference}"
+            )
+            why = (
+                "Source-backed framework metadata can execute module-level code when pickle resolves an unloaded "
+                "GLOBAL; suppress it only when the module is already loaded or import-time initialization is "
+                "proven inert."
+            )
+        else:
+            message = f"Found allowlisted global reference from an untrusted module origin: {import_reference}"
+            why = (
+                "Allowlisted modules are safe only when they resolve from the standard library or installed "
+                "site-packages; a project-local shadow module can execute arbitrary import-time code."
+            )
         additional_findings.append(
             Finding(
-                message=f"Found allowlisted global reference from an untrusted module origin: {import_reference}",
+                message=message,
                 severity=Severity.WARNING,
                 location=f"{report.source} (pos {position})" if position is not None else report.source,
                 rule_code="NON_ALLOWLISTED_GLOBAL",
@@ -2060,11 +2157,9 @@ def _with_untrusted_allowlisted_import_findings(
                     "name": name,
                     "import_reference": import_reference,
                     "position": position,
+                    "source_backed_import_initialization_untrusted": source_backed_import_initialization_untrusted,
                 },
-                why=(
-                    "Allowlisted modules are safe only when they resolve from the standard library or installed "
-                    "site-packages; a project-local shadow module can execute arbitrary import-time code."
-                ),
+                why=why,
             )
         )
         existing_references.add(key)
@@ -2180,6 +2275,7 @@ def _invoked_allowlisted_import_reference_is_proven_safe(
     *,
     suppress_safe_numpy_reconstruct: bool,
 ) -> bool:
+    reference = (module, name)
     if (
         not import_only_reference_is_proven_trusted(module, name)
         and position not in trusted_invocation_global_positions
@@ -2191,7 +2287,10 @@ def _invoked_allowlisted_import_reference_is_proven_safe(
         return True
     if position in trusted_invocation_global_positions:
         return module in invocation_load_safe_modules
-    if _source_backed_framework_identity_requires_contextual_invocation(module, name):
+    if _source_backed_invocation_requires_loaded_identity(
+        reference,
+        suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
+    ):
         return False
     return position in analyzed_invocation_global_positions and module in invocation_load_safe_modules
 
@@ -2220,7 +2319,8 @@ def _proven_trusted_invocation_global_positions(callable_invocations: object) ->
     trusted_positions: list[int] = []
     for position, invocations in grouped.items():
         if all(
-            import_only_reference_is_proven_trusted_for_pickle_invocation(
+            module_is_loaded_without_import_hooks(str(invocation.get("module", "")))
+            and import_only_reference_is_proven_trusted_for_pickle_invocation(
                 str(invocation.get("module", "")),
                 str(invocation.get("name", "")),
                 invocation,
@@ -2259,6 +2359,8 @@ def _without_proven_safe_import_findings(
     trusted_reconstruction_global_positions: frozenset[int],
     trusted_reconstruction_references: frozenset[tuple[str, str]],
     trusted_invocation_global_positions: frozenset[int],
+    *,
+    suppress_safe_numpy_reconstruct: bool,
 ) -> PickleReport:
     findings = tuple(
         finding
@@ -2275,6 +2377,7 @@ def _without_proven_safe_import_findings(
             trusted_reconstruction_global_positions,
             trusted_reconstruction_references,
             trusted_invocation_global_positions,
+            suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
         )
     )
     if len(findings) == len(report.findings):
@@ -2311,6 +2414,8 @@ def _non_allowlisted_import_finding_is_proven_safe(
     trusted_reconstruction_global_positions: frozenset[int],
     trusted_reconstruction_references: frozenset[tuple[str, str]],
     trusted_invocation_global_positions: frozenset[int] = frozenset(),
+    *,
+    suppress_safe_numpy_reconstruct: bool = False,
 ) -> bool:
     module = str(finding.details.get("module", ""))
     name = str(finding.details.get("name", ""))
@@ -2337,13 +2442,32 @@ def _non_allowlisted_import_finding_is_proven_safe(
         if position is not None
         else False
     )
-    inert_reference_is_proven_safe = position is not None and not finding_is_invoked
-    trusted_reference_is_proven_safe = position is not None and (
+    requires_loaded_identity = finding_is_invoked and _source_backed_invocation_requires_loaded_identity(
+        reference,
+        suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
+    )
+    requires_import_initialization_proof = (
         not finding_is_invoked
+        and _source_backed_import_requires_initialization_proof(
+            reference,
+            suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
+        )
+    )
+    import_initialization_is_proven_safe = (
+        not requires_import_initialization_proof
+        or module in inert_initialization_modules
+        or module_is_loaded_without_import_hooks(module)
+    )
+    inert_reference_is_proven_safe = (
+        position is not None and not finding_is_invoked and import_initialization_is_proven_safe
+    )
+    trusted_reference_is_proven_safe = position is not None and (
+        (not finding_is_invoked and import_initialization_is_proven_safe)
         or invocation_is_trusted_reconstruction
         or invocation_identity_is_trusted
         or (
-            invocation_is_analyzed
+            not requires_loaded_identity
+            and invocation_is_analyzed
             and (
                 not _source_backed_framework_identity_requires_contextual_invocation(module, name)
                 and (
@@ -2353,7 +2477,11 @@ def _non_allowlisted_import_finding_is_proven_safe(
             )
         )
     )
-    trusted_origin_is_proven = (module, name) in trusted_import_references or invocation_identity_is_trusted
+    trusted_origin_is_proven = (
+        invocation_identity_is_trusted
+        if requires_loaded_identity
+        else (module, name) in trusted_import_references or invocation_identity_is_trusted
+    )
     return (trusted_reference_is_proven_safe and trusted_origin_is_proven) or (
         inert_reference_is_proven_safe and module in inert_initialization_modules
     )

@@ -829,6 +829,10 @@ def test_numpy_object_dtype_benign_direct_scan_success_after_reconstruction_clea
 
     monkeypatch.setattr(NumPyScanner, "_scan_embedded_pickle_payload", fake_embedded_scan)
     monkeypatch.setattr(
+        "modelaudit.scanners.numpy_scanner._numpy_object_reconstruction_reference_is_trusted",
+        lambda _module, _name: True,
+    )
+    monkeypatch.setattr(
         "modelaudit.scanners.numpy_scanner._numpy_object_payload_has_safe_reconstruct_proof",
         lambda _payload: True,
     )
